@@ -8,20 +8,33 @@
 //! via [`EventKind::as_str`]. Serde will join when a serialization path
 //! (export bundle, wire protocol) actually needs it.
 
-/// PR-3 ships one variant — `Test` — for the conformance test. Real kinds
-/// (`InvoiceDraftCreated`, `InvoiceSequenceReserved`, `InvoiceFinalized`,
-/// ...) per ADR-0009 §2 land in PR-4.
+/// PR-3 shipped only `Test`. PR-5 adds the first two invoice-lifecycle
+/// kinds from ADR-0009 §2 needed by the XML-on-disk binary. Remaining
+/// invoice kinds (`InvoiceSubmitted`, `InvoiceAckPending`, ...) land
+/// when their state transition first fires in the codebase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
     /// Test-only kind used by `tests/chain_conformance.rs`. Not allowed in
-    /// production code; PR-4 will gate this via a conformance check.
+    /// production code; a future conformance check should gate this.
     Test,
+
+    /// A sequence number was reserved in `invoice_sequence_reservation`
+    /// as part of the atomic allocator (ADR-0009 §3).
+    InvoiceSequenceReserved,
+
+    /// An invoice row was inserted with state `Draft` (ADR-0009 §2).
+    /// In PR-5 this fires together with `InvoiceSequenceReserved`
+    /// because the binary's command path goes Draft -> Ready in one
+    /// allocator call. A future PR may split them.
+    InvoiceDraftCreated,
 }
 
 impl EventKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             EventKind::Test => "test",
+            EventKind::InvoiceSequenceReserved => "invoice.sequence_reserved",
+            EventKind::InvoiceDraftCreated => "invoice.draft_created",
         }
     }
 }

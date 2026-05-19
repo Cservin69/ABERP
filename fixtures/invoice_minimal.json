@@ -1,0 +1,30 @@
+{
+  "supplier": {
+    "taxNumber": "12345678-1-42",
+    "name": "ABERP Supplier Kft.",
+    "address": {
+      "countryCode": "HU",
+      "postalCode": "1011",
+      "city": "Budapest",
+      "street": "Fő utca 1."
+    }
+  },
+  "customer": {
+    "taxNumber": "87654321-2-21",
+    "name": "Test Customer Zrt."
+  },
+  "lines": [
+    {
+      "description": "Test widget",
+      "quantity": 2,
+      "unitPrice": 1000,
+      "vatRatePercent": 27
+    },
+    {
+      "description": "Test installation service",
+      "quantity": 1,
+      "unitPrice": 5000,
+      "vatRatePercent": 27
+    }
+  ]
+}

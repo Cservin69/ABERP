@@ -13,7 +13,26 @@ publish.workspace = true
 name = "aberp"
 path = "src/main.rs"
 
-# clap lands when the binary grows a real CLI surface in PR-5
-# (`aberp issue-invoice --in fixture.json --out fixture.xml`).
-# PR-1's main.rs only prints the version, so no dependencies yet.
 [dependencies]
+# Workspace siblings
+aberp-audit-ledger = { path = "../../crates/audit-ledger" }
+aberp-billing = { path = "../../modules/billing" }
+
+# Binary boundary: anyhow per ADR-0021 Part A item 2.
+anyhow = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# JSON input + (re-used) XML serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+quick-xml = { workspace = true }
+
+# Time, hashing
+time = { workspace = true }
+sha2 = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

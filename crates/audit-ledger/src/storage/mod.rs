@@ -231,6 +231,8 @@ fn row_to_entry(row: &duckdb::Row<'_>) -> duckdb::Result<Entry> {
         .map_err(|_| duckdb_decode_err("actor JSON failed to deserialize"))?;
     let kind = match kind_str.as_str() {
         "test" => EventKind::Test,
+        "invoice.sequence_reserved" => EventKind::InvoiceSequenceReserved,
+        "invoice.draft_created" => EventKind::InvoiceDraftCreated,
         _ => return Err(duckdb_decode_err("unknown event kind")),
     };
 
