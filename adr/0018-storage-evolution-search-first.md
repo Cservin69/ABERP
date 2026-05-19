@@ -1,10 +1,15 @@
 # ADR-0018 — Storage evolution toward search-first / document stores
 
-- **Status:** Proposed
+- **Status:** Superseded by [ADR-0019](0019-storage-strategy-no-fks.md) on 2026-05-19
 - **Date:** 2026-05-19
 - **Deciders:** Ervin
 - **Related:** ADR-0003 (storage abstraction with DuckDB first), ADR-0008 (audit ledger),
   ADR-0011 (inventory model — stub), ADR-0014 (CAD/CAM artifacts — stub)
+
+> **Note:** This ADR has been superseded by ADR-0019, which consolidates
+> ADR-0003 (storage abstraction), this ADR (search-first evolution), and
+> a new "no foreign keys" rule into a single cornerstone. Read ADR-0019
+> instead. Text below is retained for history.
 
 ## Context
 

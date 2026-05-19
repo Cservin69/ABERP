@@ -42,7 +42,7 @@ Any change requires a superseding ADR, not an in-place edit.
 
 1. **Backend language:** Rust. Memory safety, strong types, mature crypto and async ecosystems, and a single binary distribution model that suits Tauri.
 2. **Tenant isolation:** Database-per-tenant. Each tenant owns its own physical store.
-3. **Storage:** Pluggable. DuckDB is the first concrete backend. The module code never names DuckDB; it talks to a storage trait.
+3. **Storage:** Pluggable per-module trait. DuckDB is the first concrete backend; Postgres-per-tenant is the second. Search/document stores (ES or equivalent) arrive later as **projections**, never as source-of-truth. **No foreign keys, ever, in any SQL we write.** Full text in ADR-0019.
 4. **Local UI:** Tauri + Svelte. Single desktop binary on the operator's workstation.
 5. **Cloud UI:** TypeScript-based, designed for now, built later. The design must not retrofit; the cloud seat is reserved in the API and authn model from day one.
 6. **NAV invoice issuing is the first production surface.** Everything else defers to that.
@@ -207,7 +207,7 @@ We do not build the cloud product now, but we make four design promises that pre
 - Exact label-printer vendor and protocol (deferred until QR/vignette ADR).
 - Exact CAD/CAM artifact storage (deferred — likely content-addressed blob store).
 - Backup encryption and offsite key escrow.
-- Long-term migration toward a search/document store (Elasticsearch or equivalent). ADR-0018 makes the structural commitments today; the specific adoption is deferred.
+- Long-term migration toward a search/document store (Elasticsearch or equivalent) is a *projection* concern, not a SoT swap. ADR-0019 locks the structural commitments today; the specific product and adoption timing are deferred.
 - Visual design language is captured in ADR-0017; concrete font choice and print rendering path are deferred sub-decisions.
 
 ---

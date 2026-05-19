@@ -73,12 +73,13 @@ Things not decided here that this ADR depends on, with the ADR number that will 
 
 - [ADR-0001 — Backend language: Rust](0001-backend-language-rust.md)
 - [ADR-0002 — Tenant isolation: database-per-tenant](0002-tenant-isolation-db-per-tenant.md)
-- [ADR-0003 — Storage abstraction with DuckDB as first backend](0003-storage-abstraction-duckdb-first.md)
+- ~~[ADR-0003 — Storage abstraction with DuckDB as first backend](0003-storage-abstraction-duckdb-first.md)~~ — **superseded by ADR-0019**
 - [ADR-0004 — Frontend: Tauri + Svelte local, cloud reserved](0004-frontend-tauri-svelte.md)
 - [ADR-0005 — Universal ID scheme: prefixed ULIDs](0005-id-scheme-ulid.md)
 - [ADR-0006 — Module boundaries and contracts](0006-module-boundaries.md)
 - [ADR-0007 — Security baseline and threat model](0007-security-baseline.md)
 - [ADR-0008 — Tamper-evident audit ledger](0008-audit-ledger.md)
+- [ADR-0019 — Storage strategy: one trait, relational SoT, search-first projections, no foreign keys](0019-storage-strategy-no-fks.md) — *replaces 0003 and 0018*
 
 ### Module-level (stubs — to be filled in)
 
@@ -94,7 +95,7 @@ Things not decided here that this ADR depends on, with the ADR number that will 
 ### Cross-cutting
 
 - [ADR-0017 — ABERP design language](0017-design-language.md)
-- [ADR-0018 — Storage evolution toward search-first / document stores](0018-storage-evolution-search-first.md)
+- ~~[ADR-0018 — Storage evolution toward search-first / document stores](0018-storage-evolution-search-first.md)~~ — **superseded by ADR-0019**
 
 ### Deferred (not yet filed — tracked so they don't fall through)
 

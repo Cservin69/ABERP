@@ -1,8 +1,13 @@
 # ADR-0003 — Storage abstraction with DuckDB as first backend
 
-- **Status:** Accepted (cornerstone — pre-decided)
+- **Status:** Superseded by [ADR-0019](0019-storage-strategy-no-fks.md) on 2026-05-19
 - **Date:** 2026-05-19
 - **Deciders:** Ervin
+
+> **Note:** This ADR has been superseded by ADR-0019, which consolidates
+> the storage abstraction (this ADR), the search-first evolution
+> (ADR-0018), and a new "no foreign keys" rule into a single cornerstone
+> decision. Read ADR-0019 instead. Text below is retained for history.
 
 ## Context
 
