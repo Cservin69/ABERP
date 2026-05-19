@@ -1,6 +1,8 @@
 # ADR-0007 — Security baseline and threat model
 
-- **Status:** Accepted
+- **Status:** Accepted (partially superseded by ADR-0020 for the NAV
+  transport and credential clauses in §Transport and trust-boundary #3;
+  other clauses unchanged)
 - **Date:** 2026-05-19
 - **Deciders:** Ervin
 

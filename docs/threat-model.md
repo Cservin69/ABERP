@@ -39,8 +39,23 @@ thereafter; and immediately on any incident.
 
 1. UI process ↔ backend process (even local) — wire protocol with auth token.
 2. Backend ↔ tenant database — only the backend reads/writes; storage adapter mediates.
-3. Backend ↔ NAV — TLS with mTLS, response signature verification.
-4. Backend ↔ Billingo — TLS, API key from OS keychain.
+3. Backend ↔ NAV — TLS with the NAV server-cert issuing root pinned in
+   ABERP's trust store (OS trust store not consulted for NAV traffic),
+   strict hostname verification. **No client X.509 / no mTLS** — NAV
+   does not accept one. Client authentication is application-level
+   inside the SOAP envelope per ADR-0009 §4: technical-user `login`,
+   SHA-512 `passwordHash`, SHA3-512 `requestSignature` (with the
+   per-invoice-index extension for `manageInvoice` / `manageAnnulment`),
+   and an AES-128/ECB-decrypted `exchangeToken`. Replay protection
+   comes from `requestId` + `requestTimestamp` being inputs to the
+   signature. **Response integrity is TLS-only at the time of writing**;
+   signed-response-body verification is [OPEN] pending external check
+   (see ADR-0020 §6 and `docs/research/nav-and-billingo.md`). Authority:
+   ADR-0020 (partially supersedes ADR-0007's earlier mTLS-to-NAV claim).
+4. Backend ↔ Billingo — TLS with pinned roots, API-key header from OS
+   keychain. One-time read-path scope only (historical NAV invoice
+   ingestion per ADR-0010); not on the issuance path. Deep posture
+   detail belongs in ADR-0010.
 5. Backend ↔ printer / robotics — local network, signed commands, ack required.
 6. Tenant A backend process ↔ Tenant B backend process — none; separate processes.
 7. Backend ↔ LLM provider (future) — TLS, inputs treated as untrusted, outputs as suggestions.
@@ -74,3 +89,5 @@ that addresses it.
 | Date       | Reviewer | Findings filed as |
 |------------|----------|-------------------|
 | 2026-05-19 | Ervin    | Initial v0.1 — to be reviewed in two weeks |
+| 2026-05-19 | Ervin    | Trust-boundary #3 corrected and split (NAV vs Billingo) per ADR-0020; response-body integrity flagged [OPEN] |
+| 2026-05-19 | Ervin    | First full-spine adversarial review — see `docs/reviews/2026-05-19-pre-code-spine-review.md`; three blockers (F1–F3) and one tracked finding (F4) closed in ADR-0021 amendment same day; F5 + F6 deferred to build phase with named triggers; F7 (NAV response-body integrity) carried forward against external check |
