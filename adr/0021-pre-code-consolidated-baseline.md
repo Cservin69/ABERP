@@ -575,3 +575,50 @@ A future review walking this amendment top-to-bottom will read
 the amendment paragraph here, then Part A's items §10–§13, then
 the §"Items deferred to build phase" entries, and have the full
 amendment trail in one document.
+
+## Amendment — 2026-05-19, post-PR-3 verification
+
+§Sub-decisions wording *"`rust-toolchain.toml` pins the exact
+stable version used by ABERP CI"* is **amended** to: *"`rust-
+toolchain.toml` pins the stable **channel**; the architectural
+MSRV floor lives in each `Cargo.toml`'s `rust-version` field;
+reproducibility responsibility shifts entirely to `Cargo.lock`
+per ADR-0007 §Supply chain."*
+
+Rationale: an exact-version pin (e.g. `1.88.0`) is a ceiling,
+not a floor. Every contributor cloning the repo years later
+would have to install that exact rustc to build, and CI would
+lock onto a rustc that ages out of upstream security updates.
+The maintainable-through-years pattern is to track the stable
+channel and let `Cargo.lock` plus per-crate `rust-version` carry
+the load-bearing pins.
+
+Surfaced during PR-3 verification when the original `channel =
+"1.88.0"` pin was caught as a ceiling rather than a floor; the
+working-agreement preference is "set a floor to rust not a
+ceiling, I want this repo to be maintainable through years
+maybe" (Ervin, 2026-05-19).
+
+Operational state at time of amendment (commit `7fd09f9` and
+its predecessor `456a648`):
+
+- `rust-toolchain.toml` `channel = "stable"`
+- workspace `rust-version = "1.88"` (bumped from the original
+  1.85 floor because the locked dep tree, principally
+  `time` 0.3.47 and `icu_*` 2.2, requires it; this bump is
+  operational per the §Sub-decisions "any bump beyond the MSRV
+  floor is operational, not architectural" clause)
+- CI uses `dtolnay/rust-toolchain@stable`
+
+If a future release-engineering effort requires strict
+bit-reproducible builds for a specific shipped binary, that
+branch can temporarily re-introduce an exact-version pin
+without disturbing the main-branch maintainability posture.
+ADR-0007 §Supply chain's reproducible-build requirement is
+satisfied by `Cargo.lock` plus the binary-hash recording in
+ADR-0008 §Entry shape — which is independent of compiler
+version drift across patches.
+
+The §Items deferred to build phase entries are unchanged. The
+ADR's architectural MSRV floor (`MSRV ≥ 1.85`) is unchanged;
+the operational pin is what moved.

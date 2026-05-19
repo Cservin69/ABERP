@@ -10,8 +10,8 @@
 //!
 //! Design references:
 //!
-//! - ADR-0009  NAV invoice issuing (lifecycle, sequence allocator, retry,
-//!             offline queue, audit-evidence export, certification posture).
-//! - ADR-0020  NAV transport and credential correction.
-//! - ADR-0006  Module boundaries and contracts.
-//! - ADR-0005  Prefixed ULID identifiers.
+//! - ADR-0009 — NAV invoice issuing (lifecycle, sequence allocator, retry,
+//!   offline queue, audit-evidence export, certification posture).
+//! - ADR-0020 — NAV transport and credential correction.
+//! - ADR-0006 — Module boundaries and contracts.
+//! - ADR-0005 — Prefixed ULID identifiers.
