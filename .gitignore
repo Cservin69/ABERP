@@ -84,3 +84,8 @@ tmp/
 *.bak
 *.orig
 CLAUDE.md
+
+# --- Between-session handoffs (local-only) ------------------
+# Notes from one design/build session to the next. Not part of
+# the repo's design or code history; not for collaborators.
+/_handoffs/
