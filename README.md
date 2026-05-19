@@ -4,9 +4,11 @@ Modular multi-tenant ERP. Rust backend, Tauri + Svelte local UI, cloud UI later.
 First production surface: NAV-compliant invoicing for a single tenant.
 First real-world user: a CNC manufacturing company (inventory, logistics, CAD/CAM).
 
-This repository currently holds **design only** — no code yet. The order of operations
-is deliberate: foundation, then ADRs, then build. We do not start coding until the
-spine is approved and adversarially reviewed.
+The order of operations is deliberate: foundation, then ADRs, then build. The
+spine passed its first full-spine adversarial review at the close of session 4
+(see `docs/reviews/`); the workspace scaffold — commit #1's first PR — landed
+in session 5. Further ADRs land just-in-time when their named triggers fire
+(see `adr/README.md` Deferred section).
 
 ## Layout
 
@@ -14,11 +16,25 @@ spine is approved and adversarially reviewed.
 ABERP/
   README.md           ← you are here
   FOUNDATION.md       ← the architectural spine — every ADR must be consistent with it
+  CLAUDE.md           ← project-wide working agreement
+  LICENSE
+  Cargo.toml          ← workspace manifest, pinned deps per ADR-0021
+  Cargo.lock          ← committed pin set per ADR-0007 §Supply chain
+  rust-toolchain.toml ← Rust 1.85.0 (MSRV floor) per ADR-0021
   adr/
     README.md         ← ADR index, numbering, status lifecycle, review cadence
-    0001-*.md         ← spine ADRs (foundational, hard to reverse)
-    ...
-    0009-*.md         ← module ADRs (stubs first, then filled in)
+    0001-*.md ... 0021-*.md
+  docs/
+    threat-model.md
+    id-prefixes.md
+    research/         ← raw research notes (NAV/Billingo, stack baseline)
+    reviews/          ← adversarial review records
+  crates/
+    audit-ledger/     ← tamper-evident audit ledger (ADR-0008)
+  modules/
+    billing/          ← NAV invoice issuing (ADR-0009)
+  apps/
+    aberp/            ← the CLI binary
 ```
 
 ## Reading order
@@ -44,4 +60,7 @@ These come from the project's working agreement and apply to every change:
 
 ## Status
 
-Pre-build. Foundation drafting in progress. Code commit #1 has not landed.
+Build phase. Workspace scaffold landed in session 5; the supply-chain CI,
+audit-ledger crate, billing module, and the NAV-XML-on-disk binary (commit
+#1's success criterion) land across the rest of session 5's PRs. See
+`adr/README.md` for the design ledger and `git log` for landed commits.
