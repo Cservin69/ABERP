@@ -1,59 +1,408 @@
 # ADR-0010 — Billingo + NAV invoice ingestion (read path)
 
-- **Status:** Proposed (stub — scope only, no decisions yet)
+- **Status:** Accepted (Billingo migration scope only; NAV historical/
+  reconciliation read path explicitly deferred — see §"Deferred to
+  build phase")
 - **Date:** 2026-05-19
 - **Deciders:** Ervin
-- **Depends on:** ADR-0001 … 0008, ADR-0009
+- **Class:** Module-level
+- **Source material:** `docs/research/nav-and-billingo.md` (Billingo
+  section)
+- **Related:**
+  - ADR-0002 (tenant isolation: DB-per-tenant) — Billingo data
+    lands in the destination tenant's database only.
+  - ADR-0005 (prefixed ULIDs) — every ingested entity gets an ABERP
+    ULID at import time; the Billingo identifier is recorded as a
+    separate field, not adopted as identity.
+  - ADR-0007 (security baseline) — keychain rules, TLS posture for
+    non-pinned counterparties, audit logging, secrets lifecycle.
+  - ADR-0008 (audit ledger) — every migration step appends to the
+    ledger; the ledger is the audit-evidence floor for the
+    migration.
+  - ADR-0009 (NAV invoice issuing) — migrated invoices are NOT
+    resubmitted to NAV. ADR-0009's issuance path is for invoices
+    ABERP originates after migration.
+  - ADR-0019 (storage strategy) — no foreign keys; the
+    Billingo-to-ABERP mapping is its own table, not a FK column on
+    `invoice`.
+  - ADR-0020 (NAV transport correction) — bounds the credential
+    model for the NAV side; this ADR inherits the corrected
+    posture for the deferred NAV read path.
+  - ADR-0021 (pre-code consolidated baseline) — pins the HTTP
+    client (`reqwest` + `rustls-tls`) used by the migration
+    fetcher.
 
-## Scope
+## Context
 
-Pull invoices and related entities (customers, contacts) from Billingo
-and from NAV into the local DuckDB store. Two purposes, with very
-different design weight:
+ABERP needs a way to bring a switching customer's existing invoice
+and customer data into a fresh ABERP tenant. The decided framing
+(Ervin, 2026-05-19; recorded in project memory) is:
 
-1. **Billingo as migration source (primary).** Ervin's framing: Billingo
-   is *not a permanent integration*. It is a one-time bulk-import path
-   so existing clients and historical invoices do not have to be
-   re-entered manually, plus a client-acquisition convenience for
-   prospects already on Billingo who want to switch to ABERP. After
-   migration, ABERP's own native setup is authoritative; Billingo is
-   no longer in the loop for that tenant. Design accordingly — do
-   **not** over-engineer ongoing two-way sync.
-2. **NAV ingestion (secondary).** Pull historical and ongoing submitted
-   invoices from NAV's Online Számla read API for audit, dispute, and
-   reconciliation. NAV remains authoritative for the submission state
-   of invoices it has acknowledged.
+- Billingo is **not** a permanent integration. It is a one-time
+  migration source so prospects already on Billingo can switch to
+  ABERP without re-entering customer lists or historical invoices,
+  and a client-acquisition convenience for those prospects.
+- After migration, ABERP's own native customer/invoice setup is
+  authoritative for that tenant. Billingo is no longer in the loop.
+- There is **no** two-way sync, no ongoing pull, no write path back
+  to Billingo, and no permanent credential-storage commitment.
 
-The DuckDB store for ingested invoices is a **cache and projection**,
-not the source of truth: NAV is authoritative for its acknowledged
-invoices, Billingo is authoritative for what Billingo holds *during
-migration only*, ABERP becomes authoritative for invoices it issues
-itself (ADR-0009).
+The Billingo API surface is well understood from the research file:
+v3 API, `X-API-KEY` header auth, paginated `/partners` and
+`/documents` endpoints, async bulk export via `/document-exports`.
+Rate limits are not publicly documented for v3 (research file
+[OPEN]); ABERP paces conservatively at ≤1 req/sec until Billingo
+support confirms a higher ceiling.
 
-Decisions to be made:
+The NAV read path (historical and ongoing submitted invoices via
+`queryInvoiceData`, `queryInvoiceDigest`,
+`queryInvoiceChainDigest`) is in the same module by scope but is
+**not decided in this ADR**. See §"Deferred to build phase" for
+the named trigger.
 
-- The polling vs webhook model for each source.
-- How we detect and surface **divergence** between ABERP-issued and
-  NAV-acknowledged states (the loud-failure principle).
-- How we ingest historical invoices and bind them to internal entities
-  (customers, products) without inventing identity.
-- Whether ingested invoices have a different ULID prefix or share `inv_`
-  (likely share, with a `source` field).
-- Replay safety: ingestion is idempotent on (source, source_id).
+## Decision
+
+### 1. Billingo authentication and credential lifecycle
+
+- **API-key auth via the `X-API-KEY` header.** Per Billingo v3.
+  No OAuth flow; no Bearer prefix required (allowed but not
+  needed). The key is generated by the customer in their Billingo
+  dashboard and handed to the migration operator.
+- **OS keychain storage, per tenant, single entry:**
+  `billingo.api_key`. Held in the same keychain ABERP already uses
+  for other tenant credentials per ADR-0007 §Secrets.
+- **Lifecycle is migration-bounded.** The keychain entry is
+  written when the operator initiates a Billingo migration for
+  the tenant; it is **erased** when the migration is marked
+  complete (operator action, recorded in the audit ledger), or
+  after a configurable timeout (default 30 days) of inactivity on
+  the migration job. ABERP does not store the key longer than the
+  migration's working lifetime.
+- **In-memory handling.** The key is loaded at the start of each
+  migration batch, used for the HTTP requests in that batch, and
+  zeroized on drop per ADR-0007 §Secrets.
+
+### 2. Transport posture toward Billingo
+
+- **HTTPS to `https://api.billingo.hu/v3`** via `reqwest` with the
+  `rustls-tls` feature, using **the platform trust store** via
+  `rustls-native-certs`. Strict hostname verification enforced.
+- **No issuing-root pinning for Billingo.** Rationale: Billingo
+  uses a mainstream commercial CA chain; root pinning would carry
+  the same operational cost as the NAV pin (root rotations require
+  an ABERP release) for materially less benefit (Billingo is a
+  one-time, short-lived integration per tenant). The NAV pin
+  posture from ADR-0020 §1 does **not** transfer to Billingo.
+- **Response-body integrity is TLS-only.** No application-level
+  body signing is on offer from Billingo; ABERP's mitigation is
+  the audit-ledger capture of the verbatim response per §6.
+
+### 3. Read-only scope
+
+The migration fetcher accesses exactly these Billingo endpoints,
+in this order:
+
+1. `GET /partners` (paginated) — customer list.
+2. `GET /documents` (paginated, filtered) — invoice index.
+3. `GET /documents/{id}` (per-document) — full invoice with line
+   items and VAT breakdown.
+
+Optionally, when the operator chooses bulk mode:
+
+4. `POST /document-exports` + `GET /document-exports/{id}` + the
+   download endpoint — async bulk archive. Used as a **belt-and-
+   braces** capture next to per-document GETs; structured-data
+   fidelity of the bulk archive is [OPEN] in the research file,
+   so per-document GET is the authoritative ingest path.
+
+**No write paths to Billingo are called.** No `POST`, `PUT`,
+`PATCH`, `DELETE` against any Billingo endpoint. The ABERP
+binary's Billingo HTTP client is constructed with a guard that
+rejects non-GET / non-POST-to-`/document-exports` calls at
+construction; a unit test enforces the guard.
+
+### 4. One-time migration semantics
+
+- Imported entities are written to the destination tenant's
+  ABERP database with:
+  - A fresh ABERP ULID per ADR-0005 (`cust_…` for customers,
+    `inv_…` for invoices, etc.).
+  - A `migration_source = "billingo"` tag.
+  - A `migration_external_id` field carrying the Billingo
+    record's primary key (e.g., the Billingo `partner.id` or
+    `document.id`).
+- The mapping from Billingo external IDs to ABERP ULIDs lives in
+  a **per-tenant `migration_map` table**, not as a foreign key on
+  the entity tables (ADR-0019 — no foreign keys). The map is the
+  resolution structure used when reconciling line-item references
+  during the invoice pass.
+- **Migrated invoices are read-only in ABERP after import.** They
+  cannot be edited; any correction is issued as a fresh ABERP
+  invoice with `<invoiceReference>` to the migrated source, per
+  ADR-0009. The audit ledger entry for the migration is the
+  authoritative event for "this invoice arrived from Billingo on
+  this date with this content."
+- **No resubmission to NAV.** Billingo already submitted these
+  invoices to NAV at the time they were issued. ABERP does not
+  resubmit during migration. Verification that NAV holds the
+  invoice is by `queryInvoiceCheck` against NAV — that
+  reconciliation is the deferred NAV read path (§"Deferred to
+  build phase") and is **not blocking** for the basic migration
+  flow. The basic flow trusts Billingo's record of submission and
+  flags any reconciliation gap when the NAV-read-path adapter
+  later ships.
+
+### 5. Customer deduplication
+
+- The migration runs the customers pass before the invoices pass,
+  so invoice references resolve via the `migration_map`.
+- **Probable duplicates are surfaced to the operator, never
+  silently merged.** Match heuristic (initial; refinable in the
+  build-phase migration UI): tax number exact match → name +
+  postal-code fuzzy match → email-domain match. A match score
+  above a threshold flags a candidate; the operator confirms or
+  rejects each.
+- The operator's confirm/reject decision is itself an audit-
+  ledger event. A merged customer carries both Billingo external
+  IDs in the `migration_map` (one ABERP ULID → many external
+  IDs is permitted; the inverse is not).
+- **No silent merge ever.** A customer record that the operator
+  did not explicitly confirm is imported as a fresh ABERP entity;
+  the audit ledger entry names this as the operator's default
+  choice if they took no action.
+
+### 6. Failure mode, idempotency, restartability
+
+- A Billingo API failure during migration **does not block ABERP's
+  normal operation**. The migration runs as a separate operator
+  workflow against the destination tenant's database; the rest of
+  ABERP (invoice issuance per ADR-0009, etc.) is unaffected.
+- **Idempotency**: each migrated entity is keyed by
+  `(migration_source, migration_external_id)`. A second migration
+  run that re-fetches the same Billingo `partner.id` is a no-op;
+  the ABERP record is found via the `migration_map` and skipped.
+- **Restartability**: the migration job persists its **pagination
+  cursor** (the `page` / `per_page` for `/partners` and
+  `/documents`; the export ID for `/document-exports`) in the
+  audit ledger and in a per-job state row. On Billingo API
+  failure, the operator restarts; the job resumes from the last
+  acknowledged page. The page boundary is the checkpoint.
+- **Verbatim capture**: every Billingo HTTP response body that
+  contributes a record to ABERP is captured in the audit ledger
+  per ADR-0008. This is the integrity-by-evidence path that
+  substitutes for the absent application-level body signing
+  (§2).
+- **Rate-limit pacing**: ≤1 req/sec to Billingo until support
+  confirms otherwise. The pacing is centralized in the migration
+  HTTP client, not at the call sites.
+
+### 7. The "done with Billingo" signal
+
+- **Explicit operator action.** The operator marks the migration
+  complete via a UI control once they have verified the imported
+  data matches expectations. The audit ledger records the
+  completion event with the operator's identity, the count of
+  imported entities, and the hash of the final
+  `migration_map` snapshot.
+- On completion, the `billingo.api_key` keychain entry is erased.
+  Subsequent operations against Billingo for that tenant require
+  re-entering the key, which is itself an audit event.
+- **The first ABERP-issued invoice is NOT the trigger.** Mixing
+  Billingo-imported and ABERP-issued invoices for the same tenant
+  during a transition window is supported; the completion is the
+  operator's call, not an automatic threshold.
+
+### 8. PII and privacy
+
+- The imported customer records carry PII that ABERP did not
+  originate. They are subject to the same retention and erasure
+  rules as ABERP-originated customer data, governed by the
+  deferred GDPR erasure-workflow ADR (ADR-0002 §Deferred items,
+  also called out in ADR-0021 §Items deferred to build phase).
+- The migration ledger entries are part of the audit ledger
+  (ADR-0008) and are not erased by a downstream GDPR-forget
+  operation against an individual customer; the redaction
+  pattern for the audit ledger is the GDPR ADR's concern, not
+  this one.
+
+## Consequences
+
+**What gets easier**
+
+- Onboarding a Billingo customer is a bounded, scriptable
+  workflow with a clear start and end. No long-running sync
+  process to operate.
+- The audit ledger has the verbatim Billingo responses for every
+  imported invoice; if a discrepancy surfaces months later, the
+  source-of-record reconstruction is possible.
+- Cross-module impact is minimal: the `migration_map` is the
+  only new persistent structure; the `invoice` and `customer`
+  tables gain two columns (`migration_source`,
+  `migration_external_id`) that default to NULL for ABERP-
+  originated rows.
+
+**What gets harder**
+
+- The reconciliation gap with NAV is acknowledged but not closed
+  here. A migration completed without a NAV-side `queryInvoiceCheck`
+  pass means ABERP trusts Billingo's record of submission. The
+  trust window closes when the deferred NAV read path ships.
+- The customer-dedup UI surface is a real piece of operator-
+  facing work that ADR-0010 does not size. The decisions here
+  bind the **semantics** (no silent merge; operator confirms);
+  the UI weight is build-phase work.
+
+**What we lock ourselves into**
+
+- The `migration_source` + `migration_external_id` columns as the
+  canonical provenance markers. Any future ingestion source
+  (e.g., a different incumbent SaaS billing tool a prospect might
+  use) reuses the same two-column pattern.
+- The "no silent merge" stance on customer dedup. A future ADR
+  that proposes auto-merge for high-confidence matches must
+  supersede §5 explicitly.
+
+## Adversarial review
+
+Module-level. Bar is ≥3 concerns answered or accepted.
+
+- *"You assume Billingo's record of NAV submission is correct.
+  If Billingo's archive misreports that an invoice was submitted
+  when it was not (or was annulled), ABERP imports a phantom and
+  the tenant's NAV state diverges from ABERP's state without
+  surfacing."* — Real risk. Two mitigations: (a) the audit
+  ledger captures the verbatim Billingo response for every
+  imported invoice, so a later reconciliation can detect
+  divergence after the fact; (b) the deferred NAV read path,
+  when shipped, runs a one-shot `queryInvoiceCheck` /
+  `queryInvoiceData` reconciliation pass against the migrated
+  set, surfacing any discrepancy as an operator-facing audit
+  finding. The acknowledged gap is the trust window between
+  migration completion and the NAV-read-path adapter shipping;
+  the tenant carries that window deliberately because Billingo
+  has been NAV-submitting these invoices on the tenant's behalf
+  during the period covered. The alternative — blocking
+  migration on a NAV-side confirmation we do not yet have a code
+  path for — would force this ADR to either include the NAV read
+  path (scope blowup) or block migration entirely. Accepted with
+  the gap named.
+
+- *"Pacing at ≤1 req/sec against an undocumented rate limit is a
+  guess. A long-lived customer is thousands of invoices; the
+  migration becomes a multi-hour batch that the operator walks
+  away from, and a partial-failure recovery is more likely than
+  not."* — Correct. The restartability decision in §6 is
+  designed for exactly this case: the page boundary is the
+  checkpoint, the cursor is persisted, the operator restarts
+  from where the failure landed. The operator-facing UI must
+  show progress and survive an operator-walks-away; that UI is
+  build-phase work and is explicitly named in `docs/research/nav-
+  and-billingo.md` §"One-time-migration quirks". The pacing
+  ceiling itself is open question #14 in the research file
+  against Billingo support. Accepted with the build-phase
+  follow-up.
+
+- *"§5 says probable duplicates are surfaced 'to the operator.'
+  Which operator? When? Through what UI? The decision binds a
+  workflow that does not exist yet."* — Acknowledged. The
+  decision binds the **semantics** of the dedup step — no
+  silent merge, operator confirms, audit ledger records each
+  decision — not the UI. The UI weight is build-phase work in
+  the migration adapter and the Tauri/Svelte shell. The
+  semantics binding is what this ADR is for: it forecloses the
+  failure mode where a future PR ships auto-merge under
+  efficiency pressure. The first migration UI PR is the trigger
+  for the UI design; this ADR is what that PR cannot violate.
+  Accepted.
+
+- *"The keychain entry has a 30-day idle timeout, but a real
+  migration could legitimately run longer than 30 days if the
+  customer has a large archive and operator availability is
+  intermittent. The timeout will fire mid-migration and burn the
+  operator."* — Real ergonomic risk. The timeout is **default
+  30 days**; the migration job tracks last-activity timestamp
+  on every page boundary, so an actively running multi-week
+  migration does not idle out. The timeout fires only on no
+  activity for the configured window, and the configuration is
+  per-tenant. The operator-facing UI surfaces the remaining
+  window. If the build-phase work shows the 30-day default is
+  wrong, the default changes; the keychain-lifecycle binding
+  here is that the credential is migration-bounded, not that the
+  bound is exactly 30 days. Accepted.
+
+## Alternatives considered
+
+- **Permanent two-way Billingo sync.** Rejected by project
+  framing. Billingo is one-time per Ervin's 2026-05-19 framing
+  recorded in project memory. Designing for two-way sync is
+  speculative abstraction (CLAUDE.md rule 2).
+- **Single-pass migration with bulk export only
+  (`/document-exports`).** Rejected as the authoritative ingest
+  path because bulk-export structured-data fidelity is [OPEN]
+  in the research file; the bulk archive may be PDF-centric and
+  miss machine-readable line-item detail. Per-document GET is
+  the authoritative path; bulk export is the optional second
+  capture.
+- **Pin a Billingo issuing root in ABERP's trust store.**
+  Rejected — see §2. The NAV pin is justified by ABERP being a
+  tax-submission counterparty under a legacy-regulator constraint;
+  Billingo is a short-lived migration counterparty under no
+  comparable threat model. Operational cost of pinning would
+  exceed benefit.
+- **Auto-merge customers with high-confidence matches.** Rejected
+  — see §5. Silent merge is the failure mode this ADR
+  forecloses; the audit-evidence floor (ADR-0008) requires the
+  operator's decision to be a recorded event.
+- **Resubmit migrated invoices to NAV.** Rejected. Billingo has
+  already submitted these to NAV; resubmission would generate
+  `INVOICE_NUMBER_NOT_UNIQUE` (per the research file's NAV error
+  taxonomy) and pollute the tenant's NAV transaction log with
+  rejected requests.
+
+## Deferred to build phase
+
+The following items are in the same module scope but are not
+decided here. Filed as just-in-time ADRs when the relevant code PR
+lands.
+
+- **NAV historical / reconciliation read path** (`queryInvoiceData`,
+  `queryInvoiceDigest`, `queryInvoiceChainDigest`,
+  `queryTransactionList` for audit and reconciliation purposes).
+  Trigger: first PR that wires a Billingo-migration completion
+  pass against NAV, or the first PR that adds a "NAV-side audit
+  view" for the tenant. Inherits the credential model and TLS
+  posture from ADR-0009 + ADR-0020.
+- **Operator-facing migration UI** (progress, dedup confirmation,
+  completion control). Trigger: first PR adding the
+  Svelte/Tauri migration surface.
+- **Bulk-export fidelity check.** Trigger: first PR that uses
+  `/document-exports` as anything other than a backup capture.
+  Resolves the research-file [OPEN] on bulk-archive
+  structured-data fidelity.
+- **GDPR erasure intersection with the audit ledger.** Trigger:
+  the GDPR erasure-workflow ADR (deferred from ADR-0002 and
+  named in ADR-0021 §Items deferred). The audit-ledger
+  redaction pattern for migrated PII is decided there.
 
 ## Open questions
 
-- **Billingo:** does the migration import customers only, invoices only,
-  or both? Recommendation: both, in two passes (customers first so
-  invoice references resolve).
-- **Billingo:** what is the "done with Billingo" signal — explicit
-  operator action, or automatic after first ABERP-issued invoice?
-- **NAV read path:** continuous polling or operator-triggered fetch
-  during early phase? Recommendation: scheduled + manual trigger.
-- How long to retain ingested raw blobs vs parsed projections.
-- Privacy/PII implications of pulling customer data we did not originate.
-
-## Not in scope
-
-- Issuing invoices (ADR-0009).
-- Payment reconciliation (separate ADR, not yet filed).
+- **Billingo v3 rate limits.** Research-file open question #14;
+  resolution by direct contact with Billingo support before the
+  first real migration runs.
+- **Bulk-export structured-data fidelity.** Research-file open
+  question #16; resolution at the trigger above.
+- **Billingo `include_deleted` parameter (or equivalent).**
+  Research-file open question #15. If Billingo silently drops
+  soft-deleted partners and documents from the v3 export
+  endpoints, ABERP cannot complete a faithful migration without
+  an alternative path. Resolution: same contact-Billingo
+  workflow as the rate-limit question.
+- **NAV `transactionId` exposure in Billingo records.**
+  Research-file open question #18. If Billingo exposes the
+  per-invoice `transactionId` it received from NAV, the
+  deferred NAV reconciliation pass is materially cheaper (no
+  lookup-by-invoice-number step); if not, the reconciliation
+  pass uses `(invoiceNumber, supplier tax_number)`.
+- **Default keychain-credential idle timeout.** Currently 30
+  days. Calibrated in the build-phase work; rebound here if
+  operator feedback shows the default is wrong.

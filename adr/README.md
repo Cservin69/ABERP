@@ -77,14 +77,16 @@ Things not decided here that this ADR depends on, with the ADR number that will 
 - [ADR-0004 — Frontend: Tauri + Svelte local, cloud reserved](0004-frontend-tauri-svelte.md)
 - [ADR-0005 — Universal ID scheme: prefixed ULIDs](0005-id-scheme-ulid.md)
 - [ADR-0006 — Module boundaries and contracts](0006-module-boundaries.md)
-- [ADR-0007 — Security baseline and threat model](0007-security-baseline.md)
+- [ADR-0007 — Security baseline and threat model](0007-security-baseline.md) — *partially superseded by ADR-0020 (NAV-specific clauses only)*
 - [ADR-0008 — Tamper-evident audit ledger](0008-audit-ledger.md)
 - [ADR-0019 — Storage strategy: one trait, relational SoT, search-first projections, no foreign keys](0019-storage-strategy-no-fks.md) — *replaces 0003 and 0018*
+- [ADR-0020 — NAV transport and credential posture correction](0020-nav-transport-credential-correction.md) — *partially supersedes 0007 (NAV clauses only)*
+- [ADR-0021 — Pre-code consolidated baseline (stack + wire protocol)](0021-pre-code-consolidated-baseline.md)
 
 ### Module-level (stubs — to be filled in)
 
-- [ADR-0009 — NAV invoice issuing](0009-nav-invoice-issuing.md) — *stub*
-- [ADR-0010 — Billingo + NAV invoice ingestion (read path)](0010-invoice-ingestion.md) — *stub*
+- [ADR-0009 — NAV invoice issuing](0009-nav-invoice-issuing.md)
+- [ADR-0010 — Billingo + NAV invoice ingestion (read path)](0010-invoice-ingestion.md) — *Billingo migration Accepted; NAV historical read path deferred to build phase*
 - [ADR-0011 — Inventory model](0011-inventory-model.md) — *stub*
 - [ADR-0012 — QR / vignette labels and no-touch handling](0012-qr-labels-no-touch.md) — *stub*
 - [ADR-0013 — Robotics handoff (label print + place)](0013-robotics-handoff.md) — *stub*
@@ -99,10 +101,14 @@ Things not decided here that this ADR depends on, with the ADR number that will 
 
 ### Deferred (not yet filed — tracked so they don't fall through)
 
-- ADR — Stack baseline (async runtime, error crate, logging crate, CLI crate). *Required before commit #1; called out in ADR-0001.*
-- ADR — Wire protocol (gRPC vs HTTPS+JSON) for UI ↔ backend. *Required before commit #1; called out in ADR-0004.*
-- ADR — Backup, encryption-at-rest key management, and offsite key escrow. *Called out in ADR-0007.*
-- ADR — Data retention and GDPR erasure workflow. *Called out in ADR-0002.*
-- ADR — LLM use policy (which paths use models, which providers, supply chain). *Called out in ADR-0007.*
-- ADR — Specific font family selection (Hungarian diacritic coverage). *Called out in ADR-0017.*
-- ADR — Print rendering path (browser print vs Rust-side PDF). *Called out in ADR-0017.*
+The remaining items below are **deferred to build phase per ADR-0021 §Items deferred to build phase**. Each is filed as a just-in-time ADR when the named trigger fires; soft assertion in advance is forbidden (CLAUDE.md rule 12).
+
+- ADR — Backup, encryption-at-rest key management, and offsite key escrow. *Called out in ADR-0007. Trigger: first PR that writes the encrypted backup path.*
+- ADR — Data retention and GDPR erasure workflow. *Called out in ADR-0002. Trigger: first PR that wires a `forget-tenant` or `erase-customer` workflow.*
+- ADR — LLM use policy (which paths use models, which providers, supply chain). *Called out in ADR-0007. Trigger: first PR that adds an LLM-using code path.*
+- ADR — Specific font family selection (Hungarian diacritic coverage). *Called out in ADR-0017. Trigger: first PR that produces a printed invoice.*
+- ADR — Print rendering path (browser print vs Rust-side PDF). *Called out in ADR-0017. Trigger: same as font ADR; either fills in or is filed alongside.*
+- ADR — NAV historical / reconciliation read path (`queryInvoiceData`, `queryInvoiceDigest`, `queryInvoiceChainDigest`, `queryTransactionList`). *Called out in ADR-0010 §Deferred. Trigger: first PR wiring a NAV-side reconciliation pass against migrated invoices, or the first NAV-audit operator view.*
+- ADR — XSD runtime validation crate choice (libxml FFI vs hand-rolled invariant check vs pure-Rust validator). *Called out in ADR-0021. Trigger: first PR implementing schema-drift detection per ADR-0009 §1.*
+- ADR — Attestation signing-key type for ADR-0008 external attestation checkpoints. *Surfaced in the first full-spine adversarial review (F5). Trigger: first PR that exercises attestation cadence (long-running process, integration test crossing the cadence threshold, or cloud attestation publishing per ADR-0016). Recommendation when filed: Ed25519.*
+- ADR — OS-keychain Rust binding crate for ADR-0007 §Secrets. *Surfaced in the first full-spine adversarial review (F6). Trigger: first PR that loads keychain-bound material in production code. Likely pick: `keyring`.*
