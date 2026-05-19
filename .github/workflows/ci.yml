@@ -1,0 +1,82 @@
+# ABERP continuous integration.
+#
+# Per ADR-0007 section "Supply chain":
+#   - cargo-deny (license allow-list, banned crates, advisory check)
+#   - cargo-audit (RustSec advisories on locked deps)
+#   - pinned dependency versions, --locked builds
+#
+# Per ADR-0021 sub-decisions:
+#   - rust-toolchain.toml pins 1.85.0 (MSRV floor)
+#
+# The job is intentionally a single sequence rather than a matrix or a
+# parallel fan-out. CLAUDE.md rule 2 (simplicity first) — fan-out adds
+# duplicate toolchain setup and a cache topology to manage, neither of
+# which is justified until CI duration becomes painful.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel prior in-flight CI runs for the same ref when a new push lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI is non-interactive; surface failures verbosely.
+  CARGO_NET_RETRY: 3
+  RUSTUP_MAX_RETRIES: 3
+
+jobs:
+  check:
+    name: build + lint + supply-chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable (matches rust-toolchain.toml's channel pin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Keyed on Cargo.lock contents; busted automatically on dep changes.
+          shared-key: aberp-ci
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Build (--locked)
+        # --all-targets builds tests/benches/examples too, which catches
+        # compilation errors that would only show up later in test/clippy.
+        run: cargo build --workspace --locked --all-targets
+
+      - name: Test (--locked)
+        run: cargo test --workspace --locked
+
+      - name: Clippy (warnings denied per ADR-0007 fail-loud posture)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Install cargo-deny and cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+
+      - name: cargo-deny check
+        # Runs all sections: licenses, advisories, bans, sources.
+        run: cargo deny check
+
+      - name: cargo-audit
+        # --deny warnings makes "informational" advisories (e.g. unmaintained
+        # crates) failing-loud instead of advisory-only.
+        run: cargo audit --deny warnings

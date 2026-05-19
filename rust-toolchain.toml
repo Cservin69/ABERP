@@ -1,10 +1,19 @@
-# Pinned per ADR-0001 ("toolchain version pinned in rust-toolchain.toml")
-# and ADR-0021 sub-decisions (MSRV >= 1.85, edition 2021).
+# Pinned per ADR-0001 ("stable channel, with the toolchain version pinned
+# in rust-toolchain.toml") and ADR-0021 §Sub-decisions.
 #
-# 1.85.0 is the MSRV floor. Bumps go through the fortnightly adversarial
-# review cadence per adr/README.md.
+# Pin the CHANNEL, not an exact version. This makes the repo maintainable
+# across years: a contributor cloning ABERP in 2027 builds with whatever
+# stable rustup has at that moment, not with an old toolchain we forced
+# them to install. The MSRV floor for our own code lives in each
+# Cargo.toml's `rust-version` field; transitive deps enforce their own
+# MSRVs at build time. Reproducibility comes from Cargo.lock (ADR-0007
+# §Supply chain), which is the load-bearing pin.
+#
+# If a future build must be bit-reproducible (release engineering),
+# re-introduce a temporary exact-version pin in a branch dedicated to
+# that build — not on main.
 
 [toolchain]
-channel = "1.85.0"
+channel = "stable"
 components = ["rustfmt", "clippy"]
 profile = "default"

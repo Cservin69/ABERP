@@ -1,0 +1,83 @@
+# cargo-deny configuration per ADR-0007 section "Supply chain".
+#
+# License allow-list, advisory checks against RustSec, ban + source policy.
+# Run locally before opening a PR:
+#
+#   cargo deny check
+#
+# CI runs this on every push and pull request via .github/workflows/ci.yml.
+#
+# Exceptions are added per-crate with a comment naming the crate and the
+# reason. Soft-asserting "we'll allow this whole license class because it's
+# everywhere" is exactly the failure mode CLAUDE.md rule 12 names.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ─────────────────────────────────────────────────────────────────────
+# Advisories — RustSec advisory database. cargo-audit covers the same
+# database from a different angle; running both is intentional per the
+# session-5 handoff and ADR-0007 "cargo-deny and cargo-audit in CI".
+# ─────────────────────────────────────────────────────────────────────
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = []
+
+# ─────────────────────────────────────────────────────────────────────
+# Licenses — ADR-0007 names MIT, Apache-2.0, BSD-3-Clause, MPL-2.0.
+# Apache-2.0 WITH LLVM-exception is the SPDX variant used by several
+# RustCrypto crates; same Apache-2.0 terms with an extended patent grant.
+# Anything else requires a per-crate exception entry with a comment.
+# ─────────────────────────────────────────────────────────────────────
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "MPL-2.0",
+]
+confidence-threshold = 0.93
+exceptions = []
+
+# ABERP's own license is PolyForm-Noncommercial-1.0.0 (see LICENSE).
+# Workspace members carry `publish = false` and reference the license via
+# license-file, so the scanner does not classify the workspace crates'
+# license string. If that changes, add a [[licenses.clarify]] entry
+# scoped to the workspace package names.
+
+# ─────────────────────────────────────────────────────────────────────
+# Bans — duplicate-version is warn-only because transitive deps often
+# pull in multiple versions of common crates (e.g. windows-sys, syn).
+# Wildcards are denied because Cargo.toml never uses them; this enforces
+# that intentionally.
+# ─────────────────────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+# ─────────────────────────────────────────────────────────────────────
+# Sources — only crates.io is permitted. Git dependencies require
+# explicit allow entries with a comment justifying the source. ADR-0007
+# §Supply chain ("pinned dependency versions") is materially weaker if
+# arbitrary git URLs are accepted.
+# ─────────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
