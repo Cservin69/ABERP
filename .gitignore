@@ -1,0 +1,86 @@
+# ─────────────────────────────────────────────────────────────
+# ABERP .gitignore
+# Notes:
+#   - Cargo.lock IS committed (ADR-0007: pinned dependency versions,
+#     reproducible builds, --locked CI builds). Do not add it here.
+#   - Tenant data files, secrets, and audit mirrors must never be
+#     committed. They are listed below explicitly.
+# ─────────────────────────────────────────────────────────────
+
+# --- Rust ---------------------------------------------------
+/target
+**/target/
+**/*.rs.bk
+*.pdb
+
+# --- Node / Svelte / Tauri frontend -------------------------
+node_modules/
+dist/
+build/
+.svelte-kit/
+.vite/
+.turbo/
+*.tsbuildinfo
+
+# Tauri build output
+src-tauri/target/
+src-tauri/gen/
+
+# --- ABERP runtime data (NEVER commit) ----------------------
+# Per-tenant DuckDB files and their audit-ledger mirrors.
+*.duckdb
+*.duckdb.wal
+*.duckdb-wal
+*.audit.log
+/data/
+/tenants/
+/var/
+
+# --- Secrets (NEVER commit) ---------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+.secrets/
+secrets/
+
+# --- OS noise -----------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+desktop.ini
+*~
+.directory
+
+# --- Editor / IDE -------------------------------------------
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.shared.json
+.zed/
+*.swp
+*.swo
+*.code-workspace
+
+# --- Logs (local dev) ---------------------------------------
+*.log
+logs/
+
+# --- Test / coverage ----------------------------------------
+coverage/
+.nyc_output/
+.lcov
+
+# --- Misc ---------------------------------------------------
+.cache/
+.tmp/
+tmp/
+*.bak
+*.orig
+CLAUDE.md
