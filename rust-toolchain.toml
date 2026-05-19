@@ -1,0 +1,10 @@
+# Pinned per ADR-0001 ("toolchain version pinned in rust-toolchain.toml")
+# and ADR-0021 sub-decisions (MSRV >= 1.85, edition 2021).
+#
+# 1.85.0 is the MSRV floor. Bumps go through the fortnightly adversarial
+# review cadence per adr/README.md.
+
+[toolchain]
+channel = "1.85.0"
+components = ["rustfmt", "clippy"]
+profile = "default"

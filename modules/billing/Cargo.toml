@@ -1,0 +1,15 @@
+[package]
+name = "aberp-billing"
+description = "Billing module — NAV invoice issuing (ADR-0009)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Dependencies land in PR-4 (billing module scaffold) and PR-5 (the binary
+# wiring). This Cargo.toml currently declares the package shell only so the
+# workspace compiles cleanly under `cargo build --workspace --locked`.
+[dependencies]

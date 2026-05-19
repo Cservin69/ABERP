@@ -1,0 +1,83 @@
+# ABERP workspace.
+#
+# Members:
+#   crates/audit-ledger    - tamper-evident hash-chained audit ledger (ADR-0008).
+#   modules/billing        - NAV invoice issuing module (ADR-0009).
+#   apps/aberp             - the CLI binary that wires modules together.
+#
+# Dependency pins below come from ADR-0021 (pre-code consolidated baseline).
+# Cargo.lock is the load-bearing artifact per ADR-0007 section "Supply chain";
+# the version lines here are the floor, Cargo.lock is the exact pin.
+#
+# Only crates exercised by PRs 1..5 of session 5 appear here. Crates pinned
+# by ADR-0021 but not yet used (reqwest, axum, axum-server, rcgen, sha3,
+# aes, zeroize) are added to this catalogue when the first PR that uses
+# them lands. This matches CLAUDE.md rule 2 (simplicity first) without
+# losing the pins, which remain authoritative in ADR-0021 Part A.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/audit-ledger",
+    "modules/billing",
+    "apps/aberp",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license-file = "LICENSE"
+repository = "https://github.com/Cservin69/ABERP"
+authors = ["Ervin Aben <ervin@aben.ch>"]
+publish = false
+
+[workspace.dependencies]
+# Async runtime — ADR-0021 Part A, item 1.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "time", "sync", "signal"] }
+
+# Error crates — ADR-0021 Part A, item 2.
+# thiserror for library crates (crates/, modules/), anyhow for the binary boundary only.
+thiserror = "1"
+anyhow = "1"
+
+# Logging / tracing — ADR-0021 Part A, item 3.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "registry"] }
+
+# CLI — ADR-0021 Part A, item 4.
+clap = { version = "4.6", features = ["derive"] }
+
+# Serde + JSON — ADR-0021 Part A, item 7.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# XML / SOAP — ADR-0021 Part A, item 8.
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+# Cryptography — ADR-0021 Part A, item 9.
+# Only sha2 is exercised in commit #1 (audit-ledger entry_hash).
+# sha3, aes, zeroize join the catalogue when the NAV-submission PR lands.
+sha2 = "0.10"
+
+# Embedded database driver, bundled per ADR-0021 Part A, item 10 (closes F1).
+duckdb = { version = "1", features = ["bundled"] }
+
+# Date / time — ADR-0021 Part A, item 11 (closes F2).
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde", "serde-well-known"] }
+
+# Canonical CBOR encoding for the audit-ledger hash chain — ADR-0021 Part A,
+# item 12 (closes F3). The encoder lives in ONE place inside aberp-audit-ledger.
+ciborium = "0.2"
+
+# ULID generation — ADR-0021 Part A, item 13 (closes F4), per ADR-0005.
+ulid = "1"
+
+[profile.release]
+# Reproducible builds posture per ADR-0007 section "Supply chain".
+# Strip is off so the binary hash recorded by ADR-0008 corresponds to a
+# binary whose symbols are still inspectable post-mortem.
+strip = false
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"

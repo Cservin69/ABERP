@@ -1,0 +1,19 @@
+[package]
+name = "aberp"
+description = "ABERP binary — modular multi-tenant ERP backend."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aberp"
+path = "src/main.rs"
+
+# clap lands when the binary grows a real CLI surface in PR-5
+# (`aberp issue-invoice --in fixture.json --out fixture.xml`).
+# PR-1's main.rs only prints the version, so no dependencies yet.
+[dependencies]

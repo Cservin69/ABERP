@@ -1,0 +1,15 @@
+[package]
+name = "aberp-audit-ledger"
+description = "Tamper-evident hash-chained append-only audit ledger (ADR-0008)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Dependencies land in PR-3 (the audit-ledger crate scaffold).
+# This Cargo.toml currently declares the package shell only so the
+# workspace compiles cleanly under `cargo build --workspace --locked`.
+[dependencies]
