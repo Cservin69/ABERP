@@ -36,13 +36,28 @@ fn fresh_ledger() -> Ledger {
     Ledger::open_in_memory(tenant(), TEST_BINARY_HASH).expect("open in-memory ledger")
 }
 
+/// Local fixture replacing the old `Actor::test_only()` call site. Cargo
+/// does not propagate the lib's `test-support` feature into its own
+/// integration tests (no self-dependency mechanism), so PR-7-A's
+/// feature-gating of `Actor::test_only` would otherwise break this file.
+/// `Actor`'s fields are `pub`, which makes direct construction the
+/// surgical fix (CLAUDE.md rule 3) — and keeps the F15 invariant intact:
+/// `Actor::test_only` is unreachable from any production code path.
+fn test_actor() -> Actor {
+    Actor {
+        session_id: "test-session".to_string(),
+        user_id: "test-user".to_string(),
+        capabilities: ["audit.append".to_string()].into_iter().collect(),
+    }
+}
+
 fn append_n(ledger: &mut Ledger, n: u64) {
     for i in 1..=n {
         ledger
             .append(
                 EventKind::Test,
                 format!("payload-{i}").into_bytes(),
-                Actor::test_only(),
+                test_actor(),
                 Some(format!("idem-{i}")),
             )
             .unwrap_or_else(|e| panic!("append {i} failed: {e}"));

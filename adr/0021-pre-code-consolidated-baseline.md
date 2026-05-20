@@ -622,3 +622,144 @@ version drift across patches.
 The §Items deferred to build phase entries are unchanged. The
 ADR's architectural MSRV floor (`MSRV ≥ 1.85`) is unchanged;
 the operational pin is what moved.
+
+## Amendment — 2026-05-20, PR-7-A (§A14 + NAV trust-anchor pins)
+
+PR-7-A wires the first production code path that loads OS-keychain-
+bound material and the first that constructs a TLS client against a
+remote endpoint (NAV's test environment). Two of the build-phase
+items deferred by the 2026-05-19 amendment fire here:
+
+- **F6 — OS-keychain Rust binding crate.** Closes by pinning
+  `keyring`, named §A14 below.
+- **F15 — `Actor::test_only()` in production code path.** Closes
+  by feature-gating `Actor::test_only` (`#[cfg(any(test, feature =
+  "test-support"))]`) and adding `Actor::from_local_cli` as the
+  production constructor, driven by the keychain-loaded technical-
+  user login.
+
+The amendment also concretizes the NAV trust-store posture left
+abstract in ADR-0020 §1 ("the NAV server-certificate issuing root
+is pinned in ABERP's trust store"): which PEMs, what fingerprints,
+how long they're valid, and when the next forced rotation gate
+fires.
+
+### Part A — additional pin §A14 (OS keychain binding)
+
+14. **OS keychain binding — `keyring` crate** (MIT/Apache-2.0
+    dual). Pinned at the current 2.x minor. Used by
+    `crates/nav-transport/src/credentials/keychain.rs` to read
+    the four NAV credential artifacts named in ADR-0009 §4 and
+    ADR-0020 §3 (`technical_user.login`, `technical_user.password`,
+    `xml_sign_key`, `xml_change_key`). The 2.x default feature
+    set ships the macOS Keychain backend, Windows Credential
+    Manager backend, and Linux Secret Service backend
+    transparently — `keyring = "2"` (no explicit feature list)
+    is the right pin. The `keyring` crate itself does not store
+    secrets; it is a thin abstraction over each OS's native
+    secrets API. A future bump to keyring 3.x is its own ADR
+    amendment because 3.x reorganizes platform feature names
+    (`apple-native` / `windows-native` / `linux-native-*`) and
+    that reorganization is operator-tooling-visible. This pin
+    closes fortnightly review finding F6.
+
+### NAV trust-anchor pin set (concretizes ADR-0020 §1)
+
+The "NAV server-certificate issuing root" referenced by ADR-0020 §1
+is, as of PR-7-A, the pair (root, intermediate) below. Both are
+embedded into the ABERP binary via `include_bytes!()` in
+`crates/nav-transport/src/trust.rs`, parsed into `rustls::pki_types::
+CertificateDer` via `rustls-pemfile`, added to a `rustls::RootCertStore`
+that is otherwise EMPTY, and the resulting `rustls::ClientConfig` is
+handed to `reqwest::ClientBuilder::use_preconfigured_tls` so reqwest
+cannot layer additional roots on top.
+
+Surfaced during PR-7-A verify: reqwest 0.13's `add_root_certificate`
+*adds* to its default trust store (which on the `rustls` feature
+transitively includes the Mozilla webpki-roots bundle). The
+load-bearing trust_negation conformance test caught a 200 OK against
+`example.com` under our supposedly-pinned client — proof that the
+default bundle was active. The fix is to own the entire `ClientConfig`
+ourselves, which is also the strongest posture available: reqwest's
+runtime trust state IS our pin set, full stop. The version line on
+`rustls` in the workspace `Cargo.toml` must match reqwest 0.13.x's
+transitive choice (`Cargo.lock` authoritative) — a mismatch silently
+fails the `use_preconfigured_tls` downcast and reqwest reverts to
+its defaults.
+
+Pin set captured 2026-05-20 by `openssl s_client -connect ... -showcerts`
+against both `api.onlineszamla.nav.gov.hu` and `api-test.onlineszamla.nav.gov.hu`
+— the chain is identical across both endpoints.
+
+**Root** — `Microsec e-Szigno Root CA 2009`
+
+- SHA-256:
+  `3C:5F:81:FE:A5:FA:B8:2C:64:BF:A2:EA:EC:AF:CD:E8:E0:77:FC:86:20:A7:CA:E5:37:16:3D:F3:6E:DB:F3:78`
+- Valid: 2009-06-16 → **2029-12-30** (second forced rotation gate)
+- Subject = Issuer (self-signed trust anchor)
+- File: `crates/nav-transport/roots/microsec-eszigno-root-ca-2009.pem`
+
+**Intermediate** — `e-Szigno OV TLS CA 2023`
+
+- SHA-256:
+  `BC:75:DB:1D:F8:8E:0A:11:C1:D4:32:BC:31:CC:F3:36:9C:DF:BB:C4:8B:ED:AC:9A:C4:1F:31:F0:3D:ED:E8:A0`
+- Valid: 2025-02-12 → **2028-02-12** (first forced rotation gate)
+- Issued by the root above
+- File: `crates/nav-transport/roots/e-szigno-ov-tls-ca-2023.pem`
+
+Both are added as trust anchors (`reqwest::Certificate::from_pem` →
+`add_root_certificate`). Either-or chain validation means the leaf
+validates whether reqwest chains `leaf → intermediate` (intermediate-
+as-anchor) or `leaf → intermediate → root` (root-as-anchor). Strict
+hostname verification (`*.onlineszamla.nav.gov.hu`) is enforced on
+top, so even if a non-NAV cert were ever issued under the same
+intermediate, it would be rejected at the hostname check.
+
+**Rationale for pinning both (CLAUDE.md rule 7, ADR-0020 adv-review
+bullet 1).** The tightest pin we can ship without taking on
+disproportionate operational risk. If Microsec rotates the
+intermediate (likely before 2028-02-12), an ABERP release ships
+with an updated intermediate PEM; the root pin keeps a chain valid
+during the rollover window. If Microsec rotates the root, an ABERP
+release ships with both updated. ADR-0020 adv-review bullet 1
+explicitly accepts "release lag during root rotation" over "wrong
+CA accepted."
+
+**Rotation triggers (named, build-update required):**
+
+1. **2028-02-12** — intermediate `e-Szigno OV TLS CA 2023` expires.
+   Microsec will issue a successor before this date; the PR-7-A
+   playbook (`crates/nav-transport/src/trust.rs` header) names the
+   re-extraction and pin-update steps.
+2. **2029-12-30** — root `Microsec e-Szigno Root CA 2009` expires.
+   Microsec will issue a successor root before this date; same
+   playbook applies.
+3. **Out-of-band Microsec compromise notice** — if Microsec
+   discloses a compromise affecting the root or intermediate, ship
+   a release that removes the affected pin within the disclosure
+   window. ADR-0007 §"Incident response" carries the broader
+   playbook; this is the NAV-specific instance.
+
+### Items moved out of "Items deferred to build phase"
+
+The 2026-05-19 amendment listed:
+
+- F5 — attestation signing-key type for ADR-0008. *Unchanged
+  (still deferred; trigger has not fired in PR-7-A).*
+- F6 — OS-keychain Rust binding crate. **Closed by §A14 above.**
+- F7 — ADR-0020 [OPEN] on NAV response-body integrity. *Closed
+  editorially 2026-05-20 (separate commit, `cebb0fb`).*
+
+The 2026-05-20 fortnightly review additionally named:
+
+- F15 — `Actor::test_only()` in production code path. **Closed by
+  the `cfg`-gating in `crates/audit-ledger/src/entry/actor.rs` and
+  the `from_local_cli` constructor introduced in this amendment.**
+
+### What this amendment does NOT touch
+
+ADR-0021 Part B (wire protocol), the §Sub-decisions block
+(`rcgen`, `rustls`, MSRV), and items §A1–§A13 are unchanged.
+Pin updates within their named minor lines are operational per
+the existing §Adversarial-review bullet 2 ("`Cargo.lock` is the
+load-bearing artifact").

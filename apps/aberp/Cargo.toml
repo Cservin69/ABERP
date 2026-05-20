@@ -14,9 +14,13 @@ name = "aberp"
 path = "src/main.rs"
 
 [dependencies]
-# Workspace siblings
+# Workspace siblings — production deps. `aberp-audit-ledger` is included
+# WITHOUT the `test-support` feature; that feature lives only in dev-
+# dependencies (below) so the production binary cannot reach
+# `Actor::test_only`. Closes fortnightly review F15.
 aberp-audit-ledger = { path = "../../crates/audit-ledger" }
 aberp-billing = { path = "../../modules/billing" }
+aberp-nav-transport = { path = "../../crates/nav-transport" }
 
 # Binary boundary: anyhow per ADR-0021 Part A item 2.
 anyhow = { workspace = true }
@@ -33,6 +37,10 @@ quick-xml = { workspace = true }
 time = { workspace = true }
 sha2 = { workspace = true }
 
+# ULID for the per-CLI-invocation session_id passed to
+# `Actor::from_local_cli`. PR-7-A first use in the binary.
+ulid = { workspace = true }
+
 # Storage — the binary owns the tenant DuckDB connection so it can drive
 # one transaction across `aberp-billing` and `aberp-audit-ledger` per
 # ADR-0008 §Storage. PR-6 close-out.
@@ -41,3 +49,9 @@ duckdb = { workspace = true }
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# Integration tests need `Actor::test_only` (rollback_conformance.rs).
+# Enabling the feature here keeps it OUT of the production [dependencies]
+# above — production code paths cannot reach `Actor::test_only`. F15.
+aberp-audit-ledger = { path = "../../crates/audit-ledger", features = ["test-support"] }

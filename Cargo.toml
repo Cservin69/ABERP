@@ -2,6 +2,8 @@
 #
 # Members:
 #   crates/audit-ledger    - tamper-evident hash-chained audit ledger (ADR-0008).
+#   crates/nav-transport   - NAV TLS transport + credential loading (ADR-0009 §4,
+#                            ADR-0020 §1-3, ADR-0021 §A14). PR-7-A.
 #   modules/billing        - NAV invoice issuing module (ADR-0009).
 #   apps/aberp             - the CLI binary that wires modules together.
 #
@@ -9,16 +11,17 @@
 # Cargo.lock is the load-bearing artifact per ADR-0007 section "Supply chain";
 # the version lines here are the floor, Cargo.lock is the exact pin.
 #
-# Only crates exercised by PRs 1..5 of session 5 appear here. Crates pinned
-# by ADR-0021 but not yet used (reqwest, axum, axum-server, rcgen, sha3,
-# aes, zeroize) are added to this catalogue when the first PR that uses
-# them lands. This matches CLAUDE.md rule 2 (simplicity first) without
-# losing the pins, which remain authoritative in ADR-0021 Part A.
+# Only crates actually exercised by a landed PR appear here. Crates pinned
+# by ADR-0021 but not yet used (axum, axum-server, rcgen, sha3, aes) are
+# added when the first PR that uses them lands. This matches CLAUDE.md
+# rule 2 (simplicity first) without losing the pins, which remain
+# authoritative in ADR-0021 Part A.
 
 [workspace]
 resolver = "2"
 members = [
     "crates/audit-ledger",
+    "crates/nav-transport",
     "modules/billing",
     "apps/aberp",
 ]
@@ -61,9 +64,48 @@ serde_json = "1"
 quick-xml = { version = "0.36", features = ["serialize"] }
 
 # Cryptography — ADR-0021 Part A, item 9.
-# Only sha2 is exercised in commit #1 (audit-ledger entry_hash).
-# sha3, aes, zeroize join the catalogue when the NAV-submission PR lands.
+# sha2 used by audit-ledger entry_hash. zeroize joins here with PR-7-A
+# (first NAV credential load). sha3 and aes wait for PR-7-B (signature
+# + exchangeToken).
 sha2 = "0.10"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+# HTTP client — ADR-0021 Part A, item 5. First use: nav-transport (PR-7-A).
+# default-features = false strips reqwest's default native-tls; `rustls`
+# is the chosen TLS backend per ADR-0021 Sub-decisions ("rustls everywhere").
+#
+# Feature-name note: ADR-0021 §A5 named "rustls-tls" — that was the feature
+# name in reqwest 0.11/0.12. reqwest 0.13 renamed it to plain "rustls" and
+# split out "rustls-native-certs" / "webpki-roots" as opt-in root sources.
+# Even with neither root source feature enabled, reqwest 0.13's `rustls`
+# feature still pulls webpki-roots transitively and uses them by default
+# (caught by `crates/nav-transport/tests/trust_negation.rs`). To enforce
+# pin-only trust we build the `rustls::ClientConfig` ourselves and hand it
+# to reqwest via `use_preconfigured_tls` — see `crates/nav-transport/src/
+# trust.rs`. The other three features track the §A5 pin text; PR-7-A only
+# exercises rustls — gzip/stream/json are reachable by PR-7-B/7-C.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "stream", "json"] }
+
+# Direct rustls — needed because reqwest 0.13 only exposes
+# `use_preconfigured_tls` (no `tls_built_in_*` runtime knobs); building
+# the entire `ClientConfig` ourselves is the only way to guarantee
+# reqwest's defaults do not leak in (ADR-0020 §1 "OS trust store is not
+# consulted"). Version line MUST match reqwest 0.13.x's transitive
+# choice — Cargo.lock is authoritative (currently 0.23.x).
+rustls = "0.23"
+rustls-pemfile = "2"
+
+# OS keychain binding — ADR-0021 Part A, item §A14 (PR-7-A amendment;
+# closes fortnightly review finding F6). keyring 2.x ships the macOS
+# Keychain and Windows Credential Manager backends unconditionally;
+# the Linux backend is selected via the default feature ("secret-service"
+# over D-Bus). Default features cover all three target platforms.
+#
+# Feature-name note: an earlier draft of this pin tried `apple-native` /
+# `windows-native` — those are keyring 3.x names. v2 organizes platform
+# selection differently; sticking with v2 defaults is the smaller-blast-
+# radius choice for PR-7-A. A v3 bump can be its own ADR amendment.
+keyring = "2"
 
 # Embedded database driver, bundled per ADR-0021 Part A, item 10 (closes F1).
 duckdb = { version = "1", features = ["bundled"] }

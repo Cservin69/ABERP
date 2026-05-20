@@ -9,6 +9,13 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes `Actor::test_only` to consumers' integration tests
+# (apps/aberp/tests/rollback_conformance.rs). Production code paths in
+# apps/aberp do NOT enable this feature, so `Actor::test_only` is
+# unreachable from a release binary. Closes fortnightly review F15.
+test-support = []
+
 # Dependencies per ADR-0021 Part A. Library crate uses `thiserror` for its
 # typed error enum per Part A item 2; no `anyhow` here (anyhow is binary-only).
 [dependencies]

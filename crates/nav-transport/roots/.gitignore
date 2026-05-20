@@ -1,0 +1,4 @@
+# Scratch: raw `openssl s_client -showcerts` output captured at pin time.
+# Reproducible by anyone with the s_client commands from PR-7-A's commit
+# message. The vendored PEMs in this directory are the authoritative pin.
+_chain/

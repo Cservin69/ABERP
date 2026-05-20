@@ -48,6 +48,14 @@ src-tauri/gen/
 .secrets/
 secrets/
 
+# Vendored CA trust anchors are PUBLIC certificates that ARE the
+# pin per ADR-0020 §1 ("NAV server-certificate issuing root is
+# pinned in ABERP's trust store"). They must be committed; the
+# blanket *.pem rule above would otherwise hide them. Scope kept
+# narrow — only files under crates/*/roots/ are un-ignored, so a
+# stray *.pem anywhere else still trips the secret guard.
+!crates/*/roots/*.pem
+
 # --- OS noise -----------------------------------------------
 .DS_Store
 .AppleDouble

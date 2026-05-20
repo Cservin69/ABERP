@@ -1,0 +1,48 @@
+[package]
+name = "aberp-nav-transport"
+description = "NAV TLS transport + credential loader (ADR-0009 §4, ADR-0020, ADR-0021 §A14)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_nav_transport"
+path = "src/lib.rs"
+
+[features]
+# Exposes `NavCredentials::from_parts` to consumers' integration tests
+# (apps/aberp/tests, future modules/billing tests) without making it
+# reachable from production code paths. The same pattern is used for
+# `Actor::test_only` in crates/audit-ledger.
+test-support = []
+
+[dependencies]
+# Library boundary: thiserror per ADR-0021 Part A item 2.
+thiserror = { workspace = true }
+
+# HTTPS client with pinned NAV trust anchors per ADR-0020 §1. The
+# `ClientConfig` itself is built in `src/trust.rs` directly against the
+# rustls crate; reqwest only receives the pre-built config via
+# `use_preconfigured_tls`.
+reqwest = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+# OS keychain — credential loader per ADR-0020 §3.
+keyring = { workspace = true }
+
+# In-memory secret protection per ADR-0007 §Secrets.
+zeroize = { workspace = true }
+
+# Tracing — ADR-0007 §Logging.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# A throwaway self-signed CA used in `tests/trust_negation.rs` to prove
+# that the production trust store does NOT trust certs rooted elsewhere.
+# Build-time only; never linked into the release binary.
+tokio = { workspace = true }

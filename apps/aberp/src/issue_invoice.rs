@@ -4,26 +4,31 @@
 //!
 //! 1. Parse the JSON input into a [`InvoiceInputJson`] struct.
 //! 2. Resolve tenant id and series code (loud-fail on invalid input).
-//! 3. Compute the binary hash and build [`aberp_audit_ledger::LedgerMeta`].
-//! 4. Open a tenant DuckDB connection.
-//! 5. Pre-tx setup (idempotent, no allocation occurs here):
+//! 3. **Load NAV credentials from the OS keychain** (PR-7-A — closes
+//!    F15 and F6). Required for the operator's session identity, even
+//!    though PR-7-A does not yet submit to NAV. Missing keychain
+//!    items fail loud per CLAUDE.md rule 12 before any DB write.
+//! 4. Compute the binary hash and build [`aberp_audit_ledger::LedgerMeta`].
+//! 5. Open a tenant DuckDB connection.
+//! 6. Pre-tx setup (idempotent, no allocation occurs here):
 //!    - Ensure the billing schema exists via `DuckDbBillingStore::ensure_schema`.
 //!    - Ensure the requested series exists (auto-create on first run).
 //!    - Take the Connection back via `into_connection`.
 //!    - Ensure the audit-ledger schema exists.
-//! 6. Build the [`aberp_billing::IssueInvoiceCommand`] and the
+//! 7. Build the [`aberp_billing::IssueInvoiceCommand`] and the
 //!    [`aberp_billing::AllocateArgs`] from the parsed input.
-//! 7. Open a single DuckDB transaction; under it:
+//! 8. Open a single DuckDB transaction; under it:
 //!    - Call [`aberp_billing::allocate_in_tx`] to burn the next number
 //!      and write the reservation + invoice rows (ADR-0009 §3 steps 1–5).
 //!    - On the `Fresh` branch, call [`aberp_audit_ledger::append_in_tx`]
 //!      twice: `InvoiceSequenceReserved` then `InvoiceDraftCreated`
-//!      (ADR-0009 §3 step 6).
+//!      (ADR-0009 §3 step 6) using the keychain-derived
+//!      [`Actor::from_local_cli`] — NOT `Actor::test_only` (F15).
 //!    - Commit (ADR-0009 §3 step 7).
-//! 8. Drop the Connection to release the DuckDB file lock, then re-open
+//! 9. Drop the Connection to release the DuckDB file lock, then re-open
 //!    a fresh `Ledger` for `verify_chain` (the verify path stays
 //!    Connection-owning per session-6's verify-path decision).
-//! 9. Serialize the [`ReadyInvoice`] to NAV `InvoiceData` XML.
+//! 10. Serialize the [`ReadyInvoice`] to NAV `InvoiceData` XML.
 //!
 //! # ADR-0008 §Storage conformance (PR-6 close-out)
 //!
@@ -48,10 +53,12 @@ use aberp_billing::{
     DuckDbBillingStore, Huf, IdempotencyKey, InvoiceId, InvoiceSeries, IssueInvoiceCommand,
     LineItem, ResetPolicy, SeriesCode, SeriesId,
 };
+use aberp_nav_transport::NavCredentials;
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
 use serde::Deserialize;
 use time::OffsetDateTime;
+use ulid::Ulid;
 
 use crate::audit_payloads;
 use crate::binary_hash;
@@ -136,16 +143,36 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
         )
     })?;
 
-    // 3. Compute binary hash, then build the audit-ledger metadata once
+    // 3. Load NAV credentials from the OS keychain BEFORE any DB write.
+    //    Per ADR-0009 §4 + ADR-0020 §3 + CLAUDE.md rule 12: a missing
+    //    keychain item is a hard error, not a silent fallback. Failing
+    //    here keeps the tenant DB pristine if credentials aren't set up.
+    //
+    //    The login is then the user_id baked into every audit-ledger
+    //    entry written by this CLI invocation (Actor::from_local_cli),
+    //    closing fortnightly review F15 — Actor::test_only is no longer
+    //    reachable on a production code path.
+    let credentials = NavCredentials::load_from_keychain(&args.tenant)
+        .context("load NAV credentials from OS keychain")?;
+    let session_id = Ulid::new().to_string();
+    let actor = Actor::from_local_cli(session_id, credentials.login());
+    tracing::info!(
+        tenant = %args.tenant,
+        session_id = %actor.session_id,
+        user_id = %actor.user_id,
+        "NAV credentials loaded; actor derived for this CLI invocation"
+    );
+
+    // 4. Compute binary hash, then build the audit-ledger metadata once
     //    for the entire process. `LedgerMeta` anchors `time_mono` and is
     //    cheap to clone; threaded into every append_in_tx call.
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
-    // 4–5. Pre-tx setup: schemas + series.
+    // 5–6. Pre-tx setup: schemas + series.
     let (conn, series) = pre_tx_setup(&args.db, &series_code)?;
 
-    // 6. Build IssueInvoiceCommand + AllocateArgs for the tx body.
+    // 7. Build IssueInvoiceCommand + AllocateArgs for the tx body.
     let command = build_command(&input, &series_code)?;
     let idempotency_key = command.idempotency_key;
     let issue_date = OffsetDateTime::now_utc();
@@ -162,10 +189,10 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
         idempotency_key,
     };
 
-    // 7. One transaction across the billing writes and audit appends.
+    // 8. One transaction across the billing writes and audit appends.
     //    `run_single_tx` owns the tx lifecycle: it commits on Ok and
     //    relies on `Transaction::drop` for rollback on Err or panic.
-    let outcome = run_single_tx(conn, &ledger_meta, allocate_args, idempotency_key)?;
+    let outcome = run_single_tx(conn, &ledger_meta, allocate_args, idempotency_key, actor)?;
 
     let invoice = outcome.invoice;
     let is_fresh = outcome.was_fresh;
@@ -176,7 +203,7 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
         "invoice issued"
     );
 
-    // 8. Verify the audit chain — the success-criterion gate. Per the
+    // 9. Verify the audit chain — the success-criterion gate. Per the
     //    session-6 verify-path decision: re-open a fresh Ledger after
     //    the tx commits and the tx-Connection drops.
     let ledger =
@@ -186,7 +213,7 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
         .context("audit-ledger chain verification failed AFTER issuance")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
-    // 9. Serialize the ReadyInvoice to NAV XML.
+    // 10. Serialize the ReadyInvoice to NAV XML.
     let parties = NavParties {
         supplier: SupplierInfo {
             tax_number: input.supplier.tax_number,
@@ -282,6 +309,7 @@ fn run_single_tx(
     ledger_meta: &LedgerMeta,
     allocate_args: AllocateArgs,
     idempotency_key: IdempotencyKey,
+    actor: Actor,
 ) -> Result<TxOutcome> {
     let tx = conn
         .transaction()
@@ -303,10 +331,10 @@ fn run_single_tx(
     };
 
     if was_fresh {
-        let actor = Actor::test_only(); // Real auth lands in a later PR.
-                                        // Canonical on-disk string per ADR-0005 (PR-6.1 F8). Stable
-                                        // across crate versions; the `Debug` derive that PR-5 used
-                                        // was not.
+        // Actor is the keychain-derived `from_local_cli` value built in
+        // `run()` (PR-7-A closes F15). Canonical on-disk string per
+        // ADR-0005 (PR-6.1 F8). Stable across crate versions; the
+        // `Debug` derive that PR-5 used was not.
         let idem_str = idempotency_key.to_canonical_string();
 
         // Typed payloads serialized via `serde_json::to_vec` per
