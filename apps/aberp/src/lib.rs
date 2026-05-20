@@ -29,5 +29,6 @@ pub mod mark_abandoned;
 pub mod nav_xml;
 pub mod poll_ack;
 pub mod retry_submission;
+pub mod serve;
 pub mod setup_nav_credentials;
 pub mod submit_invoice;

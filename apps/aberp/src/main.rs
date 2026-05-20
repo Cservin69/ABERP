@@ -15,12 +15,13 @@ use anyhow::Result;
 use clap::Parser;
 
 use aberp::{
-    cli, issue_invoice, mark_abandoned, poll_ack, retry_submission, setup_nav_credentials,
+    cli, issue_invoice, mark_abandoned, poll_ack, retry_submission, serve, setup_nav_credentials,
     submit_invoice,
 };
 
 fn main() -> Result<()> {
     init_tracing();
+    install_rustls_crypto_provider();
     let args = cli::Cli::parse();
     match args.command {
         cli::Command::IssueInvoice(a) => issue_invoice::run(&a),
@@ -29,7 +30,20 @@ fn main() -> Result<()> {
         cli::Command::PollAck(a) => poll_ack::run(&a),
         cli::Command::RetrySubmission(a) => retry_submission::run(&a),
         cli::Command::MarkAbandoned(a) => mark_abandoned::run(&a),
+        cli::Command::Serve(a) => serve::run(&a),
     }
+}
+
+/// rustls 0.23 requires a process-wide crypto provider be installed
+/// before any TLS work happens. The nav-transport crate installs its
+/// own provider at first `NavTransport::new` call; the `aberp serve`
+/// path also builds a `rustls::ServerConfig`-shaped surface via
+/// `axum-server`. Installing once up-front at binary start covers both
+/// flows. `try_install` (vs `install`) is loud-fail-safe: if a future
+/// PR adds a second install site, the second one is a no-op rather
+/// than a panic.
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 fn init_tracing() {

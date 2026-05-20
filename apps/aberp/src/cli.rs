@@ -99,6 +99,21 @@ pub enum Command {
     ///
     /// Precondition: same `Stuck` precondition as `retry-submission`.
     MarkAbandoned(MarkAbandonedArgs),
+
+    /// Start the loopback HTTPS+JSON listener that the Tauri/Svelte
+    /// UI shell consumes (PR-9-1; ADR-0021 §Part B). Long-running:
+    /// binds `127.0.0.1:<port>`, terminates TLS via a self-signed
+    /// cert generated on first launch and persisted next to the
+    /// keychain material (per ADR-0007 §Transport). Routes are
+    /// read-only over the billing DB + audit ledger. Mutations
+    /// remain on the CLI subcommands.
+    ///
+    /// On first launch a session token is also minted into the OS
+    /// keychain (service `aberp.nav.<tenant>`, account
+    /// `session_token`). Clients present `Authorization: Bearer
+    /// <token>`. Future operator-action routes will land
+    /// incrementally as the Svelte shell asks for them.
+    Serve(ServeArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -272,6 +287,35 @@ pub struct MarkAbandonedArgs {
     /// human-readable justification.
     #[arg(long)]
     pub reason: String,
+}
+
+#[derive(Debug, Parser)]
+pub struct ServeArgs {
+    /// Path to the tenant DuckDB file (the same one the CLI
+    /// subcommands operate on). The serve routes are read-only;
+    /// concurrent CLI mutations on the same file are safe because
+    /// DuckDB's file-locking discipline funnels them through.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — drives both the audit-ledger genesis hash
+    /// and the keychain service-name lookup
+    /// (`aberp.nav.<tenant>`). The session-token entry lives at the
+    /// same service name under account `session_token`.
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// TCP port to bind on `127.0.0.1`. `0` means the kernel picks
+    /// an unused port; the chosen port is printed on stdout for the
+    /// Tauri shell to read.
+    ///
+    /// We default to `0` because the operator workstation may
+    /// already have something on a memorable port; a future
+    /// PR-9-1.5 can persist the chosen port in the same artifacts
+    /// directory as the cert if "remember last port" turns out to
+    /// matter to the SPA.
+    #[arg(long, default_value_t = 0)]
+    pub port: u16,
 }
 
 #[derive(Debug, Parser)]
