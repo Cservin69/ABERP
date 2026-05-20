@@ -1,28 +1,31 @@
 # ABERP workspace.
 #
 # Members:
-#   crates/audit-ledger    - tamper-evident hash-chained audit ledger (ADR-0008).
-#   crates/nav-transport   - NAV TLS transport + credential loading (ADR-0009 §4,
-#                            ADR-0020 §1-3, ADR-0021 §A14). PR-7-A.
-#   modules/billing        - NAV invoice issuing module (ADR-0009).
-#   apps/aberp             - the CLI binary that wires modules together.
+#   crates/audit-ledger      - tamper-evident hash-chained audit ledger (ADR-0008).
+#   crates/nav-transport     - NAV TLS transport + credential loading (ADR-0009 §4,
+#                              ADR-0020 §1-3, ADR-0021 §A14). PR-7-A.
+#   crates/nav-xsd-validator - hand-rolled <InvoiceData> v3.0 invariant check
+#                              (ADR-0022). PR-9-0.
+#   modules/billing          - NAV invoice issuing module (ADR-0009).
+#   apps/aberp               - the CLI binary that wires modules together.
 #
 # Dependency pins below come from ADR-0021 (pre-code consolidated baseline).
 # Cargo.lock is the load-bearing artifact per ADR-0007 section "Supply chain";
 # the version lines here are the floor, Cargo.lock is the exact pin.
 #
 # Only crates actually exercised by a landed PR appear here. Crates pinned
-# by ADR-0021 but not yet used (axum, axum-server, rcgen) are added when
-# the first PR that uses them lands. This matches CLAUDE.md rule 2
-# (simplicity first) without losing the pins, which remain authoritative
-# in ADR-0021 Part A. (sha3 + aes joined the catalogue in PR-7-B-1; the
-# remaining axum / axum-server / rcgen wait for the wire-protocol PR.)
+# by ADR-0021 but not yet used are added when the first PR that uses them
+# lands. This matches CLAUDE.md rule 2 (simplicity first) without losing
+# the pins, which remain authoritative in ADR-0021 Part A. (sha3 + aes
+# joined the catalogue in PR-7-B-1; axum + axum-server + rcgen + tower
+# joined in PR-9-1 — the wire-protocol PR.)
 
 [workspace]
 resolver = "2"
 members = [
     "crates/audit-ledger",
     "crates/nav-transport",
+    "crates/nav-xsd-validator",
     "modules/billing",
     "apps/aberp",
 ]
@@ -132,6 +135,42 @@ ciborium = "0.2"
 
 # ULID generation — ADR-0021 Part A, item 13 (closes F4), per ADR-0005.
 ulid = "1"
+
+# ── PR-9-1 additions — wire protocol per ADR-0021 §Part B ───────────
+#
+# HTTP server for the UI ↔ backend wire protocol. axum + axum-server
+# (with tls_rustls::RustlsConfig) per ADR-0021 §A6. axum-server is
+# pinned at 0.7 because its 0.7.x line is built against rustls 0.23
+# (matching nav-transport's rustls pin — sharing the version line
+# means rustls compiles once across the workspace).
+#
+# tower is reqwired by axum 0.7 as the middleware trait, pinned here
+# explicitly so cargo-deny sees the same line we developed against.
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query", "matched-path"] }
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls"] }
+tower = { version = "0.5", default-features = false }
+
+# Self-signed cert generation for the loopback listener per ADR-0021
+# §Sub-decisions "rcgen". Pinned at 0.13.x current minor.
+#
+# `pem` is a default feature in 0.13.x; gates `Certificate::pem()` and
+# `KeyPair::serialize_pem()`. We use both for at-rest cert + key
+# persistence under `~/.aberp/serve/<tenant>/`, so the feature MUST be
+# enabled. `aws_lc_rs` is the other default we want explicitly named so
+# `default-features = false` + explicit feature list is the
+# blast-radius-controlled posture.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+
+# Cert/key parsing back from PEM on subsequent launches. rustls-pemfile
+# already in the workspace; rustls types come from the existing rustls
+# pin.
+
+# Hex encoding for the SHA-256 fingerprint persisted next to the cert
+# (loopback handshake verification per ADR-0007 §Transport). Workspace
+# already has base64, but a hex fingerprint is what every "compare two
+# certs by hash" code path in OpenSSL / browsers / Tauri's allow-list
+# matches against; using hex here keeps that lineage.
+hex = "0.4"
 
 [profile.release]
 # Reproducible builds posture per ADR-0007 section "Supply chain".

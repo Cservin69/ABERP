@@ -230,6 +230,22 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
     };
     let xml =
         nav_xml::render_invoice_data(&invoice, &series_code, &parties).context("render NAV XML")?;
+    // PR-9-0 / ADR-0022: runtime <InvoiceData> v3.0 invariant check
+    // between render and disk write. On failure the typed
+    // `NavXsdValidationError` flows up as `anyhow::Error` — loud-fail
+    // per CLAUDE.md rule 12 keeps malformed XML off both disk and the
+    // wire. Audit entries from the prior commit DO remain in the
+    // ledger (they describe what happened — the sequence was
+    // allocated); recovery is to fix the emitter/validator and re-run
+    // with the same input JSON, hitting the Replay branch which
+    // returns the same invoice and re-renders cleanly.
+    aberp_nav_xsd_validator::validate_invoice_data(&xml)
+        .context("NAV InvoiceData v3.0 invariant check (ADR-0022) failed for rendered XML")?;
+    tracing::info!(
+        bytes = xml.len(),
+        nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
+        "NAV InvoiceData XML passed v3.0 invariant check"
+    );
     nav_xml::write_to_path(&args.out, &xml)?;
     tracing::info!(path = %args.out.display(), bytes = xml.len(), "NAV XML written");
 

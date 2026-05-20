@@ -30,6 +30,9 @@ path = "src/main.rs"
 aberp-audit-ledger = { path = "../../crates/audit-ledger" }
 aberp-billing = { path = "../../modules/billing" }
 aberp-nav-transport = { path = "../../crates/nav-transport" }
+# PR-9-0: runtime <InvoiceData> v3.0 invariant check per ADR-0022. Three
+# call sites — issue_invoice::run, submit_invoice::run, retry_submission::run.
+aberp-nav-xsd-validator = { path = "../../crates/nav-xsd-validator" }
 
 # Binary boundary: anyhow per ADR-0021 Part A item 2.
 anyhow = { workspace = true }
@@ -78,6 +81,20 @@ tokio = { workspace = true }
 # (`NavCredentials::load_from_keychain`). Re-using the same crate that
 # the read path uses keeps the platform-backend behaviour identical.
 keyring = { workspace = true }
+
+# PR-9-1 additions — wire protocol per ADR-0021 §Part B. The binary
+# owns the loopback HTTPS server because the rest of the orchestration
+# (DuckDB connection lifecycle, audit ledger, billing) is already on
+# the binary side. A separate crate for the server would force the
+# same coupling at module-boundary cost; per CLAUDE.md rule 2 we keep
+# the simpler shape until a real second client wants the same routes.
+axum = { workspace = true }
+axum-server = { workspace = true }
+tower = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 # Integration tests need `Actor::test_only` (rollback_conformance.rs).

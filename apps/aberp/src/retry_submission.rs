@@ -186,6 +186,21 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
         "InvoiceData XML loaded for retry"
     );
 
+    // 5a. PR-9-0 / ADR-0022: validate before the retry NAV call. Same
+    //     posture as submit_invoice: a hand-edited or schema-drifted
+    //     on-disk XML loud-fails BEFORE any tokenExchange happens. No
+    //     audit entries land on a validation failure.
+    aberp_nav_xsd_validator::validate_invoice_data(&invoice_xml).with_context(|| {
+        format!(
+            "NAV InvoiceData v3.0 invariant check (ADR-0022) failed for retry on {}",
+            args.invoice_xml.display()
+        )
+    })?;
+    tracing::info!(
+        nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
+        "on-disk InvoiceData XML passed v3.0 invariant check before NAV retry"
+    );
+
     // 6. NAV calls on a tokio current-thread runtime.
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
     let runtime = tokio::runtime::Builder::new_current_thread()

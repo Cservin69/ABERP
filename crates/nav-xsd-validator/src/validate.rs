@@ -1,0 +1,1317 @@
+//! The structural walker that turns an `<InvoiceData>` byte slice into
+//! either `Ok(())` or a typed [`NavXsdValidationError`].
+//!
+//! # Design notes
+//!
+//! The walker is event-driven (quick-xml `Reader::read_event`). It does
+//! NOT build an in-memory tree — the v3.0 InvoiceData payload is small
+//! and the validation rules are local (parent-child ordering and
+//! cardinality), so a streaming state machine keeps the allocator out
+//! of the hot path and makes the rule set explicit.
+//!
+//! # Allowlist source of truth
+//!
+//! Every element the validator accepts is named here as a `&'static
+//! str`. If `apps/aberp/src/nav_xml.rs` writes an element name not
+//! listed here, the validator rejects it loudly per ADR-0022 §"What
+//! 'invariant check' covers." Conversely, if an element is named here
+//! but the emitter never writes it (and no NAV-side response would
+//! either), it is dead allowlist surface and a future cleanup PR
+//! should prune it — but the bias is toward over-accepting on the
+//! validator side so we never silently reject something NAV's own
+//! parser would accept.
+//!
+//! # ADR-0022 conformance check
+//!
+//! The unit test `error_variants_have_distinct_display` at the bottom
+//! of this file walks every [`NavXsdValidationError`] variant and
+//! asserts pairwise-distinct `Display`. ADR-0022's adversarial-review
+//! bullet 4 names this requirement.
+//!
+//! # Why `Reader::from_str` instead of `read_event_into`
+//!
+//! `Reader::from_str(s)` returns a `Reader<&[u8]>` whose `read_event`
+//! returns `Event<'a>` borrowing from the SOURCE string — no per-call
+//! buffer is needed and no buffer parameter has to plumb through
+//! recursive walkers. The alternative (`read_event_into(&mut buf)`)
+//! returns events borrowed from the supplied buffer, which means each
+//! walk function would have to take and re-borrow the same `Vec<u8>`
+//! across loop iterations — exactly the lifetime nightmare we ran
+//! into the first time around.
+
+use quick_xml::events::Event;
+use quick_xml::name::QName;
+use quick_xml::Reader;
+
+use crate::error::NavXsdValidationError;
+use crate::NAV_NS_DATA;
+
+/// Validate that `xml` is a v3.0 `<InvoiceData>` payload structurally
+/// acceptable to NAV. Returns `Ok(())` on success; on any divergence
+/// returns a typed [`NavXsdValidationError`].
+///
+/// The call is single-pass over the input bytes; no in-memory tree is
+/// built. The input must be valid UTF-8 (NAV v3.0 InvoiceData is
+/// UTF-8 by spec).
+pub fn validate_invoice_data(xml: &[u8]) -> Result<(), NavXsdValidationError> {
+    let s = std::str::from_utf8(xml).map_err(|e| NavXsdValidationError::MalformedXml {
+        position: e.valid_up_to(),
+        message: format!("input is not valid UTF-8: {e}"),
+    })?;
+    let mut reader = Reader::from_str(s);
+    reader.config_mut().trim_text(true);
+
+    // Walk to the root element tag (skip XML declaration and any
+    // whitespace-only events).
+    //
+    // `Event::Start` matches `<Foo>...</Foo>`; `Event::Empty` matches
+    // the self-closing `<Foo/>`. Both produce a `BytesStart` carrying
+    // the element name + attributes, so the validator must accept
+    // either at the root position. The two negative-path tests
+    // `wrong_root_element_is_loud_fail` and
+    // `wrong_root_namespace_is_loud_fail` exercise the self-closing
+    // form deliberately — they want to assert the root-shape check
+    // fires regardless of whether the operator wrote a self-closing
+    // or a paired tag.
+    let root = loop {
+        match read_event(&mut reader)? {
+            Event::Start(e) | Event::Empty(e) => break e,
+            Event::Eof => {
+                return Err(NavXsdValidationError::MalformedXml {
+                    position: reader.buffer_position() as usize,
+                    message: "document ended before any element".into(),
+                });
+            }
+            _ => continue,
+        }
+    };
+
+    // Root must be <InvoiceData> at the NAV v3.0 data namespace.
+    let root_local = local_name_of(root.name());
+    if root_local != "InvoiceData" {
+        return Err(NavXsdValidationError::UnexpectedRoot {
+            actual: root_local.to_string(),
+        });
+    }
+    let xmlns = extract_xmlns(&root)?;
+    if xmlns.as_deref() != Some(NAV_NS_DATA) {
+        return Err(NavXsdValidationError::UnexpectedRootNamespace {
+            expected: NAV_NS_DATA,
+            actual: xmlns,
+        });
+    }
+
+    walk_invoice_data(&mut reader)
+}
+
+// ── Per-parent walkers ───────────────────────────────────────────────
+
+fn walk_invoice_data(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "InvoiceData";
+    const ALLOWED: &[&str] = &[
+        "invoiceNumber",
+        "invoiceIssueDate",
+        "completenessIndicator",
+        "invoiceMain",
+    ];
+    const ORDERED_REQUIRED: &[&str] = &["invoiceNumber", "invoiceIssueDate", "invoiceMain"];
+
+    let mut seen_in_order: Vec<&'static str> = Vec::new();
+
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                match canonical {
+                    "invoiceNumber" => {
+                        let _ = collect_text(reader, "invoiceNumber")?;
+                    }
+                    "invoiceIssueDate" => {
+                        let text = collect_text(reader, "invoiceIssueDate")?;
+                        ensure_date_shape("invoiceIssueDate", &text)?;
+                    }
+                    "completenessIndicator" => {
+                        let _ = collect_text(reader, "completenessIndicator")?;
+                    }
+                    "invoiceMain" => {
+                        walk_invoice_main(reader)?;
+                    }
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+                seen_in_order.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen_in_order)?;
+                return Ok(());
+            }
+            Event::Eof => {
+                return Err(NavXsdValidationError::MalformedXml {
+                    position: reader.buffer_position() as usize,
+                    message: "document ended inside <InvoiceData>".into(),
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_invoice_main(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "invoiceMain";
+    const ALLOWED: &[&str] = &["invoice"];
+    expect_single_child_then_close(reader, PARENT, ALLOWED, walk_invoice)
+}
+
+fn walk_invoice(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "invoice";
+    const ALLOWED: &[&str] = &["invoiceHead", "invoiceLines", "invoiceSummary"];
+    const ORDERED_REQUIRED: &[&str] = &["invoiceHead", "invoiceLines", "invoiceSummary"];
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                match canonical {
+                    "invoiceHead" => walk_invoice_head(reader)?,
+                    "invoiceLines" => walk_invoice_lines(reader)?,
+                    "invoiceSummary" => walk_invoice_summary(reader)?,
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in("invoice", reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_invoice_head(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "invoiceHead";
+    const ALLOWED: &[&str] = &["supplierInfo", "customerInfo", "invoiceDetail"];
+    const ORDERED_REQUIRED: &[&str] = &["supplierInfo", "customerInfo", "invoiceDetail"];
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                match canonical {
+                    "supplierInfo" => walk_supplier_info(reader)?,
+                    "customerInfo" => walk_customer_info(reader)?,
+                    "invoiceDetail" => walk_invoice_detail(reader)?,
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_supplier_info(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "supplierInfo";
+    const ALLOWED: &[&str] = &["supplierTaxNumber", "supplierName", "supplierAddress"];
+    const ORDERED_REQUIRED: &[&str] = ALLOWED;
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                match canonical {
+                    "supplierTaxNumber" => {
+                        let _ = collect_text(reader, canonical)?;
+                    }
+                    "supplierName" => {
+                        let _ = collect_text(reader, canonical)?;
+                    }
+                    "supplierAddress" => walk_address("supplierAddress", reader)?,
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_customer_info(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "customerInfo";
+    const ALLOWED: &[&str] = &["customerVatStatus", "customerVatData", "customerName"];
+    const ORDERED_REQUIRED: &[&str] = &["customerVatStatus", "customerName"];
+    // customerVatData is optional in NAV v3.0 (PRIVATE_PERSON has no
+    // tax data); we accept-and-walk its body if present.
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                match canonical {
+                    "customerVatStatus" => {
+                        let _ = collect_text(reader, canonical)?;
+                    }
+                    "customerVatData" => walk_customer_vat_data(reader)?,
+                    "customerName" => {
+                        let _ = collect_text(reader, canonical)?;
+                    }
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_customer_vat_data(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "customerVatData";
+    const ALLOWED: &[&str] = &["customerTaxNumber"];
+    expect_single_child_then_close(reader, PARENT, ALLOWED, walk_customer_tax_number)
+}
+
+fn walk_customer_tax_number(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "customerTaxNumber";
+    const ALLOWED: &[&str] = &["taxpayerId"];
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                let _ = collect_text(reader, canonical)?;
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, &["taxpayerId"], &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_address(
+    address_tag: &'static str,
+    reader: &mut Reader<&[u8]>,
+) -> Result<(), NavXsdValidationError> {
+    const ALLOWED: &[&str] = &["simpleAddress", "detailedAddress"];
+    expect_single_child_then_close(reader, address_tag, ALLOWED, walk_address_child)
+}
+
+fn walk_address_child(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    // We don't enforce the inner leaf set strictly — NAV v3.0 has many
+    // optional fields and they vary by simpleAddress vs detailedAddress.
+    // We accept-and-walk-to-close so unknown leaves do not blow up;
+    // the SUPPLIER and CUSTOMER addresses are emitter-controlled bytes
+    // and a future PR that adds new address leaves will land them with
+    // matching test fixtures.
+    skip_to_matching_end(reader)
+}
+
+fn walk_invoice_detail(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "invoiceDetail";
+    const ALLOWED: &[&str] = &[
+        "invoiceCategory",
+        "invoiceDeliveryDate",
+        "currencyCode",
+        "exchangeRate",
+        "paymentMethod",
+        "paymentDate",
+        "invoiceAppearance",
+    ];
+    const ORDERED_REQUIRED: &[&str] = &[
+        "invoiceCategory",
+        "currencyCode",
+        "exchangeRate",
+        "invoiceAppearance",
+    ];
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                let text = collect_text(reader, canonical)?;
+                if canonical == "invoiceDeliveryDate" || canonical == "paymentDate" {
+                    ensure_date_shape(canonical, &text)?;
+                }
+                if canonical == "exchangeRate" {
+                    ensure_numeric_amount(canonical, &text)?;
+                }
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_invoice_lines(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "invoiceLines";
+    const ALLOWED: &[&str] = &["mergedItemIndicator", "line"];
+
+    let mut line_count: u32 = 0;
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                match canonical {
+                    "mergedItemIndicator" => {
+                        let _ = collect_text(reader, canonical)?;
+                    }
+                    "line" => {
+                        walk_line(reader)?;
+                        line_count += 1;
+                    }
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+            }
+            Event::End(_) => {
+                if line_count == 0 {
+                    return Err(NavXsdValidationError::NoInvoiceLines);
+                }
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_line(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "line";
+    const ALLOWED: &[&str] = &[
+        "lineNumber",
+        "lineExpressionIndicator",
+        "lineDescription",
+        "quantity",
+        "unitOfMeasure",
+        "unitPrice",
+        "lineAmountsNormal",
+    ];
+    const ORDERED_REQUIRED: &[&str] = &[
+        "lineNumber",
+        "lineDescription",
+        "quantity",
+        "unitOfMeasure",
+        "unitPrice",
+        "lineAmountsNormal",
+    ];
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                match canonical {
+                    "lineNumber" => {
+                        let text = collect_text(reader, canonical)?;
+                        ensure_numeric_amount(canonical, &text)?;
+                    }
+                    "lineExpressionIndicator" => {
+                        let _ = collect_text(reader, canonical)?;
+                    }
+                    "lineDescription" => {
+                        let _ = collect_text(reader, canonical)?;
+                    }
+                    "quantity" => {
+                        let text = collect_text(reader, canonical)?;
+                        ensure_numeric_amount(canonical, &text)?;
+                    }
+                    "unitOfMeasure" => {
+                        let _ = collect_text(reader, canonical)?;
+                    }
+                    "unitPrice" => {
+                        let text = collect_text(reader, canonical)?;
+                        ensure_numeric_amount(canonical, &text)?;
+                    }
+                    "lineAmountsNormal" => walk_line_amounts_normal(reader)?,
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_line_amounts_normal(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "lineAmountsNormal";
+    const ALLOWED: &[&str] = &[
+        "lineNetAmountData",
+        "lineVatRate",
+        "lineVatData",
+        "lineGrossAmountData",
+    ];
+    const ORDERED_REQUIRED: &[&str] = ALLOWED;
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                match canonical {
+                    "lineNetAmountData" => {
+                        walk_amount_pair(canonical, &["lineNetAmount", "lineNetAmountHUF"], reader)?
+                    }
+                    "lineVatRate" => walk_line_vat_rate(reader)?,
+                    "lineVatData" => {
+                        walk_amount_pair(canonical, &["lineVatAmount", "lineVatAmountHUF"], reader)?
+                    }
+                    "lineGrossAmountData" => walk_amount_pair(
+                        canonical,
+                        &["lineGrossAmountNormal", "lineGrossAmountNormalHUF"],
+                        reader,
+                    )?,
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_line_vat_rate(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "lineVatRate";
+    const ALLOWED: &[&str] = &[
+        "vatPercentage",
+        "vatContent",
+        "vatExemption",
+        "vatOutOfScope",
+    ];
+    let mut any_seen = false;
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                if canonical == "vatPercentage" {
+                    let text = collect_text(reader, canonical)?;
+                    ensure_numeric_amount(canonical, &text)?;
+                } else {
+                    skip_to_matching_end(reader)?;
+                }
+                any_seen = true;
+            }
+            Event::End(_) => {
+                if !any_seen {
+                    return Err(NavXsdValidationError::MissingRequiredChild {
+                        parent: PARENT,
+                        expected: "vatPercentage",
+                    });
+                }
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_amount_pair(
+    parent: &'static str,
+    expected: &'static [&'static str],
+    reader: &mut Reader<&[u8]>,
+) -> Result<(), NavXsdValidationError> {
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(expected, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent,
+                        element: local.clone(),
+                    }
+                })?;
+                let text = collect_text(reader, canonical)?;
+                ensure_numeric_amount(canonical, &text)?;
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(parent, expected, &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(parent, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_invoice_summary(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "invoiceSummary";
+    const ALLOWED: &[&str] = &["summaryNormal", "summaryGrossData", "summarySimplified"];
+    const ORDERED_REQUIRED: &[&str] = &["summaryNormal", "summaryGrossData"];
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                match canonical {
+                    "summaryNormal" => walk_summary_normal(reader)?,
+                    "summaryGrossData" => walk_summary_gross_data(reader)?,
+                    "summarySimplified" => skip_to_matching_end(reader)?,
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_summary_normal(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "summaryNormal";
+    const ALLOWED: &[&str] = &[
+        "summaryByVatRate",
+        "invoiceNetAmount",
+        "invoiceNetAmountHUF",
+        "invoiceVatAmount",
+        "invoiceVatAmountHUF",
+    ];
+    const ORDERED_REQUIRED: &[&str] = &[
+        "summaryByVatRate",
+        "invoiceNetAmount",
+        "invoiceNetAmountHUF",
+        "invoiceVatAmount",
+        "invoiceVatAmountHUF",
+    ];
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                match canonical {
+                    "summaryByVatRate" => walk_summary_by_vat_rate(reader)?,
+                    "invoiceNetAmount"
+                    | "invoiceNetAmountHUF"
+                    | "invoiceVatAmount"
+                    | "invoiceVatAmountHUF" => {
+                        let text = collect_text(reader, canonical)?;
+                        ensure_numeric_amount(canonical, &text)?;
+                    }
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_summary_by_vat_rate(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "summaryByVatRate";
+    const ALLOWED: &[&str] = &[
+        "vatRateNetData",
+        "vatRateVatData",
+        "vatRateGrossData",
+        "lineVatRate",
+        "vatPercentage",
+    ];
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                match canonical {
+                    "vatRateNetData" => walk_amount_pair(
+                        canonical,
+                        &["vatRateNetAmount", "vatRateNetAmountHUF"],
+                        reader,
+                    )?,
+                    "vatRateVatData" => walk_amount_pair(
+                        canonical,
+                        &["vatRateVatAmount", "vatRateVatAmountHUF"],
+                        reader,
+                    )?,
+                    "vatRateGrossData" => walk_amount_pair(
+                        canonical,
+                        &["vatRateGrossAmount", "vatRateGrossAmountHUF"],
+                        reader,
+                    )?,
+                    "lineVatRate" => walk_line_vat_rate(reader)?,
+                    "vatPercentage" => {
+                        let text = collect_text(reader, canonical)?;
+                        ensure_numeric_amount(canonical, &text)?;
+                    }
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                if !seen.contains(&"vatRateGrossData") {
+                    return Err(NavXsdValidationError::MissingRequiredChild {
+                        parent: PARENT,
+                        expected: "vatRateGrossData",
+                    });
+                }
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn walk_summary_gross_data(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    walk_amount_pair(
+        "summaryGrossData",
+        &["invoiceGrossAmount", "invoiceGrossAmountHUF"],
+        reader,
+    )
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+fn expect_single_child_then_close<F>(
+    reader: &mut Reader<&[u8]>,
+    parent: &'static str,
+    allowed: &'static [&'static str],
+    mut inner: F,
+) -> Result<(), NavXsdValidationError>
+where
+    F: FnMut(&mut Reader<&[u8]>) -> Result<(), NavXsdValidationError>,
+{
+    let mut count: u32 = 0;
+    let mut child_canonical: Option<&'static str> = None;
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(allowed, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent,
+                        element: local.clone(),
+                    }
+                })?;
+                count += 1;
+                if count > 1 {
+                    return Err(NavXsdValidationError::CardinalityExceeded {
+                        parent,
+                        element: child_canonical.unwrap_or(canonical),
+                        max: 1,
+                        actual: count,
+                    });
+                }
+                child_canonical = Some(canonical);
+                inner(reader)?;
+            }
+            Event::End(_) => {
+                if count == 0 {
+                    return Err(NavXsdValidationError::MissingRequiredChild {
+                        parent,
+                        expected: allowed[0],
+                    });
+                }
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(parent, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn skip_to_matching_end(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    let mut depth: i32 = 1;
+    while depth > 0 {
+        match read_event(reader)? {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth -= 1,
+            Event::Empty(_) => { /* depth unchanged */ }
+            Event::Eof => {
+                return Err(NavXsdValidationError::MalformedXml {
+                    position: reader.buffer_position() as usize,
+                    message: "EOF while skipping nested content".into(),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn collect_text(
+    reader: &mut Reader<&[u8]>,
+    field: &'static str,
+) -> Result<String, NavXsdValidationError> {
+    let mut text = String::new();
+    loop {
+        match read_event(reader)? {
+            Event::Text(t) => {
+                let unescaped = t
+                    .unescape()
+                    .map_err(|e| NavXsdValidationError::MalformedXml {
+                        position: reader.buffer_position() as usize,
+                        message: format!("text unescape in <{field}>: {e}"),
+                    })?
+                    .into_owned();
+                text.push_str(&unescaped);
+            }
+            Event::End(_) => return Ok(text),
+            Event::Start(e) => {
+                let inner = local_name_of(e.name()).to_string();
+                return Err(NavXsdValidationError::UnexpectedElement {
+                    parent: field,
+                    element: inner,
+                });
+            }
+            Event::Eof => return Err(eof_in(field, reader)),
+            _ => {}
+        }
+    }
+}
+
+fn read_event<'a>(reader: &mut Reader<&'a [u8]>) -> Result<Event<'a>, NavXsdValidationError> {
+    // Explicit match (not `.map_err(|e| reader.buffer_position()...)`)
+    // because the closure form re-borrows `reader` while the original
+    // `read_event` borrow is still active — that fails the borrow
+    // check even though logically the closure only runs after
+    // read_event has finished.
+    match reader.read_event() {
+        Ok(ev) => Ok(ev),
+        Err(e) => {
+            let pos = reader.buffer_position() as usize;
+            Err(NavXsdValidationError::MalformedXml {
+                position: pos,
+                message: e.to_string(),
+            })
+        }
+    }
+}
+
+fn eof_in(parent: &'static str, reader: &Reader<&[u8]>) -> NavXsdValidationError {
+    NavXsdValidationError::MalformedXml {
+        position: reader.buffer_position() as usize,
+        message: format!("EOF inside <{parent}>"),
+    }
+}
+
+/// Local-name slice of a `QName`. The returned `&str` borrows from the
+/// same source as the input `QName<'a>` — the `from_str` source string.
+///
+/// `QName<'a>` is `pub struct QName<'a>(pub &'a [u8])` in quick-xml
+/// 0.36; we destructure the public inner field directly. `as_ref()`
+/// would return a slice borrowing from the local `name` value, which
+/// is the lifetime mistake we ran into the first time.
+fn local_name_of<'a>(name: QName<'a>) -> &'a str {
+    let raw: &'a [u8] = name.0;
+    let local = match raw.iter().rposition(|&b| b == b':') {
+        Some(i) => &raw[i + 1..],
+        None => raw,
+    };
+    std::str::from_utf8(local).unwrap_or("")
+}
+
+fn canonicalize(allowed: &'static [&'static str], local: &str) -> Option<&'static str> {
+    allowed.iter().copied().find(|a| *a == local)
+}
+
+fn extract_xmlns(
+    start: &quick_xml::events::BytesStart,
+) -> Result<Option<String>, NavXsdValidationError> {
+    for attr in start.attributes() {
+        let attr = attr.map_err(|e| NavXsdValidationError::MalformedXml {
+            position: 0,
+            message: format!("attribute parse: {e}"),
+        })?;
+        if attr.key.as_ref() == b"xmlns" {
+            let v = attr
+                .unescape_value()
+                .map_err(|e| NavXsdValidationError::MalformedXml {
+                    position: 0,
+                    message: format!("xmlns unescape: {e}"),
+                })?
+                .into_owned();
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
+}
+
+fn ensure_date_shape(field: &'static str, text: &str) -> Result<(), NavXsdValidationError> {
+    let bytes = text.as_bytes();
+    let ok = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(|b| b.is_ascii_digit())
+        && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+        && bytes[8..10].iter().all(|b| b.is_ascii_digit());
+    if !ok {
+        return Err(NavXsdValidationError::MalformedDate {
+            field,
+            actual: text.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_numeric_amount(field: &'static str, text: &str) -> Result<(), NavXsdValidationError> {
+    if text.is_empty() {
+        return Err(NavXsdValidationError::NonNumericAmount {
+            field,
+            actual: text.to_string(),
+        });
+    }
+    let mut decimal_seen = false;
+    for b in text.bytes() {
+        match b {
+            b'0'..=b'9' => {}
+            b'.' if !decimal_seen => decimal_seen = true,
+            _ => {
+                return Err(NavXsdValidationError::NonNumericAmount {
+                    field,
+                    actual: text.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_ordered_required(
+    parent: &'static str,
+    required: &'static [&'static str],
+    seen_in_order: &[&'static str],
+) -> Result<(), NavXsdValidationError> {
+    for needed in required {
+        if !seen_in_order.contains(needed) {
+            return Err(NavXsdValidationError::MissingRequiredChild {
+                parent,
+                expected: needed,
+            });
+        }
+    }
+    let projection: Vec<&'static str> = seen_in_order
+        .iter()
+        .copied()
+        .filter(|s| required.contains(s))
+        .collect();
+    for (i, r) in required.iter().enumerate() {
+        match projection.get(i) {
+            Some(p) if p == r => continue,
+            Some(p) => {
+                return Err(NavXsdValidationError::ChildOrderViolation {
+                    parent,
+                    expected_before: r,
+                    actually_appeared_first: (*p).to_string(),
+                });
+            }
+            None => {
+                return Err(NavXsdValidationError::MissingRequiredChild {
+                    parent,
+                    expected: r,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The minimum valid InvoiceData that the v3.0 allowlist accepts.
+    /// Updated whenever the allowlist or emitter changes; this fixture
+    /// is the validator's golden positive example.
+    const MIN_VALID: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<InvoiceData xmlns="http://schemas.nav.gov.hu/OSA/3.0/data" xmlns:common="http://schemas.nav.gov.hu/OSA/3.0/base">
+  <invoiceNumber>INV-default/00001</invoiceNumber>
+  <invoiceIssueDate>2026-05-20</invoiceIssueDate>
+  <invoiceMain>
+    <invoice>
+      <invoiceHead>
+        <supplierInfo>
+          <supplierTaxNumber>12345678</supplierTaxNumber>
+          <supplierName>ABERP Supplier Kft.</supplierName>
+          <supplierAddress>
+            <simpleAddress>
+              <countryCode>HU</countryCode>
+              <postalCode>1011</postalCode>
+              <city>Budapest</city>
+              <additionalAddressDetail>Fő utca 1.</additionalAddressDetail>
+            </simpleAddress>
+          </supplierAddress>
+        </supplierInfo>
+        <customerInfo>
+          <customerVatStatus>DOMESTIC</customerVatStatus>
+          <customerVatData>
+            <customerTaxNumber>
+              <taxpayerId>87654321</taxpayerId>
+            </customerTaxNumber>
+          </customerVatData>
+          <customerName>Test Customer Zrt.</customerName>
+        </customerInfo>
+        <invoiceDetail>
+          <invoiceCategory>NORMAL</invoiceCategory>
+          <invoiceDeliveryDate>2026-05-20</invoiceDeliveryDate>
+          <currencyCode>HUF</currencyCode>
+          <exchangeRate>1</exchangeRate>
+          <paymentMethod>TRANSFER</paymentMethod>
+          <paymentDate>2026-05-20</paymentDate>
+          <invoiceAppearance>ELECTRONIC</invoiceAppearance>
+        </invoiceDetail>
+      </invoiceHead>
+      <invoiceLines>
+        <mergedItemIndicator>false</mergedItemIndicator>
+        <line>
+          <lineNumber>1</lineNumber>
+          <lineExpressionIndicator>false</lineExpressionIndicator>
+          <lineDescription>Test widget</lineDescription>
+          <quantity>2</quantity>
+          <unitOfMeasure>PIECE</unitOfMeasure>
+          <unitPrice>1000</unitPrice>
+          <lineAmountsNormal>
+            <lineNetAmountData>
+              <lineNetAmount>2000</lineNetAmount>
+              <lineNetAmountHUF>2000</lineNetAmountHUF>
+            </lineNetAmountData>
+            <lineVatRate>
+              <vatPercentage>0.27</vatPercentage>
+            </lineVatRate>
+            <lineVatData>
+              <lineVatAmount>540</lineVatAmount>
+              <lineVatAmountHUF>540</lineVatAmountHUF>
+            </lineVatData>
+            <lineGrossAmountData>
+              <lineGrossAmountNormal>2540</lineGrossAmountNormal>
+              <lineGrossAmountNormalHUF>2540</lineGrossAmountNormalHUF>
+            </lineGrossAmountData>
+          </lineAmountsNormal>
+        </line>
+      </invoiceLines>
+      <invoiceSummary>
+        <summaryNormal>
+          <summaryByVatRate>
+            <lineVatRate>
+              <vatPercentage>0.27</vatPercentage>
+            </lineVatRate>
+            <vatRateNetData>
+              <vatRateNetAmount>2000</vatRateNetAmount>
+              <vatRateNetAmountHUF>2000</vatRateNetAmountHUF>
+            </vatRateNetData>
+            <vatRateVatData>
+              <vatRateVatAmount>540</vatRateVatAmount>
+              <vatRateVatAmountHUF>540</vatRateVatAmountHUF>
+            </vatRateVatData>
+            <vatRateGrossData>
+              <vatRateGrossAmount>2540</vatRateGrossAmount>
+              <vatRateGrossAmountHUF>2540</vatRateGrossAmountHUF>
+            </vatRateGrossData>
+          </summaryByVatRate>
+          <invoiceNetAmount>2000</invoiceNetAmount>
+          <invoiceNetAmountHUF>2000</invoiceNetAmountHUF>
+          <invoiceVatAmount>540</invoiceVatAmount>
+          <invoiceVatAmountHUF>540</invoiceVatAmountHUF>
+        </summaryNormal>
+        <summaryGrossData>
+          <invoiceGrossAmount>2540</invoiceGrossAmount>
+          <invoiceGrossAmountHUF>2540</invoiceGrossAmountHUF>
+        </summaryGrossData>
+      </invoiceSummary>
+    </invoice>
+  </invoiceMain>
+</InvoiceData>"#;
+
+    #[test]
+    fn minimum_valid_invoice_data_validates() {
+        validate_invoice_data(MIN_VALID.as_bytes())
+            .expect("the hand-rolled v3.0 minimum example must validate");
+    }
+
+    #[test]
+    fn empty_input_is_loud_fail() {
+        let err = validate_invoice_data(b"").unwrap_err();
+        match err {
+            NavXsdValidationError::MalformedXml { .. } => {}
+            other => panic!("expected MalformedXml for empty input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_root_element_is_loud_fail() {
+        let xml = r#"<?xml version="1.0"?><NotInvoiceData xmlns="http://schemas.nav.gov.hu/OSA/3.0/data"/>"#;
+        let err = validate_invoice_data(xml.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::UnexpectedRoot { actual } => {
+                assert_eq!(actual, "NotInvoiceData");
+            }
+            other => panic!("expected UnexpectedRoot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_root_namespace_is_loud_fail() {
+        let xml = r#"<?xml version="1.0"?><InvoiceData xmlns="http://example.com/wrong"/>"#;
+        let err = validate_invoice_data(xml.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::UnexpectedRootNamespace { expected, actual } => {
+                assert_eq!(expected, NAV_NS_DATA);
+                assert_eq!(actual.as_deref(), Some("http://example.com/wrong"));
+            }
+            other => panic!("expected UnexpectedRootNamespace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_invoice_number_is_loud_fail() {
+        let bad = MIN_VALID.replace("<invoiceNumber>INV-default/00001</invoiceNumber>", "");
+        let err = validate_invoice_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::MissingRequiredChild { parent, expected } => {
+                assert_eq!(parent, "InvoiceData");
+                assert_eq!(expected, "invoiceNumber");
+            }
+            other => panic!("expected MissingRequiredChild invoiceNumber, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unexpected_element_is_loud_fail() {
+        let bad = MIN_VALID.replace(
+            "<invoiceMain>",
+            "<unknownElement>x</unknownElement><invoiceMain>",
+        );
+        let err = validate_invoice_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::UnexpectedElement { parent, element } => {
+                assert_eq!(parent, "InvoiceData");
+                assert_eq!(element, "unknownElement");
+            }
+            other => panic!("expected UnexpectedElement unknownElement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_invoice_issue_date_is_loud_fail() {
+        let bad = MIN_VALID.replace(
+            "<invoiceIssueDate>2026-05-20</invoiceIssueDate>",
+            "<invoiceIssueDate>2026/05/20</invoiceIssueDate>",
+        );
+        let err = validate_invoice_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::MalformedDate { field, actual } => {
+                assert_eq!(field, "invoiceIssueDate");
+                assert_eq!(actual, "2026/05/20");
+            }
+            other => panic!("expected MalformedDate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_numeric_amount_is_loud_fail() {
+        let bad = MIN_VALID.replace("<unitPrice>1000</unitPrice>", "<unitPrice>1k</unitPrice>");
+        let err = validate_invoice_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::NonNumericAmount { field, actual } => {
+                assert_eq!(field, "unitPrice");
+                assert_eq!(actual, "1k");
+            }
+            other => panic!("expected NonNumericAmount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_lines_is_loud_fail() {
+        let line_open = "        <line>";
+        let line_close = "        </line>";
+        let pre = MIN_VALID
+            .find(line_open)
+            .expect("MIN_VALID contains a <line>");
+        let post = MIN_VALID
+            .find(line_close)
+            .expect("MIN_VALID contains </line>")
+            + line_close.len();
+        let bad = format!("{}{}", &MIN_VALID[..pre], &MIN_VALID[post..]);
+        let err = validate_invoice_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::NoInvoiceLines => {}
+            other => panic!("expected NoInvoiceLines, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_variants_have_distinct_display() {
+        let v = vec![
+            NavXsdValidationError::MalformedXml {
+                position: 0,
+                message: "x".into(),
+            },
+            NavXsdValidationError::UnexpectedRoot { actual: "x".into() },
+            NavXsdValidationError::UnexpectedRootNamespace {
+                expected: "x",
+                actual: None,
+            },
+            NavXsdValidationError::MissingRequiredChild {
+                parent: "x",
+                expected: "y",
+            },
+            NavXsdValidationError::UnexpectedElement {
+                parent: "x",
+                element: "y".into(),
+            },
+            NavXsdValidationError::ChildOrderViolation {
+                parent: "x",
+                expected_before: "y",
+                actually_appeared_first: "z".into(),
+            },
+            NavXsdValidationError::CardinalityExceeded {
+                parent: "x",
+                element: "y",
+                max: 1,
+                actual: 2,
+            },
+            NavXsdValidationError::MalformedDate {
+                field: "x",
+                actual: "y".into(),
+            },
+            NavXsdValidationError::NonNumericAmount {
+                field: "x",
+                actual: "y".into(),
+            },
+            NavXsdValidationError::NoInvoiceLines,
+        ];
+
+        for i in 0..v.len() {
+            for j in (i + 1)..v.len() {
+                let a = format!("{}", v[i]);
+                let b = format!("{}", v[j]);
+                assert_ne!(
+                    a, b,
+                    "variants at index {i} and {j} render to the same Display; \
+                     ADR-0022 §Adversarial review bullet 4 requires pairwise-distinct"
+                );
+            }
+        }
+    }
+}

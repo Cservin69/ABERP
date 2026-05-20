@@ -541,14 +541,24 @@ async fn run_one_attempt(
             Err(AttemptError::Retryable(format!("HTTP {status}")))
         }
         Err(NavTransportError::QueryTransactionStatusResponseParse(msg)) => {
-            // A response-parse failure is technically NAV-side schema
-            // drift. Per ADR-0021 §"Items deferred" the runtime XSD
-            // validator is not landed yet; until it is, treat parse
-            // failure as Retryable so a transient malformed response
-            // doesn't immediately stick the invoice. If a future PR
-            // adds the XSD validator, this arm graduates to
-            // NonRetryable.
-            Err(AttemptError::Retryable(format!("parse: {msg}")))
+            // PR-9-0 / ADR-0022 graduation: the XSD validator is now
+            // landed on the issuance + submit + retry paths. With our
+            // own emitted bytes structurally checked, a parse failure
+            // on NAV's response side means NAV is sending us a shape
+            // we cannot parse — that is schema drift on NAV's side,
+            // NOT a transient transport blip. Retrying does not help
+            // (the next response will have the same shape). Loud-fail
+            // per CLAUDE.md rule 12: stick the invoice, surface to the
+            // operator, who will trigger the release-level
+            // schema-allowlist update or a hot-fix.
+            //
+            // Pre-PR-9-0 this arm returned `Retryable` per the
+            // ADR-0021 §"Items deferred" note. The note's named
+            // trigger has now fired (the validator landed). If the
+            // validator is ever removed, this arm must be re-flipped
+            // back to `Retryable` and the ADR-0022 supersede path
+            // exercised.
+            Err(AttemptError::NonRetryable(format!("parse: {msg}")))
         }
         Err(other) => {
             // Any other NavTransportError shape — e.g., a credential or

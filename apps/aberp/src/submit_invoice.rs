@@ -114,6 +114,23 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
     }
     tracing::info!(bytes = invoice_xml.len(), "InvoiceData XML loaded");
 
+    // 3a. PR-9-0 / ADR-0022: validate the on-disk XML BEFORE any NAV
+    //     call. Catches the case where the file was hand-edited between
+    //     `issue-invoice` and `submit-invoice` or where a future emitter
+    //     change diverges from the validator's allowlist. Loud-fail per
+    //     CLAUDE.md rule 12 — no `tokenExchange` happens, no audit
+    //     entries land.
+    aberp_nav_xsd_validator::validate_invoice_data(&invoice_xml).with_context(|| {
+        format!(
+            "NAV InvoiceData v3.0 invariant check (ADR-0022) failed for {}",
+            args.invoice_xml.display()
+        )
+    })?;
+    tracing::info!(
+        nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
+        "on-disk InvoiceData XML passed v3.0 invariant check before NAV submit"
+    );
+
     // 4. Load the previously-issued invoice + its idempotency_key.
     //    Scoped read tx so the connection is free for the audit-write
     //    tx below.

@@ -1,0 +1,25 @@
+[package]
+name = "aberp-nav-xsd-validator"
+description = "Hand-rolled runtime invariant check for NAV v3.0 <InvoiceData> XML (ADR-0022)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_nav_xsd_validator"
+path = "src/lib.rs"
+
+[dependencies]
+# Library boundary: thiserror per ADR-0021 Part A item 2.
+thiserror = { workspace = true }
+
+# XML parser. quick-xml is the project's XML toolkit per ADR-0021 §A8;
+# reusing it here avoids adding a second XML crate to the workspace.
+# The validator walks events; no `serialize` feature is required for
+# read-side use (the existing workspace pin already includes
+# `serialize` because the SOAP envelope writer needs it).
+quick-xml = { workspace = true }
