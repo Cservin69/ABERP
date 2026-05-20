@@ -42,9 +42,7 @@
 
 use std::path::Path;
 
-use aberp_audit_ledger::{
-    self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId,
-};
+use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
 use aberp_billing::{
     self as billing, AllocateArgs, AllocateOutcome, BillingStore, CustomerId, DraftInvoice,
     DuckDbBillingStore, Huf, IdempotencyKey, InvoiceId, InvoiceSeries, IssueInvoiceCommand,
@@ -55,6 +53,7 @@ use duckdb::Connection;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
+use crate::audit_payloads;
 use crate::binary_hash;
 use crate::cli::IssueInvoiceArgs;
 use crate::nav_xml::{self, CustomerInfo, NavParties, SupplierInfo};
@@ -202,8 +201,8 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
             name: input.customer.name,
         },
     };
-    let xml = nav_xml::render_invoice_data(&invoice, &series_code, &parties)
-        .context("render NAV XML")?;
+    let xml =
+        nav_xml::render_invoice_data(&invoice, &series_code, &parties).context("render NAV XML")?;
     nav_xml::write_to_path(&args.out, &xml)?;
     tracing::info!(path = %args.out.display(), bytes = xml.len(), "NAV XML written");
 
@@ -228,10 +227,7 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
 /// (handed back from the billing store via `into_connection`) and the
 /// resolved `InvoiceSeries`. No allocation occurs here; ADR-0008
 /// §Storage's transactional contract is engaged in `run_single_tx`.
-fn pre_tx_setup(
-    db_path: &Path,
-    series_code: &SeriesCode,
-) -> Result<(Connection, InvoiceSeries)> {
+fn pre_tx_setup(db_path: &Path, series_code: &SeriesCode) -> Result<(Connection, InvoiceSeries)> {
     let mut billing = DuckDbBillingStore::open(db_path)
         .with_context(|| format!("open billing DuckDB at {}", db_path.display()))?;
     billing.ensure_schema().context("ensure billing schema")?;
@@ -308,34 +304,38 @@ fn run_single_tx(
 
     if was_fresh {
         let actor = Actor::test_only(); // Real auth lands in a later PR.
-        let idem_str = format!("{:?}", idempotency_key);
+                                        // Canonical on-disk string per ADR-0005 (PR-6.1 F8). Stable
+                                        // across crate versions; the `Debug` derive that PR-5 used
+                                        // was not.
+        let idem_str = idempotency_key.to_canonical_string();
 
-        let payload_seq = format!(
-            "{{\"invoice_id\":\"{}\",\"seq\":{},\"reservation_id\":\"{}\"}}",
-            invoice.id.to_prefixed_string(),
-            invoice.sequence_number,
-            reservation.id.to_prefixed_string(),
+        // Typed payloads serialized via `serde_json::to_vec` per
+        // PR-6.1 F9. `format!`-built JSON would have to be hand-
+        // escaped against quotes / backslashes / control chars /
+        // non-ASCII — for the values PR-5 used it happened to be
+        // safe, but PR-7's NAV verbatim-XML payloads would not be.
+        let seq_payload = audit_payloads::InvoiceSequenceReservedPayload::from_outcome(
+            &invoice,
+            &reservation,
+            idempotency_key,
         );
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
             EventKind::InvoiceSequenceReserved,
-            payload_seq.into_bytes(),
+            seq_payload.to_bytes(),
             actor.clone(),
             Some(idem_str.clone()),
         )
         .context("audit_ledger::append_in_tx InvoiceSequenceReserved")?;
 
-        let payload_draft = format!(
-            "{{\"invoice_id\":\"{}\",\"lines\":{}}}",
-            invoice.id.to_prefixed_string(),
-            invoice.lines.len(),
-        );
+        let draft_payload =
+            audit_payloads::InvoiceDraftCreatedPayload::from_invoice(&invoice, idempotency_key);
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
             EventKind::InvoiceDraftCreated,
-            payload_draft.into_bytes(),
+            draft_payload.to_bytes(),
             actor,
             Some(idem_str),
         )

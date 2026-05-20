@@ -24,6 +24,24 @@ use crate::ports::storage::{AllocateArgs, AllocateOutcome, BillingStore};
 /// `IssueInvoiceCommand` itself. The caller generates this once and
 /// retries the command with the same key on failure; the allocator
 /// returns the prior outcome without burning a new number.
+///
+/// # Canonical string form (API contract)
+///
+/// The on-disk format — written to the `audit_ledger.idempotency_key`
+/// column and used for Layer-1 lookups — is the prefixed ULID per
+/// ADR-0005 §"Entity prefixes":
+///
+/// ```text
+/// idem_<26-character-Crockford-base32-ULID>
+/// ```
+///
+/// [`IdempotencyKey::to_canonical_string`] and
+/// [`IdempotencyKey::from_canonical_string`] are the one round-trip
+/// pair. The `Debug` derivation is **not** the on-disk format and is
+/// not stable across crate versions — anyone reaching for
+/// `format!("{:?}", key)` to persist or compare across processes is
+/// breaking the contract. PR-6.1 surfaced this trap (Fortnightly
+/// review F8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IdempotencyKey(pub Ulid);
 
@@ -31,11 +49,75 @@ impl IdempotencyKey {
     pub fn new() -> Self {
         Self(Ulid::new())
     }
+
+    /// Render in the ADR-0005 prefixed form: `idem_<ULID>`. This is the
+    /// authoritative on-disk and on-the-wire string for an
+    /// idempotency key. See the type-level doc-comment for the
+    /// contract.
+    pub fn to_canonical_string(&self) -> String {
+        format!("idem_{}", self.0)
+    }
+
+    /// Inverse of [`IdempotencyKey::to_canonical_string`]. Returns
+    /// `None` if `s` is missing the `idem_` prefix or if the bare ULID
+    /// part is not a valid Crockford-base32 ULID. Loud-fail rather
+    /// than producing a silently-wrong key.
+    pub fn from_canonical_string(s: &str) -> Option<Self> {
+        let bare = s.strip_prefix("idem_")?;
+        Ulid::from_string(bare).ok().map(Self)
+    }
 }
 
 impl Default for IdempotencyKey {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod idempotency_key_tests {
+    use super::*;
+
+    /// Round-trip: every key built by `new()` must survive
+    /// `to_canonical_string` followed by `from_canonical_string`. If
+    /// this test ever fails, the on-disk format has drifted and
+    /// audit-ledger rows from prior versions become unreadable.
+    #[test]
+    fn canonical_string_round_trip() {
+        for _ in 0..32 {
+            let original = IdempotencyKey::new();
+            let s = original.to_canonical_string();
+            assert!(
+                s.starts_with("idem_"),
+                "canonical string must carry the `idem_` prefix per ADR-0005"
+            );
+            assert_eq!(s.len(), 5 + 26, "prefix + 26-char ULID");
+            let parsed =
+                IdempotencyKey::from_canonical_string(&s).expect("round-trip parse must succeed");
+            assert_eq!(parsed, original);
+        }
+    }
+
+    #[test]
+    fn from_canonical_string_rejects_missing_prefix() {
+        let key = IdempotencyKey::new();
+        let bare_ulid = key.0.to_string();
+        assert!(
+            IdempotencyKey::from_canonical_string(&bare_ulid).is_none(),
+            "bare ULID without prefix must be rejected (no silent parse)"
+        );
+    }
+
+    #[test]
+    fn from_canonical_string_rejects_malformed_ulid() {
+        assert!(
+            IdempotencyKey::from_canonical_string("idem_not-a-real-ulid").is_none(),
+            "prefix-present-but-body-garbage must be rejected"
+        );
+        assert!(
+            IdempotencyKey::from_canonical_string("idem_").is_none(),
+            "prefix-only string must be rejected"
+        );
     }
 }
 

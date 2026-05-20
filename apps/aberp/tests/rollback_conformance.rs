@@ -27,8 +27,8 @@ use aberp_audit_ledger::{
     self as audit_ledger, Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId,
 };
 use aberp_billing::{
-    self as billing, AllocateArgs, BillingStore, CustomerId, DraftInvoice, DuckDbBillingStore,
-    Huf, IdempotencyKey, InvoiceId, InvoiceSeries, LineItem, ResetPolicy, SeriesCode, SeriesId,
+    self as billing, AllocateArgs, BillingStore, CustomerId, DraftInvoice, DuckDbBillingStore, Huf,
+    IdempotencyKey, InvoiceId, InvoiceSeries, LineItem, ResetPolicy, SeriesCode, SeriesId,
 };
 use duckdb::Connection;
 use std::panic::AssertUnwindSafe;
@@ -139,8 +139,12 @@ fn drop_without_commit_rolls_back_billing_and_audit() {
     // DuckDB's Drop-rolls-back contract.
     {
         let tx = conn.transaction().expect("begin tx");
-        let _outcome = billing::allocate_in_tx(&tx, build_allocate_args(series.id), OffsetDateTime::now_utc())
-            .expect("allocate_in_tx Ok");
+        let _outcome = billing::allocate_in_tx(
+            &tx,
+            build_allocate_args(series.id),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("allocate_in_tx Ok");
         audit_ledger::append_in_tx(
             &tx,
             &ledger_meta(),
@@ -155,8 +159,14 @@ fn drop_without_commit_rolls_back_billing_and_audit() {
     drop(conn);
 
     let (seq_state, reservations, invoices, lines, audit) = row_counts(&path);
-    assert_eq!(seq_state, 0, "invoice_sequence_state should be empty after rollback");
-    assert_eq!(reservations, 0, "invoice_sequence_reservation should be empty after rollback");
+    assert_eq!(
+        seq_state, 0,
+        "invoice_sequence_state should be empty after rollback"
+    );
+    assert_eq!(
+        reservations, 0,
+        "invoice_sequence_reservation should be empty after rollback"
+    );
     assert_eq!(invoices, 0, "invoice should be empty after rollback");
     assert_eq!(lines, 0, "invoice_line should be empty after rollback");
     assert_eq!(audit, 0, "audit_ledger should be empty after rollback");
@@ -224,11 +234,23 @@ fn panic_between_appends_rolls_back_billing_and_audit() {
     // gone — both billing and audit halves. This is the contract PR-6
     // exists to defend.
     let (seq_state, reservations, invoices, lines, audit) = row_counts(&path);
-    assert_eq!(seq_state, 0, "invoice_sequence_state should be empty after panic rollback");
-    assert_eq!(reservations, 0, "invoice_sequence_reservation should be empty after panic rollback");
+    assert_eq!(
+        seq_state, 0,
+        "invoice_sequence_state should be empty after panic rollback"
+    );
+    assert_eq!(
+        reservations, 0,
+        "invoice_sequence_reservation should be empty after panic rollback"
+    );
     assert_eq!(invoices, 0, "invoice should be empty after panic rollback");
-    assert_eq!(lines, 0, "invoice_line should be empty after panic rollback");
-    assert_eq!(audit, 0, "audit_ledger should be empty after panic rollback");
+    assert_eq!(
+        lines, 0,
+        "invoice_line should be empty after panic rollback"
+    );
+    assert_eq!(
+        audit, 0,
+        "audit_ledger should be empty after panic rollback"
+    );
 
     let ledger = Ledger::open(&path, tenant(), TEST_BINARY_HASH).expect("re-open ledger");
     let verified = ledger.verify_chain().expect("verify_chain Ok");

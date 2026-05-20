@@ -317,12 +317,12 @@ fn row_to_entry(row: &duckdb::Row<'_>) -> duckdb::Result<Entry> {
         .map_err(|_| duckdb_decode_err("time_wall is not RFC3339"))?;
     let actor = Actor::from_storage_json(&actor_json)
         .map_err(|_| duckdb_decode_err("actor JSON failed to deserialize"))?;
-    let kind = match kind_str.as_str() {
-        "test" => EventKind::Test,
-        "invoice.sequence_reserved" => EventKind::InvoiceSequenceReserved,
-        "invoice.draft_created" => EventKind::InvoiceDraftCreated,
-        _ => return Err(duckdb_decode_err("unknown event kind")),
-    };
+    // Single source of truth for the kind round-trip lives next to
+    // `as_str` in `entry::event_kind`. PR-6.1 (F12) replaced the
+    // hand-maintained match here with a delegate so adding a variant
+    // touches one file, not two.
+    let kind = EventKind::from_storage_str(&kind_str)
+        .map_err(|_| duckdb_decode_err("unknown event kind"))?;
 
     Ok(Entry {
         id: EntryId(id_ulid),

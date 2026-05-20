@@ -29,5 +29,6 @@ a PR that updates this file and the corresponding module.
 | `cam`  | CAM artifact / toolpath             | cad               | |
 | `aud`  | Audit ledger entry                  | audit             | Hash-chained |
 | `evt`  | Domain event envelope               | platform          | |
+| `idem` | Idempotency key (Layer-1 retries)   | billing           | Per ADR-0009 §5; same ULID for retries of the same command. Canonical string is the on-disk format stored in `audit_ledger.idempotency_key` |
 
 **Reserved, not yet used:** `prj` (project), `wrk` (work order), `mat` (material spec), `bom` (bill of materials).

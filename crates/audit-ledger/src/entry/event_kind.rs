@@ -30,11 +30,69 @@ pub enum EventKind {
 }
 
 impl EventKind {
+    /// Render in the on-disk form. Paired with [`EventKind::from_storage_str`]
+    /// as a round-trip-proven pair (unit tests in this module check that
+    /// for every variant `V`, `from_storage_str(V.as_str()) == Ok(V)`).
     pub fn as_str(&self) -> &'static str {
         match self {
             EventKind::Test => "test",
             EventKind::InvoiceSequenceReserved => "invoice.sequence_reserved",
             EventKind::InvoiceDraftCreated => "invoice.draft_created",
         }
+    }
+
+    /// Parse the on-disk form back into an `EventKind`. Errors on
+    /// unknown strings — silent fallback would mask schema drift per
+    /// CLAUDE.md rule 12 ("fail loud").
+    ///
+    /// Adding a new `EventKind` variant requires three coordinated
+    /// edits: the variant itself, an arm in [`EventKind::as_str`],
+    /// and an arm here. The round-trip unit test below will fail
+    /// loudly if `as_str` and `from_storage_str` ever drift apart
+    /// for an existing variant. Adding a variant without updating
+    /// this function is a compile error only if the new variant's
+    /// `as_str` arm is also added — caller is on the hook for both;
+    /// PR-6.1 surfaced this trap (Fortnightly review F12).
+    pub fn from_storage_str(s: &str) -> Result<Self, &'static str> {
+        match s {
+            "test" => Ok(EventKind::Test),
+            "invoice.sequence_reserved" => Ok(EventKind::InvoiceSequenceReserved),
+            "invoice.draft_created" => Ok(EventKind::InvoiceDraftCreated),
+            _ => Err("unknown EventKind storage string"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trip every known variant. If a future contributor adds a
+    /// variant + `as_str` arm but forgets the `from_storage_str` arm,
+    /// this test fails for that variant — the maintenance trap F12
+    /// named is now caught at test time, not at runtime against a
+    /// production row.
+    #[test]
+    fn round_trip_for_every_variant() {
+        // Hand-listed so a future variant addition makes the maintainer
+        // *think* about whether they updated this list. `strum`-style
+        // auto-iteration would silently exclude a new variant if the
+        // contributor forgot to add a derive — exactly the trap.
+        let variants = [
+            EventKind::Test,
+            EventKind::InvoiceSequenceReserved,
+            EventKind::InvoiceDraftCreated,
+        ];
+        for v in variants {
+            let s = v.as_str();
+            let parsed = EventKind::from_storage_str(s).unwrap_or_else(|e| panic!("{s:?} -> {e}"));
+            assert_eq!(parsed, v, "round-trip mismatch for {s:?}");
+        }
+    }
+
+    #[test]
+    fn from_storage_str_rejects_unknown() {
+        assert!(EventKind::from_storage_str("invoice.future_kind").is_err());
+        assert!(EventKind::from_storage_str("").is_err());
     }
 }

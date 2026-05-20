@@ -11,6 +11,7 @@
 use anyhow::Result;
 use clap::Parser;
 
+mod audit_payloads;
 mod binary_hash;
 mod cli;
 mod issue_invoice;
