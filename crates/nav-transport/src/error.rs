@@ -17,6 +17,7 @@
 //!   4. SOAP envelope construction (PR-7-B-1).
 //!   5. tokenExchange operation (PR-7-B-2).
 //!   6. manageInvoice operation (PR-7-B-3).
+//!   7. queryTransactionStatus operation (PR-7-C-1).
 //!
 //! Each variant carries enough context for an audit-ledger entry without
 //! leaking secret material — credential errors deliberately do NOT
@@ -183,4 +184,45 @@ pub enum NavTransportError {
     /// PR-7-C (the ack-poll PR has the same shape).
     #[error("manageInvoice retryable error: {code} — {message}")]
     ManageInvoiceRetryable { code: String, message: String },
+
+    // ── 7. queryTransactionStatus operation (PR-7-C-1) ──────────────
+    /// HTTP-layer failure on queryTransactionStatus. Same shape as
+    /// `TokenExchangeHttp` / `ManageInvoiceHttp`; held distinct so the
+    /// audit-evidence bundle can distinguish a transport-layer failure
+    /// against each operation without inspecting the request URL.
+    #[error("queryTransactionStatus HTTP call failed: {0}")]
+    QueryTransactionStatusHttp(#[source] reqwest::Error),
+
+    /// NAV returned a non-success HTTP status to queryTransactionStatus.
+    /// The body itself is captured by the caller per ADR-0009 §8 (the
+    /// poll loop in `apps/aberp/src/poll_ack.rs` does NOT write an
+    /// audit entry for this case — there is no parsed `ack_status` to
+    /// emit. Operator triage proceeds via the tracing event and the
+    /// `SubmissionStuck` typestate transition.).
+    #[error("queryTransactionStatus returned non-success HTTP status: {status}")]
+    QueryTransactionStatusHttpStatus { status: u16 },
+
+    /// The queryTransactionStatus response body could not be parsed
+    /// against the expected `<QueryTransactionStatusResponse>` shape —
+    /// missing `<invoiceStatus>`, unknown enumeration value, malformed
+    /// XML, unexpected root element. Loud per CLAUDE.md rule 12; the
+    /// alternative (treat-as-retry or treat-as-terminal) would either
+    /// loop the poll forever or transition to the wrong terminal state.
+    #[error("queryTransactionStatus response parse failed: {0}")]
+    QueryTransactionStatusResponseParse(String),
+
+    /// NAV responded with a non-retryable application-layer error
+    /// (`INVALID_SECURITY_USER`, `INVALID_REQUEST_SIGNATURE`,
+    /// `INCORRECT_REQUEST_SCHEMA`, `SCHEMA_VIOLATION` per ADR-0009 §5).
+    /// The poll loop transitions the invoice to `SubmissionStuck`; no
+    /// further poll attempts.
+    #[error("queryTransactionStatus non-retryable error: {code} — {message}")]
+    QueryTransactionStatusNonRetryable { code: String, message: String },
+
+    /// NAV responded with a retryable application-layer error
+    /// (`OPERATION_FAILED` per ADR-0009 §5). The poll loop treats this
+    /// the same as an intermediate ack-status: count the attempt, back
+    /// off, and try again until terminal or attempts exhausted.
+    #[error("queryTransactionStatus retryable error: {code} — {message}")]
+    QueryTransactionStatusRetryable { code: String, message: String },
 }

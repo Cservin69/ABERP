@@ -142,4 +142,263 @@ impl SubmittedInvoice {
             .iter()
             .try_fold(Huf::ZERO, |acc, line| acc.checked_add(line.gross_total()?))
     }
+
+    /// Consume this `SubmittedInvoice` and produce a [`FinalizedInvoice`].
+    /// Driven by NAV's terminal-positive `SAVED` ack per ADR-0009 §2.
+    /// The transition consumes `self` per the new-type-state rule — a
+    /// finalized invoice cannot be re-polled, re-submitted, or re-
+    /// finalized.
+    pub fn into_finalized(self) -> FinalizedInvoice {
+        FinalizedInvoice {
+            id: self.id,
+            series_id: self.series_id,
+            customer_id: self.customer_id,
+            lines: self.lines,
+            issue_date: self.issue_date,
+            sequence_number: self.sequence_number,
+            fiscal_year: self.fiscal_year,
+            nav_transaction_id: self.nav_transaction_id,
+        }
+    }
+
+    /// Consume this `SubmittedInvoice` and produce a [`RejectedInvoice`].
+    /// Driven by NAV's terminal-negative `ABORTED` ack per ADR-0009 §2.
+    /// The rejected sequence slot is NOT reused (gap-free invariant);
+    /// the audit ledger documents the rejection and a corrective new
+    /// invoice must be issued.
+    pub fn into_rejected(self) -> RejectedInvoice {
+        RejectedInvoice {
+            id: self.id,
+            series_id: self.series_id,
+            customer_id: self.customer_id,
+            lines: self.lines,
+            issue_date: self.issue_date,
+            sequence_number: self.sequence_number,
+            fiscal_year: self.fiscal_year,
+            nav_transaction_id: self.nav_transaction_id,
+        }
+    }
+
+    /// Consume this `SubmittedInvoice` and produce a
+    /// [`SubmissionStuckInvoice`]. Driven by the poll loop running out
+    /// of bounded retries per ADR-0009 §5, or by a NAV-side non-
+    /// retryable error during the poll. Operator-action-required; the
+    /// audit ledger carries the last NAV status (typically
+    /// `RECEIVED` / `PROCESSING`) or the NAV error code.
+    pub fn into_submission_stuck(self) -> SubmissionStuckInvoice {
+        SubmissionStuckInvoice {
+            id: self.id,
+            series_id: self.series_id,
+            customer_id: self.customer_id,
+            lines: self.lines,
+            issue_date: self.issue_date,
+            sequence_number: self.sequence_number,
+            fiscal_year: self.fiscal_year,
+            nav_transaction_id: self.nav_transaction_id,
+        }
+    }
+}
+
+/// A finalized invoice: NAV's `queryTransactionStatus` returned `SAVED`
+/// per ADR-0009 §2. The invoice is legally issued and reported. No
+/// transition out of this state in PR-7-C scope; ADR-0009 §6 names
+/// `Amended` (a MODIFY chain invoice references this one) and `Storno`
+/// (a STORNO chain invoice cancels this one) as the side-paths that
+/// will be added when their first call site materialises.
+///
+/// Fields mirror [`SubmittedInvoice`] verbatim — the typestate machinery
+/// is the only thing that changes at this transition. Carrying the full
+/// body forward lets the operator-visible summary read the totals
+/// without re-loading the `invoice` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizedInvoice {
+    pub id: InvoiceId,
+    pub series_id: SeriesId,
+    pub customer_id: CustomerId,
+    pub lines: Vec<LineItem>,
+    pub issue_date: OffsetDateTime,
+    pub sequence_number: u64,
+    pub fiscal_year: i32,
+    /// NAV-assigned transaction id from the prior `manageInvoice`
+    /// response. Kept on the finalized invoice so the audit-evidence
+    /// bundle (ADR-0009 §8) can be reconstructed from this state alone.
+    pub nav_transaction_id: String,
+}
+
+impl FinalizedInvoice {
+    /// Sum of all line gross totals. Returns `None` on overflow.
+    /// Mirrors `ReadyInvoice::total_gross` / `SubmittedInvoice::total_gross`
+    /// so the post-terminal flow can produce the same operator-visible
+    /// totals at every stage.
+    pub fn total_gross(&self) -> Option<Huf> {
+        self.lines
+            .iter()
+            .try_fold(Huf::ZERO, |acc, line| acc.checked_add(line.gross_total()?))
+    }
+}
+
+/// A rejected invoice: NAV's `queryTransactionStatus` returned `ABORTED`
+/// per ADR-0009 §2. The sequence number is NOT reused; the operator
+/// must issue a corrective new invoice. The fields mirror
+/// [`SubmittedInvoice`] for the same operator-visible-totals reason as
+/// [`FinalizedInvoice`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedInvoice {
+    pub id: InvoiceId,
+    pub series_id: SeriesId,
+    pub customer_id: CustomerId,
+    pub lines: Vec<LineItem>,
+    pub issue_date: OffsetDateTime,
+    pub sequence_number: u64,
+    pub fiscal_year: i32,
+    pub nav_transaction_id: String,
+}
+
+impl RejectedInvoice {
+    /// Sum of all line gross totals. Returns `None` on overflow.
+    pub fn total_gross(&self) -> Option<Huf> {
+        self.lines
+            .iter()
+            .try_fold(Huf::ZERO, |acc, line| acc.checked_add(line.gross_total()?))
+    }
+}
+
+/// A submission-stuck invoice: bounded retries on the poll loop were
+/// exhausted, OR NAV returned a non-retryable error during the poll
+/// (per ADR-0009 §5). No automatic state advance — the operator
+/// unblocks via a typed `RetrySubmission` or `MarkSubmissionAbandoned`
+/// command (future scope; ADR-0009 §5 names both). Fields mirror
+/// [`SubmittedInvoice`] verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionStuckInvoice {
+    pub id: InvoiceId,
+    pub series_id: SeriesId,
+    pub customer_id: CustomerId,
+    pub lines: Vec<LineItem>,
+    pub issue_date: OffsetDateTime,
+    pub sequence_number: u64,
+    pub fiscal_year: i32,
+    pub nav_transaction_id: String,
+}
+
+impl SubmissionStuckInvoice {
+    /// Sum of all line gross totals. Returns `None` on overflow.
+    pub fn total_gross(&self) -> Option<Huf> {
+        self.lines
+            .iter()
+            .try_fold(Huf::ZERO, |acc, line| acc.checked_add(line.gross_total()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Typestate-transition tests for PR-7-C-2. The new-type-state
+    //! pattern's compile-time enforcement (illegal transitions are
+    //! compile errors) cannot be exercised by a unit test, so these
+    //! tests pin the runtime invariant: a transition consumes the
+    //! source state and preserves every load-bearing field on the
+    //! destination state. If a future refactor drops or reorders a
+    //! field-copy, the field-by-field assertions catch it loud.
+    //!
+    //! CLAUDE.md rule 9: "tests verify intent, not just behavior." The
+    //! intent here is "transitions are pure renames of the typestate;
+    //! the underlying invoice data is identical post-transition." A
+    //! test that only checked `id` would still pass if the transition
+    //! lost half the lines — the field-by-field walk closes that.
+    use super::*;
+    use crate::domain::ids::{CustomerId, InvoiceId, SeriesId};
+
+    fn fixture_submitted() -> SubmittedInvoice {
+        SubmittedInvoice {
+            id: InvoiceId::new(),
+            series_id: SeriesId::new(),
+            customer_id: CustomerId::new(),
+            lines: vec![
+                LineItem {
+                    description: "widget A".to_string(),
+                    quantity: 3,
+                    unit_price: Huf(1_000),
+                    vat_rate_basis_points: 2700,
+                },
+                LineItem {
+                    description: "widget B".to_string(),
+                    quantity: 1,
+                    unit_price: Huf(500),
+                    vat_rate_basis_points: 2700,
+                },
+            ],
+            issue_date: OffsetDateTime::now_utc(),
+            sequence_number: 42,
+            fiscal_year: 0,
+            nav_transaction_id: "TXID-fixture-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn into_finalized_preserves_every_field() {
+        let s = fixture_submitted();
+        let id = s.id;
+        let series_id = s.series_id;
+        let customer_id = s.customer_id;
+        let lines = s.lines.clone();
+        let issue_date = s.issue_date;
+        let seq = s.sequence_number;
+        let fy = s.fiscal_year;
+        let txid = s.nav_transaction_id.clone();
+
+        let f = s.into_finalized();
+        assert_eq!(f.id, id);
+        assert_eq!(f.series_id, series_id);
+        assert_eq!(f.customer_id, customer_id);
+        assert_eq!(f.lines, lines);
+        assert_eq!(f.issue_date, issue_date);
+        assert_eq!(f.sequence_number, seq);
+        assert_eq!(f.fiscal_year, fy);
+        assert_eq!(f.nav_transaction_id, txid);
+    }
+
+    #[test]
+    fn into_rejected_preserves_every_field() {
+        let s = fixture_submitted();
+        let id = s.id;
+        let lines = s.lines.clone();
+        let seq = s.sequence_number;
+        let txid = s.nav_transaction_id.clone();
+
+        let r = s.into_rejected();
+        assert_eq!(r.id, id);
+        assert_eq!(r.lines, lines);
+        assert_eq!(r.sequence_number, seq);
+        assert_eq!(r.nav_transaction_id, txid);
+    }
+
+    #[test]
+    fn into_submission_stuck_preserves_every_field() {
+        let s = fixture_submitted();
+        let id = s.id;
+        let lines = s.lines.clone();
+        let seq = s.sequence_number;
+        let txid = s.nav_transaction_id.clone();
+
+        let stuck = s.into_submission_stuck();
+        assert_eq!(stuck.id, id);
+        assert_eq!(stuck.lines, lines);
+        assert_eq!(stuck.sequence_number, seq);
+        assert_eq!(stuck.nav_transaction_id, txid);
+    }
+
+    #[test]
+    fn total_gross_consistent_across_states() {
+        // 3 * 1000 = 3000 net, 27% VAT = 810, gross = 3810
+        // 1 * 500  =  500 net, 27% VAT = 135, gross =  635
+        // total gross = 4445
+        let s = fixture_submitted();
+        let s_gross = s.total_gross().expect("totals");
+        let s2 = s.clone();
+        let s3 = s.clone();
+
+        assert_eq!(s2.into_finalized().total_gross().unwrap(), s_gross);
+        assert_eq!(s3.into_rejected().total_gross().unwrap(), s_gross);
+        assert_eq!(s.into_submission_stuck().total_gross().unwrap(), s_gross);
+    }
 }

@@ -7,7 +7,10 @@
 
 // ── Domain value types ────────────────────────────────────────────────
 pub use crate::domain::ids::{CustomerId, InvoiceId, ReservationId, SeriesId};
-pub use crate::domain::invoice::{DraftInvoice, LineItem, ReadyInvoice, SubmittedInvoice};
+pub use crate::domain::invoice::{
+    DraftInvoice, FinalizedInvoice, LineItem, ReadyInvoice, RejectedInvoice,
+    SubmissionStuckInvoice, SubmittedInvoice,
+};
 pub use crate::domain::money::Huf;
 pub use crate::domain::reservation::{ReservationStatus, SequenceReservation};
 pub use crate::domain::series::{InvoiceSeries, ResetPolicy, SeriesCode};

@@ -14,7 +14,7 @@
 use anyhow::Result;
 use clap::Parser;
 
-use aberp::{cli, issue_invoice, setup_nav_credentials, submit_invoice};
+use aberp::{cli, issue_invoice, poll_ack, setup_nav_credentials, submit_invoice};
 
 fn main() -> Result<()> {
     init_tracing();
@@ -23,6 +23,7 @@ fn main() -> Result<()> {
         cli::Command::IssueInvoice(a) => issue_invoice::run(&a),
         cli::Command::SubmitInvoice(a) => submit_invoice::run(&a),
         cli::Command::SetupNavCredentials(a) => setup_nav_credentials::run(&a),
+        cli::Command::PollAck(a) => poll_ack::run(&a),
     }
 }
 

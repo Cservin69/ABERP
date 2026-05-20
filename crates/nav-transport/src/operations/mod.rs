@@ -1,7 +1,7 @@
-//! Typed NAV operations: `tokenExchange` (PR-7-B-2) and `manageInvoice`
-//! (PR-7-B-3).
+//! Typed NAV operations: `tokenExchange` (PR-7-B-2), `manageInvoice`
+//! (PR-7-B-3), and `queryTransactionStatus` (PR-7-C-1).
 //!
-//! Both operations share the same flow shape:
+//! All three operations share the same flow shape:
 //!
 //!   1. Render the SOAP envelope (`crate::soap`).
 //!   2. POST it to the endpoint-specific URL via the pinned-trust
@@ -26,12 +26,17 @@
 //!   - `manage_invoice::call` returns a `ManageInvoiceOutcome` whose
 //!     `transaction_id` is the NAV-assigned tracking id and whose
 //!     `request_xml` / `response_xml` are again `Vec<u8>`.
+//!   - `query_transaction_status::call` returns a
+//!     `QueryTransactionStatusOutcome` whose `processing_status` is the
+//!     parsed `<invoiceStatus>` enum (`RECEIVED` / `PROCESSING` /
+//!     `SAVED` / `ABORTED`) and whose `request_xml` / `response_xml`
+//!     carry the verbatim bytes for the audit-ledger
+//!     `InvoiceAckStatus` entry the poll-loop emits per attempt.
 //!
-//! Neither operation writes to the audit ledger directly — the binary
-//! is responsible for that per ADR-0008 §Storage (same transaction as
-//! the billing state change). These operations return verbatim bytes;
-//! the caller wraps them in typed audit-payload structs (PR-7-B-3
-//! adds three new variants in `apps/aberp/src/audit_payloads.rs`).
+//! None of these operations write to the audit ledger directly — the
+//! binary is responsible for that per ADR-0008 §Storage. These
+//! operations return verbatim bytes; the caller wraps them in typed
+//! audit-payload structs in `apps/aberp/src/audit_payloads.rs`.
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -39,6 +44,7 @@ use quick_xml::Reader;
 use crate::error::NavTransportError;
 
 pub mod manage_invoice;
+pub mod query_transaction_status;
 pub mod token_exchange;
 
 /// Outcome of `<common:result>` parsing — every NAV response carries

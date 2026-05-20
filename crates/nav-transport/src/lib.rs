@@ -28,19 +28,32 @@
 //!   - [`operations::token_exchange`] — `tokenExchange` call against
 //!     the pinned [`NavTransport`].
 //!
-//! # PR-7-B-3 scope (this PR's third commit)
+//! # PR-7-B-3 scope (landed)
 //!
 //!   - [`operations::manage_invoice`] — `manageInvoice` call + typed
 //!     response parsing + retryable/non-retryable error mapping per
 //!     ADR-0009 §5.
 //!
+//! # PR-7-C-1 scope (this PR)
+//!
+//!   - [`operations::query_transaction_status`] —
+//!     `queryTransactionStatus` call + typed
+//!     [`operations::query_transaction_status::ProcessingStatus`]
+//!     (`RECEIVED` / `PROCESSING` / `SAVED` / `ABORTED`) parse. The
+//!     bounded poll loop, audit-ledger emission per poll, and the
+//!     `SubmittedInvoice → {Finalized, Rejected, SubmissionStuck}`
+//!     typestate advance live in the binary
+//!     (`apps/aberp/src/poll_ack.rs`, landed in PR-7-C-2).
+//!
 //! # What this crate still does NOT provide
 //!
-//!   - `queryTransactionStatus` ack-poll loop (PR-7-C).
-//!   - `manageAnnulment` (technical annulment, PR-7-C+).
+//!   - `manageAnnulment` (technical annulment, future PR).
+//!   - `queryInvoiceCheck` (Layer-2 idempotency disambiguation per
+//!     ADR-0009 §5; future PR).
 //!   - Audit-ledger writes — those are the binary's responsibility,
 //!     called from the NAV submission path in `apps/aberp/src/
-//!     submit_invoice.rs`.
+//!     submit_invoice.rs` and the poll-loop path in
+//!     `apps/aberp/src/poll_ack.rs`.
 
 #![forbid(unsafe_code)]
 

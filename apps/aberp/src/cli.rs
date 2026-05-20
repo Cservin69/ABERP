@@ -43,6 +43,28 @@ pub enum Command {
     /// redirect from a file with restrictive permissions, or run on
     /// a workstation where shell history is not synced.
     SetupNavCredentials(SetupNavCredentialsArgs),
+
+    /// Poll NAV's `queryTransactionStatus` for a previously-submitted
+    /// invoice and advance the typestate to its terminal state per
+    /// ADR-0009 §2 (PR-7-C-2).
+    ///
+    /// The `transactionId` is looked up from the most-recent
+    /// `InvoiceSubmissionResponse` audit-ledger entry for the given
+    /// `--invoice-id` — operators do NOT pass it explicitly, both
+    /// because it is opaque and because the audit-ledger lookup is
+    /// the load-bearing source of truth per the PR-7-B-3 design
+    /// assumption A5/A6 ("the audit ledger carries the
+    /// submission_state fact; no billing column").
+    ///
+    /// The bounded poll loop runs up to 5 attempts with exponential
+    /// backoff (1s, 2s, 4s, 8s, 16s — total wait cap 31s) per
+    /// ADR-0009 §5. On `SAVED` the invoice advances to
+    /// `FinalizedInvoice`; on `ABORTED` to `RejectedInvoice`; on
+    /// bounded retries exhausted (still RECEIVED/PROCESSING after the
+    /// last poll, or repeated retryable NAV errors) to
+    /// `SubmissionStuckInvoice` with a loud operator alert via
+    /// tracing.
+    PollAck(PollAckArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -116,6 +138,38 @@ pub struct SubmitInvoiceArgs {
 
     /// Which NAV environment to submit against. No default — explicit
     /// per ADR-0020 §1.
+    #[arg(long, value_enum)]
+    pub endpoint: NavEnv,
+}
+
+#[derive(Debug, Parser)]
+pub struct PollAckArgs {
+    /// Invoice id (prefixed form, `inv_<ULID>`) of the previously-
+    /// submitted invoice to poll. The transactionId is looked up from
+    /// the audit ledger — operators do not pass it on the CLI.
+    #[arg(long = "invoice-id")]
+    pub invoice_id: String,
+
+    /// Hungarian tax number of the submitter. Accepted forms:
+    /// `12345678`, `12345678-1`, `12345678-1-42`. Only the first 8
+    /// digits go to NAV per ADR-0009 §4. Same parser as
+    /// `submit-invoice`; passing the dashed full form produces
+    /// `INVALID_SECURITY_USER` from NAV.
+    #[arg(long = "tax-number")]
+    pub tax_number: String,
+
+    /// Path to the tenant DuckDB file.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — drives both the audit-ledger genesis hash
+    /// and the keychain service-name lookup
+    /// (`aberp.nav.<tenant_id>` per `crate::credentials::keychain`).
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Which NAV environment to poll against. No default — explicit
+    /// per ADR-0020 §1 (same posture as `submit-invoice`).
     #[arg(long, value_enum)]
     pub endpoint: NavEnv,
 }

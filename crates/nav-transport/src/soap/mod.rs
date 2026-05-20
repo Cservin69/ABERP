@@ -216,6 +216,49 @@ pub fn render_manage_invoice_request(
     )
 }
 
+/// Render a `<QueryTransactionStatusRequest>` body, ready for HTTP POST.
+///
+/// PR-7-C-1 consumer. This is a **non-`manageInvoice`** call per ADR-0009
+/// §4 — the request signature uses the plain three-input form
+/// (`requestId || requestTimestamp || xmlSignKey`), NOT the per-invoice-
+/// index extension that `manageInvoice` / `manageAnnulment` require.
+///
+/// `transaction_id` is the NAV-assigned tracking id returned by a prior
+/// `manageInvoice` call (`ManageInvoiceOutcome.transaction_id`). Treated
+/// as opaque; ABERP does not parse its shape.
+///
+/// `returnOriginalRequest` is sent as the literal `false` rather than
+/// omitted: NAV's v3.0 XSD declares it `minOccurs=0` with default `false`,
+/// but every consulted open-source client (pzs PHP, angro-kft Node) sends
+/// it explicitly. Matching that habit avoids `INCORRECT_REQUEST_SCHEMA`
+/// surprises when NAV tightens the schema in a future point release.
+pub fn render_query_transaction_status_request(
+    credentials: &NavCredentials,
+    tax_number_8: &str,
+    request_id: &str,
+    request_timestamp: &str,
+    transaction_id: &str,
+) -> Result<Vec<u8>, NavTransportError> {
+    let signature = request_signature(request_id, request_timestamp, credentials.sign_key_bytes());
+    render_request(
+        "QueryTransactionStatusRequest",
+        credentials,
+        tax_number_8,
+        request_id,
+        request_timestamp,
+        &signature,
+        |w| {
+            // XSD-sequence order per NAV v3.0:
+            //   1. transactionId
+            //   2. returnOriginalRequest (optional, defaulted false, sent
+            //      explicitly per the rationale above)
+            write_text_in_default_ns(w, "transactionId", transaction_id)?;
+            write_text_in_default_ns(w, "returnOriginalRequest", "false")?;
+            Ok(())
+        },
+    )
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Internal: shared envelope shell
 // ──────────────────────────────────────────────────────────────────────
@@ -224,11 +267,11 @@ pub fn render_manage_invoice_request(
 /// element with the two namespaces, `<common:header>`, `<common:user>`,
 /// `<software>`, then the per-operation body via the closure.
 ///
-/// Extracted so the two public renderers above (and any future
-/// `queryTransactionStatus` / `queryInvoiceCheck` in PR-7-C) share one
-/// body and one set of element-ordering invariants. The closure receives
-/// the writer positioned just after the `<software>` close tag and just
-/// before the root close tag.
+/// Extracted so the three public renderers above (and any future
+/// `queryInvoiceCheck` / `queryInvoiceDigest` / `manageAnnulment`) share
+/// one body and one set of element-ordering invariants. The closure
+/// receives the writer positioned just after the `<software>` close tag
+/// and just before the root close tag.
 fn render_request<F>(
     root_name: &str,
     credentials: &NavCredentials,
@@ -402,6 +445,58 @@ mod tests {
         )
         .expect_err("empty list must loud-fail");
         assert!(matches!(err, NavTransportError::ManageInvoiceEmpty));
+    }
+
+    #[test]
+    fn query_transaction_status_request_contains_required_blocks() {
+        let xml = render_query_transaction_status_request(
+            &fixture_credentials(),
+            "12345678",
+            "REQ12345ABCDEFG",
+            "20260520T120000Z",
+            "TXID-from-NAV-1234",
+        )
+        .expect("envelope renders");
+        let s = std::str::from_utf8(&xml).expect("UTF-8");
+
+        // Root + namespaces.
+        assert!(s.contains("<QueryTransactionStatusRequest"));
+        assert!(s.contains("xmlns=\"http://schemas.nav.gov.hu/OSA/3.0/api\""));
+        assert!(s.contains("xmlns:common=\"http://schemas.nav.gov.hu/NTCA/1.0/common\""));
+
+        // The four common-block invariants.
+        assert!(s.contains("<common:requestId>REQ12345ABCDEFG</common:requestId>"));
+        assert!(s.contains("<common:timestamp>20260520T120000Z</common:timestamp>"));
+        assert!(s.contains("<common:login>TECHNICAL_LOGIN</common:login>"));
+        assert!(s.contains("<common:taxNumber>12345678</common:taxNumber>"));
+        assert!(s.contains("cryptoType=\"SHA-512\""));
+        assert!(s.contains("cryptoType=\"SHA3-512\""));
+
+        // The two operation-specific elements, in XSD-sequence order.
+        let r_txid = s.find("<transactionId>").expect("transactionId present");
+        let r_ret = s
+            .find("<returnOriginalRequest>")
+            .expect("returnOriginalRequest present");
+        assert!(
+            r_txid < r_ret,
+            "transactionId must precede returnOriginalRequest: {s}"
+        );
+        assert!(s.contains("<transactionId>TXID-from-NAV-1234</transactionId>"));
+        assert!(s.contains("<returnOriginalRequest>false</returnOriginalRequest>"));
+
+        // Plaintext credentials MUST NOT appear.
+        assert!(
+            !s.contains("tech-password"),
+            "plaintext password leaked into envelope"
+        );
+        assert!(
+            !s.contains("SIGN-KEY-32BYTES-OF-FAKE-MATERIAL"),
+            "plaintext sign key leaked into envelope"
+        );
+        assert!(
+            !s.contains("1234567890ABCDEF"),
+            "plaintext change key leaked into envelope"
+        );
     }
 
     #[test]
