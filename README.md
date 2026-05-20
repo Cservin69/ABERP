@@ -31,10 +31,13 @@ ABERP/
     reviews/          ← adversarial review records
   crates/
     audit-ledger/     ← tamper-evident audit ledger (ADR-0008)
+    nav-transport/    ← NAV TLS transport + credentials (ADR-0009 §4, ADR-0020)
+    nav-xsd-validator/← <InvoiceData> v3.0 runtime invariant check (ADR-0022)
   modules/
     billing/          ← NAV invoice issuing (ADR-0009)
   apps/
     aberp/            ← the CLI binary
+    aberp-ui/         ← Tauri 2 + Svelte 5 operator UI shell (ADR-0004)
 ```
 
 ## Reading order

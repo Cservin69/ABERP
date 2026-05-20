@@ -1,0 +1,89 @@
+[package]
+name = "aberp-ui"
+description = "ABERP Tauri shell — launches `aberp serve` and brokers HTTPS+JSON calls to the Svelte SPA (ADR-0004, ADR-0007 §Tauri allow-list, ADR-0021 §Part B)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# PR-9-2: lib + bin split mirrors apps/aberp's PR-7-B-3 layout. The
+# integration tests under `tests/` import the handshake parser via the
+# library face; Tauri's `generate_context!` macro runs in `main.rs`
+# against the same library.
+[lib]
+name = "aberp_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aberp-ui"
+path = "src/main.rs"
+
+[build-dependencies]
+# Tauri 2 build step: parses tauri.conf.json + capabilities/*.json and
+# emits the wire-format the runtime uses. Workspace catalogue pins the
+# 2.x line; see root Cargo.toml.
+tauri-build = { workspace = true }
+
+[dependencies]
+# Tauri 2 runtime — no plugin features pulled in. The shell never
+# exposes fs::all or shell::open per ADR-0007 §Tauri allow-list; the
+# `aberp serve` subprocess is launched via plain `std::process` /
+# `tokio::process` from the Rust setup hook, which does NOT require a
+# Tauri capability and stays off the SPA's reachable surface.
+#
+# `wry` is re-enabled here as the platform web-renderer feature; the
+# workspace pin keeps default-features off so cross-platform variants
+# can swap renderers without churning the workspace line.
+tauri = { workspace = true, features = ["wry"] }
+
+# Binary boundary: anyhow per ADR-0021 Part A item 2 (same posture as
+# apps/aberp's main.rs).
+anyhow = { workspace = true }
+
+# Async runtime — Tauri 2 ships a tokio runtime; we pin the workspace
+# version so child-process management uses the same flavour.
+tokio = { workspace = true, features = ["process", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
+
+# HTTPS client to the loopback `aberp serve` listener. Same crate the
+# nav-transport crate uses; the workspace pin disables default native-
+# tls and turns on rustls so the trust-store posture stays uniform.
+reqwest = { workspace = true }
+
+# Pin-only TLS trust: build a custom `rustls::ClientConfig` with a
+# ServerCertVerifier that accepts iff SHA-256(DER) matches the
+# fingerprint printed by `aberp serve` on stdout. Per
+# `feedback_reqwest_trust_store`, hand the bare `ClientConfig` to
+# reqwest via `use_preconfigured_tls`. rustls 0.23 lives at the
+# workspace pin; the `aws_lc_rs` provider is installed at process
+# entry exactly the way apps/aberp's main.rs does it.
+rustls = { workspace = true }
+
+# JSON only — the SPA receives backend responses verbatim as
+# `serde_json::Value`. No DTO layer per ADR-0021 §Part B. `serde` is
+# NOT imported directly here; the day a Tauri-side type wants
+# `#[derive(Serialize)]` is the day it joins this Cargo.toml.
+serde_json = { workspace = true }
+
+# OS keychain — reads the session_token entry that `aberp serve`
+# minted on first launch (service `aberp.nav.<tenant>`, account
+# `session_token`). The Tauri shell does NOT mint tokens itself; the
+# CLI owns that side per A28.
+keyring = { workspace = true }
+
+# Hex decode of the fingerprint that `aberp serve` prints (lower-case,
+# no colons, matching `compute_cert_fingerprint`'s output).
+hex = { workspace = true }
+
+# SHA-256 of the leaf cert DER for pin verification.
+sha2 = { workspace = true }
+
+# Tracing — same pattern as apps/aberp.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# The integration test `tests/handshake_parse.rs` only needs the
+# library face; no test-support feature gate is required for PR-9-2.

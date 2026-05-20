@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ABERP",
+  "version": "0.0.0",
+  "identifier": "ch.aben.aberp",
+  "build": {
+    "beforeDevCommand": "npm --prefix ui run dev",
+    "beforeBuildCommand": "npm --prefix ui run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "ABERP",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 700,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "icon": ["icons/icon.png"],
+    "category": "Business",
+    "shortDescription": "ABERP — modular multi-tenant ERP (operator shell).",
+    "longDescription": "Local operator shell for ABERP. Launches the aberp backend on a loopback HTTPS listener and consumes it over the wire protocol defined by ADR-0021 §Part B."
+  }
+}

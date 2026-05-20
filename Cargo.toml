@@ -8,6 +8,9 @@
 #                              (ADR-0022). PR-9-0.
 #   modules/billing          - NAV invoice issuing module (ADR-0009).
 #   apps/aberp               - the CLI binary that wires modules together.
+#   apps/aberp-ui            - Tauri 2 + Svelte 5 operator UI shell (PR-9-2;
+#                              ADR-0004, ADR-0007 §Tauri allow-list,
+#                              ADR-0021 §Part B, ADR-0017).
 #
 # Dependency pins below come from ADR-0021 (pre-code consolidated baseline).
 # Cargo.lock is the load-bearing artifact per ADR-0007 section "Supply chain";
@@ -18,7 +21,8 @@
 # lands. This matches CLAUDE.md rule 2 (simplicity first) without losing
 # the pins, which remain authoritative in ADR-0021 Part A. (sha3 + aes
 # joined the catalogue in PR-7-B-1; axum + axum-server + rcgen + tower
-# joined in PR-9-1 — the wire-protocol PR.)
+# joined in PR-9-1 — the wire-protocol PR; tauri + tauri-build joined in
+# PR-9-2 — the operator-UI-shell PR.)
 
 [workspace]
 resolver = "2"
@@ -28,6 +32,7 @@ members = [
     "crates/nav-xsd-validator",
     "modules/billing",
     "apps/aberp",
+    "apps/aberp-ui",
 ]
 
 [workspace.package]
@@ -171,6 +176,21 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "
 # certs by hash" code path in OpenSSL / browsers / Tauri's allow-list
 # matches against; using hex here keeps that lineage.
 hex = "0.4"
+
+# ── PR-9-2 additions — Tauri operator UI shell per ADR-0004 ─────────
+#
+# Tauri 2.x is the desktop runtime. `default-features = false` strips
+# the bundled `wry` so a future cross-platform CI matrix can pick a
+# different web renderer per OS without churning this pin; the `wry`
+# feature is re-enabled in apps/aberp-ui's per-crate Cargo.toml so the
+# default-platform behaviour is unchanged. No plugin features are
+# pulled in at the workspace level — every plugin a future PR
+# integrates lands its pin alongside the PR per CLAUDE.md rule 2.
+#
+# tauri-build is the build-script counterpart that parses
+# tauri.conf.json + capabilities/*.json. Pinned at the same 2.x line.
+tauri = { version = "2", default-features = false }
+tauri-build = { version = "2", default-features = false }
 
 [profile.release]
 # Reproducible builds posture per ADR-0007 section "Supply chain".

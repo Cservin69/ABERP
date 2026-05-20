@@ -1,0 +1,119 @@
+/*
+ * ABERP design tokens — ADR-0017 (Tufte information-density discipline on
+ * a warm-charcoal foundation; surgical colour reserved for meaning;
+ * monospace tabular numbers; ambient kinetic for live data).
+ *
+ * Tokens are the enforcement mechanism (ADR-0017 §"Tokens are the
+ * enforcement mechanism"). Components MUST import from this file; a
+ * hardcoded hex value or pixel literal in a component is a code-review
+ * block. Drift happens when tokens are bypassed, not when they are used.
+ *
+ * Namespace shape matches the ADR's initial sketch:
+ *   --color-surface-*    backgrounds (warm charcoal)
+ *   --color-text-*       text (warm charcoal)
+ *   --color-signal-*     categorical signal
+ *   --space-*            spacing scale (4px base)
+ *   --type-size-*        typography scale
+ *   --type-family-*      body + monospace stacks
+ *   --motion-*           ambient motion (the only motion this file allows)
+ *
+ * Font families: system stacks for now. ADR-0017 §"Hungarian typography"
+ * defers the named body/mono families until the printed-invoice PR;
+ * Hungarian diacritic kerning is the constraint that pins the choice,
+ * and PR-9-2 has no printed-output path yet.
+ */
+
+:root {
+  /* ── Surface (warm charcoal — low saturation, slight warm tint) ─────── */
+  --color-surface-base: #1a1816;      /* app background — ~80% of pixels */
+  --color-surface-raised: #221f1c;    /* row hover, header bands */
+  --color-surface-sunken: #141210;    /* table inset, focus traps */
+  --color-surface-divider: #2c2825;   /* hairline borders */
+
+  /* ── Text (also warm charcoal — the chrome rule means low contrast for non-data) ─ */
+  --color-text-primary: #e8e4dc;
+  --color-text-secondary: #a89f93;
+  --color-text-muted: #6f685e;
+  --color-text-strong: #f5f0e6;       /* numeric primary, status labels */
+
+  /* ── Signal (the 20% — colour means something) ────────────────────────
+   * ADR-0017 §5: "Divergence has a signature color." That's the violet
+   * here, reserved for ABERP↔NAV record disagreement. No other surface
+   * uses it. */
+  --color-signal-positive: #6ea169;   /* SAVED, in-stock, reconciled */
+  --color-signal-negative: #c66060;   /* REJECTED, hard fail */
+  --color-signal-warning: #c89855;    /* RECEIVED, PROCESSING, stuck */
+  --color-signal-divergence: #8c6dc6; /* reserved violet — see ADR-0017 §5 */
+  --color-signal-muted: #555;         /* Unknown, missing state */
+
+  /* ── Spacing scale (4px base) ───────────────────────────────────────── */
+  --space-0: 0;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+
+  /* ── Typography ──────────────────────────────────────────────────────
+   * Body stack: system-ui first (each OS picks something that handles
+   *   Hungarian diacritics natively); falls through to platform-specific
+   *   fonts known to ship `ő` / `ű` with proper kerning.
+   * Mono stack: tabular figures matter — most monospace ships them by
+   *   default. `font-variant-numeric: tabular-nums` is asserted at the
+   *   table-cell level for defence in depth.
+   */
+  --type-family-body: system-ui, -apple-system, "Segoe UI", "Helvetica Neue", "Inter", "Source Sans Pro", "Liberation Sans", sans-serif;
+  --type-family-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", "Source Code Pro", "Liberation Mono", "Menlo", "Consolas", monospace;
+
+  --type-size-xs: 11px;
+  --type-size-sm: 12px;
+  --type-size-md: 13px;     /* default body for dense tables */
+  --type-size-lg: 15px;
+  --type-size-xl: 18px;
+  --type-size-xxl: 24px;
+
+  --type-line-tight: 1.15;
+  --type-line-normal: 1.4;
+  --type-line-loose: 1.6;
+
+  /* ── Motion (ambient, never theatrical — ADR-0017 §4) ──────────────── */
+  --motion-fade-in: 200ms ease-out;
+  --motion-pulse-live: 1200ms ease-in-out;
+  --motion-pulse-divergence: 1600ms ease-in-out;
+}
+
+/* Reset + global frame. Kept lean — no normalize.css, no resets-of-resets. */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--color-surface-base);
+  color: var(--color-text-primary);
+  font-family: var(--type-family-body);
+  font-size: var(--type-size-md);
+  line-height: var(--type-line-normal);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Ambient fade-in for newly-rendered content. Keyframe is opt-in via
+ * `animation: aberp-fade-in var(--motion-fade-in) both` on the element
+ * — components apply it where ADR-0017 calls for "live data." */
+@keyframes aberp-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
