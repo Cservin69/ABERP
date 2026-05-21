@@ -34,7 +34,7 @@
 //!     response parsing + retryable/non-retryable error mapping per
 //!     ADR-0009 §5.
 //!
-//! # PR-7-C-1 scope (this PR)
+//! # PR-7-C-1 scope (landed)
 //!
 //!   - [`operations::query_transaction_status`] —
 //!     `queryTransactionStatus` call + typed
@@ -45,15 +45,36 @@
 //!     typestate advance live in the binary
 //!     (`apps/aberp/src/poll_ack.rs`, landed in PR-7-C-2).
 //!
+//! # PR-13 scope (this PR — ADR-0026 §3)
+//!
+//!   - [`operations::manage_annulment`] — `manageAnnulment` call +
+//!     typed [`operations::manage_annulment::ManageAnnulmentOutcome`]
+//!     (transactionId + verbatim request/response bytes for the
+//!     audit-evidence pair). Wire half of the technical-annulment
+//!     surface; the request half landed in PR-12 (ADR-0025) as
+//!     `apps/aberp/src/request_technical_annulment.rs`.
+//!   - [`soap::render_manage_annulment_request`] +
+//!     [`soap::ManageAnnulmentItem`] — `<ManageAnnulmentRequest>`
+//!     envelope renderer. Structural mirror of
+//!     `render_manage_invoice_request` per ADR-0026 §3 (three
+//!     element-name renames + the literal `"ANNUL"` operation).
+//!   - Five new error variants in [`error::NavTransportError`]
+//!     (`ManageAnnulmentEmpty`, `ManageAnnulmentTooManyItems`,
+//!     `ManageAnnulmentHttp`, `ManageAnnulmentHttpStatus`,
+//!     `ManageAnnulmentResponseParse`,
+//!     `ManageAnnulmentNonRetryable`, `ManageAnnulmentRetryable`).
+//!
 //! # What this crate still does NOT provide
 //!
-//!   - `manageAnnulment` (technical annulment, future PR).
+//!   - `queryAnnulmentStatus` (annulment-receiver-confirmation
+//!     poll; future PR per ADR-0026 §"Follow-on PRs unblocked").
 //!   - `queryInvoiceCheck` (Layer-2 idempotency disambiguation per
 //!     ADR-0009 §5; future PR).
 //!   - Audit-ledger writes — those are the binary's responsibility,
-//!     called from the NAV submission path in `apps/aberp/src/
-//!     submit_invoice.rs` and the poll-loop path in
-//!     `apps/aberp/src/poll_ack.rs`.
+//!     called from the NAV submission paths in
+//!     `apps/aberp/src/submit_invoice.rs` (PR-7-B-3),
+//!     `apps/aberp/src/poll_ack.rs` (PR-7-C-2), and
+//!     `apps/aberp/src/submit_annulment.rs` (PR-13).
 
 #![forbid(unsafe_code)]
 

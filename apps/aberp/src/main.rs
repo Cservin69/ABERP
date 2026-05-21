@@ -16,7 +16,8 @@ use clap::Parser;
 
 use aberp::{
     cli, issue_invoice, issue_modification, issue_storno, mark_abandoned, poll_ack,
-    retry_submission, serve, setup_nav_credentials, submit_invoice,
+    request_technical_annulment, retry_submission, serve, setup_nav_credentials, submit_annulment,
+    submit_invoice,
 };
 
 fn main() -> Result<()> {
@@ -33,6 +34,8 @@ fn main() -> Result<()> {
         cli::Command::Serve(a) => serve::run(&a),
         cli::Command::IssueStorno(a) => issue_storno::run(&a),
         cli::Command::IssueModification(a) => issue_modification::run(&a),
+        cli::Command::RequestTechnicalAnnulment(a) => request_technical_annulment::run(&a),
+        cli::Command::SubmitAnnulment(a) => submit_annulment::run(&a),
     }
 }
 

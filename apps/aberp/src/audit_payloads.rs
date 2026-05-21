@@ -550,6 +550,235 @@ impl InvoiceModificationIssuedPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// InvoiceTechnicalAnnulmentRequested  (PR-12 / ADR-0025 — operator-
+// decision audit entry for a NAV-side technical annulment of a prior
+// data submission. Structurally distinct from STORNO + MODIFY: NOT a
+// chain entry, NO sequence-slot burn, NO derived typestate transition
+// on the base. The annulment's audit footprint is THIS payload alone;
+// the future submit-annulment PR will write `InvoiceSubmissionAttempt`
+// + `InvoiceSubmissionResponse` against the manageAnnulment wire call.)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceTechnicalAnnulmentRequested`].
+///
+/// Pinned by ADR-0025 §3. Written by `aberp request-technical-annulment`
+/// in a single DuckDB transaction. No companion entries
+/// (`InvoiceSequenceReserved` / `InvoiceDraftCreated` are NOT written —
+/// the annulment is not an invoice and does not burn a sequence slot,
+/// see ADR-0025 §1).
+///
+/// `prior_transaction_id` is captured from the most-recent prior
+/// `InvoiceSubmissionResponse` against the base — denormalized so the
+/// audit-evidence bundle (ADR-0009 §8) makes the annulment-target
+/// submission unambiguously identifiable without a second walk. Same
+/// posture as `InvoiceRetryRequestedPayload::prior_transaction_id` /
+/// `InvoiceMarkedAbandonedPayload::prior_transaction_id`.
+///
+/// `annulment_code` carries the canonical NAV wire-form string
+/// (`ERRATIC_DATA` / `ERRATIC_INVOICE_NUMBER` /
+/// `ERRATIC_INVOICE_ISSUE_DATE` / `ERRATIC_ELECTRONIC_HASH_VALUE`).
+/// The CLI's clap `ValueEnum` lowercased-hyphen form is converted to
+/// the canonical wire form before this payload is built (ADR-0025 §3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceTechnicalAnnulmentRequestedPayload {
+    /// The **base invoice's** id — prefixed `inv_<ULID>` form. The
+    /// annulment is FOR this invoice (not a new invoice produced by
+    /// the annulment), so the payload's `invoice_id` field IS the
+    /// base id directly. Key contrast with the storno/modify chain-
+    /// link payloads, which carry both `*_invoice_id` and
+    /// `base_invoice_id`.
+    pub invoice_id: String,
+    /// Idempotency key of the `RequestTechnicalAnnulmentCommand`.
+    /// Operator-decision idempotency, distinct from the base
+    /// invoice's issuance idempotency key. Same shape + role as
+    /// `InvoiceMarkedAbandonedPayload::idempotency_key`.
+    pub idempotency_key: String,
+    /// The base invoice's NAV `transactionId` (from the most-recent
+    /// prior `InvoiceSubmissionResponse` entry against the base).
+    /// Captured here so the audit-evidence bundle (ADR-0009 §8)
+    /// makes the annulment-target submission unambiguously
+    /// identifiable without a second walk back to the response entry.
+    pub prior_transaction_id: String,
+    /// One of the four NAV annulment codes in **canonical wire form**:
+    /// `ERRATIC_DATA`, `ERRATIC_INVOICE_NUMBER`,
+    /// `ERRATIC_INVOICE_ISSUE_DATE`, `ERRATIC_ELECTRONIC_HASH_VALUE`.
+    /// Stored as `String` (not a typed enum) per ADR-0025 §
+    /// "Alternatives considered" — the audit payload's serialization
+    /// shape is the canonical record; a typed-enum wrapper would
+    /// force serde-with adapters for a value that is canonical on
+    /// the wire. The CLI's clap-ValueEnum is the loud-fail boundary
+    /// (rejects unknown codes at parse time).
+    pub annulment_code: String,
+    /// Free-form operator-supplied reason text. Same posture as
+    /// `InvoiceRetryRequestedPayload::reason` /
+    /// `InvoiceMarkedAbandonedPayload::reason` — required at the CLI
+    /// boundary so the audit-evidence bundle (ADR-0009 §8) always
+    /// carries a human-readable justification for the annulment
+    /// decision.
+    pub reason: String,
+}
+
+impl InvoiceTechnicalAnnulmentRequestedPayload {
+    /// Build a payload from the parts the
+    /// `request-technical-annulment` orchestrator just resolved.
+    /// `new()` (not `from_outcome(...)`) because the payload's
+    /// fields cross the operator decision (code + reason) AND the
+    /// audit chain (invoice id + prior transaction id + idempotency
+    /// key); no single domain struct carries them all, and a
+    /// speculative `AnnulmentRequestOutcome` type would be a
+    /// CLAUDE.md rule-2 violation.
+    pub fn new(
+        invoice_id: &str,
+        idempotency_key: IdempotencyKey,
+        prior_transaction_id: &str,
+        annulment_code: &str,
+        reason: &str,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            prior_transaction_id: prior_transaction_id.to_string(),
+            annulment_code: annulment_code.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// InvoiceAnnulmentSubmissionAttempt  (PR-13 / ADR-0026 §2 — wire half
+// of the technical-annulment surface. Structural parallel to
+// `InvoiceSubmissionAttemptPayload` with the same field shape, but
+// deliberately forked as a distinct type so the type system enforces
+// the kind ⇄ payload binding even when the EventKind discriminator
+// is correct. Same posture as `InvoiceStornoIssuedPayload` vs
+// `InvoiceModificationIssuedPayload` — structurally similar, forked
+// deliberately so a future audit-evidence-bundle reader cannot
+// silently deserialize one as the other.)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceAnnulmentSubmissionAttempt`].
+///
+/// Written by the binary's `submit_annulment` flow just BEFORE the
+/// `manageAnnulment` POST returns — same capture-before-response
+/// posture as `InvoiceSubmissionAttemptPayload` per ADR-0009 §8.
+///
+/// `request_xml` is the verbatim bytes of the
+/// `<ManageAnnulmentRequest>` envelope (NOT the inner
+/// `<InvoiceAnnulment>` body; that lives on disk at the path the
+/// operator passed to `--annulment-xml`). The typed-struct path
+/// through `serde_json::to_vec` handles all JSON escaping per F9.
+///
+/// `idempotency_key` is the **annulment-request's** key (looked up
+/// from the prior `InvoiceTechnicalAnnulmentRequested` audit entry
+/// per ADR-0026 §6 + §7), NOT the base invoice's issuance key.
+/// Rationale: the annulment is a distinct operator decision per
+/// ADR-0025 §3 — the audit-evidence bundle reader walks back from
+/// this wire entry to the request entry via shared idempotency key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceAnnulmentSubmissionAttemptPayload {
+    /// The **base invoice's** id — prefixed `inv_<ULID>` form. The
+    /// annulment is FOR this invoice; same field semantics as
+    /// `InvoiceTechnicalAnnulmentRequestedPayload::invoice_id`.
+    pub invoice_id: String,
+    /// Idempotency key of the prior
+    /// `InvoiceTechnicalAnnulmentRequested` (the operator-decision
+    /// key minted by `request-technical-annulment`). Flows through
+    /// per ADR-0026 §"F8 contract" so a re-submission against the
+    /// same on-disk annulment XML carries the same key.
+    pub idempotency_key: String,
+    /// `"test"` or `"production"` — which NAV environment the
+    /// annulment was POSTed against. Same loud-fail surface as
+    /// `InvoiceSubmissionAttemptPayload::endpoint` (a production
+    /// annulment attempted against `api-test` is an operator-error
+    /// class that should be visible in the ledger without consulting
+    /// the URL).
+    pub endpoint: String,
+    /// Verbatim `<ManageAnnulmentRequest>` bytes (UTF-8). Same
+    /// serde_json base64-encoding behaviour for `Vec<u8>` as
+    /// `InvoiceSubmissionAttemptPayload::request_xml`, so the
+    /// round-trip preserves embedded quotes / backslashes /
+    /// non-ASCII bytes inside the operator's reason text.
+    pub request_xml: Vec<u8>,
+}
+
+impl InvoiceAnnulmentSubmissionAttemptPayload {
+    pub fn new(
+        invoice_id: &str,
+        idempotency_key: IdempotencyKey,
+        endpoint: &'static str,
+        request_xml: Vec<u8>,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            endpoint: endpoint.to_string(),
+            request_xml,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// InvoiceAnnulmentSubmissionResponse  (PR-13 / ADR-0026 §2 — wire-
+// response half. Same fork-from-`InvoiceSubmissionResponsePayload`
+// rationale as the attempt above.)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceAnnulmentSubmissionResponse`].
+///
+/// Written immediately after a successful `manageAnnulment`
+/// response is received. Carries the verbatim
+/// `<ManageAnnulmentResponse>` bytes per ADR-0009 §8 plus the
+/// parsed `transaction_id` (NAV's annulment-side tracking token —
+/// the future `query-annulment-status` poll will key on this id).
+///
+/// `transaction_id` is NAV-assigned. ABERP treats it as opaque; no
+/// shape parsing. Same posture as
+/// `InvoiceSubmissionResponsePayload::transaction_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceAnnulmentSubmissionResponsePayload {
+    /// The **base invoice's** id — prefixed `inv_<ULID>` form. Same
+    /// field semantics as the attempt payload's `invoice_id`.
+    pub invoice_id: String,
+    /// Annulment-request's idempotency key. Same per ADR-0026 §6 +
+    /// §7 + §"F8 contract".
+    pub idempotency_key: String,
+    /// NAV-assigned transaction id from the `manageAnnulment`
+    /// response. Opaque to ABERP; passed verbatim to a future
+    /// `query-annulment-status` call.
+    pub transaction_id: String,
+    /// Verbatim `<ManageAnnulmentResponse>` bytes.
+    pub response_xml: Vec<u8>,
+}
+
+impl InvoiceAnnulmentSubmissionResponsePayload {
+    pub fn new(
+        invoice_id: &str,
+        idempotency_key: IdempotencyKey,
+        transaction_id: &str,
+        response_xml: Vec<u8>,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            transaction_id: transaction_id.to_string(),
+            response_xml,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -951,5 +1180,181 @@ mod tests {
         let decoded: InvoiceSequenceReservedPayload =
             serde_json::from_slice(&bytes).expect("typed decode");
         assert_eq!(decoded, payload);
+    }
+
+    // ── PR-12 technical-annulment payload round-trips (ADR-0025 §3) ─
+
+    /// Round-trip the technical-annulment payload through serde.
+    /// Same field-by-field pin posture as
+    /// `modification_issued_round_trip`: CLAUDE.md rule 9 — assert
+    /// the intent, not just the round-trip equality. The four
+    /// chain-link-absent fields (`invoice_id` is the BASE, not a new
+    /// invoice; no chain index; no modification_issue_date) make the
+    /// shape contrast with STORNO/MODIFY load-bearing.
+    #[test]
+    fn technical_annulment_requested_round_trip() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceTechnicalAnnulmentRequestedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "TXID-42",
+            "ERRATIC_DATA",
+            "test invoice accidentally sent to production",
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoiceTechnicalAnnulmentRequestedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        // Field-by-field pin per CLAUDE.md rule 9.
+        assert_eq!(decoded.invoice_id, "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert!(decoded.idempotency_key.starts_with("idem_"));
+        assert_eq!(decoded.prior_transaction_id, "TXID-42");
+        assert_eq!(decoded.annulment_code, "ERRATIC_DATA");
+        assert_eq!(
+            decoded.reason,
+            "test invoice accidentally sent to production"
+        );
+    }
+
+    // ── PR-13 annulment wire-evidence payload round-trips (ADR-0026 §2) ─
+
+    /// Round-trip the annulment-wire-attempt payload. Field-by-field
+    /// pin per CLAUDE.md rule 9 — a future PartialEq-dropping
+    /// refactor still surfaces because each field is asserted. The
+    /// `endpoint` field is the load-bearing test/production
+    /// distinction; pin it explicitly so a future contributor cannot
+    /// silently drop the audit-bearing environment label.
+    #[test]
+    fn annulment_submission_attempt_round_trip() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceAnnulmentSubmissionAttemptPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "test",
+            fixture_hostile_xml(),
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoiceAnnulmentSubmissionAttemptPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.invoice_id, "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert!(decoded.idempotency_key.starts_with("idem_"));
+        assert_eq!(decoded.endpoint, "test");
+        assert_eq!(decoded.request_xml, fixture_hostile_xml());
+    }
+
+    /// Round-trip the annulment-wire-response payload. Same posture
+    /// as the attempt above; additionally pins `transaction_id`
+    /// round-trip cleanliness across JSON-hostile bytes (NAV's
+    /// annulment-side transaction ids are opaque, and defending
+    /// downstream tooling against unusual but legal characters is
+    /// the same posture
+    /// `submission_response_round_trips_hostile_xml` takes).
+    #[test]
+    fn annulment_submission_response_round_trip_with_hostile_txid() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceAnnulmentSubmissionResponsePayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "txid-with-\"-quote-and-\\-backslash",
+            fixture_hostile_xml(),
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoiceAnnulmentSubmissionResponsePayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(
+            decoded.transaction_id,
+            "txid-with-\"-quote-and-\\-backslash"
+        );
+        assert!(decoded.idempotency_key.starts_with("idem_"));
+    }
+
+    /// ADR-0026 §2 explicitly forks the annulment wire-evidence
+    /// payloads from the invoice ones for type-safe distinction.
+    /// Pin that the two attempt struct types do NOT round-trip
+    /// through each other's deserializer — even when the JSON shape
+    /// happens to be compatible (it is, because the field names are
+    /// the same). The type-system distinction is what stops a
+    /// future audit-evidence-bundle reader from silently
+    /// deserializing one as the other; this test pins the *intent*
+    /// (CLAUDE.md rule 9) — if a refactor merges the two struct
+    /// types into one, the type-equality assert at compile time
+    /// would catch the merge, but THIS test catches the case where
+    /// someone keeps two struct types but copy-pastes one's tests
+    /// against the other's bytes.
+    ///
+    /// Note: the JSON IS structurally identical (same field names);
+    /// the test verifies the typed Rust round-trip is field-for-field
+    /// equivalent across the disjoint discriminators, NOT that
+    /// serde refuses the cross-type decode. The discriminator lives
+    /// at the EventKind level, not in the JSON.
+    #[test]
+    fn annulment_attempt_payload_is_structurally_parallel_to_invoice_attempt() {
+        let idem = IdempotencyKey::new();
+        let annulment = InvoiceAnnulmentSubmissionAttemptPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "test",
+            b"<ManageAnnulmentRequest/>".to_vec(),
+        );
+        let invoice = InvoiceSubmissionAttemptPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "test",
+            b"<ManageInvoiceRequest/>".to_vec(),
+        );
+        // The two structs are deliberately distinct types per
+        // ADR-0026 §2; this is the load-bearing compile-time
+        // distinction. At runtime, both `to_bytes` outputs are
+        // valid JSON of the same shape, BUT a JSON value decoded
+        // from one cannot be assigned to the other without going
+        // through serde_json::from_slice — which is the call site
+        // where the type system enforces the distinction. The
+        // audit-evidence bundle reader keys on EventKind, not on
+        // payload JSON shape, so the discriminator is the
+        // load-bearing distinction.
+        let annulment_bytes = annulment.to_bytes();
+        let invoice_bytes = invoice.to_bytes();
+        // Different request_xml bytes -> different serialized JSON.
+        assert_ne!(annulment_bytes, invoice_bytes);
+    }
+
+    /// F9 trap-closing posture: the operator-supplied reason text may
+    /// carry JSON-hostile characters (quotes / backslashes / control
+    /// chars / non-ASCII). The typed-struct path MUST escape them and
+    /// produce valid JSON that round-trips. Mirror of
+    /// `marked_abandoned_round_trips_with_hostile_reason` /
+    /// `retry_requested_round_trips_with_hostile_reason`.
+    #[test]
+    fn technical_annulment_round_trips_with_hostile_reason() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceTechnicalAnnulmentRequestedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "txid-with-\"-quote-and-\\-backslash",
+            "ERRATIC_INVOICE_NUMBER",
+            "accountant note: \"customer X\" reported wrong number \\ ünïcödé",
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoiceTechnicalAnnulmentRequestedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        // Even the prior_transaction_id round-trips with hostile chars
+        // — NAV's tracking ids are opaque per
+        // `submission_response_round_trips_hostile_xml`'s same posture.
+        assert_eq!(
+            decoded.prior_transaction_id,
+            "txid-with-\"-quote-and-\\-backslash"
+        );
+        assert_eq!(decoded.annulment_code, "ERRATIC_INVOICE_NUMBER");
     }
 }

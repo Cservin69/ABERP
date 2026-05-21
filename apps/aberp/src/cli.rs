@@ -186,6 +186,86 @@ pub enum Command {
     /// rejected, abandoned, OR Storno-cancelled base are loud-fails
     /// before any ledger write (CLAUDE.md rule 12).
     IssueModification(IssueModificationArgs),
+
+    /// Submit a previously-requested technical annulment to NAV via
+    /// `tokenExchange` + `manageAnnulment` (ADR-0009 §6, ADR-0026;
+    /// PR-13). The annulment XML on disk (produced by
+    /// `request-technical-annulment --out ...`) is the body that
+    /// goes on the wire, base64-encoded inside the SOAP envelope.
+    ///
+    /// **Different NAV endpoint** from `submit-invoice`. The
+    /// `manageAnnulment` endpoint and the `<InvoiceAnnulment>`
+    /// body shape are distinct from `manageInvoice` /
+    /// `<InvoiceData>` per ADR-0009 §6 / ADR-0025 §1; that's why
+    /// this is a separate subcommand rather than an extension of
+    /// `submit-invoice` (which would have required a five-way
+    /// detector on the body root element). See ADR-0026 §1.
+    ///
+    /// On a successful `manageAnnulment` response, the NAV-assigned
+    /// annulment transaction id is recorded in the audit ledger
+    /// (the future `query-annulment-status` poll will key on it).
+    /// **The base invoice's typestate does NOT advance** per
+    /// ADR-0025 §2: annulment is data-submission withdrawal, not
+    /// legal cancellation. NAV-side fulfillment requires the
+    /// receiver to confirm the annulment in the NAV web UI per
+    /// ADR-0009 §6; ABERP observes that asynchronously via the
+    /// future polling PR.
+    ///
+    /// **Precondition** (ADR-0026 §6). `--invoice-id` must point at
+    /// an invoice that has at least one
+    /// `InvoiceTechnicalAnnulmentRequested` audit entry (i.e., the
+    /// operator's annulment-request decision was actually recorded
+    /// — run `aberp request-technical-annulment` first if not).
+    /// A successful prior `InvoiceAnnulmentSubmissionResponse`
+    /// against the same annulment-request idempotency key
+    /// loud-rejects the submission (default-reject of double wire
+    /// submission per ADR-0026 §"Surfaced conflict 3"); a failed
+    /// prior wire attempt without a successful response permits
+    /// retry.
+    SubmitAnnulment(SubmitAnnulmentArgs),
+
+    /// Request a NAV-side technical annulment of a prior data
+    /// submission against an invoice (ADR-0009 §6, ADR-0025; PR-12).
+    /// A technical annulment **withdraws** the data submission to
+    /// NAV — used for true submission-side errors such as a test
+    /// invoice accidentally sent to production. It is **distinct
+    /// from a storno** (which legally cancels the invoice as a
+    /// document) and from `mark-abandoned` (which is a local-only
+    /// decision to stop retrying a stuck invoice).
+    ///
+    /// **Key contrasts with `issue-storno` / `issue-modification`:**
+    ///
+    ///   - A technical annulment is **not itself an invoice.** No
+    ///     sequence number is burned, no allocator slot is consumed,
+    ///     no `<invoiceReference>` chain block is emitted. The audit
+    ///     footprint is a single `InvoiceTechnicalAnnulmentRequested`
+    ///     entry — not the three-entry pair that storno + modify
+    ///     write.
+    ///   - The base invoice's derived typestate is **not** changed by
+    ///     the annulment request alone. NAV-side fulfillment requires
+    ///     the receiver to confirm the annulment in the NAV web UI;
+    ///     ABERP observes that asynchronously via a future polling PR.
+    ///
+    /// **`request-technical-annulment` does NOT call NAV.** Same
+    /// posture as `issue-storno` / `issue-modification`. After this
+    /// command writes the annulment XML on disk + the operator-
+    /// decision audit entry, the operator's next step (when that
+    /// command lands) is `aberp submit-annulment --annulment-xml
+    /// ... --invoice-id ... --endpoint {test|production}` — a NEW
+    /// wire command that calls NAV's `manageAnnulment` endpoint
+    /// (distinct from `submit-invoice`'s `manageInvoice` endpoint).
+    ///
+    /// **Precondition** (ADR-0025 §6). `--references` must point at
+    /// an invoice that has at least one `InvoiceSubmissionResponse`
+    /// audit entry (i.e., a data submission was actually made to NAV
+    /// — there is something to annul). Double-annulment (a prior
+    /// `InvoiceTechnicalAnnulmentRequested` against the same base)
+    /// is loud-rejected by default per the open accountant question
+    /// in ADR-0025 §8. Annulment of a `Rejected` / `Stuck` /
+    /// `Abandoned` / already-Stornoed / already-Amended base is
+    /// **permitted** — annulment is data-submission withdrawal,
+    /// orthogonal to legal cancellation.
+    RequestTechnicalAnnulment(RequestTechnicalAnnulmentArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -488,6 +568,146 @@ pub struct IssueModificationArgs {
     /// `time::Date::parse(YYYY-MM-DD)` at the CLI boundary.
     #[arg(long = "modification-date")]
     pub modification_date: String,
+}
+
+/// NAV's four technical-annulment codes per ADR-0025 §"Surfaced
+/// conflict 2". Exposed as a clap `ValueEnum` so the parse boundary
+/// loud-fails on unknown codes (operator typo, accidental new code
+/// from a future NAV revision); the audit-payload stores the
+/// canonical SCREAMING_SNAKE_CASE wire form via
+/// [`AnnulmentCode::to_wire`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AnnulmentCode {
+    /// `ERRATIC_DATA` — generic "the data was wrong" classification.
+    /// Used when no more specific code fits (e.g., line content
+    /// errors, supplier or customer data errors).
+    ErraticData,
+    /// `ERRATIC_INVOICE_NUMBER` — the invoice number itself was
+    /// wrong (collision, off-by-one, wrong series).
+    ErraticInvoiceNumber,
+    /// `ERRATIC_INVOICE_ISSUE_DATE` — the issue date was wrong.
+    ErraticInvoiceIssueDate,
+    /// `ERRATIC_ELECTRONIC_HASH_VALUE` — the electronic hash value
+    /// was wrong (post-submission discovery of a hash mismatch
+    /// against the legally-stored copy).
+    ErraticElectronicHashValue,
+}
+
+impl AnnulmentCode {
+    /// Convert to NAV's canonical wire form. The clap-flavoured
+    /// hyphen-lowercase shape (`erratic-data`, etc.) is what the
+    /// operator types on the CLI; the wire form
+    /// (`ERRATIC_DATA`, etc.) is what NAV expects in
+    /// `<annulmentCode>` and what the audit payload stores
+    /// canonically per ADR-0025 §3.
+    pub fn to_wire(self) -> &'static str {
+        match self {
+            AnnulmentCode::ErraticData => "ERRATIC_DATA",
+            AnnulmentCode::ErraticInvoiceNumber => "ERRATIC_INVOICE_NUMBER",
+            AnnulmentCode::ErraticInvoiceIssueDate => "ERRATIC_INVOICE_ISSUE_DATE",
+            AnnulmentCode::ErraticElectronicHashValue => "ERRATIC_ELECTRONIC_HASH_VALUE",
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+pub struct RequestTechnicalAnnulmentArgs {
+    /// Invoice id (prefixed form, `inv_<ULID>`) of the base invoice
+    /// whose prior NAV data submission is being withdrawn. Must
+    /// have at least one `InvoiceSubmissionResponse` audit entry
+    /// (ADR-0025 §6) — annulment of a never-submitted invoice is
+    /// malformed; use `mark-abandoned` for the local-only "stop
+    /// retrying" decision instead. Double-annulment (a prior
+    /// `InvoiceTechnicalAnnulmentRequested` against the same base)
+    /// is loud-rejected by default.
+    #[arg(long = "references")]
+    pub references: String,
+
+    /// NAV annulment code. One of `erratic-data` /
+    /// `erratic-invoice-number` / `erratic-invoice-issue-date` /
+    /// `erratic-electronic-hash-value` — clap-ValueEnum-validated at
+    /// parse time so an unknown code loud-fails before any ledger
+    /// write. Stored canonically in the audit payload as
+    /// `ERRATIC_DATA` / `ERRATIC_INVOICE_NUMBER` /
+    /// `ERRATIC_INVOICE_ISSUE_DATE` / `ERRATIC_ELECTRONIC_HASH_VALUE`
+    /// per ADR-0025 §3.
+    #[arg(long, value_enum)]
+    pub code: AnnulmentCode,
+
+    /// Free-form operator-supplied reason text. Required at the CLI
+    /// boundary so the audit-evidence bundle (ADR-0009 §8) always
+    /// carries a human-readable justification for the annulment
+    /// decision. Same posture as `retry-submission --reason` /
+    /// `mark-abandoned --reason`.
+    #[arg(long)]
+    pub reason: String,
+
+    /// Path to write the annulment's `<InvoiceAnnulment>` XML. The
+    /// resulting bytes are what the future `submit-annulment`
+    /// command will POST to NAV's `manageAnnulment` endpoint.
+    #[arg(long)]
+    pub out: std::path::PathBuf,
+
+    /// Path to the tenant DuckDB file.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — used for the audit-ledger genesis hash.
+    /// (NAV credentials are NOT loaded —
+    /// `request-technical-annulment` does not call NAV, so the
+    /// keychain is not consulted. Same posture as `mark-abandoned`.)
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+}
+
+/// Args for `aberp submit-annulment` (PR-13, ADR-0026 §1).
+///
+/// Same shape as [`SubmitInvoiceArgs`] except for one rename
+/// (`--invoice-xml` → `--annulment-xml`, naming the body shape
+/// instead of the generic "invoice xml"). The `--invoice-id` field
+/// names the BASE invoice (which the annulment is FOR), matching
+/// the `--references` semantics in
+/// [`RequestTechnicalAnnulmentArgs`].
+#[derive(Debug, Parser)]
+pub struct SubmitAnnulmentArgs {
+    /// Path to the `<InvoiceAnnulment>` XML written by a prior
+    /// `aberp request-technical-annulment --out ...` run. The bytes
+    /// on disk are the body submitted (base64-encoded inside the
+    /// SOAP envelope per ADR-0026 §3).
+    #[arg(long = "annulment-xml")]
+    pub annulment_xml: PathBuf,
+
+    /// Base invoice id (prefixed form, `inv_<ULID>`) — the invoice
+    /// the annulment is FOR. Used to look up the prior
+    /// `InvoiceTechnicalAnnulmentRequested` audit entry so the new
+    /// wire-evidence entries share its idempotency key per the F8
+    /// contract (ADR-0026 §"F8 contract").
+    #[arg(long = "invoice-id")]
+    pub invoice_id: String,
+
+    /// Hungarian tax number of the submitter. Same accepted forms +
+    /// parser as `submit-invoice` (`12345678`, `12345678-1`,
+    /// `12345678-1-42`); only the 8-digit base goes to NAV per
+    /// ADR-0009 §4.
+    #[arg(long = "tax-number")]
+    pub tax_number: String,
+
+    /// Path to the tenant DuckDB file.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — drives both the audit-ledger genesis
+    /// hash and the keychain service-name lookup
+    /// (`aberp.nav.<tenant>`).
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Which NAV environment to submit against. No default —
+    /// explicit per ADR-0020 §1 / ADR-0026 §1. Silently submitting
+    /// an annulment to production when the operator meant test is
+    /// the exact failure mode CLAUDE.md rule 12 names.
+    #[arg(long, value_enum)]
+    pub endpoint: NavEnv,
 }
 
 #[derive(Debug, Parser)]

@@ -18,6 +18,7 @@
 //!   5. tokenExchange operation (PR-7-B-2).
 //!   6. manageInvoice operation (PR-7-B-3).
 //!   7. queryTransactionStatus operation (PR-7-C-1).
+//!   8. manageAnnulment operation (PR-13).
 //!
 //! Each variant carries enough context for an audit-ledger entry without
 //! leaking secret material — credential errors deliberately do NOT
@@ -225,4 +226,58 @@ pub enum NavTransportError {
     /// off, and try again until terminal or attempts exhausted.
     #[error("queryTransactionStatus retryable error: {code} — {message}")]
     QueryTransactionStatusRetryable { code: String, message: String },
+
+    // ── 8. manageAnnulment operation (PR-13) ────────────────────────
+    /// `render_manage_annulment_request` was called with an empty
+    /// `items` slice. Same loud-fail-at-envelope-construction
+    /// posture as `ManageInvoiceEmpty`; the failure mode catches a
+    /// malformed call before any HTTP request goes out.
+    #[error("manageAnnulment envelope cannot be built without at least one annulment operation")]
+    ManageAnnulmentEmpty,
+
+    /// `render_manage_annulment_request` was called with more than
+    /// the NAV v3.0 per-request cap of 100 annulment operations.
+    /// Same cap + defence-in-depth posture as
+    /// `ManageInvoiceTooManyItems` per ADR-0009 §3.
+    #[error(
+        "manageAnnulment envelope cannot carry {count} annulment operations (NAV v3.0 cap is 100)"
+    )]
+    ManageAnnulmentTooManyItems { count: usize },
+
+    /// HTTP-layer failure on manageAnnulment (DNS, connection reset,
+    /// TLS handshake). Same shape as `ManageInvoiceHttp` /
+    /// `QueryTransactionStatusHttp`; held distinct so the audit
+    /// entry can distinguish operations without reaching for the
+    /// URL.
+    #[error("manageAnnulment HTTP call failed: {0}")]
+    ManageAnnulmentHttp(#[source] reqwest::Error),
+
+    /// NAV returned a non-success HTTP status to manageAnnulment.
+    /// The body itself is captured by the caller per ADR-0009 §8
+    /// (the audit payload's `response_xml` field carries the
+    /// verbatim bytes regardless of HTTP status).
+    #[error("manageAnnulment returned non-success HTTP status: {status}")]
+    ManageAnnulmentHttpStatus { status: u16 },
+
+    /// The manageAnnulment response body could not be parsed
+    /// against the expected `<ManageAnnulmentResponse>` shape
+    /// (missing `<transactionId>`, malformed XML, unexpected
+    /// root, etc.). Loud per CLAUDE.md rule 12.
+    #[error("manageAnnulment response parse failed: {0}")]
+    ManageAnnulmentResponseParse(String),
+
+    /// NAV responded with a non-retryable application-layer error
+    /// against manageAnnulment. The classification set is shared
+    /// across operations per ADR-0009 §5 + ADR-0026 §5; the caller
+    /// loud-fails the operator and does not retry.
+    #[error("manageAnnulment non-retryable error: {code} — {message}")]
+    ManageAnnulmentNonRetryable { code: String, message: String },
+
+    /// NAV responded with a retryable application-layer error
+    /// against manageAnnulment (`OPERATION_FAILED`, HTTP 504 per
+    /// ADR-0009 §5). PR-13 surfaces this loud per ADR-0026 §5; an
+    /// automatic retry loop (mirror of PR-8's retry-submission) is
+    /// the named trigger if the operational pattern calls for it.
+    #[error("manageAnnulment retryable error: {code} — {message}")]
+    ManageAnnulmentRetryable { code: String, message: String },
 }

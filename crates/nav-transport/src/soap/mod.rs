@@ -13,6 +13,19 @@
 //!     XML body, ready to POST to `/tokenExchange`. PR-7-B-2 consumer.
 //!   - [`render_manage_invoice_request`] — full `<ManageInvoiceRequest>`
 //!     XML body, ready to POST to `/manageInvoice`. PR-7-B-3 consumer.
+//!   - [`render_query_transaction_status_request`] — full
+//!     `<QueryTransactionStatusRequest>` XML body, ready to POST to
+//!     `/queryTransactionStatus`. PR-7-C-1 consumer.
+//!   - [`render_manage_annulment_request`] — full
+//!     `<ManageAnnulmentRequest>` XML body, ready to POST to
+//!     `/manageAnnulment`. PR-13 / ADR-0026 consumer. Structural
+//!     mirror of `render_manage_invoice_request` with three element-
+//!     name renames per ADR-0026 §3:
+//!     `invoiceOperations` → `annulmentOperations`,
+//!     `invoiceOperation` (per-item value) → `annulmentOperation`,
+//!     `invoiceData` → `invoiceAnnulment`. The wrapping shape
+//!     (exchangeToken + common header + user + software) is
+//!     identical to `manageInvoice` per ADR-0009 §4.
 //!
 //! Lower-level building blocks (header, user, software type, request-id
 //! generation, timestamp formatting) live in [`parts`] so the unit tests
@@ -210,6 +223,126 @@ pub fn render_manage_invoice_request(
                     .map_err(envelope_io)?;
             }
             w.write_event(Event::End(BytesEnd::new("invoiceOperations")))
+                .map_err(envelope_io)?;
+            Ok(())
+        },
+    )
+}
+
+/// One element of a `manageAnnulment` request: an `<InvoiceAnnulment>`
+/// XML bytes pointer (PR-13 / ADR-0026 §3).
+///
+/// Unlike [`ManageInvoiceItem`], this struct carries NO `operation`
+/// field: NAV's annulment operation type has exactly one value
+/// (`"ANNUL"`), so the operation is implicit at the envelope level
+/// and the renderer hard-codes it. Adding a `ManageAnnulmentOperation`
+/// enum with one variant would be the speculative abstraction
+/// CLAUDE.md rule 2 names; ADR-0026 §3 commits to the literal
+/// `"ANNUL"` form, with the named-trigger amendment surface in
+/// `render_manage_annulment_request` if NAV ever introduces a second
+/// annulment operation value.
+///
+/// Index is assigned implicitly by position in the slice the caller
+/// passes to [`render_manage_annulment_request`] — NAV requires
+/// `<index>` to start at 1 and increment monotonically, same
+/// posture as [`ManageInvoiceItem`].
+#[derive(Debug, Clone)]
+pub struct ManageAnnulmentItem<'a> {
+    /// Raw bytes of the `<InvoiceAnnulment>` XML element (the output
+    /// of `apps/aberp/src/nav_xml.rs::render_annulment_data`). Will
+    /// be base64-encoded onto the wire inside `<invoiceAnnulment>`.
+    pub invoice_annulment_xml: &'a [u8],
+}
+
+/// The NAV `<annulmentOperation>` per-item operation literal per
+/// ADR-0026 §3 + §"Surfaced conflict 2". Exposed as a `&'static str`
+/// constant so the signature input and the wire element share one
+/// source of truth — a future amendment that adds a second
+/// operation value lives in one place.
+pub const ANNULMENT_OPERATION_ANNUL: &str = "ANNUL";
+
+/// Render a `<ManageAnnulmentRequest>` body, ready for HTTP POST
+/// (PR-13 / ADR-0026 §3).
+///
+/// Structural mirror of [`render_manage_invoice_request`]. The
+/// `exchange_token` is the **decrypted** token bytes (same flow as
+/// manageInvoice). NAV's per-request cap of 100 items is enforced
+/// loud per ADR-0009 §3 + ADR-0026 §3.
+///
+/// The per-invoice-index signature uses [`InvoiceSignatureInput`]
+/// with the operation literal [`ANNULMENT_OPERATION_ANNUL`] and the
+/// invoice_annulment_xml bytes — same suffix shape NAV's spec names
+/// for both `manageInvoice` and `manageAnnulment` per ADR-0009 §4
+/// (verified against the consulted clients per ADR-0026 §3).
+pub fn render_manage_annulment_request(
+    credentials: &NavCredentials,
+    tax_number_8: &str,
+    request_id: &str,
+    request_timestamp: &str,
+    exchange_token: &str,
+    items: &[ManageAnnulmentItem<'_>],
+) -> Result<Vec<u8>, NavTransportError> {
+    if items.is_empty() {
+        return Err(NavTransportError::ManageAnnulmentEmpty);
+    }
+    if items.len() > 100 {
+        return Err(NavTransportError::ManageAnnulmentTooManyItems { count: items.len() });
+    }
+
+    // Per-index signature inputs: operation is the literal "ANNUL"
+    // per ADR-0026 §3, payload is the raw <InvoiceAnnulment> bytes
+    // (base64-encoded inside the signature input by `per_invoice_hex`
+    // — same as manageInvoice).
+    let signature_inputs: Vec<InvoiceSignatureInput<'_>> = items
+        .iter()
+        .map(|i| InvoiceSignatureInput {
+            operation: ANNULMENT_OPERATION_ANNUL,
+            invoice_data_xml: i.invoice_annulment_xml,
+        })
+        .collect();
+    let signature = request_signature_manage(
+        request_id,
+        request_timestamp,
+        credentials.sign_key_bytes(),
+        &signature_inputs,
+    );
+
+    render_request(
+        "ManageAnnulmentRequest",
+        credentials,
+        tax_number_8,
+        request_id,
+        request_timestamp,
+        &signature,
+        |w| {
+            // <exchangeToken>...</exchangeToken>
+            write_text_in_default_ns(w, "exchangeToken", exchange_token)?;
+            // <annulmentOperations>
+            w.write_event(Event::Start(BytesStart::new("annulmentOperations")))
+                .map_err(envelope_io)?;
+            // No <compressedContent> for annulment — NAV's
+            // manageAnnulment envelope (per the consulted clients)
+            // does not carry the compressed-content indicator that
+            // manageInvoice does. If the testbed rejects, the
+            // amendment is mechanical (add one write_text_in_default_ns
+            // call here); the audit-payload contract is unaffected.
+            for (i, item) in items.iter().enumerate() {
+                let index = (i + 1) as u32;
+                w.write_event(Event::Start(BytesStart::new("annulmentOperation")))
+                    .map_err(envelope_io)?;
+                write_text_in_default_ns(w, "index", &index.to_string())?;
+                // Per-item operation element. NAV's manageInvoice
+                // names both the wrapper and the inner element
+                // `invoiceOperation`; manageAnnulment mirrors the
+                // pattern with `annulmentOperation` for both per
+                // ADR-0026 §3.
+                write_text_in_default_ns(w, "annulmentOperation", ANNULMENT_OPERATION_ANNUL)?;
+                let encoded = BASE64_STANDARD.encode(item.invoice_annulment_xml);
+                write_text_in_default_ns(w, "invoiceAnnulment", &encoded)?;
+                w.write_event(Event::End(BytesEnd::new("annulmentOperation")))
+                    .map_err(envelope_io)?;
+            }
+            w.write_event(Event::End(BytesEnd::new("annulmentOperations")))
                 .map_err(envelope_io)?;
             Ok(())
         },
@@ -497,6 +630,135 @@ mod tests {
             !s.contains("1234567890ABCDEF"),
             "plaintext change key leaked into envelope"
         );
+    }
+
+    // ── PR-13 / ADR-0026 §3: manageAnnulment envelope tests ────────
+
+    /// Happy-path: a one-item manageAnnulment envelope carries the
+    /// required blocks + the per-index entry shape. Same load-bearing
+    /// shape-only check as
+    /// `manage_invoice_request_orders_indices_from_one`; full byte
+    /// equality lives in the golden fixture file (added in PR-13's
+    /// integration test suite).
+    #[test]
+    fn manage_annulment_request_contains_required_blocks() {
+        let annulment_xml = b"<InvoiceAnnulment>placeholder</InvoiceAnnulment>";
+        let xml = render_manage_annulment_request(
+            &fixture_credentials(),
+            "12345678",
+            "REQ12345ABCDEFG",
+            "20260520T120000Z",
+            "decrypted-token",
+            &[ManageAnnulmentItem {
+                invoice_annulment_xml: annulment_xml,
+            }],
+        )
+        .expect("envelope renders");
+        let s = std::str::from_utf8(&xml).expect("UTF-8");
+
+        // Root + namespaces.
+        assert!(s.contains("<ManageAnnulmentRequest"));
+        assert!(s.contains("xmlns=\"http://schemas.nav.gov.hu/OSA/3.0/api\""));
+        assert!(s.contains("xmlns:common=\"http://schemas.nav.gov.hu/NTCA/1.0/common\""));
+
+        // Common-block invariants.
+        assert!(s.contains("<common:requestId>REQ12345ABCDEFG</common:requestId>"));
+        assert!(s.contains("<common:timestamp>20260520T120000Z</common:timestamp>"));
+        assert!(s.contains("<common:login>TECHNICAL_LOGIN</common:login>"));
+        assert!(s.contains("<common:taxNumber>12345678</common:taxNumber>"));
+
+        // Operation-specific shape per ADR-0026 §3.
+        assert!(s.contains("<exchangeToken>decrypted-token</exchangeToken>"));
+        assert!(s.contains("<annulmentOperations>"));
+        assert!(s.contains("<annulmentOperation>"));
+        assert!(s.contains("<index>1</index>"));
+        // The per-item operation literal is "ANNUL" per
+        // ADR-0026 §3 / ADR-0025 §"Surfaced conflict 2".
+        assert!(s.contains("<annulmentOperation>ANNUL</annulmentOperation>"));
+        // base64("<InvoiceAnnulment>placeholder</InvoiceAnnulment>")
+        // — the leading bytes are stable across base64
+        // implementations; shape-only check is enough.
+        assert!(s.contains("<invoiceAnnulment>PEludm9pY2VBbm51bG1lbnQ+"));
+
+        // Plaintext credentials MUST NOT leak.
+        assert!(
+            !s.contains("tech-password"),
+            "plaintext password leaked into annulment envelope: {s}"
+        );
+        assert!(
+            !s.contains("SIGN-KEY-32BYTES-OF-FAKE-MATERIAL"),
+            "plaintext sign key leaked: {s}"
+        );
+        assert!(
+            !s.contains("1234567890ABCDEF"),
+            "plaintext change key leaked: {s}"
+        );
+    }
+
+    /// Empty `items` slice must loud-fail per ADR-0026 §3 — same
+    /// posture as `ManageInvoiceEmpty`. CLAUDE.md rule 12.
+    #[test]
+    fn manage_annulment_request_empty_loud_fails() {
+        let err = render_manage_annulment_request(
+            &fixture_credentials(),
+            "12345678",
+            "REQ12345ABCDEFG",
+            "20260520T120000Z",
+            "decrypted-token",
+            &[],
+        )
+        .expect_err("empty list must loud-fail");
+        assert!(matches!(err, NavTransportError::ManageAnnulmentEmpty));
+    }
+
+    /// 100-item cap mirrors `manageInvoice`. 101 items must loud-fail.
+    #[test]
+    fn manage_annulment_request_over_cap_loud_fails() {
+        let annulment_xml = b"<InvoiceAnnulment>x</InvoiceAnnulment>";
+        let items: Vec<ManageAnnulmentItem<'_>> = (0..101)
+            .map(|_| ManageAnnulmentItem {
+                invoice_annulment_xml: annulment_xml,
+            })
+            .collect();
+        let err = render_manage_annulment_request(
+            &fixture_credentials(),
+            "12345678",
+            "REQ12345ABCDEFG",
+            "20260520T120000Z",
+            "decrypted-token",
+            &items,
+        )
+        .expect_err("over-cap must loud-fail");
+        assert!(matches!(
+            err,
+            NavTransportError::ManageAnnulmentTooManyItems { count: 101 }
+        ));
+    }
+
+    /// Per-index indices increment from 1 — same shape as
+    /// `manage_invoice_request_orders_indices_from_one`.
+    #[test]
+    fn manage_annulment_request_orders_indices_from_one() {
+        let annulment_xml = b"<InvoiceAnnulment>x</InvoiceAnnulment>";
+        let xml = render_manage_annulment_request(
+            &fixture_credentials(),
+            "12345678",
+            "REQ12345ABCDEFG",
+            "20260520T120000Z",
+            "decrypted-token",
+            &[
+                ManageAnnulmentItem {
+                    invoice_annulment_xml: annulment_xml,
+                },
+                ManageAnnulmentItem {
+                    invoice_annulment_xml: annulment_xml,
+                },
+            ],
+        )
+        .expect("envelope renders");
+        let s = std::str::from_utf8(&xml).expect("UTF-8");
+        assert!(s.contains("<index>1</index>"));
+        assert!(s.contains("<index>2</index>"));
     }
 
     #[test]

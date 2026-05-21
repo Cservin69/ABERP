@@ -56,9 +56,40 @@
 /// Amended` per ADR-0009 §2) is observed by the existence of this
 /// entry; the same "no second source of truth" posture as STORNO.
 ///
+/// PR-12 (ADR-0025) adds `InvoiceTechnicalAnnulmentRequested` — the
+/// third and final ADR-0009 §6 surface. Structurally **different**
+/// from STORNO + MODIFY: a technical annulment is NOT itself an
+/// invoice (no sequence-slot burn, no `InvoiceSequenceReserved` /
+/// `InvoiceDraftCreated` pair). The annulment is a NAV-side
+/// data-submission withdrawal whose canonical record is the
+/// `InvoiceTechnicalAnnulmentRequested` entry alone — a single
+/// operator-decision audit entry, NOT a chain link. The base
+/// invoice's derived typestate is NOT transitioned by an annulment
+/// request (ADR-0025 §2) — annulment is data-submission withdrawal,
+/// not legal cancellation; the base's `Finalized` / `Rejected` /
+/// `Stuck` / `Abandoned` state is unchanged. NAV-side fulfillment
+/// (receiver confirms in the NAV web UI) is asynchronous and observed
+/// by a future polling PR.
+///
+/// PR-13 (ADR-0026) adds `InvoiceAnnulmentSubmissionAttempt` +
+/// `InvoiceAnnulmentSubmissionResponse` — the **wire half** of the
+/// technical-annulment surface. Structural parallel to PR-7-B-3's
+/// `InvoiceSubmissionAttempt` + `InvoiceSubmissionResponse` (same
+/// verbatim-bytes-before-parse posture per ADR-0009 §8) but
+/// deliberately forked at the discriminator level per ADR-0026 §2
+/// + ADR-0026 §"Surfaced conflict 1". Rationale: kind-alone
+/// classification in the audit-evidence bundle (ADR-0009 §8) —
+/// a NAV inspector reading the per-invoice trail sees "ABERP
+/// requested technical annulment → ABERP submitted the annulment
+/// to NAV → NAV responded with TXID-Q" as a sequence of distinct
+/// kinds, not as "submit, submit" requiring payload XML
+/// inspection to disambiguate from a fresh invoice submission.
+/// The F12 four-edit ritual re-fires twice (once per variant) and
+/// closes the seventh and eighth times across PR-6.1 / PR-7-B-3 /
+/// PR-8 / PR-10 / PR-11 / PR-12 / PR-13.
+///
 /// The remaining invoice-lifecycle kinds (`Finalized`, `Rejected`,
-/// `SubmissionStuck`, `Voided`,
-/// `TechnicalAnnulmentRequested`) land when their state transition
+/// `SubmissionStuck`, `Voided`) land when their state transition
 /// first fires in the codebase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
@@ -148,6 +179,70 @@ pub enum EventKind {
     /// the base; no separate ledger entry is written against the
     /// base (ADR-0024 §2). PR-11.
     InvoiceModificationIssued,
+
+    /// The operator requested a NAV-side technical annulment of a
+    /// prior data submission against an invoice (ADR-0009 §6,
+    /// ADR-0025). Technical annulment is **distinct** from STORNO
+    /// and MODIFY: it withdraws a NAV-side data submission (e.g.,
+    /// a test invoice accidentally sent to production) WITHOUT
+    /// legally cancelling the invoice as a document.
+    ///
+    /// Structural contrasts with `InvoiceStornoIssued` /
+    /// `InvoiceModificationIssued`:
+    ///
+    ///   - **Not a chain entry.** No `<invoiceReference>` block,
+    ///     no `modificationIndex`, no chain-allocator walk
+    ///     (ADR-0025 §7).
+    ///   - **No sequence-slot burn.** The annulment is not itself
+    ///     an invoice; no `InvoiceSequenceReserved` /
+    ///     `InvoiceDraftCreated` pair is written. The annulment's
+    ///     audit footprint is THIS entry alone.
+    ///   - **No derived typestate transition.** The base invoice's
+    ///     state (`Finalized` / `Rejected` / `Stuck` / `Abandoned`)
+    ///     is unchanged by the annulment *request* alone; NAV-side
+    ///     fulfillment (receiver confirms in NAV's web UI) is
+    ///     asynchronous and not yet observed in code (future PR).
+    ///
+    /// Payload carries the base `invoice_id`, the operator-decision
+    /// idempotency key, the base's prior `transactionId` (the
+    /// thing being withdrawn), the NAV annulment code
+    /// (`ERRATIC_DATA` / `ERRATIC_INVOICE_NUMBER` /
+    /// `ERRATIC_INVOICE_ISSUE_DATE` /
+    /// `ERRATIC_ELECTRONIC_HASH_VALUE`), and the operator's
+    /// free-form reason text. PR-12.
+    InvoiceTechnicalAnnulmentRequested,
+
+    /// A `manageAnnulment` request was POSTed to NAV — the wire
+    /// half of the technical-annulment surface (ADR-0009 §6,
+    /// ADR-0026). Payload carries the verbatim
+    /// `<ManageAnnulmentRequest>` envelope bytes (ADR-0009 §8 —
+    /// captured BEFORE the response is parsed so a crash mid-flight
+    /// still leaves the audit trail pointing at "we tried to
+    /// withdraw data submission X with body Y"), the base
+    /// `invoice_id`, the annulment-request's `idempotency_key`
+    /// (F8 — flows from the prior
+    /// `InvoiceTechnicalAnnulmentRequested` entry per ADR-0026 §6),
+    /// and the `endpoint` label (`"test"` or `"production"`).
+    ///
+    /// Structurally parallel to `InvoiceSubmissionAttempt` but
+    /// **deliberately forked at the discriminator** so the audit-
+    /// evidence bundle reader can distinguish a manageInvoice
+    /// submission from a manageAnnulment submission by kind alone
+    /// (ADR-0026 §2 + ADR-0026 §"Surfaced conflict 1"). PR-13.
+    InvoiceAnnulmentSubmissionAttempt,
+
+    /// A `manageAnnulment` response was received from NAV with a
+    /// `transactionId`. Payload carries the verbatim
+    /// `<ManageAnnulmentResponse>` bytes (ADR-0009 §8) plus the
+    /// parsed `transaction_id` (NAV's annulment-side tracking id),
+    /// the base `invoice_id`, and the annulment-request's
+    /// `idempotency_key`. Fires AFTER
+    /// `InvoiceAnnulmentSubmissionAttempt` in the same
+    /// `submit-annulment` flow.
+    ///
+    /// Same structural-parallel-with-fork posture as
+    /// `InvoiceAnnulmentSubmissionAttempt`. PR-13, ADR-0026 §2.
+    InvoiceAnnulmentSubmissionResponse,
 }
 
 impl EventKind {
@@ -166,6 +261,15 @@ impl EventKind {
             EventKind::InvoiceMarkedAbandoned => "invoice.marked_abandoned",
             EventKind::InvoiceStornoIssued => "invoice.storno_issued",
             EventKind::InvoiceModificationIssued => "invoice.modification_issued",
+            EventKind::InvoiceTechnicalAnnulmentRequested => {
+                "invoice.technical_annulment_requested"
+            }
+            EventKind::InvoiceAnnulmentSubmissionAttempt => {
+                "invoice.annulment_submission_attempt"
+            }
+            EventKind::InvoiceAnnulmentSubmissionResponse => {
+                "invoice.annulment_submission_response"
+            }
         }
     }
 
@@ -193,6 +297,15 @@ impl EventKind {
             "invoice.marked_abandoned" => Ok(EventKind::InvoiceMarkedAbandoned),
             "invoice.storno_issued" => Ok(EventKind::InvoiceStornoIssued),
             "invoice.modification_issued" => Ok(EventKind::InvoiceModificationIssued),
+            "invoice.technical_annulment_requested" => {
+                Ok(EventKind::InvoiceTechnicalAnnulmentRequested)
+            }
+            "invoice.annulment_submission_attempt" => {
+                Ok(EventKind::InvoiceAnnulmentSubmissionAttempt)
+            }
+            "invoice.annulment_submission_response" => {
+                Ok(EventKind::InvoiceAnnulmentSubmissionResponse)
+            }
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -224,6 +337,9 @@ mod tests {
             EventKind::InvoiceMarkedAbandoned,
             EventKind::InvoiceStornoIssued,
             EventKind::InvoiceModificationIssued,
+            EventKind::InvoiceTechnicalAnnulmentRequested,
+            EventKind::InvoiceAnnulmentSubmissionAttempt,
+            EventKind::InvoiceAnnulmentSubmissionResponse,
         ];
         for v in variants {
             let s = v.as_str();
@@ -303,5 +419,80 @@ mod tests {
         assert!(EventKind::InvoiceModificationIssued
             .as_str()
             .starts_with("invoice."));
+    }
+
+    /// PR-12 specifically: `InvoiceTechnicalAnnulmentRequested` is
+    /// the third and final ADR-0009 §6 surface (ADR-0025). The
+    /// `invoice.` prefix MUST hold for the same reason PR-10 and
+    /// PR-11 pin it — the per-invoice export bundle (ADR-0009 §8)
+    /// `invoice.*` glob must pick up technical-annulment entries
+    /// alongside storno + modification + every other invoice-
+    /// lifecycle entry. An annulment under a different prefix would
+    /// be silently absent from the per-invoice export bundle —
+    /// exactly the silent-omission failure mode CLAUDE.md rule 12
+    /// names.
+    #[test]
+    fn pr_12_technical_annulment_kind_uses_invoice_prefix() {
+        assert_eq!(
+            EventKind::InvoiceTechnicalAnnulmentRequested.as_str(),
+            "invoice.technical_annulment_requested"
+        );
+        assert!(EventKind::InvoiceTechnicalAnnulmentRequested
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// PR-13 / ADR-0026 §2: the wire-evidence attempt for the
+    /// annulment surface. The `invoice.` prefix MUST hold for the
+    /// same per-invoice-export-bundle reason PR-10 / PR-11 / PR-12
+    /// pin it — the audit-evidence bundle's `invoice.*` glob
+    /// (ADR-0009 §8) must pick up annulment-wire entries alongside
+    /// every other lifecycle entry. An entry under a different
+    /// prefix would be silently absent from the per-invoice export
+    /// bundle — exactly the silent-omission failure mode CLAUDE.md
+    /// rule 12 names.
+    #[test]
+    fn pr_13_annulment_submission_attempt_kind_uses_invoice_prefix() {
+        assert_eq!(
+            EventKind::InvoiceAnnulmentSubmissionAttempt.as_str(),
+            "invoice.annulment_submission_attempt"
+        );
+        assert!(EventKind::InvoiceAnnulmentSubmissionAttempt
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// PR-13 / ADR-0026 §2: the wire-evidence response. Same
+    /// `invoice.` prefix pin as the attempt above; the two land
+    /// in this PR as a pair per the structural-parallel-with-fork
+    /// posture (ADR-0026 §2).
+    #[test]
+    fn pr_13_annulment_submission_response_kind_uses_invoice_prefix() {
+        assert_eq!(
+            EventKind::InvoiceAnnulmentSubmissionResponse.as_str(),
+            "invoice.annulment_submission_response"
+        );
+        assert!(EventKind::InvoiceAnnulmentSubmissionResponse
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// PR-13 / ADR-0026 §2: deliberate fork from the manageInvoice
+    /// kinds. The two new wire-evidence kinds MUST have distinct
+    /// storage strings from `InvoiceSubmissionAttempt` /
+    /// `InvoiceSubmissionResponse` so the audit-evidence bundle
+    /// reader's kind-alone classification works. Pinning this here
+    /// catches a future refactor accidentally collapsing the four
+    /// kinds onto two on-disk strings.
+    #[test]
+    fn pr_13_annulment_kinds_are_distinct_from_invoice_kinds() {
+        assert_ne!(
+            EventKind::InvoiceAnnulmentSubmissionAttempt.as_str(),
+            EventKind::InvoiceSubmissionAttempt.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceAnnulmentSubmissionResponse.as_str(),
+            EventKind::InvoiceSubmissionResponse.as_str()
+        );
     }
 }

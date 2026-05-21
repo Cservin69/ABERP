@@ -44,7 +44,7 @@ use quick_xml::name::QName;
 use quick_xml::Reader;
 
 use crate::error::NavXsdValidationError;
-use crate::NAV_NS_DATA;
+use crate::{NAV_NS_ANNUL, NAV_NS_DATA};
 
 /// Validate that `xml` is a v3.0 `<InvoiceData>` payload structurally
 /// acceptable to NAV. Returns `Ok(())` on success; on any divergence
@@ -883,6 +883,139 @@ fn walk_summary_gross_data(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValid
     )
 }
 
+// ── PR-13 / ADR-0026 §4 — `<InvoiceAnnulment>` validator ────────────
+//
+// Separate public entry point from `validate_invoice_data`. Same
+// streaming-walker shape; different allowlist (four required
+// children, all text leaves).
+//
+// Allowlist source-of-truth discipline mirrors the
+// `<InvoiceData>` side (ADR-0022 / module header).
+
+/// Validate that `xml` is a v3.0 `<InvoiceAnnulment>` payload
+/// structurally acceptable to NAV (ADR-0026 §4; closes session 16
+/// handoff F30). Returns `Ok(())` on success; on any divergence
+/// returns a typed [`NavXsdValidationError`].
+///
+/// Allowlist (exhaustive for v3.0):
+///
+/// - Root: `<InvoiceAnnulment>` at namespace
+///   [`crate::NAV_NS_ANNUL`].
+/// - Required children, in document order:
+///   1. `<annulmentReference>` — text content (the base invoice's
+///      NAV-facing number).
+///   2. `<annulmentTimestamp>` — text content (ISO 8601 UTC
+///      `YYYY-MM-DDTHH:MM:SSZ` per ADR-0025 §4; the NAV-compressed
+///      `YYYYMMDDhhmmss` form is the named-trigger amendment surface
+///      per ADR-0025 §"Open questions").
+///   3. `<annulmentCode>` — text content (one of the four wire-form
+///      codes per ADR-0025 §"Surfaced conflict 2"; the validator
+///      does NOT enforce the closed-set — the CLI clap-ValueEnum is
+///      the loud-fail boundary per ADR-0026 §4).
+///   4. `<annulmentReason>` — text content (free-form operator
+///      reason).
+///
+/// The walker does NOT date-shape-check `<annulmentTimestamp>`
+/// against ISO 8601 (NAV's v3.0 declares it as `xs:dateTime` rather
+/// than `xs:date`; the emitter pins the shape via
+/// `OffsetDateTime::now_utc()` formatting, and the validator
+/// accepts whatever well-formed text the operator's hand-edit could
+/// produce). Same posture as `<lineDescription>` text content in
+/// [`validate_invoice_data`].
+///
+/// The call is single-pass over the input bytes; no in-memory tree
+/// is built. The input must be valid UTF-8 (NAV v3.0
+/// `<InvoiceAnnulment>` is UTF-8 by spec).
+pub fn validate_annulment_data(xml: &[u8]) -> Result<(), NavXsdValidationError> {
+    let s = std::str::from_utf8(xml).map_err(|e| NavXsdValidationError::MalformedXml {
+        position: e.valid_up_to(),
+        message: format!("input is not valid UTF-8: {e}"),
+    })?;
+    let mut reader = Reader::from_str(s);
+    reader.config_mut().trim_text(true);
+
+    // Walk to the root element tag. Same skip-decl-and-whitespace
+    // posture as `validate_invoice_data`.
+    let root = loop {
+        match read_event(&mut reader)? {
+            Event::Start(e) | Event::Empty(e) => break e,
+            Event::Eof => {
+                return Err(NavXsdValidationError::MalformedXml {
+                    position: reader.buffer_position() as usize,
+                    message: "document ended before any element".into(),
+                });
+            }
+            _ => continue,
+        }
+    };
+
+    // Root must be <InvoiceAnnulment> at the NAV v3.0 annul namespace.
+    let root_local = local_name_of(root.name());
+    if root_local != "InvoiceAnnulment" {
+        return Err(NavXsdValidationError::UnexpectedRoot {
+            actual: root_local.to_string(),
+        });
+    }
+    let xmlns = extract_xmlns(&root)?;
+    if xmlns.as_deref() != Some(NAV_NS_ANNUL) {
+        return Err(NavXsdValidationError::UnexpectedRootNamespace {
+            expected: NAV_NS_ANNUL,
+            actual: xmlns,
+        });
+    }
+
+    walk_invoice_annulment(&mut reader)
+}
+
+fn walk_invoice_annulment(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "InvoiceAnnulment";
+    const ALLOWED: &[&str] = &[
+        "annulmentReference",
+        "annulmentTimestamp",
+        "annulmentCode",
+        "annulmentReason",
+    ];
+    // All four are required per ADR-0026 §4 and ADR-0025 §4.
+    const ORDERED_REQUIRED: &[&str] = ALLOWED;
+
+    let mut seen_in_order: Vec<&'static str> = Vec::new();
+
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                // All four allowed elements are text-leaf children
+                // (no nested structure). collect_text walks to the
+                // matching </tag> and returns the accumulated text;
+                // we discard the value here — the validator's job is
+                // schema-shape conformance, not value semantics. The
+                // four-code closed-set check on <annulmentCode>
+                // lives at the CLI's clap-ValueEnum boundary
+                // (ADR-0025 §3 / ADR-0026 §4).
+                let _ = collect_text(reader, canonical)?;
+                seen_in_order.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen_in_order)?;
+                return Ok(());
+            }
+            Event::Eof => {
+                return Err(NavXsdValidationError::MalformedXml {
+                    position: reader.buffer_position() as usize,
+                    message: "document ended inside <InvoiceAnnulment>".into(),
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn expect_single_child_then_close<F>(
@@ -1397,6 +1530,206 @@ mod tests {
         match err {
             NavXsdValidationError::NoInvoiceLines => {}
             other => panic!("expected NoInvoiceLines, got {other:?}"),
+        }
+    }
+
+    // ── PR-13 / ADR-0026 §4 — `<InvoiceAnnulment>` validator tests ──
+    //
+    // Same positive + negative shape as the `<InvoiceData>` tests
+    // above. F30 closure surface: validator accepts a well-formed
+    // body and loud-fails on the named divergences.
+
+    /// The minimum valid `<InvoiceAnnulment>` per ADR-0026 §4.
+    /// Updated whenever the allowlist or the emitter shifts; this
+    /// fixture is the annulment validator's golden positive example.
+    const MIN_VALID_ANNULMENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<InvoiceAnnulment xmlns="http://schemas.nav.gov.hu/OSA/3.0/annul" xmlns:common="http://schemas.nav.gov.hu/OSA/3.0/base">
+  <annulmentReference>INV-default/00007</annulmentReference>
+  <annulmentTimestamp>2026-05-21T12:00:00Z</annulmentTimestamp>
+  <annulmentCode>ERRATIC_DATA</annulmentCode>
+  <annulmentReason>test invoice accidentally sent to production</annulmentReason>
+</InvoiceAnnulment>"#;
+
+    #[test]
+    fn minimum_valid_annulment_data_validates() {
+        validate_annulment_data(MIN_VALID_ANNULMENT.as_bytes())
+            .expect("the hand-rolled v3.0 minimum annulment example must validate");
+    }
+
+    #[test]
+    fn empty_annulment_input_is_loud_fail() {
+        let err = validate_annulment_data(b"").unwrap_err();
+        match err {
+            NavXsdValidationError::MalformedXml { .. } => {}
+            other => panic!("expected MalformedXml for empty annulment input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_annulment_root_element_is_loud_fail() {
+        let xml = r#"<?xml version="1.0"?><NotAnnulment xmlns="http://schemas.nav.gov.hu/OSA/3.0/annul"/>"#;
+        let err = validate_annulment_data(xml.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::UnexpectedRoot { actual } => {
+                assert_eq!(actual, "NotAnnulment");
+            }
+            other => panic!("expected UnexpectedRoot, got {other:?}"),
+        }
+    }
+
+    /// ADR-0026 §4: the annul namespace differs from the data
+    /// namespace. A body with the InvoiceData namespace under an
+    /// InvoiceAnnulment root must loud-fail — exactly the shape
+    /// CLAUDE.md rule 12 names.
+    #[test]
+    fn wrong_annulment_root_namespace_is_loud_fail() {
+        let xml = r#"<?xml version="1.0"?><InvoiceAnnulment xmlns="http://schemas.nav.gov.hu/OSA/3.0/data"/>"#;
+        let err = validate_annulment_data(xml.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::UnexpectedRootNamespace { expected, actual } => {
+                assert_eq!(expected, NAV_NS_ANNUL);
+                assert_eq!(
+                    actual.as_deref(),
+                    Some("http://schemas.nav.gov.hu/OSA/3.0/data")
+                );
+            }
+            other => panic!("expected UnexpectedRootNamespace, got {other:?}"),
+        }
+    }
+
+    /// Missing `<annulmentCode>` — the most likely emitter-regression
+    /// shape per ADR-0025 §"Adversarial review #2" (a refactor
+    /// accidentally dropping the code child). Pinning this branch is
+    /// the validator's load-bearing emitter-regression catch surface;
+    /// CLAUDE.md rule 9 (test intent, not just behaviour).
+    #[test]
+    fn missing_annulment_code_is_loud_fail() {
+        let bad = MIN_VALID_ANNULMENT.replace("<annulmentCode>ERRATIC_DATA</annulmentCode>", "");
+        let err = validate_annulment_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::MissingRequiredChild { parent, expected } => {
+                assert_eq!(parent, "InvoiceAnnulment");
+                assert_eq!(expected, "annulmentCode");
+            }
+            other => panic!("expected MissingRequiredChild annulmentCode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_annulment_reference_is_loud_fail() {
+        let bad = MIN_VALID_ANNULMENT
+            .replace("<annulmentReference>INV-default/00007</annulmentReference>", "");
+        let err = validate_annulment_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::MissingRequiredChild { parent, expected } => {
+                assert_eq!(parent, "InvoiceAnnulment");
+                assert_eq!(expected, "annulmentReference");
+            }
+            other => panic!(
+                "expected MissingRequiredChild annulmentReference, got {other:?}"
+            ),
+        }
+    }
+
+    /// An out-of-order child set fires `ChildOrderViolation`. PR-13
+    /// pins the document-order requirement at the validator layer;
+    /// a future emitter regression that swaps `<annulmentCode>` and
+    /// `<annulmentReason>` would fail this test loud at CI time.
+    #[test]
+    fn annulment_child_order_violation_is_loud_fail() {
+        // Swap <annulmentCode> and <annulmentReason> so reason
+        // precedes code — out-of-order per ORDERED_REQUIRED.
+        let bad = MIN_VALID_ANNULMENT
+            .replace(
+                "<annulmentCode>ERRATIC_DATA</annulmentCode>\n  <annulmentReason>test invoice accidentally sent to production</annulmentReason>",
+                "<annulmentReason>test invoice accidentally sent to production</annulmentReason>\n  <annulmentCode>ERRATIC_DATA</annulmentCode>",
+            );
+        let err = validate_annulment_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::ChildOrderViolation {
+                parent,
+                expected_before,
+                actually_appeared_first,
+            } => {
+                assert_eq!(parent, "InvoiceAnnulment");
+                assert_eq!(expected_before, "annulmentCode");
+                assert_eq!(actually_appeared_first, "annulmentReason");
+            }
+            other => panic!("expected ChildOrderViolation, got {other:?}"),
+        }
+    }
+
+    /// An element not in the four-child allowlist (e.g. a stray
+    /// `<modificationIndex>` from a refactor that conflates
+    /// annulment with chain operations) fires `UnexpectedElement`.
+    #[test]
+    fn unexpected_element_in_annulment_is_loud_fail() {
+        let bad = MIN_VALID_ANNULMENT.replace(
+            "<annulmentReason>",
+            "<modificationIndex>1</modificationIndex><annulmentReason>",
+        );
+        let err = validate_annulment_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::UnexpectedElement { parent, element } => {
+                assert_eq!(parent, "InvoiceAnnulment");
+                assert_eq!(element, "modificationIndex");
+            }
+            other => panic!("expected UnexpectedElement modificationIndex, got {other:?}"),
+        }
+    }
+
+    /// ADR-0026 §4 explicitly does NOT enforce the four-code closed
+    /// set at the validator layer — the CLI's clap ValueEnum is the
+    /// loud-fail boundary for unknown codes. The validator accepts
+    /// any text content in `<annulmentCode>` (a future testbed-
+    /// driven amendment may tighten this; out of scope for PR-13).
+    #[test]
+    fn annulment_code_text_is_not_enum_checked_by_validator() {
+        // An off-allowlist value like `SOMETHING_ELSE` must still
+        // validate at the schema-shape layer — the closed-set check
+        // lives at the CLI boundary.
+        let body = MIN_VALID_ANNULMENT.replace(
+            "<annulmentCode>ERRATIC_DATA</annulmentCode>",
+            "<annulmentCode>SOMETHING_ELSE</annulmentCode>",
+        );
+        validate_annulment_data(body.as_bytes())
+            .expect("validator must not enforce annulmentCode enumeration");
+    }
+
+    /// PR-13 / F30 closure pin. The two `validate_*` functions
+    /// share the same error type but operate on disjoint root
+    /// elements — an InvoiceData body must NOT validate against
+    /// `validate_annulment_data`. ADR-0026 §"Adversarial review #4"
+    /// surfaced this directly; this test is the load-bearing
+    /// type-confusion guardrail.
+    #[test]
+    fn validate_annulment_data_rejects_invoice_data_body() {
+        // Use the canonical InvoiceData fixture above — passing it
+        // to validate_annulment_data must surface UnexpectedRoot.
+        let err = validate_annulment_data(MIN_VALID.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::UnexpectedRoot { actual } => {
+                assert_eq!(actual, "InvoiceData");
+            }
+            other => panic!(
+                "expected UnexpectedRoot when InvoiceData is fed to validate_annulment_data, got {other:?}"
+            ),
+        }
+    }
+
+    /// Symmetric reverse pin: an InvoiceAnnulment body must NOT
+    /// validate against `validate_invoice_data`. Defence-in-depth
+    /// on the type-confusion concern above.
+    #[test]
+    fn validate_invoice_data_rejects_annulment_body() {
+        let err = validate_invoice_data(MIN_VALID_ANNULMENT.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::UnexpectedRoot { actual } => {
+                assert_eq!(actual, "InvoiceAnnulment");
+            }
+            other => panic!(
+                "expected UnexpectedRoot when InvoiceAnnulment is fed to validate_invoice_data, got {other:?}"
+            ),
         }
     }
 

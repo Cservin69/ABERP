@@ -113,6 +113,42 @@ pub struct ModificationReference {
 
 const NAV_NS_DATA: &str = "http://schemas.nav.gov.hu/OSA/3.0/data";
 const NAV_NS_BASE: &str = "http://schemas.nav.gov.hu/OSA/3.0/base";
+/// NAV v3.0 annul namespace per ADR-0025 §"Surfaced conflict 1"'s
+/// chosen reading. The `manageInvoice` body uses `OSA/3.0/data`;
+/// the `manageAnnulment` counterpart by NAV's namespace convention
+/// uses `OSA/3.0/annul`. Verification deferred to first NAV-testbed
+/// annulment POST (the future submit-annulment PR).
+const NAV_NS_ANNUL: &str = "http://schemas.nav.gov.hu/OSA/3.0/annul";
+
+/// Technical-annulment reference data for [`render_annulment_data`]
+/// (PR-12, ADR-0025). The annulment is **not** a chain operation:
+/// no `<invoiceReference>` block, no `modificationIndex`. The
+/// payload-side analogue is
+/// `audit_payloads::InvoiceTechnicalAnnulmentRequestedPayload`;
+/// this struct carries only the fields that surface on the
+/// `<InvoiceAnnulment>` XML body (the audit payload additionally
+/// carries the operator-decision idempotency + prior transaction id
+/// for the audit-evidence bundle, which do not appear on the wire).
+#[derive(Debug, Clone)]
+pub struct AnnulmentReference {
+    /// Base invoice's NAV-facing number — same shape + caller
+    /// discipline as [`StornoReference::base_invoice_number`] /
+    /// [`ModificationReference::base_invoice_number`]. Becomes the
+    /// `<annulmentReference>` text content.
+    pub base_invoice_number: String,
+    /// NAV annulment code in canonical wire form — one of
+    /// `ERRATIC_DATA` / `ERRATIC_INVOICE_NUMBER` /
+    /// `ERRATIC_INVOICE_ISSUE_DATE` /
+    /// `ERRATIC_ELECTRONIC_HASH_VALUE`. The caller converts the
+    /// clap-ValueEnum form to the wire form via
+    /// `cli::AnnulmentCode::to_wire` before constructing this
+    /// struct.
+    pub annulment_code: &'static str,
+    /// Operator-supplied reason text — escaped by `quick_xml`'s
+    /// text writer the same way every other text-element write
+    /// goes through.
+    pub reason: String,
+}
 
 /// Render `<InvoiceData>` to bytes. The invoice number is built from the
 /// series code and the allocator-burned sequence number: `INV-default/00042`.
@@ -347,6 +383,79 @@ pub fn render_modification_data(
     w.write_event(Event::End(BytesEnd::new("invoice")))?;
     w.write_event(Event::End(BytesEnd::new("invoiceMain")))?;
     w.write_event(Event::End(BytesEnd::new("InvoiceData")))?;
+
+    Ok(buf)
+}
+
+/// Render `<InvoiceAnnulment>` to bytes (PR-12, ADR-0025).
+///
+/// **Structurally distinct** from [`render_invoice_data`] /
+/// [`render_storno_data`] / [`render_modification_data`]:
+///
+/// - **Different root element + namespace.** Root is
+///   `<InvoiceAnnulment>` in the `OSA/3.0/annul` namespace (the
+///   `manageAnnulment` endpoint's body shape) per ADR-0025 §
+///   "Surfaced conflict 1". Verification deferred to first NAV-
+///   testbed annulment POST.
+/// - **No `<invoiceMain>` / `<invoiceHead>` / lines / summary.** A
+///   technical annulment is NOT itself an invoice; it carries only
+///   the four metadata fields (reference + timestamp + code +
+///   reason).
+/// - **`<annulmentTimestamp>` is server-clock-only.** Per ADR-0025
+///   §4 — annulment timestamp is a technical not legal field; no
+///   operator-supplied date arg. Captured at render time as ISO 8601
+///   UTC (`YYYY-MM-DDTHH:MM:SSZ`). If NAV's testbed requires the
+///   compressed `YYYYMMDDhhmmss` form (which is what
+///   `requestTimestamp` uses in the SOAP header), the change is a
+///   one-line formatter swap and the wire shape per ADR-0025 §
+///   "Open questions" is the named trigger.
+///
+/// The `annulment_reference` argument carries the BASE invoice's
+/// NAV-facing number (the thing being annulled), the wire-form
+/// annulment code, and the operator's reason text. The caller is
+/// responsible for building `base_invoice_number` the same way
+/// `issue_storno.rs` / `issue_modification.rs` does.
+pub fn render_annulment_data(annulment_reference: &AnnulmentReference) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut w = Writer::new_with_indent(&mut buf, b' ', 2);
+
+    w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
+        .context("XML declaration")?;
+
+    let mut root = BytesStart::new("InvoiceAnnulment");
+    root.push_attribute(("xmlns", NAV_NS_ANNUL));
+    root.push_attribute(("xmlns:common", NAV_NS_BASE));
+    w.write_event(Event::Start(root))
+        .context("write <InvoiceAnnulment>")?;
+
+    text_element(
+        &mut w,
+        "annulmentReference",
+        &annulment_reference.base_invoice_number,
+    )?;
+    // Server-clock-only timestamp per ADR-0025 §4. ISO 8601 UTC
+    // (`YYYY-MM-DDTHH:MM:SSZ`). Formatted manually rather than
+    // depending on `time::Iso8601`'s const-generic configuration —
+    // same posture as `render_invoice_data`'s manual date format.
+    let now = time::OffsetDateTime::now_utc();
+    let timestamp = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        now.year(),
+        now.month() as u8,
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+    );
+    text_element(&mut w, "annulmentTimestamp", &timestamp)?;
+    text_element(
+        &mut w,
+        "annulmentCode",
+        annulment_reference.annulment_code,
+    )?;
+    text_element(&mut w, "annulmentReason", &annulment_reference.reason)?;
+
+    w.write_event(Event::End(BytesEnd::new("InvoiceAnnulment")))?;
 
     Ok(buf)
 }

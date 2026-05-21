@@ -1,5 +1,6 @@
 //! Typed NAV operations: `tokenExchange` (PR-7-B-2), `manageInvoice`
-//! (PR-7-B-3), and `queryTransactionStatus` (PR-7-C-1).
+//! (PR-7-B-3), `queryTransactionStatus` (PR-7-C-1), and
+//! `manageAnnulment` (PR-13 / ADR-0026 §3).
 //!
 //! All three operations share the same flow shape:
 //!
@@ -32,6 +33,14 @@
 //!     `SAVED` / `ABORTED`) and whose `request_xml` / `response_xml`
 //!     carry the verbatim bytes for the audit-ledger
 //!     `InvoiceAckStatus` entry the poll-loop emits per attempt.
+//!   - `manage_annulment::call` returns a `ManageAnnulmentOutcome`
+//!     whose `transaction_id` is NAV's annulment-side tracking id
+//!     (consumed by a future `query-annulment-status` poll per
+//!     ADR-0026 §"Follow-on PRs unblocked") and whose
+//!     `request_xml` / `response_xml` carry the verbatim bytes for
+//!     the audit-ledger
+//!     `InvoiceAnnulmentSubmissionAttempt` /
+//!     `InvoiceAnnulmentSubmissionResponse` payloads.
 //!
 //! None of these operations write to the audit ledger directly — the
 //! binary is responsible for that per ADR-0008 §Storage. These
@@ -43,6 +52,7 @@ use quick_xml::Reader;
 
 use crate::error::NavTransportError;
 
+pub mod manage_annulment;
 pub mod manage_invoice;
 pub mod query_transaction_status;
 pub mod token_exchange;
