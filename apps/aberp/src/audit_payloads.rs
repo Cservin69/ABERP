@@ -454,6 +454,102 @@ impl InvoiceStornoIssuedPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// InvoiceModificationIssued  (PR-11 / ADR-0024 — MODIFY chain-link
+// entry, the structural parallel to `InvoiceStornoIssuedPayload`. A
+// modification is itself an invoice and burns its own sequence number
+// via the standard allocator path (which writes its own
+// `InvoiceSequenceReservedPayload` + `InvoiceDraftCreatedPayload`
+// pair). THIS payload is the chain-link — same fields as the storno
+// chain-link plus `modification_issue_date` which NAV requires for
+// MODIFY but not for STORNO (ADR-0024 §3, §5).)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceModificationIssued`].
+///
+/// Pinned by ADR-0024 §5. Written by `aberp issue-modification` in the
+/// same DuckDB transaction as the modification's own allocator +
+/// audit-ledger entries.
+///
+/// `base_sequence_number` is denormalized from the base invoice's row
+/// by the same posture as
+/// [`InvoiceStornoIssuedPayload::base_sequence_number`] — drift
+/// guarded by ADR-0023 §4's integrity-scan extension (which carries
+/// forward unchanged to MODIFY).
+///
+/// `modification_issue_date` is the operator-supplied date the
+/// modification was issued, stored as `String` in canonical
+/// `YYYY-MM-DD` form (rationale per ADR-0024 §5 + "Alternatives
+/// considered" — typed-time wrapper would force serde-with adapters
+/// for a value the operator already supplies in canonical form).
+/// Validation that the string is well-formed happens at the CLI
+/// boundary (`apps/aberp/src/issue_modification.rs` step 2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceModificationIssuedPayload {
+    /// The modification's own invoice id — prefixed `inv_<ULID>` form.
+    pub modification_invoice_id: String,
+    /// The modification's own sequence number (allocated in the same
+    /// DuckDB transaction per ADR-0009 §3).
+    pub modification_seq: u64,
+    /// The modification's own sequence-reservation id (ULID-keyed,
+    /// matches `InvoiceSequenceReservedPayload::reservation_id`).
+    pub modification_reservation_id: String,
+    /// Idempotency key of the `IssueModificationCommand`. Same shape +
+    /// role as on `InvoiceStornoIssuedPayload`.
+    pub idempotency_key: String,
+    /// The **base invoice's** id — prefixed `inv_<ULID>` form. Chain
+    /// link (ULID-keyed per ADR-0019, explicit per ADR-0009 §6).
+    pub base_invoice_id: String,
+    /// The **base invoice's** NAV-facing sequence number. Denormalized
+    /// by design (see type-level doc comment above).
+    pub base_sequence_number: u64,
+    /// The `<modificationIndex>` this modification asserts against the
+    /// base invoice's chain. Allocator rules per ADR-0024 §7 — walks
+    /// both `InvoiceStornoIssued` AND `InvoiceModificationIssued`
+    /// entries against the same base.
+    pub modification_index: u32,
+    /// The operator-supplied `<modificationIssueDate>` in `YYYY-MM-DD`
+    /// form. NAV-required for MODIFY (distinguishes the wire
+    /// operation from STORNO per ADR-0024 §3); absent on STORNO so
+    /// the structural parallel breaks here intentionally.
+    pub modification_issue_date: String,
+}
+
+impl InvoiceModificationIssuedPayload {
+    /// Build a payload from the parts the allocator just produced.
+    /// `new()` rather than `from_outcome(...)` for the same reason
+    /// [`InvoiceStornoIssuedPayload::new`] uses it: the chain-link
+    /// fields cross multiple domain types (base + modification +
+    /// chain index + operator date) — no single domain struct carries
+    /// them all today, and a speculative `ModificationIssuanceOutcome`
+    /// type would be a CLAUDE.md rule-2 violation.
+    pub fn new(
+        modification_invoice_id: &str,
+        modification_seq: u64,
+        modification_reservation_id: &str,
+        idempotency_key: IdempotencyKey,
+        base_invoice_id: &str,
+        base_sequence_number: u64,
+        modification_index: u32,
+        modification_issue_date: &str,
+    ) -> Self {
+        Self {
+            modification_invoice_id: modification_invoice_id.to_string(),
+            modification_seq,
+            modification_reservation_id: modification_reservation_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            base_invoice_id: base_invoice_id.to_string(),
+            base_sequence_number,
+            modification_index,
+            modification_issue_date: modification_issue_date.to_string(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -755,6 +851,80 @@ mod tests {
         let decoded: InvoiceStornoIssuedPayload =
             serde_json::from_slice(&bytes).expect("typed decode");
         assert_eq!(decoded.modification_index, u32::MAX);
+    }
+
+    // ── PR-11 modification-chain payload round-trips (ADR-0024 §5) ──
+
+    /// Round-trip the MODIFY chain-link payload through serde. Same
+    /// posture as `storno_issued_round_trip`: the round-trip is the
+    /// canonical proof that ADR-0024 §5's payload contract holds in
+    /// code. The `modification_issue_date` field carries the
+    /// MODIFY-only delta over the storno shape; this test pins that
+    /// it round-trips byte-for-byte.
+    #[test]
+    fn modification_issued_round_trip() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceModificationIssuedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            42,
+            "rsv_01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            idem,
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            7,
+            1,
+            "2026-05-21",
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoiceModificationIssuedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        // CLAUDE.md rule 9: field-by-field pin so a future PartialEq-
+        // dropping refactor still surfaces. The MODIFY-only field
+        // `modification_issue_date` is the most likely silent-drop
+        // target since it has no STORNO analogue.
+        assert_eq!(
+            decoded.modification_invoice_id,
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAW"
+        );
+        assert_eq!(decoded.modification_seq, 42);
+        assert_eq!(
+            decoded.modification_reservation_id,
+            "rsv_01ARZ3NDEKTSV4RRFFQ69G5FAX"
+        );
+        assert!(decoded.idempotency_key.starts_with("idem_"));
+        assert_eq!(decoded.base_invoice_id, "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(decoded.base_sequence_number, 7);
+        assert_eq!(decoded.modification_index, 1);
+        assert_eq!(decoded.modification_issue_date, "2026-05-21");
+    }
+
+    /// `modification_index` must round-trip cleanly across the full
+    /// `u32` range — same rationale as
+    /// `storno_issued_round_trip_preserves_high_modification_index`.
+    /// The MODIFY chain index is allocated from the union walk over
+    /// both `InvoiceStornoIssued` and `InvoiceModificationIssued`
+    /// entries (ADR-0024 §7), so a long-running base with many
+    /// corrections plus a storno can plausibly reach higher indices
+    /// than the storno-only walk would.
+    #[test]
+    fn modification_issued_round_trip_preserves_high_modification_index() {
+        let payload = InvoiceModificationIssuedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            42,
+            "rsv_01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            IdempotencyKey::new(),
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            7,
+            u32::MAX,
+            "2026-05-21",
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceModificationIssuedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded.modification_index, u32::MAX);
+        assert_eq!(decoded.modification_issue_date, "2026-05-21");
     }
 
     /// The trap PR-6.1 closed: PR-5's `format!`-built JSON could not

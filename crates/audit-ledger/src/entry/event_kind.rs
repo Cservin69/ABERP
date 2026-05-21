@@ -44,8 +44,20 @@
 /// the existence of this entry — no second ledger entry is written
 /// against the base (ADR-0023 §2).
 ///
+/// PR-11 (ADR-0024) adds `InvoiceModificationIssued` — the MODIFY
+/// chain-link entry parallel to `InvoiceStornoIssued`. Same structural
+/// shape: a modification is itself an invoice with its own
+/// `InvoiceSequenceReserved` + `InvoiceDraftCreated` entries plus a
+/// chain-link entry that carries the base's id + the modification's
+/// own ids + the `modificationIndex` (allocated in the same DuckDB
+/// transaction by a walk that now considers BOTH `InvoiceStornoIssued`
+/// AND `InvoiceModificationIssued` entries against the same base —
+/// ADR-0024 §7). The base's derived typestate transition (`Finalized →
+/// Amended` per ADR-0009 §2) is observed by the existence of this
+/// entry; the same "no second source of truth" posture as STORNO.
+///
 /// The remaining invoice-lifecycle kinds (`Finalized`, `Rejected`,
-/// `SubmissionStuck`, `Voided`, `Amended`,
+/// `SubmissionStuck`, `Voided`,
 /// `TechnicalAnnulmentRequested`) land when their state transition
 /// first fires in the codebase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +127,27 @@ pub enum EventKind {
     /// the base; no separate ledger entry is written against the
     /// base (ADR-0023 §2). PR-10.
     InvoiceStornoIssued,
+
+    /// A modification (MODIFY) invoice was issued against a base
+    /// invoice (ADR-0009 §6, ADR-0024). Same structural shape as
+    /// `InvoiceStornoIssued`: the modification is itself an invoice
+    /// and got its own `InvoiceSequenceReserved` + `InvoiceDraftCreated`
+    /// entries in the same DuckDB transaction; THIS entry is the
+    /// chain-link payload (ADR-0024 §5) — it carries the base
+    /// invoice's id, the base's NAV-facing sequence number, the new
+    /// modification's own id + sequence + reservation id + idempotency
+    /// key, the allocated `modificationIndex` (allocated by a walk
+    /// that considers BOTH this kind AND `InvoiceStornoIssued` against
+    /// the same base — ADR-0024 §7), and the operator-supplied
+    /// `<modificationIssueDate>` (NAV-required for MODIFY but not for
+    /// STORNO; distinguishes the two operations on the wire — ADR-0024
+    /// §3).
+    ///
+    /// The base invoice's typestate transition (`Finalized → Amended`)
+    /// is **derived** from the existence of this entry pointing at
+    /// the base; no separate ledger entry is written against the
+    /// base (ADR-0024 §2). PR-11.
+    InvoiceModificationIssued,
 }
 
 impl EventKind {
@@ -132,6 +165,7 @@ impl EventKind {
             EventKind::InvoiceRetryRequested => "invoice.retry_requested",
             EventKind::InvoiceMarkedAbandoned => "invoice.marked_abandoned",
             EventKind::InvoiceStornoIssued => "invoice.storno_issued",
+            EventKind::InvoiceModificationIssued => "invoice.modification_issued",
         }
     }
 
@@ -158,6 +192,7 @@ impl EventKind {
             "invoice.retry_requested" => Ok(EventKind::InvoiceRetryRequested),
             "invoice.marked_abandoned" => Ok(EventKind::InvoiceMarkedAbandoned),
             "invoice.storno_issued" => Ok(EventKind::InvoiceStornoIssued),
+            "invoice.modification_issued" => Ok(EventKind::InvoiceModificationIssued),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -188,6 +223,7 @@ mod tests {
             EventKind::InvoiceRetryRequested,
             EventKind::InvoiceMarkedAbandoned,
             EventKind::InvoiceStornoIssued,
+            EventKind::InvoiceModificationIssued,
         ];
         for v in variants {
             let s = v.as_str();
@@ -246,6 +282,25 @@ mod tests {
             "invoice.storno_issued"
         );
         assert!(EventKind::InvoiceStornoIssued
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// PR-11 specifically: `InvoiceModificationIssued` is the MODIFY
+    /// chain-link kind for ADR-0009 §6 / ADR-0024 — same posture as
+    /// PR-10's storno-kind prefix test. The MODIFY entry MUST share
+    /// the `invoice.` prefix so the per-invoice export bundle picks
+    /// up both STORNO and MODIFY chain entries with one glob; a
+    /// MODIFY entry under a different prefix would split the chain
+    /// across two glob patterns and produce the silent-omission
+    /// failure mode CLAUDE.md rule 12 names.
+    #[test]
+    fn pr_11_modification_kind_uses_invoice_prefix() {
+        assert_eq!(
+            EventKind::InvoiceModificationIssued.as_str(),
+            "invoice.modification_issued"
+        );
+        assert!(EventKind::InvoiceModificationIssued
             .as_str()
             .starts_with("invoice."));
     }

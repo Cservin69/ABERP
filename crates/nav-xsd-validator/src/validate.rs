@@ -215,22 +215,45 @@ fn walk_invoice(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError>
     }
 }
 
-/// `<invoiceReference>` chain-link block — PR-10, ADR-0023. Present
-/// only on STORNO / MODIFY chain invoices. NAV v3.0 schema requires
-/// all three children below in order. The ABERP emitter writes
-/// `modifyWithoutMaster=false` always (the migrated-from-Billingo
-/// `true` path is deferred per ADR-0023 §4); the validator does not
-/// constrain the value here — value-level checks live in the
-/// per-invoice export bundle's evidence walker, not in the XSD
-/// allowlist.
+/// `<invoiceReference>` chain-link block — PR-10, ADR-0023; PR-11,
+/// ADR-0024. Present only on STORNO / MODIFY chain invoices. The
+/// three required children (`originalInvoiceNumber`,
+/// `modifyWithoutMaster`, `modificationIndex`) appear on both
+/// STORNO and MODIFY bodies. PR-11 adds `modificationIssueDate` as
+/// an OPTIONAL child — present on MODIFY only (NAV-required for
+/// MODIFY per the research file's "Storno and modification" section),
+/// absent on STORNO. The ABERP emitter writes `modifyWithoutMaster=
+/// false` always (the migrated-from-Billingo `true` path is deferred
+/// per ADR-0023 §4); the validator does not constrain the value here.
+///
+/// Position tolerance: `check_ordered_required` only projects onto
+/// the required set; the optional `modificationIssueDate` may appear
+/// at any position relative to the three required children. The
+/// ABERP emitter writes it between `originalInvoiceNumber` and
+/// `modifyWithoutMaster` per ADR-0024 §1 conflict 1; a future
+/// tightening (require a specific position when present) would be an
+/// explicit decision, not a silent regression. Same posture A40 names
+/// for `<invoiceReference>`'s own position within `<invoice>`.
 fn walk_invoice_reference(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
     const PARENT: &str = "invoiceReference";
+    // ALLOWED is the union of STORNO + MODIFY children. The optional
+    // `modificationIssueDate` is the PR-11 addition; it does NOT
+    // appear in ORDERED_REQUIRED because it is MODIFY-only and STORNO
+    // bodies must continue to validate without it. The discriminator
+    // between MODIFY and STORNO lives in
+    // `apps/aberp/src/submit_invoice.rs::detect_operation_from_xml`
+    // (ADR-0024 §3) — not in the XSD allowlist.
     const ALLOWED: &[&str] = &[
+        "originalInvoiceNumber",
+        "modificationIssueDate",
+        "modifyWithoutMaster",
+        "modificationIndex",
+    ];
+    const ORDERED_REQUIRED: &[&str] = &[
         "originalInvoiceNumber",
         "modifyWithoutMaster",
         "modificationIndex",
     ];
-    const ORDERED_REQUIRED: &[&str] = ALLOWED;
 
     let mut seen: Vec<&'static str> = Vec::new();
     loop {
@@ -246,6 +269,9 @@ fn walk_invoice_reference(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValida
                 match canonical {
                     "originalInvoiceNumber" => {
                         let _ = collect_text(reader, "originalInvoiceNumber")?;
+                    }
+                    "modificationIssueDate" => {
+                        let _ = collect_text(reader, "modificationIssueDate")?;
                     }
                     "modifyWithoutMaster" => {
                         let _ = collect_text(reader, "modifyWithoutMaster")?;

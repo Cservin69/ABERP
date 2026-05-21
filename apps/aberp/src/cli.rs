@@ -146,6 +146,46 @@ pub enum Command {
     /// abandoned invoice are loud-fails before any write
     /// (CLAUDE.md rule 12).
     IssueStorno(IssueStornoArgs),
+
+    /// Issue a modification (MODIFY) invoice that corrects a
+    /// previously-finalized base invoice per ADR-0009 §6 / ADR-0024
+    /// (PR-11).
+    ///
+    /// Structural parallel to `issue-storno`: the modification is
+    /// itself an invoice that burns its own sequence number, writes
+    /// its own `<InvoiceData>` XML on disk (with an
+    /// `<invoiceReference>` chain block carrying
+    /// `<modificationIssueDate>` PLUS the same fields a storno's
+    /// `<invoiceReference>` carries), and lands three audit-ledger
+    /// entries in one DuckDB transaction —
+    /// `InvoiceSequenceReserved`, `InvoiceDraftCreated`, and the
+    /// chain-link `InvoiceModificationIssued`. The base invoice's
+    /// derived typestate (`Finalized → Amended`) is observed from
+    /// the chain-link entry; no separate ledger entry is written
+    /// against the base (ADR-0024 §2).
+    ///
+    /// **Key contrast with `issue-storno`:** the modification body
+    /// is **full-replace** (carries the complete corrected invoice
+    /// line content, NOT a delta against the base — ADR-0024 §4).
+    /// Line / summary amounts are NOT negated; they are the new
+    /// effective values.
+    ///
+    /// **`issue-modification` does NOT call NAV** (same posture as
+    /// `issue-storno`). After this command writes the modification's
+    /// XML on disk, the operator's next step is `aberp submit-invoice
+    /// --invoice-xml <modification.xml> --invoice-id
+    /// <modification-id> --endpoint {test|production}` — the existing
+    /// wire path detects the MODIFY shape from the presence of
+    /// `<modificationIssueDate>` inside `<invoiceReference>` and
+    /// submits with `InvoiceOperation::Modify` (ADR-0024 §3).
+    ///
+    /// **Precondition** (ADR-0024 §6). `--references` must point at
+    /// an invoice in `Finalized` (NAV terminal `SAVED`) OR already
+    /// in `Amended` (a prior `InvoiceModificationIssued` chain entry
+    /// points at it). Modifications against an unsubmitted, stuck,
+    /// rejected, abandoned, OR Storno-cancelled base are loud-fails
+    /// before any ledger write (CLAUDE.md rule 12).
+    IssueModification(IssueModificationArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -391,6 +431,63 @@ pub struct IssueStornoArgs {
     /// silent series switch happens (ADR-0023 §1).
     #[arg(long, default_value = "INV-default")]
     pub series: String,
+}
+
+#[derive(Debug, Parser)]
+pub struct IssueModificationArgs {
+    /// Invoice id (prefixed form, `inv_<ULID>`) of the base invoice
+    /// this modification corrects. Must be in `Finalized` (NAV
+    /// terminal `SAVED`) OR already `Amended` (a prior
+    /// `InvoiceModificationIssued` entry points at it). A
+    /// modification against an unsubmitted, stuck, rejected,
+    /// abandoned, or Storno-cancelled base loud-fails before any
+    /// ledger write (ADR-0024 §6).
+    #[arg(long = "references")]
+    pub references: String,
+
+    /// Path to the input JSON file describing the modification's
+    /// **full corrected** line content. Same JSON shape as
+    /// `issue-invoice --in` / `issue-storno --in`; ABERP's MODIFY
+    /// semantics are full-replace, not delta (ADR-0024 §4) — the
+    /// modification carries the complete corrected invoice body, not
+    /// just the changed lines.
+    #[arg(long)]
+    pub r#in: PathBuf,
+
+    /// Path to write the modification's NAV InvoiceData XML.
+    /// Same on-disk validator gate as `issue-invoice --out` /
+    /// `issue-storno --out`; the resulting bytes are what
+    /// `submit-invoice` later POSTs to NAV (with operation MODIFY
+    /// detected from the body shape per ADR-0024 §3).
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Path to the tenant DuckDB file.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — used for the audit-ledger genesis hash
+    /// and the keychain service-name lookup
+    /// (`aberp.nav.<tenant>`).
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Series the modification's own sequence number is drawn from.
+    /// By default the same series as the base invoice. Same
+    /// override-path caveat as `issue-storno --series` (ADR-0023 §1).
+    #[arg(long, default_value = "INV-default")]
+    pub series: String,
+
+    /// `<modificationIssueDate>` in canonical `YYYY-MM-DD` form.
+    /// NAV-required for MODIFY (and the discriminator that
+    /// `submit-invoice`'s detector keys on per ADR-0024 §3). No
+    /// default — silently defaulting to "today" would mask an
+    /// accountant filing a back-dated correction with explicit dates
+    /// (CLAUDE.md rule 4: no hidden defaults on audit-bearing
+    /// fields; rule 12: fail loud). Validated against
+    /// `time::Date::parse(YYYY-MM-DD)` at the CLI boundary.
+    #[arg(long = "modification-date")]
+    pub modification_date: String,
 }
 
 #[derive(Debug, Parser)]

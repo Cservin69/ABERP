@@ -15,8 +15,8 @@ use anyhow::Result;
 use clap::Parser;
 
 use aberp::{
-    cli, issue_invoice, issue_storno, mark_abandoned, poll_ack, retry_submission, serve,
-    setup_nav_credentials, submit_invoice,
+    cli, issue_invoice, issue_modification, issue_storno, mark_abandoned, poll_ack,
+    retry_submission, serve, setup_nav_credentials, submit_invoice,
 };
 
 fn main() -> Result<()> {
@@ -32,6 +32,7 @@ fn main() -> Result<()> {
         cli::Command::MarkAbandoned(a) => mark_abandoned::run(&a),
         cli::Command::Serve(a) => serve::run(&a),
         cli::Command::IssueStorno(a) => issue_storno::run(&a),
+        cli::Command::IssueModification(a) => issue_modification::run(&a),
     }
 }
 

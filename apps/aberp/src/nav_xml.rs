@@ -82,6 +82,35 @@ pub struct StornoReference {
     pub modification_index: u32,
 }
 
+/// Modification chain-link reference data for
+/// [`render_modification_data`] (PR-11, ADR-0024). The MODIFY-shape
+/// counterpart to [`StornoReference`]: same base-invoice + chain-index
+/// pair, PLUS the operator-supplied `<modificationIssueDate>` that
+/// NAV requires for MODIFY but not for STORNO (ADR-0024 §3).
+///
+/// The XML emitter renders these into the SAME `<invoiceReference>`
+/// block shape as STORNO, with the additional `<modificationIssueDate>`
+/// child positioned between `<originalInvoiceNumber>` and
+/// `<modifyWithoutMaster>` per ADR-0024 §1 conflict 1's chosen
+/// reading of the research-doc grammar.
+#[derive(Debug, Clone)]
+pub struct ModificationReference {
+    /// Base invoice's NAV-facing number — same shape + caller
+    /// discipline as [`StornoReference::base_invoice_number`].
+    pub base_invoice_number: String,
+    /// `<modificationIndex>` allocated by the widened chain walker
+    /// per ADR-0024 §7 — walks both `InvoiceStornoIssued` AND
+    /// `InvoiceModificationIssued` entries against the same base, so
+    /// the index is globally unique across the chain regardless of
+    /// per-kind order.
+    pub modification_index: u32,
+    /// `<modificationIssueDate>` operator-supplied date the
+    /// modification was issued, in canonical `YYYY-MM-DD` form
+    /// (validated at the CLI boundary per
+    /// `apps/aberp/src/issue_modification.rs` step 2).
+    pub modification_issue_date: String,
+}
+
 const NAV_NS_DATA: &str = "http://schemas.nav.gov.hu/OSA/3.0/data";
 const NAV_NS_BASE: &str = "http://schemas.nav.gov.hu/OSA/3.0/base";
 
@@ -233,6 +262,95 @@ pub fn render_storno_data(
     Ok(buf)
 }
 
+/// Render the modification's `<InvoiceData>` to bytes (PR-11,
+/// ADR-0024).
+///
+/// Structurally parallel to [`render_storno_data`] with two
+/// differences that follow from ADR-0024 §3 + §4:
+///
+/// 1. The `<invoiceReference>` block carries the MODIFY-shape
+///    children (an extra `<modificationIssueDate>` between
+///    `<originalInvoiceNumber>` and `<modifyWithoutMaster>` per
+///    ADR-0024 §1 conflict 1). The discriminator for the wire
+///    operation (CREATE vs STORNO vs MODIFY) lives in
+///    `submit_invoice::detect_operation_from_xml` (ADR-0024 §3); the
+///    presence of `<modificationIssueDate>` is what flips the body
+///    from STORNO-shape to MODIFY-shape.
+///
+/// 2. Line and summary amounts are **NOT negated.** The modification
+///    is a **full-replace** body per ADR-0024 §4 — it carries the
+///    new effective invoice values, not a delta. The line writers are
+///    reused against the input invoice's lines directly, so this
+///    function shares `write_lines` / `write_summary` with
+///    [`render_invoice_data`] (and, by happenstance, with
+///    [`render_storno_data`] via that storno function's negated
+///    parallel `Vec`).
+///
+/// The `invoice` argument carries the MODIFICATION's own sequence
+/// number (the modification is itself an invoice with its own
+/// allocator slot per ADR-0009 §6 + ADR-0024 §5);
+/// `modification_reference.base_invoice_number` names what is being
+/// corrected.
+pub fn render_modification_data(
+    invoice: &ReadyInvoice,
+    series_code: &SeriesCode,
+    parties: &NavParties,
+    modification_reference: &ModificationReference,
+) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut w = Writer::new_with_indent(&mut buf, b' ', 2);
+
+    w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
+        .context("XML declaration")?;
+
+    let mut root = BytesStart::new("InvoiceData");
+    root.push_attribute(("xmlns", NAV_NS_DATA));
+    root.push_attribute(("xmlns:common", NAV_NS_BASE));
+    w.write_event(Event::Start(root))
+        .context("write <InvoiceData> (modification)")?;
+
+    // Modification's OWN invoice number — the correction is itself an invoice.
+    let invoice_number = format!("{}/{:05}", series_code.as_str(), invoice.sequence_number);
+    text_element(&mut w, "invoiceNumber", &invoice_number)?;
+    let date = invoice.issue_date.date();
+    let issue_date = format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        date.month() as u8,
+        date.day(),
+    );
+    text_element(&mut w, "invoiceIssueDate", &issue_date)?;
+
+    w.write_event(Event::Start(BytesStart::new("invoiceMain")))?;
+    w.write_event(Event::Start(BytesStart::new("invoice")))?;
+
+    // <invoiceReference> — MODIFY-shape. Position: direct child of
+    // <invoice>, BEFORE <invoiceHead>, per NAV v3.0 schema (same
+    // position as the STORNO block).
+    write_modification_reference(&mut w, modification_reference)?;
+
+    // <invoiceHead> reuses the standard supplier/customer/detail
+    // section writers — same posture as the STORNO emitter; party +
+    // detail data is the modification's own (corrected) values.
+    w.write_event(Event::Start(BytesStart::new("invoiceHead")))?;
+    write_supplier(&mut w, &parties.supplier)?;
+    write_customer(&mut w, &parties.customer)?;
+    write_invoice_detail(&mut w, &issue_date)?;
+    w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
+
+    // <invoiceLines> + <invoiceSummary> — NOT negated. Full-replace
+    // per ADR-0024 §4; the modification's `invoice.lines` already
+    // carry the new effective values.
+    write_lines(&mut w, &invoice.lines)?;
+    write_summary(&mut w, &invoice.lines)?;
+
+    w.write_event(Event::End(BytesEnd::new("invoice")))?;
+    w.write_event(Event::End(BytesEnd::new("invoiceMain")))?;
+    w.write_event(Event::End(BytesEnd::new("InvoiceData")))?;
+
+    Ok(buf)
+}
+
 /// Negate a `LineItem` for storno emission. Quantities stay positive
 /// (`u32` cannot represent negative); the negation lives in
 /// `unit_price`, which is `Huf(i64)` and can be negative. The
@@ -247,8 +365,8 @@ fn negate_line(line: &LineItem) -> LineItem {
     }
 }
 
-/// Write the `<invoiceReference>` chain-link block. PR-10 always
-/// emits `modifyWithoutMaster=false`: ADR-0023 §4 names the
+/// Write the STORNO `<invoiceReference>` chain-link block. PR-10
+/// always emits `modifyWithoutMaster=false`: ADR-0023 §4 names the
 /// `queryInvoiceChainDigest` path for migrated-from-Billingo bases
 /// (the case where `modifyWithoutMaster=true` would be the right
 /// value) and explicitly defers it. When the migrated-base path
@@ -266,6 +384,51 @@ fn write_invoice_reference(
         w,
         "modificationIndex",
         &storno_reference.modification_index.to_string(),
+    )?;
+    w.write_event(Event::End(BytesEnd::new("invoiceReference")))?;
+    Ok(())
+}
+
+/// Write the MODIFY `<invoiceReference>` chain-link block (PR-11,
+/// ADR-0024). Same shape as [`write_invoice_reference`] PLUS the
+/// MODIFY-required `<modificationIssueDate>` element positioned
+/// between `<originalInvoiceNumber>` and `<modifyWithoutMaster>` per
+/// ADR-0024 §1 conflict 1.
+///
+/// **Not extracted into a shared helper with
+/// [`write_invoice_reference`]** despite the heavy overlap — the two
+/// blocks have different required-child sets (STORNO: three required;
+/// MODIFY: same three plus one MODIFY-only required-by-NAV but
+/// optional-from-validator's perspective). A shared helper taking an
+/// `Option<&str>` for the modification date would couple the two
+/// shapes; CLAUDE.md rule 2 (no speculative abstractions) — keep the
+/// two parallel writers honest. If a third chain-shape ever appears
+/// (it does not today — technical annulment uses a different
+/// endpoint), the trigger to extract is named in ADR-0024 §7.
+///
+/// Same `modifyWithoutMaster=false` pin as STORNO; the migrated-from-
+/// Billingo path that would set this `true` is deferred symmetrically
+/// per ADR-0024 §7 / F23.
+fn write_modification_reference(
+    w: &mut Writer<&mut Vec<u8>>,
+    modification_reference: &ModificationReference,
+) -> Result<()> {
+    w.write_event(Event::Start(BytesStart::new("invoiceReference")))?;
+    text_element(
+        w,
+        "originalInvoiceNumber",
+        &modification_reference.base_invoice_number,
+    )?;
+    text_element(
+        w,
+        "modificationIssueDate",
+        &modification_reference.modification_issue_date,
+    )?;
+    text_element(w, "modifyWithoutMaster", "false")?;
+    text_element(
+        w,
+        "modificationIndex",
+        &modification_reference.modification_index.to_string(),
     )?;
     w.write_event(Event::End(BytesEnd::new("invoiceReference")))?;
     Ok(())

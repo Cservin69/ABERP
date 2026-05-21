@@ -623,47 +623,90 @@ fn run_single_tx(
 }
 
 /// Walk `audit_ledger` inside the borrowed transaction for every
-/// `InvoiceStornoIssued` entry, decode the payload, filter by
+/// chain entry (BOTH `InvoiceStornoIssued` AND
+/// `InvoiceModificationIssued`), decode each payload, filter by
 /// `base_invoice_id`, return `max(modification_index) + 1` — or `1`
 /// if no prior chain entry exists.
 ///
-/// Runs inside the caller's tx so concurrent storno commands against
-/// the same base are serialized by DuckDB's single-writer file lock
+/// Runs inside the caller's tx so concurrent commands against the
+/// same base are serialized by DuckDB's single-writer file lock
 /// (ADR-0009 §3). On the Postgres-per-tenant variant (ADR-0016) the
 /// equivalent is a `SELECT ... FOR UPDATE` on the base row; PR-10's
 /// DuckDB path needs no extra locking primitive.
 ///
-/// PR-10 considers only `InvoiceStornoIssued` entries; the future
-/// MODIFY PR will widen this walk to include
-/// `InvoiceModificationIssued` (ADR-0023 §4).
+/// **The walk considers BOTH chain kinds** per ADR-0024 §7: NAV's
+/// uniqueness rule says `modificationIndex` is unique per
+/// `invoiceReference` regardless of operation kind, so a storno-only
+/// walk would re-issue an index already used by a prior MODIFY and
+/// NAV would reject with `INVOICE_NUMBER_NOT_UNIQUE`-shape at submit
+/// time. Walking both kinds closes the failure mode at the
+/// allocator. The symmetric walker lives in
+/// `issue_modification::next_modification_index_in_tx`; both must
+/// stay in sync — if a third chain kind ever appears, both functions
+/// extend together (ADR-0024 §7 names the trigger for extracting a
+/// shared `chain_allocator` module).
 fn next_modification_index_in_tx(
     tx: &duckdb::Transaction<'_>,
     base_invoice_id: &str,
 ) -> Result<u32> {
-    let mut stmt = tx
-        .prepare("SELECT seq, payload FROM audit_ledger WHERE kind = ?;")
-        .context("prepare audit_ledger scan for storno chain index")?;
-    let rows = stmt
-        .query_map([EventKind::InvoiceStornoIssued.as_str()], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })
-        .context("query audit_ledger for storno chain index")?;
-
     let mut max_index: u32 = 0;
-    for row in rows {
-        let (seq, payload_bytes) =
-            row.context("read audit_ledger row during storno chain-index walk")?;
-        let payload: audit_payloads::InvoiceStornoIssuedPayload =
-            serde_json::from_slice(&payload_bytes).map_err(|e| {
-                anyhow!(
-                    "InvoiceStornoIssued audit payload (seq {seq}) failed typed decode: {e} \
-                     — audit ledger appears tampered or schema-drifted"
-                )
-            })?;
-        if payload.base_invoice_id == base_invoice_id && payload.modification_index > max_index {
-            max_index = payload.modification_index;
+
+    // STORNO entries.
+    {
+        let mut stmt = tx
+            .prepare("SELECT seq, payload FROM audit_ledger WHERE kind = ?;")
+            .context("prepare audit_ledger scan for storno chain index")?;
+        let rows = stmt
+            .query_map([EventKind::InvoiceStornoIssued.as_str()], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .context("query audit_ledger for storno chain index")?;
+        for row in rows {
+            let (seq, payload_bytes) =
+                row.context("read audit_ledger row during storno chain-index walk")?;
+            let payload: audit_payloads::InvoiceStornoIssuedPayload =
+                serde_json::from_slice(&payload_bytes).map_err(|e| {
+                    anyhow!(
+                        "InvoiceStornoIssued audit payload (seq {seq}) failed typed decode: {e} \
+                         — audit ledger appears tampered or schema-drifted"
+                    )
+                })?;
+            if payload.base_invoice_id == base_invoice_id
+                && payload.modification_index > max_index
+            {
+                max_index = payload.modification_index;
+            }
         }
     }
+
+    // MODIFICATION entries (PR-11 / ADR-0024 §7).
+    {
+        let mut stmt = tx
+            .prepare("SELECT seq, payload FROM audit_ledger WHERE kind = ?;")
+            .context("prepare audit_ledger scan for modification chain index")?;
+        let rows = stmt
+            .query_map([EventKind::InvoiceModificationIssued.as_str()], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .context("query audit_ledger for modification chain index")?;
+        for row in rows {
+            let (seq, payload_bytes) =
+                row.context("read audit_ledger row during modification chain-index walk")?;
+            let payload: audit_payloads::InvoiceModificationIssuedPayload =
+                serde_json::from_slice(&payload_bytes).map_err(|e| {
+                    anyhow!(
+                        "InvoiceModificationIssued audit payload (seq {seq}) failed typed decode: {e} \
+                         — audit ledger appears tampered or schema-drifted"
+                    )
+                })?;
+            if payload.base_invoice_id == base_invoice_id
+                && payload.modification_index > max_index
+            {
+                max_index = payload.modification_index;
+            }
+        }
+    }
+
     // First chain entry against a base starts at 1 per NAV's spec.
     Ok(max_index.saturating_add(1))
 }
@@ -794,6 +837,61 @@ mod tests {
         let tx = conn.transaction().unwrap();
         let idx = next_modification_index_in_tx(&tx, "inv_BASE").unwrap();
         assert_eq!(idx, 4);
+    }
+
+    /// PR-11 / ADR-0024 §7 symmetry: the storno walker MUST also see
+    /// `InvoiceModificationIssued` entries against the same base so
+    /// it does not re-issue an index a prior MODIFY already burned.
+    /// Without this, two operators on the same base who issue MODIFY
+    /// then STORNO would both end up with `modification_index = 1`
+    /// and NAV would reject the second with
+    /// `INVOICE_NUMBER_NOT_UNIQUE`-shape — failure at the wire, far
+    /// from the allocator. CLAUDE.md rule 12 fail-loud + the F22
+    /// closure depend on this.
+    #[test]
+    fn next_modification_index_for_storno_sees_prior_modify_entries() {
+        // Build a fixture: one prior MODIFY against inv_BASE at index 1.
+        let tenant = TenantId::new("t1".to_string()).unwrap();
+        let bh = BinaryHash::from_bytes([0u8; 32]);
+        let actor = Actor::from_local_cli("sess".to_string(), "test-user");
+        let meta = LedgerMeta::new(tenant, bh);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        audit_ledger::ensure_schema(&conn).unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            let idem = IdempotencyKey::new();
+            let payload = audit_payloads::InvoiceModificationIssuedPayload::new(
+                "inv_modif_0",
+                100,
+                "rsv_modif_0",
+                idem,
+                "inv_BASE",
+                42, // dummy base seq
+                1,  // chain index from the MODIFY
+                "2026-05-21",
+            );
+            audit_ledger::append_in_tx(
+                &tx,
+                &meta,
+                EventKind::InvoiceModificationIssued,
+                payload.to_bytes(),
+                actor,
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // A subsequent storno against inv_BASE must allocate index 2,
+        // not 1 — the storno walker must see the MODIFY entry too.
+        let tx = conn.transaction().unwrap();
+        let idx = next_modification_index_in_tx(&tx, "inv_BASE").unwrap();
+        assert_eq!(
+            idx, 2,
+            "storno walker must consider prior MODIFY entries against the same base \
+             (ADR-0024 §7 symmetry)"
+        );
     }
 
     /// Precondition walker — Finalized base.

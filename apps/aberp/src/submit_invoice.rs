@@ -237,13 +237,11 @@ async fn call_nav(
         .context("NAV tokenExchange")?;
 
     // 6b. manageInvoice with the decrypted token. The per-invoice
-    //     `operation` is detected from the XML body's shape
-    //     (presence of `<invoiceReference>` => STORNO chain invoice).
-    //     PR-10 / ADR-0023 §1 named this as "submit-invoice reads the
-    //     operation field out of the XML envelope"; the previous
-    //     hard-coded `Create` would have rejected every storno at NAV
-    //     because the storno body carries `<invoiceReference>` which
-    //     is invalid for CREATE.
+    //     `operation` is detected from the XML body's shape via the
+    //     three-way classifier (CREATE / STORNO / MODIFY) — see
+    //     `detect_operation_from_xml` doc comment. PR-11 / ADR-0024 §3
+    //     closed F22 by extending PR-10's two-way classifier with the
+    //     `<modificationIssueDate>` disambiguator for MODIFY.
     let operation = detect_operation_from_xml(invoice_xml)?;
     let manage = manage_invoice::call(
         &transport,
@@ -269,28 +267,34 @@ async fn call_nav(
 /// `<InvoiceData>` body's shape. Deterministic code, not an LLM
 /// classification (CLAUDE.md rule 5).
 ///
-/// Today's logic: presence of `<invoiceReference>` => `STORNO`;
-/// absence => `CREATE`. MODIFY (PR-11+) will share the
-/// `<invoiceReference>` block with STORNO and needs an additional
-/// disambiguator (e.g. the operator-set `<modificationIssueDate>`
-/// field that NAV requires for MODIFY but not STORNO). Surfaced as
-/// PR-10 F22: when MODIFY lands, this detector must split into a
-/// three-way classifier.
+/// Three-way classifier (PR-11, ADR-0024 §3 — closes F22):
+///
+/// | Body shape | Result |
+/// |---|---|
+/// | No `<invoiceReference>` | `Create` |
+/// | Contains `<invoiceReference>` AND `<modificationIssueDate>` | `Modify` |
+/// | Contains `<invoiceReference>` and NOT `<modificationIssueDate>` | `Storno` |
+///
+/// Match the OPENING tag with no attributes; the emitter always
+/// writes both `<invoiceReference>` and `<modificationIssueDate>`
+/// bare. A future emitter that adds an attribute to either would
+/// change `<x>` to `<x attr="...">` and the contains-check would
+/// miss — the round-trip pair-up tests
+/// (`apps/aberp/tests/issue_storno_xml_round_trip.rs` +
+/// `apps/aberp/tests/issue_modification_xml_round_trip.rs`) close the
+/// trap by construction: the validator + emitter pair fail together
+/// if a structural assumption breaks.
 fn detect_operation_from_xml(xml: &[u8]) -> Result<InvoiceOperation> {
     let body = std::str::from_utf8(xml).context(
         "invoice XML is not valid UTF-8 — NAV requires UTF-8 per the v3.0 schema",
     )?;
-    // Match the OPENING tag with no attributes; the emitter always
-    // writes it bare. A future emitter that adds an attribute would
-    // change `<invoiceReference>` to `<invoiceReference attr="...">`
-    // and the contains-check would miss — the round-trip test
-    // (apps/aberp/tests/nav_xsd_validator_round_trip.rs) is the
-    // closer of this trap, and the storno-XML test added in PR-10
-    // exercises the detector by construction.
-    if body.contains("<invoiceReference>") {
-        Ok(InvoiceOperation::Storno)
+    if !body.contains("<invoiceReference>") {
+        return Ok(InvoiceOperation::Create);
+    }
+    if body.contains("<modificationIssueDate>") {
+        Ok(InvoiceOperation::Modify)
     } else {
-        Ok(InvoiceOperation::Create)
+        Ok(InvoiceOperation::Storno)
     }
 }
 
@@ -464,6 +468,49 @@ mod tests {
         assert_eq!(
             detect_operation_from_xml(xml).unwrap(),
             InvoiceOperation::Storno
+        );
+    }
+
+    /// PR-11 / ADR-0024 §3 / F22: MODIFY-shape body carries BOTH
+    /// `<invoiceReference>` AND `<modificationIssueDate>`. The
+    /// detector flips to `Modify` on the second substring's presence.
+    /// CLAUDE.md rule 9: this is the intent-pinning test for the
+    /// MODIFY arm — without it a future regression flattening
+    /// `Modify` back to `Storno` would still pass the two-arm test
+    /// list above.
+    #[test]
+    fn detect_operation_modify_when_modification_issue_date_present() {
+        let xml = b"<?xml version=\"1.0\"?>\
+            <InvoiceData><invoiceNumber>X/00003</invoiceNumber>\
+            <invoiceMain><invoice>\
+            <invoiceReference><originalInvoiceNumber>X/00001</originalInvoiceNumber>\
+            <modificationIssueDate>2026-05-21</modificationIssueDate>\
+            <modifyWithoutMaster>false</modifyWithoutMaster>\
+            <modificationIndex>2</modificationIndex></invoiceReference>\
+            <invoiceHead/></invoice></invoiceMain></InvoiceData>";
+        assert_eq!(
+            detect_operation_from_xml(xml).unwrap(),
+            InvoiceOperation::Modify
+        );
+    }
+
+    /// Defence-in-depth: a body that carries `<modificationIssueDate>`
+    /// WITHOUT `<invoiceReference>` must still classify as `Create`
+    /// (the modification field on its own does not assert chain
+    /// membership; the chain link is the `<invoiceReference>` block).
+    /// This shape should not arise from the ABERP emitters, but if a
+    /// future operator-edited file carries it, the deterministic rule
+    /// is "no invoice reference => no chain => Create".
+    #[test]
+    fn detect_operation_create_when_modification_date_without_reference() {
+        let xml = b"<?xml version=\"1.0\"?>\
+            <InvoiceData><invoiceNumber>X/00004</invoiceNumber>\
+            <invoiceMain><invoice>\
+            <invoiceHead><modificationIssueDate>2026-05-21</modificationIssueDate></invoiceHead>\
+            </invoice></invoiceMain></InvoiceData>";
+        assert_eq!(
+            detect_operation_from_xml(xml).unwrap(),
+            InvoiceOperation::Create
         );
     }
 
