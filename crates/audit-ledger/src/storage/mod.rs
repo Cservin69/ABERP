@@ -163,6 +163,24 @@ impl Ledger {
         let entries = self.entries().map_err(LedgerVerifyError::Read)?;
         verify_chain(&self.meta.tenant_id, entries.iter()).map_err(LedgerVerifyError::Chain)
     }
+
+    /// Synchronise the mirror file at `mirror_path` to the DB's
+    /// current head per ADR-0030 §2. Delegates to
+    /// [`crate::sync_mirror`]; method shape exists so the binary
+    /// path's post-commit re-open + verify pattern extends with
+    /// one extra line.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces every [`AppendError`] variant
+    /// [`crate::sync_mirror`] returns. See its module docs for
+    /// the partial-write recovery posture (`MirrorCorrupt`),
+    /// the divergence-detection posture (`MirrorDivergent`),
+    /// and the bootstrap path (implicit backfill from the DB
+    /// on first call).
+    pub fn sync_mirror(&self, mirror_path: &Path) -> Result<u64, AppendError> {
+        crate::mirror::sync_mirror(&self.conn, &self.meta, mirror_path)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────

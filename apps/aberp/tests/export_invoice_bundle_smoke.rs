@@ -159,10 +159,19 @@ fn run_produces_well_formed_tar_zst_bundle() {
         manifest["signature_status"],
         serde_json::json!("deferred-per-f5")
     );
+    // PR-17 / ADR-0030 §5: the smoke seed uses `Ledger::append`
+    // (the trait-style wrapper that does NOT touch the mirror —
+    // it has no path context). So the mirror file is absent at
+    // bundle time and the bundle reader reports the
+    // `absent-pre-pr-17` agreement state. The integration tests
+    // in `audit_mirror_sync_live.rs` exercise the
+    // `verified-agreement` path through the binary-side
+    // `sync_mirror` call that the production CLI commands
+    // invoke post-commit.
     assert_eq!(manifest["mirror_file_present"], serde_json::json!(false));
     assert_eq!(
         manifest["mirror_file_status"],
-        serde_json::json!("deferred-per-f10")
+        serde_json::json!("absent-pre-pr-17")
     );
 
     // chain.jsonl: one line per entry, three entries total.
@@ -272,6 +281,125 @@ fn run_overwrites_when_explicitly_allowed() {
     // Cleanup.
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&db);
+}
+
+/// PR-17 / ADR-0030 §5: when the operator has run a post-PR-17
+/// command that called `sync_mirror`, the mirror file exists and
+/// the bundle reader's manifest flips to
+/// `mirror_file_present: true` + `mirror_file_status: "verified-
+/// agreement"`. Drives the mirror initialisation explicitly via
+/// `Ledger::sync_mirror` (the same call the binary path makes
+/// post-commit) so the integration covers the active path, not
+/// just the AbsentPrePr17 fallback.
+#[test]
+fn run_produces_verified_agreement_bundle_when_mirror_is_synced() {
+    let db = temp_path("db", "duckdb");
+    let out = temp_path("bundle", "tar.zst");
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(&out);
+
+    let invoice_id = "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    seed_ledger(&db, invoice_id);
+
+    // Initialise the mirror via the same surface the binary's
+    // post-commit code uses. ADR-0030 §7 implicit backfill kicks
+    // in here because the mirror file does not yet exist on disk.
+    let tenant = TenantId::new("tenant-bundle-smoke".to_string()).unwrap();
+    let ledger = Ledger::open(&db, tenant, TEST_BINARY_HASH).unwrap();
+    let mirror_path = aberp_audit_ledger::mirror_path_for(&db);
+    let head = ledger.sync_mirror(&mirror_path).unwrap();
+    assert_eq!(head, 3, "mirror should backfill all three seeded entries");
+    assert!(mirror_path.exists(), "mirror file present on disk after sync");
+
+    let args = ExportInvoiceBundleArgs {
+        invoice_id: invoice_id.to_string(),
+        out: out.clone(),
+        allow_overwrite: false,
+        db: db.clone(),
+        tenant: "tenant-bundle-smoke".to_string(),
+    };
+    aberp::export_invoice_bundle::run(&args).expect("bundle run succeeds against synced mirror");
+    assert!(out.exists());
+
+    // Decompress + read the manifest.
+    let compressed = std::fs::read(&out).unwrap();
+    let decoded = zstd::stream::decode_all(&compressed[..]).unwrap();
+    let mut archive = tar::Archive::new(&decoded[..]);
+    let mut manifest_json: Option<Vec<u8>> = None;
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().display().to_string();
+        let mut bytes = Vec::new();
+        std::io::copy(&mut entry, &mut bytes).unwrap();
+        if path == "bundle/manifest.json" {
+            manifest_json = Some(bytes);
+        }
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_json.unwrap()).unwrap();
+    assert_eq!(manifest["mirror_file_present"], serde_json::json!(true));
+    assert_eq!(
+        manifest["mirror_file_status"],
+        serde_json::json!("verified-agreement")
+    );
+
+    // Cleanup.
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(&mirror_path);
+}
+
+/// PR-17 / ADR-0030 §5: when the mirror file diverges from the
+/// DB at the entry_hash level, `export-invoice-bundle` REFUSES
+/// to produce the archive. CLAUDE.md rule 12 — silent emission
+/// of a bundle that disagrees with its own audit trail is the
+/// wrong affordance.
+#[test]
+fn run_refuses_bundle_when_mirror_diverges_from_db() {
+    let db = temp_path("db", "duckdb");
+    let out = temp_path("bundle", "tar.zst");
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(&out);
+
+    let invoice_id = "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    seed_ledger(&db, invoice_id);
+
+    let tenant = TenantId::new("tenant-bundle-smoke".to_string()).unwrap();
+    let ledger = Ledger::open(&db, tenant, TEST_BINARY_HASH).unwrap();
+    let mirror_path = aberp_audit_ledger::mirror_path_for(&db);
+    ledger.sync_mirror(&mirror_path).unwrap();
+
+    // Tamper with the mirror: rewrite the entry_hash on the
+    // first line to a known-bad value. The bundle reader's
+    // agreement check (assert_mirror_db_agreement) is the
+    // assertion under test.
+    let mirror_bytes = std::fs::read(&mirror_path).unwrap();
+    let mut text = String::from_utf8(mirror_bytes).unwrap();
+    let first_eh = text.find("\"entry_hash\":\"").unwrap() + "\"entry_hash\":\"".len();
+    let after_hex = first_eh + 64;
+    text.replace_range(first_eh..after_hex, &"00".repeat(32));
+    std::fs::write(&mirror_path, text.as_bytes()).unwrap();
+
+    let args = ExportInvoiceBundleArgs {
+        invoice_id: invoice_id.to_string(),
+        out: out.clone(),
+        allow_overwrite: false,
+        db: db.clone(),
+        tenant: "tenant-bundle-smoke".to_string(),
+    };
+    let err = aberp::export_invoice_bundle::run(&args).expect_err("divergent mirror loud-fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("disagrees with DB") || msg.contains("refusing to emit"),
+        "divergence must surface in the diagnostic: got {msg}"
+    );
+    assert!(
+        !out.exists(),
+        "bundle output must not exist after mirror-divergence refusal"
+    );
+
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(&mirror_path);
 }
 
 /// Missing invoice id (no entries in the ledger reference it) loud-

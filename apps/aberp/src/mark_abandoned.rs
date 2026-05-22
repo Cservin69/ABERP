@@ -159,6 +159,13 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
         .context("audit-ledger chain verification failed AFTER mark-abandoned")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
+    // 5a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
+    //     post-commit.
+    let mirror_path = audit_ledger::mirror_path_for(&args.db);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after mark-abandoned commit")?;
+
     // 6. Typestate advance + operator-visible summary.
     let submitted = ready_invoice.into_submitted(stuck.prior_transaction_id.clone());
     let stuck_typestate = submitted.into_submission_stuck();

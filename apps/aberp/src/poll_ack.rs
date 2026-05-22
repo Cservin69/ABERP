@@ -240,6 +240,13 @@ pub fn run(args: &PollAckArgs) -> Result<()> {
         .context("audit-ledger chain verification failed AFTER poll-ack")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
+    // 6a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
+    //     post-commit.
+    let mirror_path = audit_ledger::mirror_path_for(&args.db);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after poll-ack commit")?;
+
     // 7. Typestate advance + operator-visible summary.
     match terminus {
         LoopTerminus::LastStatus(ProcessingStatus::Saved) => {

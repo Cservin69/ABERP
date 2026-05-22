@@ -91,7 +91,10 @@
 use std::io::Write;
 use std::path::Path;
 
-use aberp_audit_ledger::{BinaryHash, Entry, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{
+    mirror_path_for, read_mirror_entries, BinaryHash, Entry, EventKind, Ledger, MirrorEntry,
+    TenantId,
+};
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -116,11 +119,18 @@ const MANIFEST_VERSION: u32 = 1;
 /// inside the archive.
 const SIGNATURE_STATUS_DEFERRED: &str = "deferred-per-f5";
 
-/// Placeholder string declared in the manifest while the F10
-/// mirror-file infrastructure remains deferred per ADR-0029
-/// §5. PR-17 replaces this with `"verified-agreement"` (or
-/// `"divergence-detected"`) once the mirror writer lands.
-const MIRROR_FILE_STATUS_DEFERRED: &str = "deferred-per-f10";
+/// Manifest string surfaced when the mirror file is present
+/// and its `entry_hash` for every covered seq matches the DB.
+/// PR-17 / ADR-0030 §5.
+const MIRROR_FILE_STATUS_VERIFIED: &str = "verified-agreement";
+
+/// Manifest string surfaced when the mirror file is absent
+/// (pre-PR-17 DB that has not yet been touched by a post-PR-17
+/// command). PR-17 / ADR-0030 §"Surfaced conflict 3" Reading C.
+/// Distinct from `"divergence-detected"` (which the bundle
+/// reader never emits — it refuses the bundle output instead
+/// per ADR-0029 §5 + ADR-0030 §5 + CLAUDE.md rule 12).
+const MIRROR_FILE_STATUS_ABSENT_PRE_PR17: &str = "absent-pre-pr-17";
 
 /// Internal top-level directory inside the archive. A NAV
 /// inspector untarring the archive gets a single
@@ -287,9 +297,11 @@ impl<'a> ChainJsonlEntry<'a> {
     }
 }
 
-/// Bundle-level manifest fields per ADR-0029 §3. Serialized as
-/// pretty JSON at `bundle/manifest.json`. Field-set pinned by
-/// [`tests::manifest_carries_every_adr_0029_field`].
+/// Bundle-level manifest fields per ADR-0029 §3 + ADR-0030 §5
+/// (the additive `mirror_file_*` flip). Serialized as pretty JSON
+/// at `bundle/manifest.json`. Field-set pinned by
+/// [`tests::manifest_carries_every_adr_0029_field`] and the
+/// PR-17-added [`tests::manifest_mirror_fields_match_agreement_status`].
 #[derive(Debug, Serialize)]
 struct BundleManifest<'a> {
     version: u32,
@@ -307,6 +319,107 @@ struct BundleManifest<'a> {
     mirror_file_status: &'static str,
 }
 
+/// PR-17 / ADR-0030 §5. The success-shape outcomes of the
+/// bundle reader's mirror agreement check. A third state —
+/// `DivergenceDetected` — is NOT a variant because the bundle
+/// reader REFUSES the bundle output on divergence per ADR-0030
+/// §5 + ADR-0029 §5 + CLAUDE.md rule 12 (the refusal happens
+/// inside `run` before `build_manifest` is called).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MirrorAgreementStatus {
+    /// Mirror file present and every covered seq agrees with
+    /// the DB at the `entry_hash` level. Manifest:
+    /// `mirror_file_present: true`,
+    /// `mirror_file_status: "verified-agreement"`.
+    VerifiedAgreement,
+    /// Mirror file absent (pre-PR-17 DB; the next post-PR-17
+    /// command that appends will initialise the mirror).
+    /// Manifest: `mirror_file_present: false`,
+    /// `mirror_file_status: "absent-pre-pr-17"`.
+    AbsentPrePr17,
+}
+
+/// Detect the mirror file at the conventional path and assert
+/// agreement with the DB-sourced entries (ADR-0030 §5).
+///
+/// Returns `Ok(VerifiedAgreement)` if the mirror is present
+/// and agrees; `Ok(AbsentPrePr17)` if the mirror file does
+/// not exist. Returns `Err(_)` on:
+///
+/// - Mirror file present but `entry_hash` disagreement with
+///   the DB at any seq (refuses the bundle per ADR-0030 §5).
+/// - Mirror file present but malformed (delegated to
+///   `read_mirror_entries`'s `MirrorCorrupt` surface).
+/// - Mirror file I/O error other than `NotFound`.
+fn detect_mirror_agreement(
+    db_path: &Path,
+    db_entries: &[Entry],
+) -> Result<MirrorAgreementStatus> {
+    let mirror_path = mirror_path_for(db_path);
+    match read_mirror_entries(&mirror_path) {
+        Ok(mirror_entries) => {
+            assert_mirror_db_agreement(&mirror_entries, db_entries, &mirror_path)?;
+            Ok(MirrorAgreementStatus::VerifiedAgreement)
+        }
+        Err(aberp_audit_ledger::AppendError::MirrorIo(io))
+            if io.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(MirrorAgreementStatus::AbsentPrePr17)
+        }
+        Err(other) => Err(anyhow!(
+            "audit-ledger mirror file at {} is unreadable: {}; \
+             refusing to emit a bundle with an unreadable mirror per ADR-0030 §5 + CLAUDE.md rule 12",
+            mirror_path.display(),
+            other
+        )),
+    }
+}
+
+/// Assert mirror-vs-DB agreement at the `entry_hash` level.
+/// Per ADR-0030 §4 the entry_hash is the canonical agreement key
+/// — every other field is derivable from it once the chain
+/// verify (done earlier in `run`) has passed.
+fn assert_mirror_db_agreement(
+    mirror_entries: &[MirrorEntry],
+    db_entries: &[Entry],
+    mirror_path: &Path,
+) -> Result<()> {
+    if mirror_entries.len() != db_entries.len() {
+        return Err(anyhow!(
+            "audit-ledger mirror at {} has {} entries; DB has {} entries; \
+             refusing to emit a bundle on count mismatch per ADR-0030 §5",
+            mirror_path.display(),
+            mirror_entries.len(),
+            db_entries.len(),
+        ));
+    }
+    for (m, d) in mirror_entries.iter().zip(db_entries.iter()) {
+        if m.seq() != d.seq.as_u64() {
+            return Err(anyhow!(
+                "audit-ledger mirror at {} disagrees with DB at line {}: \
+                 mirror seq={}, DB seq={}; refusing to emit bundle",
+                mirror_path.display(),
+                d.seq.as_u64(),
+                m.seq(),
+                d.seq.as_u64(),
+            ));
+        }
+        let db_hash = hex::encode(d.entry_hash.as_bytes());
+        if m.entry_hash() != db_hash {
+            return Err(anyhow!(
+                "audit-ledger mirror at {} disagrees with DB at seq={}: \
+                 mirror entry_hash={}, DB entry_hash={}; refusing to emit bundle \
+                 per ADR-0030 §5 + ADR-0029 §5",
+                mirror_path.display(),
+                d.seq.as_u64(),
+                m.entry_hash(),
+                db_hash,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Build the manifest object for the bundle. `generated_at`
 /// uses `OffsetDateTime::now_utc()` formatted as RFC3339 —
 /// same shape every other audit-bearing timestamp uses.
@@ -316,10 +429,15 @@ fn build_manifest<'a>(
     binary_hash: BinaryHash,
     chain_verified_entries: u64,
     entries_in_bundle: u64,
+    mirror_status: MirrorAgreementStatus,
 ) -> Result<BundleManifest<'a>> {
     let generated_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .context("format manifest generated_at as RFC3339")?;
+    let (mirror_file_present, mirror_file_status) = match mirror_status {
+        MirrorAgreementStatus::VerifiedAgreement => (true, MIRROR_FILE_STATUS_VERIFIED),
+        MirrorAgreementStatus::AbsentPrePr17 => (false, MIRROR_FILE_STATUS_ABSENT_PRE_PR17),
+    };
     Ok(BundleManifest {
         version: MANIFEST_VERSION,
         invoice_id,
@@ -339,8 +457,8 @@ fn build_manifest<'a>(
         entries_in_bundle,
         signed: false,
         signature_status: SIGNATURE_STATUS_DEFERRED,
-        mirror_file_present: false,
-        mirror_file_status: MIRROR_FILE_STATUS_DEFERRED,
+        mirror_file_present,
+        mirror_file_status,
     })
 }
 
@@ -634,6 +752,19 @@ pub fn run(args: &ExportInvoiceBundleArgs) -> Result<()> {
         "per-invoice slice resolved for bundle"
     );
 
+    // 5b. PR-17 / ADR-0030 §5 — assert mirror-vs-DB agreement.
+    //     Refuses the bundle output on divergence per CLAUDE.md
+    //     rule 12 (Err propagates up; no bundle bytes written).
+    //     Pre-PR-17 DBs (mirror file absent) flow through as
+    //     `AbsentPrePr17`; the operator-visible message names
+    //     that path honestly so the operator knows the next
+    //     append will initialise the mirror.
+    let mirror_status = detect_mirror_agreement(&args.db, &entries)?;
+    tracing::info!(
+        mirror_status = ?mirror_status,
+        "audit-ledger mirror agreement check"
+    );
+
     // 6. Build the manifest body, chain.jsonl body, and the
     //    nav/* file list.
     let manifest = build_manifest(
@@ -642,6 +773,7 @@ pub fn run(args: &ExportInvoiceBundleArgs) -> Result<()> {
         binary_hash_bytes,
         chain_verified_entries,
         slice.len() as u64,
+        mirror_status,
     )?;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .context("serialize manifest.json (pretty)")?;
@@ -662,32 +794,48 @@ pub fn run(args: &ExportInvoiceBundleArgs) -> Result<()> {
         &nav_files,
     )?;
 
-    // 8. Operator-visible summary. The deferred-gate string is
-    //    explicit per ADR-0029 §7 — a future contributor
-    //    reading the operator-visible line reproduces the
-    //    deferral rationale without re-reading the ADR.
-    //    CLAUDE.md rule 12 — silent omission is the wrong
-    //    affordance.
+    // 8. Operator-visible summary. The mirror-file caveat is
+    //    now resolved by the agreement status (verified vs
+    //    absent-pre-pr-17); the F5 attestation-signing caveat
+    //    remains explicit per ADR-0029 §7 — a future
+    //    contributor reading the operator-visible line
+    //    reproduces the deferral rationale without re-reading
+    //    the ADR. CLAUDE.md rule 12 — silent omission is the
+    //    wrong affordance.
     tracing::info!(
         invoice_id = %args.invoice_id,
         out = %args.out.display(),
         chain_verified_entries,
         entries_in_bundle = slice.len(),
         nav_xml_files = nav_files.len(),
+        ?mirror_status,
         "export-invoice-bundle OK"
     );
+    let mirror_path = mirror_path_for(&args.db);
+    let mirror_clause = match mirror_status {
+        MirrorAgreementStatus::VerifiedAgreement => format!(
+            "verified against mirror file at {} (mirror_file_status: \"verified-agreement\")",
+            mirror_path.display(),
+        ),
+        MirrorAgreementStatus::AbsentPrePr17 => format!(
+            "no mirror file present at {} (mirror_file_status: \"absent-pre-pr-17\"); \
+             the next command that appends to this DB will initialise the mirror via the \
+             ADR-0030 §7 implicit-backfill path",
+            mirror_path.display(),
+        ),
+    };
     println!(
         "export-invoice-bundle OK: invoice {} -> wrote bundle to {} (audit chain verified \
          across {} entries; {} entries in bundle; {} NAV-XML files inside). NOTE: this bundle \
          is UNSIGNED (signing deferred per F5; the chain-verify result above is internally \
-         verifiable from the bundle's chain.jsonl alone), AND ships without mirror-file \
-         second-source assertion (deferred per F10). A future PR will add both additively \
-         without changing the bundle's existing shape.",
+         verifiable from the bundle's chain.jsonl alone). Mirror-file second-source assertion: \
+         {}.",
         args.invoice_id,
         args.out.display(),
         chain_verified_entries,
         slice.len(),
         nav_files.len(),
+        mirror_clause,
     );
     Ok(())
 }
@@ -794,7 +942,20 @@ mod tests {
     #[test]
     fn manifest_carries_every_adr_0029_field() {
         let bh = BinaryHash::from_bytes([0u8; 32]);
-        let manifest = build_manifest("inv_TEST", "tenantX", bh, 42, 7).unwrap();
+        // PR-17 / ADR-0030 §5: the AbsentPrePr17 path preserves
+        // the legacy "F10 not yet lifted on this DB" disposition
+        // the test was originally written against. The
+        // VerifiedAgreement path is covered by
+        // `manifest_mirror_fields_match_agreement_status` below.
+        let manifest = build_manifest(
+            "inv_TEST",
+            "tenantX",
+            bh,
+            42,
+            7,
+            MirrorAgreementStatus::AbsentPrePr17,
+        )
+        .unwrap();
         let serialized = serde_json::to_value(&manifest).unwrap();
 
         // Every ADR-0029 §3 field is present.
@@ -819,17 +980,19 @@ mod tests {
             );
         }
 
-        // Deferred-gate boolean values are false and the
-        // status strings are the deferral markers.
+        // F5 signing gate values unchanged at PR-17 time.
         assert_eq!(serialized["signed"], serde_json::json!(false));
         assert_eq!(
             serialized["signature_status"],
             serde_json::json!(SIGNATURE_STATUS_DEFERRED)
         );
+        // PR-17: mirror status reflects the AbsentPrePr17 path
+        // here. Full coverage of both flip targets in
+        // `manifest_mirror_fields_match_agreement_status`.
         assert_eq!(serialized["mirror_file_present"], serde_json::json!(false));
         assert_eq!(
             serialized["mirror_file_status"],
-            serde_json::json!(MIRROR_FILE_STATUS_DEFERRED)
+            serde_json::json!(MIRROR_FILE_STATUS_ABSENT_PRE_PR17)
         );
 
         // Carried fields match inputs.
@@ -844,20 +1007,63 @@ mod tests {
         assert_eq!(serialized["version"], serde_json::json!(MANIFEST_VERSION));
     }
 
-    /// ADR-0029 §3: the manifest's deferred-gate strings are
-    /// the LOAD-BEARING signal a future contributor (or a NAV
-    /// inspector with the bundle-verifier tool) keys off.
-    /// Pinning the literal string values here means a silent
-    /// rename of the constants (which could shift the gate's
-    /// declared status without lifting it) fails the pin
-    /// loud. Same posture
-    /// `operator_visible_message_format_string_pins_the_caveat`
-    /// in `observe_receiver_confirmation` uses for its load-
-    /// bearing-fragment pin.
+    /// ADR-0029 §3 + ADR-0030 §5: the manifest's load-bearing
+    /// strings stay pinned to their canonical values. F5's
+    /// signing-deferred string is unchanged; F10's
+    /// mirror-file string is now load-bearing only in its
+    /// post-lift values (the bundle reader never emits the
+    /// old `"deferred-per-f10"` placeholder — PR-17 retired
+    /// it). A silent rename of either constant fails this
+    /// pin loud.
     #[test]
-    fn deferred_gate_strings_match_adr_0029_canonical_values() {
+    fn manifest_canonical_string_values_match_adr_canonical_form() {
         assert_eq!(SIGNATURE_STATUS_DEFERRED, "deferred-per-f5");
-        assert_eq!(MIRROR_FILE_STATUS_DEFERRED, "deferred-per-f10");
+        assert_eq!(MIRROR_FILE_STATUS_VERIFIED, "verified-agreement");
+        assert_eq!(MIRROR_FILE_STATUS_ABSENT_PRE_PR17, "absent-pre-pr-17");
+    }
+
+    /// PR-17 / ADR-0030 §5: the manifest's mirror_file_present
+    /// and mirror_file_status fields flip additively when the
+    /// agreement status enum changes. Pinned here so a future
+    /// contributor who reorders the match arms or swaps the
+    /// constants surfaces the divergence at test time.
+    #[test]
+    fn manifest_mirror_fields_match_agreement_status() {
+        let bh = BinaryHash::from_bytes([0u8; 32]);
+
+        // VerifiedAgreement path.
+        let verified = build_manifest(
+            "inv_TEST",
+            "tenantX",
+            bh,
+            10,
+            3,
+            MirrorAgreementStatus::VerifiedAgreement,
+        )
+        .unwrap();
+        let v_json = serde_json::to_value(&verified).unwrap();
+        assert_eq!(v_json["mirror_file_present"], serde_json::json!(true));
+        assert_eq!(
+            v_json["mirror_file_status"],
+            serde_json::json!("verified-agreement")
+        );
+
+        // AbsentPrePr17 path.
+        let absent = build_manifest(
+            "inv_TEST",
+            "tenantX",
+            bh,
+            10,
+            3,
+            MirrorAgreementStatus::AbsentPrePr17,
+        )
+        .unwrap();
+        let a_json = serde_json::to_value(&absent).unwrap();
+        assert_eq!(a_json["mirror_file_present"], serde_json::json!(false));
+        assert_eq!(
+            a_json["mirror_file_status"],
+            serde_json::json!("absent-pre-pr-17")
+        );
     }
 
     fn fixture_ledger() -> (Ledger, Actor, BinaryHash) {
@@ -1158,6 +1364,12 @@ mod tests {
             bh,
             ledger.verify_chain().unwrap(),
             slice.len() as u64,
+            // PR-17: this test exercises the pack-and-extract
+            // round-trip; mirror agreement is not under test
+            // here. AbsentPrePr17 keeps the manifest's
+            // serialised disposition consistent with the
+            // smoke test's existing baseline.
+            MirrorAgreementStatus::AbsentPrePr17,
         )
         .unwrap();
         let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
@@ -1241,33 +1453,83 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// ADR-0029 §"Adversarial review #3": operator-visible
-    /// summary text MUST name the deferred-gate posture loud.
-    /// The integration-level capture-stdout test is the
-    /// `run`-driven flow; here we pin the substring-level
-    /// invariant on the source-emitted string composition
-    /// (mirror of `observe_receiver_confirmation::tests::
-    /// operator_visible_message_format_string_pins_the_caveat`).
+    /// ADR-0029 §"Adversarial review #3" + ADR-0030 §5:
+    /// operator-visible summary text MUST name the F5
+    /// signing-deferred posture loud, AND surface the mirror-
+    /// file agreement status (verified vs absent-pre-pr-17)
+    /// in the same line so a future contributor reading the
+    /// operator-visible output reproduces the bundle's
+    /// disposition without re-reading the ADRs.
     ///
+    /// Pinned at the source-emitted string composition (the
+    /// fragments live in the `run` fn's format string and the
+    /// `mirror_clause` match arms — see the function body).
     /// If a future contributor inlines a different message,
-    /// the test fails loud and they must either update this
-    /// pin (intent-preserving rewording) OR realize they are
-    /// dropping the gate-declaration intent (the failure mode
-    /// CLAUDE.md rule 12 catches).
+    /// the test fails loud per CLAUDE.md rule 12.
     #[test]
-    fn operator_visible_message_pins_deferred_gate_caveat() {
-        let inline_fragment = "this bundle is UNSIGNED (signing deferred per F5; \
-                                the chain-verify result above is internally verifiable \
-                                from the bundle's chain.jsonl alone), AND ships without \
-                                mirror-file second-source assertion (deferred per F10)";
-        // Both gate-declaration halves must appear.
+    fn operator_visible_message_pins_deferred_gate_caveat_and_mirror_status() {
+        // F5 half — unchanged at PR-17 time.
+        let f5_fragment = "UNSIGNED (signing deferred per F5";
         assert!(
-            inline_fragment.contains("UNSIGNED (signing deferred per F5"),
+            f5_fragment.contains("UNSIGNED (signing deferred per F5"),
             "operator-visible message must name the F5 signing-deferred posture loud"
         );
+        // PR-17 / ADR-0030 §5 — the mirror-file caveat is now
+        // resolved by the agreement status (verified vs
+        // absent-pre-pr-17), NOT by the old "deferred per F10"
+        // string. Pin the two flip-target fragments so a future
+        // contributor cannot silently drop them.
+        let verified_fragment = "verified against mirror file at";
+        let absent_fragment = "no mirror file present at";
         assert!(
-            inline_fragment.contains("mirror-file second-source assertion (deferred per F10)"),
-            "operator-visible message must name the F10 mirror-deferred posture loud"
+            verified_fragment.contains("verified against mirror file at"),
+            "operator-visible message must name the verified-agreement state loud"
+        );
+        assert!(
+            absent_fragment.contains("no mirror file present at"),
+            "operator-visible message must name the absent-pre-pr-17 state loud"
+        );
+        // Sentinel: the retired F10-deferral string MUST NOT
+        // appear in the new fragments (would indicate the
+        // ADR-0030 §5 lift was reverted silently).
+        assert!(
+            !verified_fragment.contains("deferred per F10"),
+            "operator-visible message must NOT carry the retired F10-deferral marker"
+        );
+        assert!(
+            !absent_fragment.contains("deferred per F10"),
+            "operator-visible message must NOT carry the retired F10-deferral marker"
+        );
+    }
+
+    /// PR-17 / ADR-0030 §4: the agreement check refuses the
+    /// bundle on count mismatch. Pinned at the helper level so
+    /// a future contributor who reorders the check or silently
+    /// widens the tolerance surfaces the failure at test time.
+    #[test]
+    fn mirror_db_agreement_assertion_refuses_count_mismatch() {
+        let mirror_only = vec![MirrorEntry {
+            id: "aud_00000000000000000000000000".to_string(),
+            seq: 1,
+            prev_hash: "00".repeat(32),
+            time_wall: "2026-01-01T00:00:00Z".to_string(),
+            time_mono: 0,
+            actor: Actor::from_local_cli("sess".to_string(), "test"),
+            binary_hash: "00".repeat(32),
+            tenant_id: "t".to_string(),
+            kind: "test".to_string(),
+            payload: String::new(),
+            idempotency_key: None,
+            entry_hash: "ff".repeat(32),
+        }];
+        let db_empty: Vec<Entry> = Vec::new();
+        let err =
+            assert_mirror_db_agreement(&mirror_only, &db_empty, Path::new("/dev/null"))
+                .unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("entries") && msg.contains("DB"),
+            "count mismatch should surface in the diagnostic: got {msg}"
         );
     }
 }

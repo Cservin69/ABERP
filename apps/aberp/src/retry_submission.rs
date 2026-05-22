@@ -240,6 +240,13 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
         .context("audit-ledger chain verification failed AFTER retry-submission")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
+    // 8a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
+    //     post-commit.
+    let mirror_path = audit_ledger::mirror_path_for(&args.db);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after retry-submission commit")?;
+
     // 9. Typestate advance + operator-visible summary. The retry
     //    leaves the invoice in `Submitted` with the new txid; the
     //    operator runs `aberp poll-ack` next.

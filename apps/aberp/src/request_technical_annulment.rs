@@ -192,6 +192,13 @@ pub fn run(args: &RequestTechnicalAnnulmentArgs) -> Result<()> {
         .context("audit-ledger chain verification failed AFTER annulment audit append")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
+    // 6a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
+    //     post-commit.
+    let mirror_path = audit_ledger::mirror_path_for(&args.db);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after request-technical-annulment commit")?;
+
     // 7. Render the annulment XML + minimal call-site sanity check
     //    per ADR-0025 §4. The full `validate_annulment_data` runtime
     //    validator is the named-trigger work for the future

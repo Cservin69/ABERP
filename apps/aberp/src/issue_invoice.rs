@@ -213,6 +213,16 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
         .context("audit-ledger chain verification failed AFTER issuance")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
+    // 9a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
+    //     post-commit. On a fresh DB (or first post-PR-17 invocation
+    //     on a pre-existing DB) `sync_mirror` runs the implicit
+    //     one-time backfill per ADR-0030 §7 and logs
+    //     `audit_mirror_initialized` at INFO.
+    let mirror_path = audit_ledger::mirror_path_for(&args.db);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after commit")?;
+
     // 10. Serialize the ReadyInvoice to NAV XML.
     let parties = NavParties {
         supplier: SupplierInfo {

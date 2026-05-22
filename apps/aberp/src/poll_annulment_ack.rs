@@ -253,6 +253,13 @@ pub fn run(args: &PollAnnulmentAckArgs) -> Result<()> {
         .context("audit-ledger chain verification failed AFTER poll-annulment-ack")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
+    // 5a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
+    //     post-commit.
+    let mirror_path = audit_ledger::mirror_path_for(&args.db);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after poll-annulment-ack commit")?;
+
     // 6. Operator-visible summary per ADR-0027 §5. The terminal-
     //    SAVED message NAMES THE RECEIVER-CONFIRMATION GAP LOUD
     //    (CLAUDE.md rule 12) — load-bearing message text per

@@ -237,6 +237,13 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
         .context("audit-ledger chain verification failed AFTER storno issuance")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
+    // 9a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
+    //     post-commit (matches the issue_invoice posture).
+    let mirror_path = audit_ledger::mirror_path_for(&args.db);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after storno commit")?;
+
     // 10. Render the storno's <InvoiceData> XML with negated amounts +
     //     <invoiceReference> chain block. Then run ADR-0022's runtime
     //     XSD invariant check before writing to disk.

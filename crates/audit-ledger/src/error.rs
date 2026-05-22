@@ -46,6 +46,34 @@ pub enum AppendError {
     /// had the wrong byte length. Indicates DB corruption.
     #[error("invalid stored row at seq={seq}: {reason}")]
     CorruptRow { seq: u64, reason: &'static str },
+
+    /// PR-17 / ADR-0030 — the audit-ledger mirror file `<db>.audit.log`
+    /// is malformed: a partial trailing line (no newline terminator),
+    /// non-ascending seqs, duplicate seqs, or a line that fails JSON
+    /// decoding. The DB-committed entry is not rolled back; the
+    /// operator's recovery is to inspect the mirror, repair it, and
+    /// re-run (the next `sync_mirror` call catches up).
+    #[error("audit-ledger mirror file is malformed: {reason}")]
+    MirrorCorrupt { reason: String },
+    /// PR-17 / ADR-0030 — the audit-ledger mirror file disagrees with
+    /// the DB at the given seq (`entry_hash` mismatch). Surfaces both
+    /// "the DB was tampered with after the last mirror append" and
+    /// "the mirror was tampered with"; the operator's recovery is to
+    /// investigate before re-running. Per ADR-0030 §3 the DB-committed
+    /// entry is NOT rolled back; per CLAUDE.md rule 12 the next append
+    /// is refused until the operator investigates.
+    #[error(
+        "audit-ledger mirror diverges from DB at seq={seq}: \
+         {reason}"
+    )]
+    MirrorDivergent { seq: u64, reason: String },
+    /// PR-17 / ADR-0030 — the mirror file's I/O surface failed
+    /// (open, read, write, fsync, or advisory lock). Wraps the
+    /// `std::io::Error`. The DB-committed entry is not rolled back;
+    /// the operator's recovery is to investigate disk space /
+    /// permissions / FS readiness and re-run.
+    #[error("audit-ledger mirror I/O error: {0}")]
+    MirrorIo(#[source] std::io::Error),
 }
 
 /// Errors returned by [`crate::chain::verify_chain`]. Each variant names

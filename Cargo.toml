@@ -189,6 +189,17 @@ hex = "0.4"
 tar = "0.4"
 zstd = "0.13"
 
+# ── PR-17 additions — audit-ledger mirror file per ADR-0030 ─────────
+#
+# `fs2` provides cross-platform advisory file locks (flock on
+# Linux/macOS, LockFileEx on Windows). The mirror writer holds an
+# exclusive lock on `<db>.audit.log` for the duration of `sync_mirror`
+# so two ABERP processes that both committed a DB entry serialize on
+# the mirror append (ADR-0030 §6). MIT/Apache-2.0 dual-licensed; pure
+# Rust on the public-API side; no native dependencies. Pin floor
+# here; Cargo.lock is the exact pin per ADR-0007 §"Supply chain".
+fs2 = "0.4"
+
 # ── PR-9-2 additions — Tauri operator UI shell per ADR-0004 ─────────
 #
 # Tauri 2.x is the desktop runtime. `default-features = false` strips

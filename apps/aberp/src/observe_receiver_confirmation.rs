@@ -268,6 +268,13 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
         .context("audit-ledger chain verification failed AFTER observe-receiver-confirmation")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
+    // 7a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
+    //     post-commit.
+    let mirror_path = audit_ledger::mirror_path_for(&args.db);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after observe-receiver-confirmation commit")?;
+
     // 8. Operator-visible summary per ADR-0028 §5. The message
     //    NAMES THE VERBATIM-BYTES-AS-EVIDENCE POSTURE LOUD
     //    (CLAUDE.md rule 12) — load-bearing message text per

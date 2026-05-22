@@ -38,8 +38,10 @@ mod canonical;
 mod chain;
 mod entry;
 mod error;
+mod mirror;
 mod storage;
 
 pub use entry::{Actor, BinaryHash, Entry, EntryHash, EntryId, EventKind, Sequence, TenantId};
 pub use error::{AppendError, VerifyError};
+pub use mirror::{mirror_path_for, read_mirror_entries, sync_mirror, MirrorEntry};
 pub use storage::{append_in_tx, ensure_schema, Ledger, LedgerMeta, LedgerVerifyError};

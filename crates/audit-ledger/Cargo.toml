@@ -29,5 +29,15 @@ time = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 
+# PR-17 (ADR-0030) — audit-ledger mirror file. `base64` encodes payload
+# bytes inside the JSON-Lines mirror lines (same shape `bundle/chain.jsonl`
+# uses; ADR-0030 §1). `hex` encodes the 32-byte hashes (entry_hash,
+# prev_hash, binary_hash). `fs2` provides the exclusive advisory lock on
+# the mirror file during `sync_mirror` (ADR-0030 §6). All three crates are
+# MIT/Apache-2.0 dual-licensed.
+base64 = { workspace = true }
+hex = { workspace = true }
+fs2 = { workspace = true }
+
 [dev-dependencies]
 # Conformance test only. Kept minimal: no extra crates required.
