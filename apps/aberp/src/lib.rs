@@ -30,6 +30,7 @@ pub mod issue_storno;
 pub mod mark_abandoned;
 pub mod nav_xml;
 pub mod poll_ack;
+pub mod poll_annulment_ack;
 pub mod request_technical_annulment;
 pub mod retry_submission;
 pub mod serve;

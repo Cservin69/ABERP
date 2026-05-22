@@ -224,6 +224,52 @@ pub enum Command {
     /// retry.
     SubmitAnnulment(SubmitAnnulmentArgs),
 
+    /// Poll NAV's `queryTransactionStatus` for a previously-
+    /// submitted technical annulment and record the wire-side
+    /// ack status (ADR-0009 §6, ADR-0027; PR-14).
+    ///
+    /// The annulment-side `transactionId` is looked up from the
+    /// most-recent `InvoiceAnnulmentSubmissionResponse` audit
+    /// entry for `--invoice-id` (ADR-0027 §4). Operators do NOT
+    /// pass it explicitly — same posture as `poll-ack`.
+    ///
+    /// **Reuses `queryTransactionStatus`** per ADR-0027 §3 +
+    /// §"Surfaced conflict 1": NAV v3.0 documents one poll
+    /// endpoint that takes any `transactionId`. PR-14 does NOT
+    /// add a new nav-transport operation; the discriminator-level
+    /// fork lives at the audit-ledger
+    /// `InvoiceAnnulmentAckStatus` variant per ADR-0027 §2.
+    ///
+    /// The bounded poll loop runs up to 5 attempts with
+    /// exponential backoff (1s, 2s, 4s, 8s, 16s — same cap as
+    /// `poll-ack` per ADR-0009 §5).
+    ///
+    /// **What this command does NOT do:**
+    ///
+    ///   - It does NOT call `manageAnnulment`. PR-13's
+    ///     `submit-annulment` does that; this command only polls
+    ///     the result.
+    ///   - It does NOT poll for receiver confirmation. NAV's
+    ///     `SAVED` for an annulment submission means "NAV
+    ///     accepted the annulment for processing," NOT "the
+    ///     receiver has confirmed in the NAV web UI." The
+    ///     receiver-confirmation observation is a separate
+    ///     future PR per ADR-0027 §"Surfaced conflict 3"; the
+    ///     operator-visible message on terminal SAVED names the
+    ///     gap loud (CLAUDE.md rule 12).
+    ///   - It does NOT mutate any billing row. Annulment is
+    ///     not an invoice operation; the base invoice's
+    ///     typestate is unchanged per ADR-0025 §2 + ADR-0026.
+    ///
+    /// **Precondition** (ADR-0027 §6). `--invoice-id` must point
+    /// at an invoice that has at least one
+    /// `InvoiceAnnulmentSubmissionResponse` audit entry with a
+    /// non-empty `transaction_id` — i.e., `submit-annulment` was
+    /// run successfully against this invoice. Loud-fail with a
+    /// message steering the operator to run `submit-annulment`
+    /// first otherwise.
+    PollAnnulmentAck(PollAnnulmentAckArgs),
+
     /// Request a NAV-side technical annulment of a prior data
     /// submission against an invoice (ADR-0009 §6, ADR-0025; PR-12).
     /// A technical annulment **withdraws** the data submission to
@@ -706,6 +752,48 @@ pub struct SubmitAnnulmentArgs {
     /// explicit per ADR-0020 §1 / ADR-0026 §1. Silently submitting
     /// an annulment to production when the operator meant test is
     /// the exact failure mode CLAUDE.md rule 12 names.
+    #[arg(long, value_enum)]
+    pub endpoint: NavEnv,
+}
+
+/// Args for `aberp poll-annulment-ack` (PR-14, ADR-0027 §1).
+///
+/// Same shape as [`PollAckArgs`] — five fields, identical
+/// semantics. The annulment-side `transactionId` is looked up
+/// from the audit ledger (most-recent
+/// `InvoiceAnnulmentSubmissionResponse` for `--invoice-id` per
+/// ADR-0027 §4); operators do not pass it on the CLI.
+#[derive(Debug, Parser)]
+pub struct PollAnnulmentAckArgs {
+    /// Base invoice id (prefixed form, `inv_<ULID>`) — the
+    /// invoice whose annulment-submission ack status is being
+    /// polled. The annulment-side `transactionId` is resolved
+    /// from the most-recent
+    /// `InvoiceAnnulmentSubmissionResponse` audit entry per
+    /// ADR-0027 §4. Loud-fail if no such entry exists.
+    #[arg(long = "invoice-id")]
+    pub invoice_id: String,
+
+    /// Hungarian tax number of the submitter. Same accepted
+    /// forms + parser as `poll-ack` (`12345678`, `12345678-1`,
+    /// `12345678-1-42`); only the 8-digit base goes to NAV per
+    /// ADR-0009 §4.
+    #[arg(long = "tax-number")]
+    pub tax_number: String,
+
+    /// Path to the tenant DuckDB file.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — drives both the audit-ledger genesis
+    /// hash and the keychain service-name lookup
+    /// (`aberp.nav.<tenant>`).
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Which NAV environment to poll against. No default —
+    /// explicit per ADR-0020 §1 / ADR-0027 §1 (same posture as
+    /// every other `submit-*` / `poll-*` command).
     #[arg(long, value_enum)]
     pub endpoint: NavEnv,
 }

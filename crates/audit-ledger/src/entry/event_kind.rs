@@ -88,6 +88,22 @@
 /// closes the seventh and eighth times across PR-6.1 / PR-7-B-3 /
 /// PR-8 / PR-10 / PR-11 / PR-12 / PR-13.
 ///
+/// PR-14 (ADR-0027) adds `InvoiceAnnulmentAckStatus` — the
+/// **wire-poll half** of the technical-annulment surface, paired
+/// with PR-13's wire-submission entries. Closes the ADR-0009 §6
+/// observation gap at the wire level (the receiver-confirmation
+/// observation remains a separate future surface per ADR-0027
+/// §"Surfaced conflict 3"). Structural parallel to PR-7-B-3's
+/// `InvoiceAckStatus` (same `queryTransactionStatus` wire
+/// endpoint per ADR-0027 §3 + §"Surfaced conflict 1") but
+/// deliberately forked at the discriminator level per ADR-0027
+/// §2. Rationale identical to ADR-0026 §2: kind-alone
+/// classification at the audit-evidence-bundle level is the
+/// load-bearing inspector-facing property. The F12 four-edit
+/// ritual fires once (single variant this PR) — the eighth and
+/// final landing across PR-6.1 / PR-7-B-3 / PR-8 / PR-10 / PR-11
+/// / PR-12 / PR-13 / PR-14, and mechanical at this point.
+///
 /// The remaining invoice-lifecycle kinds (`Finalized`, `Rejected`,
 /// `SubmissionStuck`, `Voided`) land when their state transition
 /// first fires in the codebase.
@@ -243,6 +259,36 @@ pub enum EventKind {
     /// Same structural-parallel-with-fork posture as
     /// `InvoiceAnnulmentSubmissionAttempt`. PR-13, ADR-0026 §2.
     InvoiceAnnulmentSubmissionResponse,
+
+    /// A `queryTransactionStatus` poll completed against an
+    /// annulment-side `transactionId` (ADR-0009 §6, ADR-0027).
+    /// Payload carries the verbatim
+    /// `<QueryTransactionStatusResponse>` bytes (ADR-0009 §8) plus
+    /// the parsed ack status (`RECEIVED` / `PROCESSING` /
+    /// `SAVED` / `ABORTED` per NAV v3.0 — same enumeration as
+    /// `InvoiceAckStatus`), the base `invoice_id`, and the
+    /// annulment-side `transaction_id` (looked up from the prior
+    /// `InvoiceAnnulmentSubmissionResponse` entry per ADR-0027
+    /// §4).
+    ///
+    /// Structural parallel to PR-7-B-3's `InvoiceAckStatus` but
+    /// **deliberately forked at the discriminator** so the
+    /// audit-evidence bundle reader can distinguish an
+    /// invoice-side poll from an annulment-side poll by kind alone
+    /// (ADR-0027 §2). The wire endpoint is REUSED
+    /// (`queryTransactionStatus`) per ADR-0027 §3 + §"Surfaced
+    /// conflict 1"; the discriminator fork at the audit level is
+    /// independent of the wire-endpoint reuse.
+    ///
+    /// On terminal `SAVED`, the operator-visible message names the
+    /// receiver-confirmation gap loud per ADR-0027 §5 + CLAUDE.md
+    /// rule 12 — NAV's SAVED for an annulment submission means
+    /// "NAV accepted the annulment for processing," NOT "the
+    /// receiver has confirmed the annulment in the NAV web UI";
+    /// the receiver-confirmation observation is a separate future
+    /// surface per ADR-0027 §"Surfaced conflict 3". PR-14,
+    /// ADR-0027 §2.
+    InvoiceAnnulmentAckStatus,
 }
 
 impl EventKind {
@@ -270,6 +316,7 @@ impl EventKind {
             EventKind::InvoiceAnnulmentSubmissionResponse => {
                 "invoice.annulment_submission_response"
             }
+            EventKind::InvoiceAnnulmentAckStatus => "invoice.annulment_ack_status",
         }
     }
 
@@ -306,6 +353,7 @@ impl EventKind {
             "invoice.annulment_submission_response" => {
                 Ok(EventKind::InvoiceAnnulmentSubmissionResponse)
             }
+            "invoice.annulment_ack_status" => Ok(EventKind::InvoiceAnnulmentAckStatus),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -340,6 +388,7 @@ mod tests {
             EventKind::InvoiceTechnicalAnnulmentRequested,
             EventKind::InvoiceAnnulmentSubmissionAttempt,
             EventKind::InvoiceAnnulmentSubmissionResponse,
+            EventKind::InvoiceAnnulmentAckStatus,
         ];
         for v in variants {
             let s = v.as_str();
@@ -493,6 +542,42 @@ mod tests {
         assert_ne!(
             EventKind::InvoiceAnnulmentSubmissionResponse.as_str(),
             EventKind::InvoiceSubmissionResponse.as_str()
+        );
+    }
+
+    /// PR-14 / ADR-0027 §2: the wire-poll ack-status kind for the
+    /// annulment surface. The `invoice.` prefix MUST hold for the
+    /// same per-invoice-export-bundle reason every prior PR pins
+    /// it — the audit-evidence bundle's `invoice.*` glob
+    /// (ADR-0009 §8) must pick up the annulment-poll entries
+    /// alongside every other lifecycle entry. An entry under a
+    /// different prefix would be silently absent from the per-
+    /// invoice export bundle — exactly the silent-omission
+    /// failure mode CLAUDE.md rule 12 names.
+    #[test]
+    fn pr_14_annulment_ack_status_kind_uses_invoice_prefix() {
+        assert_eq!(
+            EventKind::InvoiceAnnulmentAckStatus.as_str(),
+            "invoice.annulment_ack_status"
+        );
+        assert!(EventKind::InvoiceAnnulmentAckStatus
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// PR-14 / ADR-0027 §2: deliberate fork from the invoice-side
+    /// `InvoiceAckStatus`. The wire endpoint
+    /// (`queryTransactionStatus`) is REUSED across the two flows
+    /// per ADR-0027 §3 + §"Surfaced conflict 1", but the audit-
+    /// ledger discriminator MUST be distinct so the audit-evidence
+    /// bundle reader can classify by kind alone (ADR-0027 §2).
+    /// Pinning this here catches a future refactor accidentally
+    /// collapsing the two poll-ack kinds onto one on-disk string.
+    #[test]
+    fn pr_14_annulment_ack_status_is_distinct_from_invoice_ack_status() {
+        assert_ne!(
+            EventKind::InvoiceAnnulmentAckStatus.as_str(),
+            EventKind::InvoiceAckStatus.as_str()
         );
     }
 }
