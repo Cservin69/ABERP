@@ -1,6 +1,7 @@
 //! Typed NAV operations: `tokenExchange` (PR-7-B-2), `manageInvoice`
-//! (PR-7-B-3), `queryTransactionStatus` (PR-7-C-1), and
-//! `manageAnnulment` (PR-13 / ADR-0026 §3).
+//! (PR-7-B-3), `queryTransactionStatus` (PR-7-C-1),
+//! `manageAnnulment` (PR-13 / ADR-0026 §3), and `queryInvoiceData`
+//! (PR-15 / ADR-0028 §3).
 //!
 //! All three operations share the same flow shape:
 //!
@@ -35,12 +36,19 @@
 //!     `InvoiceAckStatus` entry the poll-loop emits per attempt.
 //!   - `manage_annulment::call` returns a `ManageAnnulmentOutcome`
 //!     whose `transaction_id` is NAV's annulment-side tracking id
-//!     (consumed by a future `query-annulment-status` poll per
-//!     ADR-0026 §"Follow-on PRs unblocked") and whose
+//!     (consumed by `poll_annulment_ack` per ADR-0027) and whose
 //!     `request_xml` / `response_xml` carry the verbatim bytes for
 //!     the audit-ledger
 //!     `InvoiceAnnulmentSubmissionAttempt` /
 //!     `InvoiceAnnulmentSubmissionResponse` payloads.
+//!   - `query_invoice_data::call` returns a
+//!     `QueryInvoiceDataOutcome` whose `request_xml` /
+//!     `response_xml` carry the verbatim bytes for the audit-
+//!     ledger `InvoiceAnnulmentReceiverConfirmationPayload`. NO
+//!     parsed receiver-confirmation field is included today per
+//!     ADR-0028 §"Surfaced conflict 3"; the audit-evidence-bundle
+//!     reader inspects `response_xml` to determine receiver-
+//!     confirmation state.
 //!
 //! None of these operations write to the audit ledger directly — the
 //! binary is responsible for that per ADR-0008 §Storage. These
@@ -54,6 +62,7 @@ use crate::error::NavTransportError;
 
 pub mod manage_annulment;
 pub mod manage_invoice;
+pub mod query_invoice_data;
 pub mod query_transaction_status;
 pub mod token_exchange;
 

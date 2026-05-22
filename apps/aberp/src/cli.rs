@@ -270,6 +270,51 @@ pub enum Command {
     /// first otherwise.
     PollAnnulmentAck(PollAnnulmentAckArgs),
 
+    /// Observe NAV-side receiver-confirmation of a previously-
+    /// submitted technical annulment (ADR-0009 §6, ADR-0028;
+    /// PR-15). Closes the final ADR-0009 §6 observation gap at
+    /// the audit-evidence level.
+    ///
+    /// **One-shot, not bounded-poll.** Receiver-confirmation is
+    /// human-paced — the receiver logs into the NAV web UI on
+    /// their own schedule. The operator runs this command once
+    /// to record an observation; if the receiver has not yet
+    /// confirmed, the operator re-runs the command later at
+    /// their cadence (ADR-0028 §4 + §"Surfaced conflict 2").
+    ///
+    /// **Calls `queryInvoiceData` against the BASE invoice's
+    /// NAV-facing invoice number.** The NAV-facing invoice
+    /// number is built from the base invoice's series code +
+    /// sequence number (per ADR-0028 §1's "Does NOT take
+    /// --nav-invoice-number" — operators do not pass
+    /// secondary keys that ABERP can derive itself, avoiding
+    /// the typo class CLAUDE.md rule 12 names).
+    ///
+    /// **What this command does NOT do:**
+    ///
+    ///   - It does NOT call `manageAnnulment`. PR-13's
+    ///     `submit-annulment` does that.
+    ///   - It does NOT call `queryTransactionStatus`. PR-14's
+    ///     `poll-annulment-ack` does that.
+    ///   - It does NOT parse a receiver-confirmation status
+    ///     field. Per ADR-0028 §"Surfaced conflict 3" the
+    ///     verbatim-bytes-only posture applies until NAV-
+    ///     testbed verification surfaces the actual response
+    ///     shape; the operator inspects the response_xml in
+    ///     the audit ledger OR consults the NAV web UI
+    ///     directly to determine receiver-confirmation state.
+    ///   - It does NOT loop. One query per invocation.
+    ///   - It does NOT mutate any billing row.
+    ///
+    /// **Precondition** (ADR-0028 §6). `--invoice-id` must
+    /// point at an invoice that has at least one
+    /// `InvoiceAnnulmentSubmissionResponse` audit entry with
+    /// a non-empty `transaction_id` — i.e., `submit-annulment`
+    /// was run successfully against this invoice. Loud-fail
+    /// with a message steering the operator to run
+    /// `submit-annulment` first otherwise.
+    ObserveReceiverConfirmation(ObserveReceiverConfirmationArgs),
+
     /// Request a NAV-side technical annulment of a prior data
     /// submission against an invoice (ADR-0009 §6, ADR-0025; PR-12).
     /// A technical annulment **withdraws** the data submission to
@@ -752,6 +797,52 @@ pub struct SubmitAnnulmentArgs {
     /// explicit per ADR-0020 §1 / ADR-0026 §1. Silently submitting
     /// an annulment to production when the operator meant test is
     /// the exact failure mode CLAUDE.md rule 12 names.
+    #[arg(long, value_enum)]
+    pub endpoint: NavEnv,
+}
+
+/// Args for `aberp observe-receiver-confirmation` (PR-15,
+/// ADR-0028 §1).
+///
+/// Five fields — same shape as
+/// [`PollAnnulmentAckArgs`]. ABERP looks up the base
+/// invoice's NAV-facing invoice number from the billing store
+/// (no `--nav-invoice-number` flag per ADR-0028 §1's "Does NOT
+/// take --nav-invoice-number" posture).
+#[derive(Debug, Parser)]
+pub struct ObserveReceiverConfirmationArgs {
+    /// Base invoice id (prefixed form, `inv_<ULID>`) — the
+    /// invoice whose annulment-receiver-confirmation state is
+    /// being observed. The annulment-side `transactionId` +
+    /// idempotency key are resolved from the most-recent
+    /// `InvoiceAnnulmentSubmissionResponse` audit entry per
+    /// ADR-0028 §6 + §7; the NAV-facing invoice number is
+    /// constructed from the base's billing row per
+    /// ADR-0028 §1 / §8. Loud-fail if no prior wire response
+    /// or if the billing row is missing.
+    #[arg(long = "invoice-id")]
+    pub invoice_id: String,
+
+    /// Hungarian tax number of the submitter. Same accepted
+    /// forms + parser as every other `submit-*` / `poll-*`
+    /// command (`12345678`, `12345678-1`, `12345678-1-42`);
+    /// only the 8-digit base goes to NAV per ADR-0009 §4.
+    #[arg(long = "tax-number")]
+    pub tax_number: String,
+
+    /// Path to the tenant DuckDB file.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — drives both the audit-ledger
+    /// genesis hash and the keychain service-name lookup
+    /// (`aberp.nav.<tenant>`).
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Which NAV environment to query against. No default —
+    /// explicit per ADR-0020 §1 / ADR-0028 §1 (same posture
+    /// as every other `submit-*` / `poll-*` command).
     #[arg(long, value_enum)]
     pub endpoint: NavEnv,
 }

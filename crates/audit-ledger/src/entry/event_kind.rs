@@ -99,10 +99,27 @@
 /// deliberately forked at the discriminator level per ADR-0027
 /// §2. Rationale identical to ADR-0026 §2: kind-alone
 /// classification at the audit-evidence-bundle level is the
-/// load-bearing inspector-facing property. The F12 four-edit
-/// ritual fires once (single variant this PR) — the eighth and
-/// final landing across PR-6.1 / PR-7-B-3 / PR-8 / PR-10 / PR-11
-/// / PR-12 / PR-13 / PR-14, and mechanical at this point.
+/// load-bearing inspector-facing property.
+///
+/// PR-15 (ADR-0028) adds `InvoiceAnnulmentReceiverConfirmation`
+/// — the **receiver-confirmation observation half** of the
+/// technical-annulment surface, closing the final ADR-0009 §6
+/// observation gap at the audit-evidence level (the
+/// semantic-interpretation layer — parsing a `receiver_state`
+/// field within the response bytes — is deferred per ADR-0028
+/// §"Surfaced conflict 3" until NAV-testbed verification
+/// surfaces its shape). Structurally parallel to PR-14's
+/// `InvoiceAnnulmentAckStatus` (same audit-evidence shape:
+/// verbatim NAV response bytes + the F8 lineage idempotency-
+/// key chain) but deliberately forked at the discriminator
+/// level per ADR-0028 §2. The two observation surfaces are
+/// operationally distinct facts: PR-14 observes NAV-side wire
+/// processing (seconds-paced); PR-15 observes NAV-side
+/// receiver-confirmation (human-paced). The audit ledger
+/// keeps them distinguishable by kind. The F12 four-edit
+/// ritual fires once — the ninth landing across PR-6.1 /
+/// PR-7-B-3 / PR-8 / PR-10 / PR-11 / PR-12 / PR-13 / PR-14 /
+/// PR-15, mechanical at this point.
 ///
 /// The remaining invoice-lifecycle kinds (`Finalized`, `Rejected`,
 /// `SubmissionStuck`, `Voided`) land when their state transition
@@ -289,6 +306,39 @@ pub enum EventKind {
     /// surface per ADR-0027 §"Surfaced conflict 3". PR-14,
     /// ADR-0027 §2.
     InvoiceAnnulmentAckStatus,
+
+    /// A `queryInvoiceData` call against the BASE invoice's NAV-
+    /// facing invoice number completed (ADR-0009 §6, ADR-0028).
+    /// Closes the final ADR-0009 §6 observation gap at the audit-
+    /// evidence level — the operator can now drive the full
+    /// technical-annulment lifecycle AND observe NAV-side
+    /// receiver-confirmation evidence.
+    ///
+    /// Payload carries the verbatim `<QueryInvoiceDataResponse>`
+    /// bytes (ADR-0009 §8 — the audit evidence cannot be lost to
+    /// a parser bug), the base `invoice_id`, the NAV-facing
+    /// `nav_invoice_number` (the string that was queried —
+    /// recorded so the bundle reader can see what was queried
+    /// without re-deriving from `series.code + seq`), the
+    /// annulment-side `annulment_transaction_id` (from the prior
+    /// `InvoiceAnnulmentSubmissionResponse` — pinned so the
+    /// reader walks back to the annulment lineage by ID without
+    /// re-walking), and the annulment-request's `idempotency_key`
+    /// (F8 carry-forward per ADR-0028 §7 — same posture as the
+    /// PR-14 ack-status entries; closes the per-annulment audit
+    /// lineage end-to-end).
+    ///
+    /// **No `receiver_state` field on this payload today** per
+    /// ADR-0028 §"Surfaced conflict 3". The semantic-interpretation
+    /// layer (parsing a NAV-emitted receiver-confirmed marker
+    /// within the response bytes) lands in a future amendment ADR
+    /// after NAV-testbed verification surfaces the actual response
+    /// shape. PR-15's contract is verbatim-bytes-as-evidence; the
+    /// operator-visible message names the verbatim bytes in the
+    /// audit ledger as the source of truth and explicitly does
+    /// NOT claim a parsed receiver-confirmation state per
+    /// CLAUDE.md rule 12. PR-15, ADR-0028 §2.
+    InvoiceAnnulmentReceiverConfirmation,
 }
 
 impl EventKind {
@@ -317,6 +367,9 @@ impl EventKind {
                 "invoice.annulment_submission_response"
             }
             EventKind::InvoiceAnnulmentAckStatus => "invoice.annulment_ack_status",
+            EventKind::InvoiceAnnulmentReceiverConfirmation => {
+                "invoice.annulment_receiver_confirmation"
+            }
         }
     }
 
@@ -354,6 +407,9 @@ impl EventKind {
                 Ok(EventKind::InvoiceAnnulmentSubmissionResponse)
             }
             "invoice.annulment_ack_status" => Ok(EventKind::InvoiceAnnulmentAckStatus),
+            "invoice.annulment_receiver_confirmation" => {
+                Ok(EventKind::InvoiceAnnulmentReceiverConfirmation)
+            }
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -389,6 +445,7 @@ mod tests {
             EventKind::InvoiceAnnulmentSubmissionAttempt,
             EventKind::InvoiceAnnulmentSubmissionResponse,
             EventKind::InvoiceAnnulmentAckStatus,
+            EventKind::InvoiceAnnulmentReceiverConfirmation,
         ];
         for v in variants {
             let s = v.as_str();
@@ -578,6 +635,44 @@ mod tests {
         assert_ne!(
             EventKind::InvoiceAnnulmentAckStatus.as_str(),
             EventKind::InvoiceAckStatus.as_str()
+        );
+    }
+
+    /// PR-15 / ADR-0028 §2: the receiver-confirmation observation
+    /// kind for the annulment surface. The `invoice.` prefix MUST
+    /// hold for the same per-invoice-export-bundle reason every
+    /// prior PR pins it — the audit-evidence bundle's `invoice.*`
+    /// glob (ADR-0009 §8) must pick up the new entries alongside
+    /// every other lifecycle entry. An entry under a different
+    /// prefix would be silently absent from the per-invoice
+    /// export bundle — exactly the silent-omission failure mode
+    /// CLAUDE.md rule 12 names.
+    #[test]
+    fn pr_15_annulment_receiver_confirmation_kind_uses_invoice_prefix() {
+        assert_eq!(
+            EventKind::InvoiceAnnulmentReceiverConfirmation.as_str(),
+            "invoice.annulment_receiver_confirmation"
+        );
+        assert!(EventKind::InvoiceAnnulmentReceiverConfirmation
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// PR-15 / ADR-0028 §2: deliberate fork from the wire-side
+    /// `InvoiceAnnulmentAckStatus`. The two observation surfaces
+    /// (wire-side ack-poll vs receiver-confirmation observation)
+    /// are operationally distinct facts per ADR-0028 §2 —
+    /// pinning the discriminator-level distinction here catches
+    /// a future refactor accidentally collapsing the two
+    /// observation kinds onto one on-disk string. Same posture
+    /// `pr_13_annulment_kinds_are_distinct_from_invoice_kinds` /
+    /// `pr_14_annulment_ack_status_is_distinct_from_invoice_ack_status`
+    /// use for their respective fork-discipline pins.
+    #[test]
+    fn pr_15_receiver_confirmation_is_distinct_from_annulment_ack_status() {
+        assert_ne!(
+            EventKind::InvoiceAnnulmentReceiverConfirmation.as_str(),
+            EventKind::InvoiceAnnulmentAckStatus.as_str()
         );
     }
 }

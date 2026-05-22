@@ -26,6 +26,12 @@
 //!     `invoiceData` → `invoiceAnnulment`. The wrapping shape
 //!     (exchangeToken + common header + user + software) is
 //!     identical to `manageInvoice` per ADR-0009 §4.
+//!   - [`render_query_invoice_data_request`] — full
+//!     `<QueryInvoiceDataRequest>` XML body, ready to POST to
+//!     `/queryInvoiceData`. PR-15 / ADR-0028 consumer. Same
+//!     non-`manageInvoice` request-signature shape as
+//!     `queryTransactionStatus` (no per-invoice-index extension;
+//!     keys on the invoice number, not a transaction id).
 //!
 //! Lower-level building blocks (header, user, software type, request-id
 //! generation, timestamp formatting) live in [`parts`] so the unit tests
@@ -392,6 +398,118 @@ pub fn render_query_transaction_status_request(
     )
 }
 
+/// NAV `<invoiceDirection>` enum per the v3.0 XSD
+/// `InvoiceDirectionType`. Two values: `OUTBOUND` (caller is the
+/// supplier) / `INBOUND` (caller is the customer).
+///
+/// PR-15 / ADR-0028 §3: receiver-confirmation observation is
+/// supplier-side (ABERP is always the supplier for invoices it
+/// issued), so the binary path passes [`InvoiceDirection::Outbound`]
+/// explicitly. [`InvoiceDirection::Inbound`] is declared today
+/// because it is part of NAV's v3.0 enumeration; a future PR
+/// (Billingo-migrated reconciliation, per the deferred NAV
+/// historical / reconciliation read-path ADR) will use it. Declaring
+/// both at variant-declaration time is the same posture
+/// [`crate::operations::query_transaction_status::ProcessingStatus`]
+/// takes — name every NAV-side enum value the v3.0 XSD names,
+/// parse-fail loud on unknowns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceDirection {
+    /// Caller is the supplier (the invoice was issued BY this
+    /// taxpayer). ABERP's `observe-receiver-confirmation` path
+    /// uses this variant.
+    Outbound,
+    /// Caller is the customer (the invoice was issued TO this
+    /// taxpayer by another supplier). Not used by PR-15; named
+    /// for the future reconciliation read-path PR per ADR-0028
+    /// §3 + the deferred NAV historical read-path ADR.
+    Inbound,
+}
+
+impl InvoiceDirection {
+    /// NAV-facing string per the v3.0 XSD enumeration. Returned
+    /// as `&'static str` so it can be passed straight to the
+    /// envelope renderer without an allocation. `as_*` per the
+    /// convention established by
+    /// [`InvoiceOperation::as_nav_str`] /
+    /// [`crate::operations::query_transaction_status::ProcessingStatus::as_nav_str`].
+    pub fn as_nav_str(self) -> &'static str {
+        match self {
+            InvoiceDirection::Outbound => "OUTBOUND",
+            InvoiceDirection::Inbound => "INBOUND",
+        }
+    }
+}
+
+/// Render a `<QueryInvoiceDataRequest>` body, ready for HTTP POST.
+///
+/// PR-15 / ADR-0028 §3 consumer. This is a
+/// **non-`manageInvoice`** call per ADR-0009 §4 — the request
+/// signature uses the plain three-input form
+/// (`requestId || requestTimestamp || xmlSignKey`), NOT the
+/// per-invoice-index extension that `manageInvoice` /
+/// `manageAnnulment` require.
+///
+/// `invoice_number` is the BASE invoice's NAV-facing invoice
+/// number string (e.g., `"INV-default/00042"`). The binary
+/// constructs it from the base invoice's series code + sequence
+/// number — same format every other `<invoiceNumber>` element
+/// in ABERP-emitted bodies uses
+/// (`apps/aberp/src/nav_xml.rs::render_invoice_data`).
+///
+/// `invoice_direction` is the typed enum
+/// [`InvoiceDirection::Outbound`] for PR-15's supplier-side
+/// observation path.
+///
+/// `batch_index` is the position within a multi-invoice batch
+/// per NAV v3.0. ABERP submits single-invoice batches per
+/// ADR-0009 §3, so PR-15's binary path passes `1`.
+/// `<batchIndex>` is `xs:integer`, rendered as a decimal string.
+pub fn render_query_invoice_data_request(
+    credentials: &NavCredentials,
+    tax_number_8: &str,
+    request_id: &str,
+    request_timestamp: &str,
+    invoice_number: &str,
+    invoice_direction: InvoiceDirection,
+    batch_index: u32,
+) -> Result<Vec<u8>, NavTransportError> {
+    let signature = request_signature(request_id, request_timestamp, credentials.sign_key_bytes());
+    let batch_index_str = batch_index.to_string();
+    let direction_str = invoice_direction.as_nav_str();
+    render_request(
+        "QueryInvoiceDataRequest",
+        credentials,
+        tax_number_8,
+        request_id,
+        request_timestamp,
+        &signature,
+        |w| {
+            // XSD-sequence body per NAV v3.0:
+            //   <invoiceNumberQuery>
+            //     <invoiceNumber>...</invoiceNumber>
+            //     <invoiceDirection>OUTBOUND</invoiceDirection>
+            //     <batchIndex>1</batchIndex>
+            //   </invoiceNumberQuery>
+            //
+            // Wrapping element + child order verified at first
+            // NAV-testbed run per ADR-0028 §3 + §"Open questions".
+            // If the testbed rejects, the amendment is mechanical
+            // (rename here); the audit-payload's `response_xml`
+            // field carries the verbatim NAV-error response so a
+            // wire-rejected attempt is still recorded.
+            w.write_event(Event::Start(BytesStart::new("invoiceNumberQuery")))
+                .map_err(envelope_io)?;
+            write_text_in_default_ns(w, "invoiceNumber", invoice_number)?;
+            write_text_in_default_ns(w, "invoiceDirection", direction_str)?;
+            write_text_in_default_ns(w, "batchIndex", &batch_index_str)?;
+            w.write_event(Event::End(BytesEnd::new("invoiceNumberQuery")))
+                .map_err(envelope_io)?;
+            Ok(())
+        },
+    )
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Internal: shared envelope shell
 // ──────────────────────────────────────────────────────────────────────
@@ -400,11 +518,11 @@ pub fn render_query_transaction_status_request(
 /// element with the two namespaces, `<common:header>`, `<common:user>`,
 /// `<software>`, then the per-operation body via the closure.
 ///
-/// Extracted so the three public renderers above (and any future
-/// `queryInvoiceCheck` / `queryInvoiceDigest` / `manageAnnulment`) share
-/// one body and one set of element-ordering invariants. The closure
-/// receives the writer positioned just after the `<software>` close tag
-/// and just before the root close tag.
+/// Extracted so the five public renderers above (and any future
+/// `queryInvoiceCheck` / `queryInvoiceDigest` / `queryInvoiceChainDigest`)
+/// share one body and one set of element-ordering invariants. The
+/// closure receives the writer positioned just after the `<software>`
+/// close tag and just before the root close tag.
 fn render_request<F>(
     root_name: &str,
     credentials: &NavCredentials,
@@ -783,5 +901,108 @@ mod tests {
             err,
             NavTransportError::ManageInvoiceTooManyItems { count: 101 }
         ));
+    }
+
+    // ── PR-15 / ADR-0028 §3: queryInvoiceData envelope tests ───────
+
+    /// `InvoiceDirection::as_nav_str` round-trips against the two
+    /// values NAV v3.0's XSD names. Same shape as
+    /// `InvoiceOperation::as_nav_str` /
+    /// `ProcessingStatus::as_nav_str` — if a future contributor
+    /// adds a third value without updating the as_nav_str arm,
+    /// the missing arm is a compile error; this test pins the
+    /// canonical wire forms.
+    #[test]
+    fn invoice_direction_as_nav_str_matches_xsd_enumeration() {
+        assert_eq!(InvoiceDirection::Outbound.as_nav_str(), "OUTBOUND");
+        assert_eq!(InvoiceDirection::Inbound.as_nav_str(), "INBOUND");
+    }
+
+    /// Happy-path: a queryInvoiceData envelope carries the required
+    /// blocks + the operation-specific `<invoiceNumberQuery>` shape
+    /// per ADR-0028 §3. Same load-bearing shape-only check as the
+    /// `query_transaction_status_request_contains_required_blocks`
+    /// test (the closest existing template).
+    #[test]
+    fn query_invoice_data_request_contains_required_blocks() {
+        let xml = render_query_invoice_data_request(
+            &fixture_credentials(),
+            "12345678",
+            "REQ12345ABCDEFG",
+            "20260520T120000Z",
+            "INV-default/00042",
+            InvoiceDirection::Outbound,
+            1,
+        )
+        .expect("envelope renders");
+        let s = std::str::from_utf8(&xml).expect("UTF-8");
+
+        // Root + namespaces.
+        assert!(s.contains("<QueryInvoiceDataRequest"));
+        assert!(s.contains("xmlns=\"http://schemas.nav.gov.hu/OSA/3.0/api\""));
+        assert!(s.contains("xmlns:common=\"http://schemas.nav.gov.hu/NTCA/1.0/common\""));
+
+        // Common-block invariants (same shape as
+        // queryTransactionStatus — non-`manageInvoice` signature
+        // form).
+        assert!(s.contains("<common:requestId>REQ12345ABCDEFG</common:requestId>"));
+        assert!(s.contains("<common:timestamp>20260520T120000Z</common:timestamp>"));
+        assert!(s.contains("<common:login>TECHNICAL_LOGIN</common:login>"));
+        assert!(s.contains("<common:taxNumber>12345678</common:taxNumber>"));
+
+        // Operation-specific shape per ADR-0028 §3 + ADR-0028
+        // §"Open questions" — element names verified at first
+        // NAV-testbed run.
+        assert!(s.contains("<invoiceNumberQuery>"));
+        assert!(s.contains("<invoiceNumber>INV-default/00042</invoiceNumber>"));
+        assert!(s.contains("<invoiceDirection>OUTBOUND</invoiceDirection>"));
+        assert!(s.contains("<batchIndex>1</batchIndex>"));
+
+        // XSD-sequence order pin per ADR-0028 §3: the three
+        // children of <invoiceNumberQuery> must appear in
+        // invoiceNumber → invoiceDirection → batchIndex order.
+        let r_num = s
+            .find("<invoiceNumber>")
+            .expect("invoiceNumber present");
+        let r_dir = s
+            .find("<invoiceDirection>")
+            .expect("invoiceDirection present");
+        let r_bat = s.find("<batchIndex>").expect("batchIndex present");
+        assert!(
+            r_num < r_dir && r_dir < r_bat,
+            "invoiceNumber → invoiceDirection → batchIndex order required: {s}"
+        );
+
+        // Plaintext credentials MUST NOT leak.
+        assert!(
+            !s.contains("tech-password"),
+            "plaintext password leaked into queryInvoiceData envelope: {s}"
+        );
+        assert!(
+            !s.contains("SIGN-KEY-32BYTES-OF-FAKE-MATERIAL"),
+            "plaintext sign key leaked into queryInvoiceData envelope: {s}"
+        );
+    }
+
+    /// `InvoiceDirection::Inbound` round-trips through the
+    /// renderer cleanly even though PR-15's binary path does not
+    /// use it. Declaring both variants at the type level (per
+    /// ADR-0028 §3) means the renderer must accept either; a
+    /// future reconciliation-side caller passing `Inbound`
+    /// produces a valid envelope without re-touching this code.
+    #[test]
+    fn query_invoice_data_request_supports_inbound_direction() {
+        let xml = render_query_invoice_data_request(
+            &fixture_credentials(),
+            "12345678",
+            "REQ12345ABCDEFG",
+            "20260520T120000Z",
+            "SUPPLIER-INV-99",
+            InvoiceDirection::Inbound,
+            1,
+        )
+        .expect("envelope renders for INBOUND direction");
+        let s = std::str::from_utf8(&xml).expect("UTF-8");
+        assert!(s.contains("<invoiceDirection>INBOUND</invoiceDirection>"));
     }
 }

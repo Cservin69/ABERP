@@ -64,17 +64,49 @@
 //!     `ManageAnnulmentResponseParse`,
 //!     `ManageAnnulmentNonRetryable`, `ManageAnnulmentRetryable`).
 //!
+//! # PR-15 scope (this PR — ADR-0028 §3)
+//!
+//!   - [`operations::query_invoice_data`] — `queryInvoiceData`
+//!     call + verbatim request/response bytes for the audit-
+//!     evidence pair. Receiver-confirmation observation surface
+//!     of the technical-annulment lifecycle; pairs with
+//!     PR-14's `poll-annulment-ack`. PR-15 does NOT parse a
+//!     receiver-confirmation field out of the response per
+//!     ADR-0028 §"Surfaced conflict 3" — verbatim-bytes-only
+//!     posture until NAV-testbed verification surfaces the
+//!     actual response shape; a future amendment ADR adds the
+//!     parsed `receiver_state` enum additively.
+//!   - [`soap::render_query_invoice_data_request`] +
+//!     [`soap::InvoiceDirection`] —
+//!     `<QueryInvoiceDataRequest>` envelope renderer + the typed
+//!     `OUTBOUND`/`INBOUND` enum NAV v3.0 names. Same non-
+//!     `manageInvoice` request-signature shape as
+//!     `queryTransactionStatus`.
+//!   - Five new error variants in [`error::NavTransportError`]
+//!     (`QueryInvoiceDataHttp`, `QueryInvoiceDataHttpStatus`,
+//!     `QueryInvoiceDataResponseParse`,
+//!     `QueryInvoiceDataNonRetryable`,
+//!     `QueryInvoiceDataRetryable`).
+//!
 //! # What this crate still does NOT provide
 //!
-//!   - `queryAnnulmentStatus` (annulment-receiver-confirmation
-//!     poll; future PR per ADR-0026 §"Follow-on PRs unblocked").
 //!   - `queryInvoiceCheck` (Layer-2 idempotency disambiguation per
 //!     ADR-0009 §5; future PR).
+//!   - `queryInvoiceDigest` / `queryInvoiceChainDigest` /
+//!     `queryTransactionList` (the broader NAV historical /
+//!     reconciliation read-path operations; future PR per the
+//!     deferred ADR named in `adr/README.md` §Deferred).
+//!   - Parsed receiver-confirmation status field on
+//!     `queryInvoiceData` responses (future amendment ADR after
+//!     NAV-testbed verification per ADR-0028 §"Surfaced conflict
+//!     3").
 //!   - Audit-ledger writes — those are the binary's responsibility,
 //!     called from the NAV submission paths in
 //!     `apps/aberp/src/submit_invoice.rs` (PR-7-B-3),
-//!     `apps/aberp/src/poll_ack.rs` (PR-7-C-2), and
-//!     `apps/aberp/src/submit_annulment.rs` (PR-13).
+//!     `apps/aberp/src/poll_ack.rs` (PR-7-C-2),
+//!     `apps/aberp/src/submit_annulment.rs` (PR-13),
+//!     `apps/aberp/src/poll_annulment_ack.rs` (PR-14), and
+//!     `apps/aberp/src/observe_receiver_confirmation.rs` (PR-15).
 
 #![forbid(unsafe_code)]
 

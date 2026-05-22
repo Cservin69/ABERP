@@ -29,6 +29,7 @@ pub mod issue_modification;
 pub mod issue_storno;
 pub mod mark_abandoned;
 pub mod nav_xml;
+pub mod observe_receiver_confirmation;
 pub mod poll_ack;
 pub mod poll_annulment_ack;
 pub mod request_technical_annulment;

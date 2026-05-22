@@ -857,6 +857,137 @@ impl InvoiceAnnulmentAckStatusPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// InvoiceAnnulmentReceiverConfirmation  (PR-15 / ADR-0028 §2 —
+// receiver-confirmation observation half of the technical-annulment
+// surface. Pairs with the PR-14 wire-poll entries; closes the final
+// ADR-0009 §6 observation gap at the audit-evidence level.
+//
+// Structurally distinct from `InvoiceAnnulmentAckStatusPayload`:
+// extends the audit-evidence shape with two additional fields
+// (`nav_invoice_number` because `queryInvoiceData` keys on the
+// invoice number not the transaction id; `annulment_transaction_id`
+// to anchor the back-walk to the annulment lineage), and OMITS the
+// `ack_status` field (no parsed enumeration per ADR-0028 §"Surfaced
+// conflict 3" — verbatim-bytes-only posture until NAV-testbed
+// verification surfaces the actual response shape).
+//
+// Forked as a distinct type per the same kind ⇄ payload binding
+// posture every prior annulment-side payload uses (ADR-0026 §2 /
+// ADR-0027 §2): the type system enforces the discriminator even
+// when JSON shape happens to be compatible.)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceAnnulmentReceiverConfirmation`].
+///
+/// Written by the binary's `observe_receiver_confirmation` flow
+/// after each `queryInvoiceData` call against the BASE invoice's
+/// NAV-facing invoice number (ADR-0028 §1 + §3). One entry per
+/// call — same per-call-commit posture as
+/// `InvoiceAnnulmentAckStatusPayload` per ADR-0009 §8 ("every
+/// response across the chain" intent), BUT the call shape itself
+/// is one-shot (not a bounded poll loop) per ADR-0028 §4 + §
+/// "Surfaced conflict 2": the receiver-confirmation is human-paced
+/// so a fixed-cadence loop is structurally wrong; the operator
+/// re-runs the command at their cadence.
+///
+/// `nav_invoice_number` is the string ABERP asked NAV about
+/// (e.g., `"INV-default/00042"`). Stored verbatim so the audit-
+/// evidence bundle reader can see what was queried without
+/// re-deriving from `series.code + sequence_number`.
+///
+/// `annulment_transaction_id` is the NAV-assigned **annulment-side**
+/// tracking id from the prior `InvoiceAnnulmentSubmissionResponse`
+/// (NOT the base invoice's submission transactionId). Pinned here
+/// so the bundle reader anchors the receiver-confirmation entry to
+/// the annulment lineage by ID without re-walking the ledger; also
+/// surfaces the "this observation is about THIS annulment, not the
+/// original CREATE submission" intent at field-level granularity.
+///
+/// `idempotency_key` is the **annulment-request's** key (F8 carry-
+/// forward per ADR-0028 §7 — same posture as the PR-14 ack-status
+/// entries per ADR-0027 §6; closes the per-annulment audit lineage
+/// end-to-end: every entry from request through receiver-
+/// confirmation shares one key).
+///
+/// `response_xml` is the verbatim `<QueryInvoiceDataResponse>`
+/// bytes per ADR-0009 §8 (the audit evidence cannot be lost to a
+/// parser bug). Per ADR-0028 §"Surfaced conflict 3" the verbatim-
+/// bytes-only posture applies until NAV-testbed verification
+/// surfaces the actual receiver-confirmation response field; a
+/// future amendment ADR adds a parsed `receiver_state` enum field
+/// additively (the existing `response_xml` field carries the
+/// historic evidence regardless).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceAnnulmentReceiverConfirmationPayload {
+    /// The **base invoice's** id — prefixed `inv_<ULID>` form. The
+    /// observation is about the receiver-side state of the
+    /// annulment of THIS invoice; same field semantics as
+    /// `InvoiceAnnulmentAckStatusPayload::invoice_id`.
+    pub invoice_id: String,
+    /// The base invoice's NAV-facing invoice number string (e.g.,
+    /// `"INV-default/00042"`). This is what was passed to NAV's
+    /// `queryInvoiceData` operation per ADR-0028 §3. Stored
+    /// verbatim so the audit-evidence bundle reader sees the
+    /// query input without re-deriving from billing-store state
+    /// (which may have evolved between the call and the read).
+    pub nav_invoice_number: String,
+    /// NAV-assigned annulment-side transaction id (from the prior
+    /// `InvoiceAnnulmentSubmissionResponse` entry). Pinned here
+    /// at field-level so the bundle reader anchors to the
+    /// annulment lineage by ID; also distinguishes "this
+    /// observation is about the annulment submission" from "this
+    /// observation is about the original CREATE submission" at
+    /// the payload level without inspecting the kind discriminator
+    /// alone.
+    pub annulment_transaction_id: String,
+    /// Annulment-request's idempotency key (the operator-decision
+    /// key minted by `request-technical-annulment` and carried
+    /// forward through every annulment-lineage entry per the F8
+    /// contract — ADR-0026 §F8 + ADR-0027 §6 + ADR-0028 §7).
+    /// Same shape + role as on every other annulment-lineage
+    /// payload.
+    pub idempotency_key: String,
+    /// Verbatim `<QueryInvoiceDataResponse>` bytes. No parsed
+    /// receiver-confirmation state field per ADR-0028 §"Surfaced
+    /// conflict 3" — the verbatim bytes are the audit-evidence
+    /// today; the parsed-field extension lands additively in a
+    /// future amendment ADR after NAV-testbed verification.
+    pub response_xml: Vec<u8>,
+}
+
+impl InvoiceAnnulmentReceiverConfirmationPayload {
+    /// Build a payload from the parts the
+    /// `observe-receiver-confirmation` orchestrator just resolved.
+    /// `new()` (not `from_outcome(...)`) for the same reason every
+    /// prior annulment-side payload uses it: the fields cross the
+    /// audit chain (invoice id + annulment-side transaction id +
+    /// idempotency key) AND the query input (nav_invoice_number),
+    /// AND the NAV response (response_xml); no single domain
+    /// struct carries them all, and a speculative
+    /// `ReceiverConfirmationOutcome` type would be a CLAUDE.md
+    /// rule-2 violation.
+    pub fn new(
+        invoice_id: &str,
+        nav_invoice_number: &str,
+        annulment_transaction_id: &str,
+        idempotency_key: IdempotencyKey,
+        response_xml: Vec<u8>,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            nav_invoice_number: nav_invoice_number.to_string(),
+            annulment_transaction_id: annulment_transaction_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            response_xml,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1487,6 +1618,122 @@ mod tests {
         assert_eq!(decoded, payload);
         assert_eq!(
             decoded.transaction_id,
+            "txid-with-\"-quote-and-\\-backslash"
+        );
+    }
+
+    // ── PR-15 annulment-receiver-confirmation payload round-trips (ADR-0028 §2) ─
+
+    /// Round-trip the receiver-confirmation observation payload.
+    /// Field-by-field pin per CLAUDE.md rule 9 — a future
+    /// PartialEq-dropping refactor still surfaces because each
+    /// field is asserted. The `nav_invoice_number` field is the
+    /// load-bearing query-input record; pin it explicitly so a
+    /// future contributor cannot silently drop the recorded
+    /// query-key. Similarly `annulment_transaction_id` anchors
+    /// the back-walk to the annulment lineage; pin it too.
+    #[test]
+    fn annulment_receiver_confirmation_round_trip() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceAnnulmentReceiverConfirmationPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "INV-default/00042",
+            "NAV-ANNUL-TXID-42",
+            idem,
+            fixture_hostile_xml(),
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoiceAnnulmentReceiverConfirmationPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        // Field-by-field pin per CLAUDE.md rule 9.
+        assert_eq!(decoded.invoice_id, "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(decoded.nav_invoice_number, "INV-default/00042");
+        assert_eq!(decoded.annulment_transaction_id, "NAV-ANNUL-TXID-42");
+        assert!(decoded.idempotency_key.starts_with("idem_"));
+        assert_eq!(decoded.response_xml, fixture_hostile_xml());
+    }
+
+    /// PR-15 / ADR-0028 §2: the receiver-confirmation payload is
+    /// structurally distinct from `InvoiceAnnulmentAckStatusPayload`
+    /// — it carries TWO additional fields (`nav_invoice_number` +
+    /// `annulment_transaction_id`) and OMITS `ack_status`. The
+    /// type-system distinction is what stops a future audit-evidence
+    /// bundle reader from silently deserializing one as the other.
+    /// Same posture as the PR-13 / PR-14 parallel-payload tests.
+    /// The JSON shapes are DIFFERENT here (vs PR-13's
+    /// `annulment_attempt_payload_is_structurally_parallel_to_invoice_attempt`
+    /// where the JSON shapes happen to match); pinning that
+    /// difference is the load-bearing check.
+    #[test]
+    fn annulment_receiver_confirmation_payload_has_distinct_json_shape_from_ack_status() {
+        let idem = IdempotencyKey::new();
+        let receiver = InvoiceAnnulmentReceiverConfirmationPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "INV-default/00042",
+            "NAV-ANNUL-TXID-42",
+            idem,
+            b"<QueryInvoiceDataResponse/>".to_vec(),
+        );
+        let ack = InvoiceAnnulmentAckStatusPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "NAV-ANNUL-TXID-42",
+            "SAVED",
+            b"<QueryTransactionStatusResponse/>".to_vec(),
+        );
+        let r = receiver.to_bytes();
+        let a = ack.to_bytes();
+        // Different field sets -> different serialized JSON.
+        assert_ne!(r, a);
+        // The receiver-confirmation JSON must contain
+        // `nav_invoice_number` (the field that distinguishes it
+        // from ack-status). Pinning the field name catches a
+        // future rename that would silently break the audit-
+        // evidence bundle reader's discrimination by JSON shape
+        // (even though kind-alone classification at the audit-
+        // ledger level is the load-bearing distinction).
+        let r_str = std::str::from_utf8(&r).expect("utf-8");
+        assert!(
+            r_str.contains("nav_invoice_number"),
+            "receiver-confirmation payload must carry nav_invoice_number field: {r_str}"
+        );
+        assert!(
+            r_str.contains("annulment_transaction_id"),
+            "receiver-confirmation payload must carry annulment_transaction_id field: {r_str}"
+        );
+        assert!(
+            !r_str.contains("\"ack_status\""),
+            "receiver-confirmation payload must NOT carry an ack_status field \
+             (per ADR-0028 §\"Surfaced conflict 3\" verbatim-bytes-only posture): {r_str}"
+        );
+    }
+
+    /// F9 trap-closing posture: NAV-side strings (annulment
+    /// transaction id, nav_invoice_number) and verbatim response
+    /// bytes could in principle carry JSON-hostile characters.
+    /// The typed-struct path MUST escape them and produce valid
+    /// JSON that round-trips. Mirror of every prior
+    /// `*_round_trips_with_hostile_*` test in this module.
+    #[test]
+    fn annulment_receiver_confirmation_round_trips_with_hostile_inputs() {
+        let payload = InvoiceAnnulmentReceiverConfirmationPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "INV-\"weird\"-series/00042",
+            "txid-with-\"-quote-and-\\-backslash",
+            IdempotencyKey::new(),
+            fixture_hostile_xml(),
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoiceAnnulmentReceiverConfirmationPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.nav_invoice_number, "INV-\"weird\"-series/00042");
+        assert_eq!(
+            decoded.annulment_transaction_id,
             "txid-with-\"-quote-and-\\-backslash"
         );
     }

@@ -19,6 +19,7 @@
 //!   6. manageInvoice operation (PR-7-B-3).
 //!   7. queryTransactionStatus operation (PR-7-C-1).
 //!   8. manageAnnulment operation (PR-13).
+//!   9. queryInvoiceData operation (PR-15).
 //!
 //! Each variant carries enough context for an audit-ledger entry without
 //! leaking secret material — credential errors deliberately do NOT
@@ -280,4 +281,51 @@ pub enum NavTransportError {
     /// the named trigger if the operational pattern calls for it.
     #[error("manageAnnulment retryable error: {code} — {message}")]
     ManageAnnulmentRetryable { code: String, message: String },
+
+    // ── 9. queryInvoiceData operation (PR-15 / ADR-0028) ───────────
+    /// HTTP-layer failure on queryInvoiceData (DNS, connection
+    /// reset, TLS handshake). Same shape as
+    /// `QueryTransactionStatusHttp` / `ManageAnnulmentHttp`; held
+    /// distinct so the audit entry can distinguish operations
+    /// without reaching for the URL.
+    #[error("queryInvoiceData HTTP call failed: {0}")]
+    QueryInvoiceDataHttp(#[source] reqwest::Error),
+
+    /// NAV returned a non-success HTTP status to queryInvoiceData.
+    /// The body itself is captured by the caller per ADR-0009 §8
+    /// (the audit payload's `response_xml` field carries the
+    /// verbatim bytes regardless of HTTP status).
+    #[error("queryInvoiceData returned non-success HTTP status: {status}")]
+    QueryInvoiceDataHttpStatus { status: u16 },
+
+    /// The queryInvoiceData response body could not be parsed
+    /// against the expected `<QueryInvoiceDataResponse>` shape
+    /// (missing `<funcCode>`, malformed XML, unexpected root,
+    /// etc.). Loud per CLAUDE.md rule 12. NOTE per ADR-0028 §
+    /// "Surfaced conflict 3" the verbatim-bytes-only posture
+    /// applies: PR-15 does NOT attempt to parse a receiver-
+    /// confirmation field, so this variant fires only on
+    /// envelope-shape failures, not on
+    /// receiver-confirmation-field absence.
+    #[error("queryInvoiceData response parse failed: {0}")]
+    QueryInvoiceDataResponseParse(String),
+
+    /// NAV responded with a non-retryable application-layer
+    /// error against queryInvoiceData. The classification set is
+    /// shared across operations per ADR-0009 §5; the caller
+    /// surfaces loud and the operator escalates (credentials /
+    /// signature failures dominate this bucket).
+    #[error("queryInvoiceData non-retryable error: {code} — {message}")]
+    QueryInvoiceDataNonRetryable { code: String, message: String },
+
+    /// NAV responded with a retryable application-layer error
+    /// against queryInvoiceData (`OPERATION_FAILED`, HTTP 504 per
+    /// ADR-0009 §5). PR-15 surfaces this loud per ADR-0028 §4 —
+    /// the one-shot posture means the operator re-runs after the
+    /// transient cause resolves (NOT an automatic retry loop;
+    /// receiver-confirmation is human-paced and a fixed-cadence
+    /// loop is structurally wrong per ADR-0028 §"Surfaced
+    /// conflict 2").
+    #[error("queryInvoiceData retryable error: {code} — {message}")]
+    QueryInvoiceDataRetryable { code: String, message: String },
 }
