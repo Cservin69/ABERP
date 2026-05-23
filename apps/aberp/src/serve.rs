@@ -425,13 +425,66 @@ async fn handle_health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
+/// PR-28 / ADR-0036 §9 — typed wire shape for the eleven UI labels
+/// emitted by `InvoiceTrace::derive_state`. Replaces the pre-PR-28
+/// `&'static str` ladder per the §9 named-deferred trigger.
+///
+/// `Serialize` produces JSON strings matching the variant names
+/// exactly (no `#[serde(rename_all = ...)]` — variants are already
+/// PascalCase, matching the SPA's `InvoiceState` string union in
+/// `apps/aberp-ui/ui/src/lib/api.ts`). Variant-name drift between
+/// this enum and the SPA mirror surfaces at three layers per
+/// CLAUDE.md rule 12: the Rust-side `invoice_state_wire_shape_pins_
+/// pascalcase_strings` test pins each variant's JSON form loud; the
+/// SPA's `Record<InvoiceState, LabelMeta>` table fails `npm run
+/// check` on a missing key; the module-load runtime check in
+/// `labels.ts` throws on a `LIFECYCLE_ORDER` divergence.
+///
+/// Variants kept in lifecycle order matching ADR-0036 §3's priority-
+/// ladder inversion for readability; the discriminant order has no
+/// wire impact (serde emits the variant identifier).
+///
+/// `Debug` + `PartialEq` + `Eq` + `Clone` + `Copy` keep the test
+/// assertions ergonomic (the parameterised label-table test compares
+/// against literal variants via `assert_eq!`).
+#[derive(Serialize, Debug, PartialEq, Eq, Clone, Copy)]
+enum InvoiceState {
+    Unknown,
+    Ready,
+    Pending,
+    PendingNavExists,
+    Submitted,
+    Recovered,
+    Finalized,
+    Rejected,
+    Storno,
+    Amended,
+    Abandoned,
+}
+
 #[derive(Serialize)]
 struct InvoiceListItem {
     invoice_id: String,
     sequence_number: u64,
     fiscal_year: i32,
-    state: &'static str,
+    state: InvoiceState,
     total_gross: Option<i64>,
+    /// PR-31 / session-35 — chain-link affordance for list rows
+    /// (session-30-named Option M). `true` iff this invoice is the
+    /// base of at least one `InvoiceStornoIssued` or
+    /// `InvoiceModificationIssued` chain entry; mirrors
+    /// `InvoiceTrace::is_storno_base || is_amended_base`. The SPA
+    /// renders a small `↘` badge next to the state chip when this
+    /// flag is true so an inspector can see at a glance which rows
+    /// have a chain history without opening the detail modal. The
+    /// flag is redundant-by-construction with `state ∈ {Storno,
+    /// Amended}` for invoices that have only ever been the base of
+    /// one chain kind; it carries additional signal when an invoice
+    /// is the base of BOTH an amendment AND a storno (which the
+    /// `derive_state` ladder collapses to `Storno` per ADR-0036 §3,
+    /// hiding the prior amendment history at the state chip). Pinned
+    /// by `list_invoices_emits_has_chain_children`.
+    has_chain_children: bool,
 }
 
 #[derive(Serialize)]
@@ -439,7 +492,7 @@ struct InvoiceDetailResponse {
     invoice_id: String,
     sequence_number: u64,
     fiscal_year: i32,
-    state: &'static str,
+    state: InvoiceState,
     total_gross: Option<i64>,
     audit_entries: Vec<AuditEntryView>,
 }
@@ -449,9 +502,10 @@ struct AuditEntryView {
     seq: u64,
     kind: String,
     actor: String,
-    /// Only the kind + actor + seq + occurred_at are returned in the
-    /// short view. The Tauri shell pulls the per-invoice full payload
-    /// via `/audit/:invoice_id` when the operator drills in.
+    /// PR-27 / session-31 lifted the "short view" posture: the wire
+    /// shape now carries the full typed payload via the `payload`
+    /// field below. The `/audit/:invoice_id` endpoint and the
+    /// `/invoices/:id` endpoint return the same per-entry shape.
     occurred_at: String,
     /// PR-26 / session-30 — chain-link affordance for the detail
     /// modal. `Some(base_id)` for `InvoiceStornoIssued` /
@@ -464,6 +518,19 @@ struct AuditEntryView {
     /// navigation to the base invoice when present. Pinned by
     /// `audit_view_of_emits_chain_base_invoice_id`.
     chain_base_invoice_id: Option<String>,
+    /// PR-27 / session-31 — full typed payload as raw JSON for the
+    /// per-row drill-down in `InvoiceDetail.svelte`. The
+    /// `audit_payloads::*` types serialise via `serde_json::to_vec`
+    /// per F9 (closed in PR-6.1), so `entry.payload` bytes are
+    /// always valid JSON; a malformed payload — which would
+    /// indicate direct DB tampering — falls back to
+    /// `Value::Null` so the SPA's pretty-printer renders `null`
+    /// rather than crashing the view. The exposure matches the
+    /// `aberp dump-audit-bundle` posture per the PR-27 lean: no
+    /// redaction default (F43 bundle-redaction posture stays
+    /// named-deferred; the SPA exposure is parity, not regression).
+    /// Pinned by `audit_view_of_emits_typed_payload`.
+    payload: serde_json::Value,
 }
 
 async fn handle_list_invoices(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -630,6 +697,7 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
             fiscal_year: ready_invoice.fiscal_year,
             state: trace.derive_state(),
             total_gross: ready_invoice.total_gross().map(|h| h.as_i64()),
+            has_chain_children: trace.is_storno_base || trace.is_amended_base,
         });
     }
     Ok(items)
@@ -726,6 +794,13 @@ fn audit_view_of(entry: &Entry) -> AuditEntryView {
         // already short-circuits on kind first per ADR-0036 §4, so
         // the cost is bounded for non-chain entries.
         chain_base_invoice_id: extract_chain_base_link(entry).map(|(_, base)| base),
+        // PR-27 — the full typed payload as raw JSON. Every
+        // `audit_payloads::*` type serialises via `serde_json::to_vec`
+        // (F9 — closed in PR-6.1) so the bytes always parse cleanly;
+        // a malformed payload falls back to `Null` rather than
+        // panicking, so a corrupted entry is inspector-visible per
+        // CLAUDE.md rule 12.
+        payload: serde_json::from_slice(&entry.payload).unwrap_or(serde_json::Value::Null),
     }
 }
 
@@ -892,10 +967,10 @@ impl InvoiceTrace {
     /// the two MUST agree. Drift is the failure mode the
     /// `derive_state_label_table_mirror` test pins loud per
     /// CLAUDE.md rule 12.
-    fn derive_state(&self) -> &'static str {
+    fn derive_state(&self) -> InvoiceState {
         // 1. Terminal-by-operator-decision wins over everything.
         if self.has_marked_abandoned {
-            return "Abandoned";
+            return InvoiceState::Abandoned;
         }
         // 2-3. Chain-link terminal — the base invoice's typestate
         //      transition per ADR-0009 §2. Storno and Amended are
@@ -905,15 +980,15 @@ impl InvoiceTrace {
         //      see both on the same base; the audit-entries view
         //      exposes the full chain to the operator.
         if self.is_storno_base {
-            return "Storno";
+            return InvoiceState::Storno;
         }
         if self.is_amended_base {
-            return "Amended";
+            return InvoiceState::Amended;
         }
         // 4-5. Terminal-by-NAV from the ack status.
         match self.last_ack_status.as_deref() {
-            Some("SAVED") => return "Finalized",
-            Some("ABORTED") => return "Rejected",
+            Some("SAVED") => return InvoiceState::Finalized,
+            Some("ABORTED") => return InvoiceState::Rejected,
             _ => {}
         }
         // 6-7. State-3: Response exists, no terminal ack, no
@@ -923,9 +998,9 @@ impl InvoiceTrace {
         //      per ADR-0035 §4 / A91).
         if self.has_submission_response {
             if self.latest_response_is_recovered {
-                return "Recovered";
+                return InvoiceState::Recovered;
             }
-            return "Submitted";
+            return InvoiceState::Submitted;
         }
         // 8-9. State-2: Attempt exists, no Response, no abandon.
         //      The PendingNavExists / Pending sub-label split
@@ -933,16 +1008,16 @@ impl InvoiceTrace {
         //      posture at the UI level.
         if self.has_attempt {
             if matches!(self.latest_check_outcome.as_deref(), Some("exists")) {
-                return "PendingNavExists";
+                return InvoiceState::PendingNavExists;
             }
-            return "Pending";
+            return InvoiceState::Pending;
         }
         // 10. Pre-submission: Draft entered the ledger.
         if self.has_draft {
-            return "Ready";
+            return InvoiceState::Ready;
         }
         // 11. No entries for this invoice id.
-        "Unknown"
+        InvoiceState::Unknown
     }
 }
 
@@ -1048,20 +1123,20 @@ mod tests {
         // (the new labels are additions; no pre-PR-23 label
         // changed).
         let mut t = InvoiceTrace::default();
-        assert_eq!(t.derive_state(), "Unknown");
+        assert_eq!(t.derive_state(), InvoiceState::Unknown);
         t.has_draft = true;
-        assert_eq!(t.derive_state(), "Ready");
+        assert_eq!(t.derive_state(), InvoiceState::Ready);
         t.has_submission_response = true;
-        assert_eq!(t.derive_state(), "Submitted");
+        assert_eq!(t.derive_state(), InvoiceState::Submitted);
         t.last_ack_status = Some("RECEIVED".to_string());
-        assert_eq!(t.derive_state(), "Submitted");
+        assert_eq!(t.derive_state(), InvoiceState::Submitted);
         t.last_ack_status = Some("SAVED".to_string());
-        assert_eq!(t.derive_state(), "Finalized");
+        assert_eq!(t.derive_state(), InvoiceState::Finalized);
         t.last_ack_status = Some("ABORTED".to_string());
-        assert_eq!(t.derive_state(), "Rejected");
+        assert_eq!(t.derive_state(), InvoiceState::Rejected);
         // Abandoned wins over every NAV terminal.
         t.has_marked_abandoned = true;
-        assert_eq!(t.derive_state(), "Abandoned");
+        assert_eq!(t.derive_state(), InvoiceState::Abandoned);
     }
 
     // ── PR-23 / ADR-0036 §8 — parameterized expected-label table ──
@@ -1348,14 +1423,14 @@ mod tests {
         // 1. Unknown — no entries for this invoice.
         {
             let (ledger, _actor) = fixture_ledger();
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Unknown");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Unknown);
         }
         // 2. Ready — Draft only.
         {
             let (mut ledger, actor) = fixture_ledger();
             let idem = IdempotencyKey::new();
             write_draft(&mut ledger, &actor, "inv_A", idem);
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Ready");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Ready);
         }
         // 3. Pending — Attempt without Response, no Check entry.
         //    Mirrors stuck_precondition's
@@ -1365,7 +1440,7 @@ mod tests {
             let idem = IdempotencyKey::new();
             write_draft(&mut ledger, &actor, "inv_A", idem);
             write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Pending");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Pending);
         }
         // 4. PendingNavExists — Pending + latest Check is exists.
         //    ADR-0033 §6: Layer-2 entries are informational at the
@@ -1378,7 +1453,7 @@ mod tests {
             write_check_performed(&mut ledger, &actor, "inv_A", idem, "exists");
             assert_eq!(
                 trace_for(&ledger, "inv_A").derive_state(),
-                "PendingNavExists"
+                InvoiceState::PendingNavExists
             );
         }
         // 5. Submitted — Response (originally-witnessed) exists,
@@ -1396,7 +1471,7 @@ mod tests {
                 idem,
                 "TXID-A",
             );
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Submitted");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Submitted);
         }
         // 6. Recovered — Response carries QueryInvoiceDataResponse
         //    bytes. ADR-0034 §4 + ADR-0035 §4 / A91.
@@ -1407,7 +1482,7 @@ mod tests {
             write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
             write_check_performed(&mut ledger, &actor, "inv_A", idem, "exists");
             write_submission_response_recovered(&mut ledger, &actor, "inv_A", idem, "TXID-A");
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Recovered");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Recovered);
         }
         // 7. Finalized — last ack is SAVED. Mirrors
         //    stuck_precondition's `finalized_when_last_ack_is_saved`.
@@ -1425,7 +1500,7 @@ mod tests {
             );
             write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "PROCESSING");
             write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "SAVED");
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Finalized");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Finalized);
         }
         // 8. Rejected — last ack is ABORTED. Mirrors
         //    stuck_precondition's `rejected_when_last_ack_is_aborted`.
@@ -1442,7 +1517,7 @@ mod tests {
                 "TXID-A",
             );
             write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "ABORTED");
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Rejected");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Rejected);
         }
         // 9. Storno — InvoiceStornoIssued points at this id as
         //    base. ADR-0009 §2's Finalized → Storno transition.
@@ -1465,12 +1540,12 @@ mod tests {
             // chain-link pointing at the base.
             write_draft(&mut ledger, &actor, "inv_B", idem_storno);
             write_storno_issued(&mut ledger, &actor, "inv_B", "inv_A", idem_storno);
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Storno");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Storno);
             // The storno's OWN trace is `Ready` — it has its own
             // Draft but no Attempt yet. (In production the storno
             // would proceed through the same submit/poll/ack
             // lifecycle; the test fixture stops at the draft.)
-            assert_eq!(trace_for(&ledger, "inv_B").derive_state(), "Ready");
+            assert_eq!(trace_for(&ledger, "inv_B").derive_state(), InvoiceState::Ready);
         }
         // 10. Amended — InvoiceModificationIssued points at this id
         //     as base. ADR-0009 §2's Finalized → Amended transition.
@@ -1490,7 +1565,7 @@ mod tests {
             write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "SAVED");
             write_draft(&mut ledger, &actor, "inv_M", idem_mod);
             write_modification_issued(&mut ledger, &actor, "inv_M", "inv_A", idem_mod);
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Amended");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Amended);
         }
         // 11. Abandoned — InvoiceMarkedAbandoned exists. Mirrors
         //     stuck_precondition's
@@ -1508,7 +1583,7 @@ mod tests {
                 "TXID-A",
             );
             write_marked_abandoned(&mut ledger, &actor, "inv_A", idem, "TXID-A");
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Abandoned");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Abandoned);
         }
     }
 
@@ -1536,7 +1611,7 @@ mod tests {
         write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "SAVED");
         write_storno_issued(&mut ledger, &actor, "inv_B", "inv_A", idem_storno);
         write_marked_abandoned(&mut ledger, &actor, "inv_A", idem_base, "TXID-A");
-        assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Abandoned");
+        assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Abandoned);
     }
 
     /// PR-23 / ADR-0036 §3 priority-ordering pin: Recovered wins
@@ -1563,7 +1638,7 @@ mod tests {
         // from-nav precondition guard prevents this, but the UI
         // walker handles whatever the ledger carries).
         write_submission_response_recovered(&mut ledger, &actor, "inv_A", idem, "TXID-B");
-        assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Recovered");
+        assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Recovered);
     }
 
     /// PR-23 / ADR-0036 §5 substring-scan discriminator pin:
@@ -1639,6 +1714,77 @@ mod tests {
         assert_eq!(mod_view.chain_base_invoice_id.as_deref(), Some("inv_BASE"));
     }
 
+    /// PR-27 / session-31 — `audit_view_of` MUST surface the full
+    /// typed payload as a JSON object on the `payload` field. The
+    /// SPA's per-row drill-down in `InvoiceDetail.svelte` depends on
+    /// every typed field (chain digests, idempotency keys, NAV-emitted
+    /// timestamps, ack-status strings) being readable; a silent
+    /// regression (probe replaced with `Null` or with an empty
+    /// object) would collapse the inspector affordance per
+    /// CLAUDE.md rule 12. Three kinds covered — Draft (a thin
+    /// payload), Attempt (a payload with a byte-array field), Storno
+    /// (the chain-link payload whose `base_invoice_id` field is the
+    /// existing chain-link affordance's source of truth). Each
+    /// assertion pins a distinct typed field per CLAUDE.md rule 9
+    /// so a regression cannot hide behind a single shape mismatch.
+    #[test]
+    fn audit_view_of_emits_typed_payload() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem_a = IdempotencyKey::new();
+        let idem_s = IdempotencyKey::new();
+        write_draft(&mut ledger, &actor, "inv_A", idem_a);
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem_a);
+        write_storno_issued(&mut ledger, &actor, "inv_S", "inv_A", idem_s);
+
+        let entries = ledger.entries().unwrap();
+        let by_kind = |kind: EventKind| {
+            entries
+                .iter()
+                .find(|e| e.kind == kind)
+                .unwrap_or_else(|| panic!("missing entry of kind {kind:?}"))
+        };
+
+        let draft_view = audit_view_of(by_kind(EventKind::InvoiceDraftCreated));
+        let obj = draft_view
+            .payload
+            .as_object()
+            .expect("Draft payload must serialise as a JSON object");
+        assert_eq!(
+            obj.get("invoice_id").and_then(|v| v.as_str()),
+            Some("inv_A")
+        );
+        assert!(obj.contains_key("line_count"));
+        assert!(obj.contains_key("idempotency_key"));
+        assert!(obj.contains_key("nav_xml_path"));
+
+        let attempt_view = audit_view_of(by_kind(EventKind::InvoiceSubmissionAttempt));
+        let obj = attempt_view
+            .payload
+            .as_object()
+            .expect("Attempt payload must serialise as a JSON object");
+        assert_eq!(
+            obj.get("invoice_id").and_then(|v| v.as_str()),
+            Some("inv_A")
+        );
+        assert!(obj.contains_key("endpoint"));
+        assert!(obj.contains_key("request_xml"));
+
+        let storno_view = audit_view_of(by_kind(EventKind::InvoiceStornoIssued));
+        let obj = storno_view
+            .payload
+            .as_object()
+            .expect("Storno payload must serialise as a JSON object");
+        assert_eq!(
+            obj.get("base_invoice_id").and_then(|v| v.as_str()),
+            Some("inv_A"),
+        );
+        assert_eq!(
+            obj.get("storno_invoice_id").and_then(|v| v.as_str()),
+            Some("inv_S"),
+        );
+        assert!(obj.contains_key("modification_index"));
+    }
+
     /// PR-23 / ADR-0036 §4 cross-invoice contamination pin: a
     /// Storno chain-link for inv_B as base MUST NOT flip inv_A's
     /// trace into Storno. Mirrors
@@ -1655,8 +1801,108 @@ mod tests {
         // Storno points at inv_B as base.
         write_storno_issued(&mut ledger, &actor, "inv_S", "inv_B", idem_storno);
         // inv_A is unaffected — still Ready.
-        assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Ready");
+        assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Ready);
         // inv_B IS flipped.
-        assert_eq!(trace_for(&ledger, "inv_B").derive_state(), "Storno");
+        assert_eq!(trace_for(&ledger, "inv_B").derive_state(), InvoiceState::Storno);
+    }
+
+    /// PR-28 / ADR-0036 §9 — the typed `InvoiceState` enum MUST
+    /// serialise each variant to the exact PascalCase string the SPA
+    /// expects in `apps/aberp-ui/ui/src/lib/api.ts`. A silent rename
+    /// at either end (e.g., adding `#[serde(rename_all = ...)]` to
+    /// the enum, or a typo in the SPA union) would diverge the wire
+    /// shape and the SPA's `labelMeta` fallback would show every row
+    /// as a muted "?" pill. CLAUDE.md rule 12: pin the contract loud.
+    ///
+    /// CLAUDE.md rule 9: per-variant coverage means a regression
+    /// that collapses all variants to one string (or returns a
+    /// constant) cannot hide behind a single matching assertion.
+    #[test]
+    fn invoice_state_wire_shape_pins_pascalcase_strings() {
+        let cases: [(InvoiceState, &str); 11] = [
+            (InvoiceState::Unknown, "Unknown"),
+            (InvoiceState::Ready, "Ready"),
+            (InvoiceState::Pending, "Pending"),
+            (InvoiceState::PendingNavExists, "PendingNavExists"),
+            (InvoiceState::Submitted, "Submitted"),
+            (InvoiceState::Recovered, "Recovered"),
+            (InvoiceState::Finalized, "Finalized"),
+            (InvoiceState::Rejected, "Rejected"),
+            (InvoiceState::Storno, "Storno"),
+            (InvoiceState::Amended, "Amended"),
+            (InvoiceState::Abandoned, "Abandoned"),
+        ];
+        for (variant, expected) in cases {
+            let value = serde_json::to_value(variant)
+                .expect("InvoiceState variants must always serialise");
+            assert_eq!(
+                value,
+                serde_json::Value::String(expected.to_string()),
+                "InvoiceState::{variant:?} wire form drifted from `{expected}`",
+            );
+        }
+    }
+
+    /// PR-31 / session-35 — `InvoiceListItem` MUST carry a typed
+    /// `has_chain_children: bool` field on the JSON wire shape per
+    /// the session-30-named Option M lift. The SPA's `InvoiceList`
+    /// renderer reads this field strictly (the TS interface in
+    /// `apps/aberp-ui/ui/src/lib/api.ts` types it as `boolean`); a
+    /// silent field rename or removal would diverge the wire shape
+    /// and collapse the chain-link badge for every row. CLAUDE.md
+    /// rule 12: pin the contract loud.
+    ///
+    /// CLAUDE.md rule 9: both `true` and `false` cases are covered
+    /// so a regression that hard-codes the field to one value (or
+    /// to `null` via a serde rename gone wrong) cannot pass both
+    /// assertions vacuously.
+    ///
+    /// The production derivation
+    /// (`has_chain_children: trace.is_storno_base ||
+    /// trace.is_amended_base`) is pinned at the trace level by the
+    /// existing `derive_state_label_table_mirror` test, which
+    /// exercises both Storno-base and Amended-base scenarios through
+    /// the same `trace_for` walker used by `list_invoices`. A
+    /// regression that swaps the production OR for an AND or for a
+    /// single flag would surface as a Storno or Amended row whose
+    /// state chip is correct (still set by `derive_state`) but whose
+    /// `has_chain_children` flag is wrong — caught at the integration
+    /// level by an operator survey rather than at unit-test time.
+    /// The wire-shape pin below catches the type and field-name
+    /// drift; the derivation drift remains a code-review surface
+    /// per the session-35 lean.
+    #[test]
+    fn invoice_list_item_emits_has_chain_children() {
+        let with_chain = InvoiceListItem {
+            invoice_id: "inv_BASE".to_string(),
+            sequence_number: 42,
+            fiscal_year: 2026,
+            state: InvoiceState::Storno,
+            total_gross: Some(123_456),
+            has_chain_children: true,
+        };
+        let v = serde_json::to_value(&with_chain)
+            .expect("InvoiceListItem must always serialise");
+        assert_eq!(
+            v.get("has_chain_children").and_then(|x| x.as_bool()),
+            Some(true),
+            "has_chain_children must serialise as a JSON boolean (true case)",
+        );
+
+        let without_chain = InvoiceListItem {
+            invoice_id: "inv_PLAIN".to_string(),
+            sequence_number: 1,
+            fiscal_year: 2026,
+            state: InvoiceState::Ready,
+            total_gross: None,
+            has_chain_children: false,
+        };
+        let v = serde_json::to_value(&without_chain)
+            .expect("InvoiceListItem must always serialise");
+        assert_eq!(
+            v.get("has_chain_children").and_then(|x| x.as_bool()),
+            Some(false),
+            "has_chain_children must serialise as a JSON boolean (false case)",
+        );
     }
 }

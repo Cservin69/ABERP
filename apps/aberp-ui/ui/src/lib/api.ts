@@ -25,6 +25,17 @@ export interface InvoiceListItem {
    * an integer; HUF has no sub-unit and our `Huf` newtype stores it
    * as `i64`). */
   total_gross: number | null;
+  /** PR-31 / session-35 — chain-link affordance for list rows
+   * (session-30-named Option M). `true` iff this invoice is the
+   * base of at least one InvoiceStornoIssued or
+   * InvoiceModificationIssued chain entry. The list-row renderer
+   * surfaces a small `↘` badge next to the state chip when this
+   * is true; the badge is non-interactive (the row click already
+   * opens the detail modal). Pinned by
+   * `list_invoices_emits_has_chain_children` on the Rust side; TS
+   * reads the wire shape strictly via this typed field so a
+   * backend drift surfaces at `npm run check`. */
+  has_chain_children: boolean;
 }
 
 /** Possible derived states from `InvoiceTrace::derive_state` on the
@@ -63,6 +74,19 @@ export interface AuditEntryView {
    * Rust side; TS reads the wire shape strictly via this typed
    * field so a backend drift surfaces at `npm run check`. */
   chain_base_invoice_id: string | null;
+  /** PR-27 / session-31 — full typed payload as raw JSON
+   * (whatever `audit_payloads::*` serialised). Rendered by
+   * `InvoiceDetail.svelte` under a per-row expansion toggle as
+   * pretty-printed JSON; the operator inspects every typed payload
+   * field (chain digests, idempotency keys, NAV-emitted
+   * timestamps, ack-status strings) without dumping the whole
+   * bundle. `unknown` keeps the TS type honest — the shape varies
+   * per `EventKind` and the renderer treats it as opaque JSON. A
+   * malformed payload (which would indicate direct DB tampering)
+   * serialises as `null` from the backend; the renderer prints
+   * `null` rather than crashing the view. Pinned by
+   * `audit_view_of_emits_typed_payload` on the Rust side. */
+  payload: unknown;
 }
 
 /** The single-invoice detail — shape mirrors

@@ -49,7 +49,19 @@
   // (`null` keeps it closed; a string opens it and triggers the
   // fetch). Per the session-28 handoff lean: modal / in-place over a
   // routed `/invoice/<id>` URL — no SvelteKit dependency added.
-  let selectedId: string | null = $state(null);
+  //
+  // PR-30 / session-34 — navigation history stack. Each chain-link
+  // traversal in `InvoiceDetail.svelte` pushes the base invoice id
+  // onto this stack; the modal shows the top of the stack as the
+  // current invoice and renders the entries below it as a
+  // breadcrumb of `← {id}` back-buttons. Empty stack keeps the
+  // modal closed. ESC / backdrop close clears the entire stack
+  // (matches the modal-as-single-inspection-context posture from
+  // PR-26 / PR-27 / PR-29). Reassignment pattern (build a new
+  // array on every mutation) guarantees Svelte 5 reactivity
+  // without depending on Array-mutation tracking through the
+  // $state proxy.
+  let navStack: string[] = $state([]);
 
   onMount(() => {
     void refresh();
@@ -166,7 +178,7 @@
             <button
               type="button"
               class="id-link"
-              onclick={() => (selectedId = row.invoice_id)}
+              onclick={() => (navStack = [row.invoice_id])}
               aria-label={`Open detail for invoice ${row.invoice_id}`}
             >
               {row.invoice_id}
@@ -182,6 +194,13 @@
               <span class="state-icon" aria-hidden="true">{meta.icon}</span>
               <span class="state-text">{row.state}</span>
             </span>
+            {#if row.has_chain_children}
+              <span
+                class="chain-badge"
+                aria-label="This invoice is the base of a storno or amendment chain"
+                title="This invoice is the base of a storno or amendment chain — open the row to inspect."
+              >↘</span>
+            {/if}
           </td>
           <td class="col-num mono">{formatHuf(row.total_gross)}</td>
         </tr>
@@ -190,9 +209,11 @@
   </table>
 
   <InvoiceDetail
-    invoiceId={selectedId}
-    onClose={() => (selectedId = null)}
-    onNavigate={(baseId) => (selectedId = baseId)}
+    invoiceId={navStack.length > 0 ? navStack[navStack.length - 1] : null}
+    ancestors={navStack.slice(0, -1)}
+    onClose={() => (navStack = [])}
+    onNavigate={(baseId) => (navStack = [...navStack, baseId])}
+    onJumpBack={(index) => (navStack = navStack.slice(0, index + 1))}
   />
 </section>
 
@@ -352,9 +373,28 @@
 
   /* Widened from 14ch to 22ch — PendingNavExists (16 chars) plus
    * icon + gap is the longest chip; the column must fit without
-   * wrapping. */
+   * wrapping. PR-31 / session-35 — the chain-link badge appends a
+   * single glyph (`↘`) with a small left margin to the cell; the
+   * 22ch floor still fits the badge alongside the longest chip
+   * because PendingNavExists is the only state that pairs with a
+   * chain-children flag rarely (the typical chain-base state is
+   * Storno or Amended, both shorter). */
   .col-state {
     width: 22ch;
+  }
+
+  /* PR-31 / session-35 — chain-link badge next to the state chip.
+   * Quiet aesthetic per ADR-0017 §1-2: muted text, no border,
+   * cursor-help to mirror the state pill's hover-tooltip
+   * convention. Categorical signal is the glyph itself per
+   * ADR-0017 §"Adversarial review #4" — colour is not the
+   * load-bearing signal. */
+  .chain-badge {
+    margin-left: var(--space-1);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-muted);
+    cursor: help;
   }
 
   .state-pill {

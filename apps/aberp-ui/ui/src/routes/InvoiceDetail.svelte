@@ -29,30 +29,100 @@
   // their head per the session-29 handoff lean). No new audit event
   // fires on navigation — inspection is read-only per CLAUDE.md
   // rule 13.
+  //
+  // PR-27 / session-31 — audit-entry payload drill-down. The Rust
+  // side now emits `payload: serde_json::Value` on the
+  // `AuditEntryView` shape (the full typed payload bytes parsed back
+  // as raw JSON; the audit_payloads.rs F9 discipline guarantees
+  // valid JSON). Each row gets a small `▸ / ▾` expand button at the
+  // start of the kind cell; toggling reveals a colspan-4 sub-row
+  // with the pretty-printed JSON payload underneath. No new Tauri
+  // command, no new audit event — the same `getInvoice` round-trip
+  // already carries the field. Expansion state is per-modal-mount
+  // (a fresh open clears the set), matching the chain-link
+  // navigation posture of treating the modal as a single inspection
+  // context. Per the PR-27 lean: no redaction default (matches
+  // `aberp dump-audit-bundle` posture); F43 bundle-redaction
+  // posture stays named-deferred.
+  //
+  // PR-29 / session-33 — bytes-as-UTF-8 reviver. `audit_payloads::*`
+  // carries the NAV XML envelopes (`request_xml`, `response_xml`,
+  // `ack_xml`, and `Option<Vec<u8>>` failure / annulment variants)
+  // as `Vec<u8>` fields. Serde's default emission renders those as
+  // JSON int arrays — readable in principle, useless in practice
+  // (an inspector saw `[60, 63, 120, ...]` rather than
+  // `<ManageInvoiceRequest>...`). `formatPayload` now routes the
+  // payload through `bytesAsUtf8Replacer` from
+  // `../lib/payload-reviver`, which substitutes any UTF-8-decodable
+  // byte-array subtree with its decoded string. Non-UTF-8 arrays
+  // pass through unchanged per CLAUDE.md rule 12 (fail loud rather
+  // than render U+FFFD garbage). SPA-side only: no Rust change, no
+  // new Tauri command, no new audit event, no new SPA dependency,
+  // no new TS interface field. Surfaced by the session-31 close
+  // handoff's named Option N trigger.
+  //
+  // PR-30 / session-34 — breadcrumb / back-button navigation
+  // (Option L). The pre-PR-30 chain-link traversal (PR-26) rebound
+  // the modal's `invoiceId` prop in place and lost the navigation
+  // history — an operator three storno-chains deep could not get
+  // back without remembering ids. The stack now lives on the
+  // parent (`InvoiceList.svelte` owns `navStack: string[]`); this
+  // modal stays presentational and renders the trail. `ancestors`
+  // is the slice of the stack below the top (the entries the
+  // operator walked through to get here); the current invoice is
+  // `invoiceId` as before. Each ancestor renders as a quiet
+  // `← {id}` button in the header; clicking pops the stack back to
+  // that level via `onJumpBack(index)`. ESC / backdrop close
+  // clears the whole stack (matches the modal-as-single-
+  // inspection-context posture from PR-26 / PR-27 / PR-29). No
+  // new audit event — inspection remains read-only per CLAUDE.md
+  // rule 13.
 
   import {
     getInvoice,
     type InvoiceDetail,
   } from "../lib/api";
   import { labelMeta, type LabelSignal } from "../lib/labels";
+  import { bytesAsUtf8Replacer } from "../lib/payload-reviver";
 
   interface Props {
     invoiceId: string | null;
+    /** PR-30 — entries below the current invoice in the parent's
+     * navigation stack. Empty when the modal is opened directly
+     * from the list; one entry per chain-link traversal taken since.
+     * Index 0 is the root of the trail (the invoice the operator
+     * originally opened); the last entry is the immediate parent of
+     * `invoiceId`. */
+    ancestors: string[];
     onClose: () => void;
     /** PR-26 — chain-link navigation callback. Invoked when the
      * operator clicks the base invoice id rendered next to an
      * `InvoiceStornoIssued` / `InvoiceModificationIssued` audit row.
-     * The parent rebinds its `selectedId` to the base id and the
+     * PR-30: the parent pushes the base id onto `navStack` and the
      * `$effect` below re-fetches into the same modal. */
     onNavigate: (baseId: string) => void;
+    /** PR-30 — breadcrumb jump-back callback. The parent slices its
+     * `navStack` to length `index + 1`, dropping every entry beyond
+     * the clicked ancestor. The clicked ancestor becomes the new
+     * top of the stack and the `$effect` below re-fetches into the
+     * same modal. */
+    onJumpBack: (index: number) => void;
   }
 
-  let { invoiceId, onClose, onNavigate }: Props = $props();
+  let { invoiceId, ancestors, onClose, onNavigate, onJumpBack }: Props =
+    $props();
 
   let dialogEl: HTMLDialogElement | null = $state(null);
   let detail: InvoiceDetail | null = $state(null);
   let loadState: "idle" | "loading" | "loaded" | "error" = $state("idle");
   let errorMessage: string | null = $state(null);
+  // PR-27 — per-row expanded-payload state. Reassignment pattern
+  // (build a new Set on every toggle) guarantees Svelte 5
+  // reactivity without depending on Set-mutation tracking through
+  // the $state proxy. The set is keyed by `entry.seq` because seq
+  // is the audit-ledger's append-only primary key per ADR-0008 —
+  // unique per ledger AND stable across the lifetime of the modal.
+  let expandedSeqs: Set<number> = $state(new Set());
 
   // Drive the dialog open/close lifecycle from the `invoiceId` prop.
   // Opening: invoke `showModal()` and kick off the fetch. Closing:
@@ -62,12 +132,19 @@
     if (!dialogEl) return;
     if (invoiceId !== null) {
       if (!dialogEl.open) dialogEl.showModal();
+      // PR-27 — reset expansion state when navigating to a new
+      // invoice (whether via fresh open or chain-link navigation).
+      // The seq numbers from one invoice's audit lineage are
+      // unrelated to another's, so a stale set would leak
+      // expansion state across inspection contexts.
+      expandedSeqs = new Set();
       void load(invoiceId);
     } else {
       if (dialogEl.open) dialogEl.close();
       detail = null;
       loadState = "idle";
       errorMessage = null;
+      expandedSeqs = new Set();
     }
   });
 
@@ -116,6 +193,42 @@
     if (value === null) return "—";
     return hufFormatter.format(value);
   }
+
+  // PR-27 — toggle the expansion state of a single audit row.
+  // Reassignment pattern (see the `expandedSeqs` declaration
+  // comment for rationale).
+  function toggleExpand(seq: number) {
+    const next = new Set(expandedSeqs);
+    if (next.has(seq)) {
+      next.delete(seq);
+    } else {
+      next.add(seq);
+    }
+    expandedSeqs = next;
+  }
+
+  // PR-27 — pretty-print the typed payload for the drill-down sub-
+  // row. PR-29 / session-33 added the `bytesAsUtf8Replacer` from
+  // `../lib/payload-reviver` so the `Vec<u8>` fields
+  // `audit_payloads::*` carries (request_xml / response_xml /
+  // ack_xml / failure response_xml / annulment request_xml) render
+  // as decoded XML instead of long JSON int arrays. Non-UTF-8 byte
+  // arrays (rare; would indicate a non-XML body in a `Vec<u8>`
+  // field — NAV always emits UTF-8 XML per v3.0 spec) pass through
+  // as the raw int array so no information is lost. See
+  // `payload-reviver.ts` for the heuristic and the future-drift
+  // note about hypothetical `Vec<integer>` payload fields.
+  function formatPayload(payload: unknown): string {
+    try {
+      return JSON.stringify(payload, bytesAsUtf8Replacer, 2);
+    } catch {
+      // Should not happen for serde_json::Value — the field is
+      // already JSON-typed. Defence-in-depth so a future malformed
+      // shape (e.g., circular reference if the renderer is reused
+      // somewhere unexpected) does not crash the modal.
+      return String(payload);
+    }
+  }
 </script>
 
 <dialog
@@ -128,6 +241,21 @@
   <div class="detail-frame">
     <header class="detail-head">
       <div class="detail-title">
+        {#if ancestors.length > 0}
+          <nav class="breadcrumb" aria-label="Navigation history">
+            {#each ancestors as ancestorId, i (i)}
+              <button
+                type="button"
+                class="breadcrumb-step mono"
+                onclick={() => onJumpBack(i)}
+                aria-label={`Back to invoice ${ancestorId}`}
+                title={`Back to invoice ${ancestorId}`}
+              >
+                ← {ancestorId}
+              </button>
+            {/each}
+          </nav>
+        {/if}
         <span class="detail-label">Invoice</span>
         <h2 class="detail-id mono">{invoiceId ?? ""}</h2>
       </div>
@@ -187,9 +315,21 @@
           </thead>
           <tbody>
             {#each detail.audit_entries as entry (entry.seq)}
+              {@const expanded = expandedSeqs.has(entry.seq)}
               <tr>
                 <td class="col-num mono">{entry.seq}</td>
                 <td class="col-kind mono">
+                  <button
+                    type="button"
+                    class="expand-toggle"
+                    onclick={() => toggleExpand(entry.seq)}
+                    aria-expanded={expanded}
+                    aria-label={expanded
+                      ? `Hide payload for seq ${entry.seq}`
+                      : `Show payload for seq ${entry.seq}`}
+                  >
+                    {expanded ? "▾" : "▸"}
+                  </button>
                   {entry.kind}
                   {#if entry.chain_base_invoice_id}
                     <span class="chain-arrow" aria-hidden="true">→</span>
@@ -206,6 +346,13 @@
                 <td class="col-actor mono">{entry.actor}</td>
                 <td class="col-time mono">{entry.occurred_at}</td>
               </tr>
+              {#if expanded}
+                <tr class="payload-row">
+                  <td colspan="4">
+                    <pre class="payload-json">{formatPayload(entry.payload)}</pre>
+                  </td>
+                </tr>
+              {/if}
             {/each}
           </tbody>
         </table>
@@ -269,6 +416,46 @@
     font-weight: 500;
     color: var(--color-text-strong);
     word-break: break-all;
+  }
+
+  /* PR-30 — breadcrumb / back-button trail. One quiet `← {id}`
+   * button per ancestor; clicking jumps the parent's navigation
+   * stack back to that level. Same aesthetic as `.id-link` (quiet
+   * chrome, underline-on-hover) per ADR-0017 §1-2. Wraps on a
+   * narrow modal — each segment stays atomic. */
+  .breadcrumb {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-1) var(--space-3);
+    margin-bottom: var(--space-1);
+  }
+
+  .breadcrumb-step {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font-family: var(--type-family-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
+    cursor: pointer;
+    text-align: left;
+    word-break: break-all;
+  }
+
+  .breadcrumb-step:hover,
+  .breadcrumb-step:focus-visible {
+    color: var(--color-text-strong);
+    text-decoration: underline;
+    text-decoration-color: var(--color-text-muted);
+    text-underline-offset: 2px;
+  }
+
+  .breadcrumb-step:focus-visible {
+    outline: 1px solid var(--color-text-muted);
+    outline-offset: 2px;
   }
 
   .quiet-button {
@@ -412,6 +599,58 @@
   .chain-arrow {
     color: var(--color-text-muted);
     margin: 0 var(--space-1);
+  }
+
+  /* PR-27 — disclosure-triangle toggle for the per-row payload
+   * drill-down. Same quiet-button aesthetic as `.id-link` and
+   * `.quiet-button` per ADR-0017 §1-2 (chrome stays quiet; the
+   * affordance is the glyph and the hover-strengthening). Sized so
+   * the touch-target is reasonable without disturbing the dense
+   * table's row height. */
+  .expand-toggle {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0 var(--space-1) 0 0;
+    font: inherit;
+    color: var(--color-text-muted);
+    cursor: pointer;
+    width: 1.25em;
+    text-align: center;
+  }
+
+  .expand-toggle:hover,
+  .expand-toggle:focus-visible {
+    color: var(--color-text-strong);
+  }
+
+  .expand-toggle:focus-visible {
+    outline: 1px solid var(--color-text-muted);
+    outline-offset: 2px;
+  }
+
+  /* PR-27 — drill-down sub-row. Sunken background distinguishes
+   * it from the regular audit row above; the JSON pre uses the
+   * same monospace family as the rest of the table but a slightly
+   * smaller size so long payloads stay inspectable without
+   * dominating the modal. `overflow-x: auto` lets a wide line
+   * (e.g., a long request_xml byte array) scroll horizontally
+   * within the cell rather than forcing the dialog to grow. */
+  .payload-row td {
+    background: var(--color-surface-sunken);
+    padding: var(--space-2) var(--space-3);
+  }
+
+  .payload-json {
+    margin: 0;
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    line-height: var(--type-line-normal);
+    color: var(--color-text-secondary);
+    white-space: pre;
+    overflow-x: auto;
+    max-height: 320px;
+    overflow-y: auto;
   }
 
   .col-actor {

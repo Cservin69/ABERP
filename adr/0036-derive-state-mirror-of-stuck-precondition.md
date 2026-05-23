@@ -505,19 +505,66 @@ an enum or string-enum-with-help is included here.
 That's a future PR with its own ADR if it surfaces as
 an operational concern.
 
+#### 9.a Wire-shape tightening — LIFTED in PR-28
+
+The "future PR" named above fired in PR-28 (session 32).
+Trigger: four SPA surfaces (PR-24 + PR-25 + PR-26 + PR-27)
+now consume typed wire fields with TS exhaustiveness pins,
+and the SPA's `Record<InvoiceState, LabelMeta>` table in
+`labels.ts` makes drift between the Rust ladder and the SPA
+union expensive to discover (an unknown string falls back
+to a muted "?" pill — visible per CLAUDE.md rule 12 but
+not loud at build time on the Rust side).
+
+PR-28 replaces the `&'static str` return type with a typed
+fieldless `InvoiceState` enum in `apps/aberp/src/serve.rs`,
+mirroring the SPA union member-for-member. The enum derives
+`Serialize`; serde emits each variant identifier verbatim
+as a JSON string, so the wire shape is byte-identical to
+the pre-PR-28 emission (a `Submitted` Rust value still
+serialises as `"Submitted"`). The SPA's TS string-union
+stays hand-typed (compile-checked via `npm run check`) per
+this ADR's §"Alternatives considered" lean — the Rust-emitted
+schema path was not justified for a four-interface surface.
+
+PR-28 pins the wire contract with a new Rust-side test
+`invoice_state_wire_shape_pins_pascalcase_strings` that
+serialises each of the eleven variants and asserts the
+resulting JSON string equals the SPA's expected literal.
+A `#[serde(rename_all = ...)]` accidentally added to the
+enum, or a typo at either end, fires that test loud per
+CLAUDE.md rule 12.
+
+The §10 four-edit obligation gains a fifth edit on a new
+label (the `InvoiceState` enum); §10 below is updated to
+name the obligation explicitly.
+
 ### 10. Future-EventKind-extension obligation
 
 Adding an `EventKind` variant that classifies into a
-new UI label requires three coordinated edits per the
-F12-ritual-style discipline this ADR carries forward:
+new UI label requires six coordinated edits per the
+F12-ritual-style discipline this ADR carries forward
+(post-PR-28; the pre-PR-28 four-edit form is preserved
+in the bullet trail below):
 
 1. Extend `InvoiceTrace`'s field set with the new fact.
 2. Extend `merge_entry`'s match arm with the new variant.
 3. Extend the `derive_state` ladder with the new label.
 4. Extend `derive_state_label_table_mirror`'s table with
    one new row per new label.
+5. **PR-28 / §9.a obligation** — extend the
+   `serve::InvoiceState` enum with the new variant.
+   The new variant's wire form is the variant name
+   verbatim (no `#[serde(rename = ...)]`); the SPA's
+   `InvoiceState` union and `LABELS` table MUST gain a
+   matching member in lockstep or `npm run check` fires
+   loud at the SPA side.
+6. **PR-28 / §9.a obligation** — extend the
+   `invoice_state_wire_shape_pins_pascalcase_strings`
+   test's case array with one new row per new variant
+   so the JSON contract stays under pin coverage.
 
-These four are NOT enforced at compile time by an
+These six are NOT enforced at compile time by an
 exhaustive match — `merge_entry`'s `_ => {}` arm catches
 unhandled variants silently. Per CLAUDE.md rule 12 the
 silent miss is the failure mode; the parameterized
