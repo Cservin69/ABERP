@@ -4,16 +4,24 @@
   // billing summary) inherit this style without re-inventing tokens.
   //
   // Columns:
-  //   Invoice id          monospace, primary text
+  //   Invoice id          monospace, primary text; PR-25 makes the id
+  //                       a clickable inspector affordance — opens
+  //                       the InvoiceDetail modal for that invoice.
   //   Series #            monospace, tabular numbers, right-aligned
   //   Fiscal year         monospace, tabular numbers, right-aligned
   //   State               signal-coloured pill (categorical signal)
+  //                       — PR-24 / ADR-0036 §7: chip carries icon +
+  //                       label + hover tooltip; eleven labels per
+  //                       ADR-0036 §2; per-label affordances come
+  //                       from `../lib/labels`.
   //   Total (gross, HUF)  monospace, tabular numbers, right-aligned
   //
   // Per ADR-0017 §3 every numeric column is monospace + tabular +
   // right-aligned. Per ADR-0017 §1-2 chrome is quiet, colour means
-  // state. Per §4 a freshly-fetched table fades in over 200ms — no
-  // spinners, no skeleton shimmers.
+  // state. Per ADR-0017 §"Adversarial review #4" categorical signal
+  // is never carried by colour alone — every chip pairs colour with
+  // a glyph + label. Per §4 a freshly-fetched table fades in over
+  // 200ms — no spinners, no skeleton shimmers.
 
   import { onMount } from "svelte";
   import {
@@ -21,10 +29,27 @@
     type InvoiceListItem,
     type InvoiceState,
   } from "../lib/api";
+  import {
+    LIFECYCLE_ORDER,
+    labelMeta,
+    lifecycleIndex,
+    type LabelSignal,
+  } from "../lib/labels";
+  import InvoiceDetail from "./InvoiceDetail.svelte";
 
   let rows: InvoiceListItem[] = $state([]);
   let loadState: "idle" | "loading" | "loaded" | "error" = $state("idle");
   let errorMessage: string | null = $state(null);
+
+  // Filter dropdown — "All" plus one entry per label. Defaults to
+  // "All" so the first paint matches the pre-PR-24 behaviour.
+  let filterLabel: "All" | InvoiceState = $state("All");
+
+  // PR-25 / session-29 — selected invoice id drives the detail modal
+  // (`null` keeps it closed; a string opens it and triggers the
+  // fetch). Per the session-28 handoff lean: modal / in-place over a
+  // routed `/invoice/<id>` URL — no SvelteKit dependency added.
+  let selectedId: string | null = $state(null);
 
   onMount(() => {
     void refresh();
@@ -57,28 +82,44 @@
     return hufFormatter.format(value);
   }
 
-  function stateSignalClass(s: InvoiceState | string): string {
-    switch (s) {
-      case "Finalized":
-        return "signal-positive";
-      case "Rejected":
-        return "signal-negative";
-      case "Submitted":
-      case "Abandoned":
-        return "signal-warning";
-      case "Ready":
-        return "signal-muted";
-      case "Unknown":
-      default:
-        return "signal-muted";
-    }
+  function signalClass(signal: LabelSignal): string {
+    return `signal-${signal}`;
   }
+
+  // Filter + lifecycle-natural sort. Per ADR-0036 §3 the operator's
+  // mental model walks Unknown → Ready → Pending → PendingNavExists
+  // → Submitted → Recovered → Finalized → Rejected → Storno →
+  // Amended → Abandoned; that ordering mirrors the audit-ledger
+  // ladder in `serve.rs::derive_state`. Within a bucket, secondary
+  // sort by invoice id keeps the display stable across refreshes.
+  let visibleRows = $derived(
+    rows
+      .filter((r) => filterLabel === "All" || r.state === filterLabel)
+      .slice()
+      .sort((a, b) => {
+        const dx = lifecycleIndex(a.state) - lifecycleIndex(b.state);
+        if (dx !== 0) return dx;
+        return a.invoice_id.localeCompare(b.invoice_id);
+      }),
+  );
 </script>
 
 <section class="screen">
   <div class="screen-head">
     <h2>Invoices</h2>
     <div class="actions">
+      <label class="filter">
+        <span class="filter-label">State</span>
+        <select
+          bind:value={filterLabel}
+          aria-label="Filter invoices by state"
+        >
+          <option value="All">All</option>
+          {#each LIFECYCLE_ORDER as state (state)}
+            <option value={state}>{state}</option>
+          {/each}
+        </select>
+      </label>
       <button
         type="button"
         class="quiet-button"
@@ -105,27 +146,54 @@
       </tr>
     </thead>
     <tbody>
-      {#if loadState === "loaded" && rows.length === 0}
+      {#if loadState === "loaded" && visibleRows.length === 0}
         <tr class="empty">
           <td colspan="5">
-            No invoices on this tenant yet. Issue one with
-            <code>aberp issue-invoice</code> and reload.
+            {#if rows.length === 0}
+              No invoices on this tenant yet. Issue one with
+              <code>aberp issue-invoice</code> and reload.
+            {:else}
+              No invoices match the filter
+              <code>{filterLabel}</code>.
+            {/if}
           </td>
         </tr>
       {/if}
-      {#each rows as row (row.invoice_id)}
+      {#each visibleRows as row (row.invoice_id)}
+        {@const meta = labelMeta(row.state)}
         <tr>
-          <td class="col-id mono">{row.invoice_id}</td>
+          <td class="col-id mono">
+            <button
+              type="button"
+              class="id-link"
+              onclick={() => (selectedId = row.invoice_id)}
+              aria-label={`Open detail for invoice ${row.invoice_id}`}
+            >
+              {row.invoice_id}
+            </button>
+          </td>
           <td class="col-num mono">{row.sequence_number}</td>
           <td class="col-num mono">{row.fiscal_year}</td>
           <td class="col-state">
-            <span class="state-pill {stateSignalClass(row.state)}">{row.state}</span>
+            <span
+              class="state-pill {signalClass(meta.signal)}"
+              title={meta.tooltip}
+            >
+              <span class="state-icon" aria-hidden="true">{meta.icon}</span>
+              <span class="state-text">{row.state}</span>
+            </span>
           </td>
           <td class="col-num mono">{formatHuf(row.total_gross)}</td>
         </tr>
       {/each}
     </tbody>
   </table>
+
+  <InvoiceDetail
+    invoiceId={selectedId}
+    onClose={() => (selectedId = null)}
+    onNavigate={(baseId) => (selectedId = baseId)}
+  />
 </section>
 
 <style>
@@ -150,7 +218,36 @@
 
   .actions {
     display: flex;
+    align-items: center;
+    gap: var(--space-3);
+  }
+
+  .filter {
+    display: inline-flex;
+    align-items: center;
     gap: var(--space-2);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-secondary);
+  }
+
+  .filter-label {
+    text-transform: uppercase;
+    font-size: var(--type-size-xs);
+    letter-spacing: 0.06em;
+  }
+
+  .filter select {
+    background: var(--color-surface-raised);
+    color: var(--color-text-strong);
+    border: 1px solid var(--color-surface-divider);
+    padding: var(--space-1) var(--space-2);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
+    cursor: pointer;
+  }
+
+  .filter select:hover {
+    border-color: var(--color-text-muted);
   }
 
   .quiet-button {
@@ -226,12 +323,44 @@
     width: 30ch;
   }
 
+  /* PR-25 — invoice-id cell is a clickable inspector affordance.
+   * Reset the native button chrome; visually it reads as a quiet
+   * link so the dense-table aesthetic per ADR-0017 is preserved. */
+  .id-link {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: var(--color-text-primary);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .id-link:hover,
+  .id-link:focus-visible {
+    color: var(--color-text-strong);
+    text-decoration: underline;
+    text-decoration-color: var(--color-text-muted);
+    text-underline-offset: 2px;
+  }
+
+  .id-link:focus-visible {
+    outline: 1px solid var(--color-text-muted);
+    outline-offset: 2px;
+  }
+
+  /* Widened from 14ch to 22ch — PendingNavExists (16 chars) plus
+   * icon + gap is the longest chip; the column must fit without
+   * wrapping. */
   .col-state {
-    width: 14ch;
+    width: 22ch;
   }
 
   .state-pill {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
     padding: 0 var(--space-2);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-xs);
@@ -241,6 +370,16 @@
     border-radius: 2px;
     background: var(--color-surface-base);
     color: var(--color-text-secondary);
+    cursor: help;
+  }
+
+  .state-icon {
+    /* Glyphs render slightly sharper in the body face than the
+     * mono face at small sizes; the chip's overall mono character
+     * is preserved by the label text + tabular alignment. */
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    line-height: 1;
   }
 
   /* Categorical signal colours — only state cells carry colour. */
@@ -255,6 +394,13 @@
   .state-pill.signal-warning {
     color: var(--color-signal-warning);
     border-color: var(--color-signal-warning);
+  }
+  /* PR-24 — reserved violet per ADR-0017 §5. Surfaces ABERP↔NAV
+   * record disagreement at the label level; `PendingNavExists` is
+   * the exact operator-visible case. */
+  .state-pill.signal-divergence {
+    color: var(--color-signal-divergence);
+    border-color: var(--color-signal-divergence);
   }
   .state-pill.signal-muted {
     color: var(--color-text-muted);

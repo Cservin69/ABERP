@@ -453,6 +453,17 @@ struct AuditEntryView {
     /// short view. The Tauri shell pulls the per-invoice full payload
     /// via `/audit/:invoice_id` when the operator drills in.
     occurred_at: String,
+    /// PR-26 / session-30 — chain-link affordance for the detail
+    /// modal. `Some(base_id)` for `InvoiceStornoIssued` /
+    /// `InvoiceModificationIssued` entries (the typed payload's
+    /// `base_invoice_id` field per ADR-0023 / ADR-0024); `None` for
+    /// every other kind. Serialised as `null` for non-chain rows
+    /// (matches `total_gross: Option<i64>`'s wire posture above so
+    /// the SPA consumes a uniform `string | null`). The SPA's
+    /// `InvoiceDetail.svelte` renders the field as a clickable
+    /// navigation to the base invoice when present. Pinned by
+    /// `audit_view_of_emits_chain_base_invoice_id`.
+    chain_base_invoice_id: Option<String>,
 }
 
 async fn handle_list_invoices(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -585,6 +596,23 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
                 .or_default()
                 .merge_entry(entry, &id);
         }
+        // PR-23 / ADR-0036 §4 — chain-link entries do not carry a
+        // top-level `invoice_id` field; they carry
+        // `storno_invoice_id` / `modification_invoice_id` (the
+        // chain invoice's own id, which already enters `by_invoice`
+        // via its own InvoiceSequenceReserved + InvoiceDraftCreated
+        // pair) AND `base_invoice_id` (the chain link's anchor,
+        // which is what flips the BASE invoice's trace into Storno
+        // / Amended). Probe specifically for the base_invoice_id
+        // and tag the base's trace.
+        if let Some((kind, base_id)) = extract_chain_base_link(entry) {
+            let trace = by_invoice.entry(base_id).or_default();
+            match kind {
+                EventKind::InvoiceStornoIssued => trace.is_storno_base = true,
+                EventKind::InvoiceModificationIssued => trace.is_amended_base = true,
+                _ => {}
+            }
+        }
     }
 
     // Load billing details for each invoice id.
@@ -621,6 +649,24 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
                 found_any = true;
                 trace.merge_entry(entry, invoice_id);
                 audit_entries.push(audit_view_of(entry));
+            }
+        }
+        // PR-23 / ADR-0036 §4 — chain-link entries: flip the
+        // base's trace into Storno / Amended. Detail view is
+        // queried by id, so we only flip when this id IS the
+        // base. The chain-link entry itself does NOT appear in
+        // `audit_entries` for the base's detail view — those
+        // entries belong to the storno / modification invoice's
+        // own audit lineage; the base's lineage references them
+        // only via the derived state label per ADR-0009 §2.
+        if let Some((kind, base_id)) = extract_chain_base_link(entry) {
+            if base_id == invoice_id {
+                found_any = true;
+                match kind {
+                    EventKind::InvoiceStornoIssued => trace.is_storno_base = true,
+                    EventKind::InvoiceModificationIssued => trace.is_amended_base = true,
+                    _ => {}
+                }
             }
         }
     }
@@ -676,6 +722,10 @@ fn audit_view_of(entry: &Entry) -> AuditEntryView {
         // nanos since process start, drift-immune). The serve view
         // wants the operator-readable form.
         occurred_at: entry.time_wall.to_string(),
+        // PR-26 — reuse the existing chain-link probe. The probe
+        // already short-circuits on kind first per ADR-0036 §4, so
+        // the cost is bounded for non-chain entries.
+        chain_base_invoice_id: extract_chain_base_link(entry).map(|(_, base)| base),
     }
 }
 
@@ -697,19 +747,72 @@ fn read_invoice_row(
 // ── State derivation from the audit-ledger trace ─────────────────────
 
 /// Per-invoice accumulator for the audit-ledger walk.
+///
+/// PR-23 / ADR-0036 §2 extends this with four new fact-bits over
+/// the pre-PR-23 five-bit shape (`has_draft`,
+/// `has_submission_response`, `has_retry_requested`,
+/// `has_marked_abandoned`, `last_ack_status`):
+///
+///   - `has_attempt` — `InvoiceSubmissionAttempt` exists for this
+///     invoice (PR-19 / ADR-0032 §4). Drives the `Pending` /
+///     `PendingNavExists` labels at the state-2 ladder branch.
+///   - `latest_response_is_recovered` — the most-recent
+///     `InvoiceSubmissionResponse`'s `response_xml` carries
+///     `<QueryInvoiceDataResponse>` bytes per ADR-0034 §4. Drives
+///     the `Recovered` vs `Submitted` distinction at the state-3
+///     ladder branch.
+///   - `latest_check_outcome` — the most-recent
+///     `InvoiceCheckPerformed`'s `outcome` field (PR-20 / ADR-0033
+///     §6). Drives the `PendingNavExists` sub-label.
+///   - `is_storno_base` / `is_amended_base` — set by
+///     [`extract_chain_base_link`] from
+///     `InvoiceStornoIssuedPayload` / `InvoiceModificationIssuedPayload`
+///     entries whose `base_invoice_id` equals this invoice's id
+///     (PR-10 / ADR-0023, PR-11 / ADR-0024). Drives the `Storno` /
+///     `Amended` labels.
 #[derive(Default)]
 struct InvoiceTrace {
     has_draft: bool,
+    /// PR-23 / ADR-0036 §2 — state-2 Pending evidence.
+    has_attempt: bool,
     has_submission_response: bool,
+    /// PR-23 / ADR-0036 §5 — most-recent Response's
+    /// recovered-or-original discriminator.
+    latest_response_is_recovered: bool,
     has_retry_requested: bool,
     has_marked_abandoned: bool,
     last_ack_status: Option<String>,
+    /// PR-23 / ADR-0036 §6 — most-recent Layer-2 check outcome.
+    /// Values per ADR-0033 §2: `"exists"` / `"absent"` / `"failure"`.
+    latest_check_outcome: Option<String>,
+    /// PR-23 / ADR-0036 §4 — base of an `InvoiceStornoIssued` chain
+    /// entry. Set via [`extract_chain_base_link`].
+    is_storno_base: bool,
+    /// PR-23 / ADR-0036 §4 — base of an `InvoiceModificationIssued`
+    /// chain entry. Set via [`extract_chain_base_link`].
+    is_amended_base: bool,
 }
 
 impl InvoiceTrace {
     fn merge_entry(&mut self, entry: &Entry, invoice_id: &str) {
         match entry.kind {
             EventKind::InvoiceDraftCreated => self.has_draft = true,
+            EventKind::InvoiceSubmissionAttempt => {
+                // PR-23 / ADR-0036 §2 — state-2 Pending evidence.
+                // The cross-invoice contamination guard parses the
+                // payload's `invoice_id` field; pre-PR-23 the
+                // walker collapsed Attempt into the catch-all `_`
+                // arm and the Pending classification was invisible
+                // at the UI layer.
+                if let Ok(parsed) = serde_json::from_slice::<
+                    audit_payloads::InvoiceSubmissionAttemptPayload,
+                >(&entry.payload)
+                {
+                    if parsed.invoice_id == invoice_id {
+                        self.has_attempt = true;
+                    }
+                }
+            }
             EventKind::InvoiceSubmissionResponse => {
                 if let Ok(parsed) = serde_json::from_slice::<
                     audit_payloads::InvoiceSubmissionResponsePayload,
@@ -717,6 +820,16 @@ impl InvoiceTrace {
                 {
                     if parsed.invoice_id == invoice_id {
                         self.has_submission_response = true;
+                        // PR-23 / ADR-0036 §5 — mirror the
+                        // verifier's A91 prefix-match: a response
+                        // whose first ~512 bytes contain
+                        // `QueryInvoiceDataResponse` was emitted
+                        // by `recover-from-nav` per ADR-0034 §4.
+                        // Walk is in seq order; the LAST Response
+                        // wins — `latest_response_is_recovered`
+                        // is overwritten on each match.
+                        self.latest_response_is_recovered =
+                            is_recovered_response_xml(&parsed.response_xml);
                     }
                 }
             }
@@ -726,6 +839,23 @@ impl InvoiceTrace {
                 ) {
                     if parsed.invoice_id == invoice_id {
                         self.last_ack_status = Some(parsed.ack_status);
+                    }
+                }
+            }
+            EventKind::InvoiceCheckPerformed => {
+                // PR-23 / ADR-0036 §6 — Layer-2 outcome. Mirrors
+                // ADR-0033 §6's command-side informational-only
+                // posture: stuck_precondition does NOT consult
+                // these entries; derive_state surfaces them at the
+                // label level to give the operator a separate
+                // signal that recommends `recover-from-nav` over
+                // `retry-submission`.
+                if let Ok(parsed) = serde_json::from_slice::<
+                    audit_payloads::InvoiceCheckPerformedPayload,
+                >(&entry.payload)
+                {
+                    if parsed.invoice_id == invoice_id {
+                        self.latest_check_outcome = Some(parsed.outcome);
                     }
                 }
             }
@@ -740,37 +870,140 @@ impl InvoiceTrace {
     }
 
     /// Derive the ADR-0009 §2 typestate label from the accumulated
-    /// trace. Order matters: terminal-by-operator (`Abandoned`) wins
-    /// over terminal-by-NAV (`Finalized` / `Rejected`); those win
-    /// over `Stuck`; `Submitted` is the default once a submission
-    /// response exists; otherwise `Ready` (the audit ledger always
-    /// records sequence reservation + draft creation for an issued
-    /// invoice).
+    /// trace. PR-23 / ADR-0036 §3 extends the pre-PR-23 six-label
+    /// ladder to eleven labels with the priority ordering:
+    ///
+    /// ```text
+    /// 1. Abandoned             (matches stuck_precondition step 1)
+    /// 2. Storno                (chain-link evidence; ADR-0009 §2)
+    /// 3. Amended               (chain-link evidence; ADR-0009 §2)
+    /// 4. Finalized             (matches stuck_precondition AlreadyFinalized)
+    /// 5. Rejected              (matches stuck_precondition AlreadyRejected)
+    /// 6. Recovered             (sub-label of Submitted; ADR-0034 §4)
+    /// 7. Submitted             (matches stuck_precondition AwaitingAck)
+    /// 8. PendingNavExists      (sub-label of Pending; ADR-0033 §6)
+    /// 9. Pending               (matches stuck_precondition Pending; ADR-0032 §4)
+    /// 10. Ready                 (Draft entered the ledger; no submit yet)
+    /// 11. Unknown               (no entries for this invoice)
+    /// ```
+    ///
+    /// The mirror invariant per ADR-0036 §1: for every state both
+    /// this ladder and `audit_query::stuck_precondition` can name,
+    /// the two MUST agree. Drift is the failure mode the
+    /// `derive_state_label_table_mirror` test pins loud per
+    /// CLAUDE.md rule 12.
     fn derive_state(&self) -> &'static str {
+        // 1. Terminal-by-operator-decision wins over everything.
         if self.has_marked_abandoned {
             return "Abandoned";
         }
+        // 2-3. Chain-link terminal — the base invoice's typestate
+        //      transition per ADR-0009 §2. Storno and Amended are
+        //      orthogonal (an invoice can be the base of both over
+        //      its lifetime per ADR-0024 §7); the ladder picks
+        //      Storno first if both are set. Operationally rare to
+        //      see both on the same base; the audit-entries view
+        //      exposes the full chain to the operator.
+        if self.is_storno_base {
+            return "Storno";
+        }
+        if self.is_amended_base {
+            return "Amended";
+        }
+        // 4-5. Terminal-by-NAV from the ack status.
         match self.last_ack_status.as_deref() {
             Some("SAVED") => return "Finalized",
             Some("ABORTED") => return "Rejected",
-            Some("RECEIVED") | Some("PROCESSING") => {
-                // Has an intermediate ack; whether the poll loop ran
-                // to exhaustion is not directly knowable from one
-                // entry — the serve view labels it `Submitted`. The
-                // CLI's `aberp poll-ack` already prints `STUCK`
-                // when it terminates with an intermediate ack; the
-                // serve view's coarser label is fine for the list.
-                return "Submitted";
-            }
             _ => {}
         }
+        // 6-7. State-3: Response exists, no terminal ack, no
+        //      abandon. The Recovered / Submitted sub-label split
+        //      mirrors ADR-0034 §4's chain-walk-by-order posture
+        //      at the byte level (response_xml root element prefix
+        //      per ADR-0035 §4 / A91).
         if self.has_submission_response {
+            if self.latest_response_is_recovered {
+                return "Recovered";
+            }
             return "Submitted";
         }
+        // 8-9. State-2: Attempt exists, no Response, no abandon.
+        //      The PendingNavExists / Pending sub-label split
+        //      mirrors ADR-0033 §6's informational-only Layer-2
+        //      posture at the UI level.
+        if self.has_attempt {
+            if matches!(self.latest_check_outcome.as_deref(), Some("exists")) {
+                return "PendingNavExists";
+            }
+            return "Pending";
+        }
+        // 10. Pre-submission: Draft entered the ledger.
         if self.has_draft {
             return "Ready";
         }
+        // 11. No entries for this invoice id.
         "Unknown"
+    }
+}
+
+/// PR-23 / ADR-0036 §5 — recovered-Response discriminator.
+///
+/// Mirrors ADR-0035 §4 / A91's prefix-match local-name check at
+/// the UI level: a NAV-emitted `response_xml` whose first ~512
+/// bytes contain the substring `QueryInvoiceDataResponse` was
+/// emitted by `recover-from-nav` per ADR-0034 §4 (which reuses
+/// the existing `InvoiceSubmissionResponsePayload` shape with
+/// `<QueryInvoiceDataResponse>` bytes rather than
+/// `<ManageInvoiceResponse>`).
+///
+/// 512-byte window: the root element appears in the first ~200
+/// bytes on every NAV-emitted body (XML prolog + optional
+/// whitespace + optional namespace-prefixed open tag). Bounded so
+/// a malformed or oversized payload doesn't scan the whole body.
+///
+/// Substring scan rather than exact prefix-match per
+/// ADR-0036 §"Adversarial review" #2 + CLAUDE.md rule 2: the
+/// dependency on quick-xml or the verifier crate's prefix-match
+/// helper is not justified for the UI label split. A future PR
+/// can upgrade the discriminator additively if operational
+/// evidence surfaces.
+fn is_recovered_response_xml(response_xml: &[u8]) -> bool {
+    let window = &response_xml[..response_xml.len().min(512)];
+    window
+        .windows(NEEDLE_QUERY_INVOICE_DATA_RESPONSE.len())
+        .any(|w| w == NEEDLE_QUERY_INVOICE_DATA_RESPONSE)
+}
+
+/// The substring scanned by [`is_recovered_response_xml`].
+/// Module-level constant so the discriminator's exact bytes are
+/// auditable in one place per ADR-0036 §5.
+const NEEDLE_QUERY_INVOICE_DATA_RESPONSE: &[u8] = b"QueryInvoiceDataResponse";
+
+/// PR-23 / ADR-0036 §4 — chain-base detection probe.
+///
+/// `InvoiceStornoIssuedPayload` and
+/// `InvoiceModificationIssuedPayload` do NOT carry a top-level
+/// `invoice_id` field; the existing [`extract_invoice_id`] probe
+/// returns `None` for these entries. This sister probe walks the
+/// per-payload `base_invoice_id` field and returns the
+/// (kind, base_id) pair so the BASE invoice's trace can be
+/// flipped into Storno / Amended at the list-and-detail walker
+/// level.
+///
+/// Returns `None` for every other `EventKind` (the typed probe
+/// would fail to decode on the wrong payload shape; we
+/// short-circuit on kind match first to keep the cost bounded).
+fn extract_chain_base_link(entry: &Entry) -> Option<(EventKind, String)> {
+    #[derive(Deserialize)]
+    struct Probe {
+        base_invoice_id: String,
+    }
+    match entry.kind {
+        EventKind::InvoiceStornoIssued | EventKind::InvoiceModificationIssued => {
+            let probe: Probe = serde_json::from_slice(&entry.payload).ok()?;
+            Some((entry.kind.clone(), probe.base_invoice_id))
+        }
+        _ => None,
     }
 }
 
@@ -791,7 +1024,13 @@ fn extract_invoice_id(entry: &Entry) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    //! `mod tests` scan (per `feedback_rust_scan_existing_mod_blocks`):
+    //! ONE `mod tests` block in this file. PR-23 / ADR-0036 §8 adds
+    //! its parameterized-table mirror tests INSIDE this existing
+    //! block rather than appending a second `mod tests`.
     use super::*;
+    use aberp_audit_ledger::{Actor, BinaryHash, Ledger, TenantId};
+    use aberp_billing::IdempotencyKey;
 
     #[test]
     fn constant_time_eq_basic() {
@@ -804,6 +1043,10 @@ mod tests {
 
     #[test]
     fn derive_state_ladder() {
+        // Pre-PR-23 ladder test preserved verbatim — every assertion
+        // here still holds under the ADR-0036 §3 extended ladder
+        // (the new labels are additions; no pre-PR-23 label
+        // changed).
         let mut t = InvoiceTrace::default();
         assert_eq!(t.derive_state(), "Unknown");
         t.has_draft = true;
@@ -819,5 +1062,601 @@ mod tests {
         // Abandoned wins over every NAV terminal.
         t.has_marked_abandoned = true;
         assert_eq!(t.derive_state(), "Abandoned");
+    }
+
+    // ── PR-23 / ADR-0036 §8 — parameterized expected-label table ──
+    //
+    // The mirror invariant per ADR-0036 §1: for every state both
+    // this ladder and `audit_query::stuck_precondition` can name,
+    // the two MUST agree. Drift is the failure mode CLAUDE.md
+    // rule 12 names; the parameterized table pins it loud.
+    //
+    // Test fixtures are duplicated from `audit_query.rs::tests`
+    // per ADR-0036 §"Adversarial review" #1 (cross-module
+    // `#[cfg(test)] pub(crate)` lift deferred until a third
+    // module needs the same shape).
+
+    /// Mint a fresh in-memory ledger + Actor pair. Same shape as
+    /// `audit_query.rs::tests::fixture_ledger`.
+    fn fixture_ledger() -> (Ledger, Actor) {
+        let tenant = TenantId::new("t1".to_string()).unwrap();
+        let bh = BinaryHash::from_bytes([0u8; 32]);
+        let ledger = Ledger::open_in_memory(tenant, bh).unwrap();
+        let actor = Actor::from_local_cli("sess".to_string(), "test-user");
+        (ledger, actor)
+    }
+
+    fn write_draft(ledger: &mut Ledger, actor: &Actor, invoice_id: &str, idem: IdempotencyKey) {
+        let payload = audit_payloads::InvoiceDraftCreatedPayload {
+            invoice_id: invoice_id.to_string(),
+            line_count: 1,
+            idempotency_key: idem.to_canonical_string(),
+            nav_xml_path: None,
+        };
+        ledger
+            .append(
+                EventKind::InvoiceDraftCreated,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    fn write_submission_attempt(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        invoice_id: &str,
+        idem: IdempotencyKey,
+    ) {
+        let payload = audit_payloads::InvoiceSubmissionAttemptPayload::new(
+            invoice_id,
+            idem,
+            "test",
+            b"<request/>".to_vec(),
+        );
+        ledger
+            .append(
+                EventKind::InvoiceSubmissionAttempt,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    fn write_submission_response_originally_witnessed(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        invoice_id: &str,
+        idem: IdempotencyKey,
+        txid: &str,
+    ) {
+        // Bytes whose first 512 bytes do NOT contain
+        // `QueryInvoiceDataResponse` — the originally-witnessed
+        // `<ManageInvoiceResponse>` path per ADR-0034 §4.
+        let payload = audit_payloads::InvoiceSubmissionResponsePayload::new(
+            invoice_id,
+            idem,
+            txid,
+            b"<ManageInvoiceResponse><transactionId>TXID</transactionId></ManageInvoiceResponse>"
+                .to_vec(),
+        );
+        ledger
+            .append(
+                EventKind::InvoiceSubmissionResponse,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    fn write_submission_response_recovered(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        invoice_id: &str,
+        idem: IdempotencyKey,
+        txid: &str,
+    ) {
+        // Bytes whose first 512 bytes DO contain
+        // `QueryInvoiceDataResponse` — the recover-from-nav path
+        // per ADR-0034 §4. Mirrors the verifier's A91 prefix-
+        // match per ADR-0035 §4.
+        let payload = audit_payloads::InvoiceSubmissionResponsePayload::new(
+            invoice_id,
+            idem,
+            txid,
+            b"<QueryInvoiceDataResponse><auditData><transactionId>TXID</transactionId></auditData></QueryInvoiceDataResponse>".to_vec(),
+        );
+        ledger
+            .append(
+                EventKind::InvoiceSubmissionResponse,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    fn write_ack_status(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        invoice_id: &str,
+        txid: &str,
+        status: &str,
+    ) {
+        let payload = audit_payloads::InvoiceAckStatusPayload::new(
+            invoice_id,
+            txid,
+            status,
+            b"<ack/>".to_vec(),
+        );
+        ledger
+            .append(
+                EventKind::InvoiceAckStatus,
+                payload.to_bytes(),
+                actor.clone(),
+                None,
+            )
+            .unwrap();
+    }
+
+    fn write_check_performed(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        invoice_id: &str,
+        idem: IdempotencyKey,
+        outcome: &'static str,
+    ) {
+        let payload = audit_payloads::InvoiceCheckPerformedPayload::new_for_outcome(
+            invoice_id,
+            idem,
+            "test",
+            "INV-default/00042",
+            outcome,
+            b"<QueryInvoiceCheckRequest/>".to_vec(),
+            b"<QueryInvoiceCheckResponse/>".to_vec(),
+        );
+        ledger
+            .append(
+                EventKind::InvoiceCheckPerformed,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    fn write_marked_abandoned(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        invoice_id: &str,
+        idem: IdempotencyKey,
+        txid: &str,
+    ) {
+        let payload = audit_payloads::InvoiceMarkedAbandonedPayload::new(
+            invoice_id,
+            idem,
+            Some(txid.to_string()),
+            None,
+            "test abandon",
+        );
+        ledger
+            .append(
+                EventKind::InvoiceMarkedAbandoned,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    fn write_storno_issued(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        storno_id: &str,
+        base_id: &str,
+        idem: IdempotencyKey,
+    ) {
+        let payload = audit_payloads::InvoiceStornoIssuedPayload::new(
+            storno_id,
+            2,
+            "rsv_test",
+            idem,
+            base_id,
+            1,
+            1,
+        );
+        ledger
+            .append(
+                EventKind::InvoiceStornoIssued,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    fn write_modification_issued(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        modification_id: &str,
+        base_id: &str,
+        idem: IdempotencyKey,
+    ) {
+        let payload = audit_payloads::InvoiceModificationIssuedPayload::new(
+            modification_id,
+            2,
+            "rsv_test",
+            idem,
+            base_id,
+            1,
+            1,
+            "2026-05-22",
+        );
+        ledger
+            .append(
+                EventKind::InvoiceModificationIssued,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    /// Build a per-invoice trace by walking the ledger using the
+    /// same probe shape `serve.rs::list_invoices` / `get_invoice_detail`
+    /// use. Mirrors the production walker so test fixtures
+    /// exercise the same code paths the wire surface does.
+    fn trace_for(ledger: &Ledger, invoice_id: &str) -> InvoiceTrace {
+        let entries = ledger.entries().unwrap();
+        let mut trace = InvoiceTrace::default();
+        for entry in &entries {
+            if let Some(id) = extract_invoice_id(entry) {
+                if id == invoice_id {
+                    trace.merge_entry(entry, invoice_id);
+                }
+            }
+            if let Some((kind, base_id)) = extract_chain_base_link(entry) {
+                if base_id == invoice_id {
+                    match kind {
+                        EventKind::InvoiceStornoIssued => trace.is_storno_base = true,
+                        EventKind::InvoiceModificationIssued => trace.is_amended_base = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        trace
+    }
+
+    /// PR-23 / ADR-0036 §8 — parameterized expected-label table.
+    ///
+    /// Eleven scenarios, one per UI label. Each fixture builds an
+    /// in-memory ledger and asserts the derived label. Drift
+    /// between the ADR-0036 §3 ladder and the parameterized
+    /// expectations surfaces here loud per CLAUDE.md rule 12.
+    ///
+    /// CLAUDE.md rule 9: each test row pins a distinct business
+    /// rule. A test that passes when `derive_state` returns a
+    /// constant would fail every row except `Unknown` — the
+    /// per-label coverage means business-logic regressions cannot
+    /// hide.
+    #[test]
+    fn derive_state_label_table_mirror() {
+        // 1. Unknown — no entries for this invoice.
+        {
+            let (ledger, _actor) = fixture_ledger();
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Unknown");
+        }
+        // 2. Ready — Draft only.
+        {
+            let (mut ledger, actor) = fixture_ledger();
+            let idem = IdempotencyKey::new();
+            write_draft(&mut ledger, &actor, "inv_A", idem);
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Ready");
+        }
+        // 3. Pending — Attempt without Response, no Check entry.
+        //    Mirrors stuck_precondition's
+        //    `pending_when_attempt_exists_and_no_response`.
+        {
+            let (mut ledger, actor) = fixture_ledger();
+            let idem = IdempotencyKey::new();
+            write_draft(&mut ledger, &actor, "inv_A", idem);
+            write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Pending");
+        }
+        // 4. PendingNavExists — Pending + latest Check is exists.
+        //    ADR-0033 §6: Layer-2 entries are informational at the
+        //    command-side; the UI surfaces the divergence loud.
+        {
+            let (mut ledger, actor) = fixture_ledger();
+            let idem = IdempotencyKey::new();
+            write_draft(&mut ledger, &actor, "inv_A", idem);
+            write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+            write_check_performed(&mut ledger, &actor, "inv_A", idem, "exists");
+            assert_eq!(
+                trace_for(&ledger, "inv_A").derive_state(),
+                "PendingNavExists"
+            );
+        }
+        // 5. Submitted — Response (originally-witnessed) exists,
+        //    no terminal ack. Mirrors stuck_precondition's
+        //    `stuck_when_submission_response_exists_and_no_ack`.
+        {
+            let (mut ledger, actor) = fixture_ledger();
+            let idem = IdempotencyKey::new();
+            write_draft(&mut ledger, &actor, "inv_A", idem);
+            write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+            write_submission_response_originally_witnessed(
+                &mut ledger,
+                &actor,
+                "inv_A",
+                idem,
+                "TXID-A",
+            );
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Submitted");
+        }
+        // 6. Recovered — Response carries QueryInvoiceDataResponse
+        //    bytes. ADR-0034 §4 + ADR-0035 §4 / A91.
+        {
+            let (mut ledger, actor) = fixture_ledger();
+            let idem = IdempotencyKey::new();
+            write_draft(&mut ledger, &actor, "inv_A", idem);
+            write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+            write_check_performed(&mut ledger, &actor, "inv_A", idem, "exists");
+            write_submission_response_recovered(&mut ledger, &actor, "inv_A", idem, "TXID-A");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Recovered");
+        }
+        // 7. Finalized — last ack is SAVED. Mirrors
+        //    stuck_precondition's `finalized_when_last_ack_is_saved`.
+        {
+            let (mut ledger, actor) = fixture_ledger();
+            let idem = IdempotencyKey::new();
+            write_draft(&mut ledger, &actor, "inv_A", idem);
+            write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+            write_submission_response_originally_witnessed(
+                &mut ledger,
+                &actor,
+                "inv_A",
+                idem,
+                "TXID-A",
+            );
+            write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "PROCESSING");
+            write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "SAVED");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Finalized");
+        }
+        // 8. Rejected — last ack is ABORTED. Mirrors
+        //    stuck_precondition's `rejected_when_last_ack_is_aborted`.
+        {
+            let (mut ledger, actor) = fixture_ledger();
+            let idem = IdempotencyKey::new();
+            write_draft(&mut ledger, &actor, "inv_A", idem);
+            write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+            write_submission_response_originally_witnessed(
+                &mut ledger,
+                &actor,
+                "inv_A",
+                idem,
+                "TXID-A",
+            );
+            write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "ABORTED");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Rejected");
+        }
+        // 9. Storno — InvoiceStornoIssued points at this id as
+        //    base. ADR-0009 §2's Finalized → Storno transition.
+        {
+            let (mut ledger, actor) = fixture_ledger();
+            let idem_base = IdempotencyKey::new();
+            let idem_storno = IdempotencyKey::new();
+            // Base went Finalized then stornod.
+            write_draft(&mut ledger, &actor, "inv_A", idem_base);
+            write_submission_attempt(&mut ledger, &actor, "inv_A", idem_base);
+            write_submission_response_originally_witnessed(
+                &mut ledger,
+                &actor,
+                "inv_A",
+                idem_base,
+                "TXID-A",
+            );
+            write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "SAVED");
+            // Storno's own draft (its own audit lineage) +
+            // chain-link pointing at the base.
+            write_draft(&mut ledger, &actor, "inv_B", idem_storno);
+            write_storno_issued(&mut ledger, &actor, "inv_B", "inv_A", idem_storno);
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Storno");
+            // The storno's OWN trace is `Ready` — it has its own
+            // Draft but no Attempt yet. (In production the storno
+            // would proceed through the same submit/poll/ack
+            // lifecycle; the test fixture stops at the draft.)
+            assert_eq!(trace_for(&ledger, "inv_B").derive_state(), "Ready");
+        }
+        // 10. Amended — InvoiceModificationIssued points at this id
+        //     as base. ADR-0009 §2's Finalized → Amended transition.
+        {
+            let (mut ledger, actor) = fixture_ledger();
+            let idem_base = IdempotencyKey::new();
+            let idem_mod = IdempotencyKey::new();
+            write_draft(&mut ledger, &actor, "inv_A", idem_base);
+            write_submission_attempt(&mut ledger, &actor, "inv_A", idem_base);
+            write_submission_response_originally_witnessed(
+                &mut ledger,
+                &actor,
+                "inv_A",
+                idem_base,
+                "TXID-A",
+            );
+            write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "SAVED");
+            write_draft(&mut ledger, &actor, "inv_M", idem_mod);
+            write_modification_issued(&mut ledger, &actor, "inv_M", "inv_A", idem_mod);
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Amended");
+        }
+        // 11. Abandoned — InvoiceMarkedAbandoned exists. Mirrors
+        //     stuck_precondition's
+        //     `abandoned_wins_over_any_other_state`.
+        {
+            let (mut ledger, actor) = fixture_ledger();
+            let idem = IdempotencyKey::new();
+            write_draft(&mut ledger, &actor, "inv_A", idem);
+            write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+            write_submission_response_originally_witnessed(
+                &mut ledger,
+                &actor,
+                "inv_A",
+                idem,
+                "TXID-A",
+            );
+            write_marked_abandoned(&mut ledger, &actor, "inv_A", idem, "TXID-A");
+            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Abandoned");
+        }
+    }
+
+    /// PR-23 / ADR-0036 §3 priority-ordering pin: Abandoned wins
+    /// over Storno (defence-in-depth — in clean production state
+    /// the two should not co-occur per the ADR-0009 §2 transition
+    /// rules, but if the audit ledger ever carries both, the
+    /// terminal-by-operator-decision branch wins per the
+    /// authoritative classifier's posture). Mirrors
+    /// `audit_query.rs::tests::already_abandoned_overrides_pending_state_2`.
+    #[test]
+    fn derive_state_abandoned_wins_over_storno_base() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem_base = IdempotencyKey::new();
+        let idem_storno = IdempotencyKey::new();
+        write_draft(&mut ledger, &actor, "inv_A", idem_base);
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem_base);
+        write_submission_response_originally_witnessed(
+            &mut ledger,
+            &actor,
+            "inv_A",
+            idem_base,
+            "TXID-A",
+        );
+        write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "SAVED");
+        write_storno_issued(&mut ledger, &actor, "inv_B", "inv_A", idem_storno);
+        write_marked_abandoned(&mut ledger, &actor, "inv_A", idem_base, "TXID-A");
+        assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Abandoned");
+    }
+
+    /// PR-23 / ADR-0036 §3 priority-ordering pin: Recovered wins
+    /// over Submitted (the state-3 sub-label split). If the most-
+    /// recent Response is a recovered one, the label is
+    /// `Recovered`; if it's an originally-witnessed one, the label
+    /// is `Submitted`. Order in the ledger matters — the LAST
+    /// Response wins.
+    #[test]
+    fn derive_state_latest_response_wins_for_recovered_split() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_draft(&mut ledger, &actor, "inv_A", idem);
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        // Earlier: an originally-witnessed Response.
+        write_submission_response_originally_witnessed(
+            &mut ledger,
+            &actor,
+            "inv_A",
+            idem,
+            "TXID-A",
+        );
+        // Later: a recovered Response (in practice the recover-
+        // from-nav precondition guard prevents this, but the UI
+        // walker handles whatever the ledger carries).
+        write_submission_response_recovered(&mut ledger, &actor, "inv_A", idem, "TXID-B");
+        assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Recovered");
+    }
+
+    /// PR-23 / ADR-0036 §5 substring-scan discriminator pin:
+    /// `is_recovered_response_xml` MUST return true for the
+    /// `<QueryInvoiceDataResponse>` root element AND for the
+    /// namespace-prefixed form `<ns0:QueryInvoiceDataResponse>`,
+    /// and MUST return false for the `<ManageInvoiceResponse>`
+    /// originally-witnessed form. CLAUDE.md rule 9: the
+    /// discriminator is the load-bearing signal for the
+    /// Recovered / Submitted split; a regression would silently
+    /// collapse Recovered into Submitted.
+    #[test]
+    fn is_recovered_response_xml_prefix_match() {
+        assert!(is_recovered_response_xml(
+            b"<QueryInvoiceDataResponse/>"
+        ));
+        assert!(is_recovered_response_xml(
+            b"<?xml version=\"1.0\"?><ns0:QueryInvoiceDataResponse xmlns:ns0=\"http://schemas.nav.gov.hu/OSA/3.0/api\"/>"
+        ));
+        assert!(!is_recovered_response_xml(
+            b"<?xml version=\"1.0\"?><ManageInvoiceResponse><transactionId>TXID</transactionId></ManageInvoiceResponse>"
+        ));
+        assert!(!is_recovered_response_xml(b""));
+        // Per ADR-0036 §5 the scan window is bounded to 512 bytes.
+        // A discriminator literal far past the window MUST NOT
+        // match. Bound the test fixture explicitly.
+        let mut padded = vec![b' '; 800];
+        padded.extend_from_slice(b"<QueryInvoiceDataResponse/>");
+        assert!(
+            !is_recovered_response_xml(&padded),
+            "discriminator past the 512-byte window must not match"
+        );
+    }
+
+    /// PR-26 / session-30 — `audit_view_of` MUST surface the
+    /// chain-link `base_invoice_id` for `InvoiceStornoIssued` and
+    /// `InvoiceModificationIssued` entries, and MUST emit `None` for
+    /// every other `EventKind`. The SPA's chain-link click handler
+    /// in `InvoiceDetail.svelte` depends on this field; a silent
+    /// regression (probe replaced with `None`) would collapse the
+    /// inspector affordance per CLAUDE.md rule 12. The field's
+    /// `Option<String>` shape is the load-bearing contract — the
+    /// SPA TS interface mirrors it as `string | null`.
+    #[test]
+    fn audit_view_of_emits_chain_base_invoice_id() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem_base = IdempotencyKey::new();
+        let idem_storno = IdempotencyKey::new();
+        let idem_mod = IdempotencyKey::new();
+
+        write_draft(&mut ledger, &actor, "inv_BASE", idem_base);
+        write_storno_issued(&mut ledger, &actor, "inv_STORNO", "inv_BASE", idem_storno);
+        write_modification_issued(&mut ledger, &actor, "inv_MOD", "inv_BASE", idem_mod);
+
+        let entries = ledger.entries().unwrap();
+        let by_kind = |kind: EventKind| {
+            entries
+                .iter()
+                .find(|e| e.kind == kind)
+                .unwrap_or_else(|| panic!("missing entry of kind {kind:?}"))
+        };
+
+        let draft_view = audit_view_of(by_kind(EventKind::InvoiceDraftCreated));
+        assert_eq!(draft_view.chain_base_invoice_id, None);
+
+        let storno_view = audit_view_of(by_kind(EventKind::InvoiceStornoIssued));
+        assert_eq!(
+            storno_view.chain_base_invoice_id.as_deref(),
+            Some("inv_BASE"),
+        );
+
+        let mod_view = audit_view_of(by_kind(EventKind::InvoiceModificationIssued));
+        assert_eq!(mod_view.chain_base_invoice_id.as_deref(), Some("inv_BASE"));
+    }
+
+    /// PR-23 / ADR-0036 §4 cross-invoice contamination pin: a
+    /// Storno chain-link for inv_B as base MUST NOT flip inv_A's
+    /// trace into Storno. Mirrors
+    /// `audit_query.rs::tests::precondition_does_not_cross_invoice_ids`
+    /// at the chain-link probe level.
+    #[test]
+    fn chain_base_link_does_not_cross_invoice_ids() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem_a = IdempotencyKey::new();
+        let idem_b = IdempotencyKey::new();
+        let idem_storno = IdempotencyKey::new();
+        write_draft(&mut ledger, &actor, "inv_A", idem_a);
+        write_draft(&mut ledger, &actor, "inv_B", idem_b);
+        // Storno points at inv_B as base.
+        write_storno_issued(&mut ledger, &actor, "inv_S", "inv_B", idem_storno);
+        // inv_A is unaffected — still Ready.
+        assert_eq!(trace_for(&ledger, "inv_A").derive_state(), "Ready");
+        // inv_B IS flipped.
+        assert_eq!(trace_for(&ledger, "inv_B").derive_state(), "Storno");
     }
 }

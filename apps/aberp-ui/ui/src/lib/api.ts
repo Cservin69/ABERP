@@ -28,15 +28,23 @@ export interface InvoiceListItem {
 }
 
 /** Possible derived states from `InvoiceTrace::derive_state` on the
- * backend. Kept in lockstep with that `&'static str` ladder; a state
- * the backend invents without a matching enum here renders as the
- * raw string but does not break the table. */
+ * backend. Kept in lockstep with that `&'static str` ladder per
+ * ADR-0036 §2 — eleven labels, lifecycle-ordered. A state the
+ * backend invents without a matching union member here renders as
+ * the raw string but does not break the table; the `labelMeta`
+ * helper in `./labels.ts` falls back to a muted "?" pill so the
+ * silent miss is visible per CLAUDE.md rule 12. */
 export type InvoiceState =
   | "Unknown"
   | "Ready"
+  | "Pending"
+  | "PendingNavExists"
   | "Submitted"
+  | "Recovered"
   | "Finalized"
   | "Rejected"
+  | "Storno"
+  | "Amended"
   | "Abandoned";
 
 /** One audit-ledger entry — shape mirrors `serve::AuditEntryView`. */
@@ -45,6 +53,16 @@ export interface AuditEntryView {
   kind: string;
   actor: string;
   occurred_at: string;
+  /** PR-26 / session-30 — chain-link affordance for the detail
+   * modal. Non-null for `InvoiceStornoIssued` /
+   * `InvoiceModificationIssued` entries (the typed payload's
+   * `base_invoice_id` field per ADR-0023 / ADR-0024); `null` for
+   * every other kind. `InvoiceDetail.svelte` renders the field as
+   * a clickable navigation to the base invoice when present.
+   * Pinned by `audit_view_of_emits_chain_base_invoice_id` on the
+   * Rust side; TS reads the wire shape strictly via this typed
+   * field so a backend drift surfaces at `npm run check`. */
+  chain_base_invoice_id: string | null;
 }
 
 /** The single-invoice detail — shape mirrors
