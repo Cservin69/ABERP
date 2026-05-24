@@ -291,7 +291,16 @@ pub fn render_storno_data(
     series_code: &SeriesCode,
     parties: &NavParties,
     storno_reference: &StornoReference,
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
 ) -> Result<Vec<u8>> {
+    // PR-44γ.1 — same C1-wire-side invariant the fresh-issuance renderer
+    // enforces: a non-HUF storno without inherited rate metadata is a
+    // loud-fail (the chain-currency inheritance path supplies the
+    // metadata; missing metadata means the caller bypassed
+    // `inherit_rate_metadata_for_chain`).
+    ensure_rate_metadata_invariant(currency, rate_metadata)?;
+
     let mut buf: Vec<u8> = Vec::new();
     let mut w = Writer::new_with_indent(&mut buf, b' ', 2);
 
@@ -333,17 +342,18 @@ pub fn render_storno_data(
     w.write_event(Event::Start(BytesStart::new("invoiceHead")))?;
     write_supplier(&mut w, &parties.supplier)?;
     write_customer(&mut w, &parties.customer)?;
-    // PR-44δ — storno chain stays HUF-only at this PR per the session-51
-    // narrowed scope; PR-44γ.1 lifts the chain to currency-aware.
-    write_invoice_detail(&mut w, &issue_date, Currency::Huf, None)?;
+    // PR-44γ.1 — currency + rate metadata inherited from base per
+    // ADR-0037 §4 invariant C6 (built by the chain caller via
+    // `invoice_currency_metadata::inherit_rate_metadata_for_chain`).
+    write_invoice_detail(&mut w, &issue_date, currency, rate_metadata)?;
     w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
 
     // <invoiceLines> with negated amounts. Negate by constructing a
     // parallel Vec with negated unit_price; net/vat/gross cascade
     // through `LineItem::net_total` etc. unchanged.
     let negated_lines: Vec<LineItem> = invoice.lines.iter().map(negate_line).collect();
-    write_lines(&mut w, &negated_lines, Currency::Huf, None)?;
-    write_summary(&mut w, &negated_lines, Currency::Huf, None)?;
+    write_lines(&mut w, &negated_lines, currency, rate_metadata)?;
+    write_summary(&mut w, &negated_lines, currency, rate_metadata)?;
 
     w.write_event(Event::End(BytesEnd::new("invoice")))?;
     w.write_event(Event::End(BytesEnd::new("invoiceMain")))?;
@@ -386,7 +396,14 @@ pub fn render_modification_data(
     series_code: &SeriesCode,
     parties: &NavParties,
     modification_reference: &ModificationReference,
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
 ) -> Result<Vec<u8>> {
+    // PR-44γ.1 — same C1-wire-side invariant the fresh-issuance renderer
+    // enforces: a non-HUF modification without inherited rate metadata
+    // loud-fails.
+    ensure_rate_metadata_invariant(currency, rate_metadata)?;
+
     let mut buf: Vec<u8> = Vec::new();
     let mut w = Writer::new_with_indent(&mut buf, b' ', 2);
 
@@ -425,17 +442,16 @@ pub fn render_modification_data(
     w.write_event(Event::Start(BytesStart::new("invoiceHead")))?;
     write_supplier(&mut w, &parties.supplier)?;
     write_customer(&mut w, &parties.customer)?;
-    // PR-44δ — modification chain stays HUF-only at this PR per the
-    // session-51 narrowed scope; PR-44γ.1 lifts the chain to
-    // currency-aware.
-    write_invoice_detail(&mut w, &issue_date, Currency::Huf, None)?;
+    // PR-44γ.1 — currency + rate metadata inherited from base per
+    // ADR-0037 §4 invariant C6.
+    write_invoice_detail(&mut w, &issue_date, currency, rate_metadata)?;
     w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
 
     // <invoiceLines> + <invoiceSummary> — NOT negated. Full-replace
     // per ADR-0024 §4; the modification's `invoice.lines` already
     // carry the new effective values.
-    write_lines(&mut w, &invoice.lines, Currency::Huf, None)?;
-    write_summary(&mut w, &invoice.lines, Currency::Huf, None)?;
+    write_lines(&mut w, &invoice.lines, currency, rate_metadata)?;
+    write_summary(&mut w, &invoice.lines, currency, rate_metadata)?;
 
     w.write_event(Event::End(BytesEnd::new("invoice")))?;
     w.write_event(Event::End(BytesEnd::new("invoiceMain")))?;

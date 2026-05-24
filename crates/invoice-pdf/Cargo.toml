@@ -1,0 +1,43 @@
+[package]
+name = "aberp-invoice-pdf"
+description = "Printed-invoice PDF renderer (ADR-0037 §1.a + ADR-0021 \"Print rendering path\"). PR-44ε.1 / A152."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_invoice_pdf"
+path = "src/lib.rs"
+
+[dependencies]
+# Library boundary: thiserror per ADR-0021 Part A item 2.
+thiserror = { workspace = true }
+
+# Low-level PDF document model — page tree + content streams + font
+# dictionaries. Workspace-pinned per Cargo.toml's PR-44ε.1 block.
+lopdf = { workspace = true }
+
+# Closed Currency vocab + RateMetadata per ADR-0037 §3 — the renderer
+# routes on currency and reads stamped rate metadata to render the
+# §1.a printed-invoice fields (Árfolyam, HUF-equivalent totals,
+# MEGJEGYZÉS rate note).
+aberp-billing = { path = "../../modules/billing" }
+
+# Decimal arithmetic for HUF-conversion at the per-VAT-rate level (the
+# §1.c per-VAT-rate posture — direct conversion at the summary level
+# using the round-half-even helper from `aberp-billing`).
+rust_decimal = { workspace = true }
+
+# Date type for stamping the supply-fulfillment date / payment date /
+# rate publication date per §1.a.
+time = { workspace = true }
+
+[dev-dependencies]
+# Pin tests parse the rendered PDF back into text and assert every
+# §1.a field is present. Dev-dep only — production renderer does not
+# parse the bytes it emits.
+pdf-extract = { workspace = true }

@@ -43,6 +43,7 @@
     lifecycleIndex,
     type LabelSignal,
   } from "../lib/labels";
+  import { formatTotal } from "../lib/format";
   import InvoiceDetail from "./InvoiceDetail.svelte";
 
   let rows: InvoiceListItem[] = $state([]);
@@ -87,20 +88,13 @@
     }
   }
 
-  // HUF amount formatter — tabular, no fractional digits because the
-  // forint has no sub-unit. Locale `hu-HU` gives space-separated
-  // thousands (1 234 567 Ft) which is the Hungarian convention.
-  const hufFormatter = new Intl.NumberFormat("hu-HU", {
-    style: "currency",
-    currency: "HUF",
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
-  });
-
-  function formatHuf(value: number | null): string {
-    if (value === null) return "—";
-    return hufFormatter.format(value);
-  }
+  // PR-44ε / session-53 — currency-aware total formatter lives in
+  // `../lib/format`. The pre-PR-44ε inline `hufFormatter` +
+  // `formatHuf` pair is removed because (a) the SPA now needs the
+  // EUR branch (an EUR invoice's `total_gross` is in cents, not
+  // forints), and (b) the same logic was duplicated in
+  // InvoiceDetail.svelte. The shared module is pinned by
+  // `format.test.ts`.
 
   function signalClass(signal: LabelSignal): string {
     return `signal-${signal}`;
@@ -210,7 +204,7 @@
               >↘</span>
             {/if}
           </td>
-          <td class="col-num mono">{formatHuf(row.total_gross)}</td>
+          <td class="col-num mono">{formatTotal(row.total_gross, row.currency)}</td>
         </tr>
       {/each}
     </tbody>

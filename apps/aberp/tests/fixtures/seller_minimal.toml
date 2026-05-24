@@ -1,0 +1,17 @@
+# Seller-info TOML fixture for the print-invoice integration test
+# (PR-44ε.1). The print-invoice orchestrator reads this file (or
+# `--seller-toml <PATH>`) for the bank-account / IBAN / SWIFT fields
+# that don't live on the NAV body but appear on the printed invoice.
+#
+# Default location at runtime is `$HOME/.aberp/<tenant>/seller.toml`.
+# Tests bypass the default by passing `--seller-toml` (or, in the
+# `print_invoice::run` call shape, by populating `args.seller_toml`).
+#
+# Shape: flat key = "value" lines, optional `[section]` headers
+# (ignored). Lines starting with `#` are comments.
+
+[seller]
+bank_account_number = "12345678-12345678-12345678"
+iban = "HU12 1234 5678 9012 3456 7890"
+bank_name = "OTP Bank Nyrt."
+swift_bic = "OTPVHUHB"

@@ -63,9 +63,9 @@ use aberp_audit_ledger::{
     self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId,
 };
 use aberp_billing::{
-    self as billing, AllocateArgs, AllocateOutcome, BillingStore, CustomerId, DraftInvoice,
-    DuckDbBillingStore, Huf, IdempotencyKey, InvoiceId, InvoiceSeries, IssueInvoiceCommand,
-    LineItem, ReadyInvoice, ResetPolicy, SeriesCode, SeriesId,
+    self as billing, AllocateArgs, AllocateOutcome, BillingStore, Currency, CustomerId,
+    DraftInvoice, DuckDbBillingStore, Huf, IdempotencyKey, InvoiceId, InvoiceSeries,
+    IssueInvoiceCommand, LineItem, RateMetadata, ReadyInvoice, ResetPolicy, SeriesCode, SeriesId,
 };
 use aberp_nav_transport::NavCredentials;
 use anyhow::{anyhow, bail, Context, Result};
@@ -78,6 +78,10 @@ use ulid::Ulid;
 use crate::audit_payloads;
 use crate::binary_hash;
 use crate::cli::IssueModificationArgs;
+use crate::invoice_currency_metadata::{
+    inherit_rate_metadata_for_chain, load_invoice_currency_metadata_in_tx,
+    require_chain_currency_match,
+};
 use crate::issue_invoice::InvoiceInputJson;
 use crate::nav_xml::{
     self, CustomerInfo, ModificationReference, NavParties, SupplierInfo,
@@ -196,15 +200,14 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
         lines: command.lines,
         issue_date,
     };
+    // PR-44γ.1 — placeholder defaults; `run_single_tx` reads the base's
+    // stored currency metadata and overrides per ADR-0037 §4 invariant
+    // C6 (chain-currency-match by inheritance).
     let allocate_args = AllocateArgs {
         series_id: series.id,
         draft,
         idempotency_key,
-        // PR-44γ — MODIFY chain stays HUF-only at this PR per the
-        // session-51 brief's "DO NOT touch storno chain" guidance
-        // (the MODIFY chain rides the same posture as STORNO). C6
-        // owner-deferred to a follow-up.
-        currency: aberp_billing::Currency::Huf,
+        currency: Currency::Huf,
         rate_metadata: None,
     };
 
@@ -225,6 +228,8 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
     let modification_index = outcome.modification_index;
     let base_sequence_number = outcome.base_sequence_number;
     let was_fresh = outcome.was_fresh;
+    let chain_currency = outcome.chain_currency;
+    let chain_rate_metadata = outcome.chain_rate_metadata;
     tracing::info!(
         seq = modification.sequence_number,
         modification_index,
@@ -286,6 +291,8 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
         &series_code,
         &parties,
         &modification_reference,
+        chain_currency,
+        chain_rate_metadata.as_ref(),
     )
     .context("render NAV modification XML")?;
     aberp_nav_xsd_validator::validate_invoice_data(&xml).context(
@@ -516,6 +523,12 @@ struct TxOutcome {
     modification_index: u32,
     base_sequence_number: u64,
     was_fresh: bool,
+    /// PR-44γ.1 — currency inherited from base per ADR-0037 §4 C6.
+    chain_currency: Currency,
+    /// PR-44γ.1 — rate metadata inherited from base; `huf_equivalent_total`
+    /// recomputed from the modification's own full-replace gross.
+    /// `None` for HUF.
+    chain_rate_metadata: Option<RateMetadata>,
 }
 
 /// One DuckDB transaction across: load base row, walk chain (both
@@ -525,7 +538,7 @@ struct TxOutcome {
 fn run_single_tx(
     mut conn: Connection,
     ledger_meta: &LedgerMeta,
-    allocate_args: AllocateArgs,
+    mut allocate_args: AllocateArgs,
     idempotency_key: IdempotencyKey,
     actor: Actor,
     base_invoice_id: &str,
@@ -550,6 +563,35 @@ fn run_single_tx(
             )
         })?;
     let base_sequence_number = base_invoice.sequence_number;
+
+    // (a') PR-44γ.1 — read the base invoice's stored currency + rate
+    //      metadata and inherit onto the modification. The modification
+    //      is full-replace per ADR-0024 §4, so `huf_equivalent_total`
+    //      is computed against the modification's OWN positive gross.
+    let base_currency_metadata =
+        load_invoice_currency_metadata_in_tx(&tx, base_invoice_id)
+            .context("load base invoice currency metadata for modification (ADR-0037 §4 C6)")?;
+    let modification_gross_cents: i64 = allocate_args
+        .draft
+        .lines
+        .iter()
+        .try_fold(0i64, |acc, line| {
+            let line_gross = line
+                .gross_total()
+                .ok_or_else(|| anyhow!("modification line gross_total overflow"))?;
+            acc.checked_add(line_gross.as_i64())
+                .ok_or_else(|| anyhow!("modification gross accumulator overflow"))
+        })?;
+    let (inherited_currency, inherited_rate_metadata) =
+        inherit_rate_metadata_for_chain(&base_currency_metadata, modification_gross_cents)
+            .context("inherit rate metadata for modification chain child")?;
+    allocate_args.currency = inherited_currency;
+    allocate_args.rate_metadata = inherited_rate_metadata.clone();
+    require_chain_currency_match(
+        base_currency_metadata.currency,
+        allocate_args.currency,
+        base_invoice_id,
+    )?;
 
     // (b) Walk the audit ledger inside the SAME tx for prior chain
     //     entries (BOTH kinds per ADR-0024 §7) against this base.
@@ -595,11 +637,26 @@ fn run_single_tx(
         // 2) InvoiceDraftCreated for the MODIFICATION. PR-18 /
         //    ADR-0031 §2 — record the operator's --out path on
         //    the audit payload.
-        let draft_payload = audit_payloads::InvoiceDraftCreatedPayload::from_invoice_with_xml_path(
-            &modification_invoice,
-            idempotency_key,
-            nav_xml_path,
-        );
+        //
+        //    PR-44γ.1 / ADR-0037 — non-HUF MODIFY stamps the inherited
+        //    currency + rate metadata via `from_invoice_with_rate`; HUF
+        //    keeps the existing PR-18 path. Same shape as issue_storno's
+        //    branch.
+        let draft_payload = if let Some(rate) = inherited_rate_metadata.as_ref() {
+            audit_payloads::InvoiceDraftCreatedPayload::from_invoice_with_rate(
+                &modification_invoice,
+                idempotency_key,
+                Some(nav_xml_path),
+                inherited_currency,
+                rate,
+            )
+        } else {
+            audit_payloads::InvoiceDraftCreatedPayload::from_invoice_with_xml_path(
+                &modification_invoice,
+                idempotency_key,
+                nav_xml_path,
+            )
+        };
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
@@ -641,6 +698,8 @@ fn run_single_tx(
         modification_index,
         base_sequence_number,
         was_fresh,
+        chain_currency: inherited_currency,
+        chain_rate_metadata: inherited_rate_metadata,
     })
 }
 

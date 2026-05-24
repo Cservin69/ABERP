@@ -171,6 +171,12 @@
     labelMeta,
     type LabelSignal,
   } from "../lib/labels";
+  import {
+    formatHufEquivalent,
+    formatRate,
+    formatRateDate,
+    formatTotal,
+  } from "../lib/format";
   import { bytesAsUtf8Replacer } from "../lib/payload-reviver";
 
   interface Props {
@@ -270,17 +276,12 @@
     }
   }
 
-  const hufFormatter = new Intl.NumberFormat("hu-HU", {
-    style: "currency",
-    currency: "HUF",
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
-  });
-
-  function formatHuf(value: number | null): string {
-    if (value === null) return "—";
-    return hufFormatter.format(value);
-  }
+  // PR-44ε / session-53 — currency-aware total formatter lives in
+  // `../lib/format`. The pre-PR-44ε inline `hufFormatter` +
+  // `formatHuf` pair is removed; the same module also serves the
+  // four new rate-metadata rows (`formatRate`, `formatRateDate`,
+  // `formatHufEquivalent`). See InvoiceList.svelte for the
+  // matching deletion.
 
   // PR-27 — toggle the expansion state of a single audit row.
   // Reassignment pattern (see the `expandedSeqs` declaration
@@ -379,7 +380,23 @@
           </span>
         </dd>
         <dt>Total (gross)</dt>
-        <dd class="mono">{formatHuf(detail.total_gross)}</dd>
+        <dd class="mono">{formatTotal(detail.total_gross, detail.currency)}</dd>
+        {#if detail.currency !== "HUF" && detail.exchange_rate !== null}
+          <dt>Exchange rate</dt>
+          <dd class="mono">{formatRate(detail.exchange_rate)}</dd>
+        {/if}
+        {#if detail.currency !== "HUF" && detail.exchange_rate_source !== null}
+          <dt>Rate source</dt>
+          <dd class="mono">{detail.exchange_rate_source}</dd>
+        {/if}
+        {#if detail.currency !== "HUF" && detail.exchange_rate_date !== null}
+          <dt>Rate date</dt>
+          <dd class="mono">{formatRateDate(detail.exchange_rate_date)}</dd>
+        {/if}
+        {#if detail.currency !== "HUF" && detail.huf_equivalent_total !== null}
+          <dt>HUF equivalent</dt>
+          <dd class="mono">{formatHufEquivalent(detail.huf_equivalent_total)}</dd>
+        {/if}
         <dt>Latest ack</dt>
         <dd>
           {#if detail.last_ack_status === null}

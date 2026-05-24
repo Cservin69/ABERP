@@ -586,6 +586,39 @@ pub enum Command {
     /// **permitted** — annulment is data-submission withdrawal,
     /// orthogonal to legal cancellation.
     RequestTechnicalAnnulment(RequestTechnicalAnnulmentArgs),
+
+    /// Render a finalized invoice to a Billingo-style A4 PDF per
+    /// ADR-0037 §1.a + ADR-0021 "Print rendering path" (PR-44ε.1 /
+    /// A152). The PDF is the operator-deliverable artifact §169 + §172
+    /// name (the §80 + NAV submission contract is the wire body; this
+    /// is the human-readable counterpart).
+    ///
+    /// **Inputs:** the invoice's audit-ledger `InvoiceDraftCreated`
+    /// entry (the source of truth for currency + rate-metadata stamp),
+    /// the on-disk NAV `<InvoiceData>` body (the source of truth for
+    /// parties + line content + amounts), and the per-tenant
+    /// `seller.toml` (the source of truth for bank account / IBAN /
+    /// SWIFT — fields that don't live on the NAV body but appear on the
+    /// printed invoice).
+    ///
+    /// **On-disk posture (A155).** The NAV body bytes are read
+    /// verbatim from the `nav_xml_path` recorded at issuance time per
+    /// ADR-0031 §2 + PR-18 — no re-render, no MNB re-fetch, no
+    /// billing-row consultation. The printed PDF is byte-deterministic
+    /// given a committed audit chain.
+    ///
+    /// **HUF + EUR.** HUF invoices print the classic Billingo single-
+    /// currency layout (no Árfolyam line, no MEGJEGYZÉS rate note).
+    /// EUR invoices add the §80(1)(g) HUF-equivalent row + the
+    /// Árfolyam line + the MEGJEGYZÉS rate note, populated from the
+    /// audit-ledger rate stamp (NOT a fresh MNB fetch). The §1.c per-
+    /// VAT-rate HUF amounts are computed via the round-half-even
+    /// helper per A137 / C11.
+    ///
+    /// **Refuses overwrite by default.** Pass `--allow-overwrite` to
+    /// permit clobbering an existing `--out` file. Same posture as
+    /// `export-invoice-bundle`.
+    PrintInvoice(PrintInvoiceArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -1396,4 +1429,56 @@ pub struct SetupNavCredentialsArgs {
     /// matching the operator-rotation flow per ADR-0009 §4.
     #[arg(long = "refuse-overwrite")]
     pub refuse_overwrite: bool,
+}
+
+/// Args for `aberp print-invoice` (PR-44ε.1, ADR-0037 §1.a + ADR-0021
+/// "Print rendering path"). Five-plus-two fields:
+///
+///   - `--id <INV_ULID>`         — the invoice to render (the
+///     audit-ledger `InvoiceDraftCreated.invoice_id` value).
+///   - `--out <PATH>`            — where to write the PDF.
+///   - `--db <PATH>`             — the tenant DuckDB file (read-only
+///     for this command — the audit ledger is consulted; no writes).
+///   - `--tenant <NAME>`         — the tenant identifier (drives the
+///     audit-ledger genesis hash + the default seller.toml path).
+///   - `--seller-toml <PATH>`    — override the default
+///     `~/.aberp/<tenant>/seller.toml` location; optional. Lets
+///     tests + offline runs pass a fixture file.
+#[derive(Debug, Parser)]
+pub struct PrintInvoiceArgs {
+    /// Invoice id (prefixed form, `inv_<ULID>`) of the finalized invoice
+    /// to print. The audit ledger MUST carry an `InvoiceDraftCreated`
+    /// entry for this id — i.e., the invoice was issued via
+    /// `aberp issue-invoice` / `issue-storno` / `issue-modification`
+    /// against this tenant DB.
+    #[arg(long)]
+    pub id: String,
+
+    /// Path to write the printed-invoice PDF. Refuses to overwrite an
+    /// existing file unless `--allow-overwrite` is passed (same posture
+    /// as `export-invoice-bundle --out` per CLAUDE.md rule 12).
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Path to the tenant DuckDB file. Read-only access — the
+    /// print-invoice command does not write to the audit ledger or
+    /// the billing tables. Same default + override shape as every
+    /// other `--db` flag on this CLI.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — drives the audit-ledger genesis hash and the
+    /// default seller-info TOML location. (NAV credentials are NOT
+    /// loaded — this command does not call NAV.)
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Override path for the seller-info TOML (bank account / IBAN /
+    /// SWIFT / bank name). When unset, defaults to
+    /// `$HOME/.aberp/<tenant>/seller.toml`. The expected shape is
+    /// flat key-value lines (`bank_account_number = "..."`, `iban =
+    /// "..."`, `bank_name = "..."`, `swift_bic = "..."`); see
+    /// `apps/aberp/tests/fixtures/seller_minimal.toml` for an example.
+    #[arg(long = "seller-toml")]
+    pub seller_toml: Option<PathBuf>,
 }

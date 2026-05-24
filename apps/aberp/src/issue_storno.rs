@@ -94,9 +94,9 @@ use aberp_audit_ledger::{
     self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId,
 };
 use aberp_billing::{
-    self as billing, AllocateArgs, AllocateOutcome, BillingStore, CustomerId, DraftInvoice,
-    DuckDbBillingStore, Huf, IdempotencyKey, InvoiceId, InvoiceSeries, IssueInvoiceCommand,
-    LineItem, ReadyInvoice, ResetPolicy, SeriesCode, SeriesId,
+    self as billing, AllocateArgs, AllocateOutcome, BillingStore, Currency, CustomerId,
+    DraftInvoice, DuckDbBillingStore, Huf, IdempotencyKey, InvoiceId, InvoiceSeries,
+    IssueInvoiceCommand, LineItem, RateMetadata, ReadyInvoice, ResetPolicy, SeriesCode, SeriesId,
 };
 use aberp_nav_transport::NavCredentials;
 use anyhow::{anyhow, bail, Context, Result};
@@ -107,6 +107,10 @@ use ulid::Ulid;
 use crate::audit_payloads;
 use crate::binary_hash;
 use crate::cli::IssueStornoArgs;
+use crate::invoice_currency_metadata::{
+    inherit_rate_metadata_for_chain, load_invoice_currency_metadata_in_tx,
+    require_chain_currency_match,
+};
 use crate::issue_invoice::InvoiceInputJson;
 use crate::nav_xml::{self, CustomerInfo, NavParties, StornoReference, SupplierInfo};
 
@@ -220,14 +224,17 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
         lines: command.lines,
         issue_date,
     };
+    // PR-44γ.1 — currency + rate_metadata are placeholders here; the
+    // real values are inherited from the base invoice's stored
+    // metadata inside `run_single_tx` (the read happens inside the
+    // same write-tx that load_ready_invoice_by_id runs in, per ADR-0023
+    // §4 + ADR-0037 §4 invariant C6). Setting HUF/None here is the
+    // pre-inheritance default; `run_single_tx` overrides per base.
     let allocate_args = AllocateArgs {
         series_id: series.id,
         draft,
         idempotency_key,
-        // PR-44γ — STORNO chain stays HUF-only at this PR per the
-        // session-51 brief's "DO NOT touch storno chain" guidance.
-        // C6 (chain-currency match) is owner-deferred to a follow-up.
-        currency: aberp_billing::Currency::Huf,
+        currency: Currency::Huf,
         rate_metadata: None,
     };
 
@@ -251,6 +258,8 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
     let modification_index = outcome.modification_index;
     let base_sequence_number = outcome.base_sequence_number;
     let was_fresh = outcome.was_fresh;
+    let chain_currency = outcome.chain_currency;
+    let chain_rate_metadata = outcome.chain_rate_metadata;
     tracing::info!(
         seq = storno.sequence_number,
         modification_index,
@@ -312,8 +321,15 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
         base_invoice_number,
         modification_index,
     };
-    let xml = nav_xml::render_storno_data(&storno, &series_code, &parties, &storno_reference)
-        .context("render NAV storno XML")?;
+    let xml = nav_xml::render_storno_data(
+        &storno,
+        &series_code,
+        &parties,
+        &storno_reference,
+        chain_currency,
+        chain_rate_metadata.as_ref(),
+    )
+    .context("render NAV storno XML")?;
     aberp_nav_xsd_validator::validate_invoice_data(&xml)
         .context("NAV InvoiceData v3.0 invariant check (ADR-0022) failed for rendered storno XML")?;
     tracing::info!(
@@ -532,6 +548,15 @@ struct TxOutcome {
     modification_index: u32,
     base_sequence_number: u64,
     was_fresh: bool,
+    /// PR-44γ.1 — currency inherited from the base invoice via
+    /// `invoice_currency_metadata::inherit_rate_metadata_for_chain`.
+    /// The chain renderer reads this; the audit-payload constructor
+    /// branches on it.
+    chain_currency: Currency,
+    /// PR-44γ.1 — rate metadata inherited from base (verbatim
+    /// `rate` / `source` / `date`), with `huf_equivalent_total`
+    /// recomputed from the storno's own negated gross. `None` for HUF.
+    chain_rate_metadata: Option<RateMetadata>,
 }
 
 /// Open one DuckDB transaction; under it: load the base invoice row,
@@ -543,7 +568,7 @@ struct TxOutcome {
 fn run_single_tx(
     mut conn: Connection,
     ledger_meta: &LedgerMeta,
-    allocate_args: AllocateArgs,
+    mut allocate_args: AllocateArgs,
     idempotency_key: IdempotencyKey,
     actor: Actor,
     base_invoice_id: &str,
@@ -570,6 +595,47 @@ fn run_single_tx(
             )
         })?;
     let base_sequence_number = base_invoice.sequence_number;
+
+    // (a') PR-44γ.1 — read the base invoice's stored currency + rate
+    //      metadata (the five PR-44γ-added DuckDB columns) and inherit
+    //      onto the storno. Same-tx with the base load so the inherited
+    //      values are consistent with the row the audit ledger says is
+    //      Finalized. The storno's huf_equivalent_total is computed
+    //      against its OWN negated gross (matching what
+    //      `nav_xml::render_storno_data` emits on the wire).
+    let base_currency_metadata =
+        load_invoice_currency_metadata_in_tx(&tx, base_invoice_id)
+            .context("load base invoice currency metadata for storno (ADR-0037 §4 C6)")?;
+    let storno_positive_gross_cents: i64 = allocate_args
+        .draft
+        .lines
+        .iter()
+        .try_fold(0i64, |acc, line| {
+            let line_gross = line
+                .gross_total()
+                .ok_or_else(|| anyhow!("storno line gross_total overflow"))?;
+            acc.checked_add(line_gross.as_i64())
+                .ok_or_else(|| anyhow!("storno gross accumulator overflow"))
+        })?;
+    let storno_negated_gross_cents = storno_positive_gross_cents
+        .checked_neg()
+        .ok_or_else(|| anyhow!("storno gross negation overflow"))?;
+    let (inherited_currency, inherited_rate_metadata) =
+        inherit_rate_metadata_for_chain(&base_currency_metadata, storno_negated_gross_cents)
+            .context("inherit rate metadata for storno chain child")?;
+    allocate_args.currency = inherited_currency;
+    allocate_args.rate_metadata = inherited_rate_metadata.clone();
+    // (a'') Defensive C6 invariant guard. By construction
+    //       allocate_args.currency == base_currency_metadata.currency
+    //       (we just assigned it), so this never trips at runtime via
+    //       the CLI path. The guard pins the invariant for any future
+    //       code change that breaks inheritance — surfaces LOUD via
+    //       `ChainCurrencyMismatch` rather than silently coercing.
+    require_chain_currency_match(
+        base_currency_metadata.currency,
+        allocate_args.currency,
+        base_invoice_id,
+    )?;
 
     // (b) Walk the audit ledger inside the SAME tx for prior
     //     `InvoiceStornoIssued` payloads pointing at this base.
@@ -616,11 +682,27 @@ fn run_single_tx(
         // 2) InvoiceDraftCreated for the STORNO. PR-18 / ADR-0031 §2
         //    — record the operator's --out path so the drain worker
         //    can submit without a per-invocation path argument.
-        let draft_payload = audit_payloads::InvoiceDraftCreatedPayload::from_invoice_with_xml_path(
-            &storno_invoice,
-            idempotency_key,
-            nav_xml_path,
-        );
+        //
+        //    PR-44γ.1 / ADR-0037 — for non-HUF chain children the
+        //    currency + inherited rate metadata are stamped onto the
+        //    same payload (existing EventKind reused per the brief's
+        //    "no F12 ritual"); for HUF the existing PR-18 path is
+        //    preserved.
+        let draft_payload = if let Some(rate) = inherited_rate_metadata.as_ref() {
+            audit_payloads::InvoiceDraftCreatedPayload::from_invoice_with_rate(
+                &storno_invoice,
+                idempotency_key,
+                Some(nav_xml_path),
+                inherited_currency,
+                rate,
+            )
+        } else {
+            audit_payloads::InvoiceDraftCreatedPayload::from_invoice_with_xml_path(
+                &storno_invoice,
+                idempotency_key,
+                nav_xml_path,
+            )
+        };
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
@@ -661,6 +743,8 @@ fn run_single_tx(
         modification_index,
         base_sequence_number,
         was_fresh,
+        chain_currency: inherited_currency,
+        chain_rate_metadata: inherited_rate_metadata,
     })
 }
 

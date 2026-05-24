@@ -24,7 +24,7 @@ use aberp::nav_xml::{
     self, CustomerInfo, NavParties, StornoReference, SupplierInfo,
 };
 use aberp_billing::{
-    CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
+    Currency, CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
 };
 use aberp_nav_xsd_validator::{validate_invoice_data, NAV_XSD_VERSION};
 use time::OffsetDateTime;
@@ -85,7 +85,7 @@ fn storno_emitter_minimal_invoice_passes_validator() {
     let parties = minimal_parties();
     let reference = minimal_storno_reference();
 
-    let xml = nav_xml::render_storno_data(&storno, &series, &parties, &reference)
+    let xml = nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
         .expect("storno emitter must succeed on minimal fixture");
 
     match validate_invoice_data(&xml) {
@@ -114,7 +114,7 @@ fn storno_xml_carries_invoice_reference_block() {
         base_invoice_number: "INV-default/00001".to_string(),
         modification_index: 3, // pin a non-1 index to defend against literal 1 elision
     };
-    let xml = nav_xml::render_storno_data(&storno, &series, &parties, &reference).unwrap();
+    let xml = nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None).unwrap();
     let body = std::str::from_utf8(&xml).expect("storno XML must be UTF-8");
 
     assert!(
@@ -150,7 +150,7 @@ fn storno_xml_carries_negative_line_amounts() {
     let series = SeriesCode::new("INV-default".to_string()).unwrap();
     let parties = minimal_parties();
     let reference = minimal_storno_reference();
-    let xml = nav_xml::render_storno_data(&storno, &series, &parties, &reference).unwrap();
+    let xml = nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None).unwrap();
     let body = std::str::from_utf8(&xml).unwrap();
 
     // The fixture line is quantity=2, unit_price=1000, vat=27%. With
@@ -178,7 +178,7 @@ fn storno_xml_invoice_number_is_the_stornos_own_seq() {
         base_invoice_number: "INV-default/00007".to_string(), // base's
         modification_index: 1,
     };
-    let xml = nav_xml::render_storno_data(&storno, &series, &parties, &reference).unwrap();
+    let xml = nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None).unwrap();
     let body = std::str::from_utf8(&xml).unwrap();
 
     // The OUTER invoiceNumber is the storno's own.

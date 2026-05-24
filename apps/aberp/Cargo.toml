@@ -39,6 +39,12 @@ aberp-nav-xsd-validator = { path = "../../crates/nav-xsd-validator" }
 # itself works against the trait so offline integration tests can
 # inject a fake provider.
 aberp-mnb-rates = { path = "../../crates/mnb-rates" }
+# PR-44ε.1 — printed-invoice PDF renderer per ADR-0037 §1.a + ADR-0021
+# "Print rendering path" (A152). The binary's `print_invoice`
+# orchestrator builds `InvoiceModel` from the audit-ledger draft entry +
+# the on-disk NAV XML + the per-tenant seller.toml and calls
+# `aberp_invoice_pdf::render_invoice` for the PDF bytes.
+aberp-invoice-pdf = { path = "../../crates/invoice-pdf" }
 # PR-44γ — decimal arithmetic for the EUR→HUF round-half-even
 # conversion at the CLI boundary (the `aberp-billing` module is the
 # arithmetic owner; the binary needs the type for the
@@ -126,6 +132,16 @@ zstd = { workspace = true }
 # Enabling the feature here keeps it OUT of the production [dependencies]
 # above — production code paths cannot reach `Actor::test_only`. F15.
 aberp-audit-ledger = { path = "../../crates/audit-ledger", features = ["test-support"] }
+
+# PR-44ε.1 — the `print_invoice` integration test renders a PDF via the
+# `aberp_invoice_pdf` crate and then re-parses it for two assertions
+# the production code does not need: the extracted text content
+# (`pdf-extract`) and the page count (`lopdf::Document::load_mem`'s
+# `Pages.Count`). Both crates are already workspace-pinned for the
+# `crates/invoice-pdf` consumer; lifting them to dev-deps here costs
+# zero new transitive crates.
+lopdf = { workspace = true }
+pdf-extract = { workspace = true }
 
 # PR-22 / ADR-0035 — the end-to-end writer-verifier round-trip test
 # at `tests/verify_bundle_round_trip.rs` exercises the real

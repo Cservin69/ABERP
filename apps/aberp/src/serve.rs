@@ -71,7 +71,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aberp_audit_ledger::{Entry, EventKind, Ledger, TenantId};
-use aberp_billing::{self as billing, ReadyInvoice};
+use aberp_billing::{self as billing, Currency, ReadyInvoice};
 use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Path as AxumPath, State},
@@ -89,6 +89,9 @@ use sha2::{Digest, Sha256};
 use crate::audit_payloads;
 use crate::binary_hash;
 use crate::cli::ServeArgs;
+use crate::invoice_currency_metadata::{
+    load_invoice_currency_metadata_in_tx, InvoiceCurrencyMetadata,
+};
 
 /// Default keychain service-name prefix for the session token (one per
 /// tenant). The matching account-name is `session_token`. The Tauri
@@ -485,6 +488,18 @@ struct InvoiceListItem {
     /// hiding the prior amendment history at the state chip). Pinned
     /// by `list_invoices_emits_has_chain_children`.
     has_chain_children: bool,
+    /// PR-44ε / session-53 — currency on the list-row wire shape per
+    /// ADR-0037 §1.a + §3. Mirrors the `invoice.currency` DuckDB
+    /// column PR-44γ added (NULL is treated as HUF at read time per
+    /// the migration backfill posture). The SPA reads this field so
+    /// the per-row total formatter can pick the EUR-vs-HUF symbol +
+    /// minor-unit interpretation (`Money::Eur` stores EUR cents in
+    /// the underlying `i64` per the issuance-path posture; the
+    /// formatter divides by 100 when `currency == Eur`). Wire form
+    /// is the existing `Currency` enum's `rename_all = "UPPERCASE"`
+    /// serde shape — `"HUF"` or `"EUR"` — pinned by
+    /// `invoice_list_item_emits_currency`.
+    currency: Currency,
 }
 
 #[derive(Serialize)]
@@ -524,6 +539,36 @@ struct InvoiceDetailResponse {
     /// posture). Pinned by `invoice_detail_emits_last_ack_status` +
     /// `ack_status_wire_shape_pins_uppercase_strings`.
     last_ack_status: Option<AckStatus>,
+    /// PR-44ε / session-53 — currency on the detail wire shape per
+    /// ADR-0037 §1.a + §3. Same wire form as the list-row
+    /// `InvoiceListItem.currency` field above (`"HUF"` / `"EUR"`).
+    /// Pinned by `invoice_detail_emits_currency_and_rate_metadata`.
+    currency: Currency,
+    /// PR-44ε / session-53 — MNB exchange rate per ADR-0037 §1.a +
+    /// §1.c (rate value) / C11 (precision). Decimal-as-string at
+    /// exactly 6 decimal places (`"405.230000"` not `"405.23"`),
+    /// mirroring the audit-ledger payload form
+    /// `InvoiceDraftCreatedPayload.exchange_rate` PR-44γ added. `Some`
+    /// iff `currency != Currency::Huf`; the SPA renders it as a
+    /// meta-grid row only on the non-HUF branch. Pinned by
+    /// `invoice_detail_emits_currency_and_rate_metadata`.
+    exchange_rate: Option<String>,
+    /// PR-44ε / session-53 — MNB source identifier per ADR-0037 §1.a
+    /// (printed-invoice field) + §2.a (literal `"MNB"`). `Some` iff
+    /// `currency != Currency::Huf`. Pinned by
+    /// `invoice_detail_emits_currency_and_rate_metadata`.
+    exchange_rate_source: Option<String>,
+    /// PR-44ε / session-53 — MNB rate publication date per ADR-0037
+    /// §1.a + §2.b (walk-back rule). ISO-8601 `YYYY-MM-DD`. `Some`
+    /// iff `currency != Currency::Huf`. Pinned by
+    /// `invoice_detail_emits_currency_and_rate_metadata`.
+    exchange_rate_date: Option<String>,
+    /// PR-44ε / session-53 — HUF-equivalent gross total per ADR-0037
+    /// §1.a + §1.c / C5 / C11. Whole forints (HUF has no sub-unit
+    /// per ADR-0009 §1 / `Huf(pub i64)`). `Some` iff `currency !=
+    /// Currency::Huf`. Pinned by
+    /// `invoice_detail_emits_currency_and_rate_metadata`.
+    huf_equivalent_total: Option<i64>,
 }
 
 /// PR-32 / session-36 — chain-children list entry. One per storno /
@@ -814,17 +859,18 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
     let mut conn = Connection::open(&*state.db_path)
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     for (id, trace) in by_invoice {
-        let (ready_invoice, _idem) = match read_invoice_row(&mut conn, &id)? {
-            Some(pair) => pair,
+        let row = match read_invoice_row(&mut conn, &id)? {
+            Some(row) => row,
             None => continue, // ledger has it but billing row gone — skip silently
         };
         items.push(InvoiceListItem {
             invoice_id: id,
-            sequence_number: ready_invoice.sequence_number,
-            fiscal_year: ready_invoice.fiscal_year,
+            sequence_number: row.ready_invoice.sequence_number,
+            fiscal_year: row.ready_invoice.fiscal_year,
             state: trace.derive_state(),
-            total_gross: ready_invoice.total_gross().map(|h| h.as_i64()),
+            total_gross: row.ready_invoice.total_gross().map(|h| h.as_i64()),
             has_chain_children: trace.is_storno_base || trace.is_amended_base,
+            currency: row.currency_metadata.currency,
         });
     }
     Ok(items)
@@ -897,13 +943,34 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         return Ok(None);
     }
 
-    let (sequence_number, fiscal_year, total_gross) = match billing {
-        Some((ri, _idem)) => (
-            ri.sequence_number,
-            ri.fiscal_year,
-            ri.total_gross().map(|h| h.as_i64()),
+    // PR-44ε / session-53 — split the billing read into the four
+    // non-currency fields the prior wire shape carried plus the
+    // five currency-aware fields (`currency` always present;
+    // exchange-rate + source + date + huf_equivalent only on the
+    // non-HUF branch). When the billing row is gone but the ledger
+    // remembers the invoice (the rare `Unknown`-derived branch), we
+    // default `currency` to `Currency::Huf` so the wire shape stays
+    // valid; the four rate fields stay `None` because there is no
+    // metadata to surface.
+    let (sequence_number, fiscal_year, total_gross, currency_metadata) = match billing {
+        Some(row) => (
+            row.ready_invoice.sequence_number,
+            row.ready_invoice.fiscal_year,
+            row.ready_invoice.total_gross().map(|h| h.as_i64()),
+            row.currency_metadata,
         ),
-        None => (0, 0, None),
+        None => (
+            0,
+            0,
+            None,
+            InvoiceCurrencyMetadata {
+                currency: Currency::Huf,
+                exchange_rate: None,
+                exchange_rate_source: None,
+                exchange_rate_date: None,
+                huf_equivalent_total: None,
+            },
+        ),
     };
     // PR-33 / session-37 — typed wire emit of the latest NAV ack
     // for this invoice. `trace.last_ack_status` carries the raw
@@ -924,6 +991,11 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         audit_entries,
         chain_children,
         last_ack_status,
+        currency: currency_metadata.currency,
+        exchange_rate: currency_metadata.exchange_rate,
+        exchange_rate_source: currency_metadata.exchange_rate_source,
+        exchange_rate_date: currency_metadata.exchange_rate_date,
+        huf_equivalent_total: currency_metadata.huf_equivalent_total,
     }))
 }
 
@@ -968,19 +1040,61 @@ fn audit_view_of(entry: &Entry) -> AuditEntryView {
     }
 }
 
+/// PR-44ε / session-53 — currency-aware billing read bundle.
+///
+/// The pre-PR-44ε `read_invoice_row` returned just
+/// `(ReadyInvoice, IdempotencyKey)`. PR-44ε threads the five
+/// PR-44γ-added DuckDB columns (`currency`, `exchange_rate`,
+/// `exchange_rate_source`, `exchange_rate_date`,
+/// `huf_equivalent_total`) into the same read so the list-row +
+/// detail-modal wire surfaces (`InvoiceListItem` /
+/// `InvoiceDetailResponse`) can render currency + rate metadata
+/// without a second DB hit. The currency lookup runs inside the
+/// same `Transaction` as `load_ready_invoice_by_id`, keeping the
+/// per-invoice read at one open-tx-commit per the existing serve
+/// posture.
+///
+/// The `IdempotencyKey` is preserved on the bundle even though no
+/// PR-44ε caller consumes it — `read_invoice_row` is a shared
+/// helper between `list_invoices` and `get_invoice_detail`, and
+/// future callers (chain-currency-match diagnostics, retry-side
+/// idempotency assertions) may want the key. Dropping it would be
+/// a regression on the pre-PR-44ε surface; keeping it is zero
+/// runtime cost (the value was read inside `load_ready_invoice_by_id`
+/// regardless).
+struct ReadInvoiceRow {
+    ready_invoice: ReadyInvoice,
+    #[allow(dead_code)]
+    idempotency_key: billing::IdempotencyKey,
+    currency_metadata: InvoiceCurrencyMetadata,
+}
+
 /// Scoped read tx + billing lookup; returns None if the row is not
 /// present.
 fn read_invoice_row(
     conn: &mut Connection,
     invoice_id: &str,
-) -> Result<Option<(ReadyInvoice, billing::IdempotencyKey)>> {
+) -> Result<Option<ReadInvoiceRow>> {
     let tx = conn
         .transaction()
         .context("begin read transaction for invoice lookup (serve)")?;
     let pair = billing::load_ready_invoice_by_id(&tx, invoice_id)
         .context("billing::load_ready_invoice_by_id (serve)")?;
+    let pair = match pair {
+        Some(p) => p,
+        None => {
+            tx.commit().context("commit read transaction (serve)")?;
+            return Ok(None);
+        }
+    };
+    let currency_metadata = load_invoice_currency_metadata_in_tx(&tx, invoice_id)
+        .context("load_invoice_currency_metadata_in_tx (serve)")?;
     tx.commit().context("commit read transaction (serve)")?;
-    Ok(pair)
+    Ok(Some(ReadInvoiceRow {
+        ready_invoice: pair.0,
+        idempotency_key: pair.1,
+        currency_metadata,
+    }))
 }
 
 // ── State derivation from the audit-ledger trace ─────────────────────
@@ -2108,6 +2222,7 @@ mod tests {
             state: InvoiceState::Storno,
             total_gross: Some(123_456),
             has_chain_children: true,
+            currency: Currency::Huf,
         };
         let v = serde_json::to_value(&with_chain)
             .expect("InvoiceListItem must always serialise");
@@ -2124,6 +2239,7 @@ mod tests {
             state: InvoiceState::Ready,
             total_gross: None,
             has_chain_children: false,
+            currency: Currency::Huf,
         };
         let v = serde_json::to_value(&without_chain)
             .expect("InvoiceListItem must always serialise");
@@ -2187,6 +2303,11 @@ mod tests {
             audit_entries: Vec::new(),
             chain_children: Vec::new(),
             last_ack_status: None,
+            currency: Currency::Huf,
+            exchange_rate: None,
+            exchange_rate_source: None,
+            exchange_rate_date: None,
+            huf_equivalent_total: None,
         };
         let v = serde_json::to_value(&empty)
             .expect("InvoiceDetailResponse must always serialise");
@@ -2225,6 +2346,11 @@ mod tests {
                 },
             ],
             last_ack_status: None,
+            currency: Currency::Huf,
+            exchange_rate: None,
+            exchange_rate_source: None,
+            exchange_rate_date: None,
+            huf_equivalent_total: None,
         };
         let v = serde_json::to_value(&with_chain)
             .expect("InvoiceDetailResponse must always serialise");
@@ -2385,6 +2511,11 @@ mod tests {
             audit_entries: Vec::new(),
             chain_children: Vec::new(),
             last_ack_status: None,
+            currency: Currency::Huf,
+            exchange_rate: None,
+            exchange_rate_source: None,
+            exchange_rate_date: None,
+            huf_equivalent_total: None,
         };
         let v = serde_json::to_value(&none)
             .expect("InvoiceDetailResponse must always serialise");
@@ -2413,6 +2544,11 @@ mod tests {
                 audit_entries: Vec::new(),
                 chain_children: Vec::new(),
                 last_ack_status: Some(variant),
+                currency: Currency::Huf,
+                exchange_rate: None,
+                exchange_rate_source: None,
+                exchange_rate_date: None,
+                huf_equivalent_total: None,
             };
             let v = serde_json::to_value(&some)
                 .expect("InvoiceDetailResponse must always serialise");
@@ -2422,5 +2558,172 @@ mod tests {
                 "last_ack_status must serialise AckStatus::{variant:?} as `{expected}`",
             );
         }
+    }
+
+    /// PR-44ε / session-53 — `InvoiceListItem` MUST carry a typed
+    /// `currency: Currency` field on the JSON wire shape per
+    /// ADR-0037 §1.a + §3 and the session-53 SPA-render brief. The
+    /// SPA reads this field strictly (the TS interface in
+    /// `apps/aberp-ui/ui/src/lib/api.ts` types it as the
+    /// `Currency = "HUF" | "EUR"` union); a silent field rename,
+    /// removal, or serde-rename gone wrong would diverge the wire
+    /// shape and the per-row total formatter would mis-interpret
+    /// `total_gross` (whole forints for HUF, EUR cents for EUR).
+    /// CLAUDE.md rule 12: pin the contract loud.
+    ///
+    /// CLAUDE.md rule 9: BOTH currency variants are covered so a
+    /// regression that hard-codes the field to one value cannot
+    /// pass both assertions vacuously. The pin also catches the
+    /// `Currency::Eur` → `"EUR"` `rename_all = "UPPERCASE"` mapping
+    /// — a silent drop of that serde attribute on the upstream
+    /// `aberp_billing::Currency` definition would surface here.
+    #[test]
+    fn invoice_list_item_emits_currency() {
+        let huf = InvoiceListItem {
+            invoice_id: "inv_HUF".to_string(),
+            sequence_number: 1,
+            fiscal_year: 2026,
+            state: InvoiceState::Ready,
+            total_gross: Some(123_456),
+            has_chain_children: false,
+            currency: Currency::Huf,
+        };
+        let v = serde_json::to_value(&huf)
+            .expect("InvoiceListItem must always serialise");
+        assert_eq!(
+            v.get("currency").and_then(|x| x.as_str()),
+            Some("HUF"),
+            "currency must serialise as the ISO 4217 string per ADR-0037 §3",
+        );
+
+        let eur = InvoiceListItem {
+            invoice_id: "inv_EUR".to_string(),
+            sequence_number: 2,
+            fiscal_year: 2026,
+            state: InvoiceState::Ready,
+            total_gross: Some(863_600),
+            has_chain_children: false,
+            currency: Currency::Eur,
+        };
+        let v = serde_json::to_value(&eur)
+            .expect("InvoiceListItem must always serialise");
+        assert_eq!(
+            v.get("currency").and_then(|x| x.as_str()),
+            Some("EUR"),
+            "currency must serialise as the ISO 4217 string per ADR-0037 §3",
+        );
+    }
+
+    /// PR-44ε / session-53 — `InvoiceDetailResponse` MUST carry the
+    /// five PR-44γ-extended fields on the JSON wire shape per
+    /// ADR-0037 §1.a + §1.c + §2.a / §2.b: `currency` always present,
+    /// `exchange_rate` / `exchange_rate_source` / `exchange_rate_date`
+    /// / `huf_equivalent_total` populated iff `currency != HUF` and
+    /// otherwise emitted as JSON `null`. The SPA reads each field
+    /// strictly and conditionally renders the four rate rows only on
+    /// the non-HUF branch (`InvoiceDetail.svelte` meta-grid). A
+    /// silent field rename or removal would diverge the wire shape
+    /// and collapse the regulatory record on the operator-visible
+    /// surface — exactly the failure mode CLAUDE.md rule 12 names.
+    ///
+    /// CLAUDE.md rule 9: BOTH the HUF (all four rate fields are
+    /// `null`) AND the EUR (all four populated) cases are covered so
+    /// a regression that drops the conditional emit (e.g., serde
+    /// `skip_serializing_if = "Option::is_none"`) cannot pass the
+    /// HUF assertion AND the EUR assertion together. The EUR case
+    /// pins the value shapes — 6-decimal string for `exchange_rate`
+    /// (mirroring `RateMetadata.rate.to_string()` from
+    /// `huf_equivalent_for` at PR-44γ + the C11 precision pin from
+    /// PR-44δ), ISO-8601 `YYYY-MM-DD` for `exchange_rate_date`,
+    /// integer for `huf_equivalent_total` (whole forints per ADR-0009
+    /// §1).
+    ///
+    /// Mirrors the `audit_payloads::tests::draft_payload_eur_round_trip`
+    /// stamp shape so a future audit-ledger schema drift surfaces on
+    /// both surfaces with the same fixture values.
+    #[test]
+    fn invoice_detail_emits_currency_and_rate_metadata() {
+        // HUF case — every rate field is `null` so the SPA omits the
+        // four rate rows from the meta-grid; only `currency` is
+        // present and reads as `"HUF"`.
+        let huf = InvoiceDetailResponse {
+            invoice_id: "inv_HUF".to_string(),
+            sequence_number: 1,
+            fiscal_year: 2026,
+            state: InvoiceState::Ready,
+            total_gross: Some(123_456),
+            audit_entries: Vec::new(),
+            chain_children: Vec::new(),
+            last_ack_status: None,
+            currency: Currency::Huf,
+            exchange_rate: None,
+            exchange_rate_source: None,
+            exchange_rate_date: None,
+            huf_equivalent_total: None,
+        };
+        let v = serde_json::to_value(&huf)
+            .expect("InvoiceDetailResponse must always serialise");
+        assert_eq!(
+            v.get("currency").and_then(|x| x.as_str()),
+            Some("HUF"),
+            "HUF case: currency must serialise as `\"HUF\"`",
+        );
+        for field in [
+            "exchange_rate",
+            "exchange_rate_source",
+            "exchange_rate_date",
+            "huf_equivalent_total",
+        ] {
+            assert!(
+                v.get(field).map(|x| x.is_null()).unwrap_or(false),
+                "HUF case: `{field}` must serialise as JSON null (NOT omitted) so the SPA's strict TS read does not need an undefined guard",
+            );
+        }
+
+        // EUR case — every rate field is populated to the canonical
+        // wire forms produced at issuance time (PR-44γ's
+        // `finalize_rate` + `huf_equivalent_round_half_even`).
+        let eur = InvoiceDetailResponse {
+            invoice_id: "inv_EUR".to_string(),
+            sequence_number: 2,
+            fiscal_year: 2026,
+            state: InvoiceState::Ready,
+            total_gross: Some(863_600), // EUR cents — 8 636,00 €
+            audit_entries: Vec::new(),
+            chain_children: Vec::new(),
+            last_ack_status: None,
+            currency: Currency::Eur,
+            exchange_rate: Some("405.230000".to_string()),
+            exchange_rate_source: Some("MNB".to_string()),
+            exchange_rate_date: Some("2026-05-22".to_string()),
+            huf_equivalent_total: Some(3_500_565),
+        };
+        let v = serde_json::to_value(&eur)
+            .expect("InvoiceDetailResponse must always serialise");
+        assert_eq!(
+            v.get("currency").and_then(|x| x.as_str()),
+            Some("EUR"),
+            "EUR case: currency must serialise as `\"EUR\"`",
+        );
+        assert_eq!(
+            v.get("exchange_rate").and_then(|x| x.as_str()),
+            Some("405.230000"),
+            "EUR case: exchange_rate must serialise as a 6-decimal decimal string per ADR-0037 §1.c / C11",
+        );
+        assert_eq!(
+            v.get("exchange_rate_source").and_then(|x| x.as_str()),
+            Some("MNB"),
+            "EUR case: exchange_rate_source must serialise as `\"MNB\"` per ADR-0037 §2.a",
+        );
+        assert_eq!(
+            v.get("exchange_rate_date").and_then(|x| x.as_str()),
+            Some("2026-05-22"),
+            "EUR case: exchange_rate_date must serialise as ISO-8601 `YYYY-MM-DD` per ADR-0037 §1.a + §2.b",
+        );
+        assert_eq!(
+            v.get("huf_equivalent_total").and_then(|x| x.as_i64()),
+            Some(3_500_565),
+            "EUR case: huf_equivalent_total must serialise as a JSON integer (whole forints per ADR-0009 §1)",
+        );
     }
 }
