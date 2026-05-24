@@ -12,6 +12,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  filenameForInvoice,
   formatHufEquivalent,
   formatRate,
   formatRateDate,
@@ -145,6 +146,32 @@ describe("formatRateDate", () => {
     // invoices and a non-empty string for EUR), but the
     // formatter must not crash if a future migration emits one.
     expect(formatRateDate("")).toBe("");
+  });
+});
+
+describe("filenameForInvoice", () => {
+  // PR-44ε.UI / session-58 — the SPA-side filename builder for the
+  // browser-native download dialog. Rust side mirror is
+  // `serve::pdf_filename_for_invoice`; a one-sided rename (e.g.,
+  // changing the prefix to `aberp_` here without touching Rust)
+  // would surface as a browser-saved filename diverging from the
+  // `Content-Disposition` header. CLAUDE.md rule 9: three distinct
+  // invoice numbers in the round-trip set, so a regression that
+  // hard-codes the filename (or strips the invoice number) cannot
+  // pass all three assertions vacuously.
+
+  it("composes `invoice_<invoice_number>.pdf` for a typical fiscal-year number", () => {
+    expect(filenameForInvoice("2026-000013")).toBe("invoice_2026-000013.pdf");
+  });
+
+  it("preserves the series prefix verbatim", () => {
+    expect(filenameForInvoice("INV-default-2026-000042")).toBe(
+      "invoice_INV-default-2026-000042.pdf",
+    );
+  });
+
+  it("handles a storno invoice's `S`-prefixed series", () => {
+    expect(filenameForInvoice("S2026-000001")).toBe("invoice_S2026-000001.pdf");
   });
 });
 

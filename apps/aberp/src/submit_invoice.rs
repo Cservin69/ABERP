@@ -74,6 +74,8 @@
 //!     Layer-2 idempotency per ADR-0009 §5 + ADR-0032 §"Open
 //!     questions" remains named-deferred (F44).
 
+use std::path::Path;
+
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
 use aberp_billing::{self as billing, IdempotencyKey, ReadyInvoice};
 use aberp_nav_transport::{
@@ -99,26 +101,13 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
     )
     .entered();
 
-    // 1. Parse + validate CLI args.
-    let tenant = TenantId::new(args.tenant.clone()).ok_or_else(|| {
-        anyhow!(
-            "--tenant value '{}' is empty or has a null byte",
-            args.tenant
-        )
-    })?;
-    let tax_number_8 = parse_tax_number_8(&args.tax_number)?;
-    let nav_endpoint = match args.endpoint {
-        NavEnv::Test => NavEndpoint::Test,
-        NavEnv::Production => NavEndpoint::Production,
-    };
-    let endpoint_audit_label = match args.endpoint {
-        NavEnv::Test => "test",
-        NavEnv::Production => "production",
-    };
-
-    // 2. Load NAV credentials BEFORE touching the DB — missing creds
-    //    leave the DB pristine instead of writing half a transaction
-    //    and rolling back.
+    // PR-44η / session-60 — thin wrapper over [`submit_from_inputs`].
+    // The CLI-specific responsibilities (load NAV credentials, mint the
+    // `Actor`, read XML bytes from `--invoice-xml`, print the operator-
+    // visible summary line) stay here; the
+    // prepare-attempt-wire-response-audit pipeline lives in the library
+    // function so the new `POST /invoices/:id/submit` route
+    // (`serve.rs::submit_invoice_request`) calls the same path.
     let credentials = NavCredentials::load_from_keychain(&args.tenant)
         .context("load NAV credentials from OS keychain")?;
     let session_id = Ulid::new().to_string();
@@ -128,7 +117,6 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
         "NAV credentials loaded; actor derived for this CLI invocation"
     );
 
-    // 3. Read the NAV InvoiceData XML bytes.
     let invoice_xml = std::fs::read(&args.invoice_xml).with_context(|| {
         format!(
             "read NAV InvoiceData XML from {}",
@@ -143,39 +131,221 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
     }
     tracing::info!(bytes = invoice_xml.len(), "InvoiceData XML loaded");
 
-    // 3a. PR-9-0 / ADR-0022: validate the on-disk XML BEFORE any NAV
-    //     call. Catches the case where the file was hand-edited between
-    //     `issue-invoice` and `submit-invoice` or where a future emitter
-    //     change diverges from the validator's allowlist. Loud-fail per
-    //     CLAUDE.md rule 12 — no `tokenExchange` happens, no audit
-    //     entries land.
-    aberp_nav_xsd_validator::validate_invoice_data(&invoice_xml).with_context(|| {
-        format!(
-            "NAV InvoiceData v3.0 invariant check (ADR-0022) failed for {}",
-            args.invoice_xml.display()
-        )
-    })?;
+    let nav_endpoint = match args.endpoint {
+        NavEnv::Test => NavEndpoint::Test,
+        NavEnv::Production => NavEndpoint::Production,
+    };
+    let endpoint_audit_label = match args.endpoint {
+        NavEnv::Test => "test",
+        NavEnv::Production => "production",
+    };
+
+    match submit_from_inputs(SubmitFromInputs {
+        db: &args.db,
+        tenant_str: &args.tenant,
+        invoice_id_str: &args.invoice_id,
+        invoice_xml_origin: args.invoice_xml.display().to_string(),
+        invoice_xml,
+        tax_number_raw: &args.tax_number,
+        nav_endpoint,
+        endpoint_audit_label,
+        credentials: &credentials,
+        actor,
+    }) {
+        Ok(outcome) => {
+            println!(
+                "submitted invoice {} (seq {}) -> NAV transactionId {} \
+                 (audit chain verified across {} entries)",
+                outcome.invoice_id,
+                outcome.sequence_number,
+                outcome.transaction_id,
+                outcome.entries_verified,
+            );
+            Ok(())
+        }
+        Err(SubmitFromInputsError::WireFailed {
+            invoice_id,
+            error_message,
+            entries_verified,
+            error_class,
+        }) => {
+            eprintln!(
+                "submit-invoice FAILED for invoice {}: {} \
+                 (audit chain verified across {} entries; \
+                 InvoiceSubmissionAttemptFailed recorded with error_class={}); \
+                 invoice is now in state-2 Pending — re-run `aberp retry-submission` \
+                 to retry (note: a state-2 retry may produce a duplicate submission \
+                 to NAV until Layer-2 queryInvoiceCheck per ADR-0009 §5 lands; F44)",
+                invoice_id, error_message, entries_verified, error_class,
+            );
+            Err(anyhow!(
+                "submit-invoice manageInvoice failed: {}",
+                error_message
+            ))
+        }
+        Err(SubmitFromInputsError::Other(e)) => Err(e),
+    }
+}
+
+/// PR-44η / session-60 — successful submission outcome returned by
+/// [`submit_from_inputs`]. The CLI consumes this to print the
+/// operator-facing summary line; the serve route surfaces
+/// `transaction_id` + the new typestate label on the wire response.
+#[derive(Debug)]
+pub struct SubmitInvoiceOutcome {
+    pub invoice_id: String,
+    pub sequence_number: u64,
+    pub transaction_id: String,
+    pub entries_verified: u64,
+}
+
+/// PR-44η / session-60 — bundled input shape for
+/// [`submit_from_inputs`]. Reduces the `too_many_arguments` lint noise
+/// and keeps the call sites readable. Borrowed fields where possible
+/// so callers don't pay an allocation per field; the `invoice_xml`
+/// is moved in because the library consumes it.
+#[allow(missing_docs)]
+pub struct SubmitFromInputs<'a> {
+    pub db: &'a Path,
+    pub tenant_str: &'a str,
+    pub invoice_id_str: &'a str,
+    /// Operator-facing origin label for `invoice_xml` — used only in
+    /// error messages so a malformed body's source location is
+    /// visible. The CLI passes the on-disk path; the serve route
+    /// passes the audit-ledger nav_xml_path resolved server-side.
+    pub invoice_xml_origin: String,
+    pub invoice_xml: Vec<u8>,
+    pub tax_number_raw: &'a str,
+    pub nav_endpoint: NavEndpoint,
+    pub endpoint_audit_label: &'static str,
+    pub credentials: &'a NavCredentials,
+    pub actor: Actor,
+}
+
+/// PR-44η / session-60 — error returned by [`submit_from_inputs`]. The
+/// happy / wire-failed split lets the CLI format its eprintln summary
+/// AND the serve route surface a typed 500 body without duplicating
+/// the `format!("{e:#}")` path. Every non-wire failure (bad creds, DB
+/// error, audit-write error, etc.) is folded into
+/// [`SubmitFromInputsError::Other`] which carries the inner anyhow
+/// error verbatim.
+#[derive(Debug)]
+pub enum SubmitFromInputsError {
+    WireFailed {
+        invoice_id: String,
+        error_message: String,
+        entries_verified: u64,
+        error_class: &'static str,
+    },
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for SubmitFromInputsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitFromInputsError::WireFailed {
+                invoice_id,
+                error_message,
+                error_class,
+                ..
+            } => write!(
+                f,
+                "submit-invoice manageInvoice failed for {invoice_id} \
+                 (error_class={error_class}): {error_message}"
+            ),
+            SubmitFromInputsError::Other(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for SubmitFromInputsError {}
+
+impl From<anyhow::Error> for SubmitFromInputsError {
+    fn from(e: anyhow::Error) -> Self {
+        SubmitFromInputsError::Other(e)
+    }
+}
+
+/// PR-44η / session-60 — library-callable submission entry. Consumed
+/// by [`run`] (the CLI path) AND by `serve::submit_invoice_request`
+/// (the loopback `POST /invoices/:id/submit` route). Both surfaces
+/// share one prepare + attempt + wire + response/audit pipeline so a
+/// regression in submission surfaces at both gates.
+///
+/// Pipeline (steps map to the pre-PR-44η `run` numbering in this
+/// module's doc comment):
+///
+///   1. Parse `tax_number_raw` to its 8-digit base; resolve `TenantId`.
+///   3a. NAV v3.0 XSD invariant check on `invoice_xml`.
+///   4. Load the previously-issued invoice + idempotency key.
+///   5–6. Build ledger meta + NAV prepare (tokenExchange + envelope
+///        construction; no wire send yet).
+///   7. TX1 Attempt audit + mirror sync.
+///   8. Wire send.
+///   9. TX2 Response audit (success) or AttemptFailed audit (failure)
+///      + mirror sync.
+///   10. Verify-chain success-criterion gate.
+///
+/// On wire failure the [`SubmitFromInputsError::WireFailed`] variant
+/// carries the operator-visible summary inputs (`invoice_id`,
+/// `error_message`, `entries_verified`, `error_class`) so callers can
+/// format the eprintln line or the route's typed JSON body without
+/// re-walking the audit ledger. The TX2 AttemptFailed audit is
+/// already committed; the invoice is left in state-2 Pending per
+/// ADR-0032 §4.
+pub fn submit_from_inputs(
+    inputs: SubmitFromInputs<'_>,
+) -> std::result::Result<SubmitInvoiceOutcome, SubmitFromInputsError> {
+    let SubmitFromInputs {
+        db,
+        tenant_str,
+        invoice_id_str,
+        invoice_xml_origin,
+        invoice_xml,
+        tax_number_raw,
+        nav_endpoint,
+        endpoint_audit_label,
+        credentials,
+        actor,
+    } = inputs;
+
+    // 1. Parse + validate inputs.
+    let tenant = TenantId::new(tenant_str.to_string())
+        .ok_or_else(|| {
+            anyhow!(
+                "tenant value '{}' is empty or has a null byte",
+                tenant_str
+            )
+        })
+        .map_err(SubmitFromInputsError::Other)?;
+    let tax_number_8 =
+        parse_tax_number_8(tax_number_raw).map_err(SubmitFromInputsError::Other)?;
+
+    // 3a. PR-9-0 / ADR-0022: validate on-disk XML BEFORE any NAV call.
+    aberp_nav_xsd_validator::validate_invoice_data(&invoice_xml)
+        .with_context(|| {
+            format!(
+                "NAV InvoiceData v3.0 invariant check (ADR-0022) failed for {invoice_xml_origin}"
+            )
+        })
+        .map_err(SubmitFromInputsError::Other)?;
     tracing::info!(
         nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
         "on-disk InvoiceData XML passed v3.0 invariant check before NAV submit"
     );
 
     // 4. Load the previously-issued invoice + its idempotency_key.
-    //    Scoped read tx so the connection is free for the audit-write
-    //    tx below.
-    let mut conn = Connection::open(&args.db)
-        .with_context(|| format!("open tenant DuckDB at {}", args.db.display()))?;
-    let (ready_invoice, idempotency_key) = load_issued_invoice(&mut conn, &args.invoice_id)?;
-    if ready_invoice.id.to_prefixed_string() != args.invoice_id {
-        // Defence-in-depth: the loader keys off the same string we
-        // passed in, but if the DB round-trip ever produces a
-        // different prefix the F8 contract is broken. Loud per CLAUDE.md
-        // rule 12.
-        return Err(anyhow!(
+    let mut conn = Connection::open(db)
+        .with_context(|| format!("open tenant DuckDB at {}", db.display()))
+        .map_err(SubmitFromInputsError::Other)?;
+    let (ready_invoice, idempotency_key) =
+        load_issued_invoice(&mut conn, invoice_id_str).map_err(SubmitFromInputsError::Other)?;
+    if ready_invoice.id.to_prefixed_string() != invoice_id_str {
+        return Err(SubmitFromInputsError::Other(anyhow!(
             "loaded invoice id {} does not match requested {}",
             ready_invoice.id.to_prefixed_string(),
-            args.invoice_id
-        ));
+            invoice_id_str
+        )));
     }
     tracing::info!(
         seq = ready_invoice.sequence_number,
@@ -184,33 +354,31 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
     );
 
     // 5. Build ledger meta.
-    let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
+    let binary_hash_bytes = binary_hash::compute()
+        .context("compute binary hash")
+        .map_err(SubmitFromInputsError::Other)?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
-    // 6. NAV prepare phase on a tokio current-thread runtime. Build
-    //    the runtime AFTER the credentials + invoice are validated so
-    //    we do not pay the runtime-startup cost on a malformed input.
-    //    The prepare phase performs tokenExchange + envelope build
-    //    (no wire send yet — that happens after TX1).
+    // 6. NAV prepare phase on a tokio current-thread runtime.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("build tokio current-thread runtime for NAV calls")?;
-    let prepared = runtime.block_on(prepare_for_attempt_audit(
-        nav_endpoint,
-        &credentials,
-        &tax_number_8,
-        &invoice_xml,
-    ))?;
+        .context("build tokio current-thread runtime for NAV calls")
+        .map_err(SubmitFromInputsError::Other)?;
+    let prepared = runtime
+        .block_on(prepare_for_attempt_audit(
+            nav_endpoint,
+            credentials,
+            &tax_number_8,
+            &invoice_xml,
+        ))
+        .map_err(SubmitFromInputsError::Other)?;
     tracing::info!(
         request_bytes = prepared.request_xml.len(),
         "manageInvoice envelope built; ready to write TX1 Attempt audit"
     );
 
-    // 7. TX1 — Attempt-before-call (ADR-0032 §1). Write the
-    //    InvoiceSubmissionAttempt entry BEFORE the wire send so a
-    //    transport-mid-flight loss or process crash still leaves the
-    //    audit trail pointing at "we tried to submit X with body Y."
+    // 7. TX1 — Attempt-before-call.
     write_attempt_audit(
         &mut conn,
         &ledger_meta,
@@ -219,19 +387,21 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
         idempotency_key,
         endpoint_audit_label,
         prepared.request_xml.clone(),
-    )?;
-    // Re-open the Ledger handle and sync the mirror for TX1.
+    )
+    .map_err(SubmitFromInputsError::Other)?;
     {
-        let ledger_tx1 = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
-            .context("open audit ledger after TX1 commit")?;
-        let mirror_path = audit_ledger::mirror_path_for(&args.db);
+        let ledger_tx1 = Ledger::open(db, tenant.clone(), binary_hash_bytes)
+            .context("open audit ledger after TX1 commit")
+            .map_err(SubmitFromInputsError::Other)?;
+        let mirror_path = audit_ledger::mirror_path_for(db);
         ledger_tx1
             .sync_mirror(&mirror_path)
-            .context("sync audit-ledger mirror file after TX1 Attempt commit")?;
+            .context("sync audit-ledger mirror file after TX1 Attempt commit")
+            .map_err(SubmitFromInputsError::Other)?;
     }
     tracing::info!("TX1 Attempt audit committed; mirror synced; sending manageInvoice");
 
-    // 8. Wire send — POST the pre-rendered envelope.
+    // 8. Wire send.
     let wire_result = runtime.block_on(manage_invoice::send_built_request(
         &prepared.transport,
         &prepared.request_xml,
@@ -252,50 +422,34 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
                 idempotency_key,
                 &send_outcome.transaction_id,
                 send_outcome.response_xml,
-            )?;
-            // 10. Verify the audit chain after TX2 commit (success-
-            //     criterion gate). Drop the tx-Connection first;
-            //     re-open a fresh Ledger.
+            )
+            .map_err(SubmitFromInputsError::Other)?;
             drop(conn);
-            let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
-                .context("open audit ledger after TX2 Response commit")?;
+            let ledger = Ledger::open(db, tenant, binary_hash_bytes)
+                .context("open audit ledger after TX2 Response commit")
+                .map_err(SubmitFromInputsError::Other)?;
             let verified = ledger
                 .verify_chain()
-                .context("audit-ledger chain verification failed AFTER submission")?;
+                .context("audit-ledger chain verification failed AFTER submission")
+                .map_err(SubmitFromInputsError::Other)?;
             tracing::info!(entries_verified = verified, "audit chain verified");
-            let mirror_path = audit_ledger::mirror_path_for(&args.db);
+            let mirror_path = audit_ledger::mirror_path_for(db);
             ledger
                 .sync_mirror(&mirror_path)
-                .context("sync audit-ledger mirror file after TX2 Response commit")?;
-            // 11. Typestate advance + operator-visible summary.
-            let submitted =
-                ready_invoice.into_submitted(send_outcome.transaction_id.clone());
-            println!(
-                "submitted invoice {} (seq {}) -> NAV transactionId {} \
-                 (audit chain verified across {} entries)",
-                submitted.id.to_prefixed_string(),
-                submitted.sequence_number,
-                submitted.nav_transaction_id,
-                verified,
-            );
-            Ok(())
+                .context("sync audit-ledger mirror file after TX2 Response commit")
+                .map_err(SubmitFromInputsError::Other)?;
+            let submitted = ready_invoice.into_submitted(send_outcome.transaction_id.clone());
+            Ok(SubmitInvoiceOutcome {
+                invoice_id: submitted.id.to_prefixed_string(),
+                sequence_number: submitted.sequence_number,
+                transaction_id: submitted.nav_transaction_id,
+                entries_verified: verified,
+            })
         }
         Err(wire_err) => {
-            // Audit the failure FIRST per ADR-0032 §1, then surface
-            // the wire error to the caller. The TX2 AttemptFailed
-            // commit is the load-bearing closure of F40 — it is the
-            // evidence that ABERP tried-and-failed, distinct from
-            // the silent-on-failure pre-PR-19 path.
             let (error_class, error_code) =
                 submission_queue::classify_attempt_failure(&wire_err);
             let error_message = format!("{wire_err}");
-            // Capture verbatim response bytes for the audit IFF the
-            // failure carried one (HTTP-status + application classes
-            // come with a body; transport + envelope + credential
-            // + client_build do not). The send_built_request surface
-            // does not expose the body alongside the error variant
-            // today; record `None` for now and let a future PR widen
-            // the surface (F47-class trigger — not yet filed).
             let response_xml: Option<Vec<u8>> = None;
             write_attempt_failed_audit(
                 &mut conn,
@@ -308,39 +462,33 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
                 error_code,
                 error_message.clone(),
                 response_xml,
-            )?;
+            )
+            .map_err(SubmitFromInputsError::Other)?;
             drop(conn);
-            let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
-                .context("open audit ledger after TX2 AttemptFailed commit")?;
+            let ledger = Ledger::open(db, tenant, binary_hash_bytes)
+                .context("open audit ledger after TX2 AttemptFailed commit")
+                .map_err(SubmitFromInputsError::Other)?;
             let verified = ledger
                 .verify_chain()
-                .context("audit-ledger chain verification failed AFTER AttemptFailed")?;
-            let mirror_path = audit_ledger::mirror_path_for(&args.db);
+                .context("audit-ledger chain verification failed AFTER AttemptFailed")
+                .map_err(SubmitFromInputsError::Other)?;
+            let mirror_path = audit_ledger::mirror_path_for(db);
             ledger
                 .sync_mirror(&mirror_path)
-                .context("sync audit-ledger mirror file after TX2 AttemptFailed commit")?;
+                .context("sync audit-ledger mirror file after TX2 AttemptFailed commit")
+                .map_err(SubmitFromInputsError::Other)?;
             tracing::error!(
                 invoice_id = %ready_invoice.id.to_prefixed_string(),
                 entries_verified = verified,
                 error_class = error_class,
                 "submit-invoice: manageInvoice failed; TX2 AttemptFailed audit written"
             );
-            eprintln!(
-                "submit-invoice FAILED for invoice {}: {} \
-                 (audit chain verified across {} entries; \
-                 InvoiceSubmissionAttemptFailed recorded with error_class={}); \
-                 invoice is now in state-2 Pending — re-run `aberp retry-submission` \
-                 to retry (note: a state-2 retry may produce a duplicate submission \
-                 to NAV until Layer-2 queryInvoiceCheck per ADR-0009 §5 lands; F44)",
-                ready_invoice.id.to_prefixed_string(),
+            Err(SubmitFromInputsError::WireFailed {
+                invoice_id: ready_invoice.id.to_prefixed_string(),
                 error_message,
-                verified,
+                entries_verified: verified,
                 error_class,
-            );
-            Err(anyhow!(
-                "submit-invoice manageInvoice failed: {}",
-                error_message
-            ))
+            })
         }
     }
 }

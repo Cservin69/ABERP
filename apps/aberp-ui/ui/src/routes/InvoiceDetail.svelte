@@ -163,7 +163,10 @@
 
 
   import {
+    downloadInvoicePdf,
     getInvoice,
+    pollAck,
+    submitInvoice,
     type InvoiceDetail,
   } from "../lib/api";
   import {
@@ -171,7 +174,9 @@
     labelMeta,
     type LabelSignal,
   } from "../lib/labels";
+  import { buttonsForState } from "../lib/invoice-actions";
   import {
+    filenameForInvoice,
     formatHufEquivalent,
     formatRate,
     formatRateDate,
@@ -210,6 +215,32 @@
   let detail: InvoiceDetail | null = $state(null);
   let loadState: "idle" | "loading" | "loaded" | "error" = $state("idle");
   let errorMessage: string | null = $state(null);
+  // PR-44ε.UI / session-58 — "Download PDF" button state. The button
+  // is visible whenever a detail has loaded (HUF + EUR alike per the
+  // session-58 brief — PR-44ε.1 handles both at the render layer).
+  // `idle` while waiting for an operator click; `downloading` while
+  // the Tauri command is in flight (disables the button and shows
+  // an inline spinner glyph); `error` to render the inline failure
+  // message in the dialog header below the button. No toast
+  // component is introduced per CLAUDE.md rule 13.
+  let downloadState: "idle" | "downloading" | "error" = $state("idle");
+  let downloadError: string | null = $state(null);
+  // PR-44η / session-60 — "Submit to NAV" + "Poll ack now" buttons.
+  // Shared `mutationState` discriminator so the modal header only ever
+  // shows one inline-error pane at a time (the operator can only click
+  // one button per modal-open window per CLAUDE.md rule 12 — surfacing
+  // two simultaneous errors would muddy the cause-of-failure).
+  // `idle` while waiting for an operator click; `submitting` /
+  // `polling` while the corresponding Tauri command is in flight
+  // (disables every action button and shows an inline spinner glyph
+  // on the active one); `error` to render the inline failure message
+  // in the dialog header below the buttons.
+  type MutationState =
+    | { kind: "idle" }
+    | { kind: "submitting" }
+    | { kind: "polling" }
+    | { kind: "error"; action: "submit" | "poll"; message: string };
+  let mutationState: MutationState = $state({ kind: "idle" });
   // PR-27 — per-row expanded-payload state. Reassignment pattern
   // (build a new Set on every toggle) guarantees Svelte 5
   // reactivity without depending on Set-mutation tracking through
@@ -232,6 +263,12 @@
       // unrelated to another's, so a stale set would leak
       // expansion state across inspection contexts.
       expandedSeqs = new Set();
+      // PR-44ε.UI — reset the download state on every navigation so
+      // a stale error from a prior invoice doesn't leak into the
+      // new inspection context.
+      downloadState = "idle";
+      downloadError = null;
+      mutationState = { kind: "idle" };
       void load(invoiceId);
     } else {
       if (dialogEl.open) dialogEl.close();
@@ -239,6 +276,9 @@
       loadState = "idle";
       errorMessage = null;
       expandedSeqs = new Set();
+      downloadState = "idle";
+      downloadError = null;
+      mutationState = { kind: "idle" };
     }
   });
 
@@ -252,6 +292,111 @@
     } catch (err: unknown) {
       loadState = "error";
       errorMessage = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  // PR-44ε.UI / session-58 — trigger the browser-native download
+  // dialog. Sequence:
+  //   1. Set `downloadState = "downloading"` so the button renders
+  //      as disabled with an inline spinner glyph.
+  //   2. Invoke `downloadInvoicePdf(invoice_id)`; the Tauri command
+  //      forwards to `GET /invoices/<id>/pdf` and returns the raw
+  //      PDF bytes wrapped as a `Blob`.
+  //   3. Build a synthetic `<a download>` from the Blob URL and
+  //      click it to surface the platform-native save dialog. The
+  //      object URL is revoked after a short timeout so memory
+  //      doesn't leak (the click is synchronous; the browser
+  //      finishes the save before the URL goes stale).
+  //   4. On failure, surface the error string inline below the
+  //      button per CLAUDE.md rule 13 (no toast component).
+  //
+  // Filename composition: the SPA composes the operator-meaningful
+  // shape from `fiscal_year` + `sequence_number`
+  // (`invoice_2026-000013.pdf`); see `filenameForInvoice` in
+  // `format.ts`. The backend emits its own filename on the
+  // `Content-Disposition` header (`pdf_filename_for_invoice` in
+  // `serve.rs`) but the Tauri `invoke` bridge does not expose
+  // response headers, so the SPA-side composition is authoritative
+  // for the browser-saved name.
+  async function triggerDownload() {
+    if (!detail) return;
+    downloadState = "downloading";
+    downloadError = null;
+    try {
+      const blob = await downloadInvoicePdf(detail.invoice_id);
+      const composedNumber = `${detail.fiscal_year}-${String(
+        detail.sequence_number,
+      ).padStart(6, "0")}`;
+      const filename = filenameForInvoice(composedNumber);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      // Append + click + remove pattern works across every browser
+      // engine the Tauri shell ships against (WebKit on macOS, WebView2
+      // on Windows). Not appending it would silently no-op on some.
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      // Revoke after a short delay so the browser's save dialog has
+      // time to consume the URL. 1s is generous; the browser
+      // typically consumes the URL synchronously on `.click()` and
+      // re-resolves on user-confirm, so the revoke is for cleanup
+      // not for correctness.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      downloadState = "idle";
+    } catch (err: unknown) {
+      downloadState = "error";
+      downloadError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  // PR-44η / session-60 — "Submit to NAV" button handler. POSTs to
+  // the backend's `/invoices/<id>/submit` route via the matching
+  // Tauri command; on success refetches the detail so the state chip
+  // + audit-entries table reflect the new `Submitted` lifecycle
+  // state. On failure (including the typed 409 precondition body)
+  // the error message lands inline below the header per A157.
+  async function triggerSubmit() {
+    if (!detail) return;
+    mutationState = { kind: "submitting" };
+    try {
+      await submitInvoice(detail.invoice_id);
+      // Refetch so the audit-entries table picks up the new
+      // InvoiceSubmissionAttempt + InvoiceSubmissionResponse rows
+      // AND the state chip flips to `Submitted`. The fetched detail
+      // is the same shape `getInvoice` already returns — no special
+      // handling required.
+      await load(detail.invoice_id);
+      mutationState = { kind: "idle" };
+    } catch (err: unknown) {
+      mutationState = {
+        kind: "error",
+        action: "submit",
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  // PR-44η / session-60 — "Poll ack now" button handler. POSTs to
+  // the backend's `/invoices/<id>/poll-ack` route; on success
+  // refetches the detail so the state chip flips to `Finalized` /
+  // `Rejected` (or stays at `Submitted` with the new ack-status
+  // chip populated). The bounded poll loop can take up to 31s per
+  // ADR-0009 §5; the spinner stays visible the whole time.
+  async function triggerPollAck() {
+    if (!detail) return;
+    mutationState = { kind: "polling" };
+    try {
+      await pollAck(detail.invoice_id);
+      await load(detail.invoice_id);
+      mutationState = { kind: "idle" };
+    } catch (err: unknown) {
+      mutationState = {
+        kind: "error",
+        action: "poll",
+        message: err instanceof Error ? err.message : String(err),
+      };
     }
   }
 
@@ -348,15 +493,84 @@
         <span class="detail-label">Invoice</span>
         <h2 class="detail-id mono">{invoiceId ?? ""}</h2>
       </div>
-      <button
-        type="button"
-        class="quiet-button"
-        onclick={() => dialogEl?.close()}
-        aria-label="Close invoice detail"
-      >
-        Close
-      </button>
+      <div class="detail-actions">
+        {#if detail}
+          {@const buttons = buttonsForState(detail.state)}
+          {@const mutationBusy =
+            mutationState.kind === "submitting" ||
+            mutationState.kind === "polling"}
+          {#if buttons.includes("Submit")}
+            <button
+              type="button"
+              class="quiet-button"
+              onclick={triggerSubmit}
+              disabled={mutationBusy}
+              aria-label={mutationState.kind === "submitting"
+                ? "Submitting invoice to NAV"
+                : "Submit invoice to NAV"}
+            >
+              {#if mutationState.kind === "submitting"}
+                <span aria-hidden="true">…</span> Submitting
+              {:else}
+                Submit to NAV
+              {/if}
+            </button>
+          {/if}
+          {#if buttons.includes("PollAck")}
+            <button
+              type="button"
+              class="quiet-button"
+              onclick={triggerPollAck}
+              disabled={mutationBusy}
+              aria-label={mutationState.kind === "polling"
+                ? "Polling NAV for ack status"
+                : "Poll NAV for ack status now"}
+            >
+              {#if mutationState.kind === "polling"}
+                <span aria-hidden="true">…</span> Polling
+              {:else}
+                Poll ack now
+              {/if}
+            </button>
+          {/if}
+          {#if buttons.includes("Download")}
+            <button
+              type="button"
+              class="quiet-button"
+              onclick={triggerDownload}
+              disabled={downloadState === "downloading" || mutationBusy}
+              aria-label={downloadState === "downloading"
+                ? "Downloading invoice PDF"
+                : "Download invoice PDF"}
+            >
+              {#if downloadState === "downloading"}
+                <span aria-hidden="true">…</span> Downloading
+              {:else}
+                Download PDF
+              {/if}
+            </button>
+          {/if}
+        {/if}
+        <button
+          type="button"
+          class="quiet-button"
+          onclick={() => dialogEl?.close()}
+          aria-label="Close invoice detail"
+        >
+          Close
+        </button>
+      </div>
     </header>
+    {#if downloadState === "error" && downloadError}
+      <p class="error download-error" role="alert">
+        Download failed: {downloadError}
+      </p>
+    {/if}
+    {#if mutationState.kind === "error"}
+      <p class="error download-error" role="alert">
+        {mutationState.action === "submit" ? "Submit" : "Poll ack"} failed: {mutationState.message}
+      </p>
+    {/if}
 
     {#if loadState === "loading"}
       <p class="muted">Loading…</p>
@@ -617,8 +831,34 @@
     transition: color var(--motion-fade-in);
   }
 
-  .quiet-button:hover {
+  .quiet-button:hover:not(:disabled) {
     color: var(--color-text-strong);
+  }
+
+  .quiet-button:disabled {
+    cursor: progress;
+    opacity: 0.7;
+  }
+
+  /* PR-44ε.UI — header actions row. The pre-PR-44ε.UI header carried
+   * only the Close button; we now add a Download-PDF sibling. A
+   * `.detail-actions` flex wrapper keeps the two buttons aligned
+   * horizontally with consistent spacing — secondary (download)
+   * leading, primary-by-position (close) trailing per ADR-0017's
+   * quiet-chrome posture (no primary-accent button; both stay
+   * `.quiet-button`). */
+  .detail-actions {
+    display: flex;
+    gap: var(--space-2);
+    align-items: center;
+  }
+
+  /* PR-44ε.UI — inline download-error message. Same `.error` styling
+   * as the body-level load-error message; an extra `download-error`
+   * modifier reduces top margin since the message sits directly under
+   * the header rather than in the body-load region. */
+  .error.download-error {
+    margin: 0 0 var(--space-3) 0;
   }
 
   /* Two-column dt/dd grid for the invoice metadata. */

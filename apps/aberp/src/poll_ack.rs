@@ -72,6 +72,7 @@
 //!     ADR-0009 §5); that path lands when the crash-between-submit-
 //!     and-ack disambiguation case surfaces.
 
+use std::path::Path;
 use std::time::Duration;
 
 use aberp_audit_ledger::{
@@ -149,20 +150,12 @@ pub fn run(args: &PollAckArgs) -> Result<()> {
     )
     .entered();
 
-    // 1. Parse + validate CLI args.
-    let tenant = TenantId::new(args.tenant.clone()).ok_or_else(|| {
-        anyhow!(
-            "--tenant value '{}' is empty or has a null byte",
-            args.tenant
-        )
-    })?;
-    let tax_number_8 = parse_tax_number_8(&args.tax_number)?;
-    let nav_endpoint = match args.endpoint {
-        NavEnv::Test => NavEndpoint::Test,
-        NavEnv::Production => NavEndpoint::Production,
-    };
-
-    // 2. Load NAV credentials.
+    // PR-44η / session-60 — thin wrapper over [`poll_ack_from_inputs`].
+    // The CLI-specific responsibilities (load NAV credentials, mint
+    // the `Actor`, print the operator-visible summary line) stay here;
+    // the bounded-poll-loop + audit-write pipeline lives in the
+    // library function so the new `POST /invoices/:id/poll-ack` route
+    // (`serve.rs::poll_ack_request`) calls the same path.
     let credentials = NavCredentials::load_from_keychain(&args.tenant)
         .context("load NAV credentials from OS keychain")?;
     let session_id = Ulid::new().to_string();
@@ -172,16 +165,189 @@ pub fn run(args: &PollAckArgs) -> Result<()> {
         "NAV credentials loaded; actor derived for this CLI invocation"
     );
 
-    // 3. Open DuckDB; load the invoice + its idempotency key (scoped
-    //    read tx — connection freed for the per-poll audit writes).
-    let mut conn = Connection::open(&args.db)
-        .with_context(|| format!("open tenant DuckDB at {}", args.db.display()))?;
-    let (ready_invoice, idempotency_key) = load_issued_invoice(&mut conn, &args.invoice_id)?;
-    if ready_invoice.id.to_prefixed_string() != args.invoice_id {
+    let nav_endpoint = match args.endpoint {
+        NavEnv::Test => NavEndpoint::Test,
+        NavEnv::Production => NavEndpoint::Production,
+    };
+
+    let outcome = poll_ack_from_inputs(
+        &args.db,
+        &args.tenant,
+        &args.invoice_id,
+        &args.tax_number,
+        nav_endpoint,
+        &credentials,
+        actor,
+    )?;
+
+    // 7. Typestate advance + operator-visible summary.
+    match &outcome.terminal {
+        PollAckTerminal::Finalized => {
+            println!(
+                "ack-poll finalized invoice {} (seq {}) -> NAV SAVED \
+                 transactionId {} (audit chain verified across {} entries)",
+                outcome.invoice_id,
+                outcome.sequence_number,
+                outcome.transaction_id,
+                outcome.entries_verified,
+            );
+        }
+        PollAckTerminal::Rejected => {
+            tracing::error!(
+                invoice_id = %outcome.invoice_id,
+                seq = outcome.sequence_number,
+                transaction_id = %outcome.transaction_id,
+                "NAV ABORTED: invoice rejected, sequence slot is used-with-reason; \
+                 a corrective new invoice must be issued"
+            );
+            println!(
+                "ack-poll REJECTED invoice {} (seq {}) -> NAV ABORTED \
+                 transactionId {} (audit chain verified across {} entries) \
+                 — sequence not reused; issue a corrective new invoice",
+                outcome.invoice_id,
+                outcome.sequence_number,
+                outcome.transaction_id,
+                outcome.entries_verified,
+            );
+        }
+        PollAckTerminal::StuckIntermediate { last_status } => {
+            tracing::error!(
+                invoice_id = %outcome.invoice_id,
+                seq = outcome.sequence_number,
+                transaction_id = %outcome.transaction_id,
+                last_status = %last_status,
+                "poll-ack: attempts exhausted with intermediate status, invoice STUCK"
+            );
+            println!(
+                "ack-poll STUCK invoice {} (seq {}) -> last status {} after {} attempts \
+                 (audit chain verified across {} entries) — operator action required",
+                outcome.invoice_id,
+                outcome.sequence_number,
+                last_status,
+                MAX_POLL_ATTEMPTS,
+                outcome.entries_verified,
+            );
+        }
+        PollAckTerminal::StuckNonRetryable { diagnostic } => {
+            tracing::error!(
+                invoice_id = %outcome.invoice_id,
+                seq = outcome.sequence_number,
+                transaction_id = %outcome.transaction_id,
+                "poll-ack: NAV non-retryable error during poll, invoice STUCK: {}",
+                diagnostic,
+            );
+            println!(
+                "ack-poll STUCK invoice {} (seq {}) -> NAV non-retryable error: {} \
+                 (audit chain verified across {} entries) — operator action required",
+                outcome.invoice_id, outcome.sequence_number, diagnostic, outcome.entries_verified,
+            );
+        }
+        PollAckTerminal::StuckAllAttemptsErrored { diagnostic } => {
+            tracing::error!(
+                invoice_id = %outcome.invoice_id,
+                seq = outcome.sequence_number,
+                transaction_id = %outcome.transaction_id,
+                "poll-ack: every attempt errored, invoice STUCK: {}",
+                diagnostic,
+            );
+            println!(
+                "ack-poll STUCK invoice {} (seq {}) -> all {} attempts errored, last: {} \
+                 (audit chain verified across {} entries) — operator action required",
+                outcome.invoice_id,
+                outcome.sequence_number,
+                MAX_POLL_ATTEMPTS,
+                diagnostic,
+                outcome.entries_verified,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// PR-44η / session-60 — terminal classification of a completed poll
+/// loop. Mirrors the per-arm operator-visible summary the CLI's
+/// `run` prints, but exposed as a typed enum so the serve route can
+/// surface the terminus on the wire response.
+#[derive(Debug, Clone)]
+pub enum PollAckTerminal {
+    /// NAV ack: SAVED — invoice advanced to `FinalizedInvoice`.
+    Finalized,
+    /// NAV ack: ABORTED — invoice advanced to `RejectedInvoice`.
+    Rejected,
+    /// Bounded attempts exhausted with the last poll returning an
+    /// intermediate status (`RECEIVED` / `PROCESSING`). The invoice
+    /// is left in `SubmissionStuck` per ADR-0009 §5.
+    StuckIntermediate { last_status: String },
+    /// NAV returned a non-retryable error mid-loop; the loop broke
+    /// early with `SubmissionStuck`.
+    StuckNonRetryable { diagnostic: String },
+    /// Every attempt errored (transient or retryable) without a
+    /// terminal status; the loop exhausted with `SubmissionStuck`.
+    StuckAllAttemptsErrored { diagnostic: String },
+}
+
+/// PR-44η / session-60 — successful poll-loop outcome returned by
+/// [`poll_ack_from_inputs`]. Carries enough fact for both the CLI's
+/// operator-visible summary AND the serve route's wire response.
+#[derive(Debug)]
+pub struct PollAckOutcome {
+    pub invoice_id: String,
+    pub sequence_number: u64,
+    pub transaction_id: String,
+    pub terminal: PollAckTerminal,
+    pub attempts_made: u32,
+    pub entries_verified: u64,
+}
+
+/// PR-44η / session-60 — library-callable poll-loop entry. Consumed
+/// by [`run`] (the CLI path) AND by `serve::poll_ack_request` (the
+/// loopback `POST /invoices/:id/poll-ack` route). Both surfaces share
+/// one bounded-poll-loop + per-attempt audit pipeline.
+///
+/// Pipeline (steps map to the pre-PR-44η `run` numbering in this
+/// module's doc comment):
+///
+///   1. Parse `tax_number_raw` to its 8-digit base; resolve `TenantId`.
+///   3. Open DuckDB; load the invoice + its idempotency key.
+///   4. Resolve the NAV `transactionId` from the most-recent
+///      `InvoiceSubmissionResponse` audit entry.
+///   5. Drive the bounded poll loop on a per-call tokio current-
+///      thread runtime; per attempt writes one `InvoiceAckStatus`
+///      audit entry under its own DuckDB tx.
+///   6. Verify-chain + mirror-sync success-criterion gate.
+///
+/// Returns a typed [`PollAckOutcome`] so callers don't re-walk the
+/// ledger to format their summary; the operator-visible eprintln /
+/// JSON shape lives at the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn poll_ack_from_inputs(
+    db: &Path,
+    tenant_str: &str,
+    invoice_id_str: &str,
+    tax_number_raw: &str,
+    nav_endpoint: NavEndpoint,
+    credentials: &NavCredentials,
+    actor: Actor,
+) -> Result<PollAckOutcome> {
+    // 1. Parse + validate inputs.
+    let tenant = TenantId::new(tenant_str.to_string()).ok_or_else(|| {
+        anyhow!(
+            "tenant value '{}' is empty or has a null byte",
+            tenant_str
+        )
+    })?;
+    let tax_number_8 = parse_tax_number_8(tax_number_raw)?;
+
+    // 3. Open DuckDB; load the invoice + its idempotency key.
+    let mut conn = Connection::open(db)
+        .with_context(|| format!("open tenant DuckDB at {}", db.display()))?;
+    let (ready_invoice, idempotency_key) = load_issued_invoice(&mut conn, invoice_id_str)?;
+    if ready_invoice.id.to_prefixed_string() != invoice_id_str {
         return Err(anyhow!(
             "loaded invoice id {} does not match requested {}",
             ready_invoice.id.to_prefixed_string(),
-            args.invoice_id
+            invoice_id_str
         ));
     }
     tracing::info!(
@@ -190,39 +356,28 @@ pub fn run(args: &PollAckArgs) -> Result<()> {
         "issued invoice loaded for ack poll"
     );
 
-    // 4. Look up the NAV transactionId from the most-recent
-    //    InvoiceSubmissionResponse audit entry. Loud-fail if missing.
+    // 4. Look up the NAV transactionId from the audit ledger.
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
-    let transaction_id = lookup_transaction_id(
-        &args.db,
-        tenant.clone(),
-        binary_hash_bytes,
-        &args.invoice_id,
-    )?;
+    let transaction_id =
+        lookup_transaction_id(db, tenant.clone(), binary_hash_bytes, invoice_id_str)?;
     tracing::info!(
         transaction_id = %transaction_id,
         "NAV transactionId resolved from audit-ledger submission_response"
     );
 
-    // The Submitted typestate construction is purely typing — the
-    // billing data already came from the DB above; this is the
-    // semantic move that says "we have an invoice that NAV is tracking
-    // under this transactionId."
     let submitted_invoice = ready_invoice.into_submitted(transaction_id.clone());
     let submitted_invoice_id = submitted_invoice.id.to_prefixed_string();
+    let sequence_number = submitted_invoice.sequence_number;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
-    // 5. tokio current-thread runtime for the poll loop. Built AFTER
-    //    every prerequisite is validated so we don't pay the startup
-    //    cost on a malformed input.
+    // 5. tokio current-thread runtime for the poll loop.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build tokio current-thread runtime for poll loop")?;
-
     let terminus = runtime.block_on(poll_loop(
         nav_endpoint,
-        &credentials,
+        credentials,
         &tax_number_8,
         &transaction_id,
         &submitted_invoice_id,
@@ -231,118 +386,44 @@ pub fn run(args: &PollAckArgs) -> Result<()> {
         &actor,
     ))?;
 
-    // 6. Verify the audit chain after the loop (success-criterion gate).
-    //    Drop the tx-Connection first; re-open a fresh Ledger to read.
+    // 6. Verify the audit chain (success-criterion gate).
     drop(conn);
-    let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes).context("open audit ledger")?;
+    let ledger = Ledger::open(db, tenant, binary_hash_bytes).context("open audit ledger")?;
     let verified = ledger
         .verify_chain()
         .context("audit-ledger chain verification failed AFTER poll-ack")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
-
-    // 6a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    //     post-commit.
-    let mirror_path = audit_ledger::mirror_path_for(&args.db);
+    let mirror_path = audit_ledger::mirror_path_for(db);
     ledger
         .sync_mirror(&mirror_path)
         .context("sync audit-ledger mirror file after poll-ack commit")?;
 
-    // 7. Typestate advance + operator-visible summary.
-    match terminus {
-        LoopTerminus::LastStatus(ProcessingStatus::Saved) => {
-            let finalized = submitted_invoice.into_finalized();
-            println!(
-                "ack-poll finalized invoice {} (seq {}) -> NAV SAVED \
-                 transactionId {} (audit chain verified across {} entries)",
-                finalized.id.to_prefixed_string(),
-                finalized.sequence_number,
-                finalized.nav_transaction_id,
-                verified,
-            );
-        }
-        LoopTerminus::LastStatus(ProcessingStatus::Aborted) => {
-            let rejected = submitted_invoice.into_rejected();
-            // Rejection is operator-action-required per ADR-0009 §2:
-            // sequence is gap-free, the operator must issue a
-            // corrective new invoice. Loud per CLAUDE.md rule 12.
-            tracing::error!(
-                invoice_id = %rejected.id.to_prefixed_string(),
-                seq = rejected.sequence_number,
-                transaction_id = %rejected.nav_transaction_id,
-                "NAV ABORTED: invoice rejected, sequence slot is used-with-reason; \
-                 a corrective new invoice must be issued"
-            );
-            println!(
-                "ack-poll REJECTED invoice {} (seq {}) -> NAV ABORTED \
-                 transactionId {} (audit chain verified across {} entries) \
-                 — sequence not reused; issue a corrective new invoice",
-                rejected.id.to_prefixed_string(),
-                rejected.sequence_number,
-                rejected.nav_transaction_id,
-                verified,
-            );
-        }
-        LoopTerminus::LastStatus(intermediate) => {
-            // Intermediate status reached the terminus because the
-            // attempt budget ran out. SubmissionStuck per ADR-0009 §5.
-            let stuck = submitted_invoice.into_submission_stuck();
-            tracing::error!(
-                invoice_id = %stuck.id.to_prefixed_string(),
-                seq = stuck.sequence_number,
-                transaction_id = %stuck.nav_transaction_id,
-                last_status = intermediate.as_nav_str(),
-                "poll-ack: attempts exhausted with intermediate status, invoice STUCK"
-            );
-            println!(
-                "ack-poll STUCK invoice {} (seq {}) -> last status {} after {} attempts \
-                 (audit chain verified across {} entries) — operator action required",
-                stuck.id.to_prefixed_string(),
-                stuck.sequence_number,
-                intermediate.as_nav_str(),
-                MAX_POLL_ATTEMPTS,
-                verified,
-            );
-        }
+    let (terminal, attempts_made) = match terminus {
+        LoopTerminus::LastStatus(ProcessingStatus::Saved) => (PollAckTerminal::Finalized, MAX_POLL_ATTEMPTS),
+        LoopTerminus::LastStatus(ProcessingStatus::Aborted) => (PollAckTerminal::Rejected, MAX_POLL_ATTEMPTS),
+        LoopTerminus::LastStatus(intermediate) => (
+            PollAckTerminal::StuckIntermediate {
+                last_status: intermediate.as_nav_str().to_string(),
+            },
+            MAX_POLL_ATTEMPTS,
+        ),
         LoopTerminus::NonRetryableError(diagnostic) => {
-            let stuck = submitted_invoice.into_submission_stuck();
-            tracing::error!(
-                invoice_id = %stuck.id.to_prefixed_string(),
-                seq = stuck.sequence_number,
-                transaction_id = %stuck.nav_transaction_id,
-                "poll-ack: NAV non-retryable error during poll, invoice STUCK: {}",
-                diagnostic,
-            );
-            println!(
-                "ack-poll STUCK invoice {} (seq {}) -> NAV non-retryable error: {} \
-                 (audit chain verified across {} entries) — operator action required",
-                stuck.id.to_prefixed_string(),
-                stuck.sequence_number,
-                diagnostic,
-                verified,
-            );
+            (PollAckTerminal::StuckNonRetryable { diagnostic }, 1)
         }
-        LoopTerminus::AllAttemptsErrored(diagnostic) => {
-            let stuck = submitted_invoice.into_submission_stuck();
-            tracing::error!(
-                invoice_id = %stuck.id.to_prefixed_string(),
-                seq = stuck.sequence_number,
-                transaction_id = %stuck.nav_transaction_id,
-                "poll-ack: every attempt errored, invoice STUCK: {}",
-                diagnostic,
-            );
-            println!(
-                "ack-poll STUCK invoice {} (seq {}) -> all {} attempts errored, last: {} \
-                 (audit chain verified across {} entries) — operator action required",
-                stuck.id.to_prefixed_string(),
-                stuck.sequence_number,
-                MAX_POLL_ATTEMPTS,
-                diagnostic,
-                verified,
-            );
-        }
-    }
+        LoopTerminus::AllAttemptsErrored(diagnostic) => (
+            PollAckTerminal::StuckAllAttemptsErrored { diagnostic },
+            MAX_POLL_ATTEMPTS,
+        ),
+    };
 
-    Ok(())
+    Ok(PollAckOutcome {
+        invoice_id: submitted_invoice_id,
+        sequence_number,
+        transaction_id,
+        terminal,
+        attempts_made,
+        entries_verified: verified,
+    })
 }
 
 /// Open a scoped read tx, look up the issued invoice, and return it

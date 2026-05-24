@@ -18,7 +18,7 @@
 use std::fmt;
 
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::Date;
 
 /// Whole forints. Hungarian invoicing rounds to the forint at the line
@@ -122,7 +122,7 @@ impl fmt::Display for Eur {
 /// `PartialEq` + `Eq` + `Clone` + `Copy` keep test assertions ergonomic;
 /// `Hash` is added so a future per-(currency, date) MNB-rate cache (named
 /// open in ADR-0037 §2.b) can key on `Currency` without re-deriving.
-#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Currency {
     Huf,

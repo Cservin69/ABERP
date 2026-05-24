@@ -48,6 +48,80 @@ pub async fn get_audit(state: State<'_, AppState>, invoice_id: String) -> Result
     forward_get(&state, &path, true).await
 }
 
+/// PR-44ε.UI / session-58 — `GET /invoices/<id>/pdf`; returns the
+/// raw PDF bytes for the SPA's "Download PDF" button on the invoice
+/// detail modal. Unlike the other commands here, the response body
+/// is binary (`application/pdf`), not JSON; the bytes are relayed to
+/// the SPA as a `Vec<u8>` and the SPA re-wraps them in a `Blob` for
+/// the browser-side download trigger.
+#[tauri::command]
+pub async fn download_invoice_pdf(
+    state: State<'_, AppState>,
+    invoice_id: String,
+) -> Result<Vec<u8>, String> {
+    validate_invoice_id(&invoice_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/invoices/{invoice_id}/pdf");
+    forward_get_bytes(&state, &path).await
+}
+
+/// PR-44ζ / session-59 — `POST /invoices/issue`; the SPA's "+ New
+/// Invoice" form posts the composed body here. The body is forwarded
+/// verbatim — the typed shape lives on the backend's
+/// `IssueInvoiceRequest` and on the SPA's `composeIssueInvoiceBody`
+/// composer (`issue-invoice.ts`); this command is the pass-through
+/// seam.
+///
+/// Returns the backend's typed response body
+/// (`{invoice_id, invoice_number, state}`); the SPA navigates the
+/// detail modal open on the returned `invoice_id`.
+#[tauri::command]
+pub async fn issue_invoice(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/invoices/issue", body).await
+}
+
+/// PR-44η / session-60 — `POST /invoices/<id>/submit`; the SPA's
+/// "Submit to NAV" button on the invoice-detail modal posts here.
+/// No body — the backend resolves the on-disk NAV XML + supplier
+/// tax number from the audit ledger server-side per A162.
+///
+/// Returns the backend's typed response body (`{invoice_id,
+/// transaction_id, state, entries_verified}`). On precondition
+/// mismatch (invoice not in `Ready`) the backend returns 409; the
+/// SPA renders the typed error body inline per A157.
+#[tauri::command]
+pub async fn submit_invoice_to_nav(
+    state: State<'_, AppState>,
+    invoice_id: String,
+) -> Result<Value, String> {
+    validate_invoice_id(&invoice_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/invoices/{invoice_id}/submit");
+    forward_post(&state, &path, Value::Null).await
+}
+
+/// PR-44η / session-60 — `POST /invoices/<id>/poll-ack`; the SPA's
+/// "Poll ack now" button on the invoice-detail modal posts here.
+/// No body — the backend resolves the NAV transactionId from the
+/// audit ledger server-side per the same posture as the CLI's
+/// `aberp poll-ack`.
+///
+/// Returns the backend's typed response body (`{invoice_id, state,
+/// attempts_made, transaction_id, diagnostic, entries_verified}`).
+/// On precondition mismatch (invoice not in `Submitted` or
+/// `PendingNavExists`) the backend returns 409; the SPA renders the
+/// typed error body inline per A157.
+#[tauri::command]
+pub async fn poll_ack(
+    state: State<'_, AppState>,
+    invoice_id: String,
+) -> Result<Value, String> {
+    validate_invoice_id(&invoice_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/invoices/{invoice_id}/poll-ack");
+    forward_post(&state, &path, Value::Null).await
+}
+
 /// Single point of contact with the backend. Locks the backend
 /// mutex briefly to grab `url + token + client` and releases before
 /// the HTTP roundtrip so command latency doesn't serialise across
@@ -91,6 +165,107 @@ async fn forward_get(
     }
     let value: Value = serde_json::from_str(&body)
         .with_context(|| format!("parse JSON body of {url}: `{body}`"))
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(value)
+}
+
+/// PR-44ε.UI / session-58 — binary-body sibling of [`forward_get`].
+///
+/// The four pre-existing routes return JSON; the new
+/// `/invoices/<id>/pdf` route returns `application/pdf` bytes. JSON
+/// decoding is wrong for those bytes — a `serde_json::from_str` on a
+/// PDF would always fail at the first non-JSON byte. This helper
+/// reads the response as raw bytes and surfaces non-2xx as an error
+/// string (matching the JSON path's posture).
+async fn forward_get_bytes(state: &State<'_, AppState>, path: &str) -> Result<Vec<u8>, String> {
+    let (url, token, client) = {
+        let guard = state.backend.lock().await;
+        let backend = guard
+            .as_ref()
+            .ok_or_else(|| "backend not ready yet — wait a moment and retry".to_string())?;
+        (
+            format!("{}{}", backend.url, path),
+            backend.session_token.clone(),
+            backend.client.clone(),
+        )
+    };
+
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .with_context(|| format!("HTTPS GET {url}"))
+        .map_err(|e| format!("{e:#}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        // Try to surface the backend error JSON body if present so the
+        // SPA renders the loud-fail message; falls back to "<no body>"
+        // on a read failure rather than swallowing it silently.
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<no body>".to_string());
+        return Err(format!("backend returned {status} for {path}: {body}"));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .with_context(|| format!("read bytes of {url}"))
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(bytes.to_vec())
+}
+
+/// PR-44ζ / session-59 — POST sibling of [`forward_get`]. Sends
+/// `body` as the request's JSON body; surfaces the backend's typed
+/// 4xx error message verbatim to the SPA (so the inline-error pane
+/// renders the actionable "customer name is required" rather than an
+/// opaque "internal error"). The four pre-existing JSON routes are
+/// all GETs; this is the first POST seam — kept narrow, no shared
+/// helper with `forward_get` because the body + method differ at the
+/// `RequestBuilder` layer.
+async fn forward_post(
+    state: &State<'_, AppState>,
+    path: &str,
+    body: Value,
+) -> Result<Value, String> {
+    let (url, token, client) = {
+        let guard = state.backend.lock().await;
+        let backend = guard
+            .as_ref()
+            .ok_or_else(|| "backend not ready yet — wait a moment and retry".to_string())?;
+        (
+            format!("{}{}", backend.url, path),
+            backend.session_token.clone(),
+            backend.client.clone(),
+        )
+    };
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("HTTPS POST {url}"))
+        .map_err(|e| format!("{e:#}"))?;
+
+    let status = resp.status();
+    let response_body = resp
+        .text()
+        .await
+        .with_context(|| format!("read body of {url}"))
+        .map_err(|e| format!("{e:#}"))?;
+
+    if !status.is_success() {
+        // Surface the backend's typed `{ "error": "..." }` body verbatim
+        // so the SPA can render the operator-actionable message inline.
+        // A non-JSON body (rare) falls through as the raw text.
+        return Err(format!("backend returned {status} for {path}: {response_body}"));
+    }
+    let value: Value = serde_json::from_str(&response_body)
+        .with_context(|| format!("parse JSON body of {url}: `{response_body}`"))
         .map_err(|e| format!("{e:#}"))?;
     Ok(value)
 }

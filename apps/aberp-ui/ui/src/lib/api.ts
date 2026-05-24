@@ -255,3 +255,124 @@ export async function getInvoice(invoiceId: string): Promise<InvoiceDetail> {
 export async function getAudit(invoiceId: string): Promise<AuditEntryView[]> {
   return invoke<AuditEntryView[]>("get_audit", { invoiceId });
 }
+
+/** PR-44ε.UI / session-58 — download the printed-invoice PDF as a
+ * Blob suitable for triggering a browser save. The backend Tauri
+ * command (`download_invoice_pdf`) wraps the loopback
+ * `GET /invoices/<id>/pdf` route which streams `application/pdf`
+ * bytes from `print_invoice::render_to_bytes`. The bytes cross the
+ * Tauri boundary as a `Vec<u8>` (decoded SPA-side from Tauri's
+ * default `Array<number>` shape into a `Uint8Array` for the
+ * `Blob` constructor).
+ *
+ * Returns a `Blob` with MIME type `application/pdf`; the caller
+ * (`InvoiceDetail.svelte`) uses `URL.createObjectURL` + a synthetic
+ * `<a download>` click to surface the browser-native save dialog.
+ * Errors propagate as the rejected promise per the existing
+ * `getInvoice` / `getAudit` posture — the caller renders the
+ * message inline. */
+export async function downloadInvoicePdf(invoiceId: string): Promise<Blob> {
+  const bytes = await invoke<number[]>("download_invoice_pdf", { invoiceId });
+  return new Blob([new Uint8Array(bytes)], { type: "application/pdf" });
+}
+
+/** PR-44ζ / session-59 — wire request body for `POST /invoices/issue`.
+ * Mirrors `serve::IssueInvoiceRequest` on the backend. The form-to-
+ * body composer in `./issue-invoice.ts` turns the SPA form state into
+ * this shape; pinned by `issue-invoice.test.ts`. */
+export interface IssueInvoiceRequest {
+  supplier: {
+    taxNumber: string;
+    name: string;
+    address: {
+      countryCode: string;
+      postalCode: string;
+      city: string;
+      street: string;
+    };
+  };
+  customer: {
+    taxNumber: string;
+    name: string;
+  };
+  lines: Array<{
+    description: string;
+    quantity: number;
+    unitPrice: number;
+    vatRatePercent: number;
+  }>;
+  currency: Currency;
+  /** Optional series code; backend defaults to `"INV-default"` when
+   * omitted. Kept opt-in so the SPA form does not have to expose a
+   * series-picker on the first cut. */
+  series?: string;
+}
+
+/** PR-44ζ / session-59 — wire response body for `POST /invoices/issue`.
+ * Mirrors `serve::IssueInvoiceResponse` on the backend. The SPA reads
+ * `invoice_id` to open the detail modal at the just-issued invoice. */
+export interface IssueInvoiceResponse {
+  invoice_id: string;
+  invoice_number: string;
+  state: InvoiceState;
+}
+
+/** PR-44ζ / session-59 — POST the SPA-composed request body to the
+ * backend's `/invoices/issue` route via the matching Tauri command.
+ * Errors propagate as the rejected promise; the caller renders the
+ * message inline (no toast component per A157 precedent). */
+export async function issueInvoice(
+  body: IssueInvoiceRequest,
+): Promise<IssueInvoiceResponse> {
+  return invoke<IssueInvoiceResponse>("issue_invoice", { body });
+}
+
+/** PR-44η / session-60 — wire response body for
+ * `POST /invoices/<id>/submit`. Mirrors `serve::SubmitInvoiceResponse`.
+ * The SPA reads `transaction_id` to flash a success state and `state`
+ * to flip the chip without an extra `getInvoice` roundtrip. */
+export interface SubmitInvoiceResponse {
+  invoice_id: string;
+  transaction_id: string;
+  state: InvoiceState;
+  entries_verified: number;
+}
+
+/** PR-44η / session-60 — wire response body for
+ * `POST /invoices/<id>/poll-ack`. Mirrors `serve::PollAckResponse`.
+ * `state` reflects the terminal lifecycle label (`Finalized` /
+ * `Rejected` on a clean terminus; `Submitted` when the loop hit a
+ * stuck variant — the operator-visible reason is in `diagnostic`).
+ * `attempts_made` lets the SPA render "after N attempts" verbatim. */
+export interface PollAckResponse {
+  invoice_id: string;
+  state: InvoiceState;
+  attempts_made: number;
+  transaction_id: string;
+  diagnostic: string | null;
+  entries_verified: number;
+}
+
+/** PR-44η / session-60 — POST the SPA's "Submit to NAV" button to
+ * the backend's `/invoices/<id>/submit` route via the matching Tauri
+ * command. No body — the backend resolves the on-disk NAV XML +
+ * supplier tax number from the audit ledger server-side. Errors
+ * propagate as the rejected promise (including the typed 409 body
+ * for precondition mismatch); the caller renders the message inline
+ * (no toast component per A157). */
+export async function submitInvoice(
+  invoiceId: string,
+): Promise<SubmitInvoiceResponse> {
+  return invoke<SubmitInvoiceResponse>("submit_invoice_to_nav", {
+    invoiceId,
+  });
+}
+
+/** PR-44η / session-60 — POST the SPA's "Poll ack now" button to the
+ * backend's `/invoices/<id>/poll-ack` route via the matching Tauri
+ * command. No body — the backend resolves the NAV transactionId
+ * from the audit ledger server-side. Errors propagate as the
+ * rejected promise; the caller renders the message inline. */
+export async function pollAck(invoiceId: string): Promise<PollAckResponse> {
+  return invoke<PollAckResponse>("poll_ack", { invoiceId });
+}

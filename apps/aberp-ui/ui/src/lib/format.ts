@@ -134,3 +134,17 @@ export function formatHufEquivalent(value: number): string {
 export function formatRateDate(date: string): string {
   return date;
 }
+
+/** PR-44ε.UI / session-58 — build the browser-side download filename
+ * for the printed-invoice PDF. The Rust side emits the same shape on
+ * the `Content-Disposition` header (`serve::pdf_filename_for_invoice`),
+ * but the SPA cannot read that header through Tauri's `invoke`
+ * boundary; the SPA composes the filename locally for the synthetic
+ * `<a download>` click instead. Both sides emit
+ * `invoice_<invoice_number>.pdf` verbatim — pinned at the Rust side
+ * by `pdf_filename_uses_invoice_number` and at the SPA side by the
+ * vitest in `format.test.ts`.
+ */
+export function filenameForInvoice(invoiceNumber: string): string {
+  return `invoice_${invoiceNumber}.pdf`;
+}

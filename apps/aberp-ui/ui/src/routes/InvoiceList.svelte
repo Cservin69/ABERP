@@ -45,6 +45,7 @@
   } from "../lib/labels";
   import { formatTotal } from "../lib/format";
   import InvoiceDetail from "./InvoiceDetail.svelte";
+  import IssueInvoice from "./IssueInvoice.svelte";
 
   let rows: InvoiceListItem[] = $state([]);
   let loadState: "idle" | "loading" | "loaded" | "error" = $state("idle");
@@ -71,6 +72,13 @@
   // without depending on Array-mutation tracking through the
   // $state proxy.
   let navStack: string[] = $state([]);
+
+  // PR-44ζ / session-59 — issue-invoice modal open state. The modal
+  // is a separate component; this boolean toggles its visibility.
+  // On successful issuance, the modal invokes `onIssued(invoice_id)`
+  // and this screen rebinds `navStack` to navigate the detail modal
+  // open on the just-issued invoice + reloads the list.
+  let issueOpen: boolean = $state(false);
 
   onMount(() => {
     void refresh();
@@ -141,6 +149,13 @@
         disabled={loadState === "loading"}
       >
         Refresh
+      </button>
+      <button
+        type="button"
+        class="quiet-button primary"
+        onclick={() => (issueOpen = true)}
+      >
+        + New invoice
       </button>
     </div>
   </div>
@@ -217,6 +232,20 @@
     onNavigate={(baseId) => (navStack = [...navStack, baseId])}
     onJumpBack={(index) => (navStack = navStack.slice(0, index + 1))}
   />
+
+  <IssueInvoice
+    open={issueOpen}
+    onClose={() => (issueOpen = false)}
+    onIssued={(invoiceId) => {
+      // PR-44ζ — Close the issue modal + refresh the list + navigate
+      // the detail modal open on the just-issued invoice so the
+      // operator immediately sees the regulatory record (EUR + MNB
+      // rate + HUF-equivalent on the EUR branch).
+      issueOpen = false;
+      void refresh();
+      navStack = [invoiceId];
+    }}
+  />
 </section>
 
 <style>
@@ -291,6 +320,16 @@
   .quiet-button:disabled {
     opacity: 0.5;
     cursor: progress;
+  }
+
+  /* PR-44ζ / session-59 — quiet-emphasis primary button for the
+   * "+ New invoice" affordance. Slightly stronger than the bare
+   * quiet button so the operator's eye is drawn to the issuance
+   * action without breaking the ADR-0017 quiet-chrome posture
+   * (no accent colour, no fill — just a stronger border + label). */
+  .quiet-button.primary {
+    color: var(--color-text-strong);
+    border-color: var(--color-text-muted);
   }
 
   .error {

@@ -104,6 +104,10 @@ pub fn run() {
             commands::list_invoices,
             commands::get_invoice,
             commands::get_audit,
+            commands::download_invoice_pdf,
+            commands::issue_invoice,
+            commands::submit_invoice_to_nav,
+            commands::poll_ack,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

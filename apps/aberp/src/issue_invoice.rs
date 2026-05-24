@@ -200,6 +200,14 @@ impl MnbRatesProvider for NeverProvider {
 /// [`MnbRatesProvider`]. Production calls reach here via `run()` with
 /// the real `LiveMnbRatesProvider`; tests inject a fake provider to
 /// exercise the EUR path offline.
+///
+/// PR-44ζ / session-59 — refactored to a thin wrapper over
+/// [`issue_from_parsed`]. The CLI-specific responsibilities (read JSON
+/// from `--in`, load NAV credentials from the keychain, mint the
+/// `Actor`, print the success line) stay here; the
+/// allocation-and-NAV-XML pipeline moves to the library function so
+/// the new `POST /invoices/issue` route (`serve.rs::issue_invoice_request`)
+/// can call the same path without re-implementing it.
 pub fn run_with_provider<P: MnbRatesProvider>(
     args: &IssueInvoiceArgs,
     provider: &P,
@@ -213,25 +221,7 @@ pub fn run_with_provider<P: MnbRatesProvider>(
         serde_json::from_slice(&input_bytes).context("parse input JSON")?;
     tracing::info!(lines = input.lines.len(), "JSON input parsed");
 
-    if input.lines.is_empty() {
-        return Err(anyhow!("input JSON has no lines"));
-    }
-
-    // 2. Resolve tenant id + series code (loud-fail on invalid input).
-    let tenant = TenantId::new(args.tenant.clone()).ok_or_else(|| {
-        anyhow!(
-            "--tenant value '{}' is empty or has a null byte",
-            args.tenant
-        )
-    })?;
-    let series_code = SeriesCode::new(args.series.clone()).ok_or_else(|| {
-        anyhow!(
-            "--series value '{}' fails SeriesCode validation",
-            args.series
-        )
-    })?;
-
-    // 3. Load NAV credentials from the OS keychain BEFORE any DB write.
+    // 2. Load NAV credentials from the OS keychain BEFORE any DB write.
     //    Per ADR-0009 §4 + ADR-0020 §3 + CLAUDE.md rule 12: a missing
     //    keychain item is a hard error, not a silent fallback. Failing
     //    here keeps the tenant DB pristine if credentials aren't set up.
@@ -251,6 +241,83 @@ pub fn run_with_provider<P: MnbRatesProvider>(
         "NAV credentials loaded; actor derived for this CLI invocation"
     );
 
+    let summary = issue_from_parsed(
+        input,
+        &args.db,
+        &args.tenant,
+        &args.series,
+        args.currency.to_billing_currency(),
+        args.out.clone(),
+        actor,
+        provider,
+    )?;
+
+    // Match the XML's invoice-number format exactly (5-digit padding) so
+    // operator logs, audit entries, and the XML body all agree.
+    println!(
+        "issued invoice {} -> {} (audit chain verified)",
+        summary.invoice_number,
+        args.out.display(),
+    );
+    Ok(())
+}
+
+/// PR-44ζ / session-59 — library-callable issuance entry. Consumed by
+/// [`run_with_provider`] (the CLI path) AND by
+/// `serve::issue_invoice_request` (the loopback `POST /invoices/issue`
+/// route landing at THIS PR). Both surfaces share one allocation +
+/// audit-ledger + NAV-XML pipeline so a regression in the issuance
+/// path surfaces at both gates.
+///
+/// Pipeline (steps map to the pre-PR-44ζ `run_with_provider` numbering
+/// in this module's doc comment):
+///
+///   4.  Compute binary hash + build [`LedgerMeta`].
+///   4a. ADR-0031 §5 pre-allocation cap check.
+///   5–6. Pre-tx setup (schemas + series).
+///   7.  Build command + (for non-HUF) fetch MNB rate + stamp metadata.
+///   8.  Single DuckDB transaction: allocate + audit appends.
+///   9.  `verify_chain` (success-criterion gate).
+///   9a. ADR-0030 §2 audit-ledger mirror sync.
+///   10. Render NAV XML + XSD validate + write to `nav_xml_out`.
+///
+/// What this fn does NOT do (CLI/route boundary):
+///   - Read JSON from disk (caller hands in parsed [`InvoiceInputJson`]).
+///   - Load NAV credentials (caller builds [`Actor`] from whatever
+///     identity surface they have — keychain on CLI, the AppState's
+///     session-derived login on the route).
+///   - Print the operator-facing success line.
+///
+/// `nav_xml_out` carries the on-disk path the NAV body is written to;
+/// recorded on the `InvoiceDraftCreated` payload's `nav_xml_path` field
+/// per ADR-0031 §2 so the downstream drain worker + the
+/// `print-invoice` orchestrator can read it back. The CLI threads the
+/// operator-supplied `--out` path here; the route mints a server-side
+/// deterministic path under `~/.aberp/serve/<tenant>/issued/<ulid>.xml`
+/// (see `serve::issued_xml_path`).
+#[allow(clippy::too_many_arguments)]
+pub fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
+    input: InvoiceInputJson,
+    db: &Path,
+    tenant_str: &str,
+    series_str: &str,
+    currency: Currency,
+    nav_xml_out: std::path::PathBuf,
+    actor: Actor,
+    provider: &P,
+) -> Result<IssuedInvoiceSummary> {
+    if input.lines.is_empty() {
+        return Err(anyhow!("input has no lines"));
+    }
+
+    // 2. Resolve tenant id + series code (loud-fail on invalid input).
+    let tenant = TenantId::new(tenant_str.to_string()).ok_or_else(|| {
+        anyhow!("tenant value '{}' is empty or has a null byte", tenant_str)
+    })?;
+    let series_code = SeriesCode::new(series_str.to_string()).ok_or_else(|| {
+        anyhow!("series value '{}' fails SeriesCode validation", series_str)
+    })?;
+
     // 4. Compute binary hash, then build the audit-ledger metadata once
     //    for the entire process. `LedgerMeta` anchors `time_mono` and is
     //    cheap to clone; threaded into every append_in_tx call.
@@ -266,7 +333,7 @@ pub fn run_with_provider<P: MnbRatesProvider>(
     //     is preserved. The check opens + drops its own Ledger
     //     handle; pre_tx_setup below opens a fresh Connection.
     let pending_count = submission_queue::count_pending(
-        &args.db,
+        db,
         tenant.clone(),
         binary_hash_bytes,
     )
@@ -288,7 +355,7 @@ pub fn run_with_provider<P: MnbRatesProvider>(
     );
 
     // 5–6. Pre-tx setup: schemas + series.
-    let (conn, series) = pre_tx_setup(&args.db, &series_code)?;
+    let (conn, series) = pre_tx_setup(db, &series_code)?;
 
     // 7. Build IssueInvoiceCommand + AllocateArgs for the tx body.
     let command = build_command(&input, &series_code)?;
@@ -301,7 +368,6 @@ pub fn run_with_provider<P: MnbRatesProvider>(
         lines: command.lines.clone(),
         issue_date,
     };
-    let currency = args.currency.to_billing_currency();
 
     // PR-44γ — for non-HUF currencies, fetch the MNB rate (with D-1
     // walk-back per ADR-0037 §2.b up to A139's 7-day cap) and compute
@@ -331,18 +397,18 @@ pub fn run_with_provider<P: MnbRatesProvider>(
     //    `run_single_tx` owns the tx lifecycle: it commits on Ok and
     //    relies on `Transaction::drop` for rollback on Err or panic.
     //
-    //    PR-18 / ADR-0031 §2: the operator-chosen `--out` path is
-    //    threaded into `run_single_tx` so the InvoiceDraftCreated
-    //    payload's new `nav_xml_path` field records where the XML
-    //    will be written. The drain worker consumes this at submit
-    //    time without requiring an operator-supplied path argument.
+    //    PR-18 / ADR-0031 §2: the `nav_xml_out` path is threaded into
+    //    `run_single_tx` so the InvoiceDraftCreated payload's
+    //    `nav_xml_path` field records where the XML will be written.
+    //    The drain worker consumes this at submit time without
+    //    requiring an operator-supplied path argument.
     let outcome = run_single_tx(
         conn,
         &ledger_meta,
         allocate_args,
         idempotency_key,
         actor,
-        args.out.clone(),
+        nav_xml_out.clone(),
         currency,
         rate_metadata.clone(),
     )?;
@@ -360,7 +426,7 @@ pub fn run_with_provider<P: MnbRatesProvider>(
     //    session-6 verify-path decision: re-open a fresh Ledger after
     //    the tx commits and the tx-Connection drops.
     let ledger =
-        Ledger::open(&args.db, tenant.clone(), binary_hash_bytes).context("open audit ledger")?;
+        Ledger::open(db, tenant.clone(), binary_hash_bytes).context("open audit ledger")?;
     let verified = ledger
         .verify_chain()
         .context("audit-ledger chain verification failed AFTER issuance")?;
@@ -371,7 +437,7 @@ pub fn run_with_provider<P: MnbRatesProvider>(
     //     on a pre-existing DB) `sync_mirror` runs the implicit
     //     one-time backfill per ADR-0030 §7 and logs
     //     `audit_mirror_initialized` at INFO.
-    let mirror_path = audit_ledger::mirror_path_for(&args.db);
+    let mirror_path = audit_ledger::mirror_path_for(db);
     ledger
         .sync_mirror(&mirror_path)
         .context("sync audit-ledger mirror file after commit")?;
@@ -424,19 +490,43 @@ pub fn run_with_provider<P: MnbRatesProvider>(
         nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
         "NAV InvoiceData XML passed v3.0 invariant check"
     );
-    nav_xml::write_to_path(&args.out, &xml)?;
-    tracing::info!(path = %args.out.display(), bytes = xml.len(), "NAV XML written");
+    nav_xml::write_to_path(&nav_xml_out, &xml)?;
+    tracing::info!(path = %nav_xml_out.display(), bytes = xml.len(), "NAV XML written");
 
-    // Match the XML's invoice-number format exactly (5-digit padding) so
-    // operator logs, audit entries, and the XML body all agree.
-    println!(
-        "issued invoice {}/{:05} -> {} (audit chain verified across {} entries)",
-        series_code.as_str(),
-        invoice.sequence_number,
-        args.out.display(),
-        verified,
+    let invoice_number = format!("{}/{:05}", series_code.as_str(), invoice.sequence_number);
+    tracing::info!(
+        invoice_number = %invoice_number,
+        entries_verified = verified,
+        "issuance completed"
     );
-    Ok(())
+    Ok(IssuedInvoiceSummary {
+        invoice_id: invoice.id.to_prefixed_string(),
+        invoice_number,
+        nav_xml_path: nav_xml_out,
+    })
+}
+
+/// PR-44ζ / session-59 — minimal carrier the two issuance entry points
+/// hand back to their caller. The CLI path consumes
+/// [`invoice_number`] for the operator-facing success line; the
+/// `POST /invoices/issue` route consumes [`invoice_id`] for the SPA's
+/// detail-modal navigation. [`nav_xml_path`] is returned so the route
+/// handler can log the on-disk write location (operator inspection +
+/// debug); the CLI already knows it from `args.out`.
+#[derive(Debug)]
+pub struct IssuedInvoiceSummary {
+    /// Prefixed-ULID invoice id (e.g. `inv_01ARZ3NDEK...`) — the
+    /// audit-ledger primary key the SPA uses to open the detail modal.
+    pub invoice_id: String,
+    /// NAV-aligned `<series>/<5-digit-seq>` form (e.g.
+    /// `INV-default/00013`) — operator-facing identifier matching the
+    /// NAV body's `<invoiceNumber>`.
+    pub invoice_number: String,
+    /// Server-determined on-disk path of the rendered NAV XML. Recorded
+    /// on the `InvoiceDraftCreated` payload's `nav_xml_path` field; the
+    /// drain worker + `print-invoice` orchestrator read it back at
+    /// submit / render time.
+    pub nav_xml_path: std::path::PathBuf,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -655,7 +745,7 @@ fn percent_to_basis_points(percent: u16) -> u16 {
 ///   in our normalizer.
 /// - [`IssueRateError::HufOverflow`] — extreme operand combination
 ///   (loud-fail per CLAUDE.md rule 12 + §1.c arithmetic).
-pub fn fetch_and_stamp_rate<P: MnbRatesProvider>(
+pub fn fetch_and_stamp_rate<P: MnbRatesProvider + ?Sized>(
     provider: &P,
     currency: Currency,
     supply_date: time::Date,

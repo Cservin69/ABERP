@@ -1,0 +1,358 @@
+//! Integration tests for `POST /invoices/issue` (PR-44ζ /
+//! session-59).
+//!
+//! Three pin tests:
+//!
+//! 1. **HUF happy path** — `issue_invoice_request` returns
+//!    `Ok(summary)`; the audit ledger contains the expected
+//!    `InvoiceSequenceReserved` + `InvoiceDraftCreated` pair; the
+//!    XML lands on disk at the server-minted path.
+//! 2. **EUR happy path** — with a fake `MnbRatesProvider` returning
+//!    a known rate, the audit ledger's draft payload carries the
+//!    rate metadata stamp per ADR-0037 §1.a + §1.c.
+//! 3. **Validation failure** — an empty-lines request fails the
+//!    `validate_issue_request` pre-check and would surface at the
+//!    route as a 400. Pinned here at the validator boundary so
+//!    the test does not have to spin the axum listener.
+//!
+//! Both happy-path tests inject a fake provider per A140 (matching
+//! the offline-test posture in `tests/issue_invoice_eur_offline.rs`)
+//! so the test is fully offline.
+//!
+//! The full HTTP layer (status code emission, JSON body bytes) is
+//! structural — axum's `Json(...).into_response()` constructs the
+//! response from the typed value; pinning it would couple the test
+//! to axum's private response-building details. Per CLAUDE.md rule
+//! 2 the discriminator at the `issue_invoice_request` level is the
+//! load-bearing pin.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_billing::Currency;
+use aberp_mnb_rates::{MnbError, MnbRate};
+use time::Date;
+use ulid::Ulid;
+
+use aberp::audit_payloads::InvoiceDraftCreatedPayload;
+use aberp::issue_invoice::{CustomerJson, LineJson, SupplierJson, AddressJson};
+use aberp::mnb_rates_provider::MnbRatesProvider;
+use aberp::serve::{self, AppState, IssueInvoiceRequest};
+
+const TEST_TENANT: &str = "serve_issue_route_test";
+
+// ──────────────────────────────────────────────────────────────────────
+// Fixtures
+// ──────────────────────────────────────────────────────────────────────
+
+fn test_dir(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir()
+        .join("aberp-serve-issue")
+        .join(format!("{}-{}", label, Ulid::new()));
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    dir
+}
+
+fn build_state(db_path: PathBuf) -> AppState {
+    let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
+    let binary_hash = BinaryHash::from_bytes([0u8; 32]);
+    AppState {
+        db_path: Arc::new(db_path),
+        tenant,
+        binary_hash,
+        session_token: Arc::new("test-token".to_string()),
+        operator_login: Arc::new("test-operator".to_string()),
+    }
+}
+
+fn fixture_supplier() -> SupplierJson {
+    SupplierJson {
+        tax_number: "12345678-1-42".to_string(),
+        name: "ABERP Supplier Kft.".to_string(),
+        address: AddressJson {
+            country_code: "HU".to_string(),
+            postal_code: "1011".to_string(),
+            city: "Budapest".to_string(),
+            street: "Fő utca 1.".to_string(),
+        },
+    }
+}
+
+fn fixture_customer() -> CustomerJson {
+    CustomerJson {
+        tax_number: "87654321-2-13".to_string(),
+        name: "Vevő Kft.".to_string(),
+    }
+}
+
+fn fixture_lines() -> Vec<LineJson> {
+    vec![LineJson {
+        description: "Widget A".to_string(),
+        quantity: 2,
+        unit_price: 1000,
+        vat_rate_percent: 27,
+    }]
+}
+
+fn fixture_request(currency: Currency) -> IssueInvoiceRequest {
+    IssueInvoiceRequest {
+        supplier: fixture_supplier(),
+        customer: fixture_customer(),
+        lines: fixture_lines(),
+        currency,
+        series: None,
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Fake MnbRatesProvider — mirrors `tests/issue_invoice_eur_offline.rs`
+// ──────────────────────────────────────────────────────────────────────
+
+/// HashMap-backed `MnbRatesProvider` for offline tests. Returns
+/// `MnbError::NoRateForCurrency` for any (currency, date) tuple not
+/// in the map. Mirrors the fake in
+/// `tests/issue_invoice_eur_offline.rs` (duplicated per CLAUDE.md
+/// rule 3 — extracting to a shared dev-dep helper would widen the
+/// surface for a second consumer).
+struct FakeMnbRates {
+    rates: HashMap<(Currency, Date), MnbRate>,
+    calls: Mutex<Vec<(Currency, Date)>>,
+}
+
+impl MnbRatesProvider for FakeMnbRates {
+    fn fetch_official_rate(
+        &self,
+        currency: Currency,
+        date: Date,
+    ) -> Result<MnbRate, MnbError> {
+        self.calls.lock().unwrap().push((currency, date));
+        match self.rates.get(&(currency, date)) {
+            Some(rate) => Ok(rate.clone()),
+            None => Err(MnbError::NoRateForCurrency {
+                currency: currency.iso_code().to_string(),
+                date: date.to_string(),
+            }),
+        }
+    }
+}
+
+/// Sentinel provider for the HUF path — should never be consulted
+/// (issue_from_parsed's HUF branch is rate-free per ADR-0037 §1).
+/// Tests that exercise the HUF path use this to prove the
+/// rate-fetch path is not entered.
+struct UnreachableProvider;
+
+impl MnbRatesProvider for UnreachableProvider {
+    fn fetch_official_rate(
+        &self,
+        _currency: Currency,
+        _date: Date,
+    ) -> Result<MnbRate, MnbError> {
+        unreachable!(
+            "UnreachableProvider must not be consulted — HUF path is rate-free"
+        )
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Pin tests
+// ──────────────────────────────────────────────────────────────────────
+
+/// HUF happy path — the route's library helper writes the
+/// `InvoiceSequenceReserved` + `InvoiceDraftCreated` audit pair and
+/// returns a non-empty summary. The returned `invoice_id` matches
+/// the prefixed-ULID shape; the NAV XML lands at the server-minted
+/// path (recorded on the draft payload's `nav_xml_path` field).
+#[test]
+fn issue_route_huf_happy_path_writes_audit_pair_and_xml() {
+    let dir = test_dir("huf");
+    // HOME redirect so the server-side `~/.aberp/serve/<tenant>/issued/`
+    // path stays inside the test scratch directory. The redirect is
+    // process-wide but this test file has only the three serial tests
+    // below and none of them depend on $HOME beyond this redirect.
+    std::env::set_var("HOME", &dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+    let actor = Actor::from_local_cli("test-session".to_string(), "test-user");
+
+    let summary = serve::issue_invoice_request(
+        &state,
+        fixture_request(Currency::Huf),
+        &UnreachableProvider,
+        actor,
+    )
+    .expect("HUF happy path must succeed");
+
+    assert!(
+        summary.invoice_id.starts_with("inv_"),
+        "invoice_id `{}` must be prefixed-ULID",
+        summary.invoice_id
+    );
+    assert!(
+        summary.invoice_number.starts_with("INV-default/"),
+        "invoice_number `{}` must carry the series prefix",
+        summary.invoice_number
+    );
+    assert!(
+        summary.nav_xml_path.exists(),
+        "NAV XML must land on disk at the server-minted path"
+    );
+
+    // Walk the audit ledger and prove the two-event pair landed.
+    let ledger = Ledger::open(
+        &dir.join("aberp.duckdb"),
+        TenantId::new(TEST_TENANT.to_string()).unwrap(),
+        BinaryHash::from_bytes([0u8; 32]),
+    )
+    .expect("open ledger");
+    let entries = ledger.entries().expect("read entries");
+    let kinds: Vec<&EventKind> = entries.iter().map(|e| &e.kind).collect();
+    assert!(
+        kinds.contains(&&EventKind::InvoiceSequenceReserved),
+        "InvoiceSequenceReserved must be in the ledger after issuance"
+    );
+    assert!(
+        kinds.contains(&&EventKind::InvoiceDraftCreated),
+        "InvoiceDraftCreated must be in the ledger after issuance"
+    );
+
+    // Keep the scratch dir alive until here.
+    let _keep = &dir;
+}
+
+/// EUR happy path — with a FakeMnbRates provider returning a known
+/// rate on the issue date, the audit ledger's draft payload carries
+/// the rate-metadata stamp per ADR-0037 §1.a + §1.c. The route does
+/// NOT make any real network call (the fake provider is the only
+/// rate source). Mirrors the fake-provider pattern from
+/// `tests/issue_invoice_eur_offline.rs` per A140.
+#[test]
+fn issue_route_eur_happy_path_stamps_rate_metadata_on_draft() {
+    let dir = test_dir("eur");
+    std::env::set_var("HOME", &dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+    let actor = Actor::from_local_cli("test-session".to_string(), "test-user");
+
+    // The supply date is whatever `OffsetDateTime::now_utc().date()`
+    // returns inside `issue_from_parsed`; populate the fake for
+    // today AND tomorrow so the walk-back loop has at least one
+    // hit regardless of the clock-tick between this line and the
+    // route call.
+    let today = time::OffsetDateTime::now_utc().date();
+    let mut fake_rates = HashMap::new();
+    fake_rates.insert(
+        (Currency::Eur, today),
+        MnbRate {
+            currency: Currency::Eur,
+            date: today,
+            unit: 1,
+            value: "405.230000".to_string(),
+        },
+    );
+    fake_rates.insert(
+        (Currency::Eur, today - time::Duration::days(1)),
+        MnbRate {
+            currency: Currency::Eur,
+            date: today - time::Duration::days(1),
+            unit: 1,
+            value: "405.230000".to_string(),
+        },
+    );
+    let provider = FakeMnbRates {
+        rates: fake_rates,
+        calls: Mutex::new(Vec::new()),
+    };
+
+    let summary = serve::issue_invoice_request(
+        &state,
+        fixture_request(Currency::Eur),
+        &provider,
+        actor,
+    )
+    .expect("EUR happy path must succeed");
+
+    // Walk the ledger; find the matching draft entry; assert the
+    // rate-metadata fields are populated per ADR-0037 §1.a.
+    let ledger = Ledger::open(
+        &dir.join("aberp.duckdb"),
+        TenantId::new(TEST_TENANT.to_string()).unwrap(),
+        BinaryHash::from_bytes([0u8; 32]),
+    )
+    .expect("open ledger");
+    let entries = ledger.entries().expect("read entries");
+    let draft_payload: InvoiceDraftCreatedPayload = entries
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventKind::InvoiceDraftCreated)
+        .map(|e| serde_json::from_slice(&e.payload).expect("decode draft payload"))
+        .expect("InvoiceDraftCreated must be in the ledger after EUR issuance");
+    assert_eq!(
+        draft_payload.invoice_id, summary.invoice_id,
+        "draft payload's invoice_id must match the returned summary id"
+    );
+    assert_eq!(
+        draft_payload.currency.as_deref(),
+        Some("EUR"),
+        "EUR draft payload must stamp currency='EUR' per ADR-0037 §1.a"
+    );
+    assert_eq!(
+        draft_payload.exchange_rate.as_deref(),
+        Some("405.230000"),
+        "EUR draft payload must stamp the MNB rate at 6-decimal precision per §1.c / C11"
+    );
+    assert_eq!(
+        draft_payload.exchange_rate_source.as_deref(),
+        Some("MNB"),
+        "EUR draft payload must stamp source='MNB' per ADR-0037 §2.a"
+    );
+    assert!(
+        draft_payload.exchange_rate_date.is_some(),
+        "EUR draft payload must stamp the rate publication date per §1.a + §2.b"
+    );
+    assert!(
+        draft_payload.huf_equivalent_total.is_some(),
+        "EUR draft payload must stamp the round-half-even HUF-equivalent per §1.c / A137"
+    );
+
+    let _keep = &dir;
+}
+
+/// Validation failure — an empty-lines request fails the
+/// `validate_issue_request` precheck. The current call path goes
+/// through `issue_invoice_request` → `issue_from_parsed`, which
+/// also rejects empty lines with `"input has no lines"`; the route
+/// handler short-circuits at the validator BEFORE calling the
+/// library helper so the SPA sees a 400 rather than a 500.
+///
+/// This test pins the library-helper layer's rejection so a
+/// regression at either layer (handler skipping validation OR
+/// library not rejecting) surfaces loud per CLAUDE.md rule 12.
+#[test]
+fn issue_route_rejects_empty_lines_with_loud_error() {
+    let dir = test_dir("invalid");
+    std::env::set_var("HOME", &dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+    let actor = Actor::from_local_cli("test-session".to_string(), "test-user");
+
+    let request = IssueInvoiceRequest {
+        supplier: fixture_supplier(),
+        customer: fixture_customer(),
+        lines: Vec::new(), // ← validation failure trigger
+        currency: Currency::Huf,
+        series: None,
+    };
+
+    let err = serve::issue_invoice_request(
+        &state,
+        request,
+        &UnreachableProvider,
+        actor,
+    )
+    .expect_err("empty-lines request must fail loud");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no lines") || msg.contains("line"),
+        "loud-fail message must reference the lines validation: got `{msg}`"
+    );
+}

@@ -70,14 +70,15 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aberp_audit_ledger::{Entry, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, Entry, EventKind, Ledger, TenantId};
 use aberp_billing::{self as billing, Currency, ReadyInvoice};
+use aberp_nav_transport::{NavCredentials, NavEndpoint};
 use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -85,6 +86,7 @@ use duckdb::Connection;
 use rcgen::{DistinguishedName, KeyPair, KeyUsagePurpose};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use ulid::Ulid;
 
 use crate::audit_payloads;
 use crate::binary_hash;
@@ -92,6 +94,11 @@ use crate::cli::ServeArgs;
 use crate::invoice_currency_metadata::{
     load_invoice_currency_metadata_in_tx, InvoiceCurrencyMetadata,
 };
+use crate::issue_invoice::{self, InvoiceInputJson};
+use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
+use crate::poll_ack;
+use crate::print_invoice;
+use crate::submit_invoice;
 
 /// Default keychain service-name prefix for the session token (one per
 /// tenant). The matching account-name is `session_token`. The Tauri
@@ -153,6 +160,19 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     })?;
     let session_token = load_or_create_session_token(&args.tenant)?;
 
+    // PR-44ζ / session-59 — load the NAV credentials at startup so the
+    // `POST /invoices/issue` mutation route can derive a per-request
+    // `Actor` without paying keychain latency on every issuance. The
+    // only field we stash is `login()` (non-secret); the secret bytes
+    // are dropped when this scope exits.
+    let operator_login = NavCredentials::load_from_keychain(&args.tenant)
+        .context(
+            "load NAV credentials from OS keychain for actor derivation \
+             (run `aberp setup-nav-credentials --tenant <id>` if missing)",
+        )?
+        .login()
+        .to_string();
+
     // 2. Resolve / generate the loopback cert + key.
     let artifacts_dir = serve_artifacts_dir(&args.tenant)?;
     std::fs::create_dir_all(&artifacts_dir).with_context(|| {
@@ -182,6 +202,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         tenant,
         binary_hash: binary_hash_bytes,
         session_token: Arc::new(session_token.clone()),
+        operator_login: Arc::new(operator_login),
     };
 
     // 5. Build the axum router.
@@ -396,19 +417,46 @@ fn generate_session_token() -> String {
 
 // ── Axum router + handlers ───────────────────────────────────────────
 
+/// Per-request shared state passed to every authenticated handler.
+///
+/// Public surface as of PR-44ε.UI / session-58 so the
+/// `apps/aberp/tests/serve_pdf_route.rs` integration test can
+/// exercise [`get_invoice_pdf`] directly without spinning the axum
+/// listener (the listener still owns the lifecycle in `run`). Fields
+/// stay narrow — the cert + fingerprint + tokio runtime stay private
+/// to `run` per ADR-0007 §Transport (the SPA never sees them, and
+/// neither does the read-path test surface).
+///
+/// PR-44ζ / session-59 added `operator_login: Arc<String>` so the new
+/// `POST /invoices/issue` mutation route can derive an `Actor` per
+/// request without re-loading NAV credentials from the keychain
+/// (which already happened once at `run` startup). The full
+/// [`NavCredentials`] is NOT stored on the state — only the
+/// non-secret `login()` value, which is the only field the audit-
+/// ledger actor needs. Keeps secrets out of the route surface.
 #[derive(Clone)]
-struct AppState {
-    db_path: Arc<PathBuf>,
-    tenant: TenantId,
-    binary_hash: aberp_audit_ledger::BinaryHash,
-    session_token: Arc<String>,
+pub struct AppState {
+    pub db_path: Arc<PathBuf>,
+    pub tenant: TenantId,
+    pub binary_hash: aberp_audit_ledger::BinaryHash,
+    pub session_token: Arc<String>,
+    /// PR-44ζ / session-59 — operator login string extracted from the
+    /// startup-loaded `NavCredentials` (the technical-user identifier
+    /// per ADR-0009 §4). Baked into the `Actor::from_local_cli` value
+    /// every `POST /invoices/issue` request writes to the audit ledger.
+    /// Non-secret per the [`NavCredentials::login`] surface contract.
+    pub operator_login: Arc<String>,
 }
 
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(handle_health))
         .route("/invoices", get(handle_list_invoices))
+        .route("/invoices/issue", post(handle_issue_invoice))
         .route("/invoices/:id", get(handle_get_invoice))
+        .route("/invoices/:id/pdf", get(handle_get_invoice_pdf))
+        .route("/invoices/:id/submit", post(handle_submit_invoice))
+        .route("/invoices/:id/poll-ack", post(handle_poll_ack))
         .route("/audit/:invoice_id", get(handle_get_audit))
         .with_state(state)
 }
@@ -752,6 +800,823 @@ async fn handle_get_audit(
         Ok(entries) => Json(entries).into_response(),
         Err(e) => internal_error("get_audit_for_invoice", e),
     }
+}
+
+/// PR-44ε.UI / session-58 — printed-invoice PDF download route.
+///
+/// Wraps the `print_invoice::render_to_bytes` orchestrator behind a
+/// loopback HTTPS endpoint so the SPA's "Download PDF" button on the
+/// invoice-detail modal closes the operator-facing render path
+/// end-to-end (no terminal drop). Same on-disk posture as the CLI
+/// subcommand (A155): audit-ledger + on-disk NAV XML + per-tenant
+/// `seller.toml` are read byte-verbatim; nothing is re-rendered or
+/// re-fetched.
+///
+/// Returns:
+///   - 200 + `Content-Type: application/pdf` + `Content-Disposition`
+///     attachment + PDF bytes on the happy path.
+///   - 404 if no `InvoiceDraftCreated` audit entry matches `id` —
+///     mirrors the existing `/invoices/:id` 404 posture.
+///   - 500 for every other propagated error (`get_invoice_detail`
+///     pattern).
+///
+/// Seller-info path is resolved by `print_invoice` to
+/// `~/.aberp/<tenant>/seller.toml`; no SPA-side override is wired
+/// (the CLI's `--seller-toml` exists for fixture overrides; an
+/// operator who needs an alternative path can land it via the CLI).
+async fn handle_get_invoice_pdf(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(invoice_id): AxumPath<String>,
+) -> Response {
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match get_invoice_pdf(&state, &invoice_id, None) {
+        Ok(Some(rendered)) => {
+            let filename = pdf_filename_for_invoice(&rendered.invoice_number);
+            let disposition = format!("attachment; filename=\"{filename}\"");
+            (
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/pdf".to_string()),
+                    (axum::http::header::CONTENT_DISPOSITION, disposition),
+                ],
+                rendered.pdf_bytes,
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!(
+                "no InvoiceDraftCreated audit entry for invoice id {invoice_id}"
+            ))),
+        )
+            .into_response(),
+        Err(e) => internal_error("get_invoice_pdf", e),
+    }
+}
+
+/// PR-44ε.UI / session-58 — render the printed-invoice PDF for one
+/// invoice id. Returns `None` when no draft entry is found (so the
+/// route emits 404 rather than 500); every other failure mode is a
+/// loud-fail per CLAUDE.md rule 12.
+///
+/// `seller_toml_override`: production callers (the route handler)
+/// pass `None` so `print_invoice` resolves the default
+/// `~/.aberp/<tenant>/seller.toml` path; the integration test in
+/// `apps/aberp/tests/serve_pdf_route.rs` passes `Some(path)` to a
+/// per-test fixture file so the test doesn't have to rebind the
+/// process-wide HOME (which races under cargo's parallel test
+/// runner per the Rust 2024 `unsafe set_var` discipline).
+///
+/// `pub` so the integration test can exercise the route's read path
+/// without spinning up an HTTPS listener (same posture as
+/// `list_invoices` / `get_invoice_detail` would have if they were
+/// directly tested).
+pub fn get_invoice_pdf(
+    state: &AppState,
+    invoice_id: &str,
+    seller_toml_override: Option<&Path>,
+) -> Result<Option<print_invoice::RenderedInvoice>> {
+    match print_invoice::render_to_bytes(
+        invoice_id,
+        &state.db_path,
+        state.tenant.as_str(),
+        seller_toml_override,
+    ) {
+        Ok(rendered) => Ok(Some(rendered)),
+        Err(e) => {
+            // The "no draft entry" failure is the operator's most likely
+            // mistake (wrong id pasted, wrong tenant DB) — discriminate
+            // it from every other propagated error so the route emits
+            // 404 rather than 500 per the existing `/invoices/:id`
+            // shape. The error string is the one
+            // `print_invoice::find_invoice_draft` mints.
+            let msg = format!("{e:#}");
+            if msg.contains("no InvoiceDraftCreated audit entry found for invoice id") {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// PR-44ε.UI / session-58 — `Content-Disposition` filename for the
+/// PDF download. Mirrors the SPA's `filenameForInvoice` so the
+/// browser-saved file matches the operator-facing
+/// `invoice_<invoice_number>.pdf` shape regardless of whether the
+/// browser honours the Content-Disposition or falls back to the SPA-
+/// side download blob naming. Pinned by `pdf_filename_uses_invoice_number`.
+fn pdf_filename_for_invoice(invoice_number: &str) -> String {
+    format!("invoice_{invoice_number}.pdf")
+}
+
+// ── PR-44ζ / session-59 — POST /invoices/issue route ────────────────
+
+/// Request body for `POST /invoices/issue`. Mirrors the CLI's
+/// [`InvoiceInputJson`] (parties + lines, flattened in) with the
+/// PR-44ζ-added wire fields the CLI's `--currency` / `--series` flags
+/// carry. The Tauri SPA's `composeIssueInvoiceBody` (`issue-invoice.ts`)
+/// emits exactly this shape; mirror invariant per A156 precedent.
+///
+/// `series` is optional with a `"INV-default"` fallback so the SPA
+/// form does NOT have to expose a series-picker on the first cut —
+/// the CLI's default behaviour is preserved.
+#[derive(Debug, Deserialize)]
+pub struct IssueInvoiceRequest {
+    pub supplier: issue_invoice::SupplierJson,
+    pub customer: issue_invoice::CustomerJson,
+    pub lines: Vec<issue_invoice::LineJson>,
+    pub currency: Currency,
+    #[serde(default)]
+    pub series: Option<String>,
+}
+
+/// Response body for `POST /invoices/issue`. The SPA reads
+/// `invoice_id` to navigate the detail modal open; `invoice_number` +
+/// `state` are surfaced for the success-flash render. Private to this
+/// module — the response shape never leaves the axum handler, so
+/// keeping the type at the JSON-emit boundary avoids leaking the
+/// internal `InvoiceState` enum into the public surface.
+#[derive(Debug, Serialize)]
+struct IssueInvoiceResponse {
+    invoice_id: String,
+    invoice_number: String,
+    state: InvoiceState,
+}
+
+/// `400 Bad Request` body emitted for validation failures (empty
+/// payload, missing required field, invalid currency string, etc.).
+/// Same shape as [`ErrorBody`] above so the SPA's error renderer can
+/// consume both 4xx and 5xx surfaces with one parser.
+const DEFAULT_SERIES_CODE: &str = "INV-default";
+
+/// PR-44ζ / session-59 — `POST /invoices/issue` route handler. The
+/// SPA's "New Invoice" form posts here; the handler:
+///
+///   1. Checks the bearer token (same posture as every other
+///      authenticated route).
+///   2. Validates the request body shape (4xx on validation failure
+///      vs 5xx on propagated issuance errors).
+///   3. Mints a server-side `nav_xml_path` under
+///      `~/.aberp/serve/<tenant>/issued/<ulid>.xml` — the CLI threads
+///      an operator-supplied `--out`; the route is operator-pathless
+///      so the SPA never has to surface a path picker.
+///   4. Builds the `Actor` from the startup-loaded operator login.
+///   5. Dispatches into `issue_invoice::issue_from_parsed` via the
+///      `issue_invoice_request` library helper (which the integration
+///      test hits directly with a fake `MnbRatesProvider`).
+///
+/// Failure modes:
+///   - `400 Bad Request` on validation failure (empty lines, etc.).
+///   - `500 Internal Server Error` on any other propagated error
+///     (MNB fetch, DB write, XSD validate, NAV XML write).
+async fn handle_issue_invoice(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<IssueInvoiceRequest>,
+) -> Response {
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    // Pre-issuance validation. Loud-fail per CLAUDE.md rule 12 with a
+    // 400 + a typed error body so the SPA's inline-error surface can
+    // distinguish operator-correctable input from server-side faults.
+    if let Err(msg) = validate_issue_request(&request) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body(msg)),
+        )
+            .into_response();
+    }
+
+    let provider = match build_live_provider_for_currency(request.currency) {
+        Ok(p) => p,
+        Err(e) => return internal_error("build_live_provider", e),
+    };
+
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), &state.operator_login);
+
+    match issue_invoice_request(&state, request, provider.as_ref(), actor) {
+        Ok(summary) => Json(IssueInvoiceResponse {
+            invoice_id: summary.invoice_id,
+            invoice_number: summary.invoice_number,
+            state: InvoiceState::Ready,
+        })
+        .into_response(),
+        Err(e) => internal_error("issue_invoice_request", e),
+    }
+}
+
+/// PR-44ζ / session-59 — input validation that maps to `400 Bad
+/// Request` rather than `500`. Mirrors the CLI's first-pass shape
+/// checks at the route layer so the SPA renders an operator-actionable
+/// inline error instead of an opaque "internal error" string.
+///
+/// Per CLAUDE.md rule 9: per-rule coverage — each branch pins a
+/// distinct field-level rule so a regression that drops one check
+/// surfaces at the route_validation_rejects_* test rather than at a
+/// silent 500.
+fn validate_issue_request(request: &IssueInvoiceRequest) -> std::result::Result<(), String> {
+    if request.lines.is_empty() {
+        return Err("at least one line item is required".to_string());
+    }
+    if request.customer.name.trim().is_empty() {
+        return Err("customer name is required".to_string());
+    }
+    if request.customer.tax_number.trim().is_empty() {
+        return Err("customer tax number (ADÓSZÁM) is required".to_string());
+    }
+    if request.supplier.name.trim().is_empty() {
+        return Err("supplier name is required".to_string());
+    }
+    if request.supplier.tax_number.trim().is_empty() {
+        return Err("supplier tax number (ADÓSZÁM) is required".to_string());
+    }
+    Ok(())
+}
+
+/// PR-44ζ / session-59 — build the production `MnbRatesProvider` for
+/// the request's currency. The HUF branch returns `None`-equivalent
+/// (the NeverProvider sentinel inside `issue_invoice`); the EUR branch
+/// builds a `LiveMnbRatesProvider` with its own current-thread tokio
+/// runtime. Same shape as `issue_invoice::run` per the matching
+/// runtime-construction posture in `mnb_rates_provider`.
+///
+/// Returns `Box<dyn MnbRatesProvider>` so the call site can pass it to
+/// `issue_from_parsed`'s generic-over-`P` surface without duplicating
+/// the issuance-path code for the two currency branches.
+fn build_live_provider_for_currency(
+    currency: Currency,
+) -> Result<Box<dyn MnbRatesProvider>> {
+    match currency {
+        Currency::Huf => Ok(Box::new(NeverProvider)),
+        _ => Ok(Box::new(
+            LiveMnbRatesProvider::new()
+                .context("build MNB rates provider for non-HUF issuance via serve route")?,
+        )),
+    }
+}
+
+/// Stand-in `MnbRatesProvider` for the HUF route path — never expected
+/// to be consulted (the HUF branch of `issue_from_parsed` does not
+/// reach for the rate). Mirrors the same sentinel in
+/// `issue_invoice::NeverProvider` (private there) so a wrongful EUR
+/// regression on the HUF branch panics rather than silently returns a
+/// placeholder rate.
+struct NeverProvider;
+
+impl MnbRatesProvider for NeverProvider {
+    fn fetch_official_rate(
+        &self,
+        _currency: Currency,
+        _date: time::Date,
+    ) -> std::result::Result<aberp_mnb_rates::MnbRate, aberp_mnb_rates::MnbError> {
+        unreachable!(
+            "serve.rs::NeverProvider must not be consulted — \
+             the HUF issuance path is rate-free per ADR-0037 §1"
+        )
+    }
+}
+
+/// PR-44ζ / session-59 — library helper that wires
+/// `issue_invoice::issue_from_parsed` over the [`AppState`]'s
+/// db_path + tenant + operator login. `pub` so the integration test
+/// (`tests/serve_issue_route.rs`) can hit it with a fake
+/// `MnbRatesProvider` and a fixture `Actor` without spinning the
+/// HTTPS listener (same posture as `get_invoice_pdf` per A158).
+pub fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
+    state: &AppState,
+    request: IssueInvoiceRequest,
+    provider: &P,
+    actor: Actor,
+) -> Result<issue_invoice::IssuedInvoiceSummary> {
+    let xml_path = mint_issued_xml_path(state.tenant.as_str())
+        .context("mint server-side NAV-XML output path for issuance")?;
+    let input = InvoiceInputJson {
+        supplier: request.supplier,
+        customer: request.customer,
+        lines: request.lines,
+    };
+    let series = request
+        .series
+        .as_deref()
+        .unwrap_or(DEFAULT_SERIES_CODE);
+    issue_invoice::issue_from_parsed(
+        input,
+        &state.db_path,
+        state.tenant.as_str(),
+        series,
+        request.currency,
+        xml_path,
+        actor,
+        provider,
+    )
+}
+
+/// PR-44ζ / session-59 — mint a per-issuance NAV-XML on-disk path
+/// under `~/.aberp/serve/<tenant>/issued/<ULID>.xml`. The CLI's
+/// `aberp issue-invoice --out <PATH>` lets the operator pick the
+/// filename; the SPA route is operator-pathless so the server picks a
+/// deterministic ULID-keyed slug. The path is recorded on the
+/// `InvoiceDraftCreated` payload (per ADR-0031 §2) so downstream
+/// readers (drain worker, print-invoice) find it regardless of the
+/// filename shape.
+///
+/// Same `~/.aberp/serve/<tenant>/` parent dir as the cert + session
+/// token persistence per A158 — "operator-invisible artifacts live
+/// next to the keychain material" posture from PR-9-1.
+fn mint_issued_xml_path(tenant: &str) -> Result<std::path::PathBuf> {
+    let dir = serve_artifacts_dir(tenant)?.join("issued");
+    std::fs::create_dir_all(&dir).with_context(|| {
+        format!("create issued-XML directory at {}", dir.display())
+    })?;
+    Ok(dir.join(format!("{}.xml", Ulid::new())))
+}
+
+// ── PR-44η / session-60 — POST /invoices/:id/submit + /poll-ack ──────
+
+/// PR-44η / session-60 — wire response body for
+/// `POST /invoices/:id/submit`. Surfaces the NAV-assigned
+/// `transaction_id` so the SPA's detail-modal renderer can display
+/// it immediately AND the new typestate label so the SPA's state
+/// chip flips without an extra `getInvoice` roundtrip.
+#[derive(Debug, Serialize)]
+struct SubmitInvoiceResponse {
+    invoice_id: String,
+    transaction_id: String,
+    state: InvoiceState,
+    entries_verified: u64,
+}
+
+/// PR-44η / session-60 — wire response body for
+/// `POST /invoices/:id/poll-ack`. Carries the terminal classification
+/// (`Finalized` / `Rejected` / `Submitted` with stuck variants) the
+/// poll loop reached + the attempt count that actually fired so the
+/// SPA can render the operator-visible "loop completed after N
+/// attempts" line without re-parsing audit entries.
+#[derive(Debug, Serialize)]
+struct PollAckResponse {
+    invoice_id: String,
+    state: InvoiceState,
+    attempts_made: u32,
+    transaction_id: String,
+    /// On terminal `Rejected` / stuck-loop terminuses the SPA renders
+    /// the diagnostic inline; `None` on the clean `Finalized` arm.
+    diagnostic: Option<String>,
+    entries_verified: u64,
+}
+
+/// PR-44η / session-60 — `POST /invoices/:id/submit` handler.
+///
+/// 1. Bearer-auth check.
+/// 2. Precondition: derive the invoice's state from the audit-ledger
+///    trace; loud-fail 409 if not `Ready`. Issued-but-already-
+///    submitted invoices, terminal invoices, and unknown ids all
+///    bounce here.
+/// 3. Resolve the NAV-body on-disk path from the most-recent
+///    `InvoiceDraftCreated` audit entry per ADR-0031 §2.
+/// 4. Read the on-disk XML; extract the supplier 8-digit tax number
+///    from the body (same source the CLI parses from `--tax-number`,
+///    but server-derived so the SPA does not need to surface it).
+/// 5. Load NAV credentials fresh per request (mirrors the CLI's
+///    `submit-invoice` posture; the startup-cached `operator_login`
+///    on `AppState` is non-secret and not sufficient for signing).
+/// 6. Mint the per-request `Actor` from the startup-loaded
+///    `operator_login` (A159 boilerplate).
+/// 7. Dispatch into `submit_invoice::submit_from_inputs` (the
+///    library helper extracted at this PR).
+///
+/// Failure modes:
+///   - `401 Unauthorized` — bearer missing or wrong.
+///   - `409 Conflict` — invoice is not in `Ready` state (loud-fail
+///     per CLAUDE.md rule 12; the SPA renders the typed error body
+///     inline).
+///   - `500 Internal Server Error` — any propagated error (NAV
+///     transport, audit-write, DB error, etc.). The TX2
+///     AttemptFailed audit is committed BEFORE the 500 is surfaced
+///     per ADR-0032 §1 so the invoice's state transitions to
+///     `Pending` even on wire failure.
+async fn handle_submit_invoice(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(invoice_id): AxumPath<String>,
+) -> Response {
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match submit_invoice_request(&state, &invoice_id) {
+        Ok(outcome) => Json(SubmitInvoiceResponse {
+            invoice_id: outcome.invoice_id,
+            transaction_id: outcome.transaction_id,
+            state: InvoiceState::Submitted,
+            entries_verified: outcome.entries_verified,
+        })
+        .into_response(),
+        Err(SubmitRouteError::PreconditionMismatch { current_state, message }) => (
+            StatusCode::CONFLICT,
+            Json(error_body(format!(
+                "{message} (current state: {current_state})"
+            ))),
+        )
+            .into_response(),
+        Err(SubmitRouteError::NotFound(message)) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(message)),
+        )
+            .into_response(),
+        Err(SubmitRouteError::Other(e)) => internal_error("submit_invoice_request", e),
+    }
+}
+
+/// PR-44η / session-60 — `POST /invoices/:id/poll-ack` handler.
+///
+/// 1. Bearer-auth check.
+/// 2. Precondition: derive the invoice's state; loud-fail 409 if
+///    not `Submitted` or `PendingNavExists`. Only those two states
+///    are poll-meaningful — Pending without NAV-side evidence has
+///    no transactionId to poll yet (operator should `submit`
+///    first); terminal states are done.
+/// 3. Load NAV credentials fresh per request.
+/// 4. Mint per-request `Actor`.
+/// 5. Dispatch into `poll_ack::poll_ack_from_inputs`.
+async fn handle_poll_ack(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(invoice_id): AxumPath<String>,
+) -> Response {
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match poll_ack_request(&state, &invoice_id) {
+        Ok(outcome) => Json(PollAckResponse {
+            invoice_id: outcome.invoice_id,
+            state: poll_terminal_to_state(&outcome.terminal),
+            attempts_made: outcome.attempts_made,
+            transaction_id: outcome.transaction_id,
+            diagnostic: poll_terminal_diagnostic(&outcome.terminal),
+            entries_verified: outcome.entries_verified,
+        })
+        .into_response(),
+        Err(SubmitRouteError::PreconditionMismatch { current_state, message }) => (
+            StatusCode::CONFLICT,
+            Json(error_body(format!(
+                "{message} (current state: {current_state})"
+            ))),
+        )
+            .into_response(),
+        Err(SubmitRouteError::NotFound(message)) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(message)),
+        )
+            .into_response(),
+        Err(SubmitRouteError::Other(e)) => internal_error("poll_ack_request", e),
+    }
+}
+
+/// PR-44η / session-60 — typed error returned by the two mutation
+/// helpers below. `PreconditionMismatch` maps to 409; `NotFound`
+/// maps to 404; `Other` maps to 500 via the existing
+/// [`internal_error`] helper.
+#[derive(Debug)]
+pub enum SubmitRouteError {
+    PreconditionMismatch {
+        /// PascalCase wire form of the current `InvoiceState` (the
+        /// label the SPA reads). Kept as `String` rather than the
+        /// typed enum so this error type stays composable across the
+        /// pub crate surface without lifting `InvoiceState` itself
+        /// to `pub` (it remains an implementation detail of the
+        /// wire shape).
+        current_state: String,
+        message: String,
+    },
+    NotFound(String),
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for SubmitRouteError {
+    fn from(e: anyhow::Error) -> Self {
+        SubmitRouteError::Other(e)
+    }
+}
+
+/// PR-44η / session-60 — library helper that wires
+/// `submit_invoice::submit_from_inputs` over the [`AppState`]'s
+/// db_path + tenant + operator login. `pub` so the integration test
+/// can hit it for precondition pin tests without spinning the HTTPS
+/// listener (same posture as `get_invoice_pdf` per A158 and
+/// `issue_invoice_request` per A159).
+pub fn submit_invoice_request(
+    state: &AppState,
+    invoice_id: &str,
+) -> std::result::Result<submit_invoice::SubmitInvoiceOutcome, SubmitRouteError> {
+    // 1. Precondition check — derive current state from audit trace.
+    let derived = derive_state_for(state, invoice_id)?;
+    if !matches!(derived.state, InvoiceState::Ready) {
+        return Err(SubmitRouteError::PreconditionMismatch {
+            current_state: format!("{:?}", derived.state),
+            message: format!(
+                "POST /invoices/{invoice_id}/submit requires state `Ready`; \
+                 re-fetch detail and retry"
+            ),
+        });
+    }
+
+    // 2. Resolve nav_xml_path from the most-recent
+    //    InvoiceDraftCreated entry per ADR-0031 §2.
+    let nav_xml_path = derived
+        .nav_xml_path
+        .ok_or_else(|| {
+            SubmitRouteError::Other(anyhow!(
+                "invoice {invoice_id} is Ready but no `nav_xml_path` recorded on the \
+                 InvoiceDraftCreated audit entry — pre-PR-18 entry; \
+                 fall back to `aberp submit-invoice --invoice-xml <path>`"
+            ))
+        })?;
+
+    // 3. Read the on-disk XML.
+    let invoice_xml = std::fs::read(&nav_xml_path)
+        .with_context(|| {
+            format!(
+                "read NAV InvoiceData XML from {} (server-resolved from audit ledger)",
+                nav_xml_path.display()
+            )
+        })?;
+    if invoice_xml.is_empty() {
+        return Err(SubmitRouteError::Other(anyhow!(
+            "NAV InvoiceData XML at {} is empty",
+            nav_xml_path.display()
+        )));
+    }
+
+    // 4. Extract the supplier 8-digit tax number from the XML body.
+    let tax_number_8 = parse_supplier_tax_number_from_xml(&invoice_xml)?;
+
+    // 5. Load NAV credentials fresh per request (per A159 — secrets
+    //    are not stashed on AppState; only the non-secret
+    //    `operator_login` is).
+    let credentials = NavCredentials::load_from_keychain(state.tenant.as_str())
+        .with_context(|| {
+            format!(
+                "load NAV credentials from OS keychain for tenant `{}` \
+                 (run `aberp setup-nav-credentials` if missing)",
+                state.tenant.as_str()
+            )
+        })?;
+
+    // 6. Mint per-request Actor from startup-loaded operator login.
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), &state.operator_login);
+
+    // 7. Dispatch into the library helper. The route surface routes
+    //    only to NAV test per the standing boilerplate (production
+    //    cutover gated by future ADR-0038).
+    submit_invoice::submit_from_inputs(submit_invoice::SubmitFromInputs {
+        db: &state.db_path,
+        tenant_str: state.tenant.as_str(),
+        invoice_id_str: invoice_id,
+        invoice_xml_origin: nav_xml_path.display().to_string(),
+        invoice_xml,
+        tax_number_raw: &tax_number_8,
+        nav_endpoint: NavEndpoint::Test,
+        endpoint_audit_label: "test",
+        credentials: &credentials,
+        actor,
+    })
+    .map_err(|e| match e {
+        submit_invoice::SubmitFromInputsError::WireFailed { error_message, .. } => {
+            SubmitRouteError::Other(anyhow!(
+                "manageInvoice wire send failed: {error_message}"
+            ))
+        }
+        submit_invoice::SubmitFromInputsError::Other(inner) => SubmitRouteError::Other(inner),
+    })
+}
+
+/// PR-44η / session-60 — library helper that wires
+/// `poll_ack::poll_ack_from_inputs` over the [`AppState`]'s db_path
+/// + tenant + operator login. `pub` so the integration test can hit
+/// it for precondition pin tests without spinning the HTTPS
+/// listener.
+pub fn poll_ack_request(
+    state: &AppState,
+    invoice_id: &str,
+) -> std::result::Result<poll_ack::PollAckOutcome, SubmitRouteError> {
+    // 1. Precondition check.
+    let derived = derive_state_for(state, invoice_id)?;
+    let poll_eligible = matches!(
+        derived.state,
+        InvoiceState::Submitted | InvoiceState::PendingNavExists
+    );
+    if !poll_eligible {
+        return Err(SubmitRouteError::PreconditionMismatch {
+            current_state: format!("{:?}", derived.state),
+            message: format!(
+                "POST /invoices/{invoice_id}/poll-ack requires state \
+                 `Submitted` or `PendingNavExists`; re-fetch detail and retry"
+            ),
+        });
+    }
+
+    // 2. Resolve supplier tax number from the on-disk XML.
+    let nav_xml_path = derived.nav_xml_path.ok_or_else(|| {
+        SubmitRouteError::Other(anyhow!(
+            "invoice {invoice_id} has no `nav_xml_path` on the audit ledger; \
+             fall back to `aberp poll-ack --tax-number <n>`"
+        ))
+    })?;
+    let invoice_xml = std::fs::read(&nav_xml_path).with_context(|| {
+        format!(
+            "read NAV InvoiceData XML from {} (server-resolved from audit ledger)",
+            nav_xml_path.display()
+        )
+    })?;
+    let tax_number_8 = parse_supplier_tax_number_from_xml(&invoice_xml)?;
+
+    // 3. Load NAV credentials fresh per request.
+    let credentials = NavCredentials::load_from_keychain(state.tenant.as_str())
+        .with_context(|| {
+            format!(
+                "load NAV credentials from OS keychain for tenant `{}`",
+                state.tenant.as_str()
+            )
+        })?;
+
+    // 4. Mint per-request Actor.
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), &state.operator_login);
+
+    // 5. Dispatch into the library helper. NAV test endpoint only
+    //    per the standing boilerplate (production cutover gated by
+    //    future ADR-0038).
+    poll_ack::poll_ack_from_inputs(
+        &state.db_path,
+        state.tenant.as_str(),
+        invoice_id,
+        &tax_number_8,
+        NavEndpoint::Test,
+        &credentials,
+        actor,
+    )
+    .map_err(SubmitRouteError::Other)
+}
+
+/// PR-44η / session-60 — wire-state mapper for the poll-ack response.
+/// Mirrors the [`InvoiceTrace::derive_state`] ladder at the
+/// poll-loop terminal level so the SPA can flip its state chip
+/// without an extra `getInvoice` roundtrip.
+fn poll_terminal_to_state(t: &poll_ack::PollAckTerminal) -> InvoiceState {
+    match t {
+        poll_ack::PollAckTerminal::Finalized => InvoiceState::Finalized,
+        poll_ack::PollAckTerminal::Rejected => InvoiceState::Rejected,
+        // Stuck variants leave the invoice at `Submitted` per ADR-0036
+        // §3 — the SPA renders the operator-visible diagnostic from
+        // the `diagnostic` field and can prompt for retry / recovery.
+        // The chip stays at `Submitted` because the underlying audit
+        // trace still classifies the invoice as state-3 AwaitingAck;
+        // a separate "SubmissionStuck" UI label would diverge from
+        // the derive_state ladder.
+        poll_ack::PollAckTerminal::StuckIntermediate { .. }
+        | poll_ack::PollAckTerminal::StuckNonRetryable { .. }
+        | poll_ack::PollAckTerminal::StuckAllAttemptsErrored { .. } => InvoiceState::Submitted,
+    }
+}
+
+/// PR-44η / session-60 — surface the operator-visible diagnostic
+/// (last-status string / NAV error message / etc.) on the wire so
+/// the SPA can render it inline. `None` for the clean `Finalized`
+/// arm.
+fn poll_terminal_diagnostic(t: &poll_ack::PollAckTerminal) -> Option<String> {
+    match t {
+        poll_ack::PollAckTerminal::Finalized => None,
+        poll_ack::PollAckTerminal::Rejected => Some(
+            "NAV ack: ABORTED — sequence slot is used-with-reason; issue a corrective new invoice"
+                .to_string(),
+        ),
+        poll_ack::PollAckTerminal::StuckIntermediate { last_status } => Some(format!(
+            "attempts exhausted with intermediate status {last_status}"
+        )),
+        poll_ack::PollAckTerminal::StuckNonRetryable { diagnostic } => {
+            Some(format!("NAV non-retryable error: {diagnostic}"))
+        }
+        poll_ack::PollAckTerminal::StuckAllAttemptsErrored { diagnostic } => {
+            Some(format!("all attempts errored, last: {diagnostic}"))
+        }
+    }
+}
+
+/// PR-44η / session-60 — per-invoice derived-state bundle the
+/// mutation helpers consult for precondition checks. Carries the
+/// derived state label (the same ladder `get_invoice_detail`
+/// surfaces on the read path) AND the on-disk `nav_xml_path` the
+/// helpers need for the wire-call payload, in one ledger walk.
+struct DerivedStateForInvoice {
+    state: InvoiceState,
+    nav_xml_path: Option<std::path::PathBuf>,
+}
+
+/// PR-44η / session-60 — walk the audit ledger once and compute the
+/// derived state + extract the most-recent `InvoiceDraftCreated`
+/// payload's `nav_xml_path`. Mirrors the
+/// `get_invoice_detail` walker shape so the read and mutation
+/// surfaces agree on what "this invoice is in state X" means; a
+/// regression that flipped one but not the other would surface here
+/// loud per CLAUDE.md rule 12.
+fn derive_state_for(
+    state: &AppState,
+    invoice_id: &str,
+) -> std::result::Result<DerivedStateForInvoice, SubmitRouteError> {
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), state.binary_hash)
+        .context("open audit ledger for serve mutation precondition")?;
+    let entries = ledger
+        .entries()
+        .context("read audit ledger entries for precondition")?;
+
+    let mut trace = InvoiceTrace::default();
+    let mut nav_xml_path: Option<std::path::PathBuf> = None;
+    let mut found_any = false;
+    for entry in &entries {
+        if let Some(id) = extract_invoice_id(entry) {
+            if id == invoice_id {
+                found_any = true;
+                trace.merge_entry(entry, invoice_id);
+                if entry.kind == EventKind::InvoiceDraftCreated {
+                    if let Ok(parsed) = serde_json::from_slice::<
+                        audit_payloads::InvoiceDraftCreatedPayload,
+                    >(&entry.payload)
+                    {
+                        if let Some(path_str) = parsed.nav_xml_path {
+                            nav_xml_path = Some(std::path::PathBuf::from(path_str));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(link) = extract_chain_link(entry) {
+            if link.base_invoice_id == invoice_id {
+                found_any = true;
+                match link.kind {
+                    EventKind::InvoiceStornoIssued => trace.is_storno_base = true,
+                    EventKind::InvoiceModificationIssued => trace.is_amended_base = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if !found_any {
+        return Err(SubmitRouteError::NotFound(format!(
+            "no audit-ledger entries for invoice id {invoice_id}"
+        )));
+    }
+    Ok(DerivedStateForInvoice {
+        state: trace.derive_state(),
+        nav_xml_path,
+    })
+}
+
+/// PR-44η / session-60 — extract the 8-digit supplier base tax
+/// number from a NAV `<InvoiceData>` body. The CLI's
+/// `submit-invoice --tax-number` accepts the dashed forms; the
+/// NAV-emitted XML always carries the bare 8-digit base inside
+/// `<supplierTaxNumber><taxpayerId>...</taxpayerId>`. Server-
+/// derived so the SPA does not need to surface a tax-number input
+/// on the operator-facing button.
+///
+/// Substring scan rather than a full XML parse per CLAUDE.md rule 2
+/// (minimum code). Loud-fail on missing element OR a non-8-digit
+/// payload per rule 12.
+fn parse_supplier_tax_number_from_xml(xml: &[u8]) -> Result<String> {
+    let body = std::str::from_utf8(xml).context(
+        "InvoiceData XML is not valid UTF-8 — NAV requires UTF-8 per the v3.0 schema",
+    )?;
+    let open = "<supplierTaxNumber>";
+    let close = "</supplierTaxNumber>";
+    let start = body
+        .find(open)
+        .ok_or_else(|| anyhow!("InvoiceData XML missing <supplierTaxNumber>"))?
+        + open.len();
+    let end = body[start..]
+        .find(close)
+        .ok_or_else(|| anyhow!("InvoiceData XML missing </supplierTaxNumber>"))?
+        + start;
+    let block = &body[start..end];
+    let tag_open = "<taxpayerId>";
+    let tag_close = "</taxpayerId>";
+    let id_start = block
+        .find(tag_open)
+        .ok_or_else(|| anyhow!("InvoiceData XML <supplierTaxNumber> missing <taxpayerId>"))?
+        + tag_open.len();
+    let id_end = block[id_start..]
+        .find(tag_close)
+        .ok_or_else(|| anyhow!("InvoiceData XML <supplierTaxNumber> missing </taxpayerId>"))?
+        + id_start;
+    let id = block[id_start..id_end].trim();
+    if id.len() != 8 || !id.chars().all(|c| c.is_ascii_digit()) {
+        return Err(anyhow!(
+            "supplier <taxpayerId> value '{id}' is not 8 ASCII digits"
+        ));
+    }
+    Ok(id.to_string())
 }
 
 /// Inspect the request's `Authorization` header against the expected
@@ -1441,6 +2306,67 @@ mod tests {
     use aberp_audit_ledger::{Actor, BinaryHash, Ledger, TenantId};
     use aberp_billing::IdempotencyKey;
 
+    /// PR-44η / session-60 — `parse_supplier_tax_number_from_xml`
+    /// MUST extract the 8-digit base supplier tax number from a
+    /// NAV-emitted `<InvoiceData>` body. The load-bearing server-
+    /// side derivation that lets the SPA POST submit/poll-ack
+    /// without a tax-number input field per A163. A regression that
+    /// silently returned an empty string (or the wrong tag's value)
+    /// would surface as an `INVALID_SECURITY_USER` from NAV — a
+    /// confusing failure mode CLAUDE.md rule 12 names.
+    ///
+    /// CLAUDE.md rule 9: happy path + each loud-fail arm pinned
+    /// individually so a regression that collapsed validation
+    /// cannot pass every assertion vacuously.
+    #[test]
+    fn parse_supplier_tax_number_from_xml_extracts_eight_digit_base() {
+        // Happy path — well-formed body.
+        let xml = b"<?xml version=\"1.0\"?>\
+            <InvoiceData>\
+            <invoiceNumber>INV-default/00013</invoiceNumber>\
+            <invoiceMain><invoice><invoiceHead>\
+            <supplierInfo>\
+            <supplierTaxNumber><taxpayerId>12345678</taxpayerId><vatCode>1</vatCode><countyCode>42</countyCode></supplierTaxNumber>\
+            <supplierName>Test Kft.</supplierName>\
+            </supplierInfo>\
+            </invoiceHead></invoice></invoiceMain></InvoiceData>";
+        assert_eq!(
+            parse_supplier_tax_number_from_xml(xml).unwrap(),
+            "12345678"
+        );
+    }
+
+    #[test]
+    fn parse_supplier_tax_number_from_xml_rejects_missing_tag() {
+        let xml = b"<?xml version=\"1.0\"?>\
+            <InvoiceData><invoiceNumber>X</invoiceNumber></InvoiceData>";
+        let err = parse_supplier_tax_number_from_xml(xml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("supplierTaxNumber"),
+            "missing-tag error must name the element: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_supplier_tax_number_from_xml_rejects_non_eight_digit() {
+        // 9-digit value — the dashed full form (12345678-1-42) would
+        // arrive here without the dashes stripped, which is exactly
+        // the failure mode the loud-fail catches.
+        let xml = b"<?xml version=\"1.0\"?>\
+            <InvoiceData><invoiceMain><invoice><invoiceHead>\
+            <supplierInfo>\
+            <supplierTaxNumber><taxpayerId>123456789</taxpayerId></supplierTaxNumber>\
+            </supplierInfo>\
+            </invoiceHead></invoice></invoiceMain></InvoiceData>";
+        let err = parse_supplier_tax_number_from_xml(xml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("8 ASCII digits"),
+            "non-8-digit error must name the constraint: {msg}"
+        );
+    }
+
     #[test]
     fn constant_time_eq_basic() {
         assert!(constant_time_eq("abcd", "abcd"));
@@ -1448,6 +2374,36 @@ mod tests {
         assert!(!constant_time_eq("abcd", "abc"));
         assert!(!constant_time_eq("", "x"));
         assert!(constant_time_eq("", ""));
+    }
+
+    /// PR-44ε.UI / session-58 — the `Content-Disposition` filename
+    /// emitted by `handle_get_invoice_pdf` MUST be the operator-
+    /// facing `invoice_<invoice_number>.pdf` shape. The SPA's
+    /// `filenameForInvoice` mirror in `format.ts` carries the same
+    /// shape; a one-sided rename (e.g., changing the prefix to
+    /// `aberp_` on the Rust side without touching the SPA) would
+    /// surface as a browser-saved filename that does not match the
+    /// SPA-displayed filename — confusing rather than wrong. Pin the
+    /// contract loud per CLAUDE.md rule 12.
+    ///
+    /// CLAUDE.md rule 9: per-shape coverage — three distinct invoice
+    /// numbers in the round-trip set, so a regression that hard-codes
+    /// the filename (or strips the invoice_number) cannot pass all
+    /// three assertions vacuously.
+    #[test]
+    fn pdf_filename_uses_invoice_number() {
+        assert_eq!(
+            pdf_filename_for_invoice("2026-000013"),
+            "invoice_2026-000013.pdf",
+        );
+        assert_eq!(
+            pdf_filename_for_invoice("INV-default-2026-000042"),
+            "invoice_INV-default-2026-000042.pdf",
+        );
+        assert_eq!(
+            pdf_filename_for_invoice("S2026-000001"),
+            "invoice_S2026-000001.pdf",
+        );
     }
 
     #[test]

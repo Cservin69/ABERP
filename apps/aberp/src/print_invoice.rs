@@ -65,17 +65,87 @@ use crate::binary_hash;
 use crate::cli::PrintInvoiceArgs;
 
 // ──────────────────────────────────────────────────────────────────────
-// Entry point
+// Entry points
 // ──────────────────────────────────────────────────────────────────────
 
+/// A successfully rendered printed-invoice PDF.
+///
+/// Returned by [`render_to_bytes`] for callers that need to do something
+/// other than write the bytes to a single on-disk path — at PR-44ε.UI
+/// the SPA `/api/invoices/:id/pdf` route streams `pdf_bytes` to the
+/// browser as `application/pdf` and the `invoice_number` is used
+/// downstream for the `Content-Disposition` filename.
+///
+/// CLAUDE.md rule 13: the struct carries the two and only two fields
+/// every caller needs (`invoice_number` for naming, `pdf_bytes` for the
+/// body); a future `pages_rendered` / `currency` / `total` field would
+/// add weight for a hypothetical caller and so stays absent until a
+/// trigger surfaces.
+pub struct RenderedInvoice {
+    pub invoice_number: String,
+    pub pdf_bytes: Vec<u8>,
+}
+
+/// CLI entry point — invoked from `main.rs`'s `Command::PrintInvoice`
+/// arm. Thin wrapper over [`render_to_bytes`] that writes the rendered
+/// bytes to the operator-supplied `--out` path and prints a one-line
+/// summary.
 pub fn run(args: &PrintInvoiceArgs) -> Result<()> {
     let _span = tracing::info_span!("print_invoice").entered();
 
-    let tenant = TenantId::new(args.tenant.clone()).ok_or_else(|| {
-        anyhow!(
-            "--tenant value '{}' is empty or has a null byte",
-            args.tenant
-        )
+    let rendered = render_to_bytes(
+        &args.id,
+        &args.db,
+        &args.tenant,
+        args.seller_toml.as_deref(),
+    )?;
+
+    fs::write(&args.out, &rendered.pdf_bytes)
+        .with_context(|| format!("write printed-invoice PDF to {}", args.out.display()))?;
+
+    tracing::info!(
+        invoice_id = %args.id,
+        out = %args.out.display(),
+        bytes = rendered.pdf_bytes.len(),
+        "printed-invoice PDF written"
+    );
+    println!(
+        "printed invoice {} -> {} ({} bytes)",
+        rendered.invoice_number,
+        args.out.display(),
+        rendered.pdf_bytes.len(),
+    );
+    Ok(())
+}
+
+/// Library-callable surface — produces the printed-invoice PDF bytes
+/// without touching the file system at the output side. Consumed by
+/// both [`run`] (which writes to `--out`) and the PR-44ε.UI
+/// `GET /api/invoices/:id/pdf` route (which streams the bytes to the
+/// browser).
+///
+/// The on-disk reads — audit ledger, NAV body byte-verbatim, seller
+/// TOML — are unchanged from the pre-PR-44ε.UI shape per A155
+/// (printed-invoice render is byte-deterministic given a committed
+/// audit chain + the on-disk NAV body). The split is a refactor for
+/// caller polymorphism, NOT a posture change.
+///
+/// `invoice_id` shape per `find_invoice_draft`: the prefixed-ULID form
+/// the audit-ledger `InvoiceDraftCreated` payload's `invoice_id` field
+/// carries. Not validated here — the ledger walk returns a clean
+/// not-found error if no entry matches.
+///
+/// `seller_toml`: `Some(path)` for an explicit override (CLI's
+/// `--seller-toml` or the test fixture); `None` to fall back to
+/// `~/.aberp/<tenant>/seller.toml` per `resolve_seller_toml_path`.
+pub fn render_to_bytes(
+    invoice_id: &str,
+    db: &Path,
+    tenant: &str,
+    seller_toml: Option<&Path>,
+) -> Result<RenderedInvoice> {
+    let tenant_id = TenantId::new(tenant.to_string()).ok_or_else(|| {
+        anyhow!("--tenant value '{}' is empty or has a null byte", tenant)
     })?;
 
     // 1. Locate the InvoiceDraftCreated payload from the audit ledger.
@@ -83,9 +153,9 @@ pub fn run(args: &PrintInvoiceArgs) -> Result<()> {
     //    LedgerMeta surface; the print-invoice path does NOT write to
     //    the ledger so the hash is not load-bearing here.
     let binary_hash_bytes: BinaryHash = binary_hash::compute().context("compute binary hash")?;
-    let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
-        .with_context(|| format!("open audit ledger at {}", args.db.display()))?;
-    let draft = find_invoice_draft(&ledger, &args.id)?;
+    let ledger = Ledger::open(db, tenant_id, binary_hash_bytes)
+        .with_context(|| format!("open audit ledger at {}", db.display()))?;
+    let draft = find_invoice_draft(&ledger, invoice_id)?;
 
     // 2. Read the verbatim NAV body bytes off disk.
     let xml_path: PathBuf = draft
@@ -98,7 +168,7 @@ pub fn run(args: &PrintInvoiceArgs) -> Result<()> {
                  (pre-PR-18 entry); printed-invoice render requires the \
                  on-disk NAV body — recover the XML and pass --xml-path-override \
                  on a future PR-44ε.1.1 lift",
-                args.id
+                invoice_id
             )
         })?;
     let xml_bytes = fs::read(&xml_path)
@@ -111,13 +181,13 @@ pub fn run(args: &PrintInvoiceArgs) -> Result<()> {
     // 4. Resolve currency + rate metadata from the audit payload (NOT
     //    from the XML — the XML carries the wire body shape; the
     //    audit-ledger stamp is the regulatory record per ADR-0037 §3).
-    let currency = parse_currency_from_payload(&draft, args)?;
+    let currency = parse_currency_from_payload(&draft, invoice_id)?;
     let rate_metadata = build_rate_metadata_from_payload(&draft, currency)?;
 
     // 5. Read the seller-info TOML (bank account / IBAN / SWIFT — fields
     //    that don't appear on the NAV body but are on the printed
     //    invoice per the reference template).
-    let seller_toml_path = resolve_seller_toml_path(args)?;
+    let seller_toml_path = resolve_seller_toml_path(seller_toml, tenant)?;
     let seller_info = read_seller_toml(&seller_toml_path).with_context(|| {
         format!(
             "read seller-info TOML at {}",
@@ -175,24 +245,12 @@ pub fn run(args: &PrintInvoiceArgs) -> Result<()> {
         note: None,
     };
 
-    // 7. Render + write.
-    let bytes = render_invoice(&model).context("render printed-invoice PDF")?;
-    fs::write(&args.out, &bytes)
-        .with_context(|| format!("write printed-invoice PDF to {}", args.out.display()))?;
-
-    tracing::info!(
-        invoice_id = %args.id,
-        out = %args.out.display(),
-        bytes = bytes.len(),
-        "printed-invoice PDF written"
-    );
-    println!(
-        "printed invoice {} -> {} ({} bytes)",
-        parsed.invoice_number,
-        args.out.display(),
-        bytes.len(),
-    );
-    Ok(())
+    // 7. Render.
+    let pdf_bytes = render_invoice(&model).context("render printed-invoice PDF")?;
+    Ok(RenderedInvoice {
+        invoice_number: parsed.invoice_number,
+        pdf_bytes,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -232,7 +290,7 @@ fn find_invoice_draft(
 
 fn parse_currency_from_payload(
     payload: &InvoiceDraftCreatedPayload,
-    args: &PrintInvoiceArgs,
+    invoice_id: &str,
 ) -> Result<Currency> {
     // Pre-PR-44γ entries serialise with `currency: None`; treat as HUF
     // per the same convention `audit_payloads.rs` documents on the
@@ -244,7 +302,7 @@ fn parse_currency_from_payload(
             "InvoiceDraftCreated for {} has currency='{}'; PR-44ε.1 \
              renders the closed ADR-0037 §3 vocab only (HUF, EUR) — \
              a third currency variant is named-deferred per ADR-0037 §5",
-            args.id,
+            invoice_id,
             other
         )),
     }
@@ -634,15 +692,18 @@ pub struct SellerToml {
     pub swift_bic: Option<String>,
 }
 
-fn resolve_seller_toml_path(args: &PrintInvoiceArgs) -> Result<PathBuf> {
-    if let Some(p) = &args.seller_toml {
-        return Ok(p.clone());
+fn resolve_seller_toml_path(
+    explicit_override: Option<&Path>,
+    tenant: &str,
+) -> Result<PathBuf> {
+    if let Some(p) = explicit_override {
+        return Ok(p.to_path_buf());
     }
     let home = std::env::var("HOME")
         .map_err(|_| anyhow!("HOME environment variable not set; pass --seller-toml <PATH>"))?;
     Ok(PathBuf::from(home)
         .join(".aberp")
-        .join(&args.tenant)
+        .join(tenant)
         .join("seller.toml"))
 }
 
