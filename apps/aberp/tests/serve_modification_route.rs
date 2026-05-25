@@ -224,8 +224,8 @@ fn modification_route_rejects_ready_invoice_with_precondition_mismatch() {
 /// currency inside `run_single_tx`, leaving the operator's mistake
 /// invisible until the printed-invoice render diverged from
 /// expectations. CLAUDE.md rule 12: fail loud.
-#[test]
-fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
+#[tokio::test(flavor = "current_thread")]
+async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
     let dir = test_dir("modification-c6");
     let db_path = dir.join("aberp.duckdb");
     // A Finalized base must exist BOTH in the audit ledger AND in the
@@ -265,6 +265,7 @@ fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
         Actor::from_local_cli("sess".to_string(), "test-user"),
         &NeverProvider,
     )
+    .await
     .expect("issue base HUF invoice");
 
     // Find the base id from the audit ledger.
@@ -357,8 +358,9 @@ fn modification_route_returns_not_found_for_unknown_invoice() {
 /// fixture issues a HUF invoice (no rate fetch on the HUF branch
 /// per ADR-0037 §1).
 struct NeverProvider;
+#[async_trait::async_trait]
 impl aberp::mnb_rates_provider::MnbRatesProvider for NeverProvider {
-    fn fetch_official_rate(
+    async fn fetch_official_rate(
         &self,
         _currency: aberp_billing::Currency,
         _date: time::Date,

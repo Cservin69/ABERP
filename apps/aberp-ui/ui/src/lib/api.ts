@@ -365,20 +365,46 @@ export async function submitInvoice(
   });
 }
 
+/** PR-59 / session-79 — one parsed `<technicalValidationMessages>` block
+ * from NAV's `GeneralErrorResponse`. NAV emits one of these per validation
+ * rule that fired against the request; a 400 typically carries 3-10. The
+ * shape mirrors NAV's OSA 3.0 schema:
+ *
+ *   - `result_code` — `<validationResultCode>`: `"ERROR"` or `"WARN"`.
+ *   - `error_code`  — `<validationErrorCode>`: machine-readable code.
+ *   - `message`     — Hungarian-localized human description.
+ *   - `tag`         — XPath / element name the rule fired on.
+ *
+ * Each field is nullable because NAV occasionally omits fields for
+ * envelope-level rules. Mirrors `serve::TechnicalValidationBody`. */
+export interface NavTechnicalValidation {
+  result_code: string | null;
+  error_code: string | null;
+  message: string | null;
+  tag: string | null;
+}
+
 /** PR-58 / session-78 — typed shape for the backend's
  * `nav_upstream_fault` JSON body (HTTP 502). Returned by
  * `POST /invoices/:id/submit` when NAV's `tokenExchange` rejects the
  * request at the HTTP layer (signature mismatch, IP not whitelisted,
  * expired technical-user password, etc.). The `fault_code` /
- * `fault_message` pair is NAV's parsed diagnostic (Hungarian-localized
- * message when present); `raw_body_preview` is the first 500 chars of
- * the verbatim response body as a fallback when parsing did not find
- * a typed pair. Mirrors `serve::NavUpstreamFaultBody`. */
+ * `fault_message` pair is NAV's parsed top-level diagnostic (Hungarian-
+ * localized message when present); `raw_body_preview` is a prefix of
+ * the verbatim response body as a fallback when parsing did not find a
+ * typed pair. Mirrors `serve::NavUpstreamFaultBody`.
+ *
+ * PR-59 / session-79 — added `technical_validations`. For NAV's most
+ * common 400 (`fault_code=INVALID_REQUEST`) the top-level wrapper is
+ * generic; the per-rule diagnostic NAV actually emits lives inside the
+ * `<technicalValidationMessages>` array. The SPA's invoice-detail
+ * modal renders the list below the top-level fault headline. */
 export interface NavUpstreamFault {
   error: "nav_upstream_fault";
   status: number;
   fault_code: string | null;
   fault_message: string | null;
+  technical_validations: NavTechnicalValidation[];
   raw_body_preview: string;
 }
 
@@ -401,7 +427,15 @@ export function parseNavUpstreamFault(message: string): NavUpstreamFault | null 
       parsed !== null &&
       (parsed as { error?: unknown }).error === "nav_upstream_fault"
     ) {
-      return parsed as NavUpstreamFault;
+      const fault = parsed as NavUpstreamFault;
+      // PR-59 / session-79 — the backend sends an empty array for the
+      // no-technical-validations case, but a pre-PR-59 backend (or a
+      // future schema regression) might omit the field entirely.
+      // Normalise to `[]` so consumers can iterate without null-checks.
+      if (!Array.isArray(fault.technical_validations)) {
+        fault.technical_validations = [];
+      }
+      return fault;
     }
   } catch {
     // Not JSON — caller renders the raw string.

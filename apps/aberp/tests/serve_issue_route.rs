@@ -151,8 +151,9 @@ struct FakeMnbRates {
     calls: Mutex<Vec<(Currency, Date)>>,
 }
 
+#[async_trait::async_trait]
 impl MnbRatesProvider for FakeMnbRates {
-    fn fetch_official_rate(
+    async fn fetch_official_rate(
         &self,
         currency: Currency,
         date: Date,
@@ -174,8 +175,9 @@ impl MnbRatesProvider for FakeMnbRates {
 /// rate-fetch path is not entered.
 struct UnreachableProvider;
 
+#[async_trait::async_trait]
 impl MnbRatesProvider for UnreachableProvider {
-    fn fetch_official_rate(
+    async fn fetch_official_rate(
         &self,
         _currency: Currency,
         _date: Date,
@@ -195,8 +197,8 @@ impl MnbRatesProvider for UnreachableProvider {
 /// returns a non-empty summary. The returned `invoice_id` matches
 /// the prefixed-ULID shape; the NAV XML lands at the server-minted
 /// path (recorded on the draft payload's `nav_xml_path` field).
-#[test]
-fn issue_route_huf_happy_path_writes_audit_pair_and_xml() {
+#[tokio::test(flavor = "current_thread")]
+async fn issue_route_huf_happy_path_writes_audit_pair_and_xml() {
     let dir = test_dir("huf");
     // HOME redirect so the server-side `~/.aberp/serve/<tenant>/issued/`
     // path stays inside the test scratch directory. The redirect is
@@ -214,6 +216,7 @@ fn issue_route_huf_happy_path_writes_audit_pair_and_xml() {
         &UnreachableProvider,
         actor,
     )
+    .await
     .expect("HUF happy path must succeed");
 
     assert!(
@@ -259,8 +262,8 @@ fn issue_route_huf_happy_path_writes_audit_pair_and_xml() {
 /// NOT make any real network call (the fake provider is the only
 /// rate source). Mirrors the fake-provider pattern from
 /// `tests/issue_invoice_eur_offline.rs` per A140.
-#[test]
-fn issue_route_eur_happy_path_stamps_rate_metadata_on_draft() {
+#[tokio::test(flavor = "current_thread")]
+async fn issue_route_eur_happy_path_stamps_rate_metadata_on_draft() {
     let dir = test_dir("eur");
     std::env::set_var("HOME", &dir);
     write_fixture_seller_toml(&dir);
@@ -304,6 +307,7 @@ fn issue_route_eur_happy_path_stamps_rate_metadata_on_draft() {
         &provider,
         actor,
     )
+    .await
     .expect("EUR happy path must succeed");
 
     // Walk the ledger; find the matching draft entry; assert the
@@ -362,8 +366,8 @@ fn issue_route_eur_happy_path_stamps_rate_metadata_on_draft() {
 /// This test pins the library-helper layer's rejection so a
 /// regression at either layer (handler skipping validation OR
 /// library not rejecting) surfaces loud per CLAUDE.md rule 12.
-#[test]
-fn issue_route_rejects_empty_lines_with_loud_error() {
+#[tokio::test(flavor = "current_thread")]
+async fn issue_route_rejects_empty_lines_with_loud_error() {
     let dir = test_dir("invalid");
     std::env::set_var("HOME", &dir);
     let state = build_state(dir.join("aberp.duckdb"));
@@ -383,6 +387,7 @@ fn issue_route_rejects_empty_lines_with_loud_error() {
         &UnreachableProvider,
         actor,
     )
+    .await
     .expect_err("empty-lines request must fail loud");
     let msg = format!("{err:#}");
     assert!(
@@ -402,8 +407,8 @@ fn issue_route_rejects_empty_lines_with_loud_error() {
 /// sequence number. A regression that drops the gate would let a
 /// fresh draft land on disk and then fail at submit time — the
 /// pre-PR-50 failure mode the brief inverts.
-#[test]
-fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
+#[tokio::test(flavor = "current_thread")]
+async fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
     let dir = test_dir("malformed-supplier");
     std::env::set_var("HOME", &dir);
     let state = build_state(dir.join("aberp.duckdb"));
@@ -431,6 +436,7 @@ fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
         &UnreachableProvider,
         actor,
     )
+    .await
     .expect_err("malformed supplier tax number must fail loud");
     let msg = format!("{err:#}");
     assert!(

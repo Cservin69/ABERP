@@ -198,51 +198,244 @@ pub(crate) fn parse_result_block(
     }
 }
 
-/// PR-58 / session-78 — best-effort parse of a NAV error body into a
-/// `(fault_code, fault_message)` pair. Used on the non-2xx-HTTP path
-/// where the response is not guaranteed to be the OK-shape NAV envelope
-/// `parse_result_block` expects.
+/// PR-59 / session-79 — one repeated `<technicalValidationMessages>`
+/// block out of NAV's `GeneralErrorResponse`. NAV emits one of these
+/// per validation rule that fired; a single 400 rejection typically
+/// carries 3-10 of them. The four fields mirror NAV's OSA 3.0 schema
+/// exactly:
 ///
-/// Two body shapes are tolerated:
+///   - `result_code` — `<validationResultCode>`: `"ERROR"` or `"WARN"`.
+///   - `error_code` — `<validationErrorCode>`: NAV's machine-readable
+///     code (`SCHEMA_VIOLATION`, `SUPPLIER_ADDRESS`, etc.).
+///   - `message` — NAV's Hungarian-localized human-readable message.
+///   - `tag` — the XPath / element name the rule fired on.
+///
+/// All four are `Option` because NAV occasionally omits `tag` (for
+/// envelope-level rules with no associated element) or `validationErrorCode`
+/// (for terse `"WARN"`-class entries); the parser does not silently
+/// substitute defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TechnicalValidation {
+    pub result_code: Option<String>,
+    pub error_code: Option<String>,
+    pub message: Option<String>,
+    pub tag: Option<String>,
+}
+
+/// PR-59 / session-79 — typed shape of a parsed NAV fault body. The
+/// top-level `fault_code` / `fault_message` pair comes from the
+/// `<result>` block (NAV-OSA) OR `<s:Fault>` block (SOAP fallback);
+/// `technical_validations` is the per-rule list NAV emits inside
+/// `<technicalValidationMessages>` elements (the actual diagnostic for
+/// a 400 — `fault_code=INVALID_REQUEST` is just the generic wrapper).
+/// `body_preview` is the operator's fallback evidence when NAV returns
+/// a shape this parser does not recognise (HTML maintenance page,
+/// non-XML response, etc.).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NavFault {
+    pub fault_code: Option<String>,
+    pub fault_message: Option<String>,
+    pub technical_validations: Vec<TechnicalValidation>,
+    pub body_preview: String,
+}
+
+/// PR-58 / session-78 — best-effort parse of a NAV error body into a
+/// [`NavFault`]. Used on the non-2xx-HTTP path where the response is
+/// not guaranteed to be the OK-shape NAV envelope `parse_result_block`
+/// expects.
+///
+/// Two top-level shapes are tolerated:
 ///
 ///   1. `GeneralErrorResponse` with `<common:errorCode>` + `<common:message>`
-///      (NAV's typical OSA REST error shape — same fixture
-///      `GENERAL_ERROR_BODY` in this module's tests).
+///      + repeated `<technicalValidationMessages>` (NAV's typical OSA
+///      REST error shape — the technicalValidationMessages array carries
+///      the actual per-rule diagnostic).
 ///   2. SOAP `<s:Fault>` with `<faultcode>` + `<faultstring>` (and
 ///      possibly a nested `<detail><GeneralExceptionResponse><errorCode>`).
+///      No technicalValidationMessages on this path.
 ///
 /// `find_first_text` is namespace-blind (local-name match), so this
-/// helper picks up both shapes without an explicit XPath. If the body
-/// is not parseable XML at all, both fields come back `None` — the raw
-/// body preview on the error variant is the operator's fallback
-/// diagnostic.
-pub(crate) fn parse_nav_fault(xml: &[u8]) -> (Option<String>, Option<String>) {
+/// helper picks up both shapes without an explicit XPath. PR-59 /
+/// session-79 extends the prior tuple return with the parsed
+/// technical_validations array + an embedded body_preview so the
+/// downstream layers can render NAV's structured per-rule errors
+/// instead of just the generic `INVALID_REQUEST` wrapper.
+pub(crate) fn parse_nav_fault(xml: &[u8]) -> NavFault {
+    let mut out = NavFault {
+        body_preview: body_preview(xml),
+        ..NavFault::default()
+    };
     // Try the most-specific NAV-OSA shape first.
     let error_code = find_first_text(xml, "errorCode").ok().flatten();
     let message = find_first_text(xml, "message").ok().flatten();
     if error_code.is_some() || message.is_some() {
-        return (error_code, message);
+        out.fault_code = error_code;
+        out.fault_message = message;
+    } else {
+        // Fall back to SOAP-fault shape — `faultcode` + `faultstring`.
+        out.fault_code = find_first_text(xml, "faultcode").ok().flatten();
+        out.fault_message = find_first_text(xml, "faultstring").ok().flatten();
     }
-    // Fall back to SOAP-fault shape — `faultcode` + `faultstring`.
-    let faultcode = find_first_text(xml, "faultcode").ok().flatten();
-    let faultstring = find_first_text(xml, "faultstring").ok().flatten();
-    (faultcode, faultstring)
+    // Per-rule technical validation list. Parse independently of the
+    // top-level shape — NAV's `GeneralErrorResponse` carries both the
+    // result block AND the array; the SOAP-fault shape carries neither
+    // and this returns an empty Vec.
+    out.technical_validations = find_all_technical_validations(xml).unwrap_or_default();
+    out
 }
 
-/// PR-58 / session-78 — produce a short, log-safe preview of a NAV
-/// response body. UTF-8-lossy decode + first 500 chars + newline
-/// collapse so the value lands cleanly on one tracing log line. The
-/// audit-ledger gets the full verbatim bytes separately per ADR-0009 §8.
+/// PR-59 / session-79 — walk `xml` and collect every
+/// `<technicalValidationMessages>` block into a typed list. NAV's
+/// OSA 3.0 schema names this element as a repeating direct child of
+/// `<GeneralErrorResponse>`; this parser is namespace-blind (local-name
+/// match per [`local_name_matches`]) and tolerates the element appearing
+/// at any depth. Returns `Ok(Vec::new())` for bodies that contain no
+/// matching element.
+///
+/// Direct-children-only collection: text inside the outer block is
+/// captured only when it is the direct content of a known sub-element
+/// (`validationResultCode`, `validationErrorCode`, `message`, `tag`).
+/// This prevents the sibling-block `<message>` (inside `<result>`) from
+/// polluting the per-validation `message` field.
+fn find_all_technical_validations(
+    xml: &[u8],
+) -> Result<Vec<TechnicalValidation>, NavTransportError> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut out: Vec<TechnicalValidation> = Vec::new();
+
+    // block_depth == 0: outside any technicalValidationMessages element.
+    // block_depth == 1: inside the outer element (immediately before/
+    //                   between/after sub-element children).
+    // block_depth >= 2: inside a sub-element (text accumulates into
+    //                   `active_sub` of `current`).
+    let mut block_depth: u32 = 0;
+    let mut current = TechnicalValidation::default();
+    let mut active_sub: Option<&'static str> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let qualified = e.name();
+                let qualified = qualified.as_ref();
+                if block_depth == 0 {
+                    if local_name_matches(qualified, "technicalValidationMessages") {
+                        block_depth = 1;
+                        current = TechnicalValidation::default();
+                        active_sub = None;
+                    }
+                } else if block_depth == 1 {
+                    block_depth = 2;
+                    active_sub = sub_field_for(qualified);
+                } else {
+                    // Already deeper than a direct child — text inside a
+                    // grandchild does NOT accumulate into the per-
+                    // validation field. NAV's schema does not name any
+                    // grandchildren here, but the depth book-keeping
+                    // keeps the parser tolerant of a future shape change.
+                    block_depth += 1;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let qualified = e.name();
+                let qualified = qualified.as_ref();
+                if block_depth == 1
+                    && local_name_matches(qualified, "technicalValidationMessages")
+                {
+                    out.push(std::mem::take(&mut current));
+                    block_depth = 0;
+                    active_sub = None;
+                } else if block_depth >= 2 {
+                    block_depth -= 1;
+                    if block_depth == 1 {
+                        active_sub = None;
+                    }
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                // Self-closing element like `<ns2:tag/>` — record an
+                // empty-string value into the matching field so the
+                // operator sees the element WAS present (vs. NAV omitting
+                // it entirely, which leaves the field `None`).
+                if block_depth == 1 {
+                    let qualified = e.name();
+                    let qualified = qualified.as_ref();
+                    if let Some(field) = sub_field_for(qualified) {
+                        assign_sub_field(&mut current, field, String::new());
+                    }
+                }
+            }
+            Ok(Event::Text(t)) if block_depth == 2 && active_sub.is_some() => {
+                let unescaped = t
+                    .unescape()
+                    .map_err(|e| {
+                        NavTransportError::TokenExchangeResponseParse(format!(
+                            "XML text unescape failed in technicalValidationMessages: {e}"
+                        ))
+                    })?
+                    .into_owned();
+                let field = active_sub.expect("guarded by match");
+                assign_sub_field(&mut current, field, unescaped);
+            }
+            Ok(Event::Eof) => return Ok(out),
+            Err(e) => {
+                return Err(NavTransportError::TokenExchangeResponseParse(format!(
+                    "XML parse failed at position {} (technicalValidationMessages walk): {e}",
+                    reader.buffer_position()
+                )));
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
+fn sub_field_for(qualified: &[u8]) -> Option<&'static str> {
+    if local_name_matches(qualified, "validationResultCode") {
+        Some("result_code")
+    } else if local_name_matches(qualified, "validationErrorCode") {
+        Some("error_code")
+    } else if local_name_matches(qualified, "message") {
+        Some("message")
+    } else if local_name_matches(qualified, "tag") {
+        Some("tag")
+    } else {
+        None
+    }
+}
+
+fn assign_sub_field(current: &mut TechnicalValidation, field: &'static str, value: String) {
+    let slot = match field {
+        "result_code" => &mut current.result_code,
+        "error_code" => &mut current.error_code,
+        "message" => &mut current.message,
+        "tag" => &mut current.tag,
+        _ => return,
+    };
+    match slot {
+        Some(s) => s.push_str(&value),
+        None => *slot = Some(value),
+    }
+}
+
+/// PR-58 / session-78 — produce a log-safe preview of a NAV response
+/// body. UTF-8-lossy decode + newline collapse so the value lands cleanly
+/// on one tracing log line. PR-59 / session-79 — bump the cap from 500
+/// to 4000 chars so NAV's repeated `<technicalValidationMessages>` blocks
+/// fit in the preview (most NAV fault bodies are 1-2 KB; the 4000-char
+/// ceiling covers ~20 technical validations comfortably). The audit-
+/// ledger gets the full verbatim bytes separately per ADR-0009 §8.
 pub(crate) fn body_preview(xml: &[u8]) -> String {
     let s = String::from_utf8_lossy(xml);
     let collapsed: String = s
         .chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
         .collect();
-    if collapsed.chars().count() <= 500 {
+    if collapsed.chars().count() <= 4000 {
         collapsed
     } else {
-        collapsed.chars().take(500).collect::<String>() + "…"
+        collapsed.chars().take(4000).collect::<String>() + "…"
     }
 }
 
@@ -387,17 +580,24 @@ mod tests {
         ));
     }
 
-    // ── PR-58 / session-78: parse_nav_fault + body_preview ──────────
+    // ── PR-58 / session-78 + PR-59 / session-79:
+    //    parse_nav_fault + body_preview + technicalValidationMessages ──
 
     /// `GeneralErrorResponse`-shaped body — NAV's typical OSA REST
     /// error envelope. The parser must pull both `errorCode` and
     /// `message` out of the namespaced common prefix (local-name
-    /// match, namespace-blind).
+    /// match, namespace-blind). No technicalValidationMessages on
+    /// this fixture — that's pinned separately below.
     #[test]
     fn parse_nav_fault_extracts_general_error_shape() {
-        let (code, msg) = parse_nav_fault(GENERAL_ERROR_BODY);
-        assert_eq!(code.as_deref(), Some("INVALID_REQUEST_SIGNATURE"));
-        assert_eq!(msg.as_deref(), Some("The request signature does not match."));
+        let fault = parse_nav_fault(GENERAL_ERROR_BODY);
+        assert_eq!(fault.fault_code.as_deref(), Some("INVALID_REQUEST_SIGNATURE"));
+        assert_eq!(
+            fault.fault_message.as_deref(),
+            Some("The request signature does not match.")
+        );
+        assert!(fault.technical_validations.is_empty());
+        assert!(fault.body_preview.contains("INVALID_REQUEST_SIGNATURE"));
     }
 
     /// SOAP fault-shaped body — `<s:Envelope><s:Fault><faultcode>` +
@@ -422,29 +622,120 @@ mod tests {
     </s:Fault>\n\
   </s:Body>\n\
 </s:Envelope>";
-        let (code, msg) = parse_nav_fault(body.as_bytes());
-        assert_eq!(code.as_deref(), Some("s:Client"));
-        assert!(msg.as_deref().unwrap().contains("A kérés"));
+        let fault = parse_nav_fault(body.as_bytes());
+        assert_eq!(fault.fault_code.as_deref(), Some("s:Client"));
+        assert!(fault.fault_message.as_deref().unwrap().contains("A kérés"));
+        assert!(fault.technical_validations.is_empty());
     }
 
     /// Body the parser cannot extract anything from (HTML error page,
-    /// plain text, etc.) returns `(None, None)` — the caller renders
-    /// the raw body preview instead.
+    /// plain text, etc.) returns a fault with all four NAV fields
+    /// empty — the caller renders `body_preview` instead.
     #[test]
     fn parse_nav_fault_returns_none_for_unparseable_body() {
         let body = b"<html><body>500 Internal Server Error</body></html>";
-        let (code, msg) = parse_nav_fault(body);
-        assert!(code.is_none());
-        assert!(msg.is_none());
+        let fault = parse_nav_fault(body);
+        assert!(fault.fault_code.is_none());
+        assert!(fault.fault_message.is_none());
+        assert!(fault.technical_validations.is_empty());
+        assert!(fault.body_preview.contains("500 Internal Server Error"));
     }
 
-    /// `body_preview` caps at 500 chars + collapses newlines to spaces.
+    /// PR-59 / session-79 — the actual diagnostic for a NAV 400 lives
+    /// inside the `<technicalValidationMessages>` array, NOT the
+    /// top-level `<errorCode>` wrapper (which is just `INVALID_REQUEST`).
+    /// Fixture mirrors NAV's verbatim shape — three repeating blocks
+    /// at the same depth as `<result>`, namespaced `ns2:` prefix
+    /// (which the parser strips via local-name match). The parser
+    /// MUST collect all three with correct field-by-field values; a
+    /// regression that returns 0 or 1 entries silently drops NAV's
+    /// actual reject reason and is exactly the bug PR-59 closes.
+    #[test]
+    fn parse_nav_fault_extracts_three_technical_validation_messages() {
+        // Hungarian text exercised verbatim — NAV's localized messages
+        // are Hungarian and the parser must round-trip them losslessly.
+        // Plain `&str` rather than a `b"..."` raw byte string because
+        // the byte literal cannot carry non-ASCII characters.
+        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<GeneralErrorResponse xmlns=\"http://schemas.nav.gov.hu/OSA/3.0/api\"\n\
+                      xmlns:ns2=\"http://schemas.nav.gov.hu/NTCA/1.0/common\">\n\
+  <ns2:result>\n\
+    <ns2:funcCode>ERROR</ns2:funcCode>\n\
+    <ns2:errorCode>INVALID_REQUEST</ns2:errorCode>\n\
+    <ns2:message>Helytelen kérés!</ns2:message>\n\
+  </ns2:result>\n\
+  <technicalValidationMessages>\n\
+    <ns2:validationResultCode>ERROR</ns2:validationResultCode>\n\
+    <ns2:validationErrorCode>SCHEMA_VIOLATION</ns2:validationErrorCode>\n\
+    <ns2:message>Hiányzó kötelező mező: invoiceNumber</ns2:message>\n\
+    <ns2:tag>InvoiceData/invoiceNumber</ns2:tag>\n\
+  </technicalValidationMessages>\n\
+  <technicalValidationMessages>\n\
+    <ns2:validationResultCode>ERROR</ns2:validationResultCode>\n\
+    <ns2:validationErrorCode>SUPPLIER_ADDRESS</ns2:validationErrorCode>\n\
+    <ns2:message>A szállító címe nem érvényes.</ns2:message>\n\
+    <ns2:tag>invoiceMain/invoice/invoiceHead/supplierInfo/supplierAddress</ns2:tag>\n\
+  </technicalValidationMessages>\n\
+  <technicalValidationMessages>\n\
+    <ns2:validationResultCode>WARN</ns2:validationResultCode>\n\
+    <ns2:validationErrorCode>CUSTOMER_TAX_NUMBER</ns2:validationErrorCode>\n\
+    <ns2:message>A vevő adószám ellenőrzése nem sikerült.</ns2:message>\n\
+    <ns2:tag>invoiceMain/invoice/invoiceHead/customerInfo/customerTaxNumber</ns2:tag>\n\
+  </technicalValidationMessages>\n\
+</GeneralErrorResponse>";
+        let fault = parse_nav_fault(body.as_bytes());
+        // Top-level wrapper still parses out of <result>.
+        assert_eq!(fault.fault_code.as_deref(), Some("INVALID_REQUEST"));
+        assert_eq!(fault.fault_message.as_deref(), Some("Helytelen kérés!"));
+        // All three per-rule blocks parsed verbatim.
+        assert_eq!(fault.technical_validations.len(), 3);
+
+        let v0 = &fault.technical_validations[0];
+        assert_eq!(v0.result_code.as_deref(), Some("ERROR"));
+        assert_eq!(v0.error_code.as_deref(), Some("SCHEMA_VIOLATION"));
+        assert_eq!(
+            v0.message.as_deref(),
+            Some("Hiányzó kötelező mező: invoiceNumber")
+        );
+        assert_eq!(v0.tag.as_deref(), Some("InvoiceData/invoiceNumber"));
+
+        let v1 = &fault.technical_validations[1];
+        assert_eq!(v1.result_code.as_deref(), Some("ERROR"));
+        assert_eq!(v1.error_code.as_deref(), Some("SUPPLIER_ADDRESS"));
+        assert_eq!(v1.message.as_deref(), Some("A szállító címe nem érvényes."));
+        assert_eq!(
+            v1.tag.as_deref(),
+            Some("invoiceMain/invoice/invoiceHead/supplierInfo/supplierAddress")
+        );
+
+        let v2 = &fault.technical_validations[2];
+        assert_eq!(v2.result_code.as_deref(), Some("WARN"));
+        assert_eq!(v2.error_code.as_deref(), Some("CUSTOMER_TAX_NUMBER"));
+        assert_eq!(
+            v2.message.as_deref(),
+            Some("A vevő adószám ellenőrzése nem sikerült.")
+        );
+        assert_eq!(
+            v2.tag.as_deref(),
+            Some("invoiceMain/invoice/invoiceHead/customerInfo/customerTaxNumber")
+        );
+    }
+
+    /// `body_preview` caps at 4000 chars + collapses newlines to spaces.
+    /// PR-59 / session-79 — bumped from 500 to 4000 to fit NAV's
+    /// repeated `<technicalValidationMessages>` array in the fallback.
     #[test]
     fn body_preview_caps_long_input_and_collapses_newlines() {
-        let body = "x".repeat(600);
+        let body = "x".repeat(5000);
         let p = body_preview(body.as_bytes());
-        assert_eq!(p.chars().count(), 501); // 500 + the elision "…"
+        assert_eq!(p.chars().count(), 4001); // 4000 + the elision "…"
         assert!(p.ends_with('…'));
+
+        // A 3000-char body fits whole; nothing elided.
+        let body = "y".repeat(3000);
+        let p = body_preview(body.as_bytes());
+        assert_eq!(p.chars().count(), 3000);
+        assert!(!p.ends_with('…'));
 
         let multiline = b"line1\nline2\r\nline3";
         let p = body_preview(multiline);

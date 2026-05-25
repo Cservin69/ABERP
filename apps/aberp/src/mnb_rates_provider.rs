@@ -10,15 +10,6 @@
 //! path must run fully offline — the live test path (`MNB_LIVE_TEST=1`)
 //! from PR-44β is env-gated and not the default test surface.
 //!
-//! Per the session-51 brief's
-//! "Live MNB calls in tests" guidance, this module defines a small
-//! sync trait the issuance path consumes; the production impl wraps
-//! the async [`aberp_mnb_rates::MnbClient`] via a per-call `block_on`
-//! on a current-thread tokio runtime (matching the binary's existing
-//! pattern in submit_invoice / drain_submission_queue / etc.). The
-//! test impl is a `HashMap<(Currency, Date), Result<MnbRate>>`-backed
-//! fake — purely sync, no network, no runtime ceremony.
-//!
 //! # A140 — trait over direct injection
 //!
 //! The session-51 brief named two alternatives: a trait, or inject the
@@ -36,34 +27,56 @@
 //!    `dyn` boxing keeps the per-call site (`issue_invoice::run_with_provider`)
 //!    free of `MnbClient`-specific type ceremony.
 //!
-//! The trait is sync to match the surrounding `issue_invoice::run`
-//! pipeline (which today has no tokio runtime — the runtime is built
-//! only inside the submit / poll-ack subcommands per the existing
-//! pattern). The real-impl `block_on` is the standard binary-side
-//! sync↔async bridge.
+//! # PR-60 / session-80 — async-native trait
+//!
+//! Pre-PR-60 the trait was sync; the production impl owned a
+//! current-thread tokio runtime and `block_on`'d the async
+//! `MnbClient::fetch_official_rate` per call. That works for the CLI
+//! (called from sync `main`, outside any runtime), but the
+//! `POST /invoices/issue` route on the EUR branch reached this same
+//! impl from inside axum's already-running multi-thread runtime — at
+//! which point `block_on` panicked with the structural
+//! "Cannot start a runtime from within a runtime" error (same shape
+//! PR-56 / session-76 closed for the submit + poll path).
+//!
+//! Fix: lift the trait to `async fn fetch_official_rate(...)` via
+//! `#[async_trait]` (preserves dyn-compatibility — the serve route
+//! consumes the provider as `Box<dyn MnbRatesProvider>`). The
+//! production impl now holds only the `MnbClient` and `.await`s the
+//! crate's native-async fetch; the CLI's `issue_invoice::run` owns a
+//! current-thread runtime at the top-level and `block_on`s
+//! `issue_from_parsed` exactly once. The SPA's
+//! `handle_issue_invoice` `.await`s the same async pipeline directly.
 
 use aberp_billing::Currency;
 use aberp_mnb_rates::{MnbClient, MnbError, MnbRate};
+use async_trait::async_trait;
 use time::Date;
 
-/// Sync abstraction over MNB-rate fetching. The production impl wraps
-/// the real [`aberp_mnb_rates::MnbClient`] via a per-call `block_on`
-/// on a current-thread tokio runtime; the test impl returns canned
-/// values from a `HashMap`.
+/// Async abstraction over MNB-rate fetching. The production impl wraps
+/// the real [`aberp_mnb_rates::MnbClient`]; the test impl returns
+/// canned values from a `HashMap`.
 ///
 /// The error type is the same [`MnbError`] the `aberp-mnb-rates` crate
 /// emits — re-exported here without wrapping so the issuance path's
 /// walk-back loop pattern-matches on the same variants
 /// (`NoRateForCurrency` is the "walk back" signal; every other variant
 /// is an immediate loud-fail per ADR-0037 §4 invariant C2).
-pub trait MnbRatesProvider: Send {
+///
+/// The `Send + Sync` super-bounds + the `#[async_trait]` macro keep
+/// this trait dyn-compatible (the serve route's
+/// `build_live_provider_for_currency` returns
+/// `Box<dyn MnbRatesProvider>`) AND keep the resulting future `Send`
+/// (axum's handler bound requires `Future: Send`).
+#[async_trait]
+pub trait MnbRatesProvider: Send + Sync {
     /// Fetch the MNB official mid-rate for `currency` on `date`. The
     /// returned [`MnbRate::date`] may walk back to MNB's most-recent
     /// prior publication date if `date` was a non-publication day per
     /// ADR-0037 §2.b — consumers MUST read the returned date when
     /// populating the printed-invoice `Exchange-rate date` field per
     /// ADR-0037 §1.a.
-    fn fetch_official_rate(
+    async fn fetch_official_rate(
         &self,
         currency: Currency,
         date: Date,
@@ -71,42 +84,34 @@ pub trait MnbRatesProvider: Send {
 }
 
 /// Production impl backed by the real `aberp_mnb_rates::MnbClient`.
-/// Owns a current-thread tokio runtime (built once at construction);
-/// the per-call `block_on` runs the async `fetch_official_rate`
-/// without per-call runtime ceremony. Matching the existing binary-
-/// side pattern in `submit_invoice::run` etc. (each subcommand owns
-/// its own runtime) — but lifted to construction-time here because
-/// the issuance walk-back may call `fetch_official_rate` up to N
-/// times in one issuance (per A139's 7-day cap).
+/// Holds the client only — no internal runtime (PR-60 / session-80
+/// lifted the runtime ownership to the CLI's top-level `run`; the SPA
+/// handler reaches this impl via `.await` on axum's existing runtime).
 pub struct LiveMnbRatesProvider {
     client: MnbClient,
-    runtime: tokio::runtime::Runtime,
 }
 
 impl LiveMnbRatesProvider {
     /// Build a live provider targeting the public MNB endpoint with
     /// the default request timeout. Returns an `anyhow::Error` on
-    /// runtime-build failure (lifted to anyhow at the binary boundary
-    /// per ADR-0021 Part A item 2; runtime-build is rare OOM territory
-    /// and surfaces as the binary's top-level loud-fail).
+    /// client-build failure (lifted to anyhow at the binary boundary
+    /// per ADR-0021 Part A item 2; client-build failure is rare TLS /
+    /// reqwest territory and surfaces as the binary's top-level
+    /// loud-fail).
     pub fn new() -> anyhow::Result<Self> {
         use anyhow::Context;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("build tokio current-thread runtime for MNB rate fetch")?;
         let client = MnbClient::new().context("build MNB client")?;
-        Ok(Self { client, runtime })
+        Ok(Self { client })
     }
 }
 
+#[async_trait]
 impl MnbRatesProvider for LiveMnbRatesProvider {
-    fn fetch_official_rate(
+    async fn fetch_official_rate(
         &self,
         currency: Currency,
         date: Date,
     ) -> Result<MnbRate, MnbError> {
-        self.runtime
-            .block_on(self.client.fetch_official_rate(currency, date))
+        self.client.fetch_official_rate(currency, date).await
     }
 }

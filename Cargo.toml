@@ -71,6 +71,15 @@ publish = false
 # Async runtime — ADR-0021 Part A, item 1.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "time", "sync", "signal"] }
 
+# PR-60 / session-80 — `async-trait` is needed to declare `async fn`s on
+# the dyn-compatible `MnbRatesProvider` trait. Without it, native
+# `async fn` in trait methods would break object safety (the trait is
+# consumed via `Box<dyn MnbRatesProvider>` from the serve-route's
+# currency-discriminator). The macro de-sugars to `Pin<Box<dyn Future>>`
+# return types, preserving dyn-compatibility while keeping the trait
+# definition + impl sites readable.
+async-trait = "0.1"
+
 # Error crates — ADR-0021 Part A, item 2.
 # thiserror for library crates (crates/, modules/), anyhow for the binary boundary only.
 thiserror = "1"

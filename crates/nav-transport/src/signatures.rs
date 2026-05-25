@@ -9,7 +9,7 @@
 //!      / non-`manageAnnulment` operations the input is exactly:
 //!
 //!      ```text
-//!      requestId || requestTimestamp(YYYYMMDDhhmmss, UTC) || xmlSignKey
+//!      requestId || requestTimestamp(YYYY-MM-DDTHH:MM:SSZ, UTC) || xmlSignKey
 //!      ```
 //!
 //!      For `manageInvoice` and `manageAnnulment` the input is extended by a
@@ -76,7 +76,7 @@ pub fn password_hash(password: &[u8]) -> String {
 ///   request_id || request_timestamp || xml_sign_key
 ///
 /// `request_timestamp` must already be in the NAV-mandated form
-/// `YYYYMMDDhhmmss` UTC (see [`crate::soap::parts::request_timestamp`]).
+/// `YYYY-MM-DDTHH:MM:SSZ` UTC (see [`crate::soap::parts::request_timestamp`]).
 /// `xml_sign_key` is the bytes returned by
 /// `NavCredentials::sign_key_bytes()`.
 pub fn request_signature(request_id: &str, request_timestamp: &str, xml_sign_key: &[u8]) -> String {

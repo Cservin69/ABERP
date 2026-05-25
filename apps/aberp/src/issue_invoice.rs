@@ -57,6 +57,7 @@ use aberp_billing::{
 use aberp_mnb_rates::{MnbError, MnbRate, SOURCE as MNB_SOURCE};
 use aberp_nav_transport::NavCredentials;
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use duckdb::Connection;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -174,17 +175,32 @@ pub struct LineJson {
 pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
     // PR-44γ — construct the production MNB-rates provider only when
     // the EUR (non-HUF) path actually needs one. The HUF path stays
-    // network-free (no reqwest::Client built, no tokio runtime
-    // spawned); a hypothetical `reqwest::Client::builder().build()`
-    // failure does NOT loud-fail a HUF issuance.
-    match args.currency.to_billing_currency() {
-        Currency::Huf => run_with_provider(args, &NeverProvider),
-        _ => {
-            let provider = LiveMnbRatesProvider::new()
-                .context("build MNB rates provider for non-HUF issuance")?;
-            run_with_provider(args, &provider)
+    // network-free (no reqwest::Client built); a hypothetical
+    // `reqwest::Client::builder().build()` failure does NOT loud-fail
+    // a HUF issuance.
+    //
+    // PR-60 / session-80 — the issuance pipeline (`issue_from_parsed`)
+    // is now async-native because `MnbRatesProvider::fetch_official_rate`
+    // is async (it `.await`s `MnbClient::fetch_official_rate` directly,
+    // no inner runtime). The CLI owns the tokio runtime at this
+    // top-level boundary and `block_on`s the async pipeline exactly
+    // once — outside any pre-existing runtime, so no nested-runtime
+    // panic. Same shape as `submit_invoice::run` and `poll_ack::run`
+    // (PR-56 / session-76).
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio current-thread runtime for issue-invoice CLI")?;
+    runtime.block_on(async {
+        match args.currency.to_billing_currency() {
+            Currency::Huf => run_with_provider(args, &NeverProvider).await,
+            _ => {
+                let provider = LiveMnbRatesProvider::new()
+                    .context("build MNB rates provider for non-HUF issuance")?;
+                run_with_provider(args, &provider).await
+            }
         }
-    }
+    })
 }
 
 /// PR-44γ — stand-in [`MnbRatesProvider`] for the HUF code path.
@@ -196,8 +212,9 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
 /// call-count assertions on the fake provider.
 struct NeverProvider;
 
+#[async_trait]
 impl MnbRatesProvider for NeverProvider {
-    fn fetch_official_rate(
+    async fn fetch_official_rate(
         &self,
         _currency: Currency,
         _date: time::Date,
@@ -220,58 +237,69 @@ impl MnbRatesProvider for NeverProvider {
 /// allocation-and-NAV-XML pipeline moves to the library function so
 /// the new `POST /invoices/issue` route (`serve.rs::issue_invoice_request`)
 /// can call the same path without re-implementing it.
-pub fn run_with_provider<P: MnbRatesProvider>(
+pub async fn run_with_provider<P: MnbRatesProvider + ?Sized>(
     args: &IssueInvoiceArgs,
     provider: &P,
 ) -> Result<()> {
-    let _span = tracing::info_span!("issue_invoice").entered();
+    // PR-60 / session-80 — span is scoped via Instrument-on-the-future
+    // shape (NOT `.entered()`) so the !Send EnteredSpan guard does NOT
+    // cross the inner `.await`. Same fix shape as PR-56's poll_loop
+    // (session-76) — the structural invariant being preserved is that
+    // any code path reachable from the axum handler keeps a Send
+    // future across yield points.
+    use tracing::Instrument;
+    let span = tracing::info_span!("issue_invoice");
+    async move {
+        // 1. Read + parse the JSON input.
+        let input_bytes = std::fs::read(&args.r#in)
+            .with_context(|| format!("read input JSON from {}", args.r#in.display()))?;
+        let input: InvoiceInputJson =
+            serde_json::from_slice(&input_bytes).context("parse input JSON")?;
+        tracing::info!(lines = input.lines.len(), "JSON input parsed");
 
-    // 1. Read + parse the JSON input.
-    let input_bytes = std::fs::read(&args.r#in)
-        .with_context(|| format!("read input JSON from {}", args.r#in.display()))?;
-    let input: InvoiceInputJson =
-        serde_json::from_slice(&input_bytes).context("parse input JSON")?;
-    tracing::info!(lines = input.lines.len(), "JSON input parsed");
+        // 2. Load NAV credentials from the OS keychain BEFORE any DB write.
+        //    Per ADR-0009 §4 + ADR-0020 §3 + CLAUDE.md rule 12: a missing
+        //    keychain item is a hard error, not a silent fallback. Failing
+        //    here keeps the tenant DB pristine if credentials aren't set up.
+        //
+        //    The login is then the user_id baked into every audit-ledger
+        //    entry written by this CLI invocation (Actor::from_local_cli),
+        //    closing fortnightly review F15 — Actor::test_only is no longer
+        //    reachable on a production code path.
+        let credentials = NavCredentials::load_from_keychain(&args.tenant)
+            .context("load NAV credentials from OS keychain")?;
+        let session_id = Ulid::new().to_string();
+        let actor = Actor::from_local_cli(session_id, credentials.login());
+        tracing::info!(
+            tenant = %args.tenant,
+            session_id = %actor.session_id,
+            user_id = %actor.user_id,
+            "NAV credentials loaded; actor derived for this CLI invocation"
+        );
 
-    // 2. Load NAV credentials from the OS keychain BEFORE any DB write.
-    //    Per ADR-0009 §4 + ADR-0020 §3 + CLAUDE.md rule 12: a missing
-    //    keychain item is a hard error, not a silent fallback. Failing
-    //    here keeps the tenant DB pristine if credentials aren't set up.
-    //
-    //    The login is then the user_id baked into every audit-ledger
-    //    entry written by this CLI invocation (Actor::from_local_cli),
-    //    closing fortnightly review F15 — Actor::test_only is no longer
-    //    reachable on a production code path.
-    let credentials = NavCredentials::load_from_keychain(&args.tenant)
-        .context("load NAV credentials from OS keychain")?;
-    let session_id = Ulid::new().to_string();
-    let actor = Actor::from_local_cli(session_id, credentials.login());
-    tracing::info!(
-        tenant = %args.tenant,
-        session_id = %actor.session_id,
-        user_id = %actor.user_id,
-        "NAV credentials loaded; actor derived for this CLI invocation"
-    );
+        let summary = issue_from_parsed(
+            input,
+            &args.db,
+            &args.tenant,
+            &args.series,
+            args.currency.to_billing_currency(),
+            args.out.clone(),
+            actor,
+            provider,
+        )
+        .await?;
 
-    let summary = issue_from_parsed(
-        input,
-        &args.db,
-        &args.tenant,
-        &args.series,
-        args.currency.to_billing_currency(),
-        args.out.clone(),
-        actor,
-        provider,
-    )?;
-
-    // Match the XML's invoice-number format exactly (5-digit padding) so
-    // operator logs, audit entries, and the XML body all agree.
-    println!(
-        "issued invoice {} -> {} (audit chain verified)",
-        summary.invoice_number,
-        args.out.display(),
-    );
-    Ok(())
+        // Match the XML's invoice-number format exactly (5-digit padding) so
+        // operator logs, audit entries, and the XML body all agree.
+        println!(
+            "issued invoice {} -> {} (audit chain verified)",
+            summary.invoice_number,
+            args.out.display(),
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .instrument(span)
+    .await
 }
 
 /// PR-44ζ / session-59 — library-callable issuance entry. Consumed by
@@ -308,7 +336,7 @@ pub fn run_with_provider<P: MnbRatesProvider>(
 /// deterministic path under `~/.aberp/serve/<tenant>/issued/<ulid>.xml`
 /// (see `serve::issued_xml_path`).
 #[allow(clippy::too_many_arguments)]
-pub fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
+pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     input: InvoiceInputJson,
     db: &Path,
     tenant_str: &str,
@@ -410,12 +438,10 @@ pub fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     let rate_metadata: Option<RateMetadata> = if matches!(currency, Currency::Huf) {
         None
     } else {
-        Some(fetch_and_stamp_rate(
-            provider,
-            currency,
-            issue_date.date(),
-            &command.lines,
-        )?)
+        Some(
+            fetch_and_stamp_rate(provider, currency, issue_date.date(), &command.lines)
+                .await?,
+        )
     };
 
     let allocate_args = AllocateArgs {
@@ -778,7 +804,7 @@ fn percent_to_basis_points(percent: u16) -> u16 {
 ///   in our normalizer.
 /// - [`IssueRateError::HufOverflow`] — extreme operand combination
 ///   (loud-fail per CLAUDE.md rule 12 + §1.c arithmetic).
-pub fn fetch_and_stamp_rate<P: MnbRatesProvider + ?Sized>(
+pub async fn fetch_and_stamp_rate<P: MnbRatesProvider + ?Sized>(
     provider: &P,
     currency: Currency,
     supply_date: time::Date,
@@ -802,7 +828,7 @@ pub fn fetch_and_stamp_rate<P: MnbRatesProvider + ?Sized>(
             offset,
             "MNB walk-back fetch attempt"
         );
-        match provider.fetch_official_rate(currency, candidate) {
+        match provider.fetch_official_rate(currency, candidate).await {
             Ok(rate) => {
                 return finalize_rate(&rate, lines);
             }

@@ -853,6 +853,7 @@ mod tests {
             status: 500,
             fault_code: None,
             fault_message: None,
+            technical_validations: Vec::new(),
             body_preview: String::new(),
         };
         assert!(!is_transport_error(&err));

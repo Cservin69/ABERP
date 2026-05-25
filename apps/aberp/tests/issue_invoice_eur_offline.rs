@@ -109,8 +109,9 @@ impl FakeMnbRates {
     }
 }
 
+#[async_trait::async_trait]
 impl MnbRatesProvider for FakeMnbRates {
-    fn fetch_official_rate(
+    async fn fetch_official_rate(
         &self,
         currency: Currency,
         date: Date,
@@ -174,13 +175,14 @@ const SUPPLY_DATE: Date = time::macros::date!(2026 - 05 - 22);
 /// EUR happy path. Provider has a rate on the supply date; the
 /// stamped `RateMetadata` carries the rate, source, date, and
 /// round-half-even HUF-equivalent total.
-#[test]
-fn eur_happy_path_stamps_all_four_metadata_fields() {
+#[tokio::test(flavor = "current_thread")]
+async fn eur_happy_path_stamps_all_four_metadata_fields() {
     let provider =
         FakeMnbRates::empty().with_rate(Currency::Eur, SUPPLY_DATE, "405.230000");
     let lines = fixture_eur_lines();
 
     let metadata = fetch_and_stamp_rate(&provider, Currency::Eur, SUPPLY_DATE, &lines)
+        .await
         .expect("EUR happy path must succeed");
 
     use rust_decimal::Decimal;
@@ -203,14 +205,15 @@ fn eur_happy_path_stamps_all_four_metadata_fields() {
 /// EUR walk-back to D-1. Provider has no rate on the supply date
 /// but a rate on D-1; the helper walks back one day and uses the
 /// D-1 rate. The stamped `RateMetadata.date` IS D-1.
-#[test]
-fn eur_walks_back_to_d_minus_1_when_supply_date_has_no_rate() {
+#[tokio::test(flavor = "current_thread")]
+async fn eur_walks_back_to_d_minus_1_when_supply_date_has_no_rate() {
     let d_minus_1 = SUPPLY_DATE - time::Duration::days(1);
     let provider =
         FakeMnbRates::empty().with_rate(Currency::Eur, d_minus_1, "404.000000");
     let lines = fixture_eur_lines();
 
     let metadata = fetch_and_stamp_rate(&provider, Currency::Eur, SUPPLY_DATE, &lines)
+        .await
         .expect("walk-back to D-1 must succeed");
 
     assert_eq!(
@@ -235,12 +238,13 @@ fn eur_walks_back_to_d_minus_1_when_supply_date_has_no_rate() {
 /// helper loud-fails with the named substring per ADR-0037 §4
 /// invariant C2; the call count proves the cap was traversed in
 /// full.
-#[test]
-fn eur_walk_back_exhausted_loud_fails_with_named_sentinel() {
+#[tokio::test(flavor = "current_thread")]
+async fn eur_walk_back_exhausted_loud_fails_with_named_sentinel() {
     let provider = FakeMnbRates::empty();
     let lines = fixture_eur_lines();
 
     let err = fetch_and_stamp_rate(&provider, Currency::Eur, SUPPLY_DATE, &lines)
+        .await
         .expect_err("walk-back exhausted MUST loud-fail per C2");
     let msg = format!("{:#}", err);
     assert!(
@@ -271,12 +275,13 @@ fn eur_walk_back_exhausted_loud_fails_with_named_sentinel() {
 /// walk-back — that posture is only for `NoRateForCurrency`. The
 /// loud-fail message carries the named transport-failure sentinel
 /// per the C2 invariant.
-#[test]
-fn eur_mnb_envelope_parse_failure_propagates_without_walk_back() {
+#[tokio::test(flavor = "current_thread")]
+async fn eur_mnb_envelope_parse_failure_propagates_without_walk_back() {
     let provider = FakeMnbRates::empty().poisoned(MnbErrorKind::EnvelopeParse);
     let lines = fixture_eur_lines();
 
     let err = fetch_and_stamp_rate(&provider, Currency::Eur, SUPPLY_DATE, &lines)
+        .await
         .expect_err("envelope-parse fault must propagate without walk-back");
     let msg = format!("{:#}", err);
     assert!(
@@ -300,12 +305,13 @@ fn eur_mnb_envelope_parse_failure_propagates_without_walk_back() {
 /// for MNB) propagates the same way as envelope-parse. Confirms the
 /// loud-fail behaviour is uniform across non-`NoRateForCurrency`
 /// variants.
-#[test]
-fn eur_mnb_soap_fault_failure_propagates_without_walk_back() {
+#[tokio::test(flavor = "current_thread")]
+async fn eur_mnb_soap_fault_failure_propagates_without_walk_back() {
     let provider = FakeMnbRates::empty().poisoned(MnbErrorKind::SoapFault);
     let lines = fixture_eur_lines();
 
     let err = fetch_and_stamp_rate(&provider, Currency::Eur, SUPPLY_DATE, &lines)
+        .await
         .expect_err("SOAP fault must propagate without walk-back");
     let msg = format!("{:#}", err);
     assert!(
@@ -326,15 +332,16 @@ fn eur_mnb_soap_fault_failure_propagates_without_walk_back() {
 /// Fixture: provider returns NoRateForCurrency on supply-date and
 /// D-1, then poisons on D-2 onwards (via a hand-crafted custom
 /// provider).
-#[test]
-fn eur_mid_walk_back_transport_failure_surfaces_typed() {
+#[tokio::test(flavor = "current_thread")]
+async fn eur_mid_walk_back_transport_failure_surfaces_typed() {
     // Custom provider: walks-back-then-poisons.
     struct PoisonAfterN {
         no_rate_until_offset: u32,
         calls: Mutex<u32>,
     }
+    #[async_trait::async_trait]
     impl MnbRatesProvider for PoisonAfterN {
-        fn fetch_official_rate(
+        async fn fetch_official_rate(
             &self,
             _currency: Currency,
             date: Date,
@@ -365,6 +372,7 @@ fn eur_mid_walk_back_transport_failure_surfaces_typed() {
     let lines = fixture_eur_lines();
 
     let err = fetch_and_stamp_rate(&provider, Currency::Eur, SUPPLY_DATE, &lines)
+        .await
         .expect_err("mid-walk-back transport fault must surface typed");
     let msg = format!("{:#}", err);
     assert!(

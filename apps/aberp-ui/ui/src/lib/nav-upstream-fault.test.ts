@@ -61,11 +61,68 @@ describe("parseNavUpstreamFault", () => {
       'backend returned 502 Bad Gateway for /invoices/01HX.../submit: ' +
       '{"error":"nav_upstream_fault","status":500,' +
       '"fault_code":null,"fault_message":null,' +
+      '"technical_validations":[],' +
       '"raw_body_preview":"<html><body>NAV maintenance</body></html>"}';
     const fault = parseNavUpstreamFault(wrapped);
     expect(fault).not.toBeNull();
     expect(fault?.fault_code).toBeNull();
     expect(fault?.fault_message).toBeNull();
+    expect(fault?.technical_validations).toEqual([]);
     expect(fault?.raw_body_preview).toContain("NAV maintenance");
+  });
+
+  it("extracts the technical_validations array with per-rule fields", () => {
+    // PR-59 / session-79 — NAV's `INVALID_REQUEST` top-level wrapper is
+    // generic; the actual per-rule diagnostic NAV emits for a 400 lives
+    // inside the repeated `<technicalValidationMessages>` array. The
+    // backend parses and forwards the list as a flat JSON array; the
+    // SPA renders each as a row in the fault panel. Regression posture:
+    // a parser that returns this array empty silently drops the actual
+    // reject reason — exactly the bug PR-59 closes.
+    const wrapped =
+      'backend returned 502 Bad Gateway for /invoices/01HX.../submit: ' +
+      '{"error":"nav_upstream_fault","status":400,' +
+      '"fault_code":"INVALID_REQUEST","fault_message":"Helytelen kérés!",' +
+      '"technical_validations":[' +
+      '{"result_code":"ERROR","error_code":"SCHEMA_VIOLATION",' +
+      '"message":"Hiányzó kötelező mező: invoiceNumber",' +
+      '"tag":"InvoiceData/invoiceNumber"},' +
+      '{"result_code":"WARN","error_code":"CUSTOMER_TAX_NUMBER",' +
+      '"message":"A vevő adószám ellenőrzése nem sikerült.",' +
+      '"tag":"invoiceMain/invoice/invoiceHead/customerInfo/customerTaxNumber"}' +
+      '],"raw_body_preview":"<GeneralErrorResponse>...</GeneralErrorResponse>"}';
+    const fault = parseNavUpstreamFault(wrapped);
+    expect(fault).not.toBeNull();
+    expect(fault?.fault_code).toBe("INVALID_REQUEST");
+    expect(fault?.technical_validations).toHaveLength(2);
+    expect(fault?.technical_validations[0].result_code).toBe("ERROR");
+    expect(fault?.technical_validations[0].error_code).toBe("SCHEMA_VIOLATION");
+    expect(fault?.technical_validations[0].message).toBe(
+      "Hiányzó kötelező mező: invoiceNumber",
+    );
+    expect(fault?.technical_validations[0].tag).toBe(
+      "InvoiceData/invoiceNumber",
+    );
+    expect(fault?.technical_validations[1].result_code).toBe("WARN");
+    expect(fault?.technical_validations[1].error_code).toBe(
+      "CUSTOMER_TAX_NUMBER",
+    );
+  });
+
+  it("normalises a missing technical_validations field to an empty array", () => {
+    // Backwards-compatibility — a pre-PR-59 backend (or a schema
+    // regression that drops the field) MUST still parse cleanly so the
+    // SPA renderer can iterate without a null check. Loud regression
+    // pin: if the parser leaves the field `undefined`, the renderer's
+    // `{#each}` block crashes.
+    const wrapped =
+      'backend returned 502 Bad Gateway for /invoices/01HX.../submit: ' +
+      '{"error":"nav_upstream_fault","status":400,' +
+      '"fault_code":"INVALID_REQUEST_SIGNATURE",' +
+      '"fault_message":"signature mismatch",' +
+      '"raw_body_preview":"<x/>"}';
+    const fault = parseNavUpstreamFault(wrapped);
+    expect(fault).not.toBeNull();
+    expect(fault?.technical_validations).toEqual([]);
   });
 });

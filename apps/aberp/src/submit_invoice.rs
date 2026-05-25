@@ -81,7 +81,7 @@ use std::path::Path;
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
 use aberp_billing::{self as billing, IdempotencyKey, ReadyInvoice};
 use aberp_nav_transport::{
-    operations::{manage_invoice, token_exchange},
+    operations::{manage_invoice, token_exchange, TechnicalValidation},
     soap::{InvoiceOperation, ManageInvoiceItem},
     NavCredentials, NavEndpoint, NavTransport, NavTransportError,
 };
@@ -202,6 +202,7 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         }) => {
             // PR-58 / session-78 — operator-visible eprintln for the
@@ -209,17 +210,36 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
             // (when present) are the actionable diagnostic; the
             // body_preview is the fallback evidence when parsing
             // could not extract a typed pair.
+            // PR-59 / session-79 — also emit the per-rule
+            // technical_validations array NAV carried for the rejection.
+            // For `INVALID_REQUEST` (the most common NAV 400 wrapper)
+            // the validation list is the actual diagnostic; the
+            // top-level fault_code is just the generic envelope.
             eprintln!(
                 "submit-invoice FAILED at NAV tokenExchange (HTTP {}): \
-                 fault_code={} fault_message={} body_preview=`{}`",
+                 fault_code={} fault_message={} \
+                 technical_validations={} body_preview=`{}`",
                 status,
                 fault_code.as_deref().unwrap_or("<none>"),
                 fault_message.as_deref().unwrap_or("<none>"),
+                technical_validations.len(),
                 body_preview,
             );
+            for (i, v) in technical_validations.iter().enumerate() {
+                eprintln!(
+                    "  [{}] result_code={} error_code={} tag={} message={}",
+                    i,
+                    v.result_code.as_deref().unwrap_or("<none>"),
+                    v.error_code.as_deref().unwrap_or("<none>"),
+                    v.tag.as_deref().unwrap_or("<none>"),
+                    v.message.as_deref().unwrap_or("<none>"),
+                );
+            }
             Err(anyhow!(
                 "NAV tokenExchange returned HTTP {status} \
-                 (fault_code={fault_code:?})"
+                 (fault_code={fault_code:?}, \
+                 technical_validations={})",
+                technical_validations.len()
             ))
         }
         Err(SubmitFromInputsError::Other(e)) => Err(e),
@@ -280,6 +300,12 @@ pub struct SubmitFromInputs<'a> {
 /// password, signature drift). No audit-ledger entry is written for
 /// the tokenExchange failure path per ADR-0032 §1 — the invoice
 /// remains NeverSubmitted and is operator-retriable.
+///
+/// PR-59 / session-79 — extended with `technical_validations`. NAV's
+/// `INVALID_REQUEST` top-level wrapper is generic; the per-rule
+/// diagnostic lives inside the repeating `<technicalValidationMessages>`
+/// array (parser at `nav_transport::operations::parse_nav_fault`). The
+/// SPA renders the list inside the existing fault panel.
 #[derive(Debug)]
 pub enum SubmitFromInputsError {
     WireFailed {
@@ -292,6 +318,7 @@ pub enum SubmitFromInputsError {
         status: u16,
         fault_code: Option<String>,
         fault_message: Option<String>,
+        technical_validations: Vec<TechnicalValidation>,
         body_preview: String,
     },
     Other(anyhow::Error),
@@ -314,11 +341,13 @@ impl std::fmt::Display for SubmitFromInputsError {
                 status,
                 fault_code,
                 fault_message,
+                technical_validations,
                 body_preview,
             } => write!(
                 f,
                 "NAV tokenExchange returned HTTP {status} \
-                 (fault_code={fault_code:?}, fault_message={fault_message:?}) \
+                 (fault_code={fault_code:?}, fault_message={fault_message:?}, \
+                 technical_validations={technical_validations:?}) \
                  body_preview=`{body_preview}`"
             ),
             SubmitFromInputsError::Other(e) => write!(f, "{e:#}"),
@@ -446,11 +475,13 @@ pub async fn submit_from_inputs(
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         } => SubmitFromInputsError::NavUpstreamFault {
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         },
         PrepareError::Other(inner) => SubmitFromInputsError::Other(inner),
@@ -620,12 +651,14 @@ async fn prepare_for_attempt_audit(
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         }) => {
             tracing::error!(
                 status,
                 fault_code = ?fault_code,
                 fault_message = ?fault_message,
+                technical_validations = ?technical_validations,
                 body_preview = %body_preview,
                 "NAV tokenExchange rejected: non-2xx HTTP status"
             );
@@ -633,6 +666,7 @@ async fn prepare_for_attempt_audit(
                 status,
                 fault_code,
                 fault_message,
+                technical_validations,
                 body_preview,
             });
         }
@@ -679,6 +713,7 @@ enum PrepareError {
         status: u16,
         fault_code: Option<String>,
         fault_message: Option<String>,
+        technical_validations: Vec<TechnicalValidation>,
         body_preview: String,
     },
     Other(anyhow::Error),

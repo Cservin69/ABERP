@@ -2,7 +2,8 @@
 //!
 //!   - [`new_request_id`] — mint a fresh `requestId` for an outgoing call.
 //!   - [`request_timestamp`] — render an `OffsetDateTime` in the
-//!     `YYYYMMDDhhmmssZ` form NAV's `requestSignature` consumes.
+//!     `YYYY-MM-DDTHH:MM:SSZ` (extended ISO 8601) form NAV's
+//!     `GenericTimestampType` requires and `requestSignature` consumes.
 //!   - [`write_header`] — `<common:header>` block.
 //!   - [`write_user`] — `<common:user>` block.
 //!   - [`write_software`] — `<software>` self-identification block.
@@ -33,13 +34,14 @@ pub fn new_request_id() -> String {
     format!("REQ{}", Ulid::new())
 }
 
-/// Render a UTC timestamp in NAV's required `YYYYMMDDhhmmssZ` form.
+/// Render a UTC timestamp in NAV's required `YYYY-MM-DDTHH:MM:SSZ` form.
 ///
-/// NAV's v3.0 XSD `RequestTimestampType` is the basic-ISO-8601 compact
-/// form *with the literal `T` separator and trailing `Z`*. The format
-/// string is built inline because `time::format_description::well_known`
-/// does not include a constant for the NAV variant (well-known names are
-/// RFC3339 / ISO8601-extended / RFC2822, none of which match).
+/// NAV's v3.0 XSD `GenericTimestampType` (used by `<common:timestamp>`)
+/// pins the regex `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z` —
+/// extended ISO 8601 with the literal `T` separator and trailing `Z`.
+/// We emit the integer-second form; the optional milliseconds branch
+/// is unused (NAV accepts but does not require sub-second precision and
+/// adding it would needlessly broaden the signature input surface).
 ///
 /// **The same string MUST be fed to [`crate::signatures::request_signature`]
 /// — byte equality is load-bearing.** That's why the formatter lives in
@@ -50,7 +52,7 @@ pub fn request_timestamp(at: OffsetDateTime) -> Result<String, NavTransportError
     // but the type allows arbitrary offsets and we don't want to assume).
     let utc = at.to_offset(time::UtcOffset::UTC);
     Ok(format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         utc.year(),
         utc.month() as u8,
         utc.day(),
@@ -131,8 +133,13 @@ pub(super) fn write_user(
 pub(super) fn write_software(w: &mut Writer<&mut Vec<u8>>) -> Result<(), NavTransportError> {
     w.write_event(Event::Start(BytesStart::new("software")))
         .map_err(envelope_io)?;
-    // softwareId max 18 chars per XSD; the bare crate name fits.
-    write_default(w, "softwareId", "ABERP000000000001")?;
+    // softwareId XSD pattern is `[0-9A-Z\-]{18}` — EXACTLY 18 chars
+    // (length is pinned, not a max). NAV-test rejected the prior
+    // 17-char value `ABERP000000000001` with `SCHEMA_VIOLATION` on
+    // SoftwareIdType in session-81 / PR-61; the hyphen splits the
+    // ABERP brand prefix from a numeric build slot and keeps the
+    // string in the regex's character class.
+    write_default(w, "softwareId", "ABERP-000000000001")?;
     write_default(w, "softwareName", "ABERP")?;
     write_default(w, "softwareOperation", "LOCAL_SOFTWARE")?;
     write_default(w, "softwareMainVersion", env!("CARGO_PKG_VERSION"))?;
@@ -199,13 +206,13 @@ mod tests {
     }
 
     #[test]
-    fn request_timestamp_format_is_nav_compact_with_z() {
+    fn request_timestamp_format_is_nav_extended_iso_8601() {
         // 2026-05-20 12:34:56 UTC — pinned input, pinned output.
         // If the formatter ever drifts (off-by-one on month, missing Z,
-        // accidental dashes), this test fails before the first NAV call.
+        // wrong separators), this test fails before the first NAV call.
         let dt = time::macros::datetime!(2026-05-20 12:34:56 UTC);
         let s = request_timestamp(dt).expect("format");
-        assert_eq!(s, "20260520T123456Z");
+        assert_eq!(s, "2026-05-20T12:34:56Z");
     }
 
     #[test]
@@ -217,7 +224,36 @@ mod tests {
         // includes this exact string.
         let local = time::macros::datetime!(2026-05-20 14:34:56 +02:00);
         let s = request_timestamp(local).expect("format");
-        assert_eq!(s, "20260520T123456Z");
+        assert_eq!(s, "2026-05-20T12:34:56Z");
+    }
+
+    /// PR-61 pin: NAV's `GenericTimestampType` XSD regex is
+    /// `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z`. NAV-test
+    /// rejected the previous compact form (`20260525T161651Z`) with
+    /// `SCHEMA_VIOLATION` on this exact pattern. Hand-rolled character-
+    /// class check (no regex dep added) — verifies positions, separators,
+    /// and the trailing `Z` against the NAV pattern.
+    #[test]
+    fn request_timestamp_matches_nav_generic_timestamp_regex() {
+        let dt = time::macros::datetime!(2026-05-25 16:16:51 UTC);
+        let s = request_timestamp(dt).expect("format");
+        let bytes = s.as_bytes();
+        assert_eq!(bytes.len(), 20, "extended-form length is 20 chars: {s}");
+        for (i, b) in bytes.iter().enumerate() {
+            let ok = match i {
+                0..=3 | 5..=6 | 8..=9 | 11..=12 | 14..=15 | 17..=18 => b.is_ascii_digit(),
+                4 | 7 => *b == b'-',
+                10 => *b == b'T',
+                13 | 16 => *b == b':',
+                19 => *b == b'Z',
+                _ => unreachable!(),
+            };
+            assert!(
+                ok,
+                "byte {i} = {:?} violates NAV GenericTimestampType regex (got {s})",
+                *b as char
+            );
+        }
     }
 
     #[test]
@@ -285,5 +321,34 @@ mod tests {
         // shape, not exact value (otherwise the test churns on every
         // workspace version bump).
         assert!(s.contains("<softwareMainVersion>"));
+    }
+
+    /// PR-61 pin: NAV's `SoftwareIdType` XSD regex is
+    /// `[0-9A-Z\-]{18}` — EXACTLY 18 chars, uppercase alnum + hyphen.
+    /// NAV-test rejected the previous 17-char `ABERP000000000001` with
+    /// `SCHEMA_VIOLATION`. Hand-rolled character-class check.
+    #[test]
+    fn write_software_emits_softwareid_matching_nav_regex() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut w = Writer::new(&mut buf);
+        write_software(&mut w).expect("write");
+        let s = std::str::from_utf8(&buf).expect("UTF-8");
+
+        let open = s.find("<softwareId>").expect("softwareId open tag");
+        let close = s.find("</softwareId>").expect("softwareId close tag");
+        let value = &s[open + "<softwareId>".len()..close];
+
+        assert_eq!(
+            value.len(),
+            18,
+            "NAV SoftwareIdType pattern pins length to 18; got {} ({value})",
+            value.len()
+        );
+        assert!(
+            value
+                .chars()
+                .all(|c| matches!(c, '0'..='9' | 'A'..='Z' | '-')),
+            "NAV SoftwareIdType pattern is [0-9A-Z-]; got {value}"
+        );
     }
 }

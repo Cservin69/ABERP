@@ -697,9 +697,14 @@
              The backend returned HTTP 502 with the parsed fault_code +
              Hungarian-localized fault_message; render both prominently
              so the operator can act (e.g. IP whitelist mismatch,
-             expired technical-user password, signature drift). The raw
-             body preview is the fallback evidence for the cases NAV
-             returns a shape the backend parser does not recognise. -->
+             expired technical-user password, signature drift).
+             PR-59 / session-79 — also render the per-rule
+             technical_validations list NAV emits inside
+             <technicalValidationMessages>. For NAV's most common 400
+             (fault_code=INVALID_REQUEST) the top-level wrapper is
+             generic; the actual reject reason is in this list. The
+             raw body preview is the fallback evidence for the cases
+             NAV returns a shape the backend parser does not recognise. -->
         <div class="error download-error nav-fault" role="alert">
           <p class="nav-fault-headline">
             {mutationState.action === "submit"
@@ -717,11 +722,45 @@
             <dd>
               {mutationState.navFault.fault_message ?? "<no fault message>"}
             </dd>
-            <dt>Body preview</dt>
-            <dd>
-              <pre class="nav-fault-body">{mutationState.navFault.raw_body_preview}</pre>
-            </dd>
           </dl>
+          {#if mutationState.navFault.technical_validations.length > 0}
+            <p class="nav-fault-validations-heading">
+              NAV validation messages ({mutationState.navFault
+                .technical_validations.length})
+            </p>
+            <ul class="nav-fault-validations">
+              {#each mutationState.navFault.technical_validations as v, i (i)}
+                <li class="nav-fault-validation">
+                  <div class="nav-fault-validation-head">
+                    <span class="mono nav-fault-validation-code"
+                      >{v.error_code ?? "<no code>"}</span
+                    >
+                    {#if v.result_code}
+                      <span
+                        class="mono nav-fault-validation-result {v.result_code ===
+                        'WARN'
+                          ? 'warn'
+                          : 'error'}"
+                      >
+                        {v.result_code}
+                      </span>
+                    {/if}
+                  </div>
+                  {#if v.message}
+                    <p class="nav-fault-validation-message">{v.message}</p>
+                  {/if}
+                  {#if v.tag}
+                    <p class="mono nav-fault-validation-tag">{v.tag}</p>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+          <details class="nav-fault-body-details">
+            <summary>Body preview</summary>
+            <pre class="nav-fault-body">{mutationState.navFault
+                .raw_body_preview}</pre>
+          </details>
         </div>
       {:else}
         <p class="error download-error" role="alert">
@@ -1062,7 +1101,7 @@
   }
 
   .nav-fault-body {
-    margin: 0;
+    margin: var(--space-1) 0 0 0;
     padding: var(--space-1) var(--space-2);
     background: var(--color-surface);
     border-radius: var(--radius-sm, 3px);
@@ -1070,8 +1109,88 @@
     font-size: var(--type-size-xs);
     white-space: pre-wrap;
     word-break: break-word;
-    max-height: 8em;
+    max-height: 12em;
     overflow: auto;
+  }
+
+  /* PR-59 / session-79 — per-rule technical_validations list. Rendered
+   * BELOW the top-level fault_code / fault_message pair because NAV's
+   * generic INVALID_REQUEST wrapper is rarely actionable on its own —
+   * the operator's actual triage lives in the validation messages. */
+  .nav-fault-body-details {
+    margin-top: var(--space-2);
+  }
+
+  .nav-fault-body-details summary {
+    cursor: pointer;
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .nav-fault-validations-heading {
+    margin: var(--space-3) 0 var(--space-1) 0;
+    color: var(--color-text-secondary);
+    text-transform: uppercase;
+    font-size: var(--type-size-xs);
+    letter-spacing: 0.06em;
+  }
+
+  .nav-fault-validations {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .nav-fault-validation {
+    padding: var(--space-2);
+    background: var(--color-surface);
+    border-radius: var(--radius-sm, 3px);
+    border-left: 3px solid var(--color-signal-negative);
+  }
+
+  .nav-fault-validation-head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    margin-bottom: var(--space-1);
+  }
+
+  .nav-fault-validation-code {
+    font-size: var(--type-size-sm);
+    color: var(--color-text-strong);
+    font-weight: 600;
+  }
+
+  .nav-fault-validation-result {
+    font-size: var(--type-size-xs);
+    padding: 0 var(--space-1);
+    border-radius: var(--radius-sm, 3px);
+  }
+
+  .nav-fault-validation-result.error {
+    color: var(--color-signal-negative);
+    background: var(--color-signal-negative-bg, transparent);
+  }
+
+  .nav-fault-validation-result.warn {
+    color: var(--color-signal-caution, var(--color-text-secondary));
+  }
+
+  .nav-fault-validation-message {
+    margin: 0;
+    color: var(--color-text-strong);
+  }
+
+  .nav-fault-validation-tag {
+    margin: var(--space-1) 0 0 0;
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-xs);
+    word-break: break-all;
   }
 
   /* Two-column dt/dd grid for the invoice metadata. */

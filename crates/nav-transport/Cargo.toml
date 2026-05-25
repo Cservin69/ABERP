@@ -74,10 +74,12 @@ base64 = { workspace = true }
 # InvoiceData payload (`apps/aberp/src/nav_xml.rs`).
 quick-xml = { workspace = true }
 
-# Time formatting for the NAV requestTimestamp (YYYYMMDDhhmmss UTC per
-# ADR-0009 §4). Same crate ADR-0021 §A11 pins for RFC3339 elsewhere; the
-# format string is built inline because NAV's compact form does not have
-# a well-known constant in `time::format_description::well_known`.
+# Time formatting for the NAV requestTimestamp (extended ISO 8601,
+# `YYYY-MM-DDTHH:MM:SSZ` UTC per NAV `GenericTimestampType` XSD). Same
+# crate ADR-0021 §A11 pins for RFC3339 elsewhere; the format string is
+# built inline because NAV's pattern (integer-second, mandatory Z, no
+# offset variants) does not have a well-known constant in
+# `time::format_description::well_known`.
 time = { workspace = true }
 
 # ULID — minted as `requestId` for each NAV operation (ADR-0009 §4

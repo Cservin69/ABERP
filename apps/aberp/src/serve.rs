@@ -72,7 +72,9 @@ use std::sync::Arc;
 
 use aberp_audit_ledger::{Actor, Entry, EventKind, Ledger, TenantId};
 use aberp_billing::{self as billing, Currency, ReadyInvoice};
-use aberp_nav_transport::{NavCredentials, NavEndpoint, NavTransportError};
+use aberp_nav_transport::{
+    operations::TechnicalValidation, NavCredentials, NavEndpoint, NavTransportError,
+};
 use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Path as AxumPath, Query, State},
@@ -98,6 +100,7 @@ use crate::issue_invoice::{self, InvoiceInputJson};
 use crate::issue_modification;
 use crate::issue_storno;
 use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
+use async_trait::async_trait;
 use crate::nav_xml::{self, SupplierConfigError, SupplierInfo};
 use crate::partners::{self, Partner, PartnerInputs, ValidationError as PartnerValidationError};
 use crate::poll_ack;
@@ -2421,7 +2424,7 @@ async fn handle_issue_invoice(
 
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
 
-    match issue_invoice_request(&state, request, supplier, provider.as_ref(), actor) {
+    match issue_invoice_request(&state, request, supplier, provider.as_ref(), actor).await {
         Ok(summary) => Json(IssueInvoiceResponse {
             invoice_id: summary.invoice_id,
             invoice_number: summary.invoice_number,
@@ -2486,15 +2489,19 @@ enum IssueRequestValidationError {
 }
 
 /// PR-44ζ / session-59 — build the production `MnbRatesProvider` for
-/// the request's currency. The HUF branch returns `None`-equivalent
-/// (the NeverProvider sentinel inside `issue_invoice`); the EUR branch
-/// builds a `LiveMnbRatesProvider` with its own current-thread tokio
-/// runtime. Same shape as `issue_invoice::run` per the matching
-/// runtime-construction posture in `mnb_rates_provider`.
+/// the request's currency. The HUF branch returns the `NeverProvider`
+/// sentinel (any consult is a bug — the HUF issuance branch is
+/// rate-free per ADR-0037 §1); the EUR branch builds a
+/// `LiveMnbRatesProvider`.
 ///
 /// Returns `Box<dyn MnbRatesProvider>` so the call site can pass it to
 /// `issue_from_parsed`'s generic-over-`P` surface without duplicating
 /// the issuance-path code for the two currency branches.
+///
+/// PR-60 / session-80 — `LiveMnbRatesProvider::new` no longer builds a
+/// per-instance tokio runtime; the issuance pipeline is now async-
+/// native and `.await`s the underlying `MnbClient::fetch_official_rate`
+/// directly on the runtime owned by axum's request executor.
 fn build_live_provider_for_currency(
     currency: Currency,
 ) -> Result<Box<dyn MnbRatesProvider>> {
@@ -2515,8 +2522,9 @@ fn build_live_provider_for_currency(
 /// placeholder rate.
 struct NeverProvider;
 
+#[async_trait]
 impl MnbRatesProvider for NeverProvider {
-    fn fetch_official_rate(
+    async fn fetch_official_rate(
         &self,
         _currency: Currency,
         _date: time::Date,
@@ -2534,7 +2542,7 @@ impl MnbRatesProvider for NeverProvider {
 /// (`tests/serve_issue_route.rs`) can hit it with a fake
 /// `MnbRatesProvider` and a fixture `Actor` without spinning the
 /// HTTPS listener (same posture as `get_invoice_pdf` per A158).
-pub fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
+pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
     state: &AppState,
     request: IssueInvoiceRequest,
     supplier: issue_invoice::SupplierJson,
@@ -2584,6 +2592,7 @@ pub fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         actor,
         provider,
     )
+    .await
 }
 
 /// PR-47α / session-64 — given an issued NAV-XML path, return the
@@ -2729,12 +2738,14 @@ async fn handle_submit_invoice(
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         }) => nav_upstream_fault_response(
             "submit_invoice_request",
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         ),
         Err(SubmitRouteError::Other(e)) => internal_error("submit_invoice_request", e),
@@ -2794,12 +2805,14 @@ async fn handle_poll_ack(
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         }) => nav_upstream_fault_response(
             "poll_ack_request",
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         ),
         Err(SubmitRouteError::Other(e)) => internal_error("poll_ack_request", e),
@@ -2834,6 +2847,7 @@ pub enum SubmitRouteError {
         status: u16,
         fault_code: Option<String>,
         fault_message: Option<String>,
+        technical_validations: Vec<TechnicalValidation>,
         body_preview: String,
     },
     Other(anyhow::Error),
@@ -2971,11 +2985,13 @@ pub async fn submit_invoice_request(
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         } => SubmitRouteError::NavUpstreamFault {
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         },
         submit_invoice::SubmitFromInputsError::Other(inner) => SubmitRouteError::Other(inner),
@@ -3181,12 +3197,14 @@ async fn handle_storno_invoice(
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         }) => nav_upstream_fault_response(
             "storno_invoice_request",
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         ),
         Err(SubmitRouteError::Other(e)) => internal_error("storno_invoice_request", e),
@@ -3376,6 +3394,7 @@ pub enum ModificationRouteError {
         status: u16,
         fault_code: Option<String>,
         fault_message: Option<String>,
+        technical_validations: Vec<TechnicalValidation>,
         body_preview: String,
     },
     Other(anyhow::Error),
@@ -3402,11 +3421,13 @@ impl From<SubmitRouteError> for ModificationRouteError {
                 status,
                 fault_code,
                 fault_message,
+                technical_validations,
                 body_preview,
             } => ModificationRouteError::NavUpstreamFault {
                 status,
                 fault_code,
                 fault_message,
+                technical_validations,
                 body_preview,
             },
             SubmitRouteError::Other(inner) => ModificationRouteError::Other(inner),
@@ -3482,12 +3503,14 @@ async fn handle_modification_invoice(
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         }) => nav_upstream_fault_response(
             "modification_invoice_request",
             status,
             fault_code,
             fault_message,
+            technical_validations,
             body_preview,
         ),
         Err(ModificationRouteError::Other(e)) => {
@@ -4225,16 +4248,51 @@ fn internal_error(context_label: &'static str, e: anyhow::Error) -> Response {
 /// PR-58 / session-78 — typed JSON body for NAV upstream-fault rejection
 /// (HTTP-layer non-2xx returned by NAV's `tokenExchange`). Mapped to
 /// HTTP 502 (Bad Gateway): the local server processed the request fine,
-/// but the upstream NAV API rejected it. The four fields surface the
-/// operator-actionable diagnostic verbatim; the SPA's invoice-detail
-/// modal renders `fault_code` + `fault_message` prominently.
+/// but the upstream NAV API rejected it. The four top-level fields
+/// surface the operator-actionable diagnostic verbatim; the SPA's
+/// invoice-detail modal renders `fault_code` + `fault_message`
+/// prominently.
+///
+/// PR-59 / session-79 — extended with `technical_validations`, the per-
+/// rule list NAV emits inside repeated `<technicalValidationMessages>`
+/// elements. For NAV's most common 400 (`fault_code=INVALID_REQUEST`)
+/// this array is the ACTUAL diagnostic; the top-level is just the
+/// generic wrapper. Wire shape is a flat array of typed
+/// [`TechnicalValidationBody`] objects (snake_case fields match the
+/// SPA's TS interface in `nav-upstream-fault.test.ts`).
 #[derive(Serialize)]
 struct NavUpstreamFaultBody {
     error: &'static str,
     status: u16,
     fault_code: Option<String>,
     fault_message: Option<String>,
+    technical_validations: Vec<TechnicalValidationBody>,
     raw_body_preview: String,
+}
+
+/// PR-59 / session-79 — wire-shape mirror of
+/// [`aberp_nav_transport::operations::TechnicalValidation`]. A separate
+/// struct (vs. deriving `Serialize` on the crate type) keeps the
+/// nav-transport crate free of `serde` and lets the wire field names
+/// be controlled here (snake_case to match the SPA's TS interface
+/// `NavUpstreamFault.technical_validations`).
+#[derive(Serialize)]
+struct TechnicalValidationBody {
+    result_code: Option<String>,
+    error_code: Option<String>,
+    message: Option<String>,
+    tag: Option<String>,
+}
+
+impl From<TechnicalValidation> for TechnicalValidationBody {
+    fn from(v: TechnicalValidation) -> Self {
+        Self {
+            result_code: v.result_code,
+            error_code: v.error_code,
+            message: v.message,
+            tag: v.tag,
+        }
+    }
 }
 
 fn nav_upstream_fault_response(
@@ -4242,16 +4300,22 @@ fn nav_upstream_fault_response(
     status: u16,
     fault_code: Option<String>,
     fault_message: Option<String>,
+    technical_validations: Vec<TechnicalValidation>,
     body_preview: String,
 ) -> Response {
     tracing::error!(
         nav_status = status,
         fault_code = ?fault_code,
         fault_message = ?fault_message,
+        technical_validations_len = technical_validations.len(),
         body_preview = %body_preview,
         "NAV upstream fault in {}",
         context_label,
     );
+    let technical_validations: Vec<TechnicalValidationBody> = technical_validations
+        .into_iter()
+        .map(TechnicalValidationBody::from)
+        .collect();
     (
         StatusCode::BAD_GATEWAY,
         Json(NavUpstreamFaultBody {
@@ -4259,6 +4323,7 @@ fn nav_upstream_fault_response(
             status,
             fault_code,
             fault_message,
+            technical_validations,
             raw_body_preview: body_preview,
         }),
     )

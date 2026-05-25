@@ -39,6 +39,13 @@ aberp-nav-xsd-validator = { path = "../../crates/nav-xsd-validator" }
 # itself works against the trait so offline integration tests can
 # inject a fake provider.
 aberp-mnb-rates = { path = "../../crates/mnb-rates" }
+# PR-60 / session-80 — needed for the `#[async_trait]` macro on
+# `MnbRatesProvider`. The trait carries `async fn fetch_official_rate`
+# and is consumed both via generic-`P` static dispatch (issuance
+# pipeline) AND via `Box<dyn MnbRatesProvider>` (serve-route currency
+# discriminator); `async-trait` preserves dyn-compatibility under
+# native AFIT's RPITIT shape.
+async-trait = { workspace = true }
 # PR-44ε.1 — printed-invoice PDF renderer per ADR-0037 §1.a + ADR-0021
 # "Print rendering path" (A152). The binary's `print_invoice`
 # orchestrator builds `InvoiceModel` from the audit-ledger draft entry +

@@ -30,6 +30,8 @@
 
 use thiserror::Error;
 
+use crate::operations::TechnicalValidation;
+
 #[derive(Debug, Error)]
 pub enum NavTransportError {
     // ── 1. Trust-store construction (PR-7-A) ────────────────────────
@@ -140,19 +142,28 @@ pub enum NavTransportError {
     /// carried, which made every 400 from NAV indistinguishable from
     /// the next (the actual diagnostic — `INVALID_REQUEST_SIGNATURE` vs
     /// `IP_ADDRESS_NOT_AUTHORIZED` vs schema mismatch — lives in the
-    /// response body, and we were throwing it away). The body_preview
-    /// is a UTF-8-lossy first-500-chars slice so the error message is
-    /// inspectable from the log line alone; the parsed fault fields are
-    /// best-effort (`None` if NAV returned a non-XML body).
+    /// response body, and we were throwing it away).
+    ///
+    /// PR-59 / session-79 — extended again with `technical_validations`.
+    /// NAV's `INVALID_REQUEST` top-level wrapper is generic; the actual
+    /// per-rule diagnostic lives in the repeated
+    /// `<technicalValidationMessages>` array inside
+    /// `GeneralErrorResponse`. The parsed list (one
+    /// [`TechnicalValidation`] per rule that fired) is the operator's
+    /// actionable triage signal. The body_preview cap was also bumped
+    /// from 500 to 4000 chars in the same PR so the array fits in the
+    /// log line for the cases the parser cannot recognise.
     #[error(
         "tokenExchange returned non-success HTTP status: {status} \
-         (fault_code={fault_code:?}, fault_message={fault_message:?}) \
+         (fault_code={fault_code:?}, fault_message={fault_message:?}, \
+         technical_validations={technical_validations:?}) \
          body_preview=`{body_preview}`"
     )]
     TokenExchangeHttpStatus {
         status: u16,
         fault_code: Option<String>,
         fault_message: Option<String>,
+        technical_validations: Vec<TechnicalValidation>,
         body_preview: String,
     },
 

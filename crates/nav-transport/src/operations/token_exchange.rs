@@ -33,7 +33,7 @@ use crate::error::NavTransportError;
 use crate::soap;
 use crate::NavTransport;
 
-use super::{body_preview, find_first_text, parse_nav_fault, parse_result_block, NavResultBlock};
+use super::{find_first_text, parse_nav_fault, parse_result_block, NavResultBlock};
 
 /// Successful tokenExchange outcome. The token IS the secret the caller
 /// will include in the next modifying request; the verbatim bytes go to
@@ -108,17 +108,21 @@ pub async fn call(
         // now best-effort-parse the body for a NAV fault shape
         // (`<errorCode>` + `<message>` OR SOAP `<faultcode>` +
         // `<faultstring>`) and carry both the parsed pair AND a
-        // first-500-chars preview on the error variant. The verbatim
-        // bytes are NOT lost — the caller still receives them
-        // separately on its audit-payload path (a future audit
-        // amendment may attach the response_xml even on the
-        // tokenExchange failure path; out of scope for PR-58).
-        let (fault_code, fault_message) = parse_nav_fault(&response_xml);
+        // body preview on the error variant. PR-59 / session-79 —
+        // also carry the per-rule `<technicalValidationMessages>`
+        // array, which is where NAV's actual reject reason lives for
+        // a 400 (the top-level `<errorCode>` is just `INVALID_REQUEST`
+        // wrapper). The verbatim bytes are NOT lost — the caller still
+        // receives them separately on its audit-payload path (a future
+        // audit amendment may attach the response_xml even on the
+        // tokenExchange failure path; out of scope for PR-59).
+        let fault = parse_nav_fault(&response_xml);
         return Err(NavTransportError::TokenExchangeHttpStatus {
             status: status.as_u16(),
-            fault_code,
-            fault_message,
-            body_preview: body_preview(&response_xml),
+            fault_code: fault.fault_code,
+            fault_message: fault.fault_message,
+            technical_validations: fault.technical_validations,
+            body_preview: fault.body_preview,
         });
     }
 
