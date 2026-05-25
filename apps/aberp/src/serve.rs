@@ -106,7 +106,8 @@ use crate::setup_nav_credentials::{
     self, NavCredentialInputs, SetupCredentialsError,
 };
 use crate::setup_seller_info::{
-    self, FieldError as SellerFieldError, SellerInfoInputs, SetupSellerInfoError,
+    self, FieldError as SellerFieldError, SellerIdentity, SellerInfoInputs,
+    SetupSellerInfoError,
 };
 use crate::submit_invoice;
 
@@ -778,6 +779,19 @@ fn build_router(state: AppState) -> Router {
             "/api/setup-seller-info",
             post(handle_setup_seller_info),
         )
+        // PR-53 / session-73 — read-side counterparts of the two setup
+        // routes, plus the single-slot rotate route. All three are
+        // Ready-only + bearer-required (rotation happens after the
+        // wizard chain — A170 only applies to first-run-setup).
+        .route("/api/seller-info", get(handle_get_seller_info))
+        .route(
+            "/api/nav-credentials-status",
+            get(handle_get_nav_credentials_status),
+        )
+        .route(
+            "/api/rotate-nav-credential",
+            post(handle_rotate_nav_credential),
+        )
         // PR-48α / session-68 — partner CRUD. Five routes (list +
         // create on the collection; get + update + delete on the
         // resource), all require_ready + bearer auth — partners is a
@@ -1249,6 +1263,424 @@ pub fn setup_seller_info_request(
     );
 
     Ok(())
+}
+
+// ── PR-53 / session-73 — GET /api/seller-info ────────────────────────
+
+/// PR-53 / session-73 — read-only counterpart of the
+/// `POST /api/setup-seller-info` write route. Used by the SPA's
+/// Tenant Settings page (PR-53) to render the current saved values
+/// before the operator decides to edit any of them.
+///
+/// Wire shape mirrors `SetupSellerInfoRequest` (camelCase via serde
+/// rename to match the SPA composer is NOT used — the SPA owns the
+/// case mapping on the read side too, matching the
+/// `SetupSellerInfoRequest` direction).
+#[derive(Debug, Serialize)]
+pub struct SellerInfoResponse {
+    pub legal_name: String,
+    pub tax_number: String,
+    pub eu_vat_number: Option<String>,
+    pub address: SellerInfoAddress,
+    pub bank: SellerInfoBank,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SellerInfoAddress {
+    pub country_code: String,
+    pub postal_code: String,
+    pub city: String,
+    pub street: String,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct SellerInfoBank {
+    pub account_number: Option<String>,
+    pub iban: Option<String>,
+    pub name: Option<String>,
+    pub swift_bic: Option<String>,
+}
+
+/// PR-53 / session-73 — `GET /api/seller-info` handler. Returns the
+/// per-tenant seller.toml contents as JSON. The route requires the
+/// backend to be in `Ready` (bearer auth + ready-gate); the wizard
+/// path covers the not-yet-saved case via the boot-state
+/// `needs-seller-config` dispatch.
+///
+/// Failure modes:
+///   - `401` if bearer missing.
+///   - `503` if backend is in `NeedsSetup` / `NeedsSellerConfig`.
+///   - `404` if the file is unexpectedly missing (the boot gate
+///     should have caught this — the route surfaces a loud-fail
+///     message rather than synthesising defaults).
+///   - `500` on filesystem read errors.
+async fn handle_get_seller_info(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match seller_info_request(&state) {
+        Ok(Some(body)) => Json(body).into_response(),
+        Ok(None) => {
+            let path =
+                match setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str()) {
+                    Ok(p) => p,
+                    Err(e) => return internal_error("seller_toml_path_for_tenant", e),
+                };
+            (
+                StatusCode::NOT_FOUND,
+                Json(error_body(format!(
+                    "seller.toml at {} is missing or identity-incomplete; \
+                     re-run the seller-config wizard",
+                    path.display()
+                ))),
+            )
+                .into_response()
+        }
+        Err(e) => internal_error("seller_info_request", e),
+    }
+}
+
+/// PR-53 / session-73 — library helper backing
+/// [`handle_get_seller_info`]. Extracted as `pub` so the integration
+/// test in `tests/serve_settings_routes.rs` can hit it without
+/// spinning the HTTPS listener (A158 posture).
+///
+/// Returns `Ok(None)` when the per-tenant seller.toml is absent OR
+/// identity-incomplete; `Ok(Some(body))` when the file parses
+/// cleanly; `Err` on filesystem read errors (the route maps these
+/// to 500).
+pub fn seller_info_request(state: &AppState) -> Result<Option<SellerInfoResponse>> {
+    let path = setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str())
+        .context("resolve seller.toml path for /api/seller-info")?;
+    seller_info_request_from_path(&path)
+}
+
+/// PR-53 / session-73 — path-explicit sibling of
+/// [`seller_info_request`] for the integration tests (HOME-mutation-
+/// free per the session-58 path-override pattern).
+pub fn seller_info_request_from_path(
+    path: &std::path::Path,
+) -> Result<Option<SellerInfoResponse>> {
+    let identity = match setup_seller_info::read_seller_identity(path)? {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+    let bank = setup_seller_info::read_seller_bank(path)?;
+    Ok(Some(SellerInfoResponse {
+        legal_name: identity.legal_name,
+        tax_number: identity.tax_number,
+        eu_vat_number: identity.eu_vat_number,
+        address: SellerInfoAddress {
+            country_code: identity.address_country_code,
+            postal_code: identity.address_postal_code,
+            city: identity.address_city,
+            street: identity.address_street,
+        },
+        bank: SellerInfoBank {
+            account_number: bank.account_number,
+            iban: bank.iban,
+            name: bank.name,
+            swift_bic: bank.swift_bic,
+        },
+    }))
+}
+
+// ── PR-53 / session-73 — GET /api/nav-credentials-status ─────────────
+
+/// PR-53 / session-73 — per-item presence flags for the four NAV
+/// credential artifacts. The login VALUE is returned verbatim (it's
+/// not a secret — it's the operator-visible identifier the audit
+/// ledger stamps); the other three values are NEVER returned (they
+/// are secrets in the keychain; only presence-bool surfaces).
+#[derive(Debug, Serialize)]
+pub struct NavCredentialsStatusResponse {
+    pub login: bool,
+    pub password: bool,
+    pub sign_key: bool,
+    pub change_key: bool,
+    /// `Some(_)` iff the login is present; the SPA renders this as a
+    /// plain-text row next to the three masked secret rows.
+    pub login_value: Option<String>,
+}
+
+/// PR-53 / session-73 — `GET /api/nav-credentials-status` handler.
+/// Lets the SPA's NAV Credentials settings page render the four
+/// presence rows + the operator-visible login value without
+/// surfacing the three secret values.
+async fn handle_get_nav_credentials_status(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match nav_credentials_status_request(&state) {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => internal_error("nav_credentials_status_request", e),
+    }
+}
+
+/// PR-53 / session-73 — library helper backing
+/// [`handle_get_nav_credentials_status`]. Reads the four keychain
+/// entries (login value verbatim; three secrets as presence-bools
+/// only). `pub` for integration-test access (A158).
+pub fn nav_credentials_status_request(state: &AppState) -> Result<NavCredentialsStatusResponse> {
+    let tenant = state.tenant.as_str();
+    let (login, login_value) = match read_keychain_value(tenant, ITEM_LOGIN_NAME) {
+        ProbeResult::Present(v) => (true, Some(v)),
+        ProbeResult::Missing => (false, None),
+        ProbeResult::BackendError(e) => return Err(e.context("read login keychain entry")),
+    };
+    let password = probe_keychain_entry(tenant, ITEM_PASSWORD_NAME)
+        .context("probe password keychain entry")?;
+    let sign_key = probe_keychain_entry(tenant, ITEM_SIGN_KEY_NAME)
+        .context("probe sign_key keychain entry")?;
+    let change_key = probe_keychain_entry(tenant, ITEM_CHANGE_KEY_NAME)
+        .context("probe change_key keychain entry")?;
+    Ok(NavCredentialsStatusResponse {
+        login,
+        password,
+        sign_key,
+        change_key,
+        login_value,
+    })
+}
+
+/// PR-53 / session-73 — keychain item-name slugs used in the rotate
+/// route's wire body + this module's probe / write helpers. The
+/// authoritative keychain-entry strings live on
+/// `aberp_nav_transport::credentials::keychain::ITEM_*`; these
+/// short slugs are the SPA-facing identifiers (matched verbatim in
+/// the rotate route's request body's `item` discriminator).
+const ITEM_LOGIN_NAME: &str = "login";
+const ITEM_PASSWORD_NAME: &str = "password";
+const ITEM_SIGN_KEY_NAME: &str = "sign_key";
+const ITEM_CHANGE_KEY_NAME: &str = "change_key";
+
+/// PR-53 / session-73 — map a SPA-facing slug to the canonical
+/// keychain account-name constant. `None` if the slug is unrecognised
+/// (loud-fail at the route layer so an operator-typed body shape with
+/// a bogus `item` value surfaces a 400 rather than silently writing
+/// to a slot the audit-actor login can't read back).
+fn resolve_credential_item(slug: &str) -> Option<&'static str> {
+    use aberp_nav_transport::credentials::keychain::{
+        ITEM_CHANGE_KEY, ITEM_LOGIN, ITEM_PASSWORD, ITEM_SIGN_KEY,
+    };
+    match slug {
+        ITEM_LOGIN_NAME => Some(ITEM_LOGIN),
+        ITEM_PASSWORD_NAME => Some(ITEM_PASSWORD),
+        ITEM_SIGN_KEY_NAME => Some(ITEM_SIGN_KEY),
+        ITEM_CHANGE_KEY_NAME => Some(ITEM_CHANGE_KEY),
+        _ => None,
+    }
+}
+
+enum ProbeResult {
+    Present(String),
+    Missing,
+    BackendError(anyhow::Error),
+}
+
+/// Read one keychain entry and return its value if present. Used for
+/// the login slot (the only credential the SPA gets back verbatim).
+fn read_keychain_value(tenant: &str, slug: &str) -> ProbeResult {
+    use aberp_nav_transport::credentials::keychain::service_name;
+    let item = match resolve_credential_item(slug) {
+        Some(i) => i,
+        None => {
+            return ProbeResult::BackendError(anyhow!(
+                "unknown credential slug `{slug}` (programmer error — route layer should have gated)"
+            ));
+        }
+    };
+    let service = service_name(tenant);
+    let entry = match keyring::Entry::new(&service, item) {
+        Ok(e) => e,
+        Err(e) => {
+            return ProbeResult::BackendError(anyhow!(
+                "open keychain entry for service `{service}` item `{item}`: {e}"
+            ));
+        }
+    };
+    match entry.get_password() {
+        Ok(value) => ProbeResult::Present(value),
+        Err(keyring::Error::NoEntry) => ProbeResult::Missing,
+        Err(e) => ProbeResult::BackendError(anyhow!(
+            "read keychain entry `{item}` for service `{service}`: {e}"
+        )),
+    }
+}
+
+/// Probe an entry's presence without surfacing the value (used for
+/// the three secret slots).
+fn probe_keychain_entry(tenant: &str, slug: &str) -> Result<bool> {
+    use aberp_nav_transport::credentials::keychain::service_name;
+    let item = resolve_credential_item(slug)
+        .ok_or_else(|| anyhow!("unknown credential slug `{slug}`"))?;
+    let service = service_name(tenant);
+    let entry = keyring::Entry::new(&service, item)
+        .with_context(|| format!("open keychain entry for service `{service}` item `{item}`"))?;
+    match entry.get_password() {
+        Ok(_) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(e) => Err(anyhow!(
+            "probe keychain entry `{item}` for service `{service}`: {e}"
+        )),
+    }
+}
+
+// ── PR-53 / session-73 — POST /api/rotate-nav-credential ─────────────
+
+/// PR-53 / session-73 — request body for the single-slot rotate route.
+/// The SPA's NAV Credentials settings page POSTs one of these per
+/// "Rotate" button click so the operator can update an individual
+/// secret without re-entering the other three (which they probably
+/// don't remember; the wizard's all-four-required posture is
+/// first-run scope, not rotation scope).
+#[derive(Debug, Deserialize)]
+pub struct RotateNavCredentialRequest {
+    pub item: String,
+    pub new_value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RotateNavCredentialResponse {
+    ok: bool,
+    item: String,
+}
+
+/// PR-53 / session-73 — typed error from
+/// [`rotate_nav_credential_request`] so the handler can map
+/// validation arms to 400 and backend arms to 500.
+#[derive(Debug)]
+pub enum RotateNavCredentialError {
+    Validation(String),
+    Backend(anyhow::Error),
+}
+
+impl std::fmt::Display for RotateNavCredentialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RotateNavCredentialError::Validation(m) => write!(f, "{m}"),
+            RotateNavCredentialError::Backend(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for RotateNavCredentialError {}
+
+/// PR-53 / session-73 — handler. Ready-gated + bearer-required (this
+/// is NOT a first-run route; rotation only happens after the wizard
+/// chain). Validates the `item` slug + non-empty new_value, then
+/// writes the single keychain entry. The login slot rewrite also
+/// rebuilds the in-process `operator_login` so subsequent audit-actor
+/// derivations pick up the new value without a restart.
+async fn handle_rotate_nav_credential(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<RotateNavCredentialRequest>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match rotate_nav_credential_request(&state, &request.item, &request.new_value) {
+        Ok(slug) => Json(RotateNavCredentialResponse {
+            ok: true,
+            item: slug.to_string(),
+        })
+        .into_response(),
+        Err(RotateNavCredentialError::Validation(msg)) => {
+            (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response()
+        }
+        Err(RotateNavCredentialError::Backend(e)) => {
+            internal_error("rotate_nav_credential_request", e)
+        }
+    }
+}
+
+/// PR-53 / session-73 — library helper backing
+/// [`handle_rotate_nav_credential`]. Validates the slug + non-empty
+/// new_value, writes the keychain entry, and (for the login slot)
+/// refreshes the in-process `operator_login` so subsequent
+/// audit-actor derivations pick up the new value. Returns the
+/// resolved slug string on success.
+///
+/// `pub` for integration-test access (A158).
+pub fn rotate_nav_credential_request(
+    state: &AppState,
+    item_slug: &str,
+    new_value: &str,
+) -> std::result::Result<&'static str, RotateNavCredentialError> {
+    let item = resolve_credential_item(item_slug).ok_or_else(|| {
+        RotateNavCredentialError::Validation(format!(
+            "unknown credential item `{item_slug}` — accepted values: \
+             `login`, `password`, `sign_key`, `change_key`"
+        ))
+    })?;
+    if new_value.is_empty() {
+        return Err(RotateNavCredentialError::Validation(format!(
+            "new_value for item `{item_slug}` is empty"
+        )));
+    }
+
+    use aberp_nav_transport::credentials::keychain::service_name;
+    let service = service_name(state.tenant.as_str());
+    let entry = keyring::Entry::new(&service, item).map_err(|e| {
+        RotateNavCredentialError::Backend(anyhow!(
+            "open keychain entry for service `{service}` item `{item}`: {e}"
+        ))
+    })?;
+    entry.set_password(new_value).map_err(|e| {
+        RotateNavCredentialError::Backend(anyhow!(
+            "write keychain entry `{item}` for service `{service}`: {e}"
+        ))
+    })?;
+
+    // If the rotated slot is the login, refresh the cached operator_login
+    // on the boot_state so subsequent issuance / submit routes derive
+    // the audit actor from the new value.
+    if item_slug == ITEM_LOGIN_NAME {
+        let mut guard = state.boot_state.write().map_err(|e| {
+            RotateNavCredentialError::Backend(anyhow!(
+                "boot_state RwLock poisoned during login rotation: {e}"
+            ))
+        })?;
+        let next = match &*guard {
+            ServeBootState::Ready { .. } => ServeBootState::Ready {
+                operator_login: new_value.to_string(),
+            },
+            other => other.clone(),
+        };
+        *guard = next;
+    }
+
+    tracing::info!(
+        tenant = %state.tenant.as_str(),
+        item = item,
+        "NAV credential item rotated via /api/rotate-nav-credential"
+    );
+
+    // Return the canonical slug string (matches the request body's
+    // `item` field verbatim).
+    Ok(match item_slug {
+        ITEM_LOGIN_NAME => ITEM_LOGIN_NAME,
+        ITEM_PASSWORD_NAME => ITEM_PASSWORD_NAME,
+        ITEM_SIGN_KEY_NAME => ITEM_SIGN_KEY_NAME,
+        ITEM_CHANGE_KEY_NAME => ITEM_CHANGE_KEY_NAME,
+        _ => unreachable!("resolve_credential_item already validated"),
+    })
 }
 
 #[derive(Serialize)]
@@ -1741,9 +2173,16 @@ fn pdf_filename_for_invoice(invoice_number: &str) -> String {
 /// `series` is optional with a `"INV-default"` fallback so the SPA
 /// form does NOT have to expose a series-picker on the first cut —
 /// the CLI's default behaviour is preserved.
+/// PR-53 / session-73 — supplier removed from the wire shape. The
+/// SPA's IssueInvoice form no longer surfaces seller-info inputs;
+/// `issue_invoice_request` reads the per-tenant seller.toml server-
+/// side and synthesises the `SupplierJson` for `issue_from_parsed`.
+/// The setup-wizard chain (PR-46α + PR-51) guarantees the file is
+/// present and identity-complete before the backend reaches `Ready`,
+/// so a None branch in the synthesiser maps to the typed
+/// `missing_seller_config` 400.
 #[derive(Debug, Deserialize)]
 pub struct IssueInvoiceRequest {
-    pub supplier: issue_invoice::SupplierJson,
     pub customer: issue_invoice::CustomerJson,
     pub lines: Vec<issue_invoice::LineJson>,
     pub currency: Currency,
@@ -1819,6 +2258,67 @@ fn seller_toml_path_for_tenant(tenant: &str) -> String {
     format!("{home}/.aberp/{tenant}/seller.toml")
 }
 
+/// PR-53 / session-73 — read the per-tenant `seller.toml` identity
+/// block and synthesise the `SupplierJson` shape the issuance core
+/// expects. Used by `issue_invoice_request` + `modification_invoice_request`
+/// after PR-53 removed supplier from both wire shapes (cross-cutting
+/// fix per Ervin's "obsolete to retype seller on invoice form").
+///
+/// Returns the typed [`SupplierConfigError`] (matching the existing
+/// PR-50 surface) when:
+///   - the file is missing or unreadable → `MissingTaxNumber`
+///   - the identity block is incomplete → `MissingTaxNumber`
+///   - the persisted tax number fails the ADÓSZÁM shape gate →
+///     `MalformedTaxNumber`
+///
+/// The route handler maps the error to the typed
+/// `missing_seller_config` 400 body via the existing PR-50
+/// `IssueRequestValidationError::SupplierConfig` arm so the SPA's
+/// `parseMissingSellerConfigError` renders the config_path +
+/// sample_path hints inline.
+pub fn supplier_from_seller_toml(
+    tenant: &str,
+) -> std::result::Result<issue_invoice::SupplierJson, SupplierConfigError> {
+    let path = setup_seller_info::seller_toml_path_for_tenant(tenant)
+        .map_err(|_| SupplierConfigError::MissingTaxNumber)?;
+    supplier_from_seller_toml_path(&path)
+}
+
+/// PR-53 / session-73 — path-explicit sibling of
+/// [`supplier_from_seller_toml`]. Used by the integration tests
+/// (which can't safely mutate HOME under cargo's parallel test
+/// runner) per the session-58 `get_invoice_pdf(seller_toml_override)`
+/// precedent.
+pub fn supplier_from_seller_toml_path(
+    path: &std::path::Path,
+) -> std::result::Result<issue_invoice::SupplierJson, SupplierConfigError> {
+    let identity: SellerIdentity = setup_seller_info::read_seller_identity(path)
+        .map_err(|_| SupplierConfigError::MissingTaxNumber)?
+        .ok_or(SupplierConfigError::MissingTaxNumber)?;
+    let supplier_info = SupplierInfo {
+        tax_number: identity.tax_number.clone(),
+        name: identity.legal_name.clone(),
+        address_country_code: identity.address_country_code.clone(),
+        address_postal_code: identity.address_postal_code.clone(),
+        address_city: identity.address_city.clone(),
+        address_street: identity.address_street.clone(),
+    };
+    // Re-validate the persisted tax-number shape — a hand-edited
+    // seller.toml could carry a malformed value the wizard never
+    // wrote (the file is operator-editable after the wizard run).
+    nav_xml::validate_supplier_info(&supplier_info)?;
+    Ok(issue_invoice::SupplierJson {
+        tax_number: identity.tax_number,
+        name: identity.legal_name,
+        address: issue_invoice::AddressJson {
+            country_code: identity.address_country_code,
+            postal_code: identity.address_postal_code,
+            city: identity.address_city,
+            street: identity.address_street,
+        },
+    })
+}
+
 /// PR-50 / session-70 — repo-relative sample-template path the typed
 /// error names. Constructed from `CARGO_MANIFEST_DIR` at compile
 /// time so the operator-facing hint is correct in dev runs from any
@@ -1884,12 +2384,16 @@ async fn handle_issue_invoice(
         Err(IssueRequestValidationError::Plain(msg)) => {
             return (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response();
         }
-        Err(IssueRequestValidationError::SupplierConfig(supplier_err)) => {
-            // PR-50 / session-70 — typed 400 body the SPA's
-            // inline-error renderer detects (by the
-            // `missing_seller_config` discriminant) and surfaces
-            // with the config_path + sample_path hint instead of the
-            // bare anyhow string.
+    }
+
+    // PR-53 / session-73 — supplier read from seller.toml server-side
+    // instead of from the wire body. Any missing-file / malformed
+    // identity surfaces via the same typed 400 body the operator-
+    // typed shape gate emits, so the SPA's inline-error renderer
+    // shows the existing `config_path` + `sample_path` hints.
+    let supplier = match supplier_from_seller_toml(state.tenant.as_str()) {
+        Ok(s) => s,
+        Err(supplier_err) => {
             let body = TypedErrorBody {
                 error: ERR_MISSING_SELLER_CONFIG,
                 message: supplier_err.to_string(),
@@ -1898,7 +2402,7 @@ async fn handle_issue_invoice(
             };
             return (StatusCode::BAD_REQUEST, Json(body)).into_response();
         }
-    }
+    };
 
     let provider = match build_live_provider_for_currency(request.currency) {
         Ok(p) => p,
@@ -1907,7 +2411,7 @@ async fn handle_issue_invoice(
 
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
 
-    match issue_invoice_request(&state, request, provider.as_ref(), actor) {
+    match issue_invoice_request(&state, request, supplier, provider.as_ref(), actor) {
         Ok(summary) => Json(IssueInvoiceResponse {
             invoice_id: summary.invoice_id,
             invoice_number: summary.invoice_number,
@@ -1951,43 +2455,24 @@ fn validate_issue_request(
             "customer tax number (ADÓSZÁM) is required".to_string(),
         ));
     }
-    if request.supplier.name.trim().is_empty() {
-        return Err(IssueRequestValidationError::Plain(
-            "supplier name is required".to_string(),
-        ));
-    }
-    // PR-50 / session-70 — supplier tax-number SHAPE check happens
-    // via `nav_xml::validate_supplier_info` so the typed error
-    // surfaces with `config_path` + `sample_path`. The pre-existing
-    // empty-string check stays inside the supplier_config branch as
-    // `MissingTaxNumber` per the `SupplierConfigError` discriminant.
-    let supplier_for_check = SupplierInfo {
-        tax_number: request.supplier.tax_number.clone(),
-        name: request.supplier.name.clone(),
-        address_country_code: request.supplier.address.country_code.clone(),
-        address_postal_code: request.supplier.address.postal_code.clone(),
-        address_city: request.supplier.address.city.clone(),
-        address_street: request.supplier.address.street.clone(),
-    };
-    if let Err(e) = nav_xml::validate_supplier_info(&supplier_for_check) {
-        return Err(IssueRequestValidationError::SupplierConfig(e));
-    }
+    // PR-53 / session-73 — supplier validation moved off the wire
+    // shape. The synthesiser inside `issue_invoice_request` reads
+    // seller.toml and dispatches the same typed
+    // `missing_seller_config` 400 if the file is missing OR the tax
+    // number's shape fails.
     Ok(())
 }
 
 /// PR-50 / session-70 — typed validation error for the issue route.
-/// Two variants:
 ///
-///   - `Plain(String)` — every pre-PR-50 string-shape failure
-///     (empty customer name, etc.) maps to a generic 400 with the
-///     `{error}` body. Pin tests still pass on the legacy shape.
-///   - `SupplierConfig(SupplierConfigError)` — the supplier-shape
-///     branch the route handler maps to the typed
-///     `missing_seller_config` 400 body with the operator-actionable
-///     hint pointers.
+/// PR-53 / session-73 — narrowed to one variant after supplier moved
+/// off the wire shape. The supplier-config gate now fires inside
+/// [`supplier_from_seller_toml`] in the handler and surfaces the
+/// typed `missing_seller_config` 400 body directly, so the
+/// validation surface here is just the plain string-shape failures
+/// (empty lines / customer name / tax number).
 enum IssueRequestValidationError {
     Plain(String),
-    SupplierConfig(SupplierConfigError),
 }
 
 /// PR-44ζ / session-59 — build the production `MnbRatesProvider` for
@@ -2042,13 +2527,14 @@ impl MnbRatesProvider for NeverProvider {
 pub fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
     state: &AppState,
     request: IssueInvoiceRequest,
+    supplier: issue_invoice::SupplierJson,
     provider: &P,
     actor: Actor,
 ) -> Result<issue_invoice::IssuedInvoiceSummary> {
     let xml_path = mint_issued_xml_path(state.tenant.as_str())
         .context("mint server-side NAV-XML output path for issuance")?;
     let input = InvoiceInputJson {
-        supplier: request.supplier,
+        supplier,
         customer: request.customer,
         lines: request.lines,
     };
@@ -2749,7 +3235,6 @@ pub fn storno_invoice_request(
 /// defence-in-depth against a curl bypass.
 #[derive(Debug, Deserialize)]
 pub struct ModificationInvoiceRequest {
-    pub supplier: issue_invoice::SupplierJson,
     pub customer: issue_invoice::CustomerJson,
     pub lines: Vec<issue_invoice::LineJson>,
     pub currency: Currency,
@@ -2976,8 +3461,20 @@ pub fn modification_invoice_request(
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
 
     // 5. Build the parsed input shape the library helper expects.
+    //
+    //    PR-53 / session-73 — supplier resolved from the per-tenant
+    //    seller.toml instead of the wire body (cross-cutting fix for
+    //    the SPA's modification form which no longer surfaces seller
+    //    inputs). The seller.toml read failures bounce back as a
+    //    typed 400 via `ModificationRouteError::BadRequest` rather
+    //    than a 500 so the SPA's inline-error renderer stays
+    //    operator-actionable.
+    let supplier = supplier_from_seller_toml(state.tenant.as_str())
+        .map_err(|e| ModificationRouteError::BadRequest(format!(
+            "seller.toml identity unavailable for modification: {e}"
+        )))?;
     let input = InvoiceInputJson {
-        supplier: request.supplier,
+        supplier,
         customer: request.customer,
         lines: request.lines,
     };

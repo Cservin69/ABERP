@@ -43,9 +43,41 @@
     latestLogLine,
     type BootViewMode,
   } from "./lib/boot-status";
+  import {
+    currentRoute,
+    navigateTo,
+    routeHash,
+    subscribeRoute,
+    type AppRoute,
+  } from "./lib/router";
   import InvoiceList from "./routes/InvoiceList.svelte";
+  import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
+  import PartnersList from "./routes/PartnersList.svelte";
   import SellerConfigWizard from "./routes/SellerConfigWizard.svelte";
   import SetupWizard from "./routes/SetupWizard.svelte";
+  import TenantSettings from "./routes/TenantSettings.svelte";
+
+  // PR-53 / session-73 — hash-routing for the top-level navigation
+  // shell. Three routes (`invoices` / `tenant` / `nav-credentials`);
+  // the side-nav active item tracks `route`; deep-links into a
+  // specific route work via the hash on first paint. The router only
+  // takes effect once the backend reports Ready — pre-Ready, the
+  // wizard chain owns the main pane (the operator can't usefully
+  // navigate to settings without a session token).
+  let route: AppRoute = $state(currentRoute());
+  let unsubscribeRoute: (() => void) | null = null;
+
+  interface NavItem {
+    slug: AppRoute;
+    label: string;
+  }
+
+  const NAV_ITEMS: NavItem[] = [
+    { slug: "invoices", label: "Invoices" },
+    { slug: "partners", label: "Partners" },
+    { slug: "tenant", label: "Tenant settings" },
+    { slug: "nav-credentials", label: "NAV credentials" },
+  ];
 
   // Boot-lifecycle gate state. We default to a `starting` snapshot
   // so the loading pane renders on the first paint without flashing
@@ -77,11 +109,15 @@
     // looks like it's updating in near-real-time during cold boot,
     // slow enough that we're not hammering Tauri with invokes.
     bootPollTimer = setInterval(() => void pollBoot(), 300);
+    unsubscribeRoute = subscribeRoute((r) => {
+      route = r;
+    });
   });
 
   onDestroy(() => {
     if (bootPollTimer !== null) clearInterval(bootPollTimer);
     if (healthPollTimer !== null) clearInterval(healthPollTimer);
+    if (unsubscribeRoute !== null) unsubscribeRoute();
   });
 
   async function pollBoot() {
@@ -201,6 +237,55 @@
     {/if}
   </header>
 
+  {#if viewMode === "ready"}
+    <div class="layout">
+      <nav class="sidenav" aria-label="Primary">
+        <ul class="sidenav__list">
+          {#each NAV_ITEMS as item (item.slug)}
+            <li>
+              <a
+                class="sidenav__item"
+                href={routeHash(item.slug)}
+                aria-current={route === item.slug ? "page" : undefined}
+                onclick={(e) => {
+                  // The native `<a>` href on a hash link already
+                  // pushes to history; calling navigateTo here is
+                  // belt-and-suspenders for any test environment
+                  // (vitest jsdom) that doesn't fire hashchange.
+                  e.preventDefault();
+                  navigateTo(item.slug);
+                }}
+              >
+                {item.label}
+              </a>
+            </li>
+          {/each}
+        </ul>
+      </nav>
+      <main class="main">
+        {#if healthState === "error"}
+          <section class="banner" role="alert">
+            <strong>Backend is not responding.</strong>
+            <p class="banner-detail">{healthError}</p>
+            <p class="banner-hint">
+              Run <code>aberp serve --tenant default</code> in a terminal at least
+              once so the session token is minted in the OS keychain, then
+              relaunch this shell.
+            </p>
+          </section>
+        {/if}
+        {#if route === "tenant"}
+          <TenantSettings />
+        {:else if route === "nav-credentials"}
+          <NavCredentialsSettings />
+        {:else if route === "partners"}
+          <PartnersList />
+        {:else}
+          <InvoiceList />
+        {/if}
+      </main>
+    </div>
+  {:else}
   <main>
     {#if viewMode === "setup"}
       <SetupWizard />
@@ -261,21 +346,9 @@
           </details>
         {/if}
       </section>
-    {:else}
-      {#if healthState === "error"}
-        <section class="banner" role="alert">
-          <strong>Backend is not responding.</strong>
-          <p class="banner-detail">{healthError}</p>
-          <p class="banner-hint">
-            Run <code>aberp serve --tenant default</code> in a terminal at least
-            once so the session token is minted in the OS keychain, then
-            relaunch this shell.
-          </p>
-        </section>
-      {/if}
-      <InvoiceList />
     {/if}
   </main>
+  {/if}
 </div>
 
 <style>
@@ -334,6 +407,57 @@
 
   main {
     flex: 1;
+    padding: var(--space-5);
+    overflow: auto;
+  }
+
+  /* PR-53 / session-73 — top-level layout with the side-nav (left)
+   * and the route's main pane (right). Two-column grid; the side-nav
+   * carries its own background to read as chrome against the
+   * existing dark theme. */
+  .layout {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    min-height: 0;
+  }
+
+  .sidenav {
+    background: var(--color-surface-raised);
+    border-right: 1px solid var(--color-surface-divider);
+    padding: var(--space-4) 0;
+  }
+
+  .sidenav__list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sidenav__item {
+    display: block;
+    padding: var(--space-2) var(--space-4);
+    color: var(--color-text-secondary);
+    text-decoration: none;
+    font-size: var(--type-size-sm);
+    border-left: 3px solid transparent;
+  }
+
+  .sidenav__item:hover {
+    color: var(--color-text-strong);
+    background: var(--color-surface-divider);
+  }
+
+  .sidenav__item[aria-current="page"] {
+    color: var(--color-text-strong);
+    border-left-color: var(--color-signal-positive, var(--color-text-strong));
+    background: var(--color-surface-divider);
+    font-weight: 500;
+  }
+
+  .main {
     padding: var(--space-5);
     overflow: auto;
   }

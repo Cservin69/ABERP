@@ -106,12 +106,34 @@ fn fixture_lines() -> Vec<LineJson> {
 
 fn fixture_request(currency: Currency) -> IssueInvoiceRequest {
     IssueInvoiceRequest {
-        supplier: fixture_supplier(),
         customer: fixture_customer(),
         lines: fixture_lines(),
         currency,
         series: None,
     }
+}
+
+/// PR-53 / session-73 — write a fixture seller.toml so the route's
+/// new server-side seller read (`supplier_from_seller_toml`) finds an
+/// identity-complete file. The wizard chain (PR-46α + PR-51) gates
+/// the boot state on this in production; the integration tests build
+/// `AppState::Ready` directly so they have to seed the file
+/// themselves.
+fn write_fixture_seller_toml(home_dir: &std::path::Path) {
+    let tenant_dir = home_dir.join(".aberp").join(TEST_TENANT);
+    std::fs::create_dir_all(&tenant_dir).expect("create tenant dir for seller.toml fixture");
+    let body = r#"[seller]
+legal_name = "ABERP Supplier Kft."
+tax_number = "12345678-1-42"
+
+[seller.address]
+country_code = "HU"
+postal_code = "1011"
+city = "Budapest"
+street = "Fő utca 1."
+"#;
+    std::fs::write(tenant_dir.join("seller.toml"), body)
+        .expect("write seller.toml fixture");
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -181,12 +203,14 @@ fn issue_route_huf_happy_path_writes_audit_pair_and_xml() {
     // process-wide but this test file has only the three serial tests
     // below and none of them depend on $HOME beyond this redirect.
     std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
     let state = build_state(dir.join("aberp.duckdb"));
     let actor = Actor::from_local_cli("test-session".to_string(), "test-user");
 
     let summary = serve::issue_invoice_request(
         &state,
         fixture_request(Currency::Huf),
+        fixture_supplier(),
         &UnreachableProvider,
         actor,
     )
@@ -239,6 +263,7 @@ fn issue_route_huf_happy_path_writes_audit_pair_and_xml() {
 fn issue_route_eur_happy_path_stamps_rate_metadata_on_draft() {
     let dir = test_dir("eur");
     std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
     let state = build_state(dir.join("aberp.duckdb"));
     let actor = Actor::from_local_cli("test-session".to_string(), "test-user");
 
@@ -275,6 +300,7 @@ fn issue_route_eur_happy_path_stamps_rate_metadata_on_draft() {
     let summary = serve::issue_invoice_request(
         &state,
         fixture_request(Currency::Eur),
+        fixture_supplier(),
         &provider,
         actor,
     )
@@ -344,7 +370,6 @@ fn issue_route_rejects_empty_lines_with_loud_error() {
     let actor = Actor::from_local_cli("test-session".to_string(), "test-user");
 
     let request = IssueInvoiceRequest {
-        supplier: fixture_supplier(),
         customer: fixture_customer(),
         lines: Vec::new(), // ← validation failure trigger
         currency: Currency::Huf,
@@ -354,6 +379,7 @@ fn issue_route_rejects_empty_lines_with_loud_error() {
     let err = serve::issue_invoice_request(
         &state,
         request,
+        fixture_supplier(),
         &UnreachableProvider,
         actor,
     )
@@ -387,16 +413,21 @@ fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
     bad_supplier.tax_number = "24904362".to_string(); // ← bare base; no `-y-zz`
 
     let request = IssueInvoiceRequest {
-        supplier: bad_supplier,
         customer: fixture_customer(),
         lines: fixture_lines(),
         currency: Currency::Huf,
         series: None,
     };
 
+    // PR-53 / session-73 — supplier comes via the new arg, not the
+    // wire body. `issue_invoice_request` itself doesn't re-validate
+    // (the route handler calls `supplier_from_seller_toml` for the
+    // typed 400 path); the supplier_config gate still fires inside
+    // `issue_from_parsed` so the defence-in-depth pin remains.
     let err = serve::issue_invoice_request(
         &state,
         request,
+        bad_supplier,
         &UnreachableProvider,
         actor,
     )

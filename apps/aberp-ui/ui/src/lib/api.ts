@@ -279,18 +279,15 @@ export async function downloadInvoicePdf(invoiceId: string): Promise<Blob> {
 /** PR-44ζ / session-59 — wire request body for `POST /invoices/issue`.
  * Mirrors `serve::IssueInvoiceRequest` on the backend. The form-to-
  * body composer in `./issue-invoice.ts` turns the SPA form state into
- * this shape; pinned by `issue-invoice.test.ts`. */
+ * this shape; pinned by `issue-invoice.test.ts`.
+ *
+ * PR-53 / session-73 — `supplier` removed from the wire shape. The
+ * backend now reads seller identity from the per-tenant
+ * `~/.aberp/<tenant>/seller.toml` (populated by the
+ * SellerConfigWizard, PR-51). The Issue form no longer surfaces
+ * seller inputs; the cross-cutting fix per Ervin's feedback that the
+ * post-tenant-setup form was re-asking for already-saved values. */
 export interface IssueInvoiceRequest {
-  supplier: {
-    taxNumber: string;
-    name: string;
-    address: {
-      countryCode: string;
-      postalCode: string;
-      city: string;
-      street: string;
-    };
-  };
   customer: {
     taxNumber: string;
     name: string;
@@ -417,16 +414,6 @@ export async function cancelInvoiceStorno(
  * enforces a 400 if the body's currency differs (defence in depth
  * against a curl bypass). */
 export interface ModificationInvoiceRequest {
-  supplier: {
-    taxNumber: string;
-    name: string;
-    address: {
-      countryCode: string;
-      postalCode: string;
-      city: string;
-      street: string;
-    };
-  };
   customer: {
     taxNumber: string;
     name: string;
@@ -632,4 +619,185 @@ export async function setupSellerInfo(
   body: SetupSellerInfoRequest,
 ): Promise<SetupSellerInfoResponse> {
   return invoke<SetupSellerInfoResponse>("setup_seller_info", { body });
+}
+
+/** PR-53 / session-73 — wire response body for the new read-side
+ * counterpart `GET /api/seller-info`. Mirror of the request shape
+ * `SetupSellerInfoRequest` minus the wrapping — used by the SPA's
+ * Tenant Settings page to pre-fill the form with the current saved
+ * values. */
+export interface SellerInfoResponse {
+  legal_name: string;
+  tax_number: string;
+  eu_vat_number: string | null;
+  address: {
+    country_code: string;
+    postal_code: string;
+    city: string;
+    street: string;
+  };
+  bank: {
+    account_number: string | null;
+    iban: string | null;
+    name: string | null;
+    swift_bic: string | null;
+  };
+}
+
+/** PR-53 / session-73 — fetch the saved seller-info for the Tenant
+ * Settings page. The backend route requires the backend to be in
+ * `Ready` (the wizard chain ensures it is by the time the SPA reaches
+ * the settings screen); the promise rejects on 404 (file missing) and
+ * 503 (boot state pre-Ready). */
+export async function getSellerInfo(): Promise<SellerInfoResponse> {
+  return invoke<SellerInfoResponse>("get_seller_info");
+}
+
+/** PR-53 / session-73 — per-item presence flags for the four NAV
+ * credential artifacts. The `login_value` field carries the operator-
+ * visible login string; the other three values are NEVER returned
+ * (presence-bool only). The SPA's NAV Credentials settings page reads
+ * this to render the four rows + the Rotate buttons. */
+export interface NavCredentialsStatusResponse {
+  login: boolean;
+  password: boolean;
+  sign_key: boolean;
+  change_key: boolean;
+  login_value: string | null;
+}
+
+/** PR-53 / session-73 — fetch the four NAV credential presence flags
+ * + the login value for the Settings page. */
+export async function getNavCredentialsStatus(): Promise<NavCredentialsStatusResponse> {
+  return invoke<NavCredentialsStatusResponse>("get_nav_credentials_status");
+}
+
+/** PR-53 / session-73 — wire request body for the single-slot rotate
+ * route. `item` is one of the four operator-readable slugs (`login`,
+ * `password`, `sign_key`, `change_key`); `new_value` is the new
+ * secret. The login slug also flows through the same route since the
+ * operator may rotate it independently. */
+export interface RotateNavCredentialRequest {
+  item: "login" | "password" | "sign_key" | "change_key";
+  new_value: string;
+}
+
+/** PR-53 / session-73 — typed response body for the single-slot
+ * rotate route. `ok` is always `true` on the happy path (4xx / 5xx
+ * propagate as rejected promises); `item` echoes the rotated slug. */
+export interface RotateNavCredentialResponse {
+  ok: true;
+  item: string;
+}
+
+/** PR-53 / session-73 — POST a single-slot NAV-credential rotation to
+ * the backend. */
+export async function rotateNavCredential(
+  body: RotateNavCredentialRequest,
+): Promise<RotateNavCredentialResponse> {
+  return invoke<RotateNavCredentialResponse>("rotate_nav_credential", { body });
+}
+
+/** PR-54 / session-74 — closed-vocab discriminator on a partner row.
+ * PascalCase wire mirror of `aberp::partners::PartnerKind`. Pinned by
+ * `partner_kind_serde_round_trip_pin` on the Rust side; the SPA's
+ * TS-strict consumption catches a backend drift at `npm run check`. */
+export type PartnerKind = "Customer" | "Supplier" | "Both";
+
+/** PR-54 / session-74 — single partner row. Snake_case JSON shape
+ * mirrors `aberp::partners::Partner`'s `#[derive(Serialize)]` (no
+ * `rename_all` directive on the Rust struct). `eu_vat_number` and the
+ * address / bank / contact fields are all nullable since the operator
+ * may skip them at create time. `deleted_at` is non-null only for soft-
+ * deleted rows; the list endpoint hides them by default per A182. */
+export interface Partner {
+  /** Prefixed-ULID `prt_<26-char-ULID>`. */
+  id: string;
+  display_name: string;
+  legal_name: string;
+  kind: PartnerKind;
+  tax_number: string;
+  eu_vat_number: string | null;
+  address_street: string | null;
+  address_postal_code: string | null;
+  address_city: string | null;
+  address_country: string | null;
+  bank_account: string | null;
+  contact_email: string | null;
+  contact_phone: string | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+}
+
+/** PR-54 / session-74 — request-body shape for `POST /api/partners` +
+ * `PUT /api/partners/:id`. Mirror of `aberp::partners::PartnerInputs`
+ * — every optional field defaults to `null` on the wire so the
+ * backend's `#[serde(default)]` accepts the body without rejecting
+ * missing keys. `display_name`, `legal_name`, `kind`, and `tax_number`
+ * are required (the backend's `validate_partner_inputs` enforces). */
+export interface PartnerInputs {
+  display_name: string;
+  legal_name: string;
+  kind: PartnerKind;
+  tax_number: string;
+  eu_vat_number: string | null;
+  address_street: string | null;
+  address_postal_code: string | null;
+  address_city: string | null;
+  address_country: string | null;
+  bank_account: string | null;
+  contact_email: string | null;
+  contact_phone: string | null;
+}
+
+/** PR-54 / session-74 — typed 400 validation body per field. Same
+ * envelope shape as `SetupSellerInfoFieldError` (A157 inline-error
+ * rendering pattern). */
+export interface PartnerFieldError {
+  field: string;
+  message: string;
+}
+
+/** PR-54 / session-74 — typed 400 body for partner create / update.
+ * Same discriminant as the seller-info path; consumed by the
+ * PartnerForm modal's catch arm to surface per-field inline errors. */
+export interface PartnerValidationErrorBody {
+  error: "validation_failed";
+  fields: PartnerFieldError[];
+}
+
+/** PR-54 / session-74 — `GET /api/partners[?search=]`. Used both by
+ * the PartnersList screen (no search → full list) and by the typeahead
+ * (search prefix, debounced 200ms). The backend filters case-
+ * insensitively on `display_name` OR `legal_name` per
+ * `aberp::partners::list_partners`. */
+export async function listPartners(search?: string): Promise<Partner[]> {
+  const trimmed = search?.trim();
+  const args = trimmed && trimmed.length > 0 ? { search: trimmed } : {};
+  return invoke<Partner[]>("list_partners", args);
+}
+
+/** PR-54 / session-74 — `GET /api/partners/:id`. */
+export async function getPartner(partnerId: string): Promise<Partner> {
+  return invoke<Partner>("get_partner", { partnerId });
+}
+
+/** PR-54 / session-74 — `POST /api/partners`. */
+export async function createPartner(body: PartnerInputs): Promise<Partner> {
+  return invoke<Partner>("create_partner", { body });
+}
+
+/** PR-54 / session-74 — `PUT /api/partners/:id`. */
+export async function updatePartner(
+  partnerId: string,
+  body: PartnerInputs,
+): Promise<Partner> {
+  return invoke<Partner>("update_partner", { partnerId, body });
+}
+
+/** PR-54 / session-74 — `DELETE /api/partners/:id`. Soft-delete; the
+ * row stays in the DB for historical-invoice resolution per A182. */
+export async function deletePartner(partnerId: string): Promise<void> {
+  await invoke<void>("delete_partner", { partnerId });
 }

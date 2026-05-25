@@ -22,14 +22,11 @@ import {
 
 describe("composeIssueInvoiceBody", () => {
   it("reshapes HUF form state into the wire body verbatim", () => {
+    // PR-53 / session-73 — supplier removed from the form + wire
+    // shape; backend reads seller identity from seller.toml server-
+    // side. The composer's output is customer + lines + currency.
     const form = {
       ...emptyForm(),
-      supplierName: "ABERP Supplier Kft.",
-      supplierTaxNumber: "12345678-1-42",
-      supplierCountryCode: "HU",
-      supplierPostalCode: "1011",
-      supplierCity: "Budapest",
-      supplierStreet: "Fő utca 1.",
       customerName: "Vevő Kft.",
       customerTaxNumber: "87654321-2-13",
       currency: "HUF" as const,
@@ -46,16 +43,6 @@ describe("composeIssueInvoiceBody", () => {
     const body = composeIssueInvoiceBody(form);
 
     expect(body).toEqual({
-      supplier: {
-        taxNumber: "12345678-1-42",
-        name: "ABERP Supplier Kft.",
-        address: {
-          countryCode: "HU",
-          postalCode: "1011",
-          city: "Budapest",
-          street: "Fő utca 1.",
-        },
-      },
       customer: {
         taxNumber: "87654321-2-13",
         name: "Vevő Kft.",
@@ -72,15 +59,22 @@ describe("composeIssueInvoiceBody", () => {
     });
   });
 
+  it("does not emit a supplier field on the wire body (PR-53)", () => {
+    // Regression guard for the PR-53 cross-cutting fix: the SPA must
+    // NOT send supplier in the wire body. A drift here would
+    // re-introduce the "obsolete to retype seller after wizard"
+    // operator-feedback that PR-53 closed.
+    const body = composeIssueInvoiceBody({
+      ...emptyForm(),
+      customerName: "C",
+      customerTaxNumber: "y",
+    });
+    expect("supplier" in body).toBe(false);
+  });
+
   it("emits EUR currency verbatim on the EUR branch", () => {
     const form = {
       ...emptyForm(),
-      supplierName: "ABERP Kft.",
-      supplierTaxNumber: "12345678-1-42",
-      supplierCountryCode: "HU",
-      supplierPostalCode: "1011",
-      supplierCity: "Budapest",
-      supplierStreet: "Fő utca 1.",
       customerName: "EU Buyer GmbH",
       customerTaxNumber: "DE123456789",
       currency: "EUR" as const,
@@ -106,19 +100,13 @@ describe("composeIssueInvoiceBody", () => {
   });
 
   it("trims whitespace on every string field the backend validates", () => {
-    // Backend `validate_issue_request` `.trim()`-checks supplier
-    // name + tax number + customer name + tax number; the composer
-    // pre-trims so the wire body matches what the backend reads.
-    // A regression that drops a trim would let a `"  "` value pass
-    // the SPA's required-field check but fail the backend's.
+    // Backend `validate_issue_request` `.trim()`-checks customer
+    // name + tax number; the composer pre-trims so the wire body
+    // matches what the backend reads. A regression that drops a
+    // trim would let a `"  "` value pass the SPA's required-field
+    // check but fail the backend's.
     const form = {
       ...emptyForm(),
-      supplierName: "  Trimmed Supplier  ",
-      supplierTaxNumber: "  12345678-1-42  ",
-      supplierCountryCode: " HU ",
-      supplierPostalCode: " 1011 ",
-      supplierCity: " Budapest ",
-      supplierStreet: " Fő utca 1. ",
       customerName: "  Trimmed Customer  ",
       customerTaxNumber: "  87654321-2-13  ",
       currency: "HUF" as const,
@@ -134,10 +122,6 @@ describe("composeIssueInvoiceBody", () => {
 
     const body = composeIssueInvoiceBody(form);
 
-    expect(body.supplier.name).toBe("Trimmed Supplier");
-    expect(body.supplier.taxNumber).toBe("12345678-1-42");
-    expect(body.supplier.address.countryCode).toBe("HU");
-    expect(body.supplier.address.city).toBe("Budapest");
     expect(body.customer.name).toBe("Trimmed Customer");
     expect(body.customer.taxNumber).toBe("87654321-2-13");
     expect(body.lines[0].description).toBe("Trimmed description");
@@ -149,12 +133,6 @@ describe("composeIssueInvoiceBody", () => {
     // deduplicated would corrupt the invoice silently.
     const form = {
       ...emptyForm(),
-      supplierName: "S",
-      supplierTaxNumber: "x",
-      supplierCountryCode: "HU",
-      supplierPostalCode: "1",
-      supplierCity: "B",
-      supplierStreet: "S",
       customerName: "C",
       customerTaxNumber: "y",
       currency: "HUF" as const,

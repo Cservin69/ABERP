@@ -215,6 +215,14 @@ pub fn run() {
             commands::retry_boot,
             commands::setup_nav_credentials,
             commands::setup_seller_info,
+            commands::get_seller_info,
+            commands::get_nav_credentials_status,
+            commands::rotate_nav_credential,
+            commands::list_partners,
+            commands::get_partner,
+            commands::create_partner,
+            commands::update_partner,
+            commands::delete_partner,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

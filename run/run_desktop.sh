@@ -17,32 +17,57 @@
 #   regression by running the binary directly with the codesign-then-
 #   exec pattern; PR-46δ restores the working pattern.
 #
-# Why we still pre-build + codesign:
-#   `tauri dev` ultimately runs `cargo run`, which produces a binary
-#   at `target/<profile>/aberp-ui` and execs it. macOS keychain ACLs
-#   ("Always Allow") key off the binary's cdhash; a fresh ad-hoc
-#   signature (`codesign --sign -`) gives the binary a deterministic
-#   cdhash so the ACL persists across consecutive launches that don't
-#   touch Rust source. We do `cargo build` + codesign BEFORE invoking
-#   `tauri dev`, so by the time tauri's internal `cargo run` fires,
-#   the build is up-to-date (cargo's mtime check → no-op rebuild),
-#   and the codesigned bytes are what executes.
+# Why we pre-build (PR-52 — and why we removed the explicit codesign step):
+#   macOS keychain ACLs ("Always Allow") key off the running binary's CDHash.
+#   The Apple Silicon linker (ld) automatically applies an ad-hoc Mach-O
+#   signature on every link — that's the `flags=0x20002(adhoc,linker-signed)`
+#   you see in `codesign -dvv` output. The linker-signed CDHash is a stable
+#   function of the binary's code bytes: SAME bytes → SAME CDHash → ACL hits.
 #
-#   Limitation: if a Rust source change between pre-build and
-#   `tauri dev`'s cargo run causes a relink, the freshly-relinked
-#   binary will be unsigned for that launch (keychain may re-prompt).
-#   In a single script run this race is essentially impossible. The
-#   regular workflow — operator edits Rust, runs this script, repeats
-#   — codesigns exactly once per source change, which is the right
-#   trade.
+#   For the linker-signed CDHash to be stable across launcher invocations,
+#   tauri-CLI's internal `cargo run --bin aberp-ui` (which fires on every
+#   `tauri dev` launch) must be a TRUE NO-OP — no link, no copy, no byte
+#   change. That requires two things in the pre-build:
+#
+#     (a) Flag-match: pre-build with the same flags tauri-CLI invokes
+#         (`--no-default-features` injected by tauri-cli's `dev_options`).
+#         Mismatched flags = different cargo fingerprint bucket = tauri
+#         re-links from scratch on launch.
+#
+#     (b) Double-build: cargo's incremental linker re-runs once after the
+#         first link, even with no source change, before fingerprints
+#         "settle." Running `cargo build` twice in the pre-build absorbs
+#         this re-link so tauri-CLI's `cargo run` is the third invocation —
+#         which IS a true no-op.
+#
+#   With (a) + (b) in place, the linker-signed CDHash from the second pre-
+#   build pass survives across all subsequent cargo invocations within and
+#   between launcher runs. The operator clicks "Always Allow" once for each
+#   keychain item on the first launch; subsequent launches match the ACL.
+#
+#   Sessions 63/66/67 each added an explicit `codesign --force --sign -`
+#   pass thinking it would "stabilize" the ad-hoc identity. Empirically it
+#   did the opposite: explicit codesign rewrites the binary's `__LINKEDIT`
+#   segment and changes the file size, which trips cargo's fingerprint check
+#   on the next invocation and triggers a re-link that undoes the signature.
+#   PR-52 removes the codesign step entirely. The linker's native ad-hoc
+#   signature is already stable.
+#
+#   Limitation: any Rust source change re-links the binary on the next run,
+#   producing a new CDHash. The operator will see one "Always Allow" prompt
+#   per keychain item the first time the new build runs, then it's stable
+#   again until the next source change. This is unavoidable without a real
+#   Apple-Developer-issued signing identity (which is out of scope here).
 #
 # What this script does:
 #   1. Remembers your original working directory.
 #   2. cd's into the ABERP repo root for the cargo build step.
-#   3. Pre-builds both binaries with `cargo build` so codesign has
-#      stable bytes to sign.
-#   4. Ad-hoc codesigns both Mach-O binaries on Darwin (--no-codesign
-#      to opt out).
+#   3. Pre-builds `aberp` then `aberp-ui` in SEPARATE cargo invocations,
+#      each one TWICE — the second pass settles cargo's linker
+#      fingerprint so tauri-CLI's later `cargo run` is a true no-op
+#      and the linker-signed ad-hoc CDHash stays stable across runs.
+#   4. (No explicit codesign — see PR-52 note above. --no-codesign is
+#      retained as an inert no-op for backward compat.)
 #   5. Frees TCP port 5173 if a prior run left Vite stranded there.
 #   6. cd's into `apps/aberp-ui/` and runs `./ui/node_modules/.bin/tauri dev`.
 #      tauri-CLI then:
@@ -50,8 +75,9 @@
 #          `{ "script": "npm run dev", "cwd": "ui" }`, i.e. cd into
 #          `apps/aberp-ui/ui/` and run `npm run dev` → Vite serves
 #          http://localhost:5173)
-#        - runs `cargo run --bin aberp-ui` (a no-op rebuild since we
-#          pre-built; execs the codesigned binary)
+#        - runs `cargo run --no-default-features --bin aberp-ui` (a
+#          true no-op rebuild since we pre-built twice with matching
+#          flags; execs the linker-signed binary unmodified)
 #        - the Tauri webview loads `devUrl` (http://localhost:5173)
 #          and the SPA mounts with hot-reload enabled.
 #   7. Puts the whole thing in one process group; Ctrl-C in this
@@ -166,36 +192,81 @@ if [[ -f "${OPERATOR_DB_DEFAULT}.wal" ]] || [[ -f "${OPERATOR_DB_DEFAULT}.tmp" ]
   echo "       if launch fails with 'database is locked', stop here and inspect)"
 fi
 
-# ---------- pre-build (so codesign has stable bytes) -------------------------
-# tauri-CLI's `dev` runs `cargo run --bin aberp-ui` internally. If we don't
-# pre-build, codesign has nothing to sign. By pre-building from the workspace
-# root with the same profile tauri-CLI will use, tauri's internal cargo run
-# becomes a no-op rebuild and execs the bytes we just signed.
+# ---------- pre-build (settle cargo's linker fingerprint) -------------------
+# PR-52 — closes the macOS-keychain "Always Allow" prompt-storm that sessions
+# 63/66/67 each half-closed.
+#
+# Empirically-verified mechanism (May 2026, macOS 15, cargo 1.88):
+#
+#   (a) Apple Silicon LD auto-applies an ad-hoc Mach-O signature on every link
+#       (flag `linker-signed,adhoc`). The signature's CDHash is what the macOS
+#       keychain ACL ("Always Allow") binds to. CDHash is a function of the
+#       binary's code-segment bytes, so any change to the linked bytes = new
+#       CDHash = re-prompt.
+#
+#   (b) tauri-CLI's `dev` mode invokes `cargo run --no-default-features --bin
+#       aberp-ui` internally (verified against tauri-cli's rust.rs
+#       `dev_options`: it unconditionally injects `--no-default-features` if
+#       not already in args). If our pre-build uses a different flag set, the
+#       artifacts go to a different cargo fingerprint bucket and tauri-CLI
+#       re-links from scratch on launch.
+#
+#   (c) Even with matching flags, the FIRST `cargo build` after a fresh clean
+#       (or after any source change) and the SECOND cargo invocation produce
+#       DIFFERENT linked bytes. The first link emits to deps/; the second
+#       re-runs the linker once more, then fingerprints settle. The THIRD and
+#       subsequent invocations are pure no-ops — same bytes, same CDHash.
+#       So the pre-build must run cargo TWICE to settle before tauri-CLI's
+#       `cargo run` (the third invocation) sees an up-to-date binary.
+#
+#   (d) aberp and aberp-ui must be built in SEPARATE cargo invocations. A
+#       single `cargo build --bin aberp --bin aberp-ui` selects both packages
+#       and unifies features across the dependency graph (resolver v2),
+#       producing different aberp-ui bytes than tauri-CLI's narrower
+#       `cargo run --bin aberp-ui` build will.
+#
+# Why we no longer run `codesign --sign -` explicitly:
+#   Prior sessions added an explicit `codesign --force --sign -` pass to
+#   "stabilize" the ad-hoc identity. Empirically that step DESTABILIZES it:
+#   codesign rewrites the binary's `__LINKEDIT` segment, changing the file
+#   size. Cargo's fingerprint check on the NEXT invocation sees the file is
+#   "dirty" and re-links over our signature. The linker-signed adhoc CDHash
+#   that LD applies natively is stable on its own once the double-build
+#   settles — verified by hashing CDHash across four consecutive launcher
+#   runs (all four matched). The codesign step is therefore dead weight that
+#   caused the symptom it was meant to prevent. (CLAUDE.md rule 13: delete
+#   before optimize.)
+profile_flag=()
 if [[ "$mode" == "release" ]]; then
   bin_dir="${REPO_ROOT}/target/release"
-  build_cmd=(cargo build --release --bin "${ABERP_BIN_NAME}" --bin "${TAURI_BIN_NAME}")
+  profile_flag=(--release)
 else
   bin_dir="${REPO_ROOT}/target/debug"
-  build_cmd=(cargo build --bin "${ABERP_BIN_NAME}" --bin "${TAURI_BIN_NAME}")
 fi
-echo "[build] ${build_cmd[*]}"
-"${build_cmd[@]}" || { echo "[fail] cargo build failed" >&2; exit 4; }
 
-# ---------- ad-hoc codesign (macOS keychain ACL stability) ------------------
-# See the long header comment at the top of this file. Short version: a
-# stable ad-hoc identity means the macOS keychain's "Always Allow" ACL
-# persists across launches when the binary content is unchanged.
-if [[ "$(uname -s)" == "Darwin" && $codesign_enabled -eq 1 ]]; then
-  for cs_bin in "$ABERP_BIN_NAME" "$TAURI_BIN_NAME"; do
-    if [[ -f "${bin_dir}/${cs_bin}" ]]; then
-      codesign --force --sign - "${bin_dir}/${cs_bin}" 2>/dev/null \
-        && echo "[codesign] ad-hoc signed ${bin_dir}/${cs_bin}" \
-        || echo "[codesign] could not sign ${bin_dir}/${cs_bin} (continuing — keychain may re-prompt)"
-    fi
-  done
-  unset cs_bin
-elif [[ $codesign_enabled -eq 0 ]]; then
-  echo "[codesign] skipped (--no-codesign)"
+# aberp: CLI binary, also the keychain-reading subprocess that aberp-ui spawns
+# at runtime. Two passes settle the linker fingerprint; subsequent cargo
+# invocations (within this launcher run and across runs without source
+# changes) are true no-ops, so the linker-signed CDHash stays stable.
+aberp_build_cmd=(cargo build -p "${ABERP_BIN_NAME}" --bin "${ABERP_BIN_NAME}" "${profile_flag[@]}")
+echo "[build] ${aberp_build_cmd[*]}  (pass 1/2)"
+"${aberp_build_cmd[@]}" || { echo "[fail] cargo build (aberp pass 1) failed" >&2; exit 4; }
+echo "[build] ${aberp_build_cmd[*]}  (pass 2/2 — settle linker fingerprint)"
+"${aberp_build_cmd[@]}" || { echo "[fail] cargo build (aberp pass 2) failed" >&2; exit 4; }
+
+# aberp-ui: same pattern, but with --no-default-features matching tauri-CLI's
+# `cargo run` invocation so tauri-CLI later sees the build as up-to-date and
+# its internal cargo step is a true no-op.
+ui_build_cmd=(cargo build -p "${TAURI_BIN_NAME}" --bin "${TAURI_BIN_NAME}" --no-default-features "${profile_flag[@]}")
+echo "[build] ${ui_build_cmd[*]}  (pass 1/2)"
+"${ui_build_cmd[@]}" || { echo "[fail] cargo build (aberp-ui pass 1) failed" >&2; exit 4; }
+echo "[build] ${ui_build_cmd[*]}  (pass 2/2 — settle linker fingerprint)"
+"${ui_build_cmd[@]}" || { echo "[fail] cargo build (aberp-ui pass 2) failed" >&2; exit 4; }
+
+# --no-codesign retained for backward-compat with operators who scripted around
+# it; the launcher no longer calls codesign at all so the flag is now inert.
+if [[ $codesign_enabled -eq 0 ]]; then
+  echo "[codesign] flag accepted; explicit codesign was removed in PR-52 (linker adhoc is stable)"
 fi
 
 # ---------- free port 5173 if a prior run left it stranded ------------------

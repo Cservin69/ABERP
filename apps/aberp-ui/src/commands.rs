@@ -294,6 +294,110 @@ pub async fn setup_seller_info(
     Ok(response)
 }
 
+/// PR-53 / session-73 — `GET /api/seller-info`. Used by the SPA's
+/// Tenant Settings page to read the saved seller identity (legal
+/// name + tax number + EU VAT + address + bank) before the operator
+/// decides to edit any of the fields.
+#[tauri::command]
+pub async fn get_seller_info(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/seller-info", true).await
+}
+
+/// PR-53 / session-73 — `GET /api/nav-credentials-status`. Used by
+/// the SPA's NAV Credentials settings page to show the four presence
+/// rows + the operator-visible login value.
+#[tauri::command]
+pub async fn get_nav_credentials_status(
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    forward_get(&state, "/api/nav-credentials-status", true).await
+}
+
+/// PR-53 / session-73 — `POST /api/rotate-nav-credential`. The
+/// Settings page POSTs one of these per "Rotate" button click so the
+/// operator can update a single secret without re-entering the other
+/// three. Errors propagate as the rejected promise.
+#[tauri::command]
+pub async fn rotate_nav_credential(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/rotate-nav-credential", body).await
+}
+
+/// PR-54 / session-74 — `GET /api/partners[?search=]`. The SPA's
+/// PartnersList screen calls this on open + on every typeahead
+/// keystroke (debounced 200ms client-side). `search` is appended as a
+/// query-string only when non-empty so the route's `Option<String>`
+/// deserialiser treats absence and empty-string identically.
+#[tauri::command]
+pub async fn list_partners(
+    state: State<'_, AppState>,
+    search: Option<String>,
+) -> Result<Value, String> {
+    let path = match search.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(needle) => format!("/api/partners?search={}", urlencode(needle)),
+        None => "/api/partners".to_string(),
+    };
+    forward_get(&state, &path, true).await
+}
+
+/// PR-54 / session-74 — `GET /api/partners/:id`. Used by the SPA when
+/// an operator clicks "Edit" on a list row OR when a deep-link wants
+/// to surface a single partner by id. Returns the full Partner JSON.
+#[tauri::command]
+pub async fn get_partner(
+    state: State<'_, AppState>,
+    partner_id: String,
+) -> Result<Value, String> {
+    validate_partner_id(&partner_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/partners/{partner_id}");
+    forward_get(&state, &path, true).await
+}
+
+/// PR-54 / session-74 — `POST /api/partners`. PartnerForm modal POSTs
+/// the composed inputs body here. Backend returns 201 with the
+/// freshly-created Partner (server-minted id + timestamps). Validation
+/// failures surface as the typed `{ "error": "validation_failed",
+/// "fields": [...] }` 400 body the SPA renders inline per A157.
+#[tauri::command]
+pub async fn create_partner(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/partners", body).await
+}
+
+/// PR-54 / session-74 — `PUT /api/partners/:id`. PartnerForm modal's
+/// edit path PUTs the composed inputs body here. Backend returns 200
+/// with the updated Partner (bumped `updated_at`). 404 on unknown id;
+/// 400 on validation failure (same envelope as create).
+#[tauri::command]
+pub async fn update_partner(
+    state: State<'_, AppState>,
+    partner_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_partner_id(&partner_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/partners/{partner_id}");
+    forward_put(&state, &path, body).await
+}
+
+/// PR-54 / session-74 — `DELETE /api/partners/:id`. PartnerList's
+/// per-row Delete button POSTs here (after the inline confirm). The
+/// backend soft-deletes the row (kept in the DB for
+/// historical-invoice resolution per A182); subsequent GETs surface
+/// 404. Returns `null` on the happy path (HTTP 204 → no JSON body).
+#[tauri::command]
+pub async fn delete_partner(
+    state: State<'_, AppState>,
+    partner_id: String,
+) -> Result<(), String> {
+    validate_partner_id(&partner_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/partners/{partner_id}");
+    forward_delete(&state, &path).await
+}
+
 /// PR-45a / session-61 — the SPA's Retry button calls this command
 /// from the "backend boot failed" error pane. Spawns a fresh
 /// `boot_backend` attempt; the SPA continues polling
@@ -478,6 +582,128 @@ async fn forward_post(
     Ok(value)
 }
 
+/// PR-54 / session-74 — PUT sibling of [`forward_post`]. Used by
+/// `/api/partners/:id` updates. The body shape is identical to POST;
+/// only the HTTP method differs (PUT for an existence-required update
+/// vs POST for a create-or-validate).
+async fn forward_put(
+    state: &State<'_, AppState>,
+    path: &str,
+    body: Value,
+) -> Result<Value, String> {
+    let (url, token, client) = {
+        let guard = state.backend.lock().await;
+        let backend = guard
+            .as_ref()
+            .ok_or_else(|| "backend not ready yet — wait a moment and retry".to_string())?;
+        (
+            format!("{}{}", backend.url, path),
+            backend.session_token.clone(),
+            backend.client.clone(),
+        )
+    };
+
+    let resp = client
+        .put(&url)
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("HTTPS PUT {url}"))
+        .map_err(|e| format!("{e:#}"))?;
+
+    let status = resp.status();
+    let response_body = resp
+        .text()
+        .await
+        .with_context(|| format!("read body of {url}"))
+        .map_err(|e| format!("{e:#}"))?;
+
+    if !status.is_success() {
+        return Err(format!("backend returned {status} for {path}: {response_body}"));
+    }
+    let value: Value = serde_json::from_str(&response_body)
+        .with_context(|| format!("parse JSON body of {url}: `{response_body}`"))
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(value)
+}
+
+/// PR-54 / session-74 — DELETE sibling of [`forward_get`]. Used by
+/// `/api/partners/:id` soft-deletes. The backend returns 204 (empty
+/// body) on the happy path — there's no JSON to parse, so the helper
+/// returns `Ok(())` rather than `Ok(Value::Null)`. The SPA's typed
+/// wrapper mirrors this as `Promise<void>`.
+async fn forward_delete(state: &State<'_, AppState>, path: &str) -> Result<(), String> {
+    let (url, token, client) = {
+        let guard = state.backend.lock().await;
+        let backend = guard
+            .as_ref()
+            .ok_or_else(|| "backend not ready yet — wait a moment and retry".to_string())?;
+        (
+            format!("{}{}", backend.url, path),
+            backend.session_token.clone(),
+            backend.client.clone(),
+        )
+    };
+
+    let resp = client
+        .delete(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .with_context(|| format!("HTTPS DELETE {url}"))
+        .map_err(|e| format!("{e:#}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_else(|_| "<no body>".to_string());
+        return Err(format!("backend returned {status} for {path}: {body}"));
+    }
+    Ok(())
+}
+
+/// PR-54 / session-74 — minimal percent-encoder for the `?search=`
+/// query-string value. Only operator-typed prefix needles flow through
+/// here; the encoder covers the small set of bytes the operator might
+/// realistically type (space, `&`, `=`, `#`, `?`, `+`, `%`) plus a
+/// catch-all for any non-ASCII byte. Pulling in a dep just for this
+/// would violate CLAUDE.md rule 2.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{:02X}", b));
+            }
+        }
+    }
+    out
+}
+
+/// PR-54 / session-74 — defence-in-depth path-parameter validator for
+/// the `:id` segment on partner routes. Mirrors `validate_invoice_id`
+/// (alphanumeric + `_` + `-`, capped at 64 chars) since the
+/// `PartnerId` newtype is `prt_<26-char-ULID>` (30 chars total).
+fn validate_partner_id(s: &str) -> anyhow::Result<()> {
+    if s.is_empty() {
+        anyhow::bail!("partner_id is empty");
+    }
+    if s.len() > 64 {
+        anyhow::bail!("partner_id length {} exceeds 64", s.len());
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        anyhow::bail!("partner_id `{s}` contains characters outside [A-Za-z0-9_-]");
+    }
+    Ok(())
+}
+
 /// Reject obviously malformed invoice ids before they reach the
 /// backend. The backend itself has its own (looser) parsing — this
 /// is defence in depth against a path-injection attempt from a
@@ -531,5 +757,32 @@ mod tests {
     fn validate_invoice_id_rejects_overlong() {
         let s = "a".repeat(65);
         assert!(validate_invoice_id(&s).is_err());
+    }
+
+    #[test]
+    fn validate_partner_id_accepts_typical_prefixed_ulid() {
+        assert!(validate_partner_id("prt_01ARZ3NDEKTSV4RRFFQ69G5FAV").is_ok());
+    }
+
+    #[test]
+    fn validate_partner_id_rejects_path_traversal() {
+        assert!(validate_partner_id("../etc/passwd").is_err());
+        assert!(validate_partner_id("prt/foo").is_err());
+    }
+
+    #[test]
+    fn urlencode_preserves_unreserved_and_escapes_reserved() {
+        // PR-54 — the operator types arbitrary text into the
+        // typeahead; the encoder must keep alphanumerics + `-._~`
+        // verbatim AND escape the bytes that would otherwise break
+        // the query string parse on the backend.
+        assert_eq!(urlencode("Alpha"), "Alpha");
+        assert_eq!(urlencode("Alpha-1.2_3~"), "Alpha-1.2_3~");
+        assert_eq!(urlencode("Alpha Bravo"), "Alpha%20Bravo");
+        assert_eq!(urlencode("a&b=c"), "a%26b%3Dc");
+        // Non-ASCII bytes (Hungarian operator name) escape one byte at
+        // a time per UTF-8 — the backend's `urlencoding` round-trip
+        // re-parses them as the original characters.
+        assert_eq!(urlencode("Ágnes"), "%C3%81gnes");
     }
 }

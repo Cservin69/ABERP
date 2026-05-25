@@ -29,14 +29,13 @@ export interface LineFormState {
 
 /** PR-44ζ — top-level form state. Captures every operator-typed
  * value the form exposes; the composer reshapes it into the wire
- * `IssueInvoiceRequest`. */
+ * `IssueInvoiceRequest`.
+ *
+ * PR-53 / session-73 — supplier fields removed from the form (the
+ * backend now reads seller identity from the per-tenant
+ * `seller.toml` populated via the wizard). Operator-typed values are
+ * customer + currency + line items only. */
 export interface IssueInvoiceFormState {
-  supplierTaxNumber: string;
-  supplierName: string;
-  supplierCountryCode: string;
-  supplierPostalCode: string;
-  supplierCity: string;
-  supplierStreet: string;
   customerTaxNumber: string;
   customerName: string;
   currency: Currency;
@@ -49,12 +48,6 @@ export interface IssueInvoiceFormState {
  * editable on first paint without a separate "+ Add line" click. */
 export function emptyForm(): IssueInvoiceFormState {
   return {
-    supplierTaxNumber: "",
-    supplierName: "",
-    supplierCountryCode: "HU",
-    supplierPostalCode: "",
-    supplierCity: "",
-    supplierStreet: "",
     customerTaxNumber: "",
     customerName: "",
     currency: "HUF",
@@ -150,16 +143,6 @@ export function composeIssueInvoiceBody(
   form: IssueInvoiceFormState,
 ): IssueInvoiceRequest {
   return {
-    supplier: {
-      taxNumber: form.supplierTaxNumber.trim(),
-      name: form.supplierName.trim(),
-      address: {
-        countryCode: form.supplierCountryCode.trim(),
-        postalCode: form.supplierPostalCode.trim(),
-        city: form.supplierCity.trim(),
-        street: form.supplierStreet.trim(),
-      },
-    },
     customer: {
       taxNumber: form.customerTaxNumber.trim(),
       name: form.customerName.trim(),

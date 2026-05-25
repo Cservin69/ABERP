@@ -88,12 +88,6 @@ export function formFromIssuanceInput(
     vatRatePercent: l.vatRatePercent,
   }));
   return {
-    supplierTaxNumber: input.supplier.taxNumber,
-    supplierName: input.supplier.name,
-    supplierCountryCode: input.supplier.address.countryCode,
-    supplierPostalCode: input.supplier.address.postalCode,
-    supplierCity: input.supplier.address.city,
-    supplierStreet: input.supplier.address.street,
     customerTaxNumber: input.customer.taxNumber,
     customerName: input.customer.name,
     currency: baseCurrency,
@@ -110,16 +104,6 @@ export function composeModificationBody(
   form: ModificationFormState,
 ): ModificationInvoiceRequest {
   return {
-    supplier: {
-      taxNumber: form.supplierTaxNumber.trim(),
-      name: form.supplierName.trim(),
-      address: {
-        countryCode: form.supplierCountryCode.trim(),
-        postalCode: form.supplierPostalCode.trim(),
-        city: form.supplierCity.trim(),
-        street: form.supplierStreet.trim(),
-      },
-    },
     customer: {
       taxNumber: form.customerTaxNumber.trim(),
       name: form.customerName.trim(),

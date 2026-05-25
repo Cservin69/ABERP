@@ -35,6 +35,7 @@
   import {
     issueInvoice,
     type Currency,
+    type Partner,
   } from "../lib/api";
   import {
     composeIssueInvoiceBody,
@@ -44,6 +45,8 @@
     type IssueInvoiceFormState,
     type MissingSellerConfigError,
   } from "../lib/issue-invoice";
+  import { buyerFieldsFromPartner } from "../lib/partners";
+  import PartnerTypeahead from "../lib/PartnerTypeahead.svelte";
 
   interface Props {
     /** Whether the modal is open. The parent toggles by reassigning
@@ -66,6 +69,12 @@
   let form: IssueInvoiceFormState = $state(emptyForm());
   let submitState: "idle" | "submitting" | "error" = $state("idle");
   let submitError: string | null = $state(null);
+  /** PR-54 / session-74 — typeahead-bound buyer-name string. Decoupled
+   * from `form.customerName` so the operator can type a search prefix
+   * (which the typeahead consumes) without prematurely committing it
+   * to the wire body. On select OR on "use as one-off" the value
+   * flows into the form fields. */
+  let buyerTypeahead = $state("");
   /** PR-50 / session-70 — when the backend's `400` body carries the
    * `missing_seller_config` discriminant, hold the typed shape so the
    * template can render the operator-actionable `config_path` +
@@ -90,6 +99,27 @@
     submitState = "idle";
     submitError = null;
     missingSellerConfig = null;
+    buyerTypeahead = "";
+  }
+
+  function onPartnerSelect(partner: Partner) {
+    const fields = buyerFieldsFromPartner(partner);
+    form = {
+      ...form,
+      customerName: fields.customerName,
+      customerTaxNumber: fields.customerTaxNumber,
+    };
+    buyerTypeahead = partner.display_name;
+  }
+
+  function onPartnerOneOff() {
+    // Operator typed a name that doesn't match a saved partner; treat
+    // the typed string as the customer name and leave the tax-number
+    // field for manual entry below.
+    form = {
+      ...form,
+      customerName: buyerTypeahead.trim(),
+    };
   }
 
   function addLine() {
@@ -195,53 +225,23 @@
     {/if}
 
     <fieldset>
-      <legend>Supplier</legend>
-      <label>
-        <span>Name</span>
-        <input type="text" bind:value={form.supplierName} required />
-      </label>
-      <label>
-        <span>ADÓSZÁM</span>
-        <input
-          type="text"
-          bind:value={form.supplierTaxNumber}
-          required
-          placeholder="12345678-1-42"
-        />
-      </label>
-      <div class="row">
-        <label class="narrow">
-          <span>Country</span>
-          <input
-            type="text"
-            bind:value={form.supplierCountryCode}
-            maxlength="2"
-            required
-          />
-        </label>
-        <label class="narrow">
-          <span>Postal code</span>
-          <input type="text" bind:value={form.supplierPostalCode} required />
-        </label>
-        <label>
-          <span>City</span>
-          <input type="text" bind:value={form.supplierCity} required />
-        </label>
-      </div>
-      <label>
-        <span>Street</span>
-        <input type="text" bind:value={form.supplierStreet} required />
-      </label>
-    </fieldset>
-
-    <fieldset>
       <legend>Buyer</legend>
       <label>
-        <span>Name</span>
+        <span>Search saved partners</span>
+        <PartnerTypeahead
+          bind:value={buyerTypeahead}
+          onSelect={onPartnerSelect}
+          onUseAsOneOff={onPartnerOneOff}
+          placeholder="Type 3+ characters to search…"
+          ariaLabel="Search saved partners"
+        />
+      </label>
+      <label>
+        <span>Name (auto-filled from selected partner)</span>
         <input type="text" bind:value={form.customerName} required />
       </label>
       <label>
-        <span>ADÓSZÁM</span>
+        <span>ADÓSZÁM (auto-filled from selected partner)</span>
         <input
           type="text"
           bind:value={form.customerTaxNumber}
@@ -413,11 +413,6 @@
 
   label.wide {
     flex: 2 1 auto;
-  }
-
-  .row {
-    display: flex;
-    gap: var(--space-2);
   }
 
   .line {

@@ -37,6 +37,7 @@
     amendInvoiceModification,
     getIssuanceInput,
     type Currency,
+    type Partner,
   } from "../lib/api";
   import {
     composeModificationBody,
@@ -44,6 +45,8 @@
     formFromIssuanceInput,
     type ModificationFormState,
   } from "../lib/modification";
+  import { buyerFieldsFromPartner } from "../lib/partners";
+  import PartnerTypeahead from "../lib/PartnerTypeahead.svelte";
 
   interface Props {
     /** The base invoice id this modification references. `null`
@@ -84,6 +87,11 @@
     | "error" = $state("idle");
   let submitError: string | null = $state(null);
   let prefillFallback: string | null = $state(null);
+  /** PR-54 / session-74 — typeahead-bound buyer-name string. Same
+   * decoupling posture as IssueInvoice: typing a search prefix does
+   * not commit to the wire body until the operator either picks a
+   * saved partner or accepts the typed value as a one-off. */
+  let buyerTypeahead = $state("");
 
   // Drive the dialog open/close lifecycle from the `baseInvoiceId`
   // prop. Opening: showModal() + kick off the pre-fill fetch.
@@ -112,6 +120,7 @@
       // verbatim; we still source currency from the billing row
       // (passed in as `currency`) per the C6 source-of-truth posture.
       form = formFromIssuanceInput(input, currency);
+      buyerTypeahead = form.customerName;
       modalState = "prefilled";
     } catch (err: unknown) {
       // 404 (CLI-issued or pre-PR-47α SPA-issued) lands here as a
@@ -124,6 +133,23 @@
         err instanceof Error ? err.message : String(err);
       modalState = "prefilled";
     }
+  }
+
+  function onPartnerSelect(partner: Partner) {
+    const fields = buyerFieldsFromPartner(partner);
+    form = {
+      ...form,
+      customerName: fields.customerName,
+      customerTaxNumber: fields.customerTaxNumber,
+    };
+    buyerTypeahead = partner.display_name;
+  }
+
+  function onPartnerOneOff() {
+    form = {
+      ...form,
+      customerName: buyerTypeahead.trim(),
+    };
   }
 
   function addLine() {
@@ -221,47 +247,17 @@
     {/if}
 
     <fieldset disabled={modalState === "prefilling"}>
-      <legend>Supplier</legend>
+      <legend>Buyer</legend>
       <label>
-        <span>Name</span>
-        <input type="text" bind:value={form.supplierName} required />
-      </label>
-      <label>
-        <span>ADÓSZÁM</span>
-        <input
-          type="text"
-          bind:value={form.supplierTaxNumber}
-          required
-          placeholder="12345678-1-42"
+        <span>Search saved partners</span>
+        <PartnerTypeahead
+          bind:value={buyerTypeahead}
+          onSelect={onPartnerSelect}
+          onUseAsOneOff={onPartnerOneOff}
+          placeholder="Type 3+ characters to search…"
+          ariaLabel="Search saved partners"
         />
       </label>
-      <div class="row">
-        <label class="narrow">
-          <span>Country</span>
-          <input
-            type="text"
-            bind:value={form.supplierCountryCode}
-            maxlength="2"
-            required
-          />
-        </label>
-        <label class="narrow">
-          <span>Postal code</span>
-          <input type="text" bind:value={form.supplierPostalCode} required />
-        </label>
-        <label>
-          <span>City</span>
-          <input type="text" bind:value={form.supplierCity} required />
-        </label>
-      </div>
-      <label>
-        <span>Street</span>
-        <input type="text" bind:value={form.supplierStreet} required />
-      </label>
-    </fieldset>
-
-    <fieldset disabled={modalState === "prefilling"}>
-      <legend>Buyer</legend>
       <label>
         <span>Name</span>
         <input type="text" bind:value={form.customerName} required />
@@ -439,11 +435,6 @@
 
   label.wide {
     flex: 2 1 auto;
-  }
-
-  .row {
-    display: flex;
-    gap: var(--space-2);
   }
 
   .line {

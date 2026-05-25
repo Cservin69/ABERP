@@ -92,16 +92,6 @@ fn fixture_ready_invoice() -> ReadyInvoice {
 
 fn fixture_request_body(currency: aberp_billing::Currency) -> ModificationInvoiceRequest {
     ModificationInvoiceRequest {
-        supplier: SupplierJson {
-            tax_number: "12345678-1-42".to_string(),
-            name: "Test Supplier Kft.".to_string(),
-            address: AddressJson {
-                country_code: "HU".to_string(),
-                postal_code: "1011".to_string(),
-                city: "Budapest".to_string(),
-                street: "Fő utca 1.".to_string(),
-            },
-        },
         customer: CustomerJson {
             tax_number: "87654321-2-13".to_string(),
             name: "Test Buyer Kft.".to_string(),
@@ -117,6 +107,7 @@ fn fixture_request_body(currency: aberp_billing::Currency) -> ModificationInvoic
         series: None,
     }
 }
+
 
 fn open_ledger(db_path: &PathBuf) -> Ledger {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");

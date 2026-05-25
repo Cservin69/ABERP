@@ -367,6 +367,63 @@ pub fn read_seller_identity(path: &Path) -> Result<Option<SellerIdentity>> {
     Ok(parse_seller_identity(&body))
 }
 
+/// PR-53 / session-73 — bank-block subset of the `seller.toml` file.
+/// All four fields are optional (the wizard treats them as optional;
+/// the PDF renderer hides empty rows). Returns an all-`None` value
+/// when the file is absent so the Tenant Settings page can render
+/// blank inputs without a separate file-missing branch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SellerBank {
+    pub account_number: Option<String>,
+    pub iban: Option<String>,
+    pub name: Option<String>,
+    pub swift_bic: Option<String>,
+}
+
+/// PR-53 / session-73 — read the bank block out of `seller.toml`.
+/// Returns an empty [`SellerBank`] when the file is absent (the
+/// Settings page renders blank inputs); a present file with any
+/// recognised bank-key is folded into the matching slot.
+pub fn read_seller_bank(path: &Path) -> Result<SellerBank> {
+    if !path.exists() {
+        return Ok(SellerBank::default());
+    }
+    let body = fs::read_to_string(path)
+        .with_context(|| format!("read seller.toml at {}", path.display()))?;
+    Ok(parse_seller_bank(&body))
+}
+
+/// PR-53 / session-73 — line-oriented parser for the bank block.
+/// Mirrors `parse_seller_identity`'s tolerance (blank / `#`-comment /
+/// `[section]` lines skipped; `key = "value"` lines collected) and
+/// folds the four recognised bank keys into the typed [`SellerBank`].
+pub fn parse_seller_bank(body: &str) -> SellerBank {
+    let mut bank = SellerBank::default();
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+            continue;
+        }
+        let (k, v) = match line.split_once('=') {
+            Some(pair) => pair,
+            None => continue,
+        };
+        let key = k.trim();
+        let value = v.trim().trim_matches('"').to_string();
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "bank_account_number" => bank.account_number = Some(value),
+            "iban" => bank.iban = Some(value),
+            "bank_name" => bank.name = Some(value),
+            "swift_bic" => bank.swift_bic = Some(value),
+            _ => {}
+        }
+    }
+    bank
+}
+
 /// PR-51 / session-71 — parsed identity-block subset of the
 /// `seller.toml` file. Returns `None` if any required identity field
 /// is missing so the caller can fold it into the

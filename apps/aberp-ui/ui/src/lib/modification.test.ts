@@ -1,16 +1,10 @@
 // PR-47β / session-65 — vitest pin for the Modification form-to-
 // request-body composer + the pre-fill `formFromIssuanceInput` seam.
 //
-// The composer is the load-bearing seam between the operator-edited
-// form state and the wire `ModificationInvoiceRequest` shape. The
-// pre-fill seam is the operator-visible affordance that turns "open
-// modification modal" from "retype the entire invoice" into "edit
-// in place" — a regression that mis-maps the side-stored
-// `IssueInvoiceRequest` into the form state would silently lose
-// content (e.g., a renamed `unitPrice` field would leave the line
-// at 0 and the operator would only notice on the printed invoice).
-// CLAUDE.md rule 9: per-field assertions so a regression that
-// collapses every line item to a constant cannot pass vacuously.
+// PR-53 / session-73 — supplier fields removed from both the form
+// shape and the wire shape. The composer + the pre-fill seam are
+// pinned at customer + lines + currency + modificationDate only;
+// supplier comes from seller.toml server-side now.
 //
 // Mirror invariant per A156 / A161: the backend's
 // `serve::ModificationInvoiceRequest` Deserialize and this composer
@@ -30,12 +24,6 @@ describe("composeModificationBody", () => {
   it("reshapes form state into the wire body with modificationDate", () => {
     const form = {
       ...emptyModificationForm("HUF"),
-      supplierName: "ABERP Supplier Kft.",
-      supplierTaxNumber: "12345678-1-42",
-      supplierCountryCode: "HU",
-      supplierPostalCode: "1011",
-      supplierCity: "Budapest",
-      supplierStreet: "Fő utca 1.",
       customerName: "Vevő Kft.",
       customerTaxNumber: "87654321-2-13",
       lines: [
@@ -50,16 +38,6 @@ describe("composeModificationBody", () => {
     };
     const body = composeModificationBody(form);
     expect(body).toEqual({
-      supplier: {
-        taxNumber: "12345678-1-42",
-        name: "ABERP Supplier Kft.",
-        address: {
-          countryCode: "HU",
-          postalCode: "1011",
-          city: "Budapest",
-          street: "Fő utca 1.",
-        },
-      },
       customer: {
         taxNumber: "87654321-2-13",
         name: "Vevő Kft.",
@@ -77,6 +55,14 @@ describe("composeModificationBody", () => {
     });
   });
 
+  it("does not emit a supplier field on the wire body (PR-53)", () => {
+    // Regression guard — the modification form parallels Issue in
+    // dropping supplier; the wire body must NOT carry it.
+    const form = emptyModificationForm("HUF");
+    const body = composeModificationBody(form);
+    expect("supplier" in body).toBe(false);
+  });
+
   it("trims whitespace on every string field including modificationDate", () => {
     // Defence in depth — the backend's date validator only accepts
     // canonical YYYY-MM-DD; surrounding whitespace would silently
@@ -84,8 +70,6 @@ describe("composeModificationBody", () => {
     // when they actually typed a malformed date.
     const form = {
       ...emptyModificationForm("EUR"),
-      supplierName: "  Trimmed supplier  ",
-      supplierTaxNumber: "  12345678-1-42  ",
       customerName: "  Trimmed buyer  ",
       modificationDate: "  2026-05-24  ",
       lines: [
@@ -98,8 +82,6 @@ describe("composeModificationBody", () => {
       ],
     };
     const body = composeModificationBody(form);
-    expect(body.supplier.name).toBe("Trimmed supplier");
-    expect(body.supplier.taxNumber).toBe("12345678-1-42");
     expect(body.customer.name).toBe("Trimmed buyer");
     expect(body.modificationDate).toBe("2026-05-24");
     expect(body.lines[0].description).toBe("trimmed desc");
@@ -120,21 +102,10 @@ describe("composeModificationBody", () => {
 describe("formFromIssuanceInput", () => {
   it("maps side-stored issuance input into the modification form state", () => {
     // The side-stored `<ULID>.input.json` carries the
-    // `IssueInvoiceRequest` shape; the modification form's state
-    // shape uses snake-case-free field names + `unitPriceMinor`. The
-    // mapper is the seam — a renamed field would silently strand the
-    // operator's content. Per-field assertions per CLAUDE.md rule 9.
+    // `IssueInvoiceRequest` shape (PR-53 dropped supplier from it);
+    // the mapper folds customer + lines + currency into the form
+    // state. Per-field assertions per CLAUDE.md rule 9.
     const input: IssueInvoiceRequest = {
-      supplier: {
-        taxNumber: "12345678-1-42",
-        name: "ABERP Supplier Kft.",
-        address: {
-          countryCode: "HU",
-          postalCode: "1011",
-          city: "Budapest",
-          street: "Fő utca 1.",
-        },
-      },
       customer: {
         taxNumber: "87654321-2-13",
         name: "Vevő Kft.",
@@ -156,12 +127,6 @@ describe("formFromIssuanceInput", () => {
       currency: "EUR",
     };
     const form = formFromIssuanceInput(input, "EUR");
-    expect(form.supplierTaxNumber).toBe("12345678-1-42");
-    expect(form.supplierName).toBe("ABERP Supplier Kft.");
-    expect(form.supplierCountryCode).toBe("HU");
-    expect(form.supplierPostalCode).toBe("1011");
-    expect(form.supplierCity).toBe("Budapest");
-    expect(form.supplierStreet).toBe("Fő utca 1.");
     expect(form.customerTaxNumber).toBe("87654321-2-13");
     expect(form.customerName).toBe("Vevő Kft.");
     expect(form.currency).toBe("EUR");
@@ -191,11 +156,6 @@ describe("formFromIssuanceInput", () => {
     // The mapper takes both inputs and emits the form with the
     // billing-row-sourced currency.
     const input: IssueInvoiceRequest = {
-      supplier: {
-        taxNumber: "12345678-1-42",
-        name: "S",
-        address: { countryCode: "HU", postalCode: "1", city: "B", street: "F" },
-      },
       customer: { taxNumber: "87654321-2-13", name: "C" },
       lines: [
         {
