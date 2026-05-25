@@ -469,6 +469,86 @@ mod tests {
         assert_eq!(h, EMPTY_SHA3_512_HEX.replace([' ', '\n'], ""));
     }
 
+    /// Session-83 / PR-63 — algorithm + concatenation pin against a
+    /// hardcoded triple.
+    ///
+    /// Hashes
+    /// `requestId="REQ00TESTREQ" || timestamp="2024-01-01T00:00:00Z"
+    ///  || xml_sign_key="testkey1234567890"`
+    /// — the 49-byte string
+    /// `"REQ00TESTREQ2024-01-01T00:00:00Ztestkey1234567890"` —
+    /// against the FIPS 202 SHA3-512 digest precomputed externally
+    /// (Python `hashlib.sha3_512(...).hexdigest().upper()`).
+    ///
+    /// What this pin catches that nothing else does:
+    ///
+    ///   1. **Algorithm swap to SHA-2/512.** A future contributor
+    ///      reaching for `sha2::Sha512` (which is already in this
+    ///      file's `use` for the password hash) would compute
+    ///      `0834CD7F...` — a totally different digest. The test
+    ///      loud-fails before NAV does.
+    ///
+    ///   2. **Implicit separator byte.** Any padding insert between
+    ///      the three `update()` calls changes the digest. The empty-
+    ///      input test above catches the simplest case; this one
+    ///      catches the "separator only between non-empty parts"
+    ///      flavour that the empty test cannot.
+    ///
+    ///   3. **Case-folding.** If a future `.to_lowercase()` slips in
+    ///      anywhere on the input strings, the digest changes
+    ///      (uppercase `REQ` → `req`, uppercase `T`/`Z` in the
+    ///      timestamp → `t`/`z`). The test pin holds the case
+    ///      exactly as NAV requires.
+    ///
+    ///   4. **UTF-8 vs codepoint hashing.** All three inputs are
+    ///      ASCII, so this particular vector wouldn't catch a
+    ///      codepoint regression — but the empty-input test's
+    ///      sibling on the manage form, plus the `password_hash`
+    ///      non-ASCII test, cover the byte-shape pin. Documenting
+    ///      the gap here so a future session knows to extend.
+    ///
+    /// If a published NAV worked example surfaces in a future session,
+    /// add it here as a second pin — the only extra benefit beyond
+    /// this internal pin is verification that **NAV computes the same
+    /// digest as we do**, not just "we are self-consistent". Mechanical
+    /// addition.
+    const PIN_REQ_ID: &str = "REQ00TESTREQ";
+    const PIN_TIMESTAMP: &str = "2024-01-01T00:00:00Z";
+    const PIN_SIGN_KEY: &[u8] = b"testkey1234567890";
+    const PIN_EXPECTED_HEX: &str = "575FB340945F3781F0EC37A9748E6F4C5FE370264940152B824FEE3BF865CAD0\
+                                    7D76BFB7C8C5F9BFAC4368FE628B186655B8AFC357FCB50CE5F4A398F46D5B5E";
+
+    #[test]
+    fn request_signature_pins_known_sha3_512_vector() {
+        let observed = request_signature(PIN_REQ_ID, PIN_TIMESTAMP, PIN_SIGN_KEY);
+        assert_eq!(
+            observed,
+            PIN_EXPECTED_HEX.replace([' ', '\n'], ""),
+            "SHA3-512 of REQ00TESTREQ+timestamp+sign_key drifted — \
+             algorithm swap to SHA-2, separator insert, case-fold, or \
+             concatenation reorder. NAV will reject every request."
+        );
+    }
+
+    #[test]
+    fn request_signature_pin_vector_differs_from_sha2_512() {
+        // Cross-check: the same input under SHA-2/512 produces a
+        // totally different digest. If this test ever passes (i.e.
+        // SHA-2 and SHA-3 produced the same bytes), reality has
+        // broken and the universe has bigger problems than NAV.
+        const SHA2_512_OF_PIN_INPUT: &str =
+            "0834CD7F945581D8207E2A966A739AC9917B56383C0393BD2DBCFB8D11072E53\
+             92539AE80B1A63824F7857CD1B4198843930E47E748AFA4CF7C1C3D490387593";
+        let observed = request_signature(PIN_REQ_ID, PIN_TIMESTAMP, PIN_SIGN_KEY);
+        assert_ne!(
+            observed,
+            SHA2_512_OF_PIN_INPUT.replace([' ', '\n'], ""),
+            "request_signature computed the SHA-2/512 of the input, \
+             not the SHA3-512 — algorithm swap from sha3::Sha3_512 \
+             to sha2::Sha512 is the most likely cause."
+        );
+    }
+
     // ── request_signature_manage ─────────────────────────────────────
 
     #[test]

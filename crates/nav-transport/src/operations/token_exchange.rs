@@ -84,6 +84,28 @@ pub async fn call(
 
     let url = format!("{}tokenExchange", transport.endpoint().base_url());
 
+    // Session-83 / PR-63 — log the resolved POST URL at `info!` so
+    // operators can confirm at a glance which NAV environment ABERP
+    // is hitting. The session-82 retry's `INVALID_REQUEST_SIGNATURE`
+    // raised the hypothesis that a refactor since PR-57 / session-77
+    // might have silently dropped the Test-vs-Production selector, in
+    // which case test creds would be signing requests bound for the
+    // production endpoint (which would reject the signature without
+    // disclosing the env-mismatch root cause). The URL is NOT secret —
+    // it is one of two static constants in `endpoint::NavEndpoint`,
+    // both already in the source code and on the wire. Logged here
+    // (HTTP-call site) rather than in `signatures.rs` because the
+    // signature function is pure and does not know about transport;
+    // the operations layer is where the URL is constructed. Emitted
+    // BEFORE `.post(&url)` so the line surfaces even if the POST
+    // itself hangs or errors at the network layer.
+    tracing::info!(
+        target: "aberp_nav_transport::operations::token_exchange",
+        nav_endpoint_url = %url,
+        nav_environment = ?transport.endpoint(),
+        "POSTing tokenExchange"
+    );
+
     let response = transport
         .client()
         .post(&url)
