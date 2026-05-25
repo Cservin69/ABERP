@@ -12,6 +12,14 @@
 //!      requestId || requestTimestamp(YYYY-MM-DDTHH:MM:SSZ, UTC) || xmlSignKey
 //!      ```
 //!
+//!      `xmlSignKey` is **leading/trailing ASCII-whitespace-trimmed**
+//!      before hashing (PR-62 / session-82). NAV's `xmlSignKey` is
+//!      documented as alphanumeric ASCII; operator paste artifacts
+//!      (trailing newline from TextEdit, leading/trailing space from
+//!      a portal copy) used to silently land in the keychain blob and
+//!      produce `INVALID_REQUEST_SIGNATURE` rejections. See
+//!      [`trim_ascii_ws`] for the full rationale.
+//!
 //!      For `manageInvoice` and `manageAnnulment` the input is extended by a
 //!      per-invoice-index suffix:
 //!
@@ -78,13 +86,25 @@ pub fn password_hash(password: &[u8]) -> String {
 /// `request_timestamp` must already be in the NAV-mandated form
 /// `YYYY-MM-DDTHH:MM:SSZ` UTC (see [`crate::soap::parts::request_timestamp`]).
 /// `xml_sign_key` is the bytes returned by
-/// `NavCredentials::sign_key_bytes()`.
+/// `NavCredentials::sign_key_bytes()`. ASCII whitespace at either end is
+/// trimmed before hashing (see [`trim_ascii_ws`]) — defends against
+/// operator paste artifacts in the keychain blob (PR-62 / session-82).
 pub fn request_signature(request_id: &str, request_timestamp: &str, xml_sign_key: &[u8]) -> String {
+    let key = trim_ascii_ws(xml_sign_key);
     let mut hasher = Sha3_512::new();
     hasher.update(request_id.as_bytes());
     hasher.update(request_timestamp.as_bytes());
-    hasher.update(xml_sign_key);
-    hex_upper(&hasher.finalize())
+    hasher.update(key);
+    let out = hex_upper(&hasher.finalize());
+    log_signature_diagnostics(
+        "tokenExchange/query",
+        request_id,
+        request_timestamp,
+        xml_sign_key,
+        key,
+        &out,
+    );
+    out
 }
 
 /// SHA3-512 of the request-signature input for `manageInvoice` /
@@ -124,15 +144,25 @@ pub fn request_signature_manage(
     xml_sign_key: &[u8],
     invoice_inputs: &[InvoiceSignatureInput<'_>],
 ) -> String {
+    let key = trim_ascii_ws(xml_sign_key);
     let mut hasher = Sha3_512::new();
     hasher.update(request_id.as_bytes());
     hasher.update(request_timestamp.as_bytes());
-    hasher.update(xml_sign_key);
+    hasher.update(key);
     for input in invoice_inputs {
         let suffix_hex = per_invoice_hex(input);
         hasher.update(suffix_hex.as_bytes());
     }
-    hex_upper(&hasher.finalize())
+    let out = hex_upper(&hasher.finalize());
+    log_signature_diagnostics(
+        "manageInvoice/manageAnnulment",
+        request_id,
+        request_timestamp,
+        xml_sign_key,
+        key,
+        &out,
+    );
+    out
 }
 
 /// One per-invoice-index contribution to a `manageInvoice` /
@@ -168,6 +198,98 @@ fn per_invoice_hex(input: &InvoiceSignatureInput<'_>) -> String {
     hasher.update(input.operation.as_bytes());
     hasher.update(base64_xml.as_bytes());
     hex_upper(&hasher.finalize())
+}
+
+/// PR-62 / session-82 — trim leading and trailing ASCII whitespace
+/// (space, tab, CR, LF, vertical-tab, form-feed) from `xml_sign_key`
+/// before hashing.
+///
+/// **Why this exists.** NAV's `xmlSignKey` is documented as an
+/// alphanumeric ASCII string with no whitespace. Operators paste it
+/// from NAV's portal into ABERP's setup wizard or rotate form. Pastes
+/// regularly carry a trailing `\n` (TextEdit autocompletion) or a
+/// leading/trailing space (the portal copies the value with the
+/// surrounding cell whitespace on some browsers). Both pre-PR-62 paths
+/// — the CLI's `read_line` and the HTTP wizard's JSON deserialisation
+/// — wrote the value verbatim into the keychain blob; the trailing
+/// whitespace then participated in the SHA3-512 input, while NAV
+/// (which holds the clean key in its own DB) computed a different
+/// signature and rejected the request with `INVALID_REQUEST_SIGNATURE`
+/// (session 82 — Hungarian `"Érvénytelen kérés aláírás!"`).
+///
+/// **Why the fix lives here, not at write-time.** The keychain blob
+/// shape and the write path (`keychain::write_blob`, the setup-wizard
+/// HTTP route, the rotate route) are out of scope for PR-62
+/// (signature-only — see the session-82 brief). Trimming inside the
+/// signature path also survives **existing dirty blobs** — an operator
+/// whose previous setup baked in a trailing newline does not have to
+/// re-enter the key. The keychain still holds the dirty bytes; the
+/// signature path normalises them at use-time.
+///
+/// **What is NOT trimmed.** Only the xmlSignKey input to the signature
+/// computation. The keychain bytes themselves are unchanged. The
+/// password (separate `passwordHash` flow) and the change_key (AES
+/// decode flow) are NOT trimmed here — those are different code paths
+/// and out of scope for this PR.
+fn trim_ascii_ws(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(bytes.len());
+    if start >= end {
+        return &[];
+    }
+    &bytes[start..end]
+}
+
+/// PR-62 / session-82 — emit one structured `tracing::debug!` line per
+/// signature computation. NO secret bytes are logged — only lengths,
+/// non-alphanumeric byte counts (a smell for whitespace / BOM / non-
+/// ASCII drift), and the first 16 hex chars of the resulting signature.
+///
+/// The 16-char prefix is enough to triangulate against a NAV-side echo
+/// when one is available but is **not** enough to recover the key. The
+/// raw vs trimmed length pair is the load-bearing diagnostic: if they
+/// differ, the keychain blob has whitespace and the trim path saved
+/// the request.
+///
+/// Logged at `debug!` (not `info!`) so a normal production session
+/// stays quiet; operators triaging a signature reject add
+/// `RUST_LOG=aberp_nav_transport::signatures=debug` to surface the line.
+fn log_signature_diagnostics(
+    operation_family: &'static str,
+    request_id: &str,
+    request_timestamp: &str,
+    sign_key_raw: &[u8],
+    sign_key_trimmed: &[u8],
+    signature_hex: &str,
+) {
+    let nonalnum_raw = sign_key_raw
+        .iter()
+        .filter(|b| !b.is_ascii_alphanumeric())
+        .count();
+    let nonalnum_trimmed = sign_key_trimmed
+        .iter()
+        .filter(|b| !b.is_ascii_alphanumeric())
+        .count();
+    let prefix_end = signature_hex.len().min(16);
+    tracing::debug!(
+        target: "aberp_nav_transport::signatures",
+        operation_family,
+        request_id,
+        request_timestamp,
+        sign_key_len_raw = sign_key_raw.len(),
+        sign_key_len_trimmed = sign_key_trimmed.len(),
+        sign_key_nonalnum_raw = nonalnum_raw,
+        sign_key_nonalnum_trimmed = nonalnum_trimmed,
+        signature_hex_prefix = &signature_hex[..prefix_end],
+        "computed NAV requestSignature (no secret bytes logged)"
+    );
 }
 
 /// Encode a hash as uppercase hex. NAV's XSD types pin `[0-9A-F]{128}`;
@@ -370,6 +492,134 @@ mod tests {
     }
 
     // ── hex_upper invariant ─────────────────────────────────────────
+
+    // ── PR-62 / session-82: xml_sign_key whitespace-trim pins ──────
+
+    /// The signature MUST be byte-equal whether the operator's
+    /// keychain blob carries a clean key, a trailing newline (the
+    /// TextEdit / wizard-paste pattern), a leading space (the portal
+    /// cell-copy pattern), or all of the above. NAV holds the clean
+    /// key on its side and computes the signature against it; our
+    /// signature has to match. If this test fails, the trim path
+    /// regressed and operator submits will get
+    /// `INVALID_REQUEST_SIGNATURE` again.
+    #[test]
+    fn request_signature_trims_trailing_newline_from_sign_key() {
+        let clean = request_signature(
+            "REQ12345ABCDEFG",
+            "2026-05-25T16:41:07Z",
+            b"abcdefghijklmnopqrstuvwxyz012345",
+        );
+        let trailing_lf = request_signature(
+            "REQ12345ABCDEFG",
+            "2026-05-25T16:41:07Z",
+            b"abcdefghijklmnopqrstuvwxyz012345\n",
+        );
+        let trailing_crlf = request_signature(
+            "REQ12345ABCDEFG",
+            "2026-05-25T16:41:07Z",
+            b"abcdefghijklmnopqrstuvwxyz012345\r\n",
+        );
+        let leading_space = request_signature(
+            "REQ12345ABCDEFG",
+            "2026-05-25T16:41:07Z",
+            b"  abcdefghijklmnopqrstuvwxyz012345",
+        );
+        let both_ends = request_signature(
+            "REQ12345ABCDEFG",
+            "2026-05-25T16:41:07Z",
+            b" \t abcdefghijklmnopqrstuvwxyz012345 \r\n",
+        );
+        assert_eq!(clean, trailing_lf);
+        assert_eq!(clean, trailing_crlf);
+        assert_eq!(clean, leading_space);
+        assert_eq!(clean, both_ends);
+    }
+
+    /// `request_signature_manage` shares the same trim path as
+    /// `request_signature`. A regression that only trims one would
+    /// break manageInvoice silently — pin it explicitly.
+    #[test]
+    fn request_signature_manage_trims_trailing_newline_from_sign_key() {
+        let inputs = [InvoiceSignatureInput {
+            operation: "CREATE",
+            invoice_data_xml: b"<InvoiceData>x</InvoiceData>",
+        }];
+        let clean = request_signature_manage(
+            "REQ12345ABCDEFG",
+            "2026-05-25T16:41:07Z",
+            b"abcdefghijklmnopqrstuvwxyz012345",
+            &inputs,
+        );
+        let dirty = request_signature_manage(
+            "REQ12345ABCDEFG",
+            "2026-05-25T16:41:07Z",
+            b"  abcdefghijklmnopqrstuvwxyz012345\r\n",
+            &inputs,
+        );
+        assert_eq!(clean, dirty);
+    }
+
+    /// Interior whitespace (e.g. a stray space in the middle of the
+    /// key) is **not** trimmed — `trim_ascii_ws` only trims at the
+    /// boundaries. NAV holds the canonical key; if an operator's key
+    /// genuinely had interior whitespace they'd have a different bug
+    /// (NAV's portal won't accept such a key in the first place), but
+    /// we pin the boundary-only behaviour so a future contributor
+    /// doesn't reach for `.iter().filter(|b| !b.is_ascii_whitespace())`
+    /// thinking it's "more defensive". It isn't — it'd change the
+    /// signature for any operator whose key legitimately contains
+    /// alphanumerics on both sides of a paste artifact at position 5.
+    #[test]
+    fn request_signature_does_not_trim_interior_whitespace() {
+        let no_interior = request_signature(
+            "REQ-1",
+            "2026-05-25T16:41:07Z",
+            b"abcdefghij",
+        );
+        let with_interior = request_signature(
+            "REQ-1",
+            "2026-05-25T16:41:07Z",
+            b"abcde fghij",
+        );
+        assert_ne!(no_interior, with_interior);
+    }
+
+    /// `trim_ascii_ws` on an all-whitespace input returns the empty
+    /// slice. NAV will reject the resulting signature for a different
+    /// reason (the sign_key in NAV's DB is not empty), but the function
+    /// must not panic or index out of bounds.
+    #[test]
+    fn trim_ascii_ws_on_all_whitespace_returns_empty() {
+        assert_eq!(trim_ascii_ws(b"   \t\r\n  "), b"");
+        assert_eq!(trim_ascii_ws(b""), b"");
+        assert_eq!(trim_ascii_ws(b"x"), b"x");
+        assert_eq!(trim_ascii_ws(b"  x  "), b"x");
+    }
+
+    /// Byte-equality pin for the trim helper used by the signature
+    /// path. Locks the exact byte-shape of the trimmed slice so a
+    /// future refactor can't quietly broaden it (e.g. to also trim
+    /// non-ASCII Unicode whitespace, which would over-trim a key
+    /// that legitimately starts with a high-bit-set byte — NAV's
+    /// xmlSignKey is ASCII so the over-trim wouldn't show up in
+    /// production, but it'd be a silent behaviour drift).
+    #[test]
+    fn trim_ascii_ws_only_recognises_ascii_whitespace_bytes() {
+        // 0xA0 is a non-breaking space in Latin-1 — NOT
+        // `u8::is_ascii_whitespace()`. Stays in the result.
+        assert_eq!(trim_ascii_ws(&[0xA0, b'x', 0xA0]), &[0xA0, b'x', 0xA0]);
+        // Rust's `u8::is_ascii_whitespace` matches U+0020 SPACE,
+        // U+0009 HT, U+000A LF, U+000C FF, U+000D CR. Vertical-tab
+        // (0x0B) is intentionally NOT in that set — match Rust's
+        // definition exactly so the pin doesn't quietly drift if a
+        // future contributor reaches for a hand-rolled char check.
+        assert_eq!(trim_ascii_ws(b" \t\r\nx\x0C"), b"x");
+        // VT (0x0B) is NOT whitespace per Rust, so it survives the
+        // trim. Pinning the negative case is what keeps the helper
+        // honest about which bytes it accepts.
+        assert_eq!(trim_ascii_ws(b"\x0Bx\x0B"), b"\x0Bx\x0B");
+    }
 
     #[test]
     fn hex_upper_round_trips_zero_byte_and_high_byte() {
