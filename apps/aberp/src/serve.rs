@@ -75,7 +75,7 @@ use aberp_billing::{self as billing, Currency, ReadyInvoice};
 use aberp_nav_transport::{NavCredentials, NavEndpoint, NavTransportError};
 use anyhow::{anyhow, Context, Result};
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -98,6 +98,7 @@ use crate::issue_invoice::{self, InvoiceInputJson};
 use crate::issue_modification;
 use crate::issue_storno;
 use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
+use crate::partners::{self, Partner, PartnerInputs, ValidationError as PartnerValidationError};
 use crate::poll_ack;
 use crate::print_invoice;
 use crate::setup_nav_credentials::{
@@ -663,6 +664,20 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/setup-nav-credentials",
             post(handle_setup_nav_credentials),
+        )
+        // PR-48α / session-68 — partner CRUD. Five routes (list +
+        // create on the collection; get + update + delete on the
+        // resource), all require_ready + bearer auth — partners is a
+        // Ready-state feature, not a first-run-setup surface.
+        .route(
+            "/api/partners",
+            get(handle_list_partners).post(handle_create_partner),
+        )
+        .route(
+            "/api/partners/:id",
+            get(handle_get_partner)
+                .put(handle_update_partner)
+                .delete(handle_delete_partner),
         )
         .with_state(state)
 }
@@ -2559,6 +2574,264 @@ pub fn get_issuance_input(
         )
     })?;
     Ok(Some(parsed))
+}
+
+// ── PR-48α / session-68 — partner CRUD ───────────────────────────────
+//
+// Five routes (list + create on the collection; get + update + delete
+// on the resource) over the per-tenant DuckDB `partners` table.
+// `aberp::partners` owns the schema + the CRUD body; this section is
+// the HTTP boundary that maps validation / not-found / 5xx errors
+// onto the standard status codes.
+
+/// PR-48α — typed error for the partner route helpers. `Validation`
+/// → 400, `NotFound` → 404, `Other` → 500 (via the standard
+/// [`internal_error`] helper).
+#[derive(Debug)]
+pub enum PartnerRouteError {
+    Validation(Vec<PartnerValidationError>),
+    NotFound,
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for PartnerRouteError {
+    fn from(e: anyhow::Error) -> Self {
+        PartnerRouteError::Other(e)
+    }
+}
+
+/// PR-48α — query-string carrier for `GET /api/partners?search=<needle>`.
+/// `search` is case-insensitive prefix match on `display_name` OR
+/// `legal_name` per the typeahead UX. Absence ⇒ list every active
+/// partner.
+#[derive(Debug, Deserialize)]
+pub struct ListPartnersQuery {
+    #[serde(default)]
+    pub search: Option<String>,
+}
+
+/// Wire body shape for the validation-failure response. `error` is a
+/// fixed sentinel string the SPA can pattern-match on; `fields` is the
+/// per-field array the inline-error renderer (A157) consumes.
+#[derive(Serialize)]
+struct PartnerValidationBody {
+    error: &'static str,
+    fields: Vec<PartnerValidationError>,
+}
+
+fn partner_validation_response(errors: Vec<PartnerValidationError>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(PartnerValidationBody {
+            error: "validation_failed",
+            fields: errors,
+        }),
+    )
+        .into_response()
+}
+
+fn partner_not_found_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(error_body("partner not found".to_string())),
+    )
+        .into_response()
+}
+
+// ── GET /api/partners ─────────────────────────────────────────────────
+
+async fn handle_list_partners(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<ListPartnersQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match list_partners_request(&state, query.search.as_deref()) {
+        Ok(partners) => Json(partners).into_response(),
+        Err(PartnerRouteError::Other(e)) => internal_error("list_partners_request", e),
+        Err(PartnerRouteError::Validation(_)) | Err(PartnerRouteError::NotFound) => {
+            // Unreachable — the list helper does not validate or
+            // surface NotFound. Bug-defensive arm so a future
+            // refactor that adds either path surfaces loud rather
+            // than a status-code-dropped silent 500.
+            internal_error(
+                "list_partners_request",
+                anyhow!("list_partners_request surfaced unexpected Validation/NotFound"),
+            )
+        }
+    }
+}
+
+/// PR-48α — library helper backing `GET /api/partners`. `pub` so the
+/// integration test can hit it without spinning the HTTPS listener
+/// (same posture as `issue_invoice_request` per A159).
+pub fn list_partners_request(
+    state: &AppState,
+    search: Option<&str>,
+) -> std::result::Result<Vec<Partner>, PartnerRouteError> {
+    let conn = Connection::open(&*state.db_path).with_context(|| {
+        format!("open tenant DuckDB at {}", state.db_path.display())
+    })?;
+    let partners = partners::list_partners(&conn, state.tenant.as_str(), search)?;
+    Ok(partners)
+}
+
+// ── GET /api/partners/:id ────────────────────────────────────────────
+
+async fn handle_get_partner(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match get_partner_request(&state, &id) {
+        Ok(partner) => Json(partner).into_response(),
+        Err(PartnerRouteError::NotFound) => partner_not_found_response(),
+        Err(PartnerRouteError::Other(e)) => internal_error("get_partner_request", e),
+        Err(PartnerRouteError::Validation(_)) => internal_error(
+            "get_partner_request",
+            anyhow!("get_partner_request surfaced unexpected Validation"),
+        ),
+    }
+}
+
+pub fn get_partner_request(
+    state: &AppState,
+    id: &str,
+) -> std::result::Result<Partner, PartnerRouteError> {
+    let conn = Connection::open(&*state.db_path).with_context(|| {
+        format!("open tenant DuckDB at {}", state.db_path.display())
+    })?;
+    match partners::get_partner(&conn, state.tenant.as_str(), id)? {
+        Some(p) => Ok(p),
+        None => Err(PartnerRouteError::NotFound),
+    }
+}
+
+// ── POST /api/partners ───────────────────────────────────────────────
+
+async fn handle_create_partner(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<PartnerInputs>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match create_partner_request(&state, &inputs) {
+        Ok(partner) => (StatusCode::CREATED, Json(partner)).into_response(),
+        Err(PartnerRouteError::Validation(errors)) => partner_validation_response(errors),
+        Err(PartnerRouteError::Other(e)) => internal_error("create_partner_request", e),
+        Err(PartnerRouteError::NotFound) => internal_error(
+            "create_partner_request",
+            anyhow!("create_partner_request surfaced unexpected NotFound"),
+        ),
+    }
+}
+
+pub fn create_partner_request(
+    state: &AppState,
+    inputs: &PartnerInputs,
+) -> std::result::Result<Partner, PartnerRouteError> {
+    if let Err(errors) = partners::validate_partner_inputs(inputs) {
+        return Err(PartnerRouteError::Validation(errors));
+    }
+    let conn = Connection::open(&*state.db_path).with_context(|| {
+        format!("open tenant DuckDB at {}", state.db_path.display())
+    })?;
+    let partner = partners::create_partner(&conn, state.tenant.as_str(), inputs)?;
+    Ok(partner)
+}
+
+// ── PUT /api/partners/:id ────────────────────────────────────────────
+
+async fn handle_update_partner(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(inputs): Json<PartnerInputs>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match update_partner_request(&state, &id, &inputs) {
+        Ok(partner) => Json(partner).into_response(),
+        Err(PartnerRouteError::Validation(errors)) => partner_validation_response(errors),
+        Err(PartnerRouteError::NotFound) => partner_not_found_response(),
+        Err(PartnerRouteError::Other(e)) => internal_error("update_partner_request", e),
+    }
+}
+
+pub fn update_partner_request(
+    state: &AppState,
+    id: &str,
+    inputs: &PartnerInputs,
+) -> std::result::Result<Partner, PartnerRouteError> {
+    if let Err(errors) = partners::validate_partner_inputs(inputs) {
+        return Err(PartnerRouteError::Validation(errors));
+    }
+    let conn = Connection::open(&*state.db_path).with_context(|| {
+        format!("open tenant DuckDB at {}", state.db_path.display())
+    })?;
+    match partners::update_partner(&conn, state.tenant.as_str(), id, inputs)? {
+        Some(p) => Ok(p),
+        None => Err(PartnerRouteError::NotFound),
+    }
+}
+
+// ── DELETE /api/partners/:id ─────────────────────────────────────────
+
+async fn handle_delete_partner(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match delete_partner_request(&state, &id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(PartnerRouteError::NotFound) => partner_not_found_response(),
+        Err(PartnerRouteError::Other(e)) => internal_error("delete_partner_request", e),
+        Err(PartnerRouteError::Validation(_)) => internal_error(
+            "delete_partner_request",
+            anyhow!("delete_partner_request surfaced unexpected Validation"),
+        ),
+    }
+}
+
+pub fn delete_partner_request(
+    state: &AppState,
+    id: &str,
+) -> std::result::Result<(), PartnerRouteError> {
+    let conn = Connection::open(&*state.db_path).with_context(|| {
+        format!("open tenant DuckDB at {}", state.db_path.display())
+    })?;
+    let deleted = partners::soft_delete_partner(&conn, state.tenant.as_str(), id)?;
+    if deleted {
+        Ok(())
+    } else {
+        Err(PartnerRouteError::NotFound)
+    }
 }
 
 /// PR-44η / session-60 — wire-state mapper for the poll-ack response.

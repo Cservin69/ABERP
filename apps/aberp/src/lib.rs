@@ -35,6 +35,7 @@ pub mod mark_abandoned;
 pub mod mnb_rates_provider;
 pub mod nav_xml;
 pub mod observe_receiver_confirmation;
+pub mod partners;
 pub mod poll_ack;
 pub mod poll_annulment_ack;
 pub mod print_invoice;

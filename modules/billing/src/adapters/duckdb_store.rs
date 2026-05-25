@@ -229,7 +229,15 @@ pub fn allocate_in_tx(
     // ── ADR-0009 §5 Layer 1 idempotency check. Same idempotency key
     //    => return the prior outcome unchanged. Hit before any number
     //    is burned.
-    let idem_str = args.idempotency_key.0.to_string();
+    //
+    // PR-49 — must be the canonical `idem_<ULID>` form so the column
+    // round-trips through `load_ready_invoice_by_id`
+    // (`IdempotencyKey::from_canonical_string`). PR-6's original write
+    // used the bare `Ulid::to_string()`; PR-7-B-1 introduced the
+    // canonical-form read on top without a round-trip pin, so the
+    // mismatch lay latent until the SPA's list+detail handlers (PR-44ζ
+    // session 59) first issued a row and immediately read it back.
+    let idem_str = args.idempotency_key.to_canonical_string();
     let prior: Option<String> = {
         let mut stmt = tx.prepare("SELECT id FROM invoice WHERE idempotency_key = ?;")?;
         let mut rows = stmt.query_map([&idem_str], |r| r.get::<_, String>(0))?;
