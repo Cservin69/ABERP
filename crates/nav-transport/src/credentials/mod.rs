@@ -49,22 +49,65 @@ impl NavCredentials {
     /// Returns the typed error if any artifact is missing (loud per
     /// CLAUDE.md rule 12) or if the keychain backend itself errors.
     ///
-    /// The keychain item naming convention (service =
-    /// `aberp.nav.<tenant_id>`, item = `technical_user.login` etc.)
-    /// is documented in [`keychain::item_path`]. An operator can list
-    /// what's populated with the platform's native keychain tool
-    /// (macOS: `security find-generic-password -s "aberp.nav.<id>"`).
+    /// # PR-57 / session-77 — single-blob storage with legacy migration
+    ///
+    /// The four artifacts now live in a single JSON-encoded keychain
+    /// entry, [`keychain::ITEM_NAV_CREDENTIALS_BLOB`]. The read path
+    /// is:
+    ///
+    ///   1. Try the blob entry. Present → parse + return (ONE
+    ///      `get_password` call, ONE ACL prompt on a fresh-build boot).
+    ///   2. Blob absent → fall back to the four legacy items
+    ///      (`technical_user.login`, `technical_user.password`,
+    ///      `xml_sign_key`, `xml_change_key`). All four present →
+    ///      migrate: write the blob, best-effort delete the legacy
+    ///      items, return. Any legacy item missing → propagate the
+    ///      typed `KeychainItemMissing` (NeedsSetup boot state).
+    ///   3. Blob present but malformed (JSON parse failure / missing
+    ///      field) → typed `KeychainBlobMalformed`. Operator triage:
+    ///      re-run the wizard or `aberp setup-nav-credentials`.
+    ///
+    /// The migration runs at most once per tenant per installation —
+    /// after the first successful migration the blob is authoritative
+    /// and the legacy items are gone, so subsequent boots take path 1
+    /// only. An operator can list what's populated with the platform's
+    /// native keychain tool (macOS: `security find-generic-password
+    /// -s "aberp.nav.<id>"`).
     pub fn load_from_keychain(tenant_id: &str) -> Result<Self, NavTransportError> {
-        let login = keychain::read_secret(tenant_id, keychain::ITEM_LOGIN)?;
-        let password = keychain::read_secret(tenant_id, keychain::ITEM_PASSWORD)?;
-        let sign_key = keychain::read_secret(tenant_id, keychain::ITEM_SIGN_KEY)?;
-        let change_key = keychain::read_secret(tenant_id, keychain::ITEM_CHANGE_KEY)?;
+        // Path 1 — blob present.
+        if let Some(blob) = keychain::read_blob(tenant_id)? {
+            return Ok(Self {
+                tenant_id: tenant_id.to_string(),
+                login: blob.login,
+                password: blob.password,
+                sign_key: blob.sign_key,
+                change_key: blob.change_key,
+            });
+        }
+
+        // Path 2 — blob absent. Read the four legacy items; partial
+        // populations surface as `KeychainItemMissing` exactly as
+        // before. Full population triggers the one-shot migration.
+        let legacy = keychain::read_legacy_artifacts(tenant_id)?;
+        keychain::write_blob(
+            tenant_id,
+            legacy.login.as_str(),
+            legacy.password.as_str(),
+            legacy.sign_key.as_str(),
+            legacy.change_key.as_str(),
+        )?;
+        keychain::delete_legacy_items_best_effort(tenant_id);
+        tracing::info!(
+            tenant = tenant_id,
+            "migrated four legacy NAV-credentials keychain entries into consolidated blob \
+             (PR-57: one prompt instead of four on subsequent rebuilds)"
+        );
         Ok(Self {
             tenant_id: tenant_id.to_string(),
-            login,
-            password,
-            sign_key,
-            change_key,
+            login: legacy.login,
+            password: legacy.password,
+            sign_key: legacy.sign_key,
+            change_key: legacy.change_key,
         })
     }
 

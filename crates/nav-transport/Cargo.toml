@@ -38,6 +38,13 @@ keyring = { workspace = true }
 # In-memory secret protection per ADR-0007 §Secrets.
 zeroize = { workspace = true }
 
+# PR-57 / session-77 — the consolidated NAV-credentials keychain blob
+# is JSON-encoded so the four secrets share ONE keychain item. serde +
+# serde_json are workspace deps already compiled tree-wide; adding them
+# here costs no incremental build time.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 # Tracing — ADR-0007 §Logging.
 tracing = { workspace = true }
 

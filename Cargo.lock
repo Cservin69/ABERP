@@ -110,6 +110,8 @@ dependencies = [
  "reqwest 0.13.3",
  "rustls",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "sha2",
  "sha3",
  "thiserror 1.0.69",

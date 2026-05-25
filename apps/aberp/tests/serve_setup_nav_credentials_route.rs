@@ -51,8 +51,10 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use aberp_audit_ledger::{BinaryHash, TenantId};
 use aberp_nav_transport::credentials::keychain::{
-    service_name, ITEM_CHANGE_KEY, ITEM_LOGIN, ITEM_PASSWORD, ITEM_SIGN_KEY,
+    service_name, ITEM_CHANGE_KEY, ITEM_LOGIN, ITEM_NAV_CREDENTIALS_BLOB, ITEM_PASSWORD,
+    ITEM_SIGN_KEY,
 };
+use aberp_nav_transport::credentials::NavCredentials;
 use keyring::credential::{
     Credential, CredentialApi, CredentialBuilderApi, CredentialPersistence,
 };
@@ -223,24 +225,30 @@ fn setup_route_happy_path_writes_keychain_and_flips_boot_state() {
     let next_token = serve::setup_nav_credentials_request(&state, &inputs)
         .expect("happy path must succeed");
 
-    // Per-field keychain verification: all four entries land verbatim.
+    // PR-57 / session-77 — the four artifacts now live in ONE
+    // keychain entry (`nav_credentials_blob`). Round-trip via the
+    // production load path: the JSON blob must parse and yield the
+    // four input fields verbatim.
+    let creds = NavCredentials::load_from_keychain(&tenant)
+        .expect("blob must round-trip after setup");
+    assert_eq!(creds.login(), inputs.technical_user_login.as_str());
+    assert_eq!(
+        creds.password_bytes(),
+        inputs.technical_user_password.as_bytes()
+    );
+    assert_eq!(creds.sign_key_bytes(), inputs.xml_sign_key.as_bytes());
+    assert_eq!(creds.change_key_bytes(), inputs.xml_change_key.as_bytes());
+
+    // PR-57 — the four legacy per-artifact entries must NOT be
+    // present after setup. The shared-core's
+    // `delete_legacy_items_best_effort` cleans them up after a
+    // successful blob write so the next fresh-build boot pays one ACL
+    // prompt for the blob, not four for the legacy entries.
     let service = service_name(&tenant);
-    assert_eq!(
-        read_back(&service, ITEM_LOGIN).as_deref(),
-        Some(inputs.technical_user_login.as_str()),
-    );
-    assert_eq!(
-        read_back(&service, ITEM_PASSWORD).as_deref(),
-        Some(inputs.technical_user_password.as_str()),
-    );
-    assert_eq!(
-        read_back(&service, ITEM_SIGN_KEY).as_deref(),
-        Some(inputs.xml_sign_key.as_str()),
-    );
-    assert_eq!(
-        read_back(&service, ITEM_CHANGE_KEY).as_deref(),
-        Some(inputs.xml_change_key.as_str()),
-    );
+    assert_eq!(read_back(&service, ITEM_LOGIN), None);
+    assert_eq!(read_back(&service, ITEM_PASSWORD), None);
+    assert_eq!(read_back(&service, ITEM_SIGN_KEY), None);
+    assert_eq!(read_back(&service, ITEM_CHANGE_KEY), None);
 
     // PR-51 / session-71 — unique tenant means seller.toml is absent;
     // post-transition state is NeedsSellerConfig, operator_login is
@@ -277,8 +285,11 @@ fn setup_route_rejects_empty_login_without_partial_write() {
         SetupRouteHelperError::Other(e) => panic!("expected Validation, got Other({e:#})"),
     }
 
-    // No keychain writes happened — every entry is None.
+    // No keychain writes happened — the blob entry is None AND the
+    // four legacy entries are None (neither was ever populated for
+    // this unique-per-run tenant).
     let service = service_name(&tenant);
+    assert_eq!(read_back(&service, ITEM_NAV_CREDENTIALS_BLOB), None);
     assert_eq!(read_back(&service, ITEM_LOGIN), None);
     assert_eq!(read_back(&service, ITEM_PASSWORD), None);
     assert_eq!(read_back(&service, ITEM_SIGN_KEY), None);
@@ -381,27 +392,25 @@ fn cli_and_http_reach_same_keychain_end_state() {
     serve::setup_nav_credentials_request(&state, &inputs)
         .expect("HTTP-path route helper must succeed");
 
-    // Both keychain end-states match input byte-for-byte.
+    // PR-57 / session-77 — both keychain end-states match input
+    // byte-for-byte via the consolidated blob.
     for (tenant_label, tenant) in [("CLI", &cli_tenant), ("HTTP", &http_tenant)] {
-        let service = service_name(tenant);
+        let creds = NavCredentials::load_from_keychain(tenant)
+            .unwrap_or_else(|e| panic!("{tenant_label}: blob load: {e}"));
+        assert_eq!(creds.login(), inputs.technical_user_login.as_str(), "{tenant_label}: login");
         assert_eq!(
-            read_back(&service, ITEM_LOGIN).as_deref(),
-            Some(inputs.technical_user_login.as_str()),
-            "{tenant_label}: login"
-        );
-        assert_eq!(
-            read_back(&service, ITEM_PASSWORD).as_deref(),
-            Some(inputs.technical_user_password.as_str()),
+            creds.password_bytes(),
+            inputs.technical_user_password.as_bytes(),
             "{tenant_label}: password"
         );
         assert_eq!(
-            read_back(&service, ITEM_SIGN_KEY).as_deref(),
-            Some(inputs.xml_sign_key.as_str()),
+            creds.sign_key_bytes(),
+            inputs.xml_sign_key.as_bytes(),
             "{tenant_label}: sign key"
         );
         assert_eq!(
-            read_back(&service, ITEM_CHANGE_KEY).as_deref(),
-            Some(inputs.xml_change_key.as_str()),
+            creds.change_key_bytes(),
+            inputs.xml_change_key.as_bytes(),
             "{tenant_label}: change key"
         );
     }

@@ -578,9 +578,14 @@ pub fn classify_attempt_failure(err: &NavTransportError) -> (&'static str, Optio
         | NavTransportError::ManageAnnulmentEmpty
         | NavTransportError::ManageAnnulmentTooManyItems { .. } => ("envelope", None),
 
-        // Credential-class (keychain access).
+        // Credential-class (keychain access). PR-57 / session-77 —
+        // a malformed `nav_credentials_blob` JSON payload is the same
+        // operator-triage class as a missing / backend-failed keychain
+        // entry (the recovery is "re-run the wizard"), so it joins the
+        // existing arm.
         NavTransportError::KeychainItemMissing { .. }
-        | NavTransportError::KeychainBackend { .. } => ("credential", None),
+        | NavTransportError::KeychainBackend { .. }
+        | NavTransportError::KeychainBlobMalformed { .. } => ("credential", None),
 
         // Client-build class (reqwest::ClientBuilder failure +
         // trust-anchor build failures — both are construction-time

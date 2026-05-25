@@ -32,9 +32,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use aberp_audit_ledger::{BinaryHash, TenantId};
-use aberp_nav_transport::credentials::keychain::{
-    service_name as nav_service_name, ITEM_CHANGE_KEY, ITEM_LOGIN, ITEM_PASSWORD, ITEM_SIGN_KEY,
-};
+use aberp_nav_transport::credentials::keychain::write_blob;
 use keyring::credential::{
     Credential, CredentialApi, CredentialBuilderApi, CredentialPersistence,
 };
@@ -162,9 +160,19 @@ fn build_state_for(tenant: &str, db_path: PathBuf) -> AppState {
     }
 }
 
-fn write_keychain_entry(service: &str, item: &str, value: &str) {
-    let entry = keyring::Entry::new(service, item).expect("entry");
-    entry.set_password(value).expect("set_password");
+/// PR-57 / session-77 — write the consolidated NAV-credentials blob
+/// for the given tenant. Mirrors what
+/// `setup_credentials_from_inputs` writes in production: ONE
+/// keychain item holding all four artifacts as JSON.
+fn write_blob_for_tenant(
+    tenant: &str,
+    login: &str,
+    password: &str,
+    sign_key: &str,
+    change_key: &str,
+) {
+    write_blob(tenant, login, password, sign_key, change_key)
+        .expect("write_blob must succeed in tests");
 }
 
 /// Write a fixture seller.toml at the given path. Tests use the
@@ -266,20 +274,16 @@ street = "Fő utca 1."
 // Tests for the rotate-credential route helper
 // ──────────────────────────────────────────────────────────────────────
 
-/// Happy-path rotation — set the four keychain entries through the
-/// shared mock, then invoke the rotate helper on one slot and
-/// re-read to confirm the value flipped.
+/// Happy-path rotation — set the consolidated NAV-credentials blob
+/// (PR-57) for the tenant, invoke the rotate helper on one slot, and
+/// re-read the blob to confirm only the target slot changed.
 #[test]
 fn rotate_nav_credential_updates_single_slot() {
     init_mock_keyring();
     let dir = test_dir("rotate");
     let tenant = unique_tenant("rotate");
-    let service = nav_service_name(&tenant);
 
-    write_keychain_entry(&service, ITEM_LOGIN, "old-login");
-    write_keychain_entry(&service, ITEM_PASSWORD, "old-pass");
-    write_keychain_entry(&service, ITEM_SIGN_KEY, "old-sign");
-    write_keychain_entry(&service, ITEM_CHANGE_KEY, "old-change");
+    write_blob_for_tenant(&tenant, "old-login", "old-pass", "old-sign", "old-change");
 
     let state = build_state_for(&tenant, dir.join("aberp.duckdb"));
     let response = aberp::serve::rotate_nav_credential_request(
@@ -290,19 +294,15 @@ fn rotate_nav_credential_updates_single_slot() {
     .expect("rotation must succeed");
     assert_eq!(response, "password");
 
-    // Re-read through the same shared mock — value must be the new.
-    let entry = keyring::Entry::new(&service, ITEM_PASSWORD).expect("re-read");
-    let value = entry.get_password().expect("get_password");
-    assert_eq!(value, "new-pass-value");
-
-    // Defence: the other three slots are unchanged.
-    assert_eq!(
-        keyring::Entry::new(&service, ITEM_LOGIN)
-            .unwrap()
-            .get_password()
-            .unwrap(),
-        "old-login"
-    );
+    // PR-57 — re-read via the public load helper. The blob round-trip
+    // must show only the rotated slot changed; the other three remain
+    // verbatim.
+    let creds = aberp_nav_transport::credentials::NavCredentials::load_from_keychain(&tenant)
+        .expect("blob must round-trip after rotation");
+    assert_eq!(creds.login(), "old-login");
+    assert_eq!(creds.password_bytes(), b"new-pass-value");
+    assert_eq!(creds.sign_key_bytes(), b"old-sign");
+    assert_eq!(creds.change_key_bytes(), b"old-change");
 }
 
 /// Login-slot rotation flips the in-process `operator_login` so
@@ -313,11 +313,7 @@ fn rotate_nav_credential_login_refreshes_operator_login() {
     init_mock_keyring();
     let dir = test_dir("rotate-login");
     let tenant = unique_tenant("rotate-login");
-    let service = nav_service_name(&tenant);
-    write_keychain_entry(&service, ITEM_LOGIN, "old-login");
-    write_keychain_entry(&service, ITEM_PASSWORD, "x");
-    write_keychain_entry(&service, ITEM_SIGN_KEY, "x");
-    write_keychain_entry(&service, ITEM_CHANGE_KEY, "x");
+    write_blob_for_tenant(&tenant, "old-login", "x", "x", "x");
 
     let state = build_state_for(&tenant, dir.join("aberp.duckdb"));
     aberp::serve::rotate_nav_credential_request(&state, "login", "new-operator")
@@ -381,16 +377,16 @@ fn rotate_nav_credential_rejects_empty_value() {
 // Tests for the nav-credentials-status read-side helper
 // ──────────────────────────────────────────────────────────────────────
 
+/// PR-57 / session-77 — status helper reads the consolidated blob and
+/// surfaces presence (all-true when the blob is populated; the four
+/// fields move together under the blob model) + the operator-visible
+/// login value verbatim.
 #[test]
 fn nav_credentials_status_reports_presence_and_login_value() {
     init_mock_keyring();
     let dir = test_dir("status");
     let tenant = unique_tenant("status");
-    let service = nav_service_name(&tenant);
-    write_keychain_entry(&service, ITEM_LOGIN, "visible-login");
-    write_keychain_entry(&service, ITEM_PASSWORD, "secret-pass");
-    // Deliberately leave sign_key + change_key unset to verify the
-    // missing-branch surfaces as `false`.
+    write_blob_for_tenant(&tenant, "visible-login", "secret-pass", "sk", "ck");
 
     let state = build_state_for(&tenant, dir.join("aberp.duckdb"));
     let status = aberp::serve::nav_credentials_status_request(&state)
@@ -398,13 +394,33 @@ fn nav_credentials_status_reports_presence_and_login_value() {
 
     assert!(status.login, "login slot must report present");
     assert!(status.password, "password slot must report present");
-    assert!(!status.sign_key, "sign_key must report missing");
-    assert!(!status.change_key, "change_key must report missing");
+    assert!(status.sign_key, "sign_key must report present (blob carries all 4)");
+    assert!(status.change_key, "change_key must report present (blob carries all 4)");
     assert_eq!(
         status.login_value.as_deref(),
         Some("visible-login"),
         "login value must be returned verbatim (it's not a secret)"
     );
+}
+
+/// PR-57 / session-77 — status helper reports all-false when the
+/// blob is absent (NeedsSetup boot state, before the wizard fires).
+#[test]
+fn nav_credentials_status_reports_all_false_when_blob_absent() {
+    init_mock_keyring();
+    let dir = test_dir("status-empty");
+    let tenant = unique_tenant("status-empty");
+    // No blob write — keychain entry is absent for this unique tenant.
+
+    let state = build_state_for(&tenant, dir.join("aberp.duckdb"));
+    let status = aberp::serve::nav_credentials_status_request(&state)
+        .expect("status read must succeed");
+
+    assert!(!status.login);
+    assert!(!status.password);
+    assert!(!status.sign_key);
+    assert!(!status.change_key);
+    assert_eq!(status.login_value, None);
 }
 
 // ──────────────────────────────────────────────────────────────────────

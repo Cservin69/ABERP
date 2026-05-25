@@ -222,13 +222,16 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // CLAUDE.md rule 12 — those are operator-triage situations, not
     // first-run setup situations.
     // PR-46α.1 / session-62-fix — same prompt-warning posture as the
-    // session_token step above. `NavCredentials::load_from_keychain`
-    // calls `entry.get_password()` four times (one per artifact); on
-    // a rebuilt binary each call may prompt for keychain access. If
-    // the operator sees this log in the loading pane and the boot
-    // hangs immediately after, the prompts are the cause.
+    // session_token step above. PR-57 / session-77: the four NAV
+    // artifacts now live in ONE keychain item (`nav_credentials_blob`),
+    // so the boot path is ONE `get_password` call → ONE potential ACL
+    // prompt on a freshly-rebuilt binary (down from four pre-PR-57).
+    // The first boot after applying PR-57 on an installation with the
+    // four legacy entries still present additionally reads each of
+    // those once to migrate; subsequent boots take the blob-only path.
     tracing::info!(
-        "boot step: reading NAV credentials from OS keychain (may prompt for keychain access)"
+        "boot step: reading NAV credentials blob from OS keychain (may prompt for keychain access; \
+         legacy 4-item migration on first launch after PR-57)"
     );
     let initial_boot_state = {
         let _s = tracing::info_span!("serve.nav_credentials").entered();
@@ -1430,29 +1433,42 @@ async fn handle_get_nav_credentials_status(
 }
 
 /// PR-53 / session-73 — library helper backing
-/// [`handle_get_nav_credentials_status`]. Reads the four keychain
-/// entries (login value verbatim; three secrets as presence-bools
-/// only). `pub` for integration-test access (A158).
+/// [`handle_get_nav_credentials_status`]. Reads the consolidated
+/// `nav_credentials_blob` keychain entry (PR-57) and returns presence
+/// flags + the operator-visible login value. `pub` for
+/// integration-test access (A158).
+///
+/// # PR-57 / session-77 — blob-first read
+///
+/// Pre-PR-57 this helper made four `get_password` calls (one per
+/// artifact). Post-PR-57 it goes through `NavCredentials::load_from
+/// _keychain`, which itself reads the consolidated blob (ONE
+/// `get_password` call) and transparently migrates any legacy entries
+/// found on first call. The behavior on the wire is unchanged: all
+/// four presence bools mirror whether the blob is populated, and
+/// `login_value` carries the login string when present.
 pub fn nav_credentials_status_request(state: &AppState) -> Result<NavCredentialsStatusResponse> {
     let tenant = state.tenant.as_str();
-    let (login, login_value) = match read_keychain_value(tenant, ITEM_LOGIN_NAME) {
-        ProbeResult::Present(v) => (true, Some(v)),
-        ProbeResult::Missing => (false, None),
-        ProbeResult::BackendError(e) => return Err(e.context("read login keychain entry")),
-    };
-    let password = probe_keychain_entry(tenant, ITEM_PASSWORD_NAME)
-        .context("probe password keychain entry")?;
-    let sign_key = probe_keychain_entry(tenant, ITEM_SIGN_KEY_NAME)
-        .context("probe sign_key keychain entry")?;
-    let change_key = probe_keychain_entry(tenant, ITEM_CHANGE_KEY_NAME)
-        .context("probe change_key keychain entry")?;
-    Ok(NavCredentialsStatusResponse {
-        login,
-        password,
-        sign_key,
-        change_key,
-        login_value,
-    })
+    match NavCredentials::load_from_keychain(tenant) {
+        Ok(creds) => Ok(NavCredentialsStatusResponse {
+            login: true,
+            password: true,
+            sign_key: true,
+            change_key: true,
+            login_value: Some(creds.login().to_string()),
+        }),
+        Err(aberp_nav_transport::NavTransportError::KeychainItemMissing { .. }) => {
+            // Blob absent AND no legacy entries to migrate — NeedsSetup.
+            Ok(NavCredentialsStatusResponse {
+                login: false,
+                password: false,
+                sign_key: false,
+                change_key: false,
+                login_value: None,
+            })
+        }
+        Err(other) => Err(anyhow!(other).context("read NAV credentials blob from OS keychain")),
+    }
 }
 
 /// PR-53 / session-73 — keychain item-name slugs used in the rotate
@@ -1465,78 +1481,6 @@ const ITEM_LOGIN_NAME: &str = "login";
 const ITEM_PASSWORD_NAME: &str = "password";
 const ITEM_SIGN_KEY_NAME: &str = "sign_key";
 const ITEM_CHANGE_KEY_NAME: &str = "change_key";
-
-/// PR-53 / session-73 — map a SPA-facing slug to the canonical
-/// keychain account-name constant. `None` if the slug is unrecognised
-/// (loud-fail at the route layer so an operator-typed body shape with
-/// a bogus `item` value surfaces a 400 rather than silently writing
-/// to a slot the audit-actor login can't read back).
-fn resolve_credential_item(slug: &str) -> Option<&'static str> {
-    use aberp_nav_transport::credentials::keychain::{
-        ITEM_CHANGE_KEY, ITEM_LOGIN, ITEM_PASSWORD, ITEM_SIGN_KEY,
-    };
-    match slug {
-        ITEM_LOGIN_NAME => Some(ITEM_LOGIN),
-        ITEM_PASSWORD_NAME => Some(ITEM_PASSWORD),
-        ITEM_SIGN_KEY_NAME => Some(ITEM_SIGN_KEY),
-        ITEM_CHANGE_KEY_NAME => Some(ITEM_CHANGE_KEY),
-        _ => None,
-    }
-}
-
-enum ProbeResult {
-    Present(String),
-    Missing,
-    BackendError(anyhow::Error),
-}
-
-/// Read one keychain entry and return its value if present. Used for
-/// the login slot (the only credential the SPA gets back verbatim).
-fn read_keychain_value(tenant: &str, slug: &str) -> ProbeResult {
-    use aberp_nav_transport::credentials::keychain::service_name;
-    let item = match resolve_credential_item(slug) {
-        Some(i) => i,
-        None => {
-            return ProbeResult::BackendError(anyhow!(
-                "unknown credential slug `{slug}` (programmer error — route layer should have gated)"
-            ));
-        }
-    };
-    let service = service_name(tenant);
-    let entry = match keyring::Entry::new(&service, item) {
-        Ok(e) => e,
-        Err(e) => {
-            return ProbeResult::BackendError(anyhow!(
-                "open keychain entry for service `{service}` item `{item}`: {e}"
-            ));
-        }
-    };
-    match entry.get_password() {
-        Ok(value) => ProbeResult::Present(value),
-        Err(keyring::Error::NoEntry) => ProbeResult::Missing,
-        Err(e) => ProbeResult::BackendError(anyhow!(
-            "read keychain entry `{item}` for service `{service}`: {e}"
-        )),
-    }
-}
-
-/// Probe an entry's presence without surfacing the value (used for
-/// the three secret slots).
-fn probe_keychain_entry(tenant: &str, slug: &str) -> Result<bool> {
-    use aberp_nav_transport::credentials::keychain::service_name;
-    let item = resolve_credential_item(slug)
-        .ok_or_else(|| anyhow!("unknown credential slug `{slug}`"))?;
-    let service = service_name(tenant);
-    let entry = keyring::Entry::new(&service, item)
-        .with_context(|| format!("open keychain entry for service `{service}` item `{item}`"))?;
-    match entry.get_password() {
-        Ok(_) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(e) => Err(anyhow!(
-            "probe keychain entry `{item}` for service `{service}`: {e}"
-        )),
-    }
-}
 
 // ── PR-53 / session-73 — POST /api/rotate-nav-credential ─────────────
 
@@ -1618,12 +1562,20 @@ async fn handle_rotate_nav_credential(
 /// resolved slug string on success.
 ///
 /// `pub` for integration-test access (A158).
+///
+/// # PR-57 / session-77 — blob round-trip
+///
+/// Pre-PR-57 this wrote a single per-field keychain entry. Post-PR-57
+/// rotation is a read-blob → mutate-one-field → write-blob round-
+/// trip, so the four artifacts continue to live in a single keychain
+/// item. The wire shape (request body's `item` enum + response's
+/// `item` echo) is unchanged.
 pub fn rotate_nav_credential_request(
     state: &AppState,
     item_slug: &str,
     new_value: &str,
 ) -> std::result::Result<&'static str, RotateNavCredentialError> {
-    let item = resolve_credential_item(item_slug).ok_or_else(|| {
+    let canonical_slug = canonical_credential_slug(item_slug).ok_or_else(|| {
         RotateNavCredentialError::Validation(format!(
             "unknown credential item `{item_slug}` — accepted values: \
              `login`, `password`, `sign_key`, `change_key`"
@@ -1635,23 +1587,56 @@ pub fn rotate_nav_credential_request(
         )));
     }
 
-    use aberp_nav_transport::credentials::keychain::service_name;
-    let service = service_name(state.tenant.as_str());
-    let entry = keyring::Entry::new(&service, item).map_err(|e| {
-        RotateNavCredentialError::Backend(anyhow!(
-            "open keychain entry for service `{service}` item `{item}`: {e}"
+    let tenant = state.tenant.as_str();
+
+    // Read current blob → mutate target field → write blob.
+    let current = NavCredentials::load_from_keychain(tenant).map_err(|e| {
+        RotateNavCredentialError::Backend(anyhow!(e).context(
+            "read NAV credentials blob before rotation; \
+             cannot rotate a single field without the other three",
         ))
     })?;
-    entry.set_password(new_value).map_err(|e| {
-        RotateNavCredentialError::Backend(anyhow!(
-            "write keychain entry `{item}` for service `{service}`: {e}"
+    let (login, password, sign_key, change_key) = match canonical_slug {
+        ITEM_LOGIN_NAME => (
+            new_value,
+            std::str::from_utf8(current.password_bytes()).map_err(utf8_err("password"))?,
+            std::str::from_utf8(current.sign_key_bytes()).map_err(utf8_err("sign_key"))?,
+            std::str::from_utf8(current.change_key_bytes()).map_err(utf8_err("change_key"))?,
+        ),
+        ITEM_PASSWORD_NAME => (
+            current.login(),
+            new_value,
+            std::str::from_utf8(current.sign_key_bytes()).map_err(utf8_err("sign_key"))?,
+            std::str::from_utf8(current.change_key_bytes()).map_err(utf8_err("change_key"))?,
+        ),
+        ITEM_SIGN_KEY_NAME => (
+            current.login(),
+            std::str::from_utf8(current.password_bytes()).map_err(utf8_err("password"))?,
+            new_value,
+            std::str::from_utf8(current.change_key_bytes()).map_err(utf8_err("change_key"))?,
+        ),
+        ITEM_CHANGE_KEY_NAME => (
+            current.login(),
+            std::str::from_utf8(current.password_bytes()).map_err(utf8_err("password"))?,
+            std::str::from_utf8(current.sign_key_bytes()).map_err(utf8_err("sign_key"))?,
+            new_value,
+        ),
+        _ => unreachable!("canonical_credential_slug already validated"),
+    };
+
+    aberp_nav_transport::credentials::keychain::write_blob(
+        tenant, login, password, sign_key, change_key,
+    )
+    .map_err(|e| {
+        RotateNavCredentialError::Backend(anyhow!(e).context(
+            "write NAV credentials blob to OS keychain during rotation",
         ))
     })?;
 
     // If the rotated slot is the login, refresh the cached operator_login
     // on the boot_state so subsequent issuance / submit routes derive
     // the audit actor from the new value.
-    if item_slug == ITEM_LOGIN_NAME {
+    if canonical_slug == ITEM_LOGIN_NAME {
         let mut guard = state.boot_state.write().map_err(|e| {
             RotateNavCredentialError::Backend(anyhow!(
                 "boot_state RwLock poisoned during login rotation: {e}"
@@ -1667,20 +1652,45 @@ pub fn rotate_nav_credential_request(
     }
 
     tracing::info!(
-        tenant = %state.tenant.as_str(),
-        item = item,
-        "NAV credential item rotated via /api/rotate-nav-credential"
+        tenant = %tenant,
+        item = canonical_slug,
+        "NAV credential item rotated via /api/rotate-nav-credential (blob round-trip)"
     );
 
-    // Return the canonical slug string (matches the request body's
-    // `item` field verbatim).
-    Ok(match item_slug {
-        ITEM_LOGIN_NAME => ITEM_LOGIN_NAME,
-        ITEM_PASSWORD_NAME => ITEM_PASSWORD_NAME,
-        ITEM_SIGN_KEY_NAME => ITEM_SIGN_KEY_NAME,
-        ITEM_CHANGE_KEY_NAME => ITEM_CHANGE_KEY_NAME,
-        _ => unreachable!("resolve_credential_item already validated"),
-    })
+    Ok(canonical_slug)
+}
+
+/// PR-57 / session-77 — closure factory for the `from_utf8` map_err
+/// arms in [`rotate_nav_credential_request`]. The blob's four fields
+/// come out of `Zeroizing<String>` (UTF-8 by construction — the
+/// keychain stored what we serialized as JSON UTF-8), so this arm
+/// fires only on a corrupted keychain backend that returned non-UTF-8
+/// bytes for one of the three retained fields. Loud per CLAUDE.md
+/// rule 12.
+fn utf8_err(
+    field: &'static str,
+) -> impl Fn(std::str::Utf8Error) -> RotateNavCredentialError {
+    move |e| {
+        RotateNavCredentialError::Backend(anyhow!(
+            "NAV credentials blob field `{field}` is not valid UTF-8 \
+             (keychain backend corruption?): {e}"
+        ))
+    }
+}
+
+/// PR-57 / session-77 — validate an SPA-facing slug and return the
+/// canonical static-str form. Replaces the pre-PR-57
+/// `resolve_credential_item` helper, which mapped to the legacy
+/// per-artifact item-name constants — under the blob model the rotate
+/// route only needs the slug itself, not the on-disk item name.
+fn canonical_credential_slug(slug: &str) -> Option<&'static str> {
+    match slug {
+        ITEM_LOGIN_NAME => Some(ITEM_LOGIN_NAME),
+        ITEM_PASSWORD_NAME => Some(ITEM_PASSWORD_NAME),
+        ITEM_SIGN_KEY_NAME => Some(ITEM_SIGN_KEY_NAME),
+        ITEM_CHANGE_KEY_NAME => Some(ITEM_CHANGE_KEY_NAME),
+        _ => None,
+    }
 }
 
 #[derive(Serialize)]

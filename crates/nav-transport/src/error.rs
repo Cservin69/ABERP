@@ -79,6 +79,22 @@ pub enum NavTransportError {
         source: keyring::Error,
     },
 
+    /// PR-57 / session-77 — the consolidated `nav_credentials_blob`
+    /// keychain entry is present but the value either fails to
+    /// serialize OR fails to parse as the expected JSON shape (missing
+    /// one of the four expected fields, malformed JSON, etc.). Loud
+    /// per CLAUDE.md rule 12 — silent fallback to NeedsSetup or to a
+    /// partial-credentials state would mask a corrupted keychain item
+    /// the operator must triage. Recovery: re-run the SPA's NAV-
+    /// credentials wizard (or `aberp setup-nav-credentials --tenant
+    /// <X>`), which overwrites the blob with a fresh, well-formed
+    /// payload.
+    #[error("NAV credentials blob malformed for tenant `{tenant_id}`: {detail}")]
+    KeychainBlobMalformed {
+        tenant_id: String,
+        detail: String,
+    },
+
     // ── 4. SOAP envelope construction (PR-7-B-1) ────────────────────
     /// `quick_xml::Writer` returned an error while assembling the
     /// envelope. The writer targets an in-memory `Vec<u8>`, so a real

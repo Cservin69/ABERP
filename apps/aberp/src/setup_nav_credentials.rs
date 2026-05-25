@@ -22,20 +22,34 @@
 //!
 //!      where `creds.txt` is `login\npassword\nxml_sign_key\nxml_change_key\n`.
 //!
-//! Both flows write the same keychain entries (`aberp.nav.<tenant>` /
-//! `technical_user.login` etc.) the production `submit-invoice` path
-//! reads via `NavCredentials::load_from_keychain`.
+//! Both flows write the same keychain entry — the PR-57 consolidated
+//! `aberp.nav.<tenant>` / `nav_credentials_blob` item — that the
+//! production `submit-invoice` path reads via
+//! `NavCredentials::load_from_keychain`.
 //!
 //! # PR-46α / session-62 — shared core
 //!
 //! The CLI `run()` and the new `POST /api/setup-nav-credentials` HTTP
-//! route both write the same four keychain entries. The actual write
-//! is factored into [`setup_credentials_from_inputs`] (mirrors the
+//! route both write the same keychain entry. The actual write is
+//! factored into [`setup_credentials_from_inputs`] (mirrors the
 //! A159 / A162 / A163 extract-library-helper pattern) so a single
 //! validate-then-write implementation backs both flows. The CLI's
 //! interactive prompts populate a [`NavCredentialInputs`] struct then
 //! call the shared core; the HTTP route deserialises the request body
 //! straight into [`NavCredentialInputs`] and calls the same core.
+//!
+//! # PR-57 / session-77 — consolidated keychain blob
+//!
+//! Pre-PR-57 the shared core wrote four separate keychain items (one
+//! per artifact). This meant a freshly-rebuilt binary paid FOUR ACL
+//! prompts on first boot (the macOS keychain re-prompts on a changed
+//! binary signature; the prompt count scales with the number of items
+//! touched). PR-57 consolidates all four into ONE JSON-encoded entry
+//! `nav_credentials_blob`; the shared core now calls
+//! [`aberp_nav_transport::credentials::keychain::write_blob`] once and
+//! best-effort deletes the four legacy entries (idempotent — see
+//! [`delete_legacy_items_best_effort`]). The boot-time read path on
+//! the same blob costs ONE ACL prompt per rebuild instead of four.
 //!
 //! # Why this lives in `apps/aberp/src/` and not in `crates/nav-transport`
 //!
@@ -48,18 +62,17 @@
 use std::io::{BufRead as _, Write as _};
 
 use aberp_nav_transport::credentials::keychain::{
-    service_name, ITEM_CHANGE_KEY, ITEM_LOGIN, ITEM_PASSWORD, ITEM_SIGN_KEY,
+    delete_legacy_items_best_effort, service_name, write_blob, ITEM_NAV_CREDENTIALS_BLOB,
 };
 use anyhow::{anyhow, Context as _, Result};
 
 use crate::cli::SetupNavCredentialsArgs;
 
-/// One of the four NAV keychain items. Hand-listed (not derived from
-/// the strings in `nav_transport::credentials::keychain`) so the prompt
-/// labels are operator-readable rather than the on-disk form.
+/// One of the four NAV credential prompts the CLI emits in fixed
+/// order. The four values are bundled into a [`NavCredentialInputs`]
+/// and written as a single keychain blob per PR-57.
 struct ItemPrompt {
     label: &'static str,
-    storage_name: &'static str,
     /// Whether the input is a secret — controls whether the prompt
     /// warns the operator about clear-text echo. (We can't disable
     /// echo without an unsafe stty call; the warning is the next best
@@ -70,22 +83,18 @@ struct ItemPrompt {
 const PROMPTS: [ItemPrompt; 4] = [
     ItemPrompt {
         label: "Technical-user login",
-        storage_name: ITEM_LOGIN,
         is_secret: false,
     },
     ItemPrompt {
         label: "Technical-user password",
-        storage_name: ITEM_PASSWORD,
         is_secret: true,
     },
     ItemPrompt {
         label: "xmlSignKey",
-        storage_name: ITEM_SIGN_KEY,
         is_secret: true,
     },
     ItemPrompt {
         label: "xmlChangeKey (16 bytes — AES-128 key)",
-        storage_name: ITEM_CHANGE_KEY,
         is_secret: true,
     },
 ];
@@ -154,11 +163,28 @@ pub fn setup_credentials_from_inputs(
     validate_input(&inputs.xml_sign_key, "xmlSignKey")?;
     validate_input(&inputs.xml_change_key, "xmlChangeKey")?;
 
-    let service = service_name(tenant);
-    write_entry(&service, ITEM_LOGIN, &inputs.technical_user_login)?;
-    write_entry(&service, ITEM_PASSWORD, &inputs.technical_user_password)?;
-    write_entry(&service, ITEM_SIGN_KEY, &inputs.xml_sign_key)?;
-    write_entry(&service, ITEM_CHANGE_KEY, &inputs.xml_change_key)?;
+    // PR-57 / session-77 — write the consolidated blob (ONE keychain
+    // item) instead of four per-artifact entries. Boot-time read cost
+    // drops from 4 ACL prompts to 1 on a freshly-rebuilt binary.
+    write_blob(
+        tenant,
+        &inputs.technical_user_login,
+        &inputs.technical_user_password,
+        &inputs.xml_sign_key,
+        &inputs.xml_change_key,
+    )
+    .map_err(|e| {
+        SetupCredentialsError::Backend(anyhow!(
+            "write NAV credentials blob to OS keychain for tenant `{tenant}`: {e}"
+        ))
+    })?;
+
+    // Best-effort cleanup of any pre-PR-57 legacy entries on this
+    // tenant. Idempotent — absent entries are a no-op. Backend errors
+    // on delete are logged via `tracing` (not propagated) so a partial
+    // failure does NOT undo the successful blob write.
+    delete_legacy_items_best_effort(tenant);
+
     Ok(())
 }
 
@@ -171,42 +197,35 @@ fn validate_input(value: &str, label: &'static str) -> std::result::Result<(), S
     Ok(())
 }
 
-fn write_entry(
-    service: &str,
-    item: &'static str,
-    value: &str,
-) -> std::result::Result<(), SetupCredentialsError> {
-    let entry = keyring::Entry::new(service, item).map_err(|e| {
-        SetupCredentialsError::Backend(anyhow!(
-            "open keychain entry for service `{service}` item `{item}`: {e}"
-        ))
-    })?;
-    entry.set_password(value).map_err(|e| {
-        SetupCredentialsError::Backend(anyhow!(
-            "write keychain entry `{item}` for service `{service}`: {e}"
-        ))
-    })
-}
-
 pub fn run(args: &SetupNavCredentialsArgs) -> Result<()> {
     let service = service_name(&args.tenant);
     eprintln!(
-        "Populating NAV credentials for tenant `{}` (service `{}`).",
-        args.tenant, service,
+        "Populating NAV credentials for tenant `{}` (service `{}`, item `{}`).",
+        args.tenant, service, ITEM_NAV_CREDENTIALS_BLOB,
     );
-    if args.refuse_overwrite {
-        eprintln!("(--refuse-overwrite set: existing keychain entries will NOT be replaced.)");
-    } else {
+
+    // PR-57 / session-77 — under the consolidated-blob model, the
+    // `--refuse-overwrite` flag is a single-decision check at the start
+    // (does the blob already exist?), not a per-field skip across the
+    // prompt loop. Pre-PR-57 the operator could skip individual
+    // fields; that surface was an artifact of having four entries and
+    // is gone with the blob.
+    if args.refuse_overwrite && blob_already_populated(&args.tenant)? {
         eprintln!(
-            "(Existing keychain entries WILL be replaced; pass --refuse-overwrite to opt out.)"
+            "(--refuse-overwrite set: keychain item `{ITEM_NAV_CREDENTIALS_BLOB}` \
+             already populated for service `{service}`; refusing to replace. \
+             Re-run without --refuse-overwrite to rotate the blob, or use the \
+             SPA's Settings → NAV Credentials → Rotate flow.)"
         );
+        return Ok(());
     }
+    eprintln!(
+        "(Existing keychain blob WILL be replaced; pass --refuse-overwrite to opt out.)"
+    );
 
     let stdin = std::io::stdin();
     let mut stdin_lock = stdin.lock();
     let mut values: [String; 4] = Default::default();
-    let mut skipped = 0usize;
-    let mut populated = 0usize;
 
     for (idx, prompt) in PROMPTS.iter().enumerate() {
         // Prompt to stderr (not stdout) so a stdin-redirected pipe
@@ -234,88 +253,45 @@ pub fn run(args: &SetupNavCredentialsArgs) -> Result<()> {
         // Trim only trailing newline / CR; do not touch leading
         // whitespace in case it is part of the value (NAV-generated
         // keys don't carry whitespace, but stay defensive).
-        let value = buf.trim_end_matches(['\n', '\r']).to_string();
-
-        if args.refuse_overwrite && keychain_entry_exists(&service, prompt.storage_name)? {
-            eprintln!(
-                "    → {} already populated; skipping (--refuse-overwrite)",
-                prompt.storage_name,
-            );
-            skipped += 1;
-            values[idx] = String::new();
-            continue;
-        }
-        values[idx] = value;
-        populated += 1;
+        values[idx] = buf.trim_end_matches(['\n', '\r']).to_string();
     }
 
-    // PR-46α / session-62 — route through the shared core when we have
-    // all four values to write. For the `--refuse-overwrite` mix-and-
-    // match case (some entries skipped) we cannot use the shared core
-    // because it refuses empty inputs; fall back to per-entry writes
-    // for those slots that survived the skip check.
-    if skipped == 0 {
-        let inputs = NavCredentialInputs {
-            technical_user_login: values[0].clone(),
-            technical_user_password: values[1].clone(),
-            xml_sign_key: values[2].clone(),
-            xml_change_key: values[3].clone(),
-        };
-        setup_credentials_from_inputs(&args.tenant, &inputs)
-            .map_err(|e| anyhow!("setup_credentials_from_inputs: {e}"))?;
-    } else {
-        // --refuse-overwrite hit at least one entry; write per-slot
-        // for the slots that survived. Validation still applies to
-        // each non-skipped value (empty → loud-fail).
-        for (idx, prompt) in PROMPTS.iter().enumerate() {
-            if values[idx].is_empty() {
-                continue;
-            }
-            validate_input(&values[idx], prompt.label)
-                .map_err(|e| anyhow!("setup_credentials_from_inputs: {e}"))?;
-            write_entry(&service, prompt.storage_name, &values[idx])
-                .map_err(|e| anyhow!("setup_credentials_from_inputs: {e}"))?;
-        }
-    }
+    let inputs = NavCredentialInputs {
+        technical_user_login: values[0].clone(),
+        technical_user_password: values[1].clone(),
+        xml_sign_key: values[2].clone(),
+        xml_change_key: values[3].clone(),
+    };
+    setup_credentials_from_inputs(&args.tenant, &inputs)
+        .map_err(|e| anyhow!("setup_credentials_from_inputs: {e}"))?;
 
     eprintln!(
-        "Done: {populated} written, {skipped} skipped \
-         (service `{service}`, 4 expected total)",
+        "Done: NAV credentials blob written for service `{service}`, \
+         item `{ITEM_NAV_CREDENTIALS_BLOB}` (legacy per-artifact entries \
+         deleted if present)."
     );
-
-    // Loud failure if the on-disk state is not "all four populated".
-    // The submit path's `NavCredentials::load_from_keychain` would
-    // surface this anyway as `KeychainItemMissing`, but failing here
-    // means the operator does not get a confused "I just ran setup
-    // and submit still says missing" loop.
-    let all_present = PROMPTS
-        .iter()
-        .all(|p| keychain_entry_exists(&service, p.storage_name).unwrap_or(false));
-    if !all_present {
-        return Err(anyhow!(
-            "after setup, one or more of the four NAV keychain items \
-             is still not present for tenant `{}`; rerun without \
-             --refuse-overwrite to fill the gaps",
-            args.tenant
-        ));
-    }
 
     Ok(())
 }
 
-/// Probe the keychain for an entry's existence without printing the
-/// value. Returns `false` for both "no such entry" and "backend
-/// returned NoEntry"; returns the underlying error for any other
-/// failure (locked keychain, permission denied) — loud per
-/// CLAUDE.md rule 12.
-fn keychain_entry_exists(service: &str, item: &'static str) -> Result<bool> {
-    let entry = keyring::Entry::new(service, item)
-        .with_context(|| format!("probe keychain entry for service `{service}` item `{item}`"))?;
+/// PR-57 / session-77 — probe ONLY the consolidated blob entry for
+/// existence. Used by the CLI's `--refuse-overwrite` gate. Backend
+/// failures are loud per CLAUDE.md rule 12 — silent fall-through to
+/// "blob absent → overwrite anyway" would mask a locked-keychain
+/// situation as a successful overwrite of a credential the operator
+/// thought was protected.
+fn blob_already_populated(tenant: &str) -> Result<bool> {
+    let service = service_name(tenant);
+    let entry = keyring::Entry::new(&service, ITEM_NAV_CREDENTIALS_BLOB).with_context(|| {
+        format!(
+            "probe keychain entry for service `{service}` item `{ITEM_NAV_CREDENTIALS_BLOB}`"
+        )
+    })?;
     match entry.get_password() {
         Ok(_) => Ok(true),
         Err(keyring::Error::NoEntry) => Ok(false),
         Err(other) => Err(anyhow!(
-            "keychain probe failed for service `{service}` item `{item}`: {other}"
+            "keychain probe failed for service `{service}` item `{ITEM_NAV_CREDENTIALS_BLOB}`: {other}"
         )),
     }
 }
