@@ -2695,7 +2695,7 @@ async fn handle_submit_invoice(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match submit_invoice_request(&state, &invoice_id) {
+    match submit_invoice_request(&state, &invoice_id).await {
         Ok(outcome) => Json(SubmitInvoiceResponse {
             invoice_id: outcome.invoice_id,
             transaction_id: outcome.transaction_id,
@@ -2741,7 +2741,7 @@ async fn handle_poll_ack(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match poll_ack_request(&state, &invoice_id) {
+    match poll_ack_request(&state, &invoice_id).await {
         Ok(outcome) => Json(PollAckResponse {
             invoice_id: outcome.invoice_id,
             state: poll_terminal_to_state(&outcome.terminal),
@@ -2799,7 +2799,7 @@ impl From<anyhow::Error> for SubmitRouteError {
 /// can hit it for precondition pin tests without spinning the HTTPS
 /// listener (same posture as `get_invoice_pdf` per A158 and
 /// `issue_invoice_request` per A159).
-pub fn submit_invoice_request(
+pub async fn submit_invoice_request(
     state: &AppState,
     invoice_id: &str,
 ) -> std::result::Result<submit_invoice::SubmitInvoiceOutcome, SubmitRouteError> {
@@ -2904,6 +2904,7 @@ pub fn submit_invoice_request(
         credentials: &credentials,
         actor,
     })
+    .await
     .map_err(|e| match e {
         submit_invoice::SubmitFromInputsError::WireFailed { error_message, .. } => {
             SubmitRouteError::Other(anyhow!(
@@ -2919,7 +2920,7 @@ pub fn submit_invoice_request(
 /// + tenant + operator login. `pub` so the integration test can hit
 /// it for precondition pin tests without spinning the HTTPS
 /// listener.
-pub fn poll_ack_request(
+pub async fn poll_ack_request(
     state: &AppState,
     invoice_id: &str,
 ) -> std::result::Result<poll_ack::PollAckOutcome, SubmitRouteError> {
@@ -3004,6 +3005,7 @@ pub fn poll_ack_request(
         &credentials,
         actor,
     )
+    .await
     .map_err(SubmitRouteError::Other)
 }
 

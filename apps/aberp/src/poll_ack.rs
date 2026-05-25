@@ -170,7 +170,15 @@ pub fn run(args: &PollAckArgs) -> Result<()> {
         NavEnv::Production => NavEndpoint::Production,
     };
 
-    let outcome = poll_ack_from_inputs(
+    // PR-56 / session-76 — build the tokio runtime at the CLI's
+    // top-level so [`poll_ack_from_inputs`] can stay async-native.
+    // Same posture as `submit_invoice::run`; see that module for the
+    // nested-runtime-panic background.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio current-thread runtime for poll-ack CLI")?;
+    let outcome = runtime.block_on(poll_ack_from_inputs(
         &args.db,
         &args.tenant,
         &args.invoice_id,
@@ -178,7 +186,7 @@ pub fn run(args: &PollAckArgs) -> Result<()> {
         nav_endpoint,
         &credentials,
         actor,
-    )?;
+    ))?;
 
     // 7. Typestate advance + operator-visible summary.
     match &outcome.terminal {
@@ -312,16 +320,18 @@ pub struct PollAckOutcome {
 ///   3. Open DuckDB; load the invoice + its idempotency key.
 ///   4. Resolve the NAV `transactionId` from the most-recent
 ///      `InvoiceSubmissionResponse` audit entry.
-///   5. Drive the bounded poll loop on a per-call tokio current-
-///      thread runtime; per attempt writes one `InvoiceAckStatus`
-///      audit entry under its own DuckDB tx.
+///   5. Drive the bounded poll loop on the caller's tokio runtime
+///      (CLI owns a current-thread runtime in `run`; the SPA route
+///      handler is itself async per PR-56 / session-76); per attempt
+///      writes one `InvoiceAckStatus` audit entry under its own
+///      DuckDB tx.
 ///   6. Verify-chain + mirror-sync success-criterion gate.
 ///
 /// Returns a typed [`PollAckOutcome`] so callers don't re-walk the
 /// ledger to format their summary; the operator-visible eprintln /
 /// JSON shape lives at the caller.
 #[allow(clippy::too_many_arguments)]
-pub fn poll_ack_from_inputs(
+pub async fn poll_ack_from_inputs(
     db: &Path,
     tenant_str: &str,
     invoice_id_str: &str,
@@ -370,12 +380,15 @@ pub fn poll_ack_from_inputs(
     let sequence_number = submitted_invoice.sequence_number;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
-    // 5. tokio current-thread runtime for the poll loop.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio current-thread runtime for poll loop")?;
-    let terminus = runtime.block_on(poll_loop(
+    // 5. Drive the poll loop on the caller's runtime. PR-56 /
+    //    session-76 — pre-PR-56 this function built its own
+    //    current-thread runtime and `block_on`'d `poll_loop` inline,
+    //    which panicked when called from the axum handler's already-
+    //    running multi-thread runtime. Both the CLI's
+    //    `poll_ack::run` and the SPA's `POST /invoices/:id/poll-ack`
+    //    handler now own the runtime above this call and `.await`
+    //    here.
+    let terminus = poll_loop(
         nav_endpoint,
         credentials,
         &tax_number_8,
@@ -384,7 +397,8 @@ pub fn poll_ack_from_inputs(
         &mut conn,
         &ledger_meta,
         &actor,
-    ))?;
+    )
+    .await?;
 
     // 6. Verify the audit chain (success-criterion gate).
     drop(conn);
@@ -530,61 +544,78 @@ async fn poll_loop(
     let mut last_intermediate_status: Option<ProcessingStatus> = None;
 
     for attempt in 1..=MAX_POLL_ATTEMPTS {
-        let _span = tracing::info_span!("poll_attempt", attempt).entered();
+        // PR-56 / session-76 — non-entered span: the prior
+        // `.entered()` form produced a `!Send` `EnteredSpan` guard
+        // that lived across the `.await`s below, which made the
+        // outer `poll_ack_from_inputs` future `!Send` and failed
+        // axum's `Handler` bound on the SPA-side `/poll-ack` route.
+        // `Instrument` + `in_scope` preserve the per-attempt span
+        // structure without holding a thread-local guard.
+        use tracing::Instrument as _;
+        let span = tracing::info_span!("poll_attempt", attempt);
 
-        let outcome = run_one_attempt(&transport, credentials, tax_number_8, transaction_id).await;
+        let outcome = run_one_attempt(&transport, credentials, tax_number_8, transaction_id)
+            .instrument(span.clone())
+            .await;
 
-        match outcome {
-            Ok(query_outcome) => {
-                let status = query_outcome.processing_status;
-                tracing::info!(
-                    status = status.as_nav_str(),
-                    response_bytes = query_outcome.response_xml.len(),
-                    "queryTransactionStatus OK"
-                );
+        let terminal = span.in_scope(|| -> Result<Option<LoopTerminus>> {
+            match outcome {
+                Ok(query_outcome) => {
+                    let status = query_outcome.processing_status;
+                    tracing::info!(
+                        status = status.as_nav_str(),
+                        response_bytes = query_outcome.response_xml.len(),
+                        "queryTransactionStatus OK"
+                    );
 
-                // Audit-write per poll. Each poll commits its own tx so
-                // a crash mid-loop preserves every completed poll's
-                // evidence.
-                write_ack_audit_entry(
-                    conn,
-                    ledger_meta,
-                    actor,
-                    invoice_id,
-                    transaction_id,
-                    &query_outcome,
-                )?;
+                    // Audit-write per poll. Each poll commits its own tx so
+                    // a crash mid-loop preserves every completed poll's
+                    // evidence.
+                    write_ack_audit_entry(
+                        conn,
+                        ledger_meta,
+                        actor,
+                        invoice_id,
+                        transaction_id,
+                        &query_outcome,
+                    )?;
 
-                if status.is_terminal() {
-                    return Ok(LoopTerminus::LastStatus(status));
+                    if status.is_terminal() {
+                        return Ok(Some(LoopTerminus::LastStatus(status)));
+                    }
+                    last_intermediate_status = Some(status);
+                    Ok(None)
                 }
-                last_intermediate_status = Some(status);
-                // fall through to backoff
+                Err(AttemptError::Retryable(diag)) => {
+                    tracing::warn!(attempt, "queryTransactionStatus retryable error: {}", diag);
+                    last_error = Some(diag);
+                    Ok(None)
+                }
+                Err(AttemptError::NonRetryable(diag)) => {
+                    tracing::error!(
+                        attempt,
+                        "queryTransactionStatus non-retryable error: {}",
+                        diag
+                    );
+                    Ok(Some(LoopTerminus::NonRetryableError(diag)))
+                }
             }
-            Err(AttemptError::Retryable(diag)) => {
-                tracing::warn!(attempt, "queryTransactionStatus retryable error: {}", diag);
-                last_error = Some(diag);
-                // fall through to backoff
-            }
-            Err(AttemptError::NonRetryable(diag)) => {
-                tracing::error!(
-                    attempt,
-                    "queryTransactionStatus non-retryable error: {}",
-                    diag
-                );
-                return Ok(LoopTerminus::NonRetryableError(diag));
-            }
+        })?;
+        if let Some(t) = terminal {
+            return Ok(t);
         }
 
         // Don't sleep after the last attempt; just exit the loop.
         if attempt < MAX_POLL_ATTEMPTS {
             let delay = Duration::from_millis(BACKOFF_BASE_MILLIS * (1u64 << (attempt - 1)));
-            tracing::info!(
-                next_attempt = attempt + 1,
-                backoff_millis = delay.as_millis() as u64,
-                "backing off before next poll attempt"
-            );
-            tokio::time::sleep(delay).await;
+            span.in_scope(|| {
+                tracing::info!(
+                    next_attempt = attempt + 1,
+                    backoff_millis = delay.as_millis() as u64,
+                    "backing off before next poll attempt"
+                );
+            });
+            tokio::time::sleep(delay).instrument(span).await;
         }
     }
 

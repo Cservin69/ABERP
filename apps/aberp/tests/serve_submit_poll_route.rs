@@ -164,8 +164,8 @@ fn write_ack(ledger: &mut Ledger, actor: &Actor, invoice_id: &str, txid: &str, s
 /// Submit precondition — a Finalized invoice (Draft + Attempt +
 /// Response + SAVED ack) must surface as `PreconditionMismatch`
 /// with `current_state == "Finalized"`. The route maps this to 409.
-#[test]
-fn submit_route_rejects_finalized_invoice_with_precondition_mismatch() {
+#[tokio::test]
+async fn submit_route_rejects_finalized_invoice_with_precondition_mismatch() {
     let dir = test_dir("submit-finalized");
     let db_path = dir.join("aberp.duckdb");
     let invoice = fixture_ready_invoice();
@@ -183,6 +183,7 @@ fn submit_route_rejects_finalized_invoice_with_precondition_mismatch() {
 
     let state = build_state(db_path);
     let err = serve::submit_invoice_request(&state, &invoice_id)
+        .await
         .expect_err("submit on Finalized must reject");
     match err {
         SubmitRouteError::PreconditionMismatch {
@@ -206,8 +207,8 @@ fn submit_route_rejects_finalized_invoice_with_precondition_mismatch() {
 /// Poll-ack precondition — a Ready invoice (Draft only) must
 /// surface as `PreconditionMismatch` with `current_state == "Ready"`.
 /// The route maps this to 409.
-#[test]
-fn poll_ack_route_rejects_ready_invoice_with_precondition_mismatch() {
+#[tokio::test]
+async fn poll_ack_route_rejects_ready_invoice_with_precondition_mismatch() {
     let dir = test_dir("poll-ready");
     let db_path = dir.join("aberp.duckdb");
     let invoice = fixture_ready_invoice();
@@ -222,6 +223,7 @@ fn poll_ack_route_rejects_ready_invoice_with_precondition_mismatch() {
 
     let state = build_state(db_path);
     let err = serve::poll_ack_request(&state, &invoice_id)
+        .await
         .expect_err("poll-ack on Ready must reject");
     match err {
         SubmitRouteError::PreconditionMismatch {
@@ -246,8 +248,8 @@ fn poll_ack_route_rejects_ready_invoice_with_precondition_mismatch() {
 /// must surface as `NotFound` (which the route maps to 404). The
 /// audit ledger has zero entries for the id; the helper rejects
 /// before any NAV interaction.
-#[test]
-fn submit_and_poll_routes_return_not_found_for_unknown_invoice() {
+#[tokio::test]
+async fn submit_and_poll_routes_return_not_found_for_unknown_invoice() {
     let dir = test_dir("not-found");
     let db_path = dir.join("aberp.duckdb");
     // Force the DB file to exist so `Ledger::open` succeeds even
@@ -265,6 +267,7 @@ fn submit_and_poll_routes_return_not_found_for_unknown_invoice() {
     let unknown = "inv_01ARZ3NDEKTSV4RRFFQ69G5XYZ";
 
     let submit_err = serve::submit_invoice_request(&state, unknown)
+        .await
         .expect_err("submit on unknown id must reject");
     match submit_err {
         SubmitRouteError::NotFound(message) => {
@@ -277,6 +280,7 @@ fn submit_and_poll_routes_return_not_found_for_unknown_invoice() {
     }
 
     let poll_err = serve::poll_ack_request(&state, unknown)
+        .await
         .expect_err("poll-ack on unknown id must reject");
     match poll_err {
         SubmitRouteError::NotFound(message) => {

@@ -296,13 +296,14 @@ fn setup_route_rejects_empty_login_without_partial_write() {
 /// `require_ready` middleware maps this to 503; the helper-level
 /// pin asserts the boot-state read short-circuits before any audit-
 /// ledger access.
-#[test]
-fn submit_invoice_request_refuses_when_needs_setup() {
+#[tokio::test]
+async fn submit_invoice_request_refuses_when_needs_setup() {
     init_mock_keyring();
     let tenant = unique_tenant("gated-submit");
     let state = build_state(ServeBootState::NeedsSetup, &tenant);
 
     let err = serve::submit_invoice_request(&state, "inv_unknown")
+        .await
         .expect_err("submit_invoice_request must reject in NeedsSetup");
     let msg = format!("{:?}", err);
     assert!(
@@ -315,13 +316,14 @@ fn submit_invoice_request_refuses_when_needs_setup() {
 /// `submit_invoice_request` gate. Defence in depth: a regression that
 /// dropped the gate from ONE of the two mutation helpers would still
 /// fail here.
-#[test]
-fn poll_ack_request_refuses_when_needs_setup() {
+#[tokio::test]
+async fn poll_ack_request_refuses_when_needs_setup() {
     init_mock_keyring();
     let tenant = unique_tenant("gated-poll");
     let state = build_state(ServeBootState::NeedsSetup, &tenant);
 
     let err = serve::poll_ack_request(&state, "inv_unknown")
+        .await
         .expect_err("poll_ack_request must reject in NeedsSetup");
     let msg = format!("{:?}", err);
     assert!(

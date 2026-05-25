@@ -16,7 +16,9 @@
 //!      after).
 //!   5. Build the actor + ledger meta with the keychain-derived login
 //!      (Actor::from_local_cli — F15 closed in PR-7-A).
-//!   6. Open a tokio current-thread runtime; on it:
+//!   6. NAV prepare phase (async, on the caller's runtime — owned by
+//!      the CLI's top-level `run`, or the axum handler's runtime for
+//!      the SPA-side `POST /invoices/:id/submit`):
 //!      - tokenExchange against the chosen NAV endpoint.
 //!      - `manage_invoice::build_request` — render the
 //!        `<ManageInvoiceRequest>` envelope bytes (no wire activity
@@ -140,7 +142,20 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
         NavEnv::Production => "production",
     };
 
-    match submit_from_inputs(SubmitFromInputs {
+    // PR-56 / session-76 — build the tokio runtime at the CLI's
+    // top-level so [`submit_from_inputs`] can stay async-native. Prior
+    // to PR-56 the library helper built a current-thread runtime and
+    // `block_on`'d its two NAV awaits internally, which panicked the
+    // moment the helper was called from the axum handler's already-
+    // running multi-thread runtime ("Cannot start a runtime from
+    // within a runtime"). Owning the runtime here keeps the CLI's
+    // sync `main` shape while letting the SPA-side handler `.await`
+    // the same library function without nesting.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio current-thread runtime for submit-invoice CLI")?;
+    match runtime.block_on(submit_from_inputs(SubmitFromInputs {
         db: &args.db,
         tenant_str: &args.tenant,
         invoice_id_str: &args.invoice_id,
@@ -151,7 +166,7 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
         endpoint_audit_label,
         credentials: &credentials,
         actor,
-    }) {
+    })) {
         Ok(outcome) => {
             println!(
                 "submitted invoice {} (seq {}) -> NAV transactionId {} \
@@ -293,7 +308,7 @@ impl From<anyhow::Error> for SubmitFromInputsError {
 /// re-walking the audit ledger. The TX2 AttemptFailed audit is
 /// already committed; the invoice is left in state-2 Pending per
 /// ADR-0032 §4.
-pub fn submit_from_inputs(
+pub async fn submit_from_inputs(
     inputs: SubmitFromInputs<'_>,
 ) -> std::result::Result<SubmitInvoiceOutcome, SubmitFromInputsError> {
     let SubmitFromInputs {
@@ -359,20 +374,21 @@ pub fn submit_from_inputs(
         .map_err(SubmitFromInputsError::Other)?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
-    // 6. NAV prepare phase on a tokio current-thread runtime.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio current-thread runtime for NAV calls")
-        .map_err(SubmitFromInputsError::Other)?;
-    let prepared = runtime
-        .block_on(prepare_for_attempt_audit(
-            nav_endpoint,
-            credentials,
-            &tax_number_8,
-            &invoice_xml,
-        ))
-        .map_err(SubmitFromInputsError::Other)?;
+    // 6. NAV prepare phase — `.await`ed on whatever runtime the caller
+    //    owns. PR-56 / session-76 — pre-PR-56 this function built its
+    //    own current-thread runtime and `block_on`'d the two NAV calls
+    //    inline, which panicked when called from the axum handler's
+    //    already-running multi-thread runtime ("Cannot start a runtime
+    //    from within a runtime"). The CLI now owns the runtime at the
+    //    top of `run`; the HTTP handler simply `.await`s.
+    let prepared = prepare_for_attempt_audit(
+        nav_endpoint,
+        credentials,
+        &tax_number_8,
+        &invoice_xml,
+    )
+    .await
+    .map_err(SubmitFromInputsError::Other)?;
     tracing::info!(
         request_bytes = prepared.request_xml.len(),
         "manageInvoice envelope built; ready to write TX1 Attempt audit"
@@ -402,10 +418,11 @@ pub fn submit_from_inputs(
     tracing::info!("TX1 Attempt audit committed; mirror synced; sending manageInvoice");
 
     // 8. Wire send.
-    let wire_result = runtime.block_on(manage_invoice::send_built_request(
+    let wire_result = manage_invoice::send_built_request(
         &prepared.transport,
         &prepared.request_xml,
-    ));
+    )
+    .await;
 
     // 9. TX2 — Response on success, AttemptFailed on failure.
     match wire_result {
