@@ -29,7 +29,8 @@
 //!
 //!   - It does not encrypt anything (NAV does not require ABERP to
 //!     encrypt anything toward NAV).
-//!   - It does not pad / unpad (NAV's plaintext token is a known-shape
+//!   - It strips PKCS#7 padding after decryption (NAV's tokenExchange
+//!     response ciphertext is block-aligned with PKCS#7 padding).
 //!     ASCII string; the decrypted output is returned verbatim; the
 //!     caller in `crate::operations::token_exchange` trims any trailing
 //!     PKCS#7-style padding bytes if present per the NAV behaviour
@@ -116,6 +117,19 @@ pub fn decrypt_exchange_token(
         block.copy_from_slice(chunk);
         cipher.decrypt_block(&mut block);
         out.extend_from_slice(block.as_slice());
+    }
+
+    // Strip PKCS#7 padding if present. NAV's tokenExchange response
+    // ciphertext is padded to AES block boundaries; the padding byte
+    // value equals the number of padding bytes. A trailing byte of
+    // 0x10 means 16 padding bytes (a full block). If stripping would
+    // remove the entire payload, return empty (malformed padding).
+    let pad_len = out.last().copied().unwrap_or(0) as usize;
+    if pad_len > 0 && pad_len <= AES_BLOCK_SIZE {
+        let data_len = out.len().saturating_sub(pad_len);
+        if data_len > 0 && out[data_len..].iter().all(|&b| b == pad_len as u8) {
+            out.truncate(data_len);
+        }
     }
 
     Ok(out)
