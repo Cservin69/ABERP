@@ -466,15 +466,15 @@ fn supplier_tax_number_emits_three_structured_subchildren() {
     // A regression that re-introduced the flat string would fail
     // every contains() below.
     assert!(
-        body.contains("<taxpayerId>12345678</taxpayerId>"),
+        body.contains("<common:taxpayerId>12345678</common:taxpayerId>"),
         "supplier <taxpayerId> must carry the 8-digit base, got body:\n{body}"
     );
     assert!(
-        body.contains("<vatCode>1</vatCode>"),
+        body.contains("<common:vatCode>1</common:vatCode>"),
         "supplier <vatCode> must carry the 1-digit VAT code, got body:\n{body}"
     );
     assert!(
-        body.contains("<countyCode>42</countyCode>"),
+        body.contains("<common:countyCode>42</common:countyCode>"),
         "supplier <countyCode> must carry the 2-digit county code, got body:\n{body}"
     );
     // And the flat shape must NOT appear — a regression would make
