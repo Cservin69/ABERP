@@ -3,7 +3,11 @@
 //!   - [`new_request_id`] — mint a fresh `requestId` for an outgoing call.
 //!   - [`request_timestamp`] — render an `OffsetDateTime` in the
 //!     `YYYY-MM-DDTHH:MM:SSZ` (extended ISO 8601) form NAV's
-//!     `GenericTimestampType` requires and `requestSignature` consumes.
+//!     `GenericTimestampType` requires.
+//!   - [`signature_timestamp`] — strip separators from the XML timestamp
+//!     to produce the `YYYYMMDDhhmmss` form NAV's `requestSignature`
+//!     computation consumes. MUST be called before every
+//!     `request_signature` / `request_signature_manage` invocation.
 //!   - [`write_header`] — `<common:header>` block.
 //!   - [`write_user`] — `<common:user>` block.
 //!   - [`write_software`] — `<software>` self-identification block.
@@ -42,10 +46,6 @@ pub fn new_request_id() -> String {
 /// We emit the integer-second form; the optional milliseconds branch
 /// is unused (NAV accepts but does not require sub-second precision and
 /// adding it would needlessly broaden the signature input surface).
-///
-/// **The same string MUST be fed to [`crate::signatures::request_signature`]
-/// — byte equality is load-bearing.** That's why the formatter lives in
-/// one place and both call sites consume its output verbatim.
 pub fn request_timestamp(at: OffsetDateTime) -> Result<String, NavTransportError> {
     // Convert to UTC first — caller may have passed an offset-bearing
     // value (typically OffsetDateTime::now_utc() which is already UTC,
@@ -60,6 +60,30 @@ pub fn request_timestamp(at: OffsetDateTime) -> Result<String, NavTransportError
         utc.minute(),
         utc.second(),
     ))
+}
+
+/// Strip separators from an XML-format timestamp for NAV signature input.
+///
+/// NAV v3.0 interface spec section 1.5.1: the `requestSignature` hash
+/// input uses a **masked** timestamp — `YYYYMMDDhhmmss` with all
+/// separators removed. The `-`, `:`, `T`, and `Z` characters that are
+/// required in the XML `<timestamp>` element must NOT appear in the
+/// signature computation.
+///
+/// Input:  `YYYY-MM-DDTHH:MM:SSZ` (as produced by [`request_timestamp`])
+/// Output: `YYYYMMDDhhmmss` (14 digits, no separators)
+///
+/// Every call site that computes a `requestSignature` MUST pass the
+/// timestamp through this function before handing it to
+/// [`crate::signatures::request_signature`] or
+/// [`crate::signatures::request_signature_manage`]. The XML timestamp
+/// itself is unchanged — only the signature input is masked.
+pub fn signature_timestamp(xml_timestamp: &str) -> String {
+    xml_timestamp
+        .replace("-", "")
+        .replace(":", "")
+        .replace("T", "")
+        .replace("Z", "")
 }
 
 /// Write the `<common:header>` block with the four required elements in

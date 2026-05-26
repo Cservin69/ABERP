@@ -151,7 +151,8 @@ pub fn render_token_exchange_request(
     request_id: &str,
     request_timestamp: &str,
 ) -> Result<Vec<u8>, NavTransportError> {
-    let signature = request_signature(request_id, request_timestamp, credentials.sign_key_bytes());
+    let sig_timestamp = parts::signature_timestamp(request_timestamp);
+    let signature = request_signature(request_id, &sig_timestamp, credentials.sign_key_bytes());
     render_request(
         "TokenExchangeRequest",
         credentials,
@@ -204,9 +205,10 @@ pub fn render_manage_invoice_request(
             invoice_data_xml: i.invoice_data_xml,
         })
         .collect();
+    let sig_timestamp = parts::signature_timestamp(request_timestamp);
     let signature = request_signature_manage(
         request_id,
-        request_timestamp,
+        &sig_timestamp,
         credentials.sign_key_bytes(),
         &signature_inputs,
     );
@@ -314,9 +316,10 @@ pub fn render_manage_annulment_request(
             invoice_data_xml: i.invoice_annulment_xml,
         })
         .collect();
+    let sig_timestamp = parts::signature_timestamp(request_timestamp);
     let signature = request_signature_manage(
         request_id,
-        request_timestamp,
+        &sig_timestamp,
         credentials.sign_key_bytes(),
         &signature_inputs,
     );
@@ -386,7 +389,8 @@ pub fn render_query_transaction_status_request(
     request_timestamp: &str,
     transaction_id: &str,
 ) -> Result<Vec<u8>, NavTransportError> {
-    let signature = request_signature(request_id, request_timestamp, credentials.sign_key_bytes());
+    let sig_timestamp = parts::signature_timestamp(request_timestamp);
+    let signature = request_signature(request_id, &sig_timestamp, credentials.sign_key_bytes());
     render_request(
         "QueryTransactionStatusRequest",
         credentials,
@@ -482,7 +486,8 @@ pub fn render_query_invoice_data_request(
     invoice_direction: InvoiceDirection,
     batch_index: u32,
 ) -> Result<Vec<u8>, NavTransportError> {
-    let signature = request_signature(request_id, request_timestamp, credentials.sign_key_bytes());
+    let sig_timestamp = parts::signature_timestamp(request_timestamp);
+    let signature = request_signature(request_id, &sig_timestamp, credentials.sign_key_bytes());
     let batch_index_str = batch_index.to_string();
     let direction_str = invoice_direction.as_nav_str();
     render_request(
@@ -543,7 +548,8 @@ pub fn render_query_invoice_check_request(
     invoice_direction: InvoiceDirection,
     batch_index: u32,
 ) -> Result<Vec<u8>, NavTransportError> {
-    let signature = request_signature(request_id, request_timestamp, credentials.sign_key_bytes());
+    let sig_timestamp = parts::signature_timestamp(request_timestamp);
+    let signature = request_signature(request_id, &sig_timestamp, credentials.sign_key_bytes());
     let batch_index_str = batch_index.to_string();
     let direction_str = invoice_direction.as_nav_str();
     render_request(

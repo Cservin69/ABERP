@@ -77,12 +77,14 @@ fn token_exchange_request_byte_shape_is_stable() {
         "password hash drift: envelope does not contain expected SHA-512: {s}"
     );
 
-    //     request_signature("REQ01...", "20260520T120000Z", sign_key) =
-    //     uppercase-hex SHA3-512(req_id || ts || sign_key).
+    //     request_signature("REQ01...", "20260520120000", sign_key) =
+    //     uppercase-hex SHA3-512(req_id || stripped_ts || sign_key).
+    //     NOTE: timestamp is MASKED (separators removed) per NAV v3.0
+    //     spec section 1.5.1 before entering the signature hash.
     let expected_signature = sha3_512_upper_hex(&{
         let mut buf = Vec::new();
         buf.extend_from_slice(b"REQ01ABCDEFGHIJKLMNOP012345");
-        buf.extend_from_slice(b"20260520T120000Z");
+        buf.extend_from_slice(b"20260520120000");  // stripped: YYYYMMDDhhmmss
         buf.extend_from_slice(b"SIGN-KEY-32B-ASCII-XXXXXXXXXXXXX");
         buf
     });

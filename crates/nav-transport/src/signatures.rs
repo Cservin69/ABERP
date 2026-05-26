@@ -9,8 +9,14 @@
 //!      / non-`manageAnnulment` operations the input is exactly:
 //!
 //!      ```text
-//!      requestId || requestTimestamp(YYYY-MM-DDTHH:MM:SSZ, UTC) || xmlSignKey
+//!      requestId || requestTimestamp(YYYYMMDDhhmmss, UTC) || xmlSignKey
 //!      ```
+//!
+//!      The timestamp MUST be stripped of separators (`-`, `:`, `T`, `Z`)
+//!      before hashing — use `crate::soap::parts::signature_timestamp()`
+//!      to convert from the XML format (`YYYY-MM-DDTHH:MM:SSZ`) to the
+//!      signature format (`YYYYMMDDhhmmss`). Passing the XML format
+//!      produces `INVALID_REQUEST_SIGNATURE` from NAV.
 //!
 //!      `xmlSignKey` is **leading/trailing ASCII-whitespace-trimmed**
 //!      before hashing (PR-62 / session-82). NAV's `xmlSignKey` is
@@ -107,8 +113,10 @@ pub fn password_hash(password: &[u8]) -> String {
 ///
 ///   request_id || request_timestamp || xml_sign_key
 ///
-/// `request_timestamp` must already be in the NAV-mandated form
-/// `YYYY-MM-DDTHH:MM:SSZ` UTC (see [`crate::soap::parts::request_timestamp`]).
+/// `request_timestamp` must be in the **stripped** form `YYYYMMDDhhmmss`
+/// (see [`crate::soap::parts::signature_timestamp`]). Do NOT pass the
+/// XML format `YYYY-MM-DDTHH:MM:SSZ` — NAV's `requestSignature`
+/// computation uses the separator-free mask per v3.0 spec section 1.5.1.
 /// `xml_sign_key` is the bytes returned by
 /// `NavCredentials::sign_key_bytes()`. ASCII whitespace at either end is
 /// trimmed before hashing (see [`trim_ascii_ws`]) — defends against
@@ -149,7 +157,9 @@ pub fn request_signature(request_id: &str, request_timestamp: &str, xml_sign_key
 /// SHA3-512 of the request-signature input for `manageInvoice` /
 /// `manageAnnulment`.
 ///
-/// Same prefix as [`request_signature`], extended by — for each per-index
+/// Same prefix as [`request_signature`] (including the same timestamp
+/// masking requirement — `YYYYMMDDhhmmss`, NOT `YYYY-MM-DDTHH:MM:SSZ`),
+/// extended by — for each per-index
 /// invoice in `invoice_inputs` (in index order; index 1, 2, 3, ...) — the
 /// **uppercase-hex** SHA3-512 of:
 ///
