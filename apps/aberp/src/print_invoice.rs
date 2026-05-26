@@ -591,8 +591,19 @@ fn handle_text(
             "customerName" => {
                 out.customer_name = value.to_string();
             }
+            // PR-50 / session-70 — customer tax number same structured
+            // shape as supplier: <taxpayerId> + <vatCode> + <countyCode>
+            // assembled into canonical xxxxxxxx-y-zz form.
             "taxpayerId" if ends_with(path, &["customerTaxNumber", "taxpayerId"]) => {
                 out.customer_tax_number = value.to_string();
+            }
+            "vatCode" if ends_with(path, &["customerTaxNumber", "vatCode"]) => {
+                out.customer_tax_number.push('-');
+                out.customer_tax_number.push_str(value);
+            }
+            "countyCode" if ends_with(path, &["customerTaxNumber", "countyCode"]) => {
+                out.customer_tax_number.push('-');
+                out.customer_tax_number.push_str(value);
             }
             _ => {}
         }

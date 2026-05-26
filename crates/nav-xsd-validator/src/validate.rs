@@ -448,7 +448,8 @@ fn walk_customer_vat_data(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValida
 
 fn walk_customer_tax_number(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
     const PARENT: &str = "customerTaxNumber";
-    const ALLOWED: &[&str] = &["taxpayerId"];
+    const ALLOWED: &[&str] = &["taxpayerId", "vatCode", "countyCode"];
+    const ORDERED_REQUIRED: &[&str] = ALLOWED;
     let mut seen: Vec<&'static str> = Vec::new();
     loop {
         match read_event(reader)? {
@@ -464,7 +465,7 @@ fn walk_customer_tax_number(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdVali
                 seen.push(canonical);
             }
             Event::End(_) => {
-                check_ordered_required(PARENT, &["taxpayerId"], &seen)?;
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
                 return Ok(());
             }
             Event::Eof => return Err(eof_in(PARENT, reader)),
@@ -472,7 +473,6 @@ fn walk_customer_tax_number(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdVali
         }
     }
 }
-
 fn walk_address(
     address_tag: &'static str,
     reader: &mut Reader<&[u8]>,
@@ -735,6 +735,48 @@ fn walk_line_vat_rate(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidation
     }
 }
 
+/// Walk <vatRate> inside summaryByVatRate (same shape as lineVatRate).
+fn walk_vat_rate(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "vatRate";
+    const ALLOWED: &[&str] = &[
+        "vatPercentage",
+        "vatContent",
+        "vatExemption",
+        "vatOutOfScope",
+    ];
+    let mut any_seen = false;
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                if canonical == "vatPercentage" {
+                    let text = collect_text(reader, canonical)?;
+                    ensure_numeric_amount(canonical, &text)?;
+                } else {
+                    skip_to_matching_end(reader)?;
+                }
+                any_seen = true;
+            }
+            Event::End(_) => {
+                if !any_seen {
+                    return Err(NavXsdValidationError::MissingRequiredChild {
+                        parent: PARENT,
+                        expected: "vatPercentage",
+                    });
+                }
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
 fn walk_amount_pair(
     parent: &'static str,
     expected: &'static [&'static str],
@@ -856,8 +898,7 @@ fn walk_summary_by_vat_rate(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdVali
         "vatRateNetData",
         "vatRateVatData",
         "vatRateGrossData",
-        "lineVatRate",
-        "vatPercentage",
+        "vatRate",
     ];
     let mut seen: Vec<&'static str> = Vec::new();
     loop {
@@ -886,11 +927,7 @@ fn walk_summary_by_vat_rate(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdVali
                         &["vatRateGrossAmount", "vatRateGrossAmountHUF"],
                         reader,
                     )?,
-                    "lineVatRate" => walk_line_vat_rate(reader)?,
-                    "vatPercentage" => {
-                        let text = collect_text(reader, canonical)?;
-                        ensure_numeric_amount(canonical, &text)?;
-                    }
+                    "vatRate" => walk_vat_rate(reader)?,
                     other => unreachable!("canonicalized unknown element {other}"),
                 }
                 seen.push(canonical);
@@ -909,7 +946,6 @@ fn walk_summary_by_vat_rate(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdVali
         }
     }
 }
-
 fn walk_summary_gross_data(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
     walk_amount_pair(
         "summaryGrossData",
@@ -1357,6 +1393,8 @@ mod tests {
           <customerVatData>
             <customerTaxNumber>
               <taxpayerId>87654321</taxpayerId>
+              <vatCode>1</vatCode>
+              <countyCode>42</countyCode>
             </customerTaxNumber>
           </customerVatData>
           <customerName>Test Customer Zrt.</customerName>
@@ -1402,9 +1440,9 @@ mod tests {
       <invoiceSummary>
         <summaryNormal>
           <summaryByVatRate>
-            <lineVatRate>
+            <vatRate>
               <vatPercentage>0.27</vatPercentage>
-            </lineVatRate>
+            </vatRate>
             <vatRateNetData>
               <vatRateNetAmount>2000</vatRateNetAmount>
               <vatRateNetAmountHUF>2000</vatRateNetAmountHUF>

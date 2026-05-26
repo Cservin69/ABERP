@@ -62,7 +62,7 @@ fn minimal_parties() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
-            tax_number: "87654321".to_string(),
+            tax_number: "87654321-1-42".to_string(),
             name: "Test Customer Zrt.".to_string(),
         },
     }

@@ -392,6 +392,7 @@ pub fn render_invoice_data(
     );
     text_element(&mut w, "invoiceIssueDate", &issue_date)?;
 
+
     // <invoiceMain>
     w.write_event(Event::Start(BytesStart::new("invoiceMain")))?;
     w.write_event(Event::Start(BytesStart::new("invoice")))?;
@@ -675,6 +676,7 @@ pub fn render_annulment_data(annulment_reference: &AnnulmentReference) -> Result
     w.write_event(Event::Start(root))
         .context("write <InvoiceAnnulment>")?;
 
+
     text_element(
         &mut w,
         "annulmentReference",
@@ -805,9 +807,9 @@ fn write_supplier(w: &mut Writer<&mut Vec<u8>>, s: &SupplierInfo) -> Result<()> 
         .map_err(|e| anyhow!("supplier tax number invalid at NAV-XML render time: {e}"))?;
     w.write_event(Event::Start(BytesStart::new("supplierInfo")))?;
     w.write_event(Event::Start(BytesStart::new("supplierTaxNumber")))?;
-    text_element(w, "taxpayerId", &parsed.taxpayer_id)?;
-    text_element(w, "vatCode", &parsed.vat_code)?;
-    text_element(w, "countyCode", &parsed.county_code)?;
+    common_element(w, "taxpayerId", &parsed.taxpayer_id)?;
+    common_element(w, "vatCode", &parsed.vat_code)?;
+    common_element(w, "countyCode", &parsed.county_code)?;
     w.write_event(Event::End(BytesEnd::new("supplierTaxNumber")))?;
     text_element(w, "supplierName", &s.name)?;
     write_address(w, "supplierAddress", s)?;
@@ -816,11 +818,15 @@ fn write_supplier(w: &mut Writer<&mut Vec<u8>>, s: &SupplierInfo) -> Result<()> 
 }
 
 fn write_customer(w: &mut Writer<&mut Vec<u8>>, c: &CustomerInfo) -> Result<()> {
+    let parsed = parse_hungarian_tax_number(&c.tax_number)
+        .map_err(|e| anyhow!("customer tax number invalid at NAV-XML render time: {e}"))?;
     w.write_event(Event::Start(BytesStart::new("customerInfo")))?;
     text_element(w, "customerVatStatus", "DOMESTIC")?;
     w.write_event(Event::Start(BytesStart::new("customerVatData")))?;
     w.write_event(Event::Start(BytesStart::new("customerTaxNumber")))?;
-    text_element(w, "taxpayerId", &c.tax_number)?;
+    common_element(w, "taxpayerId", &parsed.taxpayer_id)?;
+    common_element(w, "vatCode", &parsed.vat_code)?;
+    common_element(w, "countyCode", &parsed.county_code)?;
     w.write_event(Event::End(BytesEnd::new("customerTaxNumber")))?;
     w.write_event(Event::End(BytesEnd::new("customerVatData")))?;
     text_element(w, "customerName", &c.name)?;
@@ -830,12 +836,12 @@ fn write_customer(w: &mut Writer<&mut Vec<u8>>, c: &CustomerInfo) -> Result<()> 
 
 fn write_address(w: &mut Writer<&mut Vec<u8>>, tag: &str, s: &SupplierInfo) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new(tag.to_string())))?;
-    w.write_event(Event::Start(BytesStart::new("simpleAddress")))?;
-    text_element(w, "countryCode", &s.address_country_code)?;
-    text_element(w, "postalCode", &s.address_postal_code)?;
-    text_element(w, "city", &s.address_city)?;
-    text_element(w, "additionalAddressDetail", &s.address_street)?;
-    w.write_event(Event::End(BytesEnd::new("simpleAddress")))?;
+    w.write_event(Event::Start(BytesStart::new("common:simpleAddress")))?;
+    common_element(w, "countryCode", &s.address_country_code)?;
+    common_element(w, "postalCode", &s.address_postal_code)?;
+    common_element(w, "city", &s.address_city)?;
+    common_element(w, "additionalAddressDetail", &s.address_street)?;
+    w.write_event(Event::End(BytesEnd::new("common:simpleAddress")))?;
     w.write_event(Event::End(BytesEnd::new(tag.to_string())))?;
     Ok(())
 }
@@ -992,7 +998,14 @@ fn write_line_net(
     w.write_event(Event::End(BytesEnd::new("lineNetAmountData")))?;
     Ok(())
 }
-
+/// Write <vatRate> for summary (not <lineVatRate>).
+fn write_vat_rate(w: &mut Writer<&mut Vec<u8>>, vat_rate_basis_points: u16) -> Result<()> {
+    let rate_decimal = format!("{:.2}", vat_rate_basis_points as f64 / 10000.0);
+    w.write_event(Event::Start(BytesStart::new("vatRate")))?;
+    text_element(w, "vatPercentage", &rate_decimal)?;
+    w.write_event(Event::End(BytesEnd::new("vatRate")))?;
+    Ok(())
+}
 fn write_line_vat_rate(w: &mut Writer<&mut Vec<u8>>, vat_rate_basis_points: u16) -> Result<()> {
     let rate_decimal = format!("{:.2}", vat_rate_basis_points as f64 / 10000.0);
     w.write_event(Event::Start(BytesStart::new("lineVatRate")))?;
@@ -1071,7 +1084,7 @@ fn write_summary(
     // multi-rate invoices).
     if let Some(first) = lines.first() {
         w.write_event(Event::Start(BytesStart::new("summaryByVatRate")))?;
-        write_line_vat_rate(w, first.vat_rate_basis_points)?;
+        write_vat_rate(w, first.vat_rate_basis_points)?;
         w.write_event(Event::Start(BytesStart::new("vatRateNetData")))?;
         text_element(
             w,
@@ -1122,7 +1135,17 @@ fn write_summary(
     w.write_event(Event::End(BytesEnd::new("invoiceSummary")))?;
     Ok(())
 }
-
+/// Write an element with the `common:` prefix (NAV v3.0 base namespace).
+/// Used for elements defined in the common/base namespace that appear
+/// inside data-namespace parents (e.g., <common:taxpayerId> inside
+/// <supplierTaxNumber>).
+fn common_element(w: &mut Writer<&mut Vec<u8>>, tag: &str, value: &str) -> Result<()> {
+    let full_tag = format!("common:{}", tag);
+    w.write_event(Event::Start(BytesStart::new(full_tag.clone())))?;
+    w.write_event(Event::Text(BytesText::new(value)))?;
+    w.write_event(Event::End(BytesEnd::new(full_tag)))?;
+    Ok(())
+}
 fn text_element(w: &mut Writer<&mut Vec<u8>>, tag: &str, value: &str) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new(tag.to_string())))?;
     w.write_event(Event::Text(BytesText::new(value)))?;
