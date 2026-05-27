@@ -41,6 +41,7 @@
     type SellerBankResponse,
   } from "../lib/api";
   import {
+    cannotIssueDueToBank,
     composeIssueInvoiceBody,
     emptyForm,
     emptyLine,
@@ -84,6 +85,16 @@
    * small in practice — operator-scale, not data-warehouse-scale). */
   let savedPartners: Partner[] = $state([]);
   let partnersLoaded = $state(false);
+  /** PR-75 / session-99 — load-error state for the partners fetch.
+   * Pre-PR-75 `loadPartners`'s catch silently swallowed the error and
+   * left `savedPartners = []`, so the combobox surfaced the "No saved
+   * partner matches" hint even when the operator HAD partners saved —
+   * indistinguishable from "no match" and the regression Ervin caught
+   * in live test. Mirrors `sellerBanksLoadError`: a non-null value
+   * renders a Retry affordance below the input so the operator can
+   * recover without closing the dialog (CLAUDE.md rule 12 — fail
+   * loud). */
+  let partnersLoadError: string | null = $state(null);
   /** PR-74 — combobox dropdown lifecycle. Open on focus + 3+ char
    * needle; closed by Escape, blur, or partner selection. The
    * `buyerComboboxState` helper computes `matches` from the cached
@@ -141,6 +152,20 @@
     banksForCurrency.find((b) => b.is_default) ?? null,
   );
 
+  /** PR-75 / session-99 — disabled-Submit gate when the bank picker is
+   * unresolvable. Pure-function gate lives in `lib/issue-invoice.ts`
+   * (so vitest can pin the decision without mounting this component);
+   * the Svelte side just folds reactive state through it. See
+   * [`cannotIssueDueToBank`] for the three failure modes the gate
+   * surfaces. */
+  let bankBlocksSubmit = $derived(
+    cannotIssueDueToBank({
+      sellerBanksLoaded,
+      sellerBanksLoadError,
+      banksForCurrencyCount: banksForCurrency.length,
+    }),
+  );
+
   async function loadSellerBanks() {
     try {
       const response = await listSellerBanks();
@@ -167,18 +192,23 @@
   /** PR-74 / session-96 — lazy load the saved-partners list on first
    * dialog open. Mirrors `loadSellerBanks`'s posture: one fetch per
    * SPA session, cached for subsequent opens. The combobox filters
-   * client-side from `savedPartners`. */
+   * client-side from `savedPartners`.
+   *
+   * PR-75 / session-99 — failure now surfaces visibly via
+   * `partnersLoadError` instead of being silently swallowed. The
+   * combobox falls back to free-text entry either way, but the
+   * operator gets a Retry affordance + error message rather than a
+   * "no match" hint indistinguishable from genuine empty results. */
   async function loadPartners() {
     try {
       const response = await listPartners();
       savedPartners = response;
       partnersLoaded = true;
-    } catch (_err) {
-      // Non-fatal: a partners-fetch failure still lets the operator
-      // type a free-text buyer name. The dropdown simply never
-      // surfaces matches (operator types-through to one-off).
+      partnersLoadError = null;
+    } catch (err: unknown) {
       savedPartners = [];
       partnersLoaded = true;
+      partnersLoadError = err instanceof Error ? err.message : String(err);
     }
   }
 
@@ -294,6 +324,9 @@
     clearPreflightErrors();
     buyerDropdownOpen = false;
     buyerHighlight = -1;
+    // Note: do NOT reset `partnersLoaded` / `partnersLoadError` here —
+    // the cache outlives the per-open form state per PR-74's load-once
+    // posture. Same for `sellerBanksLoaded` / `sellerBanksLoadError`.
   }
 
   /** PR-74 — operator clicked / Enter-selected a saved partner row.
@@ -544,7 +577,26 @@
             role="listbox"
             data-testid="buyer-combobox-dropdown"
           >
-            {#if comboboxView.matches.length === 0}
+            {#if partnersLoadError !== null}
+              <!-- PR-75 / session-99 — surface partners-fetch failure
+                   visibly so the operator can distinguish "load failed"
+                   from "no match found." Retry button mirrors the
+                   bank-picker recovery affordance PR-74 added. -->
+              <li class="buyer-dropdown__hint" aria-live="polite" data-testid="buyer-combobox-load-error">
+                Could not load saved partners: {partnersLoadError}.
+                <button
+                  type="button"
+                  class="quiet-button"
+                  onmousedown={(e) => {
+                    e.preventDefault();
+                    partnersLoaded = false;
+                    partnersLoadError = null;
+                    void loadPartners();
+                  }}
+                  data-testid="buyer-combobox-retry"
+                >Retry</button>
+              </li>
+            {:else if comboboxView.matches.length === 0}
               <li class="buyer-dropdown__hint" aria-live="polite" data-testid="buyer-combobox-no-match">
                 No saved partner matches — typed name will be used as-is.
               </li>
@@ -787,7 +839,11 @@
       <button
         type="submit"
         class="quiet-button primary"
-        disabled={submitState === "submitting"}
+        disabled={submitState === "submitting" || bankBlocksSubmit}
+        title={bankBlocksSubmit
+          ? `Cannot issue: no bank account configured for ${form.currency}. Add one in Tenant Settings → Bank accounts.`
+          : undefined}
+        data-testid="issue-submit"
       >
         {#if submitState === "submitting"}
           <span aria-hidden="true">…</span> Issuing

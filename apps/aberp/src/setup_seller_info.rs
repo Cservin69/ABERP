@@ -155,7 +155,12 @@ pub fn setup_seller_info_to_path(
     inputs: &SellerInfoInputs,
 ) -> std::result::Result<SellerInfoInputs, SetupSellerInfoError> {
     let mut errors: Vec<FieldError> = Vec::new();
-    require_nonblank("legalName", &inputs.legal_name, "Legal name is required", &mut errors);
+    require_nonblank(
+        "legalName",
+        &inputs.legal_name,
+        "Legal name is required",
+        &mut errors,
+    );
     match parse_hungarian_tax_number(&inputs.tax_number) {
         Ok(_) => {}
         Err(SupplierConfigError::MissingTaxNumber) => errors.push(FieldError {
@@ -179,23 +184,52 @@ pub fn setup_seller_info_to_path(
         "Postal code is required",
         &mut errors,
     );
-    require_nonblank("addressCity", &inputs.address_city, "City is required", &mut errors);
-    require_nonblank("addressStreet", &inputs.address_street, "Street is required", &mut errors);
+    require_nonblank(
+        "addressCity",
+        &inputs.address_city,
+        "City is required",
+        &mut errors,
+    );
+    require_nonblank(
+        "addressStreet",
+        &inputs.address_street,
+        "Street is required",
+        &mut errors,
+    );
     if !errors.is_empty() {
         return Err(SetupSellerInfoError::Validation(errors));
     }
 
-    let body = render_seller_toml(inputs);
+    // PR-75 / session-99 — preserve the existing [[seller.banks]] block
+    // across the identity write. Pre-PR-75 this helper rendered the
+    // whole file from identity-only inputs, wiping any bank entries the
+    // operator had added via Tenant Settings → Bank accounts on every
+    // subsequent identity save (the regression Ervin caught in live
+    // test). read_seller_banks tolerates the missing-file case (empty
+    // collection) AND folds legacy forms (`[seller.bank]`, flat-root
+    // keys) into new-form entries on the way through; a malformed bank
+    // section loud-fails per CLAUDE.md rule 12 rather than silently
+    // dropping data.
+    let preserved = crate::seller_banks::read_seller_banks(path).map_err(|e| {
+        SetupSellerInfoError::Backend(anyhow!(
+            "read existing bank section for preservation across identity write: {e}"
+        ))
+    })?;
+
+    let mut body = render_seller_toml(inputs);
+    if !preserved.entries().is_empty() {
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push('\n');
+        body.push_str(&preserved.to_toml_section());
+    }
+
     write_atomic(path, body.as_bytes()).map_err(SetupSellerInfoError::Backend)?;
     Ok(inputs.clone())
 }
 
-fn require_nonblank(
-    field: &'static str,
-    value: &str,
-    message: &str,
-    out: &mut Vec<FieldError>,
-) {
+fn require_nonblank(field: &'static str, value: &str, message: &str, out: &mut Vec<FieldError>) {
     if value.trim().is_empty() {
         out.push(FieldError {
             field,
@@ -235,14 +269,25 @@ fn render_seller_toml(inputs: &SellerInfoInputs) -> String {
     out.push_str("[seller]\n");
     out.push_str(&format!("legal_name = \"{}\"\n", inputs.legal_name.trim()));
     out.push_str(&format!("tax_number = \"{}\"\n", inputs.tax_number.trim()));
-    if let Some(ev) = inputs.eu_vat_number.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(ev) = inputs
+        .eu_vat_number
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         out.push_str(&format!("eu_vat_number = \"{ev}\"\n"));
     }
     out.push('\n');
 
     out.push_str("[seller.address]\n");
-    out.push_str(&format!("country_code = \"{}\"\n", inputs.address_country_code.trim()));
-    out.push_str(&format!("postal_code = \"{}\"\n", inputs.address_postal_code.trim()));
+    out.push_str(&format!(
+        "country_code = \"{}\"\n",
+        inputs.address_country_code.trim()
+    ));
+    out.push_str(&format!(
+        "postal_code = \"{}\"\n",
+        inputs.address_postal_code.trim()
+    ));
     out.push_str(&format!("city = \"{}\"\n", inputs.address_city.trim()));
     out.push_str(&format!("street = \"{}\"\n", inputs.address_street.trim()));
     out.push('\n');
@@ -251,16 +296,36 @@ fn render_seller_toml(inputs: &SellerInfoInputs) -> String {
     // Emit only the populated fields so the parser sees fewer empty-value
     // lines (its tolerance is fine either way; this is cosmetic).
     out.push_str("# Bank info — consumed by the printed-invoice PDF footer.\n");
-    if let Some(b) = inputs.bank_account_number.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(b) = inputs
+        .bank_account_number
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         out.push_str(&format!("bank_account_number = \"{b}\"\n"));
     }
-    if let Some(b) = inputs.iban.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(b) = inputs
+        .iban
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         out.push_str(&format!("iban = \"{b}\"\n"));
     }
-    if let Some(b) = inputs.bank_name.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(b) = inputs
+        .bank_name
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         out.push_str(&format!("bank_name = \"{b}\"\n"));
     }
-    if let Some(b) = inputs.swift_bic.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(b) = inputs
+        .swift_bic
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         out.push_str(&format!("swift_bic = \"{b}\"\n"));
     }
     out
@@ -308,12 +373,7 @@ fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_name = format!(
-        ".seller.toml.tmp.{}-{}-{}",
-        std::process::id(),
-        nanos,
-        seq,
-    );
+    let tmp_name = format!(".seller.toml.tmp.{}-{}-{}", std::process::id(), nanos, seq,);
     let tmp_path = parent.join(tmp_name);
     {
         let mut f = fs::OpenOptions::new()
@@ -549,11 +609,23 @@ mod tests {
         inputs.bank_name = None;
         inputs.swift_bic = None;
         let body = render_seller_toml(&inputs);
-        assert!(!body.contains("eu_vat_number"), "blank EU VAT must be omitted: {body}");
-        assert!(!body.contains("bank_account_number"), "absent bank account must be omitted: {body}");
+        assert!(
+            !body.contains("eu_vat_number"),
+            "blank EU VAT must be omitted: {body}"
+        );
+        assert!(
+            !body.contains("bank_account_number"),
+            "absent bank account must be omitted: {body}"
+        );
         assert!(!body.contains("iban"), "blank IBAN must be omitted: {body}");
-        assert!(!body.contains("bank_name"), "absent bank_name must be omitted: {body}");
-        assert!(!body.contains("swift_bic"), "absent swift_bic must be omitted: {body}");
+        assert!(
+            !body.contains("bank_name"),
+            "absent bank_name must be omitted: {body}"
+        );
+        assert!(
+            !body.contains("swift_bic"),
+            "absent swift_bic must be omitted: {body}"
+        );
     }
 
     #[test]
@@ -633,5 +705,124 @@ city = "Budapest"
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    /// Allocate a unique temp dir under the system temp root. Mirrors
+    /// the `print_invoice_render::test_dir` posture (CLAUDE.md rule 13:
+    /// no `tempfile` dev-dep; leak the per-test ULID directory at end-
+    /// of-test, which is acceptable for the OS-temp-root convention).
+    fn test_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join("aberp-setup-seller-info-test")
+            .join(format!("{}-{}", label, ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    /// PR-75 / session-99 — Ervin's live-test regression. The wizard /
+    /// Tenant-Settings identity save MUST NOT wipe `[[seller.banks]]`
+    /// entries the operator added via the bank-accounts subsection.
+    /// Pre-PR-75 `setup_seller_info_to_path` rendered the whole file
+    /// from identity-only inputs, truncating the bank block. The fix
+    /// reads the existing bank section + appends it back across the
+    /// atomic write.
+    #[test]
+    fn identity_save_preserves_existing_seller_banks_block() {
+        let tmp = test_dir("preserves_banks");
+        let path = tmp.join("seller.toml");
+        // Pre-condition: file already has identity + one HUF bank.
+        let pre = "\
+[seller]
+legal_name = \"Old Name\"
+tax_number = \"24904362-2-41\"
+
+[seller.address]
+country_code = \"HU\"
+postal_code = \"1037\"
+city = \"Budapest\"
+street = \"Old Street\"
+
+[[seller.banks]]
+currency       = \"HUF\"
+account_number = \"12345678-12345678-12345678\"
+bank_name      = \"Erste Bank\"
+swift_bic      = \"GIBAHUHB\"
+default        = true
+";
+        std::fs::write(&path, pre).expect("write pre-condition file");
+
+        // Identity-only payload (mirror of the SellerConfigWizard +
+        // TenantSettings save: legacy bank fields blank, identity fields
+        // edited).
+        let inputs = SellerInfoInputs {
+            legal_name: "New Name".to_string(),
+            tax_number: "24904362-2-41".to_string(),
+            eu_vat_number: None,
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatérő köz 6".to_string(),
+            bank_account_number: None,
+            iban: None,
+            bank_name: None,
+            swift_bic: None,
+        };
+
+        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+
+        let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
+        // Identity edited:
+        assert!(
+            after.contains("legal_name = \"New Name\""),
+            "identity updated: {after}"
+        );
+        assert!(
+            after.contains("street = \"Visszatérő köz 6\""),
+            "address updated: {after}"
+        );
+        // Bank PRESERVED — the load-bearing PR-75 invariant.
+        assert!(
+            after.contains("12345678-12345678-12345678"),
+            "[[seller.banks]] entry must survive identity write: {after}"
+        );
+        assert!(
+            after.contains("Erste Bank"),
+            "bank name must survive identity write: {after}"
+        );
+        // Re-parse the file via the seller_banks reader to confirm the
+        // preserved block round-trips cleanly (no malformed output).
+        let reparsed = crate::seller_banks::read_seller_banks(&path).expect("re-parse banks");
+        assert_eq!(reparsed.entries().len(), 1);
+        assert_eq!(
+            reparsed.entries()[0].account_number,
+            "12345678-12345678-12345678"
+        );
+        assert!(reparsed.entries()[0].default);
+    }
+
+    /// PR-75 / session-99 — exercises the
+    /// "no existing banks → identity write writes identity-only file"
+    /// branch so the preservation logic does not gain a phantom empty
+    /// bank section when there is nothing to preserve.
+    #[test]
+    fn identity_save_without_existing_banks_writes_identity_only() {
+        let tmp = test_dir("identity_only");
+        let path = tmp.join("seller.toml");
+        // No pre-existing file (first-run wizard scenario).
+        assert!(!path.exists());
+
+        let inputs = good_inputs();
+        setup_seller_info_to_path(&path, &inputs).expect("first-run identity save");
+
+        let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
+        assert!(
+            !after.contains("[[seller.banks]]"),
+            "no phantom bank section when nothing to preserve: {after}"
+        );
+        // The legacy bank fields the wizard rendered live at root
+        // (good_inputs populates them) — PR-D will remove this surface,
+        // but PR-75's preservation MUST NOT introduce duplication on the
+        // first-run path.
+        assert!(after.contains("legal_name"), "identity present: {after}");
     }
 }

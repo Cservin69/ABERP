@@ -40,6 +40,15 @@ export interface IssueInvoiceFormState {
   customerName: string;
   currency: Currency;
   lines: LineFormState[];
+  /** PR-73 / ADR-0040 §addendum — operator-selected bank account id
+   * (the `bnk_<26-char>` value from `listSellerBanks`). `null`
+   * means "use the per-currency default" — the SPA's bank picker
+   * defaults this to the entry with `is_default: true` for the
+   * current `currency` but lets the operator switch. The composer
+   * emits `null` as `bankAccountId: null` on the wire; the backend
+   * resolver treats `null` the same as missing-field and falls back
+   * to the per-currency default. */
+  bankAccountId: string | null;
 }
 
 /** PR-44ζ — sensible defaults for an empty form. The 27% VAT rate is
@@ -52,6 +61,10 @@ export function emptyForm(): IssueInvoiceFormState {
     customerName: "",
     currency: "HUF",
     lines: [emptyLine()],
+    // PR-73 — `null` means "use the per-currency default"; the
+    // IssueInvoice.svelte effect re-runs whenever `currency` changes
+    // and pre-populates this from the currency's `is_default` entry.
+    bankAccountId: null,
   };
 }
 
@@ -133,6 +146,186 @@ export function parseMissingSellerConfigError(
   };
 }
 
+/** PR-69 / session-91 — closed-vocab pre-issuance error variant the
+ * backend's `validate_invoice_preflight` enumerates per ADR-0038.
+ * Mirrors the `kind` field of `serve::PreflightErrorItem` on the
+ * Rust side. New variant requires a paired pin: extend this union
+ * AND add a vitest case in `issue-invoice.test.ts`. */
+export type InvoicePreflightErrorKind =
+  | "CustomerNameEmpty"
+  | "CustomerTaxNumberMissing"
+  | "CustomerTaxNumberMalformed"
+  | "InvoiceLinesEmpty"
+  | "LineItemDescriptionEmpty"
+  | "LineItemQuantityZero"
+  | "LineItemUnitPriceNonPositive"
+  | "LineItemVatRateUnknown"
+  | "SellerBankMissingForCurrency"
+  | "SellerBankCurrencyMismatch";
+
+/** PR-69 / session-91 — one operator-correctable preflight error
+ * returned by `POST /invoices/issue` when the request body fails the
+ * pre-issuance shape gate (ADR-0038). The SPA's IssueInvoice form
+ * renders these inline at `field_path`'s input (red border + the
+ * Hungarian + English message stacked beneath the input). */
+export interface InvoicePreflightErrorItem {
+  /** Closed-vocab discriminant. The renderer pattern-matches on this
+   * for variant-specific UI affordances (e.g. linking the rejected
+   * VAT rate to the allowed-set hint). */
+  kind: InvoicePreflightErrorKind;
+  /** Dotted path into the wire shape (`customer.name`,
+   * `lines[2].vatRatePercent`, …). Used to route the inline error to
+   * the right input element. */
+  field_path: string;
+  /** Hungarian operator-facing message — rendered verbatim. */
+  message_hu: string;
+  /** English developer / debug message — rendered alongside HU. */
+  message_en: string;
+}
+
+/** PR-69 / session-91 — typed 400 body the backend's
+ * `serve::handle_issue_invoice` emits when the preflight validator
+ * (`validate_invoice_preflight`, ADR-0038) returns a non-empty error
+ * vec. Sibling of [`MissingSellerConfigError`] with a `errors` array
+ * instead of a single message so the operator sees every problem at
+ * once.
+ *
+ * The outer `error` discriminant distinguishes a preflight 400 from
+ * the PR-50 `missing_seller_config` 400 and from the legacy plain
+ * 400 (`validate_issue_request`'s empty-string surface). */
+export interface InvoicePreflightErrorBody {
+  error: "invoice_preflight_failed";
+  errors: InvoicePreflightErrorItem[];
+}
+
+/** PR-69 / session-91 — parse the raw error string the Tauri
+ * forward helper hands back (shape: `"backend returned 400 Bad
+ * Request for /invoices/issue: {json}"`) into the typed preflight
+ * body when present.
+ *
+ * Returns `null` for any other shape (network error, 500, plain 400
+ * without the typed discriminant, `missing_seller_config` 400). The
+ * caller then either tries `parseMissingSellerConfigError` (which
+ * has the same return-null-on-mismatch posture) or falls back to
+ * the raw message.
+ *
+ * Same hand-rolled JSON extraction as `parseMissingSellerConfigError`
+ * — substring + JSON.parse, no dep. */
+export function parseInvoicePreflightErrors(
+  raw: string,
+): InvoicePreflightErrorBody | null {
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const obj = parsed as Record<string, unknown>;
+  if (obj.error !== "invoice_preflight_failed") return null;
+  if (!Array.isArray(obj.errors)) return null;
+  const items: InvoicePreflightErrorItem[] = [];
+  for (const candidate of obj.errors) {
+    if (typeof candidate !== "object" || candidate === null) return null;
+    const item = candidate as Record<string, unknown>;
+    if (
+      typeof item.kind !== "string" ||
+      typeof item.field_path !== "string" ||
+      typeof item.message_hu !== "string" ||
+      typeof item.message_en !== "string"
+    ) {
+      return null;
+    }
+    if (!isKnownPreflightKind(item.kind)) return null;
+    items.push({
+      kind: item.kind,
+      field_path: item.field_path,
+      message_hu: item.message_hu,
+      message_en: item.message_en,
+    });
+  }
+  return { error: "invoice_preflight_failed", errors: items };
+}
+
+/** PR-69 / session-91 — closed-vocab guard. A backend variant the SPA
+ * does not know about should fail loud rather than render as
+ * `(unknown error)` — the renderer needs to know about every variant
+ * so the inline-error UI is exhaustive. */
+function isKnownPreflightKind(s: string): s is InvoicePreflightErrorKind {
+  switch (s) {
+    case "CustomerNameEmpty":
+    case "CustomerTaxNumberMissing":
+    case "CustomerTaxNumberMalformed":
+    case "InvoiceLinesEmpty":
+    case "LineItemDescriptionEmpty":
+    case "LineItemQuantityZero":
+    case "LineItemUnitPriceNonPositive":
+    case "LineItemVatRateUnknown":
+    case "SellerBankMissingForCurrency":
+    case "SellerBankCurrencyMismatch":
+      return true;
+    default:
+      return false;
+  }
+}
+
+/** PR-69 / session-91 — given a `field_path` returned by the backend
+ * preflight, extract a stable DOM-input identifier the IssueInvoice
+ * form uses to target the inline-error rendering. Customer paths
+ * map to bare field names; line paths to a `(lineIndex, field)`
+ * tuple.
+ *
+ * Returns `null` for any path shape outside the closed-vocab — the
+ * renderer then renders the error in the general error block rather
+ * than dropping it. Same posture as the closed-vocab kind guard
+ * above. */
+export type PreflightFieldTarget =
+  | { kind: "customer"; field: "name" | "taxNumber" }
+  | { kind: "lines" }
+  | { kind: "bankAccountId" }
+  | {
+      kind: "line";
+      lineIndex: number;
+      field: "description" | "quantity" | "unitPrice" | "vatRatePercent";
+    };
+
+export function targetForFieldPath(
+  fieldPath: string,
+): PreflightFieldTarget | null {
+  if (fieldPath === "customer.name") {
+    return { kind: "customer", field: "name" };
+  }
+  if (fieldPath === "customer.taxNumber") {
+    return { kind: "customer", field: "taxNumber" };
+  }
+  if (fieldPath === "lines") {
+    return { kind: "lines" };
+  }
+  if (fieldPath === "bankAccountId") {
+    return { kind: "bankAccountId" };
+  }
+  // Match `lines[N].field` where N is a non-negative integer and
+  // field is one of the four line-level closed-vocab field names.
+  const lineMatch = /^lines\[(\d+)\]\.(description|quantity|unitPrice|vatRatePercent)$/.exec(
+    fieldPath,
+  );
+  if (lineMatch) {
+    return {
+      kind: "line",
+      lineIndex: Number(lineMatch[1]),
+      field: lineMatch[2] as
+        | "description"
+        | "quantity"
+        | "unitPrice"
+        | "vatRatePercent",
+    };
+  }
+  return null;
+}
+
 /** PR-44ζ — turn the form state into the wire `IssueInvoiceRequest`.
  * Pure function; no side effects. The trim on string fields mirrors
  * the backend's `validate_issue_request` (which `.trim()`-checks the
@@ -154,5 +347,54 @@ export function composeIssueInvoiceBody(
       vatRatePercent: l.vatRatePercent,
     })),
     currency: form.currency,
+    // PR-73 / ADR-0040 §addendum — operator-selected bank account.
+    // Sent verbatim; `null` lets the backend fall back to the per-
+    // currency default. Empty-string is normalised to `null` so the
+    // backend resolver sees a clean "no selection" signal.
+    bankAccountId:
+      form.bankAccountId !== null && form.bankAccountId.trim() !== ""
+        ? form.bankAccountId
+        : null,
   };
+}
+
+/** PR-75 / session-99 — inputs to the Submit-button gate for the
+ * bank-picker branch. Pure data; no Svelte runes — so vitest can pin
+ * the gate decision without mounting `IssueInvoice.svelte`. */
+export interface IssueSubmitGateInputs {
+  /** `true` once `loadSellerBanks()` has resolved (success OR caught
+   * failure). `false` while the request is in flight. */
+  sellerBanksLoaded: boolean;
+  /** Non-null when `loadSellerBanks()` rejected. The error message the
+   * SPA surfaces inline; presence alone is the gate signal. */
+  sellerBanksLoadError: string | null;
+  /** Number of bank entries whose currency matches the form's currency.
+   * Zero means "no bank account configured for this currency" — the
+   * issuance path cannot complete without one. */
+  banksForCurrencyCount: number;
+}
+
+/** PR-75 / session-99 — closes the live-test regression Ervin caught:
+ * clicking "Issue invoice" when no bank entry exists for the form's
+ * currency fired a silent request that produced no inline feedback
+ * (the backend's bank resolver loud-failed, but the SPA route had no
+ * affordance for the bank-missing class of error). Pre-PR-75 the
+ * button was always enabled.
+ *
+ * Returns `true` iff the bank picker is unresolvable; the Svelte
+ * component then disables `<button type="submit">` so the operator
+ * sees a clearer dead-end (the "no bank for currency" hint above the
+ * button + the disabled state) instead of a click that does nothing.
+ *
+ * Three failure modes, any one of which gates the button:
+ *   1. Banks haven't loaded yet (`!sellerBanksLoaded`).
+ *   2. Banks load FAILED (`sellerBanksLoadError !== null`).
+ *   3. Banks loaded but there are zero entries for the form's current
+ *      currency (`banksForCurrencyCount === 0`). */
+export function cannotIssueDueToBank(args: IssueSubmitGateInputs): boolean {
+  return (
+    !args.sellerBanksLoaded ||
+    args.sellerBanksLoadError !== null ||
+    args.banksForCurrencyCount === 0
+  );
 }

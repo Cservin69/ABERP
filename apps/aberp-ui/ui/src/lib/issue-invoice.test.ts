@@ -15,9 +15,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  cannotIssueDueToBank,
   composeIssueInvoiceBody,
   emptyForm,
+  parseInvoicePreflightErrors,
   parseMissingSellerConfigError,
+  targetForFieldPath,
+  type InvoicePreflightErrorKind,
 } from "./issue-invoice";
 
 describe("composeIssueInvoiceBody", () => {
@@ -56,7 +60,45 @@ describe("composeIssueInvoiceBody", () => {
         },
       ],
       currency: "HUF",
+      bankAccountId: null,
     });
+  });
+
+  // PR-73 / ADR-0040 §addendum — bank-picker composer pins.
+  it("emits bankAccountId verbatim when the picker has a selection", () => {
+    const form = {
+      ...emptyForm(),
+      customerName: "Vevő Kft.",
+      customerTaxNumber: "87654321-2-13",
+      bankAccountId: "bnk_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    };
+    const body = composeIssueInvoiceBody(form);
+    expect(body.bankAccountId).toBe("bnk_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+  });
+
+  it("normalises empty-string bankAccountId to null on the wire", () => {
+    // The picker writes `null` for "no selection"; an empty-string
+    // residue (e.g., from a previous-row edit) must NOT reach the
+    // backend as `bankAccountId: ""` — the backend resolver treats
+    // empty-string as missing-field and falls back to the per-currency
+    // default, but emitting `null` explicitly keeps the wire clean.
+    const form = {
+      ...emptyForm(),
+      customerName: "C",
+      customerTaxNumber: "y",
+      bankAccountId: "   ",
+    };
+    const body = composeIssueInvoiceBody(form);
+    expect(body.bankAccountId).toBeNull();
+  });
+
+  it("composes null bankAccountId when picker has no selection", () => {
+    const body = composeIssueInvoiceBody({
+      ...emptyForm(),
+      customerName: "C",
+      customerTaxNumber: "y",
+    });
+    expect(body.bankAccountId).toBeNull();
   });
 
   it("does not emit a supplier field on the wire body (PR-53)", () => {
@@ -212,5 +254,379 @@ describe("parseMissingSellerConfigError", () => {
       'backend returned 400 Bad Request for /invoices/issue: ' +
       '{"error":"missing_seller_config","message":"X"}';
     expect(parseMissingSellerConfigError(raw)).toBeNull();
+  });
+});
+
+// PR-69 / session-91 — pins for the typed `invoice_preflight_failed`
+// error parser + the field-path → form-target router (ADR-0038). The
+// SPA's IssueInvoice form calls `parseInvoicePreflightErrors` on every
+// catch arm; a regression that mis-detects the discriminant or that
+// silently coerces an unknown `kind` to a known one would degrade the
+// inline-error rendering to the raw-string fallback. Per CLAUDE.md
+// rule 9 — per-variant + per-rejection-arm assertions.
+
+function preflightBodyJson(items: Array<Record<string, string>>): string {
+  return (
+    'backend returned 400 Bad Request for /invoices/issue: ' +
+    JSON.stringify({
+      error: "invoice_preflight_failed",
+      errors: items,
+    })
+  );
+}
+
+describe("parseInvoicePreflightErrors — per-variant rendering pins", () => {
+  // One pin per InvoicePreflightErrorKind. Pinning the round-trip from
+  // the wire shape into the typed body proves the closed-vocab kind
+  // guard recognizes every variant; a regression that drops a variant
+  // from `isKnownPreflightKind` would surface as `null` here.
+  const variants: Array<{
+    kind: InvoicePreflightErrorKind;
+    field_path: string;
+    message_hu: string;
+    message_en: string;
+  }> = [
+    {
+      kind: "CustomerNameEmpty",
+      field_path: "customer.name",
+      message_hu: "Az ügyfél neve kötelező.",
+      message_en: "Customer name is required.",
+    },
+    {
+      kind: "CustomerTaxNumberMissing",
+      field_path: "customer.taxNumber",
+      message_hu:
+        "Az ügyfél adószáma (ADÓSZÁM) kötelező (helyes: `xxxxxxxx-y-zz`, pl. `87654321-2-13`).",
+      message_en:
+        "Customer ADÓSZÁM is required (expected `xxxxxxxx-y-zz`, e.g. `87654321-2-13`).",
+    },
+    {
+      kind: "CustomerTaxNumberMalformed",
+      field_path: "customer.taxNumber",
+      message_hu:
+        "Az ügyfél adószáma (`1234`) hibás formátum (három, kötőjellel elválasztott szegmens szükséges). Helyes: `xxxxxxxx-y-zz`, pl. `87654321-2-13`.",
+      message_en:
+        "Customer ADÓSZÁM `1234` is not a valid Hungarian tax number (expected three dash-separated segments); expected `xxxxxxxx-y-zz`, e.g. `87654321-2-13`.",
+    },
+    {
+      kind: "InvoiceLinesEmpty",
+      field_path: "lines",
+      message_hu: "Legalább egy tételsor szükséges a számlához.",
+      message_en: "At least one line item is required.",
+    },
+    {
+      kind: "LineItemDescriptionEmpty",
+      field_path: "lines[0].description",
+      message_hu: "A(z) 1. tételsor megnevezése kötelező.",
+      message_en: "Line 1 description is required.",
+    },
+    {
+      kind: "LineItemQuantityZero",
+      field_path: "lines[0].quantity",
+      message_hu: "A(z) 1. tételsor mennyisége legalább 1 kell legyen.",
+      message_en: "Line 1 quantity must be at least 1.",
+    },
+    {
+      kind: "LineItemUnitPriceNonPositive",
+      field_path: "lines[0].unitPrice",
+      message_hu:
+        "A(z) 1. tételsor egységára pozitív kell legyen (kapott: 0). Sztornó / módosítás külön folyamat.",
+      message_en:
+        "Line 1 unit price must be positive (got 0). Storno / modification is a separate flow.",
+    },
+    {
+      kind: "LineItemVatRateUnknown",
+      field_path: "lines[0].vatRatePercent",
+      message_hu:
+        "A(z) 1. tételsor ÁFA-kulcsa (12%) nem szerepel a magyar szabványos kulcsok között (0%, 5%, 18%, 27%). Speciális kategóriák (AAM/TAM/TAH) jelenleg nem támogatottak.",
+      message_en:
+        "Line 1 VAT rate (12%) is not a Hungarian standard rate (allowed: 0%, 5%, 18%, 27%). Special categories (AAM/TAM/TAH) are not supported on this wire shape today.",
+    },
+    // PR-73 / ADR-0040 §addendum — bank-related variants.
+    {
+      kind: "SellerBankMissingForCurrency",
+      field_path: "bankAccountId",
+      message_hu: "Nincs konfigurált bankszámla a számla pénzneméhez (EUR).",
+      message_en: "No bank account configured for the invoice's currency (EUR).",
+    },
+    {
+      kind: "SellerBankCurrencyMismatch",
+      field_path: "bankAccountId",
+      message_hu:
+        "A választott bankszámla (`bnk_xyz`) pénzneme HUF eltér a számla pénznemétől EUR.",
+      message_en:
+        "Selected bank account (`bnk_xyz`) currency HUF does not match the invoice currency EUR.",
+    },
+  ];
+
+  for (const v of variants) {
+    it(`parses ${v.kind} into the typed body with HU + EN messages`, () => {
+      const parsed = parseInvoicePreflightErrors(preflightBodyJson([v]));
+      expect(parsed).not.toBeNull();
+      expect(parsed!.error).toBe("invoice_preflight_failed");
+      expect(parsed!.errors.length).toBe(1);
+      expect(parsed!.errors[0].kind).toBe(v.kind);
+      expect(parsed!.errors[0].field_path).toBe(v.field_path);
+      expect(parsed!.errors[0].message_hu).toBe(v.message_hu);
+      expect(parsed!.errors[0].message_en).toBe(v.message_en);
+    });
+  }
+
+  it("collects multiple errors in array order (no dedup, no reorder)", () => {
+    const raw = preflightBodyJson([
+      {
+        kind: "CustomerNameEmpty",
+        field_path: "customer.name",
+        message_hu: "x",
+        message_en: "y",
+      },
+      {
+        kind: "LineItemQuantityZero",
+        field_path: "lines[0].quantity",
+        message_hu: "x",
+        message_en: "y",
+      },
+      {
+        kind: "LineItemVatRateUnknown",
+        field_path: "lines[2].vatRatePercent",
+        message_hu: "x",
+        message_en: "y",
+      },
+    ]);
+    const parsed = parseInvoicePreflightErrors(raw);
+    expect(parsed!.errors.length).toBe(3);
+    expect(parsed!.errors.map((e) => e.kind)).toEqual([
+      "CustomerNameEmpty",
+      "LineItemQuantityZero",
+      "LineItemVatRateUnknown",
+    ]);
+  });
+});
+
+describe("parseInvoicePreflightErrors — rejection arms", () => {
+  it("returns null for the PR-50 missing_seller_config 400 body", () => {
+    // The two typed 400 shapes coexist on the same route; the
+    // preflight parser must not misidentify a seller-config 400 as
+    // its own shape. The caller falls through to
+    // `parseMissingSellerConfigError`.
+    const raw =
+      'backend returned 400 Bad Request for /invoices/issue: ' +
+      '{"error":"missing_seller_config","message":"x","config_path":"a","sample_path":"b"}';
+    expect(parseInvoicePreflightErrors(raw)).toBeNull();
+  });
+
+  it("returns null for a plain `{error: ...}` 400 body", () => {
+    // Pre-PR-69 legacy 400 surface from `validate_issue_request`.
+    const raw =
+      'backend returned 400 Bad Request for /invoices/issue: ' +
+      '{"error":"at least one line item is required"}';
+    expect(parseInvoicePreflightErrors(raw)).toBeNull();
+  });
+
+  it("returns null when the body is malformed JSON", () => {
+    expect(parseInvoicePreflightErrors("backend returned 500: <html>...")).toBeNull();
+  });
+
+  it("returns null when an error item carries an unknown `kind`", () => {
+    // Backend drift that adds a variant without the SPA knowing about
+    // it would surface here — fail loud rather than render `(unknown)`.
+    const raw =
+      'backend returned 400 Bad Request for /invoices/issue: ' +
+      '{"error":"invoice_preflight_failed","errors":[' +
+      '{"kind":"CustomerNameEmpty","field_path":"customer.name","message_hu":"x","message_en":"y"},' +
+      '{"kind":"FutureUnknownVariant","field_path":"customer.name","message_hu":"x","message_en":"y"}' +
+      ']}';
+    expect(parseInvoicePreflightErrors(raw)).toBeNull();
+  });
+
+  it("returns null when an error item is missing a required field", () => {
+    const raw =
+      'backend returned 400 Bad Request for /invoices/issue: ' +
+      '{"error":"invoice_preflight_failed","errors":[' +
+      '{"kind":"CustomerNameEmpty","field_path":"customer.name","message_en":"y"}' +
+      ']}';
+    expect(parseInvoicePreflightErrors(raw)).toBeNull();
+  });
+});
+
+describe("targetForFieldPath — closed-vocab router", () => {
+  it("routes customer.name to the customer-name input", () => {
+    expect(targetForFieldPath("customer.name")).toEqual({
+      kind: "customer",
+      field: "name",
+    });
+  });
+
+  it("routes customer.taxNumber to the customer-tax input", () => {
+    expect(targetForFieldPath("customer.taxNumber")).toEqual({
+      kind: "customer",
+      field: "taxNumber",
+    });
+  });
+
+  it("routes the bare `lines` path to the line-list container", () => {
+    expect(targetForFieldPath("lines")).toEqual({ kind: "lines" });
+  });
+
+  it("routes per-line paths to (lineIndex, field) tuples", () => {
+    expect(targetForFieldPath("lines[0].description")).toEqual({
+      kind: "line",
+      lineIndex: 0,
+      field: "description",
+    });
+    expect(targetForFieldPath("lines[3].vatRatePercent")).toEqual({
+      kind: "line",
+      lineIndex: 3,
+      field: "vatRatePercent",
+    });
+    expect(targetForFieldPath("lines[12].unitPrice")).toEqual({
+      kind: "line",
+      lineIndex: 12,
+      field: "unitPrice",
+    });
+    expect(targetForFieldPath("lines[7].quantity")).toEqual({
+      kind: "line",
+      lineIndex: 7,
+      field: "quantity",
+    });
+  });
+
+  it("returns null for paths outside the closed-vocab (forward-compat fallback)", () => {
+    // A future preflight variant whose field_path the SPA doesn't yet
+    // route maps to null; the renderer surfaces it in the general
+    // error block rather than dropping it.
+    expect(targetForFieldPath("customer.address.city")).toBeNull();
+    expect(targetForFieldPath("lines[0].newFutureField")).toBeNull();
+    expect(targetForFieldPath("issueDate")).toBeNull();
+    expect(targetForFieldPath("")).toBeNull();
+    expect(targetForFieldPath("lines[abc].description")).toBeNull();
+  });
+
+  // PR-73 / ADR-0040 §addendum — bank-picker field-path routing.
+  it("routes bankAccountId to the bank-picker target", () => {
+    expect(targetForFieldPath("bankAccountId")).toEqual({
+      kind: "bankAccountId",
+    });
+  });
+});
+
+// PR-73 / ADR-0040 §addendum — bank-related preflight kinds must round-
+// trip through the typed body parser. A regression that drops one of
+// the two new kinds from `isKnownPreflightKind` would surface here.
+describe("parseInvoicePreflightErrors — PR-73 bank-related variants", () => {
+  it("parses SellerBankMissingForCurrency with bilingual messages", () => {
+    const raw = preflightBodyJson([
+      {
+        kind: "SellerBankMissingForCurrency",
+        field_path: "bankAccountId",
+        message_hu:
+          "Nincs konfigurált bankszámla a számla pénzneméhez (EUR). " +
+          "Adjon meg egy `[[seller.banks]]` bejegyzést ehhez a pénznemhez a " +
+          "Bérlőbeállítások / Bank accounts menüpontban.",
+        message_en:
+          "No bank account configured for the invoice's currency (EUR). " +
+          "Add a `[[seller.banks]]` entry for this currency in Tenant " +
+          "Settings → Bank accounts.",
+      },
+    ]);
+    const parsed = parseInvoicePreflightErrors(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.errors[0].kind).toBe("SellerBankMissingForCurrency");
+    expect(parsed!.errors[0].field_path).toBe("bankAccountId");
+    expect(parsed!.errors[0].message_hu).toContain("EUR");
+    expect(parsed!.errors[0].message_en).toContain("EUR");
+    expect(parsed!.errors[0].message_en).toContain("Tenant Settings");
+  });
+
+  it("parses SellerBankCurrencyMismatch with selected_id + both currencies", () => {
+    const raw = preflightBodyJson([
+      {
+        kind: "SellerBankCurrencyMismatch",
+        field_path: "bankAccountId",
+        message_hu:
+          "A választott bankszámla (`bnk_xyz`) pénzneme HUF eltér a számla " +
+          "pénznemétől EUR. Válasszon olyan bankszámlát, amelynek pénzneme " +
+          "megegyezik a számla pénznemével.",
+        message_en:
+          "Selected bank account (`bnk_xyz`) currency HUF does not match " +
+          "the invoice currency EUR. Pick a bank account whose currency " +
+          "matches the invoice.",
+      },
+    ]);
+    const parsed = parseInvoicePreflightErrors(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.errors[0].kind).toBe("SellerBankCurrencyMismatch");
+    expect(parsed!.errors[0].field_path).toBe("bankAccountId");
+    expect(parsed!.errors[0].message_hu).toContain("bnk_xyz");
+    expect(parsed!.errors[0].message_en).toContain("HUF");
+    expect(parsed!.errors[0].message_en).toContain("EUR");
+  });
+});
+
+// PR-75 / session-99 — Submit-button gate for the bank-picker branch.
+// Pins the regression Ervin caught: clicking "Issue invoice" when no
+// bank entry exists for the form's currency silently fired a request
+// with no inline feedback. The IssueInvoice.svelte template threads the
+// derived value of `cannotIssueDueToBank` onto `<button disabled>` so
+// the button is unclickable; these tests pin the decision.
+describe("cannotIssueDueToBank — Submit gate when bank picker is unresolvable", () => {
+  it("blocks Submit while banks are still loading (first dialog open)", () => {
+    // sellerBanksLoaded=false is the in-flight state. The picker
+    // renders 'Loading bank accounts…'; the operator clicking Submit
+    // before the fetch resolves must not race past the bank check.
+    const blocked = cannotIssueDueToBank({
+      sellerBanksLoaded: false,
+      sellerBanksLoadError: null,
+      banksForCurrencyCount: 0,
+    });
+    expect(blocked).toBe(true);
+  });
+
+  it("blocks Submit when banks load failed (sellerBanksLoadError set)", () => {
+    // PR-74 added a Retry affordance for this branch; PR-75 closes the
+    // companion footgun where Submit was still clickable. Disabling
+    // Submit forces the operator to Retry or close the dialog first.
+    const blocked = cannotIssueDueToBank({
+      sellerBanksLoaded: true,
+      sellerBanksLoadError: "Network error",
+      banksForCurrencyCount: 0,
+    });
+    expect(blocked).toBe(true);
+  });
+
+  it("blocks Submit when banks loaded but zero entries exist for currency", () => {
+    // Live regression: HUF banks configured, operator switches the
+    // form's currency to EUR, picker renders the "no bank for currency"
+    // hint with the Tenant-Settings link. Pre-PR-75 Submit was still
+    // clickable + fired silently. Post-PR-75 it's disabled.
+    const blocked = cannotIssueDueToBank({
+      sellerBanksLoaded: true,
+      sellerBanksLoadError: null,
+      banksForCurrencyCount: 0,
+    });
+    expect(blocked).toBe(true);
+  });
+
+  it("allows Submit once banks loaded AND at least one entry exists for currency", () => {
+    // The happy path: bank picker populated, operator can issue.
+    const blocked = cannotIssueDueToBank({
+      sellerBanksLoaded: true,
+      sellerBanksLoadError: null,
+      banksForCurrencyCount: 1,
+    });
+    expect(blocked).toBe(false);
+  });
+
+  it("allows Submit with multiple entries for currency (operator chose a non-default)", () => {
+    // Multi-bank-per-currency case (e.g., two HUF accounts): the
+    // picker shows a dropdown; the operator's selection sets
+    // form.bankAccountId. The gate only cares about presence-for-
+    // currency, not the operator's specific pick.
+    const blocked = cannotIssueDueToBank({
+      sellerBanksLoaded: true,
+      sellerBanksLoadError: null,
+      banksForCurrencyCount: 3,
+    });
+    expect(blocked).toBe(false);
   });
 });

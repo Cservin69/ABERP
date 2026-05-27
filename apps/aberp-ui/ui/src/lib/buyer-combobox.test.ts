@@ -148,3 +148,58 @@ describe("buyerComboboxState — empty saved-partners list", () => {
     expect(result.matches).toEqual([]);
   });
 });
+
+describe("buyerComboboxState — live wire-shape pin (PR-75 / session-99)", () => {
+  it("matches against the exact snake_case JSON the GET /api/partners route emits", () => {
+    // PR-75 / session-99 — pin against the verbatim shape
+    // `aberp::partners::Partner` (the Rust serde target with NO
+    // `rename_all` directive) emits on the wire. A future drift
+    // (renaming `display_name` → `name`, or changing snake_case to
+    // camelCase) would silently break the live combobox without this
+    // test catching it. Construct the fixture by hand rather than via
+    // the partner() factory above so the field names + types are
+    // visually verifiable against the Rust struct in
+    // `apps/aberp/src/partners.rs::Partner`.
+    const wireShape: Partner = {
+      id: "prt_01HXYZABCDEFGHJKMNPQRSTVWX",
+      display_name: "BSCE",
+      legal_name: "Budapesti Sport-Egyesület Kft.",
+      kind: "Customer",
+      tax_number: "22222222-2-22",
+      eu_vat_number: "HU22222222",
+      address_street: "Üllői út 1.",
+      address_postal_code: "1097",
+      address_city: "Budapest",
+      address_country: "Magyarország",
+      bank_account: "12345678-12345678-12345678",
+      contact_email: "billing@bsce.example",
+      contact_phone: "+36 1 234 5678",
+      created_at: "2026-05-01T08:00:00Z",
+      updated_at: "2026-05-20T15:30:00Z",
+      deleted_at: null,
+    };
+
+    // Match by display_name (the short label the operator typically
+    // recalls).
+    const byDisplay = buyerComboboxState({
+      needle: "BSCE",
+      savedPartners: [wireShape],
+    });
+    expect(byDisplay.shouldShowDropdown).toBe(true);
+    expect(byDisplay.matches).toEqual([wireShape]);
+
+    // Match by legal_name substring (case-insensitive Hungarian).
+    const byLegal = buyerComboboxState({
+      needle: "egyesület",
+      savedPartners: [wireShape],
+    });
+    expect(byLegal.matches).toEqual([wireShape]);
+
+    // Match by tax_number prefix the operator might recall.
+    const byTax = buyerComboboxState({
+      needle: "22222222",
+      savedPartners: [wireShape],
+    });
+    expect(byTax.matches).toEqual([wireShape]);
+  });
+});
