@@ -93,6 +93,13 @@ fn fixture_request_body(currency: aberp_billing::Currency) -> ModificationInvoic
         customer: CustomerJson {
             tax_number: "87654321-2-13".to_string(),
             name: "Test Buyer Kft.".to_string(),
+            // PR-77 / session-101 — preflight requires customer.address.
+            address: Some(AddressJson {
+                country_code: "HU".to_string(),
+                postal_code: "1052".to_string(),
+                city: "Budapest".to_string(),
+                street: "Váci utca 19.".to_string(),
+            }),
         },
         lines: vec![LineJson {
             description: "Corrected line".to_string(),
@@ -246,6 +253,14 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
             customer: CustomerJson {
                 tax_number: "87654321-2-13".to_string(),
                 name: "Test Buyer Kft.".to_string(),
+                // PR-77 / session-101 — base invoice must carry an address so
+                // its emitted NAV body passes the strengthened validator.
+                address: Some(AddressJson {
+                    country_code: "HU".to_string(),
+                    postal_code: "1052".to_string(),
+                    city: "Budapest".to_string(),
+                    street: "Váci utca 19.".to_string(),
+                }),
             },
             lines: vec![LineJson {
                 description: "Base line".to_string(),

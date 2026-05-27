@@ -106,13 +106,32 @@ function emptyToNull(s: string): string | null {
 
 /** PR-54 / session-74 — buyer fields the typeahead's "select a
  * partner" hands the IssueInvoice / ModificationInvoice forms.
- * Customer name + tax number are the only two fields the existing
- * wire shape carries (`IssueInvoiceRequest.customer` is just
- * `{taxNumber, name}` today per session-73's surgical posture). The
- * SPA's form bindings consume these two values verbatim. */
+ *
+ * PR-77 / session-101 — extended to carry the customer-address quartet.
+ * NAV's `CUSTOMER_DATA_EXPECTED` business rule rejects any invoice
+ * whose buyer is a Hungarian business (DOMESTIC customerVatStatus —
+ * today the only path) and whose `<customerAddress>` block is
+ * missing; the wire shape on `IssueInvoiceRequest.customer` now
+ * carries the address quartet, and the SPA's form pre-populates it
+ * from the operator-selected partner so the operator doesn't re-type
+ * what the partner record already has. `customerCountryCode` is
+ * derived as `HU` whenever the partner is flagged Hungarian (today:
+ * every partner — closed-vocab + non-Hungarian buyers are named-
+ * deferred). */
 export interface BuyerFields {
   customerName: string;
   customerTaxNumber: string;
+  /** PR-77 / session-101 — derived from the partner's
+   * `address_country` (free-form on the partner record). Today every
+   * supported buyer is Hungarian and the value is `HU`; if the partner
+   * record is missing the country the field falls back to `HU` so the
+   * NAV-required code is still present, while the postal-code / city /
+   * street fields fall back to empty (the form binding renders the
+   * partner gap inline; preflight rejects the submit). */
+  customerCountryCode: string;
+  customerPostalCode: string;
+  customerCity: string;
+  customerStreet: string;
 }
 
 /** PR-54 / session-74 — pluck the IssueInvoice/Modification buyer
@@ -122,12 +141,60 @@ export interface BuyerFields {
  * regulatory-compliant string NAV expects on the printed invoice;
  * `display_name` is the operator-friendly label (e.g. "BSCE" vs
  * "Budapesti Sport-Egyesület Kft.") and is NOT what goes on the
- * invoice. */
+ * invoice.
+ *
+ * PR-77 / session-101 — also pulls the partner's address quartet
+ * (street / postal_code / city / country) into the buyer fields so
+ * NAV's `<customerAddress>` block is populated end-to-end. The
+ * partner record's `address_country` is free-form; we normalise it
+ * to the ISO 3166-1 alpha-2 code via `hungarianCountryAliasToCode`
+ * (today's closed-vocab maps `Hungary` / `Magyarország` / `HU` →
+ * `HU`; everything else falls back to `HU` to preserve the DOMESTIC
+ * customerVatStatus assumption until closed-vocab country lands). */
 export function buyerFieldsFromPartner(partner: Partner): BuyerFields {
   return {
     customerName: partner.legal_name,
     customerTaxNumber: partner.tax_number,
+    customerCountryCode: hungarianCountryAliasToCode(partner.address_country),
+    customerPostalCode: partner.address_postal_code ?? "",
+    customerCity: partner.address_city ?? "",
+    customerStreet: partner.address_street ?? "",
   };
+}
+
+/** PR-77 / session-101 — normalise the partner's free-form
+ * `address_country` field to NAV's required ISO 3166-1 alpha-2 code.
+ * Today's closed vocabulary recognises common Hungarian aliases (the
+ * setup-wizard suggests `"Magyarország"`; some partners may have
+ * `"Hungary"` or `"HU"`); any other value (or `null`) falls back to
+ * `"HU"` — the DOMESTIC customerVatStatus path the emitter
+ * unconditionally takes today. Widening to non-Hungarian buyers is
+ * named-deferred per the PR-77 handoff (it requires closed-vocab
+ * customerVatStatus + a country dropdown in the Partners form).
+ *
+ * Exported so the SPA unit test can pin every alias the operator may
+ * have typed in the Partners form. */
+export function hungarianCountryAliasToCode(
+  country: string | null | undefined,
+): string {
+  if (country === null || country === undefined) return "HU";
+  const trimmed = country.trim().toLowerCase();
+  switch (trimmed) {
+    case "":
+    case "hu":
+    case "magyarorszag":
+    case "magyarország":
+    case "hungary":
+      return "HU";
+    default:
+      // Fallback: the closed-vocab is intentionally Hungarian-only
+      // today. Returning `HU` here preserves the DOMESTIC
+      // customerVatStatus assumption — the operator who picked a
+      // non-Hungarian partner is in the named-deferred branch and the
+      // preflight + validator will catch the actual mismatch
+      // downstream (the tax-number shape, etc.).
+      return "HU";
+  }
 }
 
 /** PR-54 / session-74 — client-side admin-mode filter for the

@@ -329,3 +329,196 @@ above is Option B.
   versioning policy, and a daily CI fetch is an external-trust-
   surface ADR (ADR-0007 §Supply chain) which is a much larger
   decision than this PR carries.
+
+## PR-76 addendum — `<completenessIndicator>` required (2026-05-27)
+
+PR-76 closes a divergence that ADR-0022's §"Conformance check"
+trap-doors did NOT catch: the validator's `walk_invoice_data`
+listed `completenessIndicator` in `ALLOWED` but NOT in
+`ORDERED_REQUIRED`, and the three renderers in
+`apps/aberp/src/nav_xml.rs` (`render_invoice_data`,
+`render_storno_data`, `render_modification_data`) never wrote
+the element at all. Both sides agreed; nothing surfaced at
+commit time. NAV-test reproduced the bug live on invoice 17
+(`inv_01KSM8SRH3X2WQ2TPBHGF8QQBX`) with
+`SCHEMA_VIOLATION: One of '{…:completenessIndicator}' is
+expected`.
+
+The rule locked by PR-76:
+
+- NAV v3.0 `InvoiceData` XSD names `<completenessIndicator>` as
+  a REQUIRED `xs:boolean` element positioned between
+  `<invoiceIssueDate>` and `<invoiceMain>`. The validator's
+  `ORDERED_REQUIRED` now reflects that position.
+- ABERP always writes `false`. The dual-purpose flag
+  distinguishes "submitting data only — printed invoice is the
+  primary regulatory record" (`true`) from "submitting both the
+  data AND the invoice itself through NAV's API" (`false`).
+  ABERP issues electronic invoices via the data-submission API;
+  the printed PDF is operator-facing, not the primary record;
+  so `false` is correct in every code-path today.
+
+The trap-door class this slipped through:
+
+> An allowlist that includes an element but does NOT require it
+> is indistinguishable from a TRULY-OPTIONAL element. Future
+> additions of allowed-but-not-required elements should either
+> (a) confirm with a NAV-test live submit that the absence is
+> accepted, or (b) flip to required by default and downgrade to
+> optional only with a documented reason.
+
+The two trap-doors named in §"Conformance check" remain
+unchanged — `tests/round_trip_invoice_data.rs` round-trips the
+emitter through the (now-correct) validator, and the
+`emitter_writes_completeness_indicator_before_invoice_main`
+pin in `apps/aberp/tests/nav_xsd_validator_round_trip.rs`
+asserts the byte-verbatim presence + ordering so a future
+regression that drops the element OR puts it in the wrong slot
+loud-fails at CI rather than at the next live submit.
+
+## PR-76 addendum — NAV ack `<technicalValidationMessages>` surfaced to the operator
+
+The ack-status audit entry (`InvoiceAckStatusPayload`) carries
+the verbatim NAV `<queryTransactionStatusResponse>` bytes per
+ADR-0009 §8. Pre-PR-76 those bytes were exposed to the SPA as
+a JSON-array `response_xml` field on the typed payload but
+NEVER parsed: an operator staring at "Rejected" in the state
+chip had to flip to the raw-table toggle and read the byte
+array by hand.
+
+PR-76 closes that operator-experience gap without changing the
+on-disk payload shape:
+
+- `aberp_nav_transport::operations::find_all_technical_validations`
+  (previously `pub(crate)` — used by the upstream-fault path
+  introduced in PR-58 / PR-59) is promoted to `pub`. The parser
+  is namespace-blind (local-name match) and tolerates the
+  element appearing at any depth, so the same parser handles
+  both the SOAP-fault path's `GeneralErrorResponse` shape AND
+  the ack-status path's `processingResults/processingResult`
+  shape.
+- `apps/aberp/src/serve.rs::audit_view_of` parses the
+  `response_xml` bytes for `InvoiceAckStatus` entries and
+  grafts the parsed array onto the wire payload as
+  `technical_validation_messages: TechnicalValidationBody[]`.
+  Wire shape is uniform across SAVED / PROCESSING / RECEIVED
+  (empty array) and ABORTED (one or more rules).
+- `apps/aberp-ui/ui/src/lib/invoice-timeline.ts` reads the
+  field defensively (missing → empty list — defence in depth
+  against historical entries without the field) and renders
+  one operator-facing body line per message under the ack
+  timeline node, formatted as
+  `"<ERROR|WARN> <ERROR_CODE>: <message>"`. The audit-ledger
+  payload bytes are unchanged — the parsed array is a
+  read-side derivation, not a write-side schema bump.
+
+The audit-ledger payload schema is untouched. F12's
+four-edit ritual does NOT fire for PR-76 (the existing
+`InvoiceAckStatusPayload` shape is unchanged).
+
+## PR-77 addendum — `<customerAddress>` required under DOMESTIC customerVatStatus (2026-05-27)
+
+PR-77 closes the next NAV-test ABORTED in the same family as
+PR-76 — schema-tight but business-rule-loose: this time invoice
+18 (`5E9KWQSOX3L9EC30`, buyer AZ9 Services `27952890-2-42`)
+rejected with NAV business-rule
+`CUSTOMER_DATA_EXPECTED`:
+
+> `Vevői adatok megadása kötelező, ha a vevő nem magánszemély.`
+> (= "Customer data is mandatory if the buyer is not a private
+> individual.")
+> Pointer: `InvoiceData/invoiceMain/invoice/invoiceHead/customerInfo/customerVatStatus`
+> Value: `DOMESTIC`
+
+The rule is BUSINESS-side, not schema-side: NAV's v3.0 XSD
+declares `<customerAddress>` as a `[0..1]` optional child of
+`<customerInfo>`, but NAV's submit endpoint enforces a
+post-schema rule that the element is required whenever
+`<customerVatStatus>` is non-`PRIVATE_PERSON`. The pre-PR-77
+emitter unconditionally wrote `customerVatStatus = DOMESTIC`
+(ABERP's Hungarian-business posture; closed-vocab + private-
+person branch is named-deferred) but never emitted the
+`<customerAddress>` block — and the pre-PR-77 validator had no
+rule against the omission. Both sides agreed silently; only NAV
+caught it live.
+
+The rules locked by PR-77:
+
+1. **Wire-shape rule.** `serve::IssueInvoiceRequest.customer`
+   (and the modification counterpart) now carries an
+   `address: Option<AddressJson>` field. The SPA's
+   `composeIssueInvoiceBody` reads the form's four
+   customer-address sub-fields and emits the camelCase
+   `{ countryCode, postalCode, city, street }` shape on the
+   wire; the form populates these fields from the operator-
+   selected partner via `buyerFieldsFromPartner` (PR-54 buyer
+   combobox).
+
+2. **Emit rule.** `nav_xml::write_customer` writes
+   `<customerAddress><common:simpleAddress>…</common:simpleAddress></customerAddress>`
+   AFTER `<customerName>` when `CustomerInfo::address` is
+   `Some(_)`; the four sub-elements use the `common:` namespace
+   prefix per gotcha #5 (mirroring `<supplierAddress>`'s shape).
+
+3. **Validator rule.** `walk_customer_info` now accepts
+   `<customerAddress>` in the ALLOWED set AND enforces the
+   conditional invariant: when `<customerVatStatus>` is anything
+   other than `PRIVATE_PERSON`, BOTH `<customerVatData>` AND
+   `<customerAddress>` are required. A PRIVATE_PERSON status
+   continues to legitimately omit both (NAV's privacy posture
+   for natural-person buyers); the new pin
+   `private_person_status_does_not_require_customer_vat_data_or_address`
+   guards against a future regression that would promote the
+   two elements to unconditionally required.
+
+4. **Preflight rule.** `issue_preflight::CustomerAddressMissing`
+   fires when the customer.tax_number is well-formed (=
+   business buyer) but `customer.address` is `None`, or any of
+   its four sub-fields is blank-after-trim. The gate runs
+   BEFORE the sequence is burned so a partner with an
+   incomplete address record surfaces at preflight time, not at
+   the audit-ledger-side ABORTED.
+
+5. **Closed-vocab country code (named-deferred widening).**
+   `partners::hungarianCountryAliasToCode` normalises
+   `Magyarország` / `Hungary` / `HU` / blank → `HU` for the
+   wire body's `<common:countryCode>` slot. Non-Hungarian
+   aliases fall back to `HU` today; widening to non-Hungarian
+   buyers requires closed-vocab customerVatStatus +
+   non-Hungarian buyer support in tandem and is named-deferred
+   per `partners.ts::hungarianCountryAliasToCode`.
+
+The trap-door class this slipped through (orthogonal to PR-76's
+allowed-but-not-required class):
+
+> A NAV BUSINESS rule that is enforced post-schema looks
+> identical to "rule does not exist" at validator time. The
+> only ground-truth oracle is a live NAV-test submission. When
+> a validator allows a shape but NAV's submit endpoint rejects
+> it, the response carries a `businessValidationMessages`
+> entry with a `<pointer>` naming the failing element — the
+> next session should consult the ack-status response_xml
+> (PR-76 surfaces the parsed messages in the SPA timeline) when
+> chasing the next-onion-layer rejection.
+
+The two PR-76 trap-doors named in §"Conformance check" remain
+unchanged. PR-77 adds:
+
+- `apps/aberp/tests/nav_xsd_validator_round_trip.rs::
+  emitter_writes_customer_address_under_domestic_status` —
+  byte-verbatim pin on the `<customerAddress>` block + its
+  position (after `<customerName>`, before `</customerInfo>`)
+  + the strengthened invariant check round-trip.
+- `crates/nav-xsd-validator/src/validate.rs::
+  missing_customer_vat_data_under_domestic_is_loud_fail` AND
+  `missing_customer_address_under_domestic_is_loud_fail` —
+  negative pins on the validator's conditional-required rule.
+- `apps/aberp/src/issue_preflight.rs::
+  fires_customer_address_missing_for_*` — pin on the
+  preflight gate for both None and per-blank-sub-field arms.
+- `apps/aberp-ui/ui/src/lib/issue-invoice.test.ts::
+  emits customer.address verbatim when populated` (and
+  sibling omit-when-blank + partial pins).
+- `apps/aberp-ui/ui/src/lib/partners.test.ts::
+  populates customer address quartet from the partner record`
+  + `hungarianCountryAliasToCode` per-alias pins.

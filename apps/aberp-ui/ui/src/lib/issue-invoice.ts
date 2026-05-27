@@ -38,6 +38,18 @@ export interface LineFormState {
 export interface IssueInvoiceFormState {
   customerTaxNumber: string;
   customerName: string;
+  /** PR-77 / session-101 — customer-address quartet. Populated from
+   * the operator-selected partner via `buyerFieldsFromPartner`
+   * (PR-54 buyer combobox). Required for any Hungarian-business
+   * buyer; preflight rejects an invoice whose customer.address is
+   * absent or any of these four fields is blank-after-trim. The
+   * `customerCountryCode` is locked to `HU` for every Hungarian-
+   * DOMESTIC buyer today; widening to non-Hungarian buyers is named-
+   * deferred per the PR-77 handoff. */
+  customerCountryCode: string;
+  customerPostalCode: string;
+  customerCity: string;
+  customerStreet: string;
   currency: Currency;
   lines: LineFormState[];
   /** PR-73 / ADR-0040 §addendum — operator-selected bank account id
@@ -59,6 +71,14 @@ export function emptyForm(): IssueInvoiceFormState {
   return {
     customerTaxNumber: "",
     customerName: "",
+    // PR-77 / session-101 — customer address fields seed to empty
+    // strings; the operator-selected partner populates them via
+    // `buyerFieldsFromPartner`. A required-by-NAV submission with any
+    // of these blank trips the preflight gate.
+    customerCountryCode: "",
+    customerPostalCode: "",
+    customerCity: "",
+    customerStreet: "",
     currency: "HUF",
     lines: [emptyLine()],
     // PR-73 — `null` means "use the per-currency default"; the
@@ -339,6 +359,14 @@ export function composeIssueInvoiceBody(
     customer: {
       taxNumber: form.customerTaxNumber.trim(),
       name: form.customerName.trim(),
+      // PR-77 / session-101 — customer address quartet. Always emit
+      // the field when ANY of the four sub-strings is non-empty after
+      // trim; the backend preflight rejects partially-blank addresses
+      // explicitly so the operator sees the precise gap. If every
+      // sub-string is blank we omit the field — that surfaces as
+      // `CustomerAddressMissing` on the preflight rather than as a
+      // body with four empty strings (cleaner operator message).
+      address: composeCustomerAddress(form),
     },
     lines: form.lines.map((l) => ({
       description: l.description.trim(),
@@ -356,6 +384,32 @@ export function composeIssueInvoiceBody(
         ? form.bankAccountId
         : null,
   };
+}
+
+/** PR-77 / session-101 — build the customer-address body shape from
+ * the form's four address fields. Returns `undefined` (omitting the
+ * wire field) when every field is blank-after-trim so the backend's
+ * preflight emits the cleaner `CustomerAddressMissing` message rather
+ * than rejecting a body with four empty strings. Otherwise returns
+ * the trimmed quartet verbatim — partially-blank shapes flow through
+ * because the per-field preflight gate names the precise gap, not a
+ * generic "address is malformed" lump. */
+export function composeCustomerAddress(
+  form: IssueInvoiceFormState,
+): { countryCode: string; postalCode: string; city: string; street: string } | undefined {
+  const countryCode = form.customerCountryCode.trim();
+  const postalCode = form.customerPostalCode.trim();
+  const city = form.customerCity.trim();
+  const street = form.customerStreet.trim();
+  if (
+    countryCode === "" &&
+    postalCode === "" &&
+    city === "" &&
+    street === ""
+  ) {
+    return undefined;
+  }
+  return { countryCode, postalCode, city, street };
 }
 
 /** PR-75 / session-99 — inputs to the Submit-button gate for the

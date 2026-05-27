@@ -44,6 +44,14 @@
     type BootViewMode,
   } from "./lib/boot-status";
   import {
+    AREA_LABELS,
+    areaForRoute,
+    defaultRouteForArea,
+    modulesInArea,
+    moduleForRoute,
+    type ErpArea,
+  } from "./lib/erp-modules";
+  import {
     currentRoute,
     navigateTo,
     routeHash,
@@ -67,17 +75,46 @@
   let route: AppRoute = $state(currentRoute());
   let unsubscribeRoute: (() => void) | null = null;
 
-  interface NavItem {
-    slug: AppRoute;
-    label: string;
-  }
+  // PR-78 / session 101 — the flat NAV_ITEMS table was replaced by
+  // the closed-vocab ERP module + AREA registry in
+  // `./lib/erp-modules.ts` (per ADR-0041). The chrome groups
+  // routes by USAGE FREQUENCY into two areas:
+  //
+  //   - "operational" = daily-driver workflow (Invoicing today;
+  //     future Inventory / Accounting / Procurement). Front-and-
+  //     center sidebar.
+  //   - "maintenance" = configuration + master data, deliberately
+  //     one level removed from the operational nav so it doesn't
+  //     clutter the day-to-day. Entered via the topbar's gear
+  //     affordance; the sidebar swaps to show maintenance modules
+  //     only.
+  //
+  // `activeArea` derives from the current route's owning module's
+  // area (defence-in-depth fallback to "operational" for unknown
+  // routes, which `parseRoute` already filters into the default
+  // `invoices` route). `activeSidebarModules` is the area-scoped
+  // module list rendered in the sidebar. `activeModuleId` lights
+  // up the parent header of the active route. Every existing hash
+  // route still works verbatim; the only change is chrome
+  // grouping + the area swap affordance.
+  let activeArea: ErpArea = $derived(areaForRoute(route));
+  let activeSidebarModules = $derived(modulesInArea(activeArea));
+  let activeModuleId = $derived(moduleForRoute(route)?.id ?? null);
 
-  const NAV_ITEMS: NavItem[] = [
-    { slug: "invoices", label: "Invoices" },
-    { slug: "partners", label: "Partners" },
-    { slug: "tenant", label: "Tenant settings" },
-    { slug: "nav-credentials", label: "NAV credentials" },
-  ];
+  // Click handler for the topbar's area-swap button. Navigates to
+  // the default route of the *other* area (operational ↔
+  // maintenance). The "default route" is the first route of the
+  // first module in that area per `defaultRouteForArea` —
+  // operational → "invoices", maintenance → "partners". A future
+  // PR could add a per-area landing dashboard (e.g. tile grid for
+  // maintenance) and swap the entry point here; ADR-0041 §3 leaves
+  // that as a deliberate future widening.
+  function swapArea() {
+    const target: ErpArea =
+      activeArea === "operational" ? "maintenance" : "operational";
+    const dest = defaultRouteForArea(target);
+    if (dest !== null) navigateTo(dest);
+  }
 
   // Boot-lifecycle gate state. We default to a `starting` snapshot
   // so the loading pane renders on the first paint without flashing
@@ -196,6 +233,32 @@
   <header class="topbar">
     <h1 class="wordmark">ABERP</h1>
     {#if viewMode === "ready"}
+      <!-- PR-78 / session 101 — area-swap affordance per ADR-0041
+           §3. When operating in the daily workflow, a small "⚙
+           Maintenance" button sits in the topbar; clicking it
+           navigates to the maintenance area's default route
+           (Partners today). When in maintenance, the button flips
+           to "← Operational" returning to Invoices. Deliberately
+           understated (small, secondary-text, no badge counts) —
+           the design language is ambient, not theatrical
+           (ADR-0017). -->
+      <button
+        type="button"
+        class="area-swap"
+        data-target={activeArea === "operational" ? "maintenance" : "operational"}
+        onclick={swapArea}
+        title={activeArea === "operational"
+          ? `Open ${AREA_LABELS.maintenance.en} (master data + settings)`
+          : `Back to ${AREA_LABELS.operational.en} workflow`}
+      >
+        {#if activeArea === "operational"}
+          <span class="area-swap__glyph" aria-hidden="true">⚙</span>
+          <span class="area-swap__label">{AREA_LABELS.maintenance.en}</span>
+        {:else}
+          <span class="area-swap__glyph" aria-hidden="true">←</span>
+          <span class="area-swap__label">{AREA_LABELS.operational.en}</span>
+        {/if}
+      </button>
       <div
         class="status"
         data-state={healthState}
@@ -239,25 +302,61 @@
 
   {#if viewMode === "ready"}
     <div class="layout">
-      <nav class="sidenav" aria-label="Primary">
-        <ul class="sidenav__list">
-          {#each NAV_ITEMS as item (item.slug)}
-            <li>
-              <a
-                class="sidenav__item"
-                href={routeHash(item.slug)}
-                aria-current={route === item.slug ? "page" : undefined}
-                onclick={(e) => {
-                  // The native `<a>` href on a hash link already
-                  // pushes to history; calling navigateTo here is
-                  // belt-and-suspenders for any test environment
-                  // (vitest jsdom) that doesn't fire hashchange.
-                  e.preventDefault();
-                  navigateTo(item.slug);
-                }}
-              >
-                {item.label}
-              </a>
+      <nav
+        class="sidenav"
+        aria-label={AREA_LABELS[activeArea].en}
+        data-area={activeArea}
+      >
+        <!-- Area-section caption sits at the top of the sidebar so
+             the operator knows which area they're in (especially
+             important the first time they hit the gear and the
+             sidebar contents change). Quiet chrome — not a
+             clickable target, not a section header in the
+             marketing-deck sense. -->
+        <div class="sidenav__area-caption">
+          <span class="sidenav__area-caption-label">
+            {AREA_LABELS[activeArea].en}
+          </span>
+        </div>
+        <ul class="sidenav__modules">
+          {#each activeSidebarModules as mod (mod.id)}
+            <li
+              class="sidenav__module"
+              class:sidenav__module--active={activeModuleId === mod.id}
+            >
+              <!-- Module header is presentational, not a navigation
+                   target — modules group routes, they aren't routes
+                   themselves (ADR-0041 §3). `aria-hidden="true"` on
+                   the glyph keeps the screen-reader output clean
+                   ("Invoicing" not "section sign Invoicing"). -->
+              <div class="sidenav__module-header">
+                <span class="sidenav__module-glyph" aria-hidden="true">
+                  {mod.glyph}
+                </span>
+                <span class="sidenav__module-label">{mod.label_en}</span>
+              </div>
+              <ul class="sidenav__routes">
+                {#each mod.routes as r (r.id)}
+                  <li>
+                    <a
+                      class="sidenav__item"
+                      href={routeHash(r.id)}
+                      aria-current={route === r.id ? "page" : undefined}
+                      onclick={(e) => {
+                        // The native `<a>` href on a hash link
+                        // already pushes to history; calling
+                        // navigateTo here is belt-and-suspenders for
+                        // any test environment (vitest jsdom) that
+                        // doesn't fire hashchange.
+                        e.preventDefault();
+                        navigateTo(r.id);
+                      }}
+                    >
+                      {r.label}
+                    </a>
+                  </li>
+                {/each}
+              </ul>
             </li>
           {/each}
         </ul>
@@ -360,11 +459,64 @@
 
   .topbar {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     justify-content: space-between;
+    gap: var(--space-4);
     padding: var(--space-3) var(--space-5);
     background: var(--color-surface-raised);
     border-bottom: 1px solid var(--color-surface-divider);
+  }
+
+  /* The wordmark stays the left-most anchor; the area-swap button
+   * and the backend-status pill sit on the right. Push the right-
+   * hand cluster to the end of the row. */
+  .topbar > .area-swap {
+    margin-left: auto;
+  }
+
+  /* PR-78 / session 101 — area-swap affordance per ADR-0041 §3.
+   * The button sits in the topbar as a small, secondary control;
+   * it is NOT the visual focal point. Quiet chrome posture per
+   * ADR-0017. The button label changes between "Maintenance" (when
+   * operating) and "Operational" (when in maintenance), so the
+   * operator always sees the destination of the next click. */
+  .area-swap {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-3);
+    background: transparent;
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    color: var(--color-text-secondary);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+  }
+
+  .area-swap:hover {
+    color: var(--color-text-strong);
+    background: var(--color-surface-divider);
+  }
+
+  /* When the operator is IN the maintenance area, the swap-back
+   * button gets a slightly stronger border so it reads as the
+   * primary way out. Not theatrical — just enough visual weight
+   * that a new operator immediately spots the way back. */
+  .area-swap[data-target="operational"] {
+    color: var(--color-text-strong);
+  }
+
+  .area-swap__glyph {
+    display: inline-block;
+    width: 12px;
+    text-align: center;
+  }
+
+  .area-swap__label {
+    line-height: 1;
   }
 
   .wordmark {
@@ -428,7 +580,89 @@
     padding: var(--space-4) 0;
   }
 
-  .sidenav__list {
+  /* The maintenance area gets a faintly distinct surface so the
+   * operator immediately recognises "I am in the configuration
+   * area, not in my daily workflow". The shift is subtle (a
+   * slightly different tone) — strong enough to be a cue, not
+   * strong enough to feel like a different app. */
+  .sidenav[data-area="maintenance"] {
+    background: var(--color-surface-base, var(--color-surface-raised));
+  }
+
+  /* Area caption at the top of the sidebar. Tells the operator
+   * which area they're in. Presentational only — not a nav
+   * target. */
+  .sidenav__area-caption {
+    padding: 0 var(--space-4) var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--color-surface-divider);
+    margin-bottom: var(--space-3);
+  }
+
+  .sidenav__area-caption-label {
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--color-text-strong);
+  }
+
+  /* PR-78 / session 101 — two-level sidebar (ADR-0041 §3). Outer
+   * list groups by ERP module; each module header is presentational
+   * (glyph + label, no click handler), its nested `.sidenav__routes`
+   * carries the actual `<a>` rows. The route-row chrome below is
+   * unchanged from PR-53 — preserving the active-item visual + the
+   * `aria-current="page"` indicator that the keyboard nav (PR-68)
+   * and screen readers rely on. */
+  .sidenav__modules {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .sidenav__module {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sidenav__module-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4);
+    font-size: var(--type-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--color-text-muted);
+    font-family: var(--type-family-mono);
+  }
+
+  /* Parent-module-of-active-route is marked subtly: brighter label
+   * colour, the glyph lit. The route row itself still carries the
+   * `aria-current="page"` highlight; this is just the "you are in
+   * this section" cue at the module header level. */
+  .sidenav__module--active .sidenav__module-header {
+    color: var(--color-text-strong);
+  }
+
+  .sidenav__module-glyph {
+    display: inline-block;
+    width: 14px;
+    text-align: center;
+    color: var(--color-text-muted);
+  }
+
+  .sidenav__module--active .sidenav__module-glyph {
+    color: var(--color-signal-positive, var(--color-text-strong));
+  }
+
+  .sidenav__module-label {
+    line-height: 1;
+  }
+
+  .sidenav__routes {
     list-style: none;
     margin: 0;
     padding: 0;
@@ -438,7 +672,7 @@
 
   .sidenav__item {
     display: block;
-    padding: var(--space-2) var(--space-4);
+    padding: var(--space-2) var(--space-4) var(--space-2) var(--space-6);
     color: var(--color-text-secondary);
     text-decoration: none;
     font-size: var(--type-size-sm);

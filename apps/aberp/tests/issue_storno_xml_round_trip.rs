@@ -20,7 +20,9 @@
 //! commit message as PR-10 follow-on work (no F number — it is
 //! mechanical test plumbing, not a finding).
 
-use aberp::nav_xml::{self, CustomerInfo, NavParties, StornoReference, SupplierInfo};
+use aberp::nav_xml::{
+    self, CustomerAddress, CustomerInfo, NavParties, StornoReference, SupplierInfo,
+};
 use aberp_billing::{
     Currency, CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
 };
@@ -62,6 +64,15 @@ fn minimal_parties() -> NavParties {
         customer: CustomerInfo {
             tax_number: "87654321-1-42".to_string(),
             name: "Test Customer Zrt.".to_string(),
+            // PR-77 / session-101 — `customerAddress` required for any
+            // DOMESTIC customerVatStatus per NAV business-rule
+            // `CUSTOMER_DATA_EXPECTED`.
+            address: Some(CustomerAddress {
+                country_code: "HU".to_string(),
+                postal_code: "1052".to_string(),
+                city: "Budapest".to_string(),
+                street: "Váci utca 19.".to_string(),
+            }),
         },
     }
 }

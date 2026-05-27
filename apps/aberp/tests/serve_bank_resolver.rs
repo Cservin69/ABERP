@@ -78,6 +78,15 @@ fn fixture_customer() -> CustomerJson {
     CustomerJson {
         tax_number: "87654321-2-13".to_string(),
         name: "Vevő Kft.".to_string(),
+        // PR-77 / session-101 — preflight requires `customer.address`
+        // for any well-formed Hungarian tax number; supply the full
+        // address quartet so this fixture's golden path stays green.
+        address: Some(AddressJson {
+            country_code: "HU".to_string(),
+            postal_code: "1052".to_string(),
+            city: "Budapest".to_string(),
+            street: "Váci utca 19.".to_string(),
+        }),
     }
 }
 

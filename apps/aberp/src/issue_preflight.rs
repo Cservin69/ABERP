@@ -91,6 +91,24 @@ pub enum InvoicePreflightError {
         actual: String,
         reason: &'static str,
     },
+    /// PR-77 / session-101 — `customer.address` absent (or any of its
+    /// four sub-fields blank) when `customer.tax_number` is present
+    /// and well-formed (= business buyer; today the only branch the
+    /// pipeline supports). NAV business-rule `CUSTOMER_DATA_EXPECTED`
+    /// requires `<customerAddress>` whenever `customerVatStatus` is
+    /// non-PRIVATE_PERSON; the emitter hardcodes DOMESTIC for any
+    /// Hungarian-tax-number buyer, so a missing address is a guaranteed
+    /// NAV-side ABORTED rejection. Catching it at preflight time
+    /// prevents the sequence-burn that bit invoice 18.
+    ///
+    /// Surfaced as the typed-400 wire body the SPA's
+    /// `parseInvoicePreflightErrors` consumes; the SPA's combobox-
+    /// driven IssueInvoice form populates `customer.address` from the
+    /// operator-selected partner record, so a fire on this variant
+    /// usually means the operator picked a partner with an incomplete
+    /// address — the fix is in Partners (enrich the partner record),
+    /// not in the issuance form.
+    CustomerAddressMissing,
     /// `lines.is_empty()`. Lifted from the legacy
     /// `validate_issue_request` surface into the closed-vocab so the
     /// SPA's per-field renderer can target `lines` rather than
@@ -160,6 +178,7 @@ impl InvoicePreflightError {
             InvoicePreflightError::CustomerTaxNumberMalformed { .. } => {
                 "CustomerTaxNumberMalformed"
             }
+            InvoicePreflightError::CustomerAddressMissing => "CustomerAddressMissing",
             InvoicePreflightError::InvoiceLinesEmpty => "InvoiceLinesEmpty",
             InvoicePreflightError::LineItemDescriptionEmpty { .. } => "LineItemDescriptionEmpty",
             InvoicePreflightError::LineItemQuantityZero { .. } => "LineItemQuantityZero",
@@ -187,6 +206,7 @@ impl InvoicePreflightError {
             | InvoicePreflightError::CustomerTaxNumberMalformed { .. } => {
                 "customer.taxNumber".to_string()
             }
+            InvoicePreflightError::CustomerAddressMissing => "customer.address".to_string(),
             InvoicePreflightError::InvoiceLinesEmpty => "lines".to_string(),
             InvoicePreflightError::LineItemDescriptionEmpty { line_index } => {
                 format!("lines[{line_index}].description")
@@ -223,6 +243,12 @@ impl InvoicePreflightError {
                     "Az ügyfél adószáma (`{actual}`) hibás formátum ({}). Helyes: `xxxxxxxx-y-zz`, pl. `87654321-2-13`.",
                     translate_reason_hu(reason)
                 )
+            }
+            InvoicePreflightError::CustomerAddressMissing => {
+                "Az ügyfél címe kötelező (ország, irányítószám, város, utca) — \
+                 a NAV szabálya szerint cég vagy nem-magánszemély vevő esetén a teljes cím \
+                 megadása kötelező. Egészítse ki a Partnerek képernyőn az ügyfél adatait."
+                    .to_string()
             }
             InvoicePreflightError::InvoiceLinesEmpty => {
                 "Legalább egy tételsor szükséges a számlához.".to_string()
@@ -289,6 +315,13 @@ impl InvoicePreflightError {
                 format!(
                     "Customer ADÓSZÁM `{actual}` is not a valid Hungarian tax number ({reason}); expected `xxxxxxxx-y-zz`, e.g. `87654321-2-13`."
                 )
+            }
+            InvoicePreflightError::CustomerAddressMissing => {
+                "Customer address is required (country, postal code, city, street) — \
+                 NAV's `CUSTOMER_DATA_EXPECTED` business rule requires a full address \
+                 whenever the buyer is not a private individual. Enrich the partner \
+                 record on the Partners screen and retry."
+                    .to_string()
             }
             InvoicePreflightError::InvoiceLinesEmpty => {
                 "At least one line item is required.".to_string()
@@ -406,11 +439,14 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
         errors.push(InvoicePreflightError::CustomerNameEmpty);
     }
     let tax_trimmed = request.customer.tax_number.trim();
+    let mut tax_number_well_formed = false;
     if tax_trimmed.is_empty() {
         errors.push(InvoicePreflightError::CustomerTaxNumberMissing);
     } else {
         match parse_hungarian_tax_number(tax_trimmed) {
-            Ok(_) => {}
+            Ok(_) => {
+                tax_number_well_formed = true;
+            }
             Err(SupplierConfigError::MissingTaxNumber) => {
                 // Whitespace-after-trim case is already covered by the
                 // `is_empty` branch above; this arm is theoretically
@@ -424,6 +460,27 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
                     reason,
                 });
             }
+        }
+    }
+
+    // PR-77 / session-101 — `customer.address` is required when the
+    // buyer is a Hungarian business (well-formed tax number → today's
+    // only branch — closed-vocab customerVatStatus is named-deferred).
+    // Address is `Option<AddressJson>` on the wire (pre-PR-77 bodies
+    // omitted it entirely); we also fire when any of the four
+    // sub-fields is blank-after-trim, so a partially-filled partner
+    // record surfaces the same way as a missing one. The fix path is
+    // operator-actionable on the Partners screen — message names that
+    // surface in both Hungarian and English.
+    if tax_number_well_formed {
+        let address_ok = request.customer.address.as_ref().is_some_and(|a| {
+            !a.country_code.trim().is_empty()
+                && !a.postal_code.trim().is_empty()
+                && !a.city.trim().is_empty()
+                && !a.street.trim().is_empty()
+        });
+        if !address_ok {
+            errors.push(InvoicePreflightError::CustomerAddressMissing);
         }
     }
 
@@ -460,8 +517,20 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::issue_invoice::{CustomerJson, LineJson};
+    use crate::issue_invoice::{AddressJson, CustomerJson, LineJson};
     use aberp_billing::Currency;
+
+    /// PR-77 / session-101 — canonical good-buyer address fixture for
+    /// the preflight unit tests. All four sub-fields populated so the
+    /// `CustomerAddressMissing` gate stays quiet on the golden path.
+    fn good_customer_address() -> AddressJson {
+        AddressJson {
+            country_code: "HU".to_string(),
+            postal_code: "1052".to_string(),
+            city: "Budapest".to_string(),
+            street: "Váci utca 19.".to_string(),
+        }
+    }
 
     fn good_line() -> LineJson {
         LineJson {
@@ -477,6 +546,7 @@ mod tests {
             customer: CustomerJson {
                 tax_number: "87654321-2-13".to_string(),
                 name: "Áben Consulting KFT.".to_string(),
+                address: Some(good_customer_address()),
             },
             lines: vec![good_line()],
             currency: Currency::Huf,
@@ -527,6 +597,81 @@ mod tests {
             )
         });
         assert!(found, "expected CustomerTaxNumberMalformed, got {errs:?}");
+    }
+
+    /// PR-77 / session-101 — `CustomerAddressMissing` fires when the
+    /// customer.address is None entirely (the pre-PR-77 wire shape).
+    /// This is the load-bearing arm — invoice 18 ABORTED because the
+    /// pre-PR-77 SPA never sent an address; this gate must catch the
+    /// same scenario locally now.
+    #[test]
+    fn fires_customer_address_missing_for_none_address() {
+        let mut r = good_request();
+        r.customer.address = None;
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.contains(&InvoicePreflightError::CustomerAddressMissing),
+            "expected CustomerAddressMissing for None address, got {errs:?}"
+        );
+    }
+
+    /// PR-77 / session-101 — `CustomerAddressMissing` fires when ANY
+    /// sub-field of an otherwise-present address is blank-after-trim.
+    /// The four sub-fields are equally load-bearing on the NAV wire
+    /// body (`<common:countryCode>`, `<common:postalCode>`,
+    /// `<common:city>`, `<common:additionalAddressDetail>`); a blank
+    /// in any of them is the same trap door as a missing block.
+    #[test]
+    fn fires_customer_address_missing_for_each_blank_subfield() {
+        // city blank.
+        let mut r = good_request();
+        r.customer.address.as_mut().unwrap().city = "   ".to_string();
+        assert!(
+            validate_invoice_preflight(&r).contains(&InvoicePreflightError::CustomerAddressMissing),
+            "blank city must fire CustomerAddressMissing"
+        );
+
+        // street blank.
+        let mut r = good_request();
+        r.customer.address.as_mut().unwrap().street = "".to_string();
+        assert!(
+            validate_invoice_preflight(&r).contains(&InvoicePreflightError::CustomerAddressMissing),
+            "blank street must fire CustomerAddressMissing"
+        );
+
+        // postal_code blank.
+        let mut r = good_request();
+        r.customer.address.as_mut().unwrap().postal_code = "".to_string();
+        assert!(
+            validate_invoice_preflight(&r).contains(&InvoicePreflightError::CustomerAddressMissing),
+            "blank postal_code must fire CustomerAddressMissing"
+        );
+
+        // country_code blank.
+        let mut r = good_request();
+        r.customer.address.as_mut().unwrap().country_code = "".to_string();
+        assert!(
+            validate_invoice_preflight(&r).contains(&InvoicePreflightError::CustomerAddressMissing),
+            "blank country_code must fire CustomerAddressMissing"
+        );
+    }
+
+    /// PR-77 / session-101 — the address gate is GATED on a well-formed
+    /// tax number. A malformed tax number suppresses
+    /// `CustomerAddressMissing` (the operator has a more proximate
+    /// problem to fix first, and the address rule only applies in the
+    /// business-buyer branch). This pin guards against accidental
+    /// firing on the bare-digit-no-dash class of malformed entries.
+    #[test]
+    fn customer_address_missing_suppressed_when_tax_number_malformed() {
+        let mut r = good_request();
+        r.customer.tax_number = "12345".to_string(); // malformed
+        r.customer.address = None;
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            !errs.contains(&InvoicePreflightError::CustomerAddressMissing),
+            "malformed tax must suppress CustomerAddressMissing, got {errs:?}"
+        );
     }
 
     #[test]
@@ -638,6 +783,7 @@ mod tests {
             customer: CustomerJson {
                 tax_number: "12345".to_string(), // malformed
                 name: "  ".to_string(),          // blank
+                address: None,                   // PR-77 — also missing
             },
             lines: vec![
                 LineJson {

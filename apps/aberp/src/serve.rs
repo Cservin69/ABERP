@@ -73,7 +73,8 @@ use std::sync::Arc;
 use aberp_audit_ledger::{Actor, Entry, EventKind, Ledger, TenantId};
 use aberp_billing::{self as billing, BillingStore, Currency, DuckDbBillingStore, ReadyInvoice};
 use aberp_nav_transport::{
-    operations::TechnicalValidation, NavCredentials, NavEndpoint, NavTransportError,
+    operations::{find_all_technical_validations, TechnicalValidation},
+    NavCredentials, NavEndpoint, NavTransportError,
 };
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -5916,6 +5917,37 @@ fn get_audit_for_invoice(state: &AppState, invoice_id: &str) -> Result<Vec<Audit
 }
 
 fn audit_view_of(entry: &Entry) -> AuditEntryView {
+    // PR-27 — the full typed payload as raw JSON. Every
+    // `audit_payloads::*` type serialises via `serde_json::to_vec`
+    // (F9 — closed in PR-6.1) so the bytes always parse cleanly;
+    // a malformed payload falls back to `Null` rather than
+    // panicking, so a corrupted entry is inspector-visible per
+    // CLAUDE.md rule 12.
+    let mut payload = serde_json::from_slice::<serde_json::Value>(&entry.payload)
+        .unwrap_or(serde_json::Value::Null);
+    // PR-76 — when the entry is an `InvoiceAckStatus`, parse the
+    // `<technicalValidationMessages>` array out of the verbatim NAV
+    // ack body (`response_xml`) and graft it onto the payload as a
+    // sibling field. The SPA's `invoice-timeline.ts` renders the array
+    // inline under the ack node so an operator staring at "Rejected"
+    // in the state chip sees WHY without digging through logs. Only
+    // ABORTED acks actually carry validation messages; SAVED /
+    // PROCESSING / RECEIVED parse to an empty array, which the SPA
+    // renders as nothing additional — the field name is the same
+    // either way so the wire shape stays uniform.
+    if entry.kind == EventKind::InvoiceAckStatus {
+        if let Some(messages) = parse_ack_technical_validations(&payload) {
+            if let serde_json::Value::Object(ref mut map) = payload {
+                map.insert(
+                    "technical_validation_messages".to_string(),
+                    serde_json::json!(messages
+                        .into_iter()
+                        .map(TechnicalValidationBody::from)
+                        .collect::<Vec<_>>()),
+                );
+            }
+        }
+    }
     AuditEntryView {
         seq: entry.seq.as_u64(),
         kind: format!("{:?}", entry.kind),
@@ -5931,14 +5963,29 @@ fn audit_view_of(entry: &Entry) -> AuditEntryView {
         // the probe's return to also carry the chain child id; the
         // audit-entry view consumes only the base id here.
         chain_base_invoice_id: extract_chain_link(entry).map(|link| link.base_invoice_id),
-        // PR-27 — the full typed payload as raw JSON. Every
-        // `audit_payloads::*` type serialises via `serde_json::to_vec`
-        // (F9 — closed in PR-6.1) so the bytes always parse cleanly;
-        // a malformed payload falls back to `Null` rather than
-        // panicking, so a corrupted entry is inspector-visible per
-        // CLAUDE.md rule 12.
-        payload: serde_json::from_slice(&entry.payload).unwrap_or(serde_json::Value::Null),
+        payload,
     }
+}
+
+/// PR-76 — extract the `response_xml` bytes from an
+/// [`audit_payloads::InvoiceAckStatusPayload`] JSON Value and parse the
+/// per-rule `<technicalValidationMessages>` array out of them. Returns
+/// `None` when the payload shape does not match (corrupt entry — the
+/// caller leaves the payload unchanged so the inspector-visible
+/// fall-back posture from `audit_view_of` carries over).
+fn parse_ack_technical_validations(
+    payload: &serde_json::Value,
+) -> Option<Vec<TechnicalValidation>> {
+    let bytes_arr = payload.get("response_xml")?.as_array()?;
+    let mut bytes: Vec<u8> = Vec::with_capacity(bytes_arr.len());
+    for v in bytes_arr {
+        let n = v.as_u64()?;
+        if n > 0xFF {
+            return None;
+        }
+        bytes.push(n as u8);
+    }
+    find_all_technical_validations(&bytes).ok()
 }
 
 /// PR-44ε / session-53 — currency-aware billing read bundle.
@@ -6524,6 +6571,19 @@ mod tests {
             customer: crate::nav_xml::CustomerInfo {
                 tax_number: "27952890-2-42".to_string(),
                 name: "AZ9 Services".to_string(),
+                // PR-77 / session-101 — `<customerAddress>` is now
+                // required by `walk_customer_info` for any DOMESTIC
+                // customerVatStatus; the round-trip fixture supplies a
+                // realistic Hungarian address so the v3.0 invariant
+                // check below succeeds. The customer-address shape is
+                // exercised end-to-end by the byte-verbatim emitter pin
+                // in `nav_xsd_validator_round_trip.rs`.
+                address: Some(crate::nav_xml::CustomerAddress {
+                    country_code: "HU".to_string(),
+                    postal_code: "1097".to_string(),
+                    city: "Budapest".to_string(),
+                    street: "Üllői út 1.".to_string(),
+                }),
             },
         };
 

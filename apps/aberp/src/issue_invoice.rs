@@ -69,7 +69,9 @@ use crate::audit_payloads;
 use crate::binary_hash;
 use crate::cli::IssueInvoiceArgs;
 use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
-use crate::nav_xml::{self, CustomerInfo, NavParties, SupplierConfigError, SupplierInfo};
+use crate::nav_xml::{
+    self, CustomerAddress, CustomerInfo, NavParties, SupplierConfigError, SupplierInfo,
+};
 use crate::submission_queue;
 
 /// Maximum number of days to walk back per ADR-0037 §2.b when MNB has no
@@ -157,6 +159,17 @@ pub struct CustomerJson {
     #[serde(rename = "taxNumber")]
     pub tax_number: String,
     pub name: String,
+    /// PR-77 / session-101 — NAV business-rule `CUSTOMER_DATA_EXPECTED`
+    /// requires a full `<customerAddress>` block whenever
+    /// `customerVatStatus != PRIVATE_PERSON`. The SPA populates this
+    /// field from the operator-selected partner record (PR-54 buyer
+    /// combobox); CLI callers can supply it directly. Optional on the
+    /// wire so pre-PR-77 side-stored `input.json` files still
+    /// deserialize — but the issuance pipeline now refuses any DOMESTIC
+    /// invoice without it (preflight `CustomerAddressMissing` + the
+    /// validator's customerVatStatus-aware required-children rule).
+    #[serde(default)]
+    pub address: Option<AddressJson>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -527,6 +540,20 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         customer: CustomerInfo {
             tax_number: input.customer.tax_number,
             name: input.customer.name,
+            // PR-77 / session-101 — `<customerAddress>` is required for any
+            // DOMESTIC (non-PRIVATE_PERSON) customerVatStatus. The wire
+            // body's `customer.address` is `Option<_>` so pre-PR-77
+            // CLI-issued bodies still parse; the preflight in
+            // `serve.rs::issue_invoice_request` fires
+            // `CustomerAddressMissing` when an address is required but
+            // absent so the operator surfaces the gap BEFORE the
+            // sequence is burned.
+            address: input.customer.address.map(|a| CustomerAddress {
+                country_code: a.country_code,
+                postal_code: a.postal_code,
+                city: a.city,
+                street: a.street,
+            }),
         },
     };
     let xml = nav_xml::render_invoice_data(

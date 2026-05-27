@@ -169,6 +169,71 @@ describe("composeIssueInvoiceBody", () => {
     expect(body.lines[0].description).toBe("Trimmed description");
   });
 
+  // PR-77 / session-101 — customerAddress quartet on the wire body.
+  /** When all four address fields are populated, the wire body carries
+   * the camelCase address shape. NAV's `CUSTOMER_DATA_EXPECTED`
+   * business rule (the rule that ABORTED invoice 18) requires this
+   * block for any Hungarian-business buyer; the composer's job is to
+   * pass it through verbatim so the backend's preflight + emitter can
+   * see the same shape the operator authored. */
+  it("emits customer.address verbatim when populated", () => {
+    const form = {
+      ...emptyForm(),
+      customerName: "AZ9 Services",
+      customerTaxNumber: "27952890-2-42",
+      customerCountryCode: "HU",
+      customerPostalCode: "1097",
+      customerCity: "Budapest",
+      customerStreet: "Üllői út 1.",
+    };
+    const body = composeIssueInvoiceBody(form);
+    expect(body.customer.address).toEqual({
+      countryCode: "HU",
+      postalCode: "1097",
+      city: "Budapest",
+      street: "Üllői út 1.",
+    });
+  });
+
+  /** PR-77 / session-101 — empty quartet → field omitted entirely.
+   * The backend preflight surfaces `CustomerAddressMissing` on the
+   * absent field rather than on a body with four empty strings (the
+   * cleaner operator message; consistent with the SPA's per-field
+   * error renderer). */
+  it("omits customer.address when every sub-field is blank", () => {
+    const form = {
+      ...emptyForm(),
+      customerName: "AZ9",
+      customerTaxNumber: "27952890-2-42",
+    };
+    const body = composeIssueInvoiceBody(form);
+    expect(body.customer.address).toBeUndefined();
+  });
+
+  /** PR-77 / session-101 — partially-populated address: the SPA still
+   * sends what's there (the backend's per-field preflight names the
+   * exact gap). A future scope tightening could promote the SPA's own
+   * required-attribute check to mirror the backend; for now the SPA
+   * trusts the backend's preflight to do the per-field naming. */
+  it("emits customer.address with blank sub-fields trimmed when partially populated", () => {
+    const form = {
+      ...emptyForm(),
+      customerName: "AZ9",
+      customerTaxNumber: "27952890-2-42",
+      customerCountryCode: "HU",
+      customerPostalCode: "  ",
+      customerCity: "Budapest",
+      customerStreet: "",
+    };
+    const body = composeIssueInvoiceBody(form);
+    expect(body.customer.address).toEqual({
+      countryCode: "HU",
+      postalCode: "",
+      city: "Budapest",
+      street: "",
+    });
+  });
+
   it("preserves all lines when there are multiple", () => {
     // Per-line ordering matters — the backend stamps the lines in
     // the order received. A regression that re-ordered or

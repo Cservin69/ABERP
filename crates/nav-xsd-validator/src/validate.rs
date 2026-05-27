@@ -114,7 +114,20 @@ fn walk_invoice_data(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationE
         "completenessIndicator",
         "invoiceMain",
     ];
-    const ORDERED_REQUIRED: &[&str] = &["invoiceNumber", "invoiceIssueDate", "invoiceMain"];
+    // PR-76 — `completenessIndicator` was pre-PR-76 listed in ALLOWED but
+    // NOT ORDERED_REQUIRED. NAV-test rejected invoice 17
+    // (`inv_01KSM8SRH3X2WQ2TPBHGF8QQBX`) with
+    // `SCHEMA_VIOLATION: One of '{...:completenessIndicator}' is
+    // expected` because the emitter never wrote it. The validator missed
+    // the rule for the same reason (rule absence ≠ optional element).
+    // The element is now required between `<invoiceIssueDate>` and
+    // `<invoiceMain>`, matching the NAV v3.0 InvoiceData XSD.
+    const ORDERED_REQUIRED: &[&str] = &[
+        "invoiceNumber",
+        "invoiceIssueDate",
+        "completenessIndicator",
+        "invoiceMain",
+    ];
 
     let mut seen_in_order: Vec<&'static str> = Vec::new();
 
@@ -389,11 +402,29 @@ fn walk_supplier_tax_number(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdVali
 
 fn walk_customer_info(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
     const PARENT: &str = "customerInfo";
-    const ALLOWED: &[&str] = &["customerVatStatus", "customerVatData", "customerName"];
+    // PR-77 / session-101 — `customerAddress` added. NAV v3.0
+    // CustomerInfoType permits it at the optional position AFTER
+    // `<customerName>`; the business rule below promotes it to
+    // required when `customerVatStatus` is non-PRIVATE_PERSON.
+    const ALLOWED: &[&str] = &[
+        "customerVatStatus",
+        "customerVatData",
+        "customerName",
+        "customerAddress",
+    ];
+    // customerVatStatus + customerName are unconditionally required.
+    // customerVatData + customerAddress are conditionally required
+    // based on customerVatStatus value — that branch is enforced
+    // below, AFTER the seen-children list is fully populated.
     const ORDERED_REQUIRED: &[&str] = &["customerVatStatus", "customerName"];
-    // customerVatData is optional in NAV v3.0 (PRIVATE_PERSON has no
-    // tax data); we accept-and-walk its body if present.
 
+    // PR-77 / session-101 — capture the customerVatStatus text so the
+    // post-walk business-rule check can decide whether `customerVatData`
+    // and `customerAddress` are required. NAV's `CUSTOMER_DATA_EXPECTED`
+    // business rule fires when status is non-PRIVATE_PERSON (DOMESTIC /
+    // OTHER) and either of those two elements is missing — invoice 18
+    // ABORTED on exactly this trap door before PR-77.
+    let mut customer_vat_status: Option<String> = None;
     let mut seen: Vec<&'static str> = Vec::new();
     loop {
         match read_event(reader)? {
@@ -407,18 +438,47 @@ fn walk_customer_info(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidation
                 })?;
                 match canonical {
                     "customerVatStatus" => {
-                        let _ = collect_text(reader, canonical)?;
+                        let text = collect_text(reader, canonical)?;
+                        customer_vat_status = Some(text);
                     }
                     "customerVatData" => walk_customer_vat_data(reader)?,
                     "customerName" => {
                         let _ = collect_text(reader, canonical)?;
                     }
+                    "customerAddress" => walk_address("customerAddress", reader)?,
                     other => unreachable!("canonicalized unknown element {other}"),
                 }
                 seen.push(canonical);
             }
             Event::End(_) => {
                 check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                // PR-77 / session-101 — NAV business-rule
+                // `CUSTOMER_DATA_EXPECTED`. When customerVatStatus is
+                // anything OTHER than `PRIVATE_PERSON`, both
+                // `customerVatData` AND `customerAddress` are required.
+                // The rule fires the validator's
+                // `MissingRequiredChild` loud-fail so the gap surfaces
+                // at the ADR-0022 invariant check between render and
+                // disk write — instead of as the NAV-test ABORTED
+                // status that bit invoice 18 (`5E9KWQSOX3L9EC30`,
+                // pointer `customerInfo/customerVatStatus` =
+                // `DOMESTIC`).
+                let status = customer_vat_status.as_deref().unwrap_or("");
+                let is_business_buyer = !status.eq_ignore_ascii_case("PRIVATE_PERSON");
+                if is_business_buyer {
+                    if !seen.contains(&"customerVatData") {
+                        return Err(NavXsdValidationError::MissingRequiredChild {
+                            parent: PARENT,
+                            expected: "customerVatData",
+                        });
+                    }
+                    if !seen.contains(&"customerAddress") {
+                        return Err(NavXsdValidationError::MissingRequiredChild {
+                            parent: PARENT,
+                            expected: "customerAddress",
+                        });
+                    }
+                }
                 return Ok(());
             }
             Event::Eof => return Err(eof_in(PARENT, reader)),
@@ -1409,6 +1469,7 @@ mod tests {
 <InvoiceData xmlns="http://schemas.nav.gov.hu/OSA/3.0/data" xmlns:common="http://schemas.nav.gov.hu/OSA/3.0/base">
   <invoiceNumber>INV-default/00001</invoiceNumber>
   <invoiceIssueDate>2026-05-20</invoiceIssueDate>
+  <completenessIndicator>false</completenessIndicator>
   <invoiceMain>
     <invoice>
       <invoiceHead>
@@ -1438,6 +1499,14 @@ mod tests {
             </customerTaxNumber>
           </customerVatData>
           <customerName>Test Customer Zrt.</customerName>
+          <customerAddress>
+            <common:simpleAddress>
+              <common:countryCode>HU</common:countryCode>
+              <common:postalCode>1052</common:postalCode>
+              <common:city>Budapest</common:city>
+              <common:additionalAddressDetail>Váci utca 19.</common:additionalAddressDetail>
+            </common:simpleAddress>
+          </customerAddress>
         </customerInfo>
         <invoiceDetail>
           <invoiceCategory>NORMAL</invoiceCategory>
@@ -1563,6 +1632,27 @@ mod tests {
         }
     }
 
+    /// PR-76 — `<completenessIndicator>` is REQUIRED per NAV v3.0
+    /// InvoiceData XSD. Pre-PR-76 the emitter omitted it and the
+    /// validator tolerated the absence; NAV-test rejected invoice 17
+    /// with `SCHEMA_VIOLATION` naming this element as the expected
+    /// next child of `InvoiceData`. The new pin asserts the validator
+    /// loud-fails on the missing element so a future regression
+    /// surfaces locally (CLAUDE.md rule 12) instead of as an
+    /// `InvoiceAckStatus::ABORTED` after a live submission.
+    #[test]
+    fn missing_completeness_indicator_is_loud_fail() {
+        let bad = MIN_VALID.replace("<completenessIndicator>false</completenessIndicator>", "");
+        let err = validate_invoice_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::MissingRequiredChild { parent, expected } => {
+                assert_eq!(parent, "InvoiceData");
+                assert_eq!(expected, "completenessIndicator");
+            }
+            other => panic!("expected MissingRequiredChild completenessIndicator, got {other:?}"),
+        }
+    }
+
     #[test]
     fn unexpected_element_is_loud_fail() {
         let bad = MIN_VALID.replace(
@@ -1606,6 +1696,91 @@ mod tests {
             }
             other => panic!("expected NonNumericAmount, got {other:?}"),
         }
+    }
+
+    /// PR-77 / session-101 — NAV business-rule `CUSTOMER_DATA_EXPECTED`
+    /// trap door: `customerVatStatus=DOMESTIC` paired with a missing
+    /// `<customerVatData>` block is a loud-fail. The pre-PR-77
+    /// validator marked customerVatData as optional ("PRIVATE_PERSON
+    /// has no tax data"); but the NAV BUSINESS rule promotes it to
+    /// required under any non-PRIVATE_PERSON status. The MIN_VALID
+    /// fixture's status is `DOMESTIC`, so stripping the block exercises
+    /// the conditional branch.
+    #[test]
+    fn missing_customer_vat_data_under_domestic_is_loud_fail() {
+        let needle_open = "<customerVatData>";
+        let needle_close = "</customerVatData>";
+        let open = MIN_VALID
+            .find(needle_open)
+            .expect("MIN_VALID contains <customerVatData>");
+        let close = MIN_VALID
+            .find(needle_close)
+            .expect("MIN_VALID contains </customerVatData>")
+            + needle_close.len();
+        let bad = format!("{}{}", &MIN_VALID[..open], &MIN_VALID[close..]);
+        let err = validate_invoice_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::MissingRequiredChild { parent, expected } => {
+                assert_eq!(parent, "customerInfo");
+                assert_eq!(expected, "customerVatData");
+            }
+            other => panic!("expected MissingRequiredChild customerVatData, got {other:?}"),
+        }
+    }
+
+    /// PR-77 / session-101 — NAV business-rule `CUSTOMER_DATA_EXPECTED`,
+    /// the OTHER half of the trap door: a DOMESTIC customerVatStatus
+    /// without `<customerAddress>` is a loud-fail. This is the actual
+    /// rule NAV-test fired against invoice 18 (transaction
+    /// `5E9KWQSOX3L9EC30`); the pre-PR-77 emitter wrote
+    /// `customerVatData` correctly but omitted `customerAddress`, and
+    /// the pre-PR-77 validator had no rule against the omission. The
+    /// new pin asserts the strengthened validator catches the gap
+    /// locally so a regression cannot reach NAV-test again.
+    #[test]
+    fn missing_customer_address_under_domestic_is_loud_fail() {
+        let needle_open = "<customerAddress>";
+        let needle_close = "</customerAddress>";
+        let open = MIN_VALID
+            .find(needle_open)
+            .expect("MIN_VALID contains <customerAddress>");
+        let close = MIN_VALID
+            .find(needle_close)
+            .expect("MIN_VALID contains </customerAddress>")
+            + needle_close.len();
+        let bad = format!("{}{}", &MIN_VALID[..open], &MIN_VALID[close..]);
+        let err = validate_invoice_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::MissingRequiredChild { parent, expected } => {
+                assert_eq!(parent, "customerInfo");
+                assert_eq!(expected, "customerAddress");
+            }
+            other => panic!("expected MissingRequiredChild customerAddress, got {other:?}"),
+        }
+    }
+
+    /// PR-77 / session-101 — sanity-check the OTHER side of the
+    /// conditional branch: a `PRIVATE_PERSON` customerVatStatus may
+    /// legitimately omit both `<customerVatData>` and `<customerAddress>`
+    /// (the natural-person buyer's data is intentionally absent per NAV
+    /// privacy posture). The validator's conditional-required logic
+    /// must NOT fire on this shape. This pin guards against a future
+    /// regression that promotes the two elements to unconditionally
+    /// required.
+    #[test]
+    fn private_person_status_does_not_require_customer_vat_data_or_address() {
+        // Replace the customerInfo block wholesale: PRIVATE_PERSON +
+        // bare customerName, no vatData, no address.
+        let original = "<customerInfo>\n          <customerVatStatus>DOMESTIC</customerVatStatus>\n          <customerVatData>\n            <customerTaxNumber>\n              <common:taxpayerId>87654321</common:taxpayerId>\n              <common:vatCode>1</common:vatCode>\n              <common:countyCode>42</common:countyCode>\n            </customerTaxNumber>\n          </customerVatData>\n          <customerName>Test Customer Zrt.</customerName>\n          <customerAddress>\n            <common:simpleAddress>\n              <common:countryCode>HU</common:countryCode>\n              <common:postalCode>1052</common:postalCode>\n              <common:city>Budapest</common:city>\n              <common:additionalAddressDetail>Váci utca 19.</common:additionalAddressDetail>\n            </common:simpleAddress>\n          </customerAddress>\n        </customerInfo>";
+        let replacement = "<customerInfo>\n          <customerVatStatus>PRIVATE_PERSON</customerVatStatus>\n          <customerName>Test Private Buyer</customerName>\n        </customerInfo>";
+        assert!(
+            MIN_VALID.contains(original),
+            "MIN_VALID must contain the full customerInfo block this pin replaces — \
+             fixture drift detected"
+        );
+        let mutated = MIN_VALID.replace(original, replacement);
+        validate_invoice_data(mutated.as_bytes())
+            .expect("PRIVATE_PERSON must not require customerVatData or customerAddress");
     }
 
     /// PR-10 / ADR-0023: NAV v3.0 storno convention is negative line

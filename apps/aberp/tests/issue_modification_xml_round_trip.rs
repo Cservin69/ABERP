@@ -22,7 +22,9 @@
 //! mirror `submit_invoice_live.rs`'s shape and is named in the PR-11
 //! commit message as PR-11 follow-on work.
 
-use aberp::nav_xml::{self, CustomerInfo, ModificationReference, NavParties, SupplierInfo};
+use aberp::nav_xml::{
+    self, CustomerAddress, CustomerInfo, ModificationReference, NavParties, SupplierInfo,
+};
 use aberp_billing::{
     Currency, CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
 };
@@ -64,6 +66,14 @@ fn minimal_parties() -> NavParties {
         customer: CustomerInfo {
             tax_number: "87654321-1-42".to_string(),
             name: "Test Customer Zrt.".to_string(),
+            // PR-77 / session-101 — `customerAddress` required for any
+            // DOMESTIC customerVatStatus.
+            address: Some(CustomerAddress {
+                country_code: "HU".to_string(),
+                postal_code: "1052".to_string(),
+                city: "Budapest".to_string(),
+                street: "Váci utca 19.".to_string(),
+            }),
         },
     }
 }

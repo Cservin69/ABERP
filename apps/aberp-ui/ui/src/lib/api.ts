@@ -375,10 +375,35 @@ export async function downloadInvoicePdf(invoiceId: string): Promise<Blob> {
  * SellerConfigWizard, PR-51). The Issue form no longer surfaces
  * seller inputs; the cross-cutting fix per Ervin's feedback that the
  * post-tenant-setup form was re-asking for already-saved values. */
+/** PR-77 / session-101 — customer address sub-shape on the wire body.
+ * Mirrors backend `issue_invoice::AddressJson` (camelCase via serde
+ * rename). Required whenever the backend treats the buyer as a
+ * Hungarian business (today: any well-formed tax number triggers the
+ * DOMESTIC customerVatStatus path); preflight fires
+ * `CustomerAddressMissing` when absent. The SPA's
+ * `composeIssueInvoiceBody` reads `IssueInvoiceFormState`'s
+ * customer-address fields and emits this block; the IssueInvoice form
+ * itself populates the fields from the operator-selected partner via
+ * `buyerFieldsFromPartner`. Country is `HU` for every supported buyer
+ * today; closed-vocab country + non-Hungarian buyer support are
+ * named-deferred. */
+export interface CustomerAddressBody {
+  countryCode: string;
+  postalCode: string;
+  city: string;
+  street: string;
+}
+
 export interface IssueInvoiceRequest {
   customer: {
     taxNumber: string;
     name: string;
+    /** PR-77 / session-101 — full customer address; required for any
+     * Hungarian-business buyer (the DOMESTIC customerVatStatus branch).
+     * Optional on the TS surface so pre-PR-77 callers still type-check;
+     * the backend's preflight (PR-77) rejects an absent or partially-
+     * blank address. */
+    address?: CustomerAddressBody;
   };
   lines: Array<{
     description: string;
@@ -590,6 +615,11 @@ export interface ModificationInvoiceRequest {
   customer: {
     taxNumber: string;
     name: string;
+    /** PR-77 / session-101 — same address surface as
+     * [`IssueInvoiceRequest.customer.address`]. The modification's
+     * customer block is full-replace per ADR-0024 §4 and the address
+     * field is required for any Hungarian-business buyer. */
+    address?: CustomerAddressBody;
   };
   lines: Array<{
     description: string;

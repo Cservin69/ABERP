@@ -35,7 +35,7 @@ use time::OffsetDateTime;
 use ulid::Ulid;
 
 use aberp::audit_payloads::InvoiceDraftCreatedPayload;
-use aberp::nav_xml::{self, CustomerInfo, NavParties, SupplierInfo};
+use aberp::nav_xml::{self, CustomerAddress, CustomerInfo, NavParties, SupplierInfo};
 use aberp::serve::{self, AppState};
 
 const TEST_TENANT: &str = "serve_pdf_route_test";
@@ -80,6 +80,15 @@ fn fixture_parties() -> NavParties {
         customer: CustomerInfo {
             tax_number: "87654321-2-13".to_string(),
             name: "Vevő Kft.".to_string(),
+            // PR-77 / session-101 — `customerAddress` required for any
+            // DOMESTIC customerVatStatus per NAV business-rule
+            // `CUSTOMER_DATA_EXPECTED`.
+            address: Some(CustomerAddress {
+                country_code: "HU".to_string(),
+                postal_code: "1052".to_string(),
+                city: "Budapest".to_string(),
+                street: "Váci utca 19.".to_string(),
+            }),
         },
     }
 }

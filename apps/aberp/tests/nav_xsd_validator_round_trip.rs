@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use aberp::nav_xml::{self, CustomerInfo, NavParties, SupplierInfo};
+use aberp::nav_xml::{self, CustomerAddress, CustomerInfo, NavParties, SupplierInfo};
 use aberp_billing::{
     Currency, CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
 };
@@ -66,6 +66,15 @@ fn minimal_parties() -> NavParties {
         customer: CustomerInfo {
             tax_number: "87654321-1-42".to_string(),
             name: "Test Customer Zrt.".to_string(),
+            // PR-77 / session-101 — `customerAddress` required for any
+            // DOMESTIC customerVatStatus per NAV business-rule
+            // `CUSTOMER_DATA_EXPECTED`.
+            address: Some(CustomerAddress {
+                country_code: "HU".to_string(),
+                postal_code: "1052".to_string(),
+                city: "Budapest".to_string(),
+                street: "Váci utca 19.".to_string(),
+            }),
         },
     }
 }
@@ -274,6 +283,17 @@ fn invoice_16_aben_consulting_tax_number_round_trips_through_emit_and_validate()
         customer: CustomerInfo {
             tax_number: "27952890-2-42".to_string(),
             name: "AZ9 Services".to_string(),
+            // PR-77 / session-101 — `customerAddress` required for any
+            // DOMESTIC customerVatStatus; supply a realistic Hungarian
+            // address so the round-trip continues to validate. The
+            // street name uses the ASCII subset for the same source-
+            // literal posture as the supplier address above.
+            address: Some(CustomerAddress {
+                country_code: "HU".to_string(),
+                postal_code: "1097".to_string(),
+                city: "Budapest".to_string(),
+                street: "Ulloi ut 1.".to_string(),
+            }),
         },
     };
 
@@ -301,5 +321,157 @@ fn invoice_16_aben_consulting_tax_number_round_trips_through_emit_and_validate()
     validate_invoice_data(&xml).expect(
         "v3.0 invariant check must pass on invoice-16's Áben/AZ9 emit output \
          (this is the same byte shape that NAV-test accepted post-fix)",
+    );
+}
+
+/// PR-76 — byte-verbatim pin on `<completenessIndicator>false</…>`. NAV
+/// v3.0 InvoiceData XSD names this element as required, positioned
+/// between `<invoiceIssueDate>` and `<invoiceMain>`. Invoice 17
+/// (`inv_01KSM8SRH3X2WQ2TPBHGF8QQBX`) was rejected with NAV
+/// `SCHEMA_VIOLATION` naming exactly this element. The pin asserts:
+///
+///   1. The emitter writes the element with the value `false` (ABERP
+///      data-submits via the NAV API; the printed invoice does NOT
+///      replace the data record, so the value is always `false`).
+///   2. The element appears AFTER `<invoiceIssueDate>` and BEFORE
+///      `<invoiceMain>` — the ordered-required position NAV's XSD
+///      enforces. A future emitter that drops the element OR puts it
+///      in the wrong slot loud-fails here at CI time rather than at
+///      the next live submit.
+#[test]
+fn emitter_writes_completeness_indicator_before_invoice_main() {
+    let invoice = build_minimal_invoice();
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("emitter must succeed on the minimal fixture");
+    let body = std::str::from_utf8(&xml).expect("emitter output must be UTF-8");
+
+    assert!(
+        body.contains("<completenessIndicator>false</completenessIndicator>"),
+        "<completenessIndicator>false</…> must be present byte-verbatim; body:\n{body}"
+    );
+
+    let issue_date_pos = body
+        .find("</invoiceIssueDate>")
+        .expect("emitter must write <invoiceIssueDate> before <completenessIndicator>");
+    let completeness_pos = body
+        .find("<completenessIndicator>")
+        .expect("emitter must write <completenessIndicator>");
+    let invoice_main_pos = body
+        .find("<invoiceMain>")
+        .expect("emitter must write <invoiceMain> after <completenessIndicator>");
+    assert!(
+        issue_date_pos < completeness_pos && completeness_pos < invoice_main_pos,
+        "expected ordering invoiceIssueDate < completenessIndicator < invoiceMain; \
+         got positions {issue_date_pos} / {completeness_pos} / {invoice_main_pos}; body:\n{body}"
+    );
+
+    validate_invoice_data(&xml).expect(
+        "v3.0 invariant check must pass — the validator now requires completenessIndicator",
+    );
+}
+
+/// PR-77 / session-101 — byte-verbatim pin on the `<customerAddress>`
+/// block. NAV's `CUSTOMER_DATA_EXPECTED` business rule (the rule that
+/// ABORTED invoice 18, transaction `5E9KWQSOX3L9EC30`) requires this
+/// element whenever `customerVatStatus` is non-PRIVATE_PERSON; the
+/// pre-PR-77 emitter omitted it entirely. The pin asserts:
+///
+///   1. The emitter writes `<customerAddress>` containing
+///      `<common:simpleAddress>` containing the four `common:`-prefixed
+///      sub-elements `countryCode` / `postalCode` / `city` /
+///      `additionalAddressDetail`.
+///   2. The block appears AFTER `<customerName>` and BEFORE the
+///      closing `</customerInfo>` — the XSD CustomerInfoType ordering.
+///   3. The strengthened v3.0 invariant check passes (round-trip).
+///
+/// Uses the invoice-18 buyer AZ9 Services (tax 27952890-2-42) at the
+/// canonical Hungarian-business address shape the SPA's PR-77 form
+/// populates from the partner record.
+#[test]
+fn emitter_writes_customer_address_under_domestic_status() {
+    let invoice = build_minimal_invoice();
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = NavParties {
+        supplier: SupplierInfo {
+            tax_number: "24904362-2-41".to_string(),
+            name: "Aben Consulting Kft".to_string(),
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatero koz 6".to_string(),
+        },
+        customer: CustomerInfo {
+            tax_number: "27952890-2-42".to_string(),
+            name: "AZ9 Services".to_string(),
+            address: Some(CustomerAddress {
+                country_code: "HU".to_string(),
+                postal_code: "1097".to_string(),
+                city: "Budapest".to_string(),
+                street: "Ulloi ut 1.".to_string(),
+            }),
+        },
+    };
+
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("emitter must succeed on the invoice-18 fixture");
+    let body = std::str::from_utf8(&xml).expect("emitter output must be UTF-8");
+
+    // Byte-verbatim block presence — the four sub-elements with their
+    // `common:` prefix. Mirror of the supplier address shape (the
+    // emitter delegates to `write_customer_address`, which uses the
+    // same `common_element` helper as `write_address` for the
+    // supplier).
+    assert!(
+        body.contains("<customerAddress>"),
+        "<customerAddress> opener must be present byte-verbatim; body:\n{body}"
+    );
+    assert!(
+        body.contains("</customerAddress>"),
+        "</customerAddress> closer must be present byte-verbatim; body:\n{body}"
+    );
+    assert!(
+        body.contains("<common:countryCode>HU</common:countryCode>"),
+        "<common:countryCode>HU</…> must appear in the customer-address block; body:\n{body}"
+    );
+    assert!(
+        body.contains("<common:postalCode>1097</common:postalCode>"),
+        "<common:postalCode>1097</…> must appear; body:\n{body}"
+    );
+    assert!(
+        body.contains("<common:city>Budapest</common:city>"),
+        "<common:city>Budapest</…> must appear; body:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "<common:additionalAddressDetail>Ulloi ut 1.</common:additionalAddressDetail>"
+        ),
+        "<common:additionalAddressDetail>Ulloi ut 1.</…> must appear; body:\n{body}"
+    );
+
+    // Ordering: customerAddress lives AFTER customerName and BEFORE
+    // </customerInfo>. The XSD CustomerInfoType positions it at slot 4
+    // (after customerVatStatus, customerVatData, customerName).
+    let customer_name_pos = body
+        .find("</customerName>")
+        .expect("emitter must write </customerName> before <customerAddress>");
+    let customer_address_pos = body
+        .find("<customerAddress>")
+        .expect("emitter must write <customerAddress>");
+    let customer_info_close_pos = body
+        .find("</customerInfo>")
+        .expect("emitter must write </customerInfo>");
+    assert!(
+        customer_name_pos < customer_address_pos && customer_address_pos < customer_info_close_pos,
+        "expected ordering customerName < customerAddress < /customerInfo; \
+         got positions {customer_name_pos} / {customer_address_pos} / {customer_info_close_pos}; \
+         body:\n{body}"
+    );
+
+    validate_invoice_data(&xml).expect(
+        "v3.0 invariant check must pass — the validator now requires customerAddress under \
+         DOMESTIC customerVatStatus, and the emitter writes it",
     );
 }

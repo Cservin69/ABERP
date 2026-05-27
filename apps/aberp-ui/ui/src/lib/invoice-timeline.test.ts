@@ -229,6 +229,97 @@ describe("timelineFromAuditEntries — body lines", () => {
   });
 });
 
+describe("timelineFromAuditEntries — technicalValidationMessages on ack-status", () => {
+  // PR-76 — the backend extracts NAV's `<technicalValidationMessages>`
+  // array from the verbatim ack body and grafts it onto the payload
+  // before the SPA sees it (`apps/aberp/src/serve.rs::audit_view_of`).
+  // The timeline mapper renders each message as a body line under
+  // the ack node so an operator staring at "Rejected" sees WHY
+  // without dropping into the raw-table toggle for the response_xml
+  // bytes. Pinned against the actual invoice-17 rejection shape.
+  it("renders ABORTED ack with the parsed validation message body lines", () => {
+    const [node] = timelineFromAuditEntries([
+      entry(1, "InvoiceAckStatus", {
+        actor: "spa",
+        payload: {
+          ack_status: "ABORTED",
+          transaction_id: "5E9J5P1AQVE90N2I",
+          technical_validation_messages: [
+            {
+              result_code: "ERROR",
+              error_code: "SCHEMA_VIOLATION",
+              message:
+                "XML contains on line: [5] and column: [16] error: [...completenessIndicator is expected.]",
+              tag: null,
+            },
+            {
+              result_code: "ERROR",
+              error_code: "SCHEMA_VIOLATION",
+              message: "Xml validation failed",
+              tag: null,
+            },
+          ],
+        },
+      }),
+    ]);
+    expect(node.kind_class).toBe("kind-ack-aborted");
+    expect(node.label_html_safe).toBe("NAV ack: ABORTED");
+    expect(node.body_lines).toEqual([
+      "actor: spa",
+      "ERROR SCHEMA_VIOLATION: XML contains on line: [5] and column: [16] error: [...completenessIndicator is expected.]",
+      "ERROR SCHEMA_VIOLATION: Xml validation failed",
+    ]);
+  });
+
+  it("renders SAVED ack with no extra lines when the array is empty", () => {
+    // SAVED is the happy path — NAV does not emit any technicalValidationMessages
+    // and the backend grafts an empty array onto the payload. The timeline
+    // must NOT render any extra lines below the actor, or the ack node
+    // would always have a vestigial blank section.
+    const [node] = timelineFromAuditEntries([
+      entry(1, "InvoiceAckStatus", {
+        payload: {
+          ack_status: "SAVED",
+          technical_validation_messages: [],
+        },
+      }),
+    ]);
+    expect(node.body_lines).toEqual(["actor: cli"]);
+  });
+
+  it("renders ABORTED ack without the field as a single actor line (defence in depth)", () => {
+    // Old payload shape (pre-PR-76 ack entries already on disk) does NOT
+    // carry the technical_validation_messages field. The mapper must
+    // degrade gracefully — show the kind_class + label per the ack_status
+    // and skip the messages section, NOT crash.
+    const [node] = timelineFromAuditEntries([
+      entry(1, "InvoiceAckStatus", {
+        payload: { ack_status: "ABORTED" },
+      }),
+    ]);
+    expect(node.kind_class).toBe("kind-ack-aborted");
+    expect(node.body_lines).toEqual(["actor: cli"]);
+  });
+
+  it("renders a message with a missing field using ?-placeholders, not silent drop", () => {
+    // CLAUDE.md rule 12 — if NAV (or a future wire-shape regression) omits
+    // a required-shaped field on a single message, the operator still sees
+    // the entry instead of having it silently disappear. The `?` markers
+    // make the omission visible.
+    const [node] = timelineFromAuditEntries([
+      entry(1, "InvoiceAckStatus", {
+        payload: {
+          ack_status: "ABORTED",
+          technical_validation_messages: [
+            { result_code: null, error_code: null, message: null, tag: null },
+          ],
+        },
+      }),
+    ]);
+    expect(node.body_lines).toEqual(["actor: cli", "? ?: (no message)"]);
+  });
+});
+
 describe("timelineFromAuditEntries — node shape", () => {
   it("carries seq as the id and the occurred_at ISO string verbatim", () => {
     // The id is the Svelte #each key. The occurred_at string lands

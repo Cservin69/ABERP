@@ -297,7 +297,13 @@ pub(crate) fn parse_nav_fault(xml: &[u8]) -> NavFault {
 /// (`validationResultCode`, `validationErrorCode`, `message`, `tag`).
 /// This prevents the sibling-block `<message>` (inside `<result>`) from
 /// polluting the per-validation `message` field.
-fn find_all_technical_validations(
+///
+/// PR-76 — promoted from `fn` to `pub fn` so the binary can re-use the
+/// parser on the `queryTransactionStatus` ack-status `response_xml`
+/// (NAV emits the same element shape there when `<invoiceStatus>` is
+/// `ABORTED`). One parser; the SPA timeline + the upstream-fault
+/// renderer both consume the same typed shape.
+pub fn find_all_technical_validations(
     xml: &[u8],
 ) -> Result<Vec<TechnicalValidation>, NavTransportError> {
     let mut reader = Reader::from_reader(xml);

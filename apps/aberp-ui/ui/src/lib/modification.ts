@@ -33,6 +33,7 @@ import type {
   ModificationInvoiceRequest,
 } from "./api";
 import {
+  composeCustomerAddress,
   emptyForm as emptyIssueForm,
   type IssueInvoiceFormState,
   type LineFormState,
@@ -90,6 +91,16 @@ export function formFromIssuanceInput(
   return {
     customerTaxNumber: input.customer.taxNumber,
     customerName: input.customer.name,
+    // PR-77 / session-101 — inherit the customer-address quartet from
+    // the base's side-stored issuance input. Bases issued pre-PR-77
+    // have `customer.address === undefined`; the form fields seed to
+    // empty strings and the preflight will fire
+    // `CustomerAddressMissing` on submit — recovery is to fill the
+    // address by hand or enrich the partner record first.
+    customerCountryCode: input.customer.address?.countryCode ?? "",
+    customerPostalCode: input.customer.address?.postalCode ?? "",
+    customerCity: input.customer.address?.city ?? "",
+    customerStreet: input.customer.address?.street ?? "",
     currency: baseCurrency,
     lines,
     modificationDate: todayIsoDate(),
@@ -110,10 +121,16 @@ export function formFromIssuanceInput(
 export function composeModificationBody(
   form: ModificationFormState,
 ): ModificationInvoiceRequest {
+  // PR-77 / session-101 — reuse `composeCustomerAddress` from
+  // `issue-invoice.ts` so the address compose discipline is identical
+  // across the issue and modification surfaces. The
+  // `ModificationFormState extends IssueInvoiceFormState` shape makes
+  // the call a direct delegation.
   return {
     customer: {
       taxNumber: form.customerTaxNumber.trim(),
       name: form.customerName.trim(),
+      address: composeCustomerAddress(form),
     },
     lines: form.lines.map((l) => ({
       description: l.description.trim(),

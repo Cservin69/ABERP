@@ -117,6 +117,62 @@ function readAckStatus(payload: unknown): string | null {
   return typeof ack === "string" ? ack : null;
 }
 
+/** PR-76 — one entry from the `technical_validation_messages` array
+ * the backend grafts onto an `InvoiceAckStatus` payload (see
+ * `apps/aberp/src/serve.rs::audit_view_of`). Field names match the
+ * NAV v3.0 OSA element names verbatim, snake-cased — same shape
+ * `TechnicalValidationBody` already uses for the upstream-fault
+ * wire surface (PR-59). All four fields are `Option<string>`
+ * because NAV occasionally omits `tag` or `result_code` for terse
+ * WARN-class entries. */
+interface TechnicalValidationMessage {
+  result_code: string | null;
+  error_code: string | null;
+  message: string | null;
+  tag: string | null;
+}
+
+/** PR-76 — read the `technical_validation_messages` array off an
+ * `InvoiceAckStatus` payload, narrowing defensively. The backend
+ * always grafts a (possibly empty) array onto the payload; a missing
+ * field, a non-array value, or a non-object element falls back to
+ * an empty list so the timeline simply omits the messages section
+ * rather than crashing. */
+function readTechnicalValidationMessages(
+  payload: unknown,
+): TechnicalValidationMessage[] {
+  if (typeof payload !== "object" || payload === null) return [];
+  const raw = (payload as { technical_validation_messages?: unknown })
+    .technical_validation_messages;
+  if (!Array.isArray(raw)) return [];
+  const out: TechnicalValidationMessage[] = [];
+  for (const m of raw) {
+    if (typeof m !== "object" || m === null) continue;
+    const r = m as Record<string, unknown>;
+    out.push({
+      result_code: typeof r.result_code === "string" ? r.result_code : null,
+      error_code: typeof r.error_code === "string" ? r.error_code : null,
+      message: typeof r.message === "string" ? r.message : null,
+      tag: typeof r.tag === "string" ? r.tag : null,
+    });
+  }
+  return out;
+}
+
+/** PR-76 — format one validation message as a single-line operator-
+ * facing body line. Shape: `"<ERROR|WARN> <ERROR_CODE>: <message>"`,
+ * with the message bilingual when NAV provides both (NAV-test
+ * currently returns English; HU output would round-trip the same
+ * way). Missing fields render as `?` rather than being silently
+ * dropped, so a wire-shape regression that omits one of them
+ * surfaces visibly per CLAUDE.md rule 12. */
+function formatValidationMessage(m: TechnicalValidationMessage): string {
+  const result = m.result_code ?? "?";
+  const code = m.error_code ?? "?";
+  const body = m.message ?? "(no message)";
+  return `${result} ${code}: ${body}`;
+}
+
 /** Map one audit entry to its `(glyph, kind_class, label)` tuple. */
 function classify(entry: AuditEntryView): KindMeta {
   switch (entry.kind) {
@@ -182,11 +238,23 @@ function classify(entry: AuditEntryView): KindMeta {
  * surfaced inline so the timeline preserves the chain context the
  * audit-row table renders as a clickable affordance; the
  * "Show raw table" toggle in `InvoiceDetail.svelte` keeps the
- * clickable navigation available for power users. */
+ * clickable navigation available for power users.
+ *
+ * PR-76 — for `InvoiceAckStatus` entries, every parsed
+ * `technicalValidationMessages` from the NAV ack body appears as a
+ * separate line below the actor. This is the "operator sees WHY
+ * without digging into logs" surface for ABORTED acks; on
+ * SAVED / PROCESSING / RECEIVED the backend's parsed list is empty
+ * and no extra lines render. */
 function bodyLines(entry: AuditEntryView): string[] {
   const lines = [`actor: ${entry.actor}`];
   if (entry.chain_base_invoice_id !== null) {
     lines.push(`→ Base: ${entry.chain_base_invoice_id}`);
+  }
+  if (entry.kind === "InvoiceAckStatus") {
+    for (const m of readTechnicalValidationMessages(entry.payload)) {
+      lines.push(formatValidationMessage(m));
+    }
   }
   return lines;
 }

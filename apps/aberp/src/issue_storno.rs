@@ -111,7 +111,9 @@ use crate::invoice_currency_metadata::{
     require_chain_currency_match,
 };
 use crate::issue_invoice::InvoiceInputJson;
-use crate::nav_xml::{self, CustomerInfo, NavParties, StornoReference, SupplierInfo};
+use crate::nav_xml::{
+    self, CustomerAddress, CustomerInfo, NavParties, StornoReference, SupplierInfo,
+};
 
 // ──────────────────────────────────────────────────────────────────────
 // Entry point
@@ -368,6 +370,20 @@ pub fn storno_from_inputs(
         customer: CustomerInfo {
             tax_number: input.customer.tax_number,
             name: input.customer.name,
+            // PR-77 / session-101 — inherit `customerAddress` from the
+            // base invoice's side-stored `input.json`. Base invoices
+            // issued pre-PR-77 will have `None` here and trip the
+            // validator's customerVatStatus-aware required-children rule
+            // at render time; that is the correct loud-fail posture (the
+            // storno cannot be filed if the base lacks the data NAV
+            // demands), and recovery is to update the base partner's
+            // address in Partners and re-stamp the side-store.
+            address: input.customer.address.map(|a| CustomerAddress {
+                country_code: a.country_code,
+                postal_code: a.postal_code,
+                city: a.city,
+                street: a.street,
+            }),
         },
     };
     let base_invoice_number = format!("{}/{:05}", series_code.as_str(), base_sequence_number);

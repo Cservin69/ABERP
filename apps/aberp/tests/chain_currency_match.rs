@@ -29,7 +29,8 @@
 //! consumes those helpers' outputs.
 
 use aberp::nav_xml::{
-    self, CustomerInfo, ModificationReference, NavParties, StornoReference, SupplierInfo,
+    self, CustomerAddress, CustomerInfo, ModificationReference, NavParties, StornoReference,
+    SupplierInfo,
 };
 use aberp_billing::{
     Currency, CustomerId, Huf, InvoiceId, LineItem, RateMetadata, ReadyInvoice, SeriesCode,
@@ -54,6 +55,14 @@ fn minimal_parties() -> NavParties {
         customer: CustomerInfo {
             tax_number: "87654321-1-42".to_string(),
             name: "Test Customer Zrt.".to_string(),
+            // PR-77 / session-101 — `customerAddress` required for any
+            // DOMESTIC customerVatStatus.
+            address: Some(CustomerAddress {
+                country_code: "HU".to_string(),
+                postal_code: "1052".to_string(),
+                city: "Budapest".to_string(),
+                street: "Váci utca 19.".to_string(),
+            }),
         },
     }
 }

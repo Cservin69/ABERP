@@ -17,6 +17,7 @@ import {
   emptyPartnerForm,
   filterPartners,
   formFromPartner,
+  hungarianCountryAliasToCode,
   parsePartnerValidationError,
 } from "./partners";
 
@@ -176,6 +177,74 @@ describe("buyerFieldsFromPartner", () => {
       "Budapesti Sport-Egyesület Kft.",
     );
     expect(fields.customerTaxNumber).toBe("12345678-1-42");
+  });
+
+  /** PR-77 / session-101 — the partner's address fields flow into the
+   * buyer-fields surface so the IssueInvoice / Modification form
+   * pre-populates NAV's required `<customerAddress>` block end-to-end.
+   * The Hungarian `Magyarország` alias on the partner record maps to
+   * the ISO `HU` code that NAV's `<common:countryCode>` slot expects. */
+  it("populates customer address quartet from the partner record (HU alias normalised)", () => {
+    const fields = buyerFieldsFromPartner(SAMPLE_PARTNER);
+    expect(fields.customerCountryCode).toBe("HU");
+    expect(fields.customerPostalCode).toBe("1011");
+    expect(fields.customerCity).toBe("Budapest");
+    expect(fields.customerStreet).toBe("Fő utca 1.");
+  });
+
+  /** PR-77 / session-101 — a partner with all-null address fields
+   * (the operator never filled them in) yields empty-string customer
+   * address fields; country still falls back to `HU` because the
+   * DOMESTIC customerVatStatus path is unconditional today. The
+   * preflight catches the empties as `CustomerAddressMissing` so the
+   * operator's fix is in Partners. */
+  it("falls back to empty strings (and HU country) for an unfilled partner address", () => {
+    const empty: Partner = {
+      ...SAMPLE_PARTNER,
+      address_street: null,
+      address_postal_code: null,
+      address_city: null,
+      address_country: null,
+    };
+    const fields = buyerFieldsFromPartner(empty);
+    expect(fields.customerCountryCode).toBe("HU");
+    expect(fields.customerPostalCode).toBe("");
+    expect(fields.customerCity).toBe("");
+    expect(fields.customerStreet).toBe("");
+  });
+});
+
+describe("hungarianCountryAliasToCode", () => {
+  /** PR-77 / session-101 — closed-vocab alias normalisation. The
+   * setup-wizard suggests `Magyarország`; partners imported from
+   * other tools may carry `Hungary` / `hu` / blank. All four cases
+   * map to `HU`. */
+  it.each([
+    ["Magyarország", "HU"],
+    ["magyarország", "HU"],
+    ["Magyarorszag", "HU"],
+    ["Hungary", "HU"],
+    ["hungary", "HU"],
+    ["HU", "HU"],
+    ["hu", "HU"],
+    ["", "HU"],
+  ])("normalises %s → %s", (input, expected) => {
+    expect(hungarianCountryAliasToCode(input)).toBe(expected);
+  });
+
+  it("treats null / undefined as `HU` (DOMESTIC fallback)", () => {
+    expect(hungarianCountryAliasToCode(null)).toBe("HU");
+    expect(hungarianCountryAliasToCode(undefined)).toBe("HU");
+  });
+
+  /** PR-77 / session-101 — non-Hungarian aliases fall back to `HU`
+   * because non-Hungarian buyer support is named-deferred. The fall-
+   * back preserves the DOMESTIC customerVatStatus assumption end-to-
+   * end; widening lands closed-vocab country + non-Hungarian buyer
+   * branch together. */
+  it("falls back to `HU` for non-Hungarian aliases (named-deferred branch)", () => {
+    expect(hungarianCountryAliasToCode("Deutschland")).toBe("HU");
+    expect(hungarianCountryAliasToCode("DE")).toBe("HU");
   });
 });
 

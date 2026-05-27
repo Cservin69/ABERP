@@ -141,6 +141,14 @@
       ...form,
       customerName: fields.customerName,
       customerTaxNumber: fields.customerTaxNumber,
+      // PR-77 / session-101 — auto-fill customer address from the
+      // partner record so the modification's `<customerAddress>` body
+      // satisfies NAV's `CUSTOMER_DATA_EXPECTED` business rule
+      // unconditionally.
+      customerCountryCode: fields.customerCountryCode,
+      customerPostalCode: fields.customerPostalCode,
+      customerCity: fields.customerCity,
+      customerStreet: fields.customerStreet,
     };
     buyerTypeahead = partner.display_name;
   }
@@ -269,6 +277,47 @@
           bind:value={form.customerTaxNumber}
           required
           placeholder="87654321-2-13"
+        />
+      </label>
+      <!-- PR-77 / session-101 — customer address quartet. Same NAV
+           `CUSTOMER_DATA_EXPECTED` rule applies to modifications;
+           inherits from base side-store when present, partner combobox
+           overrides when picked. -->
+      <label>
+        <span>Country code (ISO 3166-1)</span>
+        <input
+          type="text"
+          bind:value={form.customerCountryCode}
+          required
+          placeholder="HU"
+          maxlength="2"
+        />
+      </label>
+      <label>
+        <span>Postal code</span>
+        <input
+          type="text"
+          bind:value={form.customerPostalCode}
+          required
+          placeholder="1052"
+        />
+      </label>
+      <label>
+        <span>City</span>
+        <input
+          type="text"
+          bind:value={form.customerCity}
+          required
+          placeholder="Budapest"
+        />
+      </label>
+      <label>
+        <span>Street</span>
+        <input
+          type="text"
+          bind:value={form.customerStreet}
+          required
+          placeholder="Váci utca 19."
         />
       </label>
     </fieldset>

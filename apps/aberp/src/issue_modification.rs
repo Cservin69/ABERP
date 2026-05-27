@@ -82,7 +82,9 @@ use crate::invoice_currency_metadata::{
     require_chain_currency_match,
 };
 use crate::issue_invoice::InvoiceInputJson;
-use crate::nav_xml::{self, CustomerInfo, ModificationReference, NavParties, SupplierInfo};
+use crate::nav_xml::{
+    self, CustomerAddress, CustomerInfo, ModificationReference, NavParties, SupplierInfo,
+};
 
 // ──────────────────────────────────────────────────────────────────────
 // Entry point
@@ -336,6 +338,16 @@ pub fn modification_from_inputs(
         customer: CustomerInfo {
             tax_number: input.customer.tax_number,
             name: input.customer.name,
+            // PR-77 / session-101 — same `customerAddress` inheritance
+            // posture as the storno path; the modification's parties
+            // come from the operator-supplied (or reconstructed) base
+            // invoice content, which now carries the address shape.
+            address: input.customer.address.map(|a| CustomerAddress {
+                country_code: a.country_code,
+                postal_code: a.postal_code,
+                city: a.city,
+                street: a.street,
+            }),
         },
     };
     let base_invoice_number = format!("{}/{:05}", series_code.as_str(), base_sequence_number);

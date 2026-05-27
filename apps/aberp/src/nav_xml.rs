@@ -240,6 +240,32 @@ pub fn validate_supplier_info(supplier: &SupplierInfo) -> Result<(), SupplierCon
 pub struct CustomerInfo {
     pub tax_number: String,
     pub name: String,
+    /// PR-77 / session-101 — NAV v3.0 business-rule
+    /// `CUSTOMER_DATA_EXPECTED` requires `<customerAddress>` whenever
+    /// `<customerVatStatus>` is non-PRIVATE_PERSON. ABERP today emits
+    /// `customerVatStatus=DOMESTIC` unconditionally (Hungarian-business
+    /// posture; closed-vocab + private-person branch is named-deferred),
+    /// so the address is required at submit time but the schema allows
+    /// it to be absent — hence `Option<_>`. `None` paired with DOMESTIC
+    /// is caught by `aberp-nav-xsd-validator::walk_customer_info` BEFORE
+    /// the XML reaches NAV; the preflight (`issue_preflight::
+    /// CustomerAddressMissing`) catches it BEFORE the sequence is burned.
+    pub address: Option<CustomerAddress>,
+}
+
+/// PR-77 / session-101 — structured customer address mirroring
+/// `<customerAddress><common:simpleAddress>` per NAV v3.0 schema.
+/// Mirrors [`SupplierInfo`]'s address fields shape. `country_code` is
+/// ISO 3166-1 alpha-2 (`HU` for Hungarian DOMESTIC buyers — every
+/// path that wires this struct today). Closed-vocab country + the
+/// `Magyarország`-alias normalisation are named-deferred per the
+/// PR-77 handoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomerAddress {
+    pub country_code: String,
+    pub postal_code: String,
+    pub city: String,
+    pub street: String,
 }
 
 /// Storno chain-link reference data for [`render_storno_data`] (PR-10,
@@ -390,6 +416,15 @@ pub fn render_invoice_data(
         date.day(),
     );
     text_element(&mut w, "invoiceIssueDate", &issue_date)?;
+    // <completenessIndicator> — PR-76. NAV v3.0 InvoiceData XSD names this
+    // as a REQUIRED element positioned between `<invoiceIssueDate>` and
+    // `<invoiceMain>`. Always `false` for ABERP: the dual-purpose flag
+    // distinguishes "submitting data only — printed invoice is the
+    // primary record" (`true`) from "submitting both the data AND the
+    // invoice itself" (`false`); ABERP issues electronic invoices through
+    // NAV's data-submission API, so `false` is correct. Missing this
+    // element was the SCHEMA_VIOLATION NAV-test rejected invoice 17 with.
+    text_element(&mut w, "completenessIndicator", "false")?;
 
     // <invoiceMain>
     w.write_event(Event::Start(BytesStart::new("invoiceMain")))?;
@@ -497,6 +532,11 @@ pub fn render_storno_data(
         date.day(),
     );
     text_element(&mut w, "invoiceIssueDate", &issue_date)?;
+    // <completenessIndicator> — PR-76. NAV v3.0 schema-required element
+    // between `<invoiceIssueDate>` and `<invoiceMain>`; same posture as
+    // [`render_invoice_data`] (always `false` — ABERP data-submits, it
+    // does not assert the printed invoice replaces the data record).
+    text_element(&mut w, "completenessIndicator", "false")?;
 
     w.write_event(Event::Start(BytesStart::new("invoiceMain")))?;
     w.write_event(Event::Start(BytesStart::new("invoice")))?;
@@ -600,6 +640,10 @@ pub fn render_modification_data(
         date.day(),
     );
     text_element(&mut w, "invoiceIssueDate", &issue_date)?;
+    // <completenessIndicator> — PR-76. NAV v3.0 schema-required element
+    // between `<invoiceIssueDate>` and `<invoiceMain>`; same posture as
+    // [`render_invoice_data`] / [`render_storno_data`].
+    text_element(&mut w, "completenessIndicator", "false")?;
 
     w.write_event(Event::Start(BytesStart::new("invoiceMain")))?;
     w.write_event(Event::Start(BytesStart::new("invoice")))?;
@@ -827,7 +871,35 @@ fn write_customer(w: &mut Writer<&mut Vec<u8>>, c: &CustomerInfo) -> Result<()> 
     w.write_event(Event::End(BytesEnd::new("customerTaxNumber")))?;
     w.write_event(Event::End(BytesEnd::new("customerVatData")))?;
     text_element(w, "customerName", &c.name)?;
+    // PR-77 / session-101 — `<customerAddress>` per NAV v3.0 business-rule
+    // `CUSTOMER_DATA_EXPECTED`. Required whenever `customerVatStatus !=
+    // PRIVATE_PERSON`; today the emitter hardcodes DOMESTIC, so a `None`
+    // here is a programmer error caught by `walk_customer_info` at the
+    // ADR-0022 invariant check between render and disk write. Position
+    // is AFTER `<customerName>` per the v3.0 XSD CustomerInfoType
+    // ordering.
+    if let Some(address) = c.address.as_ref() {
+        write_customer_address(w, address)?;
+    }
     w.write_event(Event::End(BytesEnd::new("customerInfo")))?;
+    Ok(())
+}
+
+/// PR-77 / session-101 — emit `<customerAddress><common:simpleAddress>`.
+/// Mirrors [`write_address`] but takes a typed [`CustomerAddress`]
+/// rather than a [`SupplierInfo`] (the two structs do not share an
+/// address shape — supplier's address fields live flat on the struct
+/// per PR-50's pre-CustomerAddress posture; threading a shared trait
+/// here would be a CLAUDE.md rule 2 abstraction over two call sites).
+fn write_customer_address(w: &mut Writer<&mut Vec<u8>>, address: &CustomerAddress) -> Result<()> {
+    w.write_event(Event::Start(BytesStart::new("customerAddress")))?;
+    w.write_event(Event::Start(BytesStart::new("common:simpleAddress")))?;
+    common_element(w, "countryCode", &address.country_code)?;
+    common_element(w, "postalCode", &address.postal_code)?;
+    common_element(w, "city", &address.city)?;
+    common_element(w, "additionalAddressDetail", &address.street)?;
+    w.write_event(Event::End(BytesEnd::new("common:simpleAddress")))?;
+    w.write_event(Event::End(BytesEnd::new("customerAddress")))?;
     Ok(())
 }
 

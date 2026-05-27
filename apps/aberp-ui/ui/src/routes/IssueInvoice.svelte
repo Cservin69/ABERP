@@ -341,6 +341,16 @@
       ...form,
       customerName: fields.customerName,
       customerTaxNumber: fields.customerTaxNumber,
+      // PR-77 / session-101 — auto-fill the customer address quartet
+      // from the partner record so NAV's required `<customerAddress>`
+      // block is populated end-to-end. Partner records with an
+      // incomplete address surface inline at preflight (the per-field
+      // `customer.address` error) so the operator's fix is in
+      // Partners, not in the issuance form.
+      customerCountryCode: fields.customerCountryCode,
+      customerPostalCode: fields.customerPostalCode,
+      customerCity: fields.customerCity,
+      customerStreet: fields.customerStreet,
     };
     buyerDropdownOpen = false;
     buyerHighlight = -1;
@@ -648,6 +658,54 @@
             <span class="inline-error-en">{customerErrors.taxNumber.message_en}</span>
           </p>
         {/if}
+      </label>
+      <!-- PR-77 / session-101 — customer address quartet. NAV's
+           `CUSTOMER_DATA_EXPECTED` business rule requires the full
+           address for every Hungarian-business buyer; the partner
+           combobox pre-fills these fields, but they remain editable
+           so the operator can correct typos before submitting. The
+           preflight surfaces the per-field gap (or
+           `CustomerAddressMissing` for an all-blank quartet) inline. -->
+      <label>
+        <span>Country code (ISO 3166-1)</span>
+        <input
+          type="text"
+          bind:value={form.customerCountryCode}
+          required
+          placeholder="HU"
+          maxlength="2"
+          data-testid="customer-country-input"
+        />
+      </label>
+      <label>
+        <span>Postal code</span>
+        <input
+          type="text"
+          bind:value={form.customerPostalCode}
+          required
+          placeholder="1052"
+          data-testid="customer-postal-input"
+        />
+      </label>
+      <label>
+        <span>City</span>
+        <input
+          type="text"
+          bind:value={form.customerCity}
+          required
+          placeholder="Budapest"
+          data-testid="customer-city-input"
+        />
+      </label>
+      <label>
+        <span>Street</span>
+        <input
+          type="text"
+          bind:value={form.customerStreet}
+          required
+          placeholder="Váci utca 19."
+          data-testid="customer-street-input"
+        />
       </label>
     </fieldset>
 
