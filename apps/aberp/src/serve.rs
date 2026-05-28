@@ -91,10 +91,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
-use crate::audit_payloads::{self, PaymentMethod};
+use crate::audit_payloads::{self, InvoiceEmailedSentPayload, PaymentMethod};
 use crate::audit_query::PaymentRecord;
 use crate::binary_hash::BinaryHashHandle;
 use crate::cli::ServeArgs;
+use crate::email_invoice::{self, EmailSendError, SendInvoiceEmailInput, SendTrigger};
 use crate::invoice_bank_snapshot::load_invoice_bank_snapshot_in_tx;
 use crate::invoice_currency_metadata::{
     load_invoice_currency_metadata_in_tx, InvoiceCurrencyMetadata,
@@ -108,14 +109,21 @@ use crate::issue_storno;
 use crate::mark_invoice_paid::{self, MarkPaidError, MarkPaidInput};
 use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
 use crate::nav_xml::{self, SupplierConfigError, SupplierInfo};
+use crate::numbering::{
+    self as numbering_mod, NumberingError, NumberingTemplate, ResetPolicy as NumberingResetPolicy,
+    Segment as NumberingSegment, YearDigits,
+};
 use crate::partners::{self, Partner, PartnerInputs, ValidationError as PartnerValidationError};
 use crate::poll_ack;
 use crate::print_invoice;
+use crate::products::{self, Product, ProductInputs, ValidationError as ProductValidationError};
 use crate::seller_banks::{self, SellerBankEntry, SellerBanks, SellerBanksError};
 use crate::setup_nav_credentials::{self, NavCredentialInputs, SetupCredentialsError};
 use crate::setup_seller_info::{
     self, FieldError as SellerFieldError, SellerIdentity, SellerInfoInputs, SetupSellerInfoError,
 };
+use crate::smtp_config::{self as smtp_config_mod, SmtpConfig, SmtpSecurity};
+use crate::smtp_credentials;
 use crate::submit_invoice;
 use async_trait::async_trait;
 
@@ -299,6 +307,21 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         billing_store
             .ensure_schema()
             .context("ensure billing schema at serve boot")?;
+    }
+
+    // PR-91 — pin the products table schema at boot for the same
+    // read-only-cold-start reason as the partners + billing tables
+    // (PR-73a). Idempotent CREATE TABLE IF NOT EXISTS so re-runs on
+    // already-migrated DBs cost nothing.
+    {
+        let _s = tracing::info_span!("serve.ensure_products_schema").entered();
+        let conn = Connection::open(&args.db).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for products boot migration",
+                args.db.display()
+            )
+        })?;
+        products::ensure_schema(&conn).context("ensure products schema at serve boot")?;
     }
 
     // 2. Resolve / generate the loopback cert + key.
@@ -849,6 +872,21 @@ fn build_router(state: AppState) -> Router {
                 .put(handle_update_partner)
                 .delete(handle_delete_partner),
         )
+        // PR-91 — products master-data CRUD. Five routes (list + create
+        // on the collection; get + update + delete on the resource), all
+        // require_ready + bearer auth — products is a Ready-state
+        // feature, not a first-run-setup surface. Mirrors the partners
+        // route shape.
+        .route(
+            "/api/products",
+            get(handle_list_products).post(handle_create_product),
+        )
+        .route(
+            "/api/products/:id",
+            get(handle_get_product)
+                .put(handle_update_product)
+                .delete(handle_delete_product),
+        )
         // PR-72 / session-94 — multi-bank-account CRUD (PR-B of the
         // multi-bank initiative; ADR-0040 §addendum). Five routes
         // (list + create on the collection; update + delete + flip-
@@ -868,6 +906,37 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/seller/banks/:id/set-default",
             post(handle_set_default_seller_bank),
+        )
+        // PR-89 — operator-configurable invoice-number template
+        // (`[seller.numbering]` section of seller.toml). GET returns
+        // the persisted template (or the default INV-default/00001
+        // shape when absent); PUT replaces it atomically, preserving
+        // every other section of seller.toml (identity + banks).
+        .route(
+            "/api/seller/numbering",
+            get(handle_get_seller_numbering).put(handle_put_seller_numbering),
+        )
+        // PR-92 / ADR-0047 — SMTP email delivery surfaces. GET returns
+        // the `[seller.smtp]` config (non-secrets only) + a `password_set`
+        // probe of the keychain. PUT writes the config (merge-not-replace
+        // on seller.toml + optional password rotation to keychain).
+        // POST /api/invoices/:id/email is the operator-clicked manual
+        // send button on InvoiceDetail. All three require_ready + bearer
+        // auth.
+        .route(
+            "/api/smtp-config",
+            get(handle_get_smtp_config).put(handle_put_smtp_config),
+        )
+        // PR-98 — operator-clicked "Test connection" button on the
+        // TenantSettings SMTP subsection. Runs the TLS handshake +
+        // AUTH + NOOP using the operator-typed config + (entered
+        // password OR existing keychain entry); reports the typed
+        // outcome WITHOUT sending mail and WITHOUT persisting
+        // anything.
+        .route("/api/seller/smtp/test", post(handle_test_smtp_connection))
+        .route(
+            "/api/invoices/:id/email",
+            post(handle_email_invoice_to_buyer),
         )
         .with_state(state)
 }
@@ -2410,6 +2479,17 @@ pub struct IssueInvoiceRequest {
     /// out-of-range override.
     #[serde(default, rename = "deliveryDateOverride")]
     pub delivery_date_override: Option<String>,
+    /// PR-92 / ADR-0047 — operator's per-invoice opt-out of the
+    /// default-on auto-send-to-buyer. The SPA's IssueInvoice form
+    /// renders a checkbox defaulted to `true`; the operator can flip
+    /// it OFF before submitting to suppress the auto-send. Optional on
+    /// the wire so pre-PR-92 callers (CLI / integration tests) still
+    /// type-check; absent → defaults to `true` server-side at the
+    /// `emailBuyerOnIssue.unwrap_or(true)` seam in
+    /// `handle_issue_invoice`. The wire token is camelCase to match
+    /// every other SPA-typed field in this struct.
+    #[serde(default, rename = "emailBuyerOnIssue")]
+    pub email_buyer_on_issue: Option<bool>,
 }
 
 /// Response body for `POST /invoices/issue`. The SPA reads
@@ -2423,6 +2503,41 @@ struct IssueInvoiceResponse {
     invoice_id: String,
     invoice_number: String,
     state: InvoiceState,
+    /// PR-92 — outcome of the default-on post-issue auto-send.
+    /// `Some(_)` when the operator left the toggle on AND the
+    /// auto-send was attempted (success or failure both populate);
+    /// `None` when the operator turned the toggle off (no send was
+    /// attempted). The SPA surfaces this inline on the issue success
+    /// flash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<EmailRouteOutcomeBody>,
+}
+
+/// PR-92 — wire shape for the per-invoice email send outcome.
+/// Mirrors the [`InvoiceEmailedSentPayload`] shape that lands in the
+/// audit ledger (`outcome` + `error_class` + `error_detail`) without
+/// the operator-decision idempotency_key (not interesting to the
+/// SPA). Returned by both the auto-send-after-issue route and the
+/// manual `POST /api/invoices/:id/email` route so the SPA renders
+/// the two paths with one component.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailRouteOutcomeBody {
+    /// `"succeeded"` | `"failed"` — closed vocab; deserialise via the
+    /// SPA's string-union mirror.
+    pub outcome: String,
+    /// Recipient address actually used (or attempted). Operator-visible.
+    pub recipient: String,
+    /// Closed-vocab error class on failure; `None` on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    /// Operator-readable detail on failure; `None` on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
+    /// `true` when the auto-send-after-issue path fired; `false` for
+    /// the manual send button.
+    pub auto: bool,
+    /// `true` iff the NAV XML rode alongside the PDF.
+    pub attached_xml: bool,
 }
 
 /// `400 Bad Request` body emitted for validation failures (empty
@@ -2838,6 +2953,15 @@ async fn handle_issue_invoice(
 
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
 
+    // PR-92 — capture the operator's email-buyer toggle BEFORE the
+    // request moves into `issue_invoice_request`. Defaults to `true`
+    // (default-on) per ADR-0047 §2 — silence-by-omission is the wrong
+    // default for a buyer-comms product.
+    let email_buyer_flag = request.email_buyer_on_issue.unwrap_or(true);
+    // Snapshot the customer's tax number for the post-issue lookup —
+    // `request` is consumed by `issue_invoice_request`.
+    let customer_tax_number_for_email = request.customer.tax_number.clone();
+
     match issue_invoice_request(
         &state,
         request,
@@ -2848,14 +2972,62 @@ async fn handle_issue_invoice(
     )
     .await
     {
-        Ok(summary) => Json(IssueInvoiceResponse {
-            invoice_id: summary.invoice_id,
-            invoice_number: summary.invoice_number,
-            state: InvoiceState::Ready,
-        })
-        .into_response(),
+        Ok(summary) => {
+            // PR-92 — default-on auto-send fires HERE. The send is
+            // best-effort with respect to the issue response: the
+            // invoice is already issued + persisted + the NAV XML is
+            // on disk; failing the response on an SMTP failure would
+            // confuse the operator into thinking the invoice wasn't
+            // created. We record the audit-ledger entry regardless
+            // (success OR failure) so the operator-twin record never
+            // has gaps, then return the invoice response WITH the
+            // email outcome for the SPA to surface.
+            let mut email_outcome: Option<EmailRouteOutcomeBody> = None;
+            if email_buyer_flag {
+                email_outcome = Some(
+                    auto_send_after_issue(
+                        &state,
+                        &summary.invoice_id,
+                        &summary.invoice_number,
+                        &customer_tax_number_for_email,
+                        &operator_login,
+                    )
+                    .await,
+                );
+            }
+            Json(IssueInvoiceResponse {
+                invoice_id: summary.invoice_id,
+                invoice_number: summary.invoice_number,
+                state: InvoiceState::Ready,
+                email: email_outcome,
+            })
+            .into_response()
+        }
         Err(e) => internal_error("issue_invoice_request", e),
     }
+}
+
+/// PR-92 — render the email send for the post-issue auto-send path.
+/// Always writes an audit-ledger `InvoiceEmailedSent` entry (success
+/// OR failure) so the operator-twin record never has gaps. Returns
+/// an [`EmailRouteOutcomeBody`] body the SPA can surface inline on
+/// the success flash.
+async fn auto_send_after_issue(
+    state: &AppState,
+    invoice_id: &str,
+    invoice_number: &str,
+    customer_tax_number: &str,
+    operator_login: &str,
+) -> EmailRouteOutcomeBody {
+    send_invoice_email_route(
+        state,
+        invoice_id,
+        invoice_number,
+        customer_tax_number,
+        operator_login,
+        SendTrigger::AutoOnIssue,
+    )
+    .await
 }
 
 /// PR-44ζ / session-59 — input validation that maps to `400 Bad
@@ -4856,6 +5028,244 @@ pub fn delete_partner_request(
     }
 }
 
+// ── PR-91 — products master-data routes ──────────────────────────────
+//
+// Five routes (list + create on the collection; get + update + delete
+// on the resource) over the per-tenant DuckDB `products` table.
+// `aberp::products` owns the schema + the CRUD body; this section is
+// the HTTP boundary that maps validation / not-found / 5xx onto status
+// codes. Shape mirrors the partners routes by intent — the SPA's
+// inline-error renderer (A157) consumes the same validation envelope.
+
+/// PR-91 — typed error for the product route helpers. Mirrors
+/// [`PartnerRouteError`].
+#[derive(Debug)]
+pub enum ProductRouteError {
+    Validation(Vec<ProductValidationError>),
+    NotFound,
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for ProductRouteError {
+    fn from(e: anyhow::Error) -> Self {
+        ProductRouteError::Other(e)
+    }
+}
+
+/// PR-91 — query-string carrier for `GET /api/products?search=<needle>`.
+#[derive(Debug, Deserialize)]
+pub struct ListProductsQuery {
+    #[serde(default)]
+    pub search: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ProductValidationBody {
+    error: &'static str,
+    fields: Vec<ProductValidationError>,
+}
+
+fn product_validation_response(errors: Vec<ProductValidationError>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ProductValidationBody {
+            error: "validation_failed",
+            fields: errors,
+        }),
+    )
+        .into_response()
+}
+
+fn product_not_found_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(error_body("product not found".to_string())),
+    )
+        .into_response()
+}
+
+// ── GET /api/products ────────────────────────────────────────────────
+
+async fn handle_list_products(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<ListProductsQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match list_products_request(&state, query.search.as_deref()) {
+        Ok(items) => Json(items).into_response(),
+        Err(ProductRouteError::Other(e)) => internal_error("list_products_request", e),
+        Err(ProductRouteError::Validation(_)) | Err(ProductRouteError::NotFound) => internal_error(
+            "list_products_request",
+            anyhow!("list_products_request surfaced unexpected Validation/NotFound"),
+        ),
+    }
+}
+
+pub fn list_products_request(
+    state: &AppState,
+    search: Option<&str>,
+) -> std::result::Result<Vec<Product>, ProductRouteError> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let items = products::list_products(&conn, state.tenant.as_str(), search)?;
+    Ok(items)
+}
+
+// ── GET /api/products/:id ────────────────────────────────────────────
+
+async fn handle_get_product(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match get_product_request(&state, &id) {
+        Ok(p) => Json(p).into_response(),
+        Err(ProductRouteError::NotFound) => product_not_found_response(),
+        Err(ProductRouteError::Other(e)) => internal_error("get_product_request", e),
+        Err(ProductRouteError::Validation(_)) => internal_error(
+            "get_product_request",
+            anyhow!("get_product_request surfaced unexpected Validation"),
+        ),
+    }
+}
+
+pub fn get_product_request(
+    state: &AppState,
+    id: &str,
+) -> std::result::Result<Product, ProductRouteError> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    match products::get_product(&conn, state.tenant.as_str(), id)? {
+        Some(p) => Ok(p),
+        None => Err(ProductRouteError::NotFound),
+    }
+}
+
+// ── POST /api/products ───────────────────────────────────────────────
+
+async fn handle_create_product(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<ProductInputs>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match create_product_request(&state, &inputs) {
+        Ok(p) => (StatusCode::CREATED, Json(p)).into_response(),
+        Err(ProductRouteError::Validation(errors)) => product_validation_response(errors),
+        Err(ProductRouteError::Other(e)) => internal_error("create_product_request", e),
+        Err(ProductRouteError::NotFound) => internal_error(
+            "create_product_request",
+            anyhow!("create_product_request surfaced unexpected NotFound"),
+        ),
+    }
+}
+
+pub fn create_product_request(
+    state: &AppState,
+    inputs: &ProductInputs,
+) -> std::result::Result<Product, ProductRouteError> {
+    if let Err(errors) = products::validate_product_inputs(inputs) {
+        return Err(ProductRouteError::Validation(errors));
+    }
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let p = products::create_product(&conn, state.tenant.as_str(), inputs)?;
+    Ok(p)
+}
+
+// ── PUT /api/products/:id ────────────────────────────────────────────
+
+async fn handle_update_product(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(inputs): Json<ProductInputs>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match update_product_request(&state, &id, &inputs) {
+        Ok(p) => Json(p).into_response(),
+        Err(ProductRouteError::Validation(errors)) => product_validation_response(errors),
+        Err(ProductRouteError::NotFound) => product_not_found_response(),
+        Err(ProductRouteError::Other(e)) => internal_error("update_product_request", e),
+    }
+}
+
+pub fn update_product_request(
+    state: &AppState,
+    id: &str,
+    inputs: &ProductInputs,
+) -> std::result::Result<Product, ProductRouteError> {
+    if let Err(errors) = products::validate_product_inputs(inputs) {
+        return Err(ProductRouteError::Validation(errors));
+    }
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    match products::update_product(&conn, state.tenant.as_str(), id, inputs)? {
+        Some(p) => Ok(p),
+        None => Err(ProductRouteError::NotFound),
+    }
+}
+
+// ── DELETE /api/products/:id ─────────────────────────────────────────
+
+async fn handle_delete_product(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match delete_product_request(&state, &id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(ProductRouteError::NotFound) => product_not_found_response(),
+        Err(ProductRouteError::Other(e)) => internal_error("delete_product_request", e),
+        Err(ProductRouteError::Validation(_)) => internal_error(
+            "delete_product_request",
+            anyhow!("delete_product_request surfaced unexpected Validation"),
+        ),
+    }
+}
+
+pub fn delete_product_request(
+    state: &AppState,
+    id: &str,
+) -> std::result::Result<(), ProductRouteError> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let deleted = products::soft_delete_product(&conn, state.tenant.as_str(), id)?;
+    if deleted {
+        Ok(())
+    } else {
+        Err(ProductRouteError::NotFound)
+    }
+}
+
 // ── PR-72 / session-94 — multi-bank-account routes ───────────────────
 //
 // Five routes (list + create on the collection; update + delete +
@@ -5460,6 +5870,954 @@ pub fn delete_seller_bank_request(
         }
         Ok(())
     })
+}
+
+// ── PR-89 — /api/seller/numbering routes ─────────────────────────────
+//
+// GET returns the operator-configurable invoice-number template
+// persisted in the `[seller.numbering]` section of seller.toml (falls
+// back to the default `INV-default/NNNNN` shape when absent). PUT
+// replaces it atomically. The wire shape mirrors `NumberingTemplate`'s
+// closed-vocab segment kinds 1:1 — JSON keys match the Rust enum
+// variants (`kind: "Literal" | "Year" | "Counter"`), `reset_policy` is
+// the closed-vocab token (`"never" | "on_year_change"`).
+
+/// Wire shape for one numbering-template segment. Tagged union with
+/// `kind` as the discriminant; the field set varies by kind. Closed-
+/// vocab — adding a new kind is a deliberate widening here + on
+/// [`NumberingSegment`] + in the SPA builder UI.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind")]
+pub enum SegmentWire {
+    Literal { text: String },
+    Year { digits: u8 },
+    Counter { pad_width: u8 },
+}
+
+impl SegmentWire {
+    fn into_domain(self) -> std::result::Result<NumberingSegment, NumberingError> {
+        Ok(match self {
+            SegmentWire::Literal { text } => NumberingSegment::Literal(text),
+            SegmentWire::Year { digits } => {
+                let yd = match digits {
+                    2 => YearDigits::Two,
+                    4 => YearDigits::Four,
+                    // Not a NumberingError variant — re-use the
+                    // InvalidLiteralCharacter shape would be wrong; fall
+                    // through to a typed-error from the validator by
+                    // constructing an invalid template would also be
+                    // wrong. The closed-vocab gate lives here.
+                    other => {
+                        tracing::warn!(digits = other, "rejected Year.digits outside (2, 4)");
+                        return Err(NumberingError::EmptyTemplate);
+                    }
+                };
+                NumberingSegment::Year { digits: yd }
+            }
+            SegmentWire::Counter { pad_width } => NumberingSegment::Counter { pad_width },
+        })
+    }
+
+    fn from_domain(seg: &NumberingSegment) -> Self {
+        match seg {
+            NumberingSegment::Literal(s) => SegmentWire::Literal { text: s.clone() },
+            NumberingSegment::Year { digits } => SegmentWire::Year {
+                digits: match digits {
+                    YearDigits::Two => 2,
+                    YearDigits::Four => 4,
+                },
+            },
+            NumberingSegment::Counter { pad_width } => SegmentWire::Counter {
+                pad_width: *pad_width,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NumberingTemplateWire {
+    segments: Vec<SegmentWire>,
+    /// `"never"` | `"on_year_change"` — closed vocab matching
+    /// [`NumberingResetPolicy`]. Any other value is rejected with a
+    /// typed `NumberingValidationError` on PUT.
+    reset_policy: String,
+    start_value: u64,
+}
+
+impl NumberingTemplateWire {
+    fn from_domain(t: &NumberingTemplate) -> Self {
+        NumberingTemplateWire {
+            segments: t.segments.iter().map(SegmentWire::from_domain).collect(),
+            reset_policy: match t.reset_policy {
+                NumberingResetPolicy::Never => "never".to_string(),
+                NumberingResetPolicy::OnYearChange => "on_year_change".to_string(),
+            },
+            start_value: t.start_value,
+        }
+    }
+
+    fn into_domain(self) -> std::result::Result<NumberingTemplate, NumberingValidationError> {
+        let policy = match self.reset_policy.as_str() {
+            "never" => NumberingResetPolicy::Never,
+            "on_year_change" => NumberingResetPolicy::OnYearChange,
+            other => {
+                return Err(NumberingValidationError::BadResetPolicy {
+                    value: other.to_string(),
+                });
+            }
+        };
+        let mut segments = Vec::with_capacity(self.segments.len());
+        for (idx, seg) in self.segments.into_iter().enumerate() {
+            match seg {
+                SegmentWire::Year { digits } if digits != 2 && digits != 4 => {
+                    return Err(NumberingValidationError::BadYearDigits {
+                        segment_index: idx,
+                        value: digits,
+                    });
+                }
+                other => match other.into_domain() {
+                    Ok(s) => segments.push(s),
+                    Err(_) => {
+                        return Err(NumberingValidationError::BadYearDigits {
+                            segment_index: idx,
+                            value: 0,
+                        })
+                    }
+                },
+            }
+        }
+        Ok(NumberingTemplate {
+            segments,
+            reset_policy: policy,
+            start_value: self.start_value,
+        })
+    }
+}
+
+/// Route-side validation failures for the PUT /api/seller/numbering
+/// path. Wraps [`NumberingError`] plus the wire-level decode arms
+/// (bad reset-policy token, bad Year.digits) the domain validator
+/// can't surface because its inputs are already typed.
+#[derive(Debug)]
+pub enum NumberingValidationError {
+    /// `reset_policy` is not in (`"never"`, `"on_year_change"`).
+    BadResetPolicy { value: String },
+    /// `Year.digits` is not in (2, 4).
+    BadYearDigits { segment_index: usize, value: u8 },
+    /// Domain-level validate-time failure.
+    Domain(NumberingError),
+}
+
+impl NumberingValidationError {
+    fn operator_message(&self) -> String {
+        match self {
+            Self::BadResetPolicy { value } => format!(
+                "`reset_policy = \"{value}\"` nincs a zárt vokabuláriumban. \
+                 Engedélyezett: `never`, `on_year_change`.\n\
+                 `reset_policy = \"{value}\"` is not in the closed vocab. \
+                 Allowed: `never`, `on_year_change`."
+            ),
+            Self::BadYearDigits {
+                segment_index,
+                value,
+            } => format!(
+                "A(z) {idx}. Year szegmens `digits = {value}` értéke nem engedélyezett. \
+                 Engedélyezett: 2 vagy 4.\n\
+                 Year segment #{idx} has `digits = {value}`. Allowed: 2 or 4.",
+                idx = segment_index + 1,
+            ),
+            Self::Domain(e) => e.operator_message(),
+        }
+    }
+}
+
+async fn handle_get_seller_numbering(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match get_seller_numbering_request(&state, None) {
+        Ok(template) => Json(NumberingTemplateWire::from_domain(&template)).into_response(),
+        Err(e) => internal_error("get_seller_numbering_request", e),
+    }
+}
+
+/// PR-89 — library helper for the GET route. `pub` so the integration
+/// tests can hit it without spinning the HTTPS listener (mirror of
+/// `list_seller_banks_request`'s posture).
+pub fn get_seller_numbering_request(
+    state: &AppState,
+    path_override: Option<&Path>,
+) -> Result<NumberingTemplate, anyhow::Error> {
+    let owned_path;
+    let path: &Path = match path_override {
+        Some(p) => p,
+        None => {
+            owned_path = setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str())
+                .context("resolve seller.toml path for /api/seller/numbering")?;
+            owned_path.as_path()
+        }
+    };
+    numbering_mod::read_numbering_template(path)
+}
+
+async fn handle_put_seller_numbering(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(wire): Json<NumberingTemplateWire>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match put_seller_numbering_request(&state, wire, None) {
+        Ok(template) => Json(NumberingTemplateWire::from_domain(&template)).into_response(),
+        Err(NumberingPutError::Validation(e)) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, e.operator_message()).into_response()
+        }
+        Err(NumberingPutError::Other(e)) => internal_error("put_seller_numbering_request", e),
+    }
+}
+
+/// Route-level error wrapper distinguishing operator-facing validation
+/// failure (HTTP 422) from internal IO/anyhow failures (HTTP 500).
+#[derive(Debug)]
+pub enum NumberingPutError {
+    Validation(NumberingValidationError),
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for NumberingPutError {
+    fn from(e: anyhow::Error) -> Self {
+        NumberingPutError::Other(e)
+    }
+}
+
+/// PR-89 — library helper for the PUT route. Validates the wire body,
+/// runs the domain validator, and atomically writes the new
+/// `[seller.numbering]` section (preserving identity + bank sections
+/// per [`numbering_mod::write_numbering_section`]). Returns the
+/// validated template on success.
+pub fn put_seller_numbering_request(
+    state: &AppState,
+    wire: NumberingTemplateWire,
+    path_override: Option<&Path>,
+) -> std::result::Result<NumberingTemplate, NumberingPutError> {
+    let template = wire.into_domain().map_err(NumberingPutError::Validation)?;
+    numbering_mod::validate_template(&template)
+        .map_err(|e| NumberingPutError::Validation(NumberingValidationError::Domain(e)))?;
+    let owned_path;
+    let path: &Path = match path_override {
+        Some(p) => p,
+        None => {
+            owned_path = setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str())
+                .context("resolve seller.toml path for /api/seller/numbering PUT")?;
+            owned_path.as_path()
+        }
+    };
+    numbering_mod::write_numbering_section(path, &template)
+        .context("write [seller.numbering] section")?;
+    Ok(template)
+}
+
+// ── PR-92 / ADR-0047 — SMTP email delivery routes ────────────────────
+//
+// Three surfaces:
+//   - GET /api/smtp-config — returns the `[seller.smtp]` config
+//     (non-secrets only) + a `password_set` bool probing the keychain.
+//   - PUT /api/smtp-config — atomically writes the config + (optionally)
+//     rotates the password in the keychain. Validates the wire body
+//     against `SmtpConfig::validate` (header-injection guard,
+//     closed-vocab `security`).
+//   - POST /api/invoices/:id/email — the operator-clicked manual send
+//     button. Looks up the buyer by tax-number → contact_email,
+//     renders + sends, writes the audit-ledger entry.
+//
+// The auto-send-after-issue path lives in `handle_issue_invoice` and
+// calls `send_invoice_email_route` directly so the issue response can
+// echo the send outcome inline.
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SmtpConfigPutWire {
+    pub host: String,
+    pub port: u16,
+    #[serde(rename = "fromAddress")]
+    pub from_address: String,
+    #[serde(default, rename = "fromDisplayName")]
+    pub from_display_name: Option<String>,
+    pub username: String,
+    /// Closed-vocab token: `"StartTls"` | `"Tls"`. Plaintext is NOT
+    /// in the vocab — ADR-0047 §1.
+    pub security: String,
+    /// `true` to ride the NAV XML as a second attachment.
+    #[serde(default, rename = "attachXml")]
+    pub attach_xml: bool,
+    /// Optional new password. `Some(_)` → write to keychain; `None` →
+    /// leave the existing keychain entry untouched (so the operator
+    /// can edit the host without re-typing the password).
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SmtpConfigGetResponse {
+    host: String,
+    port: u16,
+    #[serde(rename = "fromAddress")]
+    from_address: String,
+    #[serde(rename = "fromDisplayName", skip_serializing_if = "Option::is_none")]
+    from_display_name: Option<String>,
+    username: String,
+    security: String,
+    #[serde(rename = "attachXml")]
+    attach_xml: bool,
+    /// `true` iff the keychain has a password populated for this
+    /// tenant. Surfaced so the SPA can render a "password is set"
+    /// indicator without ever transmitting the password back. NEVER
+    /// becomes the password itself.
+    #[serde(rename = "passwordSet")]
+    password_set: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SmtpConfigGetEmpty {
+    configured: bool,
+    #[serde(rename = "passwordSet")]
+    password_set: bool,
+}
+
+async fn handle_get_smtp_config(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match get_smtp_config_request(&state) {
+        Ok(Some(cfg)) => {
+            let password_set =
+                smtp_credentials::password_is_set(state.tenant.as_str()).unwrap_or(false);
+            Json(SmtpConfigGetResponse {
+                host: cfg.host,
+                port: cfg.port,
+                from_address: cfg.from_address,
+                from_display_name: cfg.from_display_name,
+                username: cfg.username,
+                security: cfg.security.as_token().to_string(),
+                attach_xml: cfg.attach_xml,
+                password_set,
+            })
+            .into_response()
+        }
+        Ok(None) => {
+            let password_set =
+                smtp_credentials::password_is_set(state.tenant.as_str()).unwrap_or(false);
+            Json(SmtpConfigGetEmpty {
+                configured: false,
+                password_set,
+            })
+            .into_response()
+        }
+        Err(e) => internal_error("get_smtp_config_request", e),
+    }
+}
+
+/// PR-92 — library helper for the GET route. Returns `Ok(None)` when
+/// the `[seller.smtp]` section is absent (operator has not configured
+/// SMTP yet). `pub` so integration tests can hit it without spinning
+/// the HTTPS listener.
+pub fn get_smtp_config_request(state: &AppState) -> Result<Option<SmtpConfig>> {
+    let path = setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str())
+        .context("resolve seller.toml path for /api/smtp-config GET")?;
+    smtp_config_mod::read_smtp_config(&path)
+}
+
+#[derive(Debug)]
+pub enum SmtpConfigPutError {
+    Validation(Vec<smtp_config_mod::SmtpConfigValidationError>),
+    BadSecurityToken(String),
+    KeychainBackend(String),
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for SmtpConfigPutError {
+    fn from(e: anyhow::Error) -> Self {
+        SmtpConfigPutError::Other(e)
+    }
+}
+
+async fn handle_put_smtp_config(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(wire): Json<SmtpConfigPutWire>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match put_smtp_config_request(&state, wire) {
+        Ok(cfg) => {
+            let password_set =
+                smtp_credentials::password_is_set(state.tenant.as_str()).unwrap_or(false);
+            Json(SmtpConfigGetResponse {
+                host: cfg.host,
+                port: cfg.port,
+                from_address: cfg.from_address,
+                from_display_name: cfg.from_display_name,
+                username: cfg.username,
+                security: cfg.security.as_token().to_string(),
+                attach_xml: cfg.attach_xml,
+                password_set,
+            })
+            .into_response()
+        }
+        Err(SmtpConfigPutError::Validation(errs)) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(errs)).into_response()
+        }
+        Err(SmtpConfigPutError::BadSecurityToken(msg)) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response()
+        }
+        Err(SmtpConfigPutError::KeychainBackend(msg)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+        }
+        Err(SmtpConfigPutError::Other(e)) => internal_error("put_smtp_config_request", e),
+    }
+}
+
+/// PR-92 — library helper for the PUT route. Validates the wire body,
+/// writes the `[seller.smtp]` section (merge-not-replace), AND
+/// optionally rotates the password in the keychain.
+pub fn put_smtp_config_request(
+    state: &AppState,
+    wire: SmtpConfigPutWire,
+) -> std::result::Result<SmtpConfig, SmtpConfigPutError> {
+    let security =
+        SmtpSecurity::from_token(&wire.security).map_err(SmtpConfigPutError::BadSecurityToken)?;
+    let cfg = SmtpConfig {
+        host: wire.host,
+        port: wire.port,
+        from_address: wire.from_address,
+        from_display_name: wire.from_display_name,
+        username: wire.username,
+        security,
+        attach_xml: wire.attach_xml,
+    };
+    cfg.validate().map_err(SmtpConfigPutError::Validation)?;
+    let path = setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str())
+        .context("resolve seller.toml path for /api/smtp-config PUT")?;
+    smtp_config_mod::write_smtp_section(&path, &cfg).context("write [seller.smtp] section")?;
+    if let Some(password) = wire.password {
+        if !password.is_empty() {
+            smtp_credentials::write_password(state.tenant.as_str(), &password).map_err(|e| {
+                SmtpConfigPutError::KeychainBackend(format!(
+                    "rotate SMTP password in keychain: {e}"
+                ))
+            })?;
+        }
+    }
+    Ok(cfg)
+}
+
+// ── POST /api/seller/smtp/test — PR-98 ──────────────────────────────
+//
+// Operator-clicked "Test connection" button on TenantSettings →
+// SMTP subsection. Runs the TLS handshake + AUTH + NOOP using the
+// operator-typed config + (entered password OR existing keychain
+// entry). Reports the typed outcome WITHOUT sending mail and WITHOUT
+// persisting anything.
+
+#[derive(Debug, serde::Serialize)]
+struct SmtpTestOutcome {
+    /// `"succeeded"` | `"failed"` — closed vocab mirroring
+    /// [`EmailRouteOutcomeBody`].
+    outcome: &'static str,
+    /// `null` on success; closed-vocab class on failure (same
+    /// taxonomy as `EmailRouteOutcomeBody::error_class`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_class: Option<&'static str>,
+    /// Operator-readable detail. Scrubbed of secrets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_detail: Option<String>,
+}
+
+async fn handle_test_smtp_connection(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(wire): Json<SmtpConfigPutWire>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    // Build the typed config off the wire body — same path the PUT
+    // handler uses minus the persistence. Bad security token surfaces
+    // a 422; validation errors surface a 422 with the typed body.
+    let security = match smtp_config_mod::SmtpSecurity::from_token(&wire.security) {
+        Ok(s) => s,
+        Err(msg) => {
+            return (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response();
+        }
+    };
+    let cfg = smtp_config_mod::SmtpConfig {
+        host: wire.host,
+        port: wire.port,
+        from_address: wire.from_address,
+        from_display_name: wire.from_display_name,
+        username: wire.username,
+        security,
+        attach_xml: wire.attach_xml,
+    };
+    if let Err(errs) = cfg.validate() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(errs)).into_response();
+    }
+    // Password: operator may have typed a new one (test that), or
+    // left blank (test the existing keychain entry — same posture as
+    // the PUT body's null-leaves-untouched semantics).
+    let password: zeroize::Zeroizing<String> = match wire.password.as_deref() {
+        Some(p) if !p.is_empty() => zeroize::Zeroizing::new(p.to_string()),
+        _ => match smtp_credentials::read_password(state.tenant.as_str()) {
+            Ok(p) => p,
+            Err(smtp_credentials::SmtpCredentialsError::Missing { .. }) => {
+                let body = SmtpTestOutcome {
+                    outcome: "failed",
+                    error_class: Some("auth"),
+                    error_detail: Some(
+                        "no password entered AND no existing keychain password set".to_string(),
+                    ),
+                };
+                return (StatusCode::OK, Json(body)).into_response();
+            }
+            Err(other) => {
+                let body = SmtpTestOutcome {
+                    outcome: "failed",
+                    error_class: Some("other"),
+                    error_detail: Some(format!("read keychain password: {other}")),
+                };
+                return (StatusCode::OK, Json(body)).into_response();
+            }
+        },
+    };
+    match email_invoice::test_smtp_connection(&cfg, &password).await {
+        Ok(()) => Json(SmtpTestOutcome {
+            outcome: "succeeded",
+            error_class: None,
+            error_detail: None,
+        })
+        .into_response(),
+        Err(e) => {
+            let body = SmtpTestOutcome {
+                outcome: "failed",
+                error_class: Some(e.error_class()),
+                error_detail: Some(e.scrubbed_detail()),
+            };
+            (StatusCode::OK, Json(body)).into_response()
+        }
+    }
+}
+
+/// PR-92 — POST /api/invoices/:id/email handler. Operator-clicked
+/// manual send button on InvoiceDetail. Always-writes an audit-ledger
+/// entry (success OR failure) so the operator-twin record never has
+/// gaps.
+async fn handle_email_invoice_to_buyer(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(invoice_id): AxumPath<String>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    // Resolve the customer tax_number by reading the side-stored
+    // input.json (PR-47α) — that's the operator-typed source of
+    // truth, distinct from the partner table (which may have been
+    // edited post-issuance). The send path looks up the partner by
+    // tax_number to get the current contact_email.
+    let customer_tax_number = match resolve_customer_tax_number(&state, &invoice_id) {
+        Ok(tn) => tn,
+        Err(e) => {
+            tracing::warn!(invoice_id = %invoice_id, error = %e, "resolve customer tax_number for email");
+            return (
+                StatusCode::NOT_FOUND,
+                Json(error_body(format!(
+                    "invoice {invoice_id} not found or has no side-stored input.json: {e:#}"
+                ))),
+            )
+                .into_response();
+        }
+    };
+    // Look up the invoice's number for the subject + filename. We
+    // could re-derive but easier to render the PDF (it gives us the
+    // number for free); the send path renders the PDF anyway.
+    let invoice_number = match get_invoice_pdf(&state, &invoice_id, None) {
+        Ok(Some(rendered)) => rendered.invoice_number,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(error_body(format!(
+                    "invoice {invoice_id} not found in audit ledger"
+                ))),
+            )
+                .into_response();
+        }
+        Err(e) => return internal_error("get_invoice_pdf for email", e),
+    };
+    let body = send_invoice_email_route(
+        &state,
+        &invoice_id,
+        &invoice_number,
+        &customer_tax_number,
+        &operator_login,
+        SendTrigger::Manual,
+    )
+    .await;
+    let status = if body.outcome == "succeeded" {
+        StatusCode::OK
+    } else {
+        match body.error_class.as_deref() {
+            Some("recipient_rejected") => StatusCode::BAD_REQUEST,
+            Some("auth") | Some("compose") => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::BAD_GATEWAY,
+        }
+    };
+    (status, Json(body)).into_response()
+}
+
+/// PR-92 — shared send-and-audit path. Used by both the
+/// auto-send-after-issue branch in `handle_issue_invoice` AND the
+/// manual `POST /api/invoices/:id/email` handler. Always writes the
+/// audit-ledger `InvoiceEmailedSent` entry (success OR failure) so
+/// the operator-twin record never has gaps.
+pub async fn send_invoice_email_route(
+    state: &AppState,
+    invoice_id: &str,
+    invoice_number: &str,
+    customer_tax_number: &str,
+    operator_login: &str,
+    trigger: SendTrigger,
+) -> EmailRouteOutcomeBody {
+    // Resolve the buyer's contact email from the partners table.
+    let recipient_lookup =
+        resolve_recipient_email(state, customer_tax_number).unwrap_or_else(|e| {
+            tracing::warn!(invoice_id = %invoice_id, error = %e, "resolve_recipient_email");
+            None
+        });
+    let (recipient_email, recipient_display_name) = match recipient_lookup {
+        Some((email, name)) if !email.trim().is_empty() => (email, name),
+        _ => {
+            // MissingRecipient — write audit entry, return the body.
+            return finalize_email_audit(
+                state,
+                invoice_id,
+                operator_login,
+                trigger,
+                Err(EmailSendError::MissingRecipient {
+                    invoice_id: invoice_id.to_string(),
+                }),
+                String::new(),
+                "(no recipient)".to_string(),
+                false,
+            );
+        }
+    };
+    // Resolve seller.toml path + supplier legal name for the body
+    // greeting.
+    let seller_toml_path =
+        match setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str()) {
+            Ok(p) => p,
+            Err(e) => {
+                return finalize_email_audit(
+                    state,
+                    invoice_id,
+                    operator_login,
+                    trigger,
+                    Err(EmailSendError::SmtpNotConfigured(format!("{e:#}"))),
+                    recipient_email,
+                    String::new(),
+                    false,
+                );
+            }
+        };
+    let supplier_legal_name = supplier_from_seller_toml(state.tenant.as_str())
+        .map(|s| s.name)
+        .unwrap_or_else(|_| "ABERP".to_string());
+    // Load SMTP config + keychain password.
+    let (cfg, password) =
+        match email_invoice::load_smtp_credentials(state.tenant.as_str(), &seller_toml_path) {
+            Ok(t) => t,
+            Err(e) => {
+                return finalize_email_audit(
+                    state,
+                    invoice_id,
+                    operator_login,
+                    trigger,
+                    Err(e),
+                    recipient_email,
+                    String::new(),
+                    false,
+                );
+            }
+        };
+    // Resolve XML attachment path iff attach_xml is on.
+    let xml_path_buf = if cfg.attach_xml {
+        resolve_invoice_xml_path(state, invoice_id).ok()
+    } else {
+        None
+    };
+    let input = SendInvoiceEmailInput {
+        invoice_id,
+        tenant: state.tenant.as_str(),
+        db_path: state.db_path.as_path(),
+        seller_toml_path: &seller_toml_path,
+        recipient_email: &recipient_email,
+        recipient_display_name: recipient_display_name.as_deref(),
+        invoice_number,
+        supplier_legal_name: &supplier_legal_name,
+        trigger,
+        xml_path_if_attached: xml_path_buf.as_deref(),
+    };
+    let send_result = email_invoice::send_invoice_email(input, &cfg, &password).await;
+    let (subject, attached_xml) = match &send_result {
+        Ok(o) => (o.subject.clone(), o.attached_xml),
+        Err(_) => (
+            format!("Számla / Invoice {invoice_number}"),
+            cfg.attach_xml && xml_path_buf.is_some(),
+        ),
+    };
+    finalize_email_audit(
+        state,
+        invoice_id,
+        operator_login,
+        trigger,
+        send_result.map(|_| ()),
+        recipient_email,
+        subject,
+        attached_xml,
+    )
+}
+
+fn finalize_email_audit(
+    state: &AppState,
+    invoice_id: &str,
+    operator_login: &str,
+    trigger: SendTrigger,
+    outcome: Result<(), EmailSendError>,
+    recipient: String,
+    subject: String,
+    attached_xml: bool,
+) -> EmailRouteOutcomeBody {
+    let idempotency_key = email_invoice::fresh_send_idempotency_key();
+    let binary_hash_bytes = match email_invoice::binary_hash_for_audit() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = ?e, "compute binary hash for email audit append");
+            // Still emit a body to the SPA even though the audit
+            // write failed — surfaces as a logged error.
+            return match outcome {
+                Ok(()) => EmailRouteOutcomeBody {
+                    outcome: "succeeded".to_string(),
+                    recipient,
+                    error_class: None,
+                    error_detail: Some(format!("(audit write failed: {e:#})")),
+                    auto: trigger.is_auto(),
+                    attached_xml,
+                },
+                Err(e) => EmailRouteOutcomeBody {
+                    outcome: "failed".to_string(),
+                    recipient,
+                    error_class: Some(e.error_class().to_string()),
+                    error_detail: Some(e.scrubbed_detail()),
+                    auto: trigger.is_auto(),
+                    attached_xml,
+                },
+            };
+        }
+    };
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    let (payload, body) = match outcome {
+        Ok(()) => {
+            let payload = InvoiceEmailedSentPayload::succeeded(
+                invoice_id,
+                idempotency_key,
+                &recipient,
+                &subject,
+                trigger.is_auto(),
+                attached_xml,
+            );
+            let body = EmailRouteOutcomeBody {
+                outcome: "succeeded".to_string(),
+                recipient: recipient.clone(),
+                error_class: None,
+                error_detail: None,
+                auto: trigger.is_auto(),
+                attached_xml,
+            };
+            (payload, body)
+        }
+        Err(e) => {
+            let class = e.error_class().to_string();
+            let detail = e.scrubbed_detail();
+            let payload = InvoiceEmailedSentPayload::failed(
+                invoice_id,
+                idempotency_key,
+                &recipient,
+                &subject,
+                trigger.is_auto(),
+                attached_xml,
+                &class,
+                &detail,
+            );
+            let body = EmailRouteOutcomeBody {
+                outcome: "failed".to_string(),
+                recipient: recipient.clone(),
+                error_class: Some(class),
+                error_detail: Some(detail),
+                auto: trigger.is_auto(),
+                attached_xml,
+            };
+            (payload, body)
+        }
+    };
+    let mut body = body;
+    if let Err(e) = email_invoice::record_email_audit_entry(
+        state.db_path.as_path(),
+        state.tenant.clone(),
+        binary_hash_bytes,
+        actor,
+        invoice_id,
+        payload,
+    ) {
+        tracing::error!(
+            invoice_id = %invoice_id,
+            error = ?e,
+            "write InvoiceEmailedSent audit entry failed (the email outcome is still reported to the SPA)"
+        );
+        // PR-93 — surface the audit-write failure to the SPA's banner
+        // so the operator sees that the operator-twin record has a gap
+        // for THIS send. The body's `outcome` already reflects the
+        // SMTP result; we extend `error_detail` with an audit-write
+        // marker. (CLAUDE.md rule 12 — fail loud, not silent.)
+        let marker = format!("(audit-write failed: {e:#})");
+        body.error_detail = Some(match body.error_detail {
+            Some(prev) => format!("{prev} {marker}"),
+            None => marker,
+        });
+    }
+    body
+}
+
+/// Resolve the buyer's contact email by reading the side-stored
+/// input.json (PR-47α) for the invoice's tax number, then looking up
+/// the partner record. Returns `Ok(Some((email, display_name)))` on
+/// hit, `Ok(None)` when no partner matches or the partner has no
+/// email. `Err` for I/O / parse failures.
+fn resolve_recipient_email(
+    state: &AppState,
+    customer_tax_number: &str,
+) -> Result<Option<(String, Option<String>)>> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let p = match partners::find_partner_by_tax_number(
+        &conn,
+        state.tenant.as_str(),
+        customer_tax_number,
+    )? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let email = match p.contact_email.as_deref() {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => return Ok(None),
+    };
+    Ok(Some((email, Some(p.display_name))))
+}
+
+/// Look up the side-stored input.json for the invoice, parse it, and
+/// return the customer's tax_number.
+fn resolve_customer_tax_number(state: &AppState, invoice_id: &str) -> Result<String> {
+    let ledger = Ledger::open(
+        &*state.db_path,
+        state.tenant.clone(),
+        state
+            .binary_hash
+            .wait()
+            .map_err(|e| anyhow!("binary hash: {e}"))?,
+    )
+    .with_context(|| format!("open audit ledger at {}", state.db_path.display()))?;
+    let xml_path = find_draft_xml_path(&ledger, invoice_id)?;
+    let input_json_path = sibling_input_json_path(&xml_path);
+    let body = std::fs::read_to_string(&input_json_path).with_context(|| {
+        format!(
+            "read side-stored input.json at {} for invoice {}",
+            input_json_path.display(),
+            invoice_id
+        )
+    })?;
+    let input: InvoiceInputJson = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "parse side-stored input.json at {}",
+            input_json_path.display()
+        )
+    })?;
+    Ok(input.customer.tax_number)
+}
+
+fn resolve_invoice_xml_path(state: &AppState, invoice_id: &str) -> Result<PathBuf> {
+    let ledger = Ledger::open(
+        &*state.db_path,
+        state.tenant.clone(),
+        state
+            .binary_hash
+            .wait()
+            .map_err(|e| anyhow!("binary hash: {e}"))?,
+    )
+    .with_context(|| format!("open audit ledger at {}", state.db_path.display()))?;
+    find_draft_xml_path(&ledger, invoice_id)
+}
+
+fn find_draft_xml_path(ledger: &Ledger, invoice_id: &str) -> Result<PathBuf> {
+    let entries = ledger
+        .entries()
+        .context("read audit-ledger entries to resolve InvoiceDraftCreated for email")?;
+    for entry in entries.iter().rev() {
+        if entry.kind != EventKind::InvoiceDraftCreated {
+            continue;
+        }
+        let payload: audit_payloads::InvoiceDraftCreatedPayload =
+            serde_json::from_slice(&entry.payload).with_context(|| {
+                format!(
+                    "InvoiceDraftCreated payload (seq {:?}) failed typed decode",
+                    entry.seq
+                )
+            })?;
+        if payload.invoice_id == invoice_id {
+            let p = payload.nav_xml_path.ok_or_else(|| {
+                anyhow!(
+                    "InvoiceDraftCreated for {} has no nav_xml_path (pre-PR-18 entry)",
+                    invoice_id
+                )
+            })?;
+            return Ok(PathBuf::from(p));
+        }
+    }
+    Err(anyhow!(
+        "no InvoiceDraftCreated audit entry for invoice id {}",
+        invoice_id
+    ))
 }
 
 /// PR-44η / session-60 — wire-state mapper for the poll-ack response.
@@ -6778,7 +8136,10 @@ mod tests {
                 address_street: "Visszatero koz 6".to_string(),
             },
             customer: crate::nav_xml::CustomerInfo {
-                tax_number: "27952890-2-42".to_string(),
+                // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic
+                // posture for the round-trip fixture.
+                customer_vat_status: crate::nav_xml::CustomerVatStatus::Domestic,
+                tax_number: Some("27952890-2-42".to_string()),
                 name: "AZ9 Services".to_string(),
                 // PR-77 / session-101 — `<customerAddress>` is now
                 // required by `walk_customer_info` for any DOMESTIC
@@ -6985,6 +8346,10 @@ mod tests {
             payment_deadline: None,
             delivery_date: None,
             delivery_date_override: None,
+            // PR-97 / ADR-0048 — pre-PR-97 ledger fixture; the field
+            // stays `None` so the audit-query round-trip preserves
+            // the implicit Domestic posture.
+            customer_vat_status: None,
         };
         ledger
             .append(

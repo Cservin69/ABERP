@@ -13,8 +13,11 @@
 //! - Domain types: invoice + line items + customer reference; ULID-typed IDs
 //!   per ADR-0005.
 //! - Sequence allocator per ADR-0009 §3: atomic, gap-free, idempotent under
-//!   retry. Only the `Never` reset policy is implemented here;
-//!   `AnnualOnFiscalYear` lands when the first non-default series ships.
+//!   retry. Both reset policies are implemented: `Never` keeps a single
+//!   continuous bucket per series; `AnnualOnFiscalYear` keys the bucket on
+//!   the invoice's immutable issue-date year (PR-90 / ADR-0045 §2 lifted
+//!   the pre-PR-90 `AnnualResetUnimplemented` gate). Gap-free invariant
+//!   holds within each `(series_id, fiscal_year)` bucket.
 //! - Storage port + DuckDB and in-memory adapters (ADR-0006 §Conformance:
 //!   "at least one in-memory adapter for every port").
 //! - `IssueInvoiceCommand` handler that drives the allocator.

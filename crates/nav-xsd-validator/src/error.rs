@@ -131,4 +131,27 @@ pub enum NavXsdValidationError {
         expected_prefix: &'static str,
         actual_prefix: String,
     },
+
+    /// PR-97 / ADR-0048 §5 — a child element appeared inside `parent`
+    /// that is FORBIDDEN under the captured discriminant `status`
+    /// value. Distinct from `UnexpectedElement` because the local name
+    /// IS in the parent's allowlist for SOME values of the
+    /// discriminant — just not for `status`.
+    ///
+    /// Today fires only on `<customerVatData>` under
+    /// `customerVatStatus = PRIVATE_PERSON`. The generic shape is
+    /// forward-compatible with a future rule (e.g. an OTHER-status
+    /// buyer forbidding `<customerTaxNumber>` inside `<customerVatData>`
+    /// per ADR-0048 §7's v2 follow-on).
+    ///
+    /// The validator's PR-77 hold is the symmetric POSITIVE half
+    /// (`MissingRequiredChild` for `<customerVatData>` under non-
+    /// PRIVATE_PERSON); this variant is the symmetric NEGATIVE half
+    /// that NAV's business-rule layer also enforces server-side.
+    #[error("forbidden child <{element}> inside <{parent}> when status is `{status}`")]
+    ForbiddenChildUnderStatus {
+        parent: &'static str,
+        element: &'static str,
+        status: &'static str,
+    },
 }

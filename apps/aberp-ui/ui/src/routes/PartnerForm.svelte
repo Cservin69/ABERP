@@ -161,17 +161,70 @@
             {/if}
           </label>
 
+          <fieldset class="radio-group" aria-describedby="vat-status-hint">
+            <legend class="field__label">
+              Vevő típusa / Buyer type *
+            </legend>
+            <label class="radio">
+              <input
+                type="radio"
+                name="customerVatStatus"
+                value="Domestic"
+                bind:group={form.customerVatStatus}
+              />
+              <span>Adóalany / Domestic business</span>
+            </label>
+            <label class="radio">
+              <input
+                type="radio"
+                name="customerVatStatus"
+                value="PrivatePerson"
+                bind:group={form.customerVatStatus}
+              />
+              <span>Magánszemély / Natural person</span>
+            </label>
+            <label class="radio radio--disabled">
+              <input
+                type="radio"
+                name="customerVatStatus"
+                value="Other"
+                disabled
+              />
+              <span>
+                Külföldi / Foreign
+                <span class="field__hint">v2-ben jön / Coming in v2</span>
+              </span>
+            </label>
+            {#if fieldErrors.customer_vat_status !== undefined}
+              <span class="field__error" id="vat-status-hint">
+                {fieldErrors.customer_vat_status}
+              </span>
+            {/if}
+          </fieldset>
+
           <label class="field">
             <span class="field__label">
-              Tax number (ADÓSZÁM) *
-              <span class="field__hint">format: <code>xxxxxxxx-y-zz</code></span>
+              Tax number (ADÓSZÁM)
+              {#if form.customerVatStatus === "Domestic"}
+                *
+              {/if}
+              <span class="field__hint">
+                {#if form.customerVatStatus === "Domestic"}
+                  format: <code>xxxxxxxx-y-zz</code>
+                {:else if form.customerVatStatus === "PrivatePerson"}
+                  Magánszemély vevő esetén nem kell adószám / no tax number for natural persons
+                {:else}
+                  v2-ben jön / Coming in v2
+                {/if}
+              </span>
             </span>
             <input
               type="text"
               bind:value={form.taxNumber}
               autocomplete="off"
               spellcheck="false"
-              required
+              required={form.customerVatStatus === "Domestic"}
+              disabled={form.customerVatStatus !== "Domestic"}
               placeholder="12345678-1-42"
               aria-invalid={fieldErrors.tax_number !== undefined}
             />
@@ -265,12 +318,32 @@
           <h3 class="section">Contact</h3>
 
           <label class="field">
-            <span class="field__label">Email</span>
+            <span class="field__label">
+              Email
+              <span class="field__hint">
+                Több cím vesszővel, pontosvesszővel vagy szóközzel
+                elválasztva / multiple addresses separated by `,`, `;`,
+                or space
+              </span>
+            </span>
+            <!-- PR-98 — multi-email validator. Field accepts one or
+                 many addresses; the storage path joins them in
+                 canonical `", "` form. type="text" (not "email") so
+                 the browser does not reject a multi-address list at
+                 the DOM layer — the backend's `validate_partner_inputs`
+                 surfaces per-token errors inline if any token is
+                 malformed. -->
             <input
-              type="email"
+              type="text"
               bind:value={form.contactEmail}
               autocomplete="email"
+              spellcheck="false"
+              aria-invalid={fieldErrors.contact_email !== undefined}
+              data-testid="partner-contact-email"
             />
+            {#if fieldErrors.contact_email !== undefined}
+              <span class="field__error">{fieldErrors.contact_email}</span>
+            {/if}
           </label>
 
           <label class="field">
@@ -417,6 +490,43 @@
     color: var(--color-text-strong);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);
+  }
+
+  .field input:disabled {
+    background: var(--color-surface-raised);
+    color: var(--color-text-muted);
+    cursor: not-allowed;
+  }
+
+  .radio-group {
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    padding: var(--space-2) var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin: 0;
+  }
+
+  .radio-group legend {
+    padding: 0 var(--space-1);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-primary);
+    font-weight: 500;
+  }
+
+  .radio {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-strong);
+    cursor: pointer;
+  }
+
+  .radio--disabled {
+    color: var(--color-text-muted);
+    cursor: not-allowed;
   }
 
   .field input[aria-invalid="true"] {

@@ -157,6 +157,12 @@
     const fields = buyerFieldsFromPartner(partner);
     form = {
       ...form,
+      // PR-97 / ADR-0048 — overwrite buyer-kind from picked partner.
+      customerVatStatus: fields.customerVatStatus,
+      // Type-compatibility with `IssueInvoiceFormState`; the
+      // modification composer does NOT emit `partnerId` so this
+      // value is never observed by the backend chain path.
+      customerPartnerId: partner.id,
       customerName: fields.customerName,
       customerTaxNumber: fields.customerTaxNumber,
       // PR-77 / session-101 — auto-fill customer address from the

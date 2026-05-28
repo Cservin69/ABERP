@@ -3,12 +3,19 @@
 //
 // Mirror invariant per A163: the per-state visible-button table is
 // the load-bearing operator-facing contract. The backend's
-// `serve::submit_invoice_request` / `serve::poll_ack_request`
-// helpers loud-fail with 409 on state-mismatched POSTs; this table
-// keeps the SPA from surfacing a button that would always 409.
-// CLAUDE.md rule 9 — per-state coverage means a regression that
-// collapses every state to one button list (or returns a constant)
-// cannot pass every assertion vacuously.
+// `serve::submit_invoice_request` helper loud-fails with 409 on
+// state-mismatched POSTs; this table keeps the SPA from surfacing
+// a button that would always 409. CLAUDE.md rule 9 — per-state
+// coverage means a regression that collapses every state to one
+// button list (or returns a constant) cannot pass every assertion
+// vacuously.
+//
+// PR-95 / session-115 — the `PollAck` button was removed from the
+// closed-vocab; the new 4-state NAV-status pictogram
+// (`./nav-status-pictogram.ts`) replaces the manual poll affordance.
+// The Submitted / PendingNavExists rows below therefore no longer
+// list `PollAck`; the pictogram counter-pin lives in
+// `./nav-status-pictogram.test.ts`.
 //
 // The eleven `InvoiceState` values are pinned exhaustively below.
 // A new state added to the union without a `buttonsForState` arm
@@ -36,44 +43,49 @@ interface Expected {
 
 const TABLE: Expected[] = [
   // Ready — pre-submission, before any wire attempt. The operator
-  // can submit (lights up the only-Ready row) or download the printed
-  // PDF (PR-44ε.UI).
-  { state: "Ready", buttons: ["Submit", "Download"] },
+  // can submit (lights up the only-Ready row), email the PDF to the
+  // buyer (PR-92), or download (PR-44ε.UI).
+  { state: "Ready", buttons: ["Submit", "Email", "Download"] },
   // Submitted — Response audit entry exists, no terminal ack yet.
-  // The operator can poll for the ack or download.
-  { state: "Submitted", buttons: ["PollAck", "Download"] },
+  // PR-95 / session-115 — the pictogram (clickable when InFlight)
+  // carries the poll affordance; the action bar drops the PollAck
+  // button. Email + Download.
+  { state: "Submitted", buttons: ["Email", "Download"] },
   // PendingNavExists — state-2 Pending + Layer-2 Exists evidence.
-  // NAV already has the invoice (Layer-2 queryInvoiceCheck answered
-  // exists); the operator polls for the ack. Same affordance shape
-  // as Submitted per the brief.
-  { state: "PendingNavExists", buttons: ["PollAck", "Download"] },
+  // Same posture as Submitted at the action-bar level (pictogram
+  // owns poll); Email + Download.
+  { state: "PendingNavExists", buttons: ["Email", "Download"] },
   // Pending — state-2 Pending without Layer-2 evidence. The
   // operator's next move is NAV-recovery (`retry-submission` /
-  // `recover-from-nav`) which the SPA does not yet surface. Download
-  // only.
-  { state: "Pending", buttons: ["Download"] },
+  // `recover-from-nav`) which the SPA does not yet surface. Email +
+  // Download.
+  { state: "Pending", buttons: ["Email", "Download"] },
   // Recovered — state reconstructed via `recover-from-nav`. The
   // operator's next move is poll-ack against the recovered
   // transactionId — but the chip itself sits above the Submitted
-  // line, and PR-44η scope is the standard lifecycle. Download only;
-  // a future PR can add a "Poll ack" button on Recovered too.
-  { state: "Recovered", buttons: ["Download"] },
+  // line, and PR-44η scope is the standard lifecycle. Email +
+  // Download; a future PR can add a "Poll ack" button on Recovered too.
+  { state: "Recovered", buttons: ["Email", "Download"] },
   // Finalized — terminal SAVED. PR-47α / session-64: operator can
   // issue a storno (ADR-0023 §1). PR-47β / session-65: operator can
-  // also issue a modification (ADR-0024 §6 base case). Download
-  // remains available.
+  // also issue a modification (ADR-0024 §6 base case). Email +
+  // Download stay available.
   //
   // PR-70 / ADR-0039 — the default (paid=false) baseline includes
   // the "Pay" button for the mark-as-paid affordance. The paid=true
   // branch is pinned by `finalized_paid_hides_pay_button` below.
+  //
+  // PR-92 / ADR-0047 — Email is always available on Finalized so
+  // the operator can resend.
   {
     state: "Finalized",
-    buttons: ["Pay", "Storno", "Modification", "Download"],
+    buttons: ["Pay", "Storno", "Modification", "Email", "Download"],
   },
-  // Rejected — terminal ABORTED. Download only.
-  { state: "Rejected", buttons: ["Download"] },
-  // Storno — base invoice has a storno chain entry. Download only.
-  { state: "Storno", buttons: ["Download"] },
+  // Rejected — terminal ABORTED. Email + Download.
+  { state: "Rejected", buttons: ["Email", "Download"] },
+  // Storno — base invoice has a storno chain entry. Email + Download
+  // (operator may resend the original to a buyer for their records).
+  { state: "Storno", buttons: ["Email", "Download"] },
   // Amended — base invoice has a modification chain entry.
   // PR-47β / session-65: modify-after-modify is permitted per
   // ADR-0024 §6 default-permit posture; storno is NOT (a stornoed
@@ -82,14 +94,14 @@ const TABLE: Expected[] = [
   // would reject anyway).
   {
     state: "Amended",
-    buttons: ["Modification", "Download"],
+    buttons: ["Modification", "Email", "Download"],
   },
-  // Abandoned — operator marked terminal. Download only.
-  { state: "Abandoned", buttons: ["Download"] },
-  // Unknown — no entries; nothing actionable but download (which
-  // itself will 404 — the SPA still shows the button so the failure
-  // is visible per CLAUDE.md rule 12).
-  { state: "Unknown", buttons: ["Download"] },
+  // Abandoned — operator marked terminal. Email + Download.
+  { state: "Abandoned", buttons: ["Email", "Download"] },
+  // Unknown — no entries; nothing actionable but email + download
+  // (which itself will 404 — the SPA still shows the buttons so the
+  // failure is visible per CLAUDE.md rule 12).
+  { state: "Unknown", buttons: ["Email", "Download"] },
 ];
 
 describe("buttonsForState", () => {
@@ -107,19 +119,6 @@ describe("buttonsForState", () => {
       row.buttons.includes("Submit"),
     ).map((row) => row.state);
     expect(statesWithSubmit).toEqual(["Ready"]);
-  });
-
-  it("PollAck button only appears on Submitted-class states", () => {
-    // Counter-pin: PollAck is visible exactly on the two states the
-    // backend's `poll_ack_request` accepts (`Submitted` and
-    // `PendingNavExists`). A drift here would diverge the UI from
-    // the precondition guard.
-    const statesWithPoll = TABLE.filter((row) =>
-      row.buttons.includes("PollAck"),
-    ).map((row) => row.state);
-    expect(statesWithPoll.sort()).toEqual(
-      ["PendingNavExists", "Submitted"].sort(),
-    );
   });
 
   it("Storno button only appears on Finalized", () => {
@@ -200,6 +199,7 @@ describe("buttonsForState", () => {
       "Pay",
       "Storno",
       "Modification",
+      "Email",
       "Download",
     ]);
   });
@@ -213,8 +213,32 @@ describe("buttonsForState", () => {
     expect(buttonsForState("Finalized", true)).toEqual([
       "Storno",
       "Modification",
+      "Email",
       "Download",
     ]);
+  });
+
+  // ── PR-92 / ADR-0047 — Email button pins ──────────────────────────
+
+  it("Email button is present on every state", () => {
+    // PR-92 — the PDF exists from the moment the draft is created
+    // (A155), so the SMTP send button is available at any point in
+    // the lifecycle. Even terminal states (Rejected / Storno /
+    // Abandoned) keep the button so the operator can resend the
+    // original to a buyer who lost the email.
+    for (const { state, buttons } of TABLE) {
+      expect(
+        buttons.includes("Email"),
+        `state=${state} must include Email`,
+      ).toBe(true);
+    }
+  });
+
+  it("Email button lands in the Export group", () => {
+    // PR-92 — Email is a buyer-deliverable artifact channel just like
+    // Download (PDF in mailbox vs PDF on disk). Both sit in Export so
+    // the operator sees them in the same visual section.
+    expect(detailActionMeta("Email").group).toBe("Export");
   });
 
   // ── PR-80 / session-102 — Action metadata + grouping pins ─────────
@@ -226,11 +250,11 @@ describe("buttonsForState", () => {
     // affordance — the operator would see a button without a label.
     const all: DetailActionButton[] = [
       "Submit",
-      "PollAck",
       "Storno",
       "Modification",
       "Pay",
       "Download",
+      "Email",
     ];
     for (const button of all) {
       const meta = detailActionMeta(button);
@@ -251,11 +275,11 @@ describe("buttonsForState", () => {
     // ladder section header, misleading the operator about what the
     // action does.
     expect(detailActionMeta("Submit").group).toBe("Lifecycle");
-    expect(detailActionMeta("PollAck").group).toBe("Lifecycle");
     expect(detailActionMeta("Pay").group).toBe("Operational");
     expect(detailActionMeta("Storno").group).toBe("Chain");
     expect(detailActionMeta("Modification").group).toBe("Chain");
     expect(detailActionMeta("Download").group).toBe("Export");
+    expect(detailActionMeta("Email").group).toBe("Export");
   });
 
   it("groupButtons preserves canonical group order", () => {
@@ -299,8 +323,8 @@ describe("buttonsForState", () => {
   it("groupButtons of buttonsForState('Finalized') yields Operational/Chain/Export", () => {
     // Mirror-pin: Finalized (unpaid) is the most-action-rich state on
     // the regulatory ladder — Pay (Operational), Storno+Modification
-    // (Chain), Download (Export). Lifecycle is empty because the
-    // NAV ladder has already terminated at SAVED. A regression
+    // (Chain), Email+Download (Export). Lifecycle is empty because
+    // the NAV ladder has already terminated at SAVED. A regression
     // collapsing a section would surface as a missing label here.
     const buttons = buttonsForState("Finalized", false);
     const groups = groupButtons(buttons).map((g) => g.group);
@@ -316,13 +340,14 @@ describe("buttonsForState", () => {
     expect(groups).toEqual(["Lifecycle", "Export"]);
   });
 
-  it("groupButtons of buttonsForState('Submitted') yields Lifecycle/Export", () => {
-    // Mid-flight state — PollAck (Lifecycle) + Download (Export).
-    // No operational or chain actions until the NAV ladder
-    // terminates.
+  it("groupButtons of buttonsForState('Submitted') yields only Export", () => {
+    // Mid-flight state — PR-95 / session-115 dropped the PollAck
+    // button (the pictogram carries the poll affordance), so the
+    // Submitted action bar contains only Email + Download (both in
+    // Export). No Lifecycle, Operational, or Chain section renders.
     const buttons = buttonsForState("Submitted", false);
     const groups = groupButtons(buttons).map((g) => g.group);
-    expect(groups).toEqual(["Lifecycle", "Export"]);
+    expect(groups).toEqual(["Export"]);
   });
 
   it("actionGroupLabel returns bilingual labels for every group", () => {

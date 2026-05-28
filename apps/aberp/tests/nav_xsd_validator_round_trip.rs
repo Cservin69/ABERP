@@ -16,7 +16,9 @@
 
 use std::time::Duration;
 
-use aberp::nav_xml::{self, CustomerAddress, CustomerInfo, NavParties, SupplierInfo};
+use aberp::nav_xml::{
+    self, CustomerAddress, CustomerInfo, CustomerVatStatus, NavParties, SupplierInfo,
+};
 use aberp_billing::{
     Currency, CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
 };
@@ -69,7 +71,10 @@ fn minimal_parties() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
-            tax_number: "87654321-1-42".to_string(),
+            // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic
+            // behaviour for the minimal-invoice integration fixture.
+            customer_vat_status: CustomerVatStatus::Domestic,
+            tax_number: Some("87654321-1-42".to_string()),
             name: "Test Customer Zrt.".to_string(),
             // PR-77 / session-101 — `customerAddress` required for any
             // DOMESTIC customerVatStatus per NAV business-rule
@@ -286,7 +291,10 @@ fn invoice_16_aben_consulting_tax_number_round_trips_through_emit_and_validate()
             address_street: "Visszatero koz 6".to_string(),
         },
         customer: CustomerInfo {
-            tax_number: "27952890-2-42".to_string(),
+            // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic
+            // posture for the invoice-16 byte-verbatim fixture.
+            customer_vat_status: CustomerVatStatus::Domestic,
+            tax_number: Some("27952890-2-42".to_string()),
             name: "AZ9 Services".to_string(),
             // PR-77 / session-101 — `customerAddress` required for any
             // DOMESTIC customerVatStatus; supply a realistic Hungarian
@@ -409,7 +417,10 @@ fn emitter_writes_customer_address_under_domestic_status() {
             address_street: "Visszatero koz 6".to_string(),
         },
         customer: CustomerInfo {
-            tax_number: "27952890-2-42".to_string(),
+            // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic
+            // posture for the AZ9 Services regression fixture.
+            customer_vat_status: CustomerVatStatus::Domestic,
+            tax_number: Some("27952890-2-42".to_string()),
             name: "AZ9 Services".to_string(),
             address: Some(CustomerAddress {
                 country_code: "HU".to_string(),
@@ -478,5 +489,187 @@ fn emitter_writes_customer_address_under_domestic_status() {
     validate_invoice_data(&xml).expect(
         "v3.0 invariant check must pass — the validator now requires customerAddress under \
          DOMESTIC customerVatStatus, and the emitter writes it",
+    );
+}
+
+/// PR-97 / ADR-0048 §4 — byte-verbatim pin on the PRIVATE_PERSON
+/// branch's `<customerInfo>` block. NAV's `CUSTOMER_DATA_EXPECTED`
+/// business rule is symmetric: it FORBIDS `<customerVatData>` when
+/// `customerVatStatus = PRIVATE_PERSON` (the negation of the
+/// PR-77 / domestic positive half). The pin asserts:
+///
+///   1. `<customerVatStatus>PRIVATE_PERSON</customerVatStatus>` literal
+///      bytes (SCREAMING_SNAKE_CASE NAV wire token, NOT PascalCase).
+///   2. NO `<customerVatData>` element anywhere in the emitted body.
+///   3. NO `<customerTaxNumber>` block anywhere (the structured
+///      Hungarian tax-number children that DOMESTIC requires).
+///   4. `<customerName>` IS present (universally required regardless
+///      of status).
+///   5. The validator passes the round-trip — confirming the symmetric
+///      ForbiddenChildUnderStatus rule does not falsely fire on a
+///      compliant PRIVATE_PERSON body.
+#[test]
+fn emitter_writes_customer_info_under_private_person_omits_vat_data() {
+    let invoice = build_minimal_invoice();
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = NavParties {
+        supplier: SupplierInfo {
+            tax_number: "24904362-2-41".to_string(),
+            name: "Aben Consulting Kft".to_string(),
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatero koz 6".to_string(),
+        },
+        customer: CustomerInfo {
+            customer_vat_status: CustomerVatStatus::PrivatePerson,
+            // PRIVATE_PERSON forbids tax_number — None matches the
+            // partner-form invariant + the validator's symmetric rule.
+            tax_number: None,
+            name: "Kovács János".to_string(),
+            // ADR-0048 §3 open-question #5 — address is optional under
+            // PRIVATE_PERSON at the NAV wire layer; omit here to pin
+            // the bare-minimum compliant body.
+            address: None,
+        },
+    };
+
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("emitter must succeed on the PRIVATE_PERSON minimal fixture");
+    let body = std::str::from_utf8(&xml).expect("emitter output must be UTF-8");
+
+    assert!(
+        body.contains("<customerVatStatus>PRIVATE_PERSON</customerVatStatus>"),
+        "PRIVATE_PERSON wire token (SCREAMING_SNAKE) missing; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<customerVatData>"),
+        "PRIVATE_PERSON buyer MUST NOT carry <customerVatData> \
+         (NAV business-rule CUSTOMER_DATA_EXPECTED, negative half); body:\n{body}"
+    );
+    assert!(
+        !body.contains("<customerTaxNumber>"),
+        "PRIVATE_PERSON buyer MUST NOT carry <customerTaxNumber>; body:\n{body}"
+    );
+    // PR-97 / ADR-0048 (Ervin override 2 / GDPR) — `customerName` is
+    // OPTIONAL under PRIVATE_PERSON. This fixture supplies a name so
+    // the body keeps a readable Kovács János reference; the
+    // sibling pin `emitter_writes_customer_info_under_private_person_omits_name_and_address`
+    // below covers the empty-name GDPR posture.
+    assert!(
+        body.contains("<customerName>Kovács János</customerName>"),
+        "<customerName> still emitted when the operator supplied one; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<customerAddress>"),
+        "absent address must NOT emit an empty <customerAddress> wrapper; body:\n{body}"
+    );
+
+    validate_invoice_data(&xml).expect(
+        "v3.0 invariant check must pass — PRIVATE_PERSON + absent customerVatData/Address \
+         is the symmetric compliant body; the new ForbiddenChildUnderStatus rule must \
+         NOT false-fire here",
+    );
+}
+
+/// PR-97 / ADR-0048 (Ervin override 2 / GDPR) — `<customerName>` is
+/// OPTIONAL under PRIVATE_PERSON per Ervin's GDPR posture. A
+/// natural-person buyer can be issued an invoice without ABERP
+/// recording any identifying detail beyond the closed-vocab status —
+/// the emitter omits `<customerName>` when the operator-supplied name
+/// is empty-after-trim.
+///
+/// XSD verification status: NAV v3.0 `CustomerInfoType` declares
+/// `<customerName>` as `minOccurs="0"` at the schema level. The
+/// PRIVATE_PERSON + omitted-name combination has not been exercised
+/// against the live NAV-test endpoint as of PR-97; the first such
+/// issuance will confirm the business-rule layer agrees. If NAV
+/// rejects, revert this branch + the validator's
+/// `customerVatStatus`-only ORDERED_REQUIRED set.
+#[test]
+fn emitter_writes_customer_info_under_private_person_omits_name_and_address() {
+    let invoice = build_minimal_invoice();
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = NavParties {
+        supplier: SupplierInfo {
+            tax_number: "24904362-2-41".to_string(),
+            name: "Aben Consulting Kft".to_string(),
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatero koz 6".to_string(),
+        },
+        customer: CustomerInfo {
+            customer_vat_status: CustomerVatStatus::PrivatePerson,
+            tax_number: None,
+            // Empty-after-trim ⇒ omitted from the wire body. GDPR
+            // posture allows ABERP to record zero identifying detail
+            // for a natural-person buyer.
+            name: "   ".to_string(),
+            address: None,
+        },
+    };
+
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("emitter must succeed on the PRIVATE_PERSON GDPR-minimal fixture");
+    let body = std::str::from_utf8(&xml).expect("emitter output must be UTF-8");
+
+    assert!(
+        body.contains("<customerVatStatus>PRIVATE_PERSON</customerVatStatus>"),
+        "PRIVATE_PERSON wire token still required; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<customerVatData>"),
+        "PRIVATE_PERSON forbids <customerVatData>; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<customerName>"),
+        "GDPR posture: empty-after-trim name must NOT emit <customerName>; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<customerAddress>"),
+        "absent address must NOT emit an empty <customerAddress> wrapper; body:\n{body}"
+    );
+
+    validate_invoice_data(&xml).expect(
+        "v3.0 invariant check must pass — PRIVATE_PERSON + omitted name + omitted address \
+         is the GDPR-compliant minimal body; the validator's relaxed customerName \
+         ORDERED_REQUIRED set must NOT false-fire here",
+    );
+}
+
+/// PR-97 / ADR-0048 §7 — defence-in-depth pin: the v1 emitter
+/// loud-fails on `CustomerVatStatus::Other`. Preflight catches it
+/// upstream as `CustomerVatStatusOtherNotSupportedV1`, but a buggy
+/// caller that bypasses preflight must not escape an OTHER-shaped body
+/// onto the wire (v1 has no community-VAT / third-state-tax-id
+/// emission path).
+#[test]
+fn emitter_loud_fails_when_other_status_materialises() {
+    let invoice = build_minimal_invoice();
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = NavParties {
+        supplier: SupplierInfo {
+            tax_number: "24904362-2-41".to_string(),
+            name: "Aben Consulting Kft".to_string(),
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatero koz 6".to_string(),
+        },
+        customer: CustomerInfo {
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            name: "Foreign Buyer".to_string(),
+            address: None,
+        },
+    };
+
+    let err = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect_err("Other-status emit MUST loud-fail in v1 per ADR-0048 §7");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Other") || msg.contains("v2"),
+        "loud-fail message must name the v1-deferral reason; got: {msg}"
     );
 }

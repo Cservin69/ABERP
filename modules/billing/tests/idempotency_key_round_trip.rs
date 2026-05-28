@@ -91,6 +91,7 @@ fn build_allocate_args(series_id: SeriesId, idem: IdempotencyKey) -> AllocateArg
         // only the SPA-issue route populates this field.
         bank_snapshot: None,
         invoice_note: None,
+        start_value: 1,
     }
 }
 

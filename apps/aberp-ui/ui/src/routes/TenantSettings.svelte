@@ -24,11 +24,19 @@
     createSellerBank,
     deleteSellerBank,
     getSellerInfo,
+    getSellerNumbering,
+    getSmtpConfig,
     listSellerBanks,
+    putSellerNumbering,
+    putSmtpConfig,
     setDefaultSellerBank,
     setupSellerInfo,
+    testSmtpConnection,
     updateSellerBank,
     type SellerBankResponse,
+    type SmtpConfigGetResponse,
+    type SmtpSecurity,
+    type SmtpTestOutcome,
   } from "../lib/api";
   import {
     composeSellerConfigBody,
@@ -46,6 +54,17 @@
     validateSellerBankForm,
     type SellerBankFormState,
   } from "../lib/seller-banks";
+  import {
+    defaultTemplate,
+    errorMessage as numberingErrorMessage,
+    moveSegmentDown,
+    moveSegmentUp,
+    removeSegment,
+    renderTemplate,
+    validateTemplate,
+    type NumberingSegment,
+    type NumberingTemplate,
+  } from "../lib/invoice-numbering";
   import { formFromSellerInfo } from "../lib/tenant-settings";
 
   let form: SellerConfigForm = $state({ ...DEFAULT_SELLER_CONFIG_FORM });
@@ -75,9 +94,80 @@
   let bankModalValidation = $derived(validateSellerBankForm(bankModalForm));
   let banksGrouped = $derived(groupSellerBanksByCurrency(banks));
 
+  // PR-89 — Invoice numbering subsection state. The page loads the
+  // current template via GET /api/seller/numbering on mount and the
+  // operator builds against a local working copy; "Save" PUTs the
+  // composed body back. Live preview renders against the current
+  // calendar year + start_value so the operator sees exactly what
+  // "next invoice will be" before saving.
+  let numbering: NumberingTemplate = $state(defaultTemplate());
+  let numberingLoading = $state(true);
+  let numberingLoadError: string | null = $state(null);
+  let numberingSubmitting = $state(false);
+  let numberingSubmitError: string | null = $state(null);
+  let numberingSaved = $state(false);
+
+  // PR-92 / ADR-0047 — SMTP subsection state. Loaded on mount via
+  // GET /api/smtp-config; the keychain password is NEVER carried
+  // back to the SPA — the backend reports a `passwordSet` boolean.
+  // The operator may type a NEW password to rotate (blank means
+  // "leave existing keychain entry untouched").
+  interface SmtpForm {
+    host: string;
+    port: number;
+    fromAddress: string;
+    fromDisplayName: string;
+    username: string;
+    security: SmtpSecurity;
+    attachXml: boolean;
+    password: string;
+  }
+  let smtp: SmtpForm = $state({
+    host: "",
+    port: 587,
+    fromAddress: "",
+    fromDisplayName: "",
+    username: "",
+    security: "StartTls",
+    attachXml: false,
+    password: "",
+  });
+  let smtpLoading = $state(true);
+  let smtpLoadError: string | null = $state(null);
+  let smtpPasswordSet = $state(false);
+  let smtpSubmitting = $state(false);
+  let smtpSubmitError: string | null = $state(null);
+  let smtpSaved = $state(false);
+  // PR-98 — SMTP "Test connection" state. The button runs the TLS
+  // handshake + AUTH + NOOP via the backend without persisting
+  // anything; outcome surfaces as an inline banner.
+  let smtpTesting = $state(false);
+  let smtpTestOutcome: SmtpTestOutcome | null = $state(null);
+  let smtpTestError: string | null = $state(null);
+  let numberingLiteralDraft = $state("");
+  let numberingValidation = $derived(validateTemplate(numbering));
+  let numberingPreview = $derived.by(() => {
+    const err = validateTemplate(numbering);
+    if (err !== null) return "—";
+    const year = new Date().getFullYear();
+    return renderTemplate(numbering, year, numbering.start_value);
+  });
+  let numberingPreviewNextYear = $derived.by(() => {
+    const err = validateTemplate(numbering);
+    if (err !== null) return null;
+    if (numbering.reset_policy !== "on_year_change") return null;
+    return renderTemplate(
+      numbering,
+      new Date().getFullYear() + 1,
+      numbering.start_value,
+    );
+  });
+
   onMount(() => {
     void loadSellerInfo();
     void loadBanks();
+    void loadNumbering();
+    void loadSmtpConfig();
   });
 
   async function loadSellerInfo() {
@@ -234,6 +324,195 @@
       banks = response.banks;
     } catch (err: unknown) {
       bankRowError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  // ── PR-89 — Invoice numbering subsection handlers ───────────────────
+
+  async function loadNumbering() {
+    numberingLoading = true;
+    numberingLoadError = null;
+    try {
+      numbering = await getSellerNumbering();
+    } catch (err: unknown) {
+      numberingLoadError = err instanceof Error ? err.message : String(err);
+    } finally {
+      numberingLoading = false;
+    }
+  }
+
+  function addLiteralSegment() {
+    const text = numberingLiteralDraft;
+    if (text.length === 0) return;
+    numbering = {
+      ...numbering,
+      segments: [...numbering.segments, { kind: "Literal", text }],
+    };
+    numberingLiteralDraft = "";
+    numberingSaved = false;
+  }
+
+  function addYearSegment(digits: 2 | 4) {
+    numbering = {
+      ...numbering,
+      segments: [...numbering.segments, { kind: "Year", digits }],
+    };
+    numberingSaved = false;
+  }
+
+  function addCounterSegment(padWidth: number) {
+    const safePad = Math.max(1, Math.min(20, Math.floor(padWidth)));
+    numbering = {
+      ...numbering,
+      segments: [...numbering.segments, { kind: "Counter", pad_width: safePad }],
+    };
+    numberingSaved = false;
+  }
+
+  function onSegmentUp(idx: number) {
+    numbering = { ...numbering, segments: moveSegmentUp(numbering.segments, idx) };
+    numberingSaved = false;
+  }
+
+  function onSegmentDown(idx: number) {
+    numbering = { ...numbering, segments: moveSegmentDown(numbering.segments, idx) };
+    numberingSaved = false;
+  }
+
+  function onSegmentRemove(idx: number) {
+    numbering = { ...numbering, segments: removeSegment(numbering.segments, idx) };
+    numberingSaved = false;
+  }
+
+  function onResetTemplateToDefault() {
+    if (!confirm("Reset the invoice-numbering template to the default INV-default/NNNNN shape?")) {
+      return;
+    }
+    numbering = defaultTemplate();
+    numberingSaved = false;
+  }
+
+  function segmentLabel(seg: NumberingSegment): string {
+    switch (seg.kind) {
+      case "Literal":
+        return `Literal "${seg.text}"`;
+      case "Year":
+        return `Year (${seg.digits} digits)`;
+      case "Counter":
+        return `Counter (pad ${seg.pad_width})`;
+    }
+  }
+
+  // ── PR-92 / ADR-0047 — SMTP subsection handlers ─────────────────────
+
+  async function loadSmtpConfig() {
+    smtpLoading = true;
+    smtpLoadError = null;
+    try {
+      const response: SmtpConfigGetResponse = await getSmtpConfig();
+      smtpPasswordSet = response.passwordSet;
+      if ("host" in response) {
+        smtp = {
+          host: response.host,
+          port: response.port,
+          fromAddress: response.fromAddress,
+          fromDisplayName: response.fromDisplayName ?? "",
+          username: response.username,
+          security: response.security,
+          attachXml: response.attachXml,
+          password: "",
+        };
+      }
+    } catch (err: unknown) {
+      smtpLoadError = err instanceof Error ? err.message : String(err);
+    } finally {
+      smtpLoading = false;
+    }
+  }
+
+  async function onTestSmtp() {
+    smtpTestOutcome = null;
+    smtpTestError = null;
+    smtpTesting = true;
+    try {
+      const fromDisplayName =
+        smtp.fromDisplayName.trim() === "" ? null : smtp.fromDisplayName.trim();
+      // PR-98 — empty password means "use existing keychain entry" on
+      // the test endpoint too, mirroring the PUT body semantics. The
+      // operator can rotate AND test in one pass by typing the new
+      // password and clicking Test before Save.
+      const password = smtp.password.length > 0 ? smtp.password : null;
+      smtpTestOutcome = await testSmtpConnection({
+        host: smtp.host.trim(),
+        port: smtp.port,
+        fromAddress: smtp.fromAddress.trim(),
+        fromDisplayName,
+        username: smtp.username.trim(),
+        security: smtp.security,
+        attachXml: smtp.attachXml,
+        password,
+      });
+    } catch (err: unknown) {
+      smtpTestError = err instanceof Error ? err.message : String(err);
+    } finally {
+      smtpTesting = false;
+    }
+  }
+
+  async function onSaveSmtp(event: Event) {
+    event.preventDefault();
+    smtpSaved = false;
+    smtpSubmitError = null;
+    smtpSubmitting = true;
+    try {
+      // Trim + normalise the optional display-name. Empty string ⇒
+      // omit so the backend's `Option<String>` deserialiser sees the
+      // clean "no display name" signal.
+      const fromDisplayName =
+        smtp.fromDisplayName.trim() === "" ? null : smtp.fromDisplayName.trim();
+      // Password rotation: only send the field when the operator
+      // typed something; blank means "leave the keychain entry
+      // untouched". The form NEVER displays the existing password —
+      // the backend's GET /api/smtp-config surfaces a
+      // `passwordSet: bool` and the SPA renders an indicator.
+      const password = smtp.password.length > 0 ? smtp.password : null;
+      const response = await putSmtpConfig({
+        host: smtp.host.trim(),
+        port: smtp.port,
+        fromAddress: smtp.fromAddress.trim(),
+        fromDisplayName,
+        username: smtp.username.trim(),
+        security: smtp.security,
+        attachXml: smtp.attachXml,
+        password,
+      });
+      smtpPasswordSet = response.passwordSet;
+      smtp = { ...smtp, password: "" };
+      smtpSaved = true;
+    } catch (err: unknown) {
+      smtpSubmitError = err instanceof Error ? err.message : String(err);
+    } finally {
+      smtpSubmitting = false;
+    }
+  }
+
+  async function onSaveNumbering(event: Event) {
+    event.preventDefault();
+    numberingSaved = false;
+    numberingSubmitError = null;
+    const validation = validateTemplate(numbering);
+    if (validation !== null) {
+      numberingSubmitError = numberingErrorMessage(validation);
+      return;
+    }
+    numberingSubmitting = true;
+    try {
+      numbering = await putSellerNumbering(numbering);
+      numberingSaved = true;
+    } catch (err: unknown) {
+      numberingSubmitError = err instanceof Error ? err.message : String(err);
+    } finally {
+      numberingSubmitting = false;
     }
   }
 </script>
@@ -528,6 +807,402 @@
       {/if}
     </section>
 
+    <!-- PR-89 — operator-configurable invoice numbering. Click-to-
+         assemble segment chips with reorder + remove, live preview,
+         NAV-charset validation. Writes go through /api/seller/numbering
+         (atomic merge that preserves identity + bank sections above). -->
+    <section
+      class="page__numbering"
+      aria-labelledby="numbering-title"
+      data-testid="seller-numbering-section"
+    >
+      <header class="page__banks-head">
+        <h3 id="numbering-title" class="page__section">
+          Invoice numbering
+          <span class="page__section-hint">számlasorszám sablon · NAV invoiceNumber</span>
+        </h3>
+      </header>
+
+      {#if numberingLoading}
+        <p class="page__muted">Loading numbering template…</p>
+      {:else if numberingLoadError !== null}
+        <div class="page__error" role="alert">
+          <strong>Could not load numbering template.</strong>
+          <p class="page__error-detail">{numberingLoadError}</p>
+        </div>
+      {:else}
+        <p class="page__muted" style="margin-bottom: var(--space-3);">
+          Assemble the next invoice number from segments. Hungarian §169 requires gap-free numbering;
+          set the start value once as a setup/migration step (e.g. to continue from Billingo).
+          After your first real invoice is issued, do NOT change the template — historical invoices
+          would re-render under the new template.
+        </p>
+
+        <div class="numbering__preview" data-testid="seller-numbering-preview">
+          <span class="numbering__preview-label">Next invoice will be:</span>
+          <code class="numbering__preview-value">{numberingPreview}</code>
+          {#if numberingPreviewNextYear !== null}
+            <span class="numbering__preview-next-label">Next year (annual reset):</span>
+            <code class="numbering__preview-value">{numberingPreviewNextYear}</code>
+          {/if}
+        </div>
+
+        <ul class="numbering__segments" data-testid="seller-numbering-segments">
+          {#each numbering.segments as seg, idx (idx + ":" + seg.kind + ":" + (seg.kind === "Literal" ? seg.text : seg.kind === "Year" ? seg.digits : seg.pad_width))}
+            <li class="numbering__segment-row" data-testid="seller-numbering-segment-{idx}">
+              <span class="numbering__segment-chip numbering__segment-chip--{seg.kind.toLowerCase()}">
+                {segmentLabel(seg)}
+              </span>
+              <div class="numbering__segment-actions">
+                <button
+                  type="button"
+                  class="numbering__seg-btn"
+                  onclick={() => onSegmentUp(idx)}
+                  disabled={idx === 0}
+                  aria-label="Move up"
+                >↑</button>
+                <button
+                  type="button"
+                  class="numbering__seg-btn"
+                  onclick={() => onSegmentDown(idx)}
+                  disabled={idx === numbering.segments.length - 1}
+                  aria-label="Move down"
+                >↓</button>
+                <button
+                  type="button"
+                  class="numbering__seg-btn numbering__seg-btn--remove"
+                  onclick={() => onSegmentRemove(idx)}
+                  aria-label="Remove"
+                >×</button>
+              </div>
+            </li>
+          {/each}
+        </ul>
+
+        <div class="numbering__builder">
+          <div class="numbering__builder-row">
+            <input
+              type="text"
+              class="field__input numbering__literal-input"
+              placeholder="Literal text (e.g. ABERP-)"
+              bind:value={numberingLiteralDraft}
+              data-testid="seller-numbering-literal-input"
+            />
+            <button
+              type="button"
+              class="numbering__add-btn"
+              onclick={addLiteralSegment}
+              disabled={numberingLiteralDraft.length === 0}
+              data-testid="seller-numbering-add-literal"
+            >+ Literal</button>
+            <button
+              type="button"
+              class="numbering__add-btn"
+              onclick={() => addYearSegment(4)}
+              data-testid="seller-numbering-add-year-4"
+            >+ Year (4)</button>
+            <button
+              type="button"
+              class="numbering__add-btn"
+              onclick={() => addYearSegment(2)}
+              data-testid="seller-numbering-add-year-2"
+            >+ Year (2)</button>
+            <button
+              type="button"
+              class="numbering__add-btn"
+              onclick={() => addCounterSegment(6)}
+              data-testid="seller-numbering-add-counter-6"
+            >+ Counter (pad 6)</button>
+            <button
+              type="button"
+              class="numbering__add-btn"
+              onclick={() => addCounterSegment(4)}
+              data-testid="seller-numbering-add-counter-4"
+            >+ Counter (pad 4)</button>
+          </div>
+        </div>
+
+        <form onsubmit={onSaveNumbering} class="page__form">
+          <fieldset disabled={numberingSubmitting} class="page__fieldset">
+            <div class="page__columns">
+              <label class="field">
+                <span class="field__label">Reset policy</span>
+                <select
+                  class="field__input"
+                  bind:value={numbering.reset_policy}
+                  data-testid="seller-numbering-reset-policy"
+                >
+                  <option value="never">Never (continuous)</option>
+                  <option value="on_year_change">Reset on year change (HU default)</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span class="field__label">
+                  Start value
+                  <span class="field__hint">setup-only — locks after first invoice</span>
+                </span>
+                <input
+                  type="number"
+                  min="1"
+                  class="field__input"
+                  bind:value={numbering.start_value}
+                  data-testid="seller-numbering-start-value"
+                />
+              </label>
+            </div>
+
+            {#if numberingValidation !== null}
+              <div class="page__error" role="alert" data-testid="seller-numbering-validation-error">
+                <strong>Template is not yet valid.</strong>
+                <p class="page__error-detail">{numberingErrorMessage(numberingValidation)}</p>
+              </div>
+            {/if}
+
+            {#if numberingSubmitError !== null}
+              <div class="page__error" role="alert">
+                <strong>Could not save numbering template.</strong>
+                <p class="page__error-detail">{numberingSubmitError}</p>
+              </div>
+            {/if}
+
+            {#if numberingSaved}
+              <div class="page__saved" role="status" data-testid="seller-numbering-saved">Saved.</div>
+            {/if}
+
+            <div class="page__actions">
+              <button
+                type="button"
+                class="modal__cancel"
+                onclick={onResetTemplateToDefault}
+                data-testid="seller-numbering-reset-default"
+              >Reset to default</button>
+              <button
+                type="submit"
+                class="page__submit"
+                disabled={numberingSubmitting || numberingValidation !== null}
+                data-testid="seller-numbering-save"
+              >{numberingSubmitting ? "Saving…" : "Save"}</button>
+            </div>
+          </fieldset>
+        </form>
+      {/if}
+    </section>
+
+    <!-- PR-92 / ADR-0047 — SMTP delivery configuration. Non-secrets
+         persist to seller.toml's [seller.smtp] section via the same
+         atomic merge the other settings use; the password lives in the
+         OS keychain and is NEVER round-tripped back to the SPA. -->
+    <section
+      class="page__smtp"
+      aria-labelledby="smtp-title"
+      data-testid="smtp-config-section"
+    >
+      <header class="page__banks-head">
+        <h3 id="smtp-title" class="page__section">
+          SMTP email delivery
+          <span class="page__section-hint">számla küldés vevőnek · TLS-only</span>
+        </h3>
+      </header>
+
+      {#if smtpLoading}
+        <p class="page__muted">Loading SMTP config…</p>
+      {:else if smtpLoadError !== null}
+        <div class="page__error" role="alert">
+          <strong>Could not load SMTP config.</strong>
+          <p class="page__error-detail">{smtpLoadError}</p>
+        </div>
+      {:else}
+        <p class="page__muted" style="margin-bottom: var(--space-3);">
+          A számlákat ezekkel a beállításokkal küldjük el a vevőknek
+          PDF-ben (és opcionálisan NAV XML-ben is). A jelszó a macOS
+          kulcskarikán él, soha nem kerül lemezre vagy logba. Csak
+          TLS — egyszerű (plaintext) SMTP nem konfigurálható. /
+          Invoices are emailed to buyers as PDF (and optionally NAV
+          XML) using these settings. The password lives in the macOS
+          keychain — never on disk, never in logs. TLS-only — plaintext
+          SMTP is not a configurable option.
+        </p>
+
+        <form onsubmit={onSaveSmtp} class="page__form" data-testid="smtp-config-form">
+          <fieldset disabled={smtpSubmitting} class="page__fieldset">
+            <div class="page__columns">
+              <section class="page__column">
+                <label class="field">
+                  <span class="field__label">SMTP host</span>
+                  <input
+                    type="text"
+                    class="field__input"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="smtp.example.com"
+                    bind:value={smtp.host}
+                    data-testid="smtp-host"
+                    required
+                  />
+                </label>
+
+                <label class="field">
+                  <span class="field__label">Port</span>
+                  <input
+                    type="number"
+                    class="field__input"
+                    min="1"
+                    max="65535"
+                    bind:value={smtp.port}
+                    data-testid="smtp-port"
+                    required
+                  />
+                </label>
+
+                <label class="field">
+                  <span class="field__label">Security</span>
+                  <select
+                    class="field__input"
+                    bind:value={smtp.security}
+                    data-testid="smtp-security"
+                  >
+                    <option value="StartTls">STARTTLS (port 587)</option>
+                    <option value="Tls">Implicit TLS (port 465)</option>
+                  </select>
+                </label>
+
+                <label class="field field--checkbox">
+                  <input
+                    type="checkbox"
+                    bind:checked={smtp.attachXml}
+                    data-testid="smtp-attach-xml"
+                  />
+                  <span>
+                    NAV XML csatolása PDF mellé / Attach NAV XML alongside PDF
+                  </span>
+                </label>
+              </section>
+
+              <section class="page__column">
+                <label class="field">
+                  <span class="field__label">From address</span>
+                  <input
+                    type="email"
+                    class="field__input"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="noreply@example.com"
+                    bind:value={smtp.fromAddress}
+                    data-testid="smtp-from-address"
+                    required
+                  />
+                </label>
+
+                <label class="field">
+                  <span class="field__label">From display name (optional)</span>
+                  <input
+                    type="text"
+                    class="field__input"
+                    placeholder="Áben Consulting KFT."
+                    bind:value={smtp.fromDisplayName}
+                    data-testid="smtp-from-display-name"
+                  />
+                </label>
+
+                <label class="field">
+                  <span class="field__label">SMTP username</span>
+                  <input
+                    type="text"
+                    class="field__input"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="usually the same as From address"
+                    bind:value={smtp.username}
+                    data-testid="smtp-username"
+                    required
+                  />
+                </label>
+
+                <label class="field">
+                  <span class="field__label">
+                    SMTP password
+                    {#if smtpPasswordSet}
+                      <span class="field__hint" data-testid="smtp-password-set-indicator">
+                        ✓ jelszó beállítva · password is set in the keychain
+                      </span>
+                    {:else}
+                      <span class="field__hint" data-testid="smtp-password-not-set-indicator">
+                        ⚠ még nincs beállítva · not yet set
+                      </span>
+                    {/if}
+                  </span>
+                  <input
+                    type="password"
+                    class="field__input"
+                    autocomplete="new-password"
+                    spellcheck="false"
+                    placeholder={smtpPasswordSet
+                      ? "leave blank to keep existing password"
+                      : "enter SMTP password to save to keychain"}
+                    bind:value={smtp.password}
+                    data-testid="smtp-password"
+                  />
+                </label>
+              </section>
+            </div>
+
+            {#if smtpSubmitError !== null}
+              <div class="page__error" role="alert">
+                <strong>Could not save SMTP config.</strong>
+                <p class="page__error-detail">{smtpSubmitError}</p>
+              </div>
+            {/if}
+
+            {#if smtpSaved}
+              <div class="page__saved" role="status" data-testid="smtp-config-saved">Saved.</div>
+            {/if}
+
+            <!-- PR-98 — Test connection outcome banner. The test endpoint
+                 NEVER persists anything; the outcome is shown inline and
+                 does NOT toggle smtpSaved (only the Save button does). -->
+            {#if smtpTestError !== null}
+              <div class="page__error" role="alert" data-testid="smtp-test-error">
+                <strong>Could not run the SMTP test.</strong>
+                <p class="page__error-detail">{smtpTestError}</p>
+              </div>
+            {:else if smtpTestOutcome !== null}
+              {#if smtpTestOutcome.outcome === "succeeded"}
+                <div
+                  class="page__saved"
+                  role="status"
+                  data-testid="smtp-test-success"
+                >SMTP test OK — TLS handshake + AUTH + NOOP succeeded.</div>
+              {:else}
+                <div class="page__error" role="alert" data-testid="smtp-test-failure">
+                  <strong>SMTP test failed ({smtpTestOutcome.error_class ?? "other"}).</strong>
+                  {#if smtpTestOutcome.error_detail}
+                    <p class="page__error-detail">{smtpTestOutcome.error_detail}</p>
+                  {/if}
+                </div>
+              {/if}
+            {/if}
+
+            <div class="page__actions">
+              <button
+                type="button"
+                class="page__secondary"
+                disabled={smtpTesting || smtpSubmitting}
+                onclick={onTestSmtp}
+                data-testid="smtp-test-connection"
+              >{smtpTesting ? "Testing…" : "Test connection"}</button>
+              <button
+                type="submit"
+                class="page__submit"
+                disabled={smtpSubmitting || smtpTesting}
+                data-testid="smtp-config-save"
+              >{smtpSubmitting ? "Saving…" : "Save"}</button>
+            </div>
+          </fieldset>
+        </form>
+      {/if}
+    </section>
+
     {#if bankModalOpen}
       <div class="modal" role="dialog" aria-modal="true" aria-labelledby="bank-modal-title">
         <div class="modal__panel">
@@ -803,6 +1478,29 @@
   }
 
   .page__submit:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  /* PR-98 — secondary action button (Test connection). Quieter chrome
+   * than .page__submit so the primary Save action stays visually
+   * dominant; same disabled treatment. */
+  .page__secondary {
+    padding: var(--space-2) var(--space-5);
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    font-size: var(--type-size-sm);
+    cursor: pointer;
+    margin-right: var(--space-2);
+  }
+
+  .page__secondary:hover:not(:disabled) {
+    color: var(--color-text-strong);
+  }
+
+  .page__secondary:disabled {
     opacity: 0.6;
     cursor: not-allowed;
   }

@@ -322,15 +322,33 @@ fn write_party(
     is_seller: bool,
 ) -> i64 {
     text_in(ops, "F1", 7, x, y_top, section_label, MUTED);
-    text(ops, "FB", 13, x, y_top - 16, &party.name);
-    let mut y = y_top - 32;
+    // PR-97 / ADR-0048 (Ervin override 2 / GDPR) — natural-person
+    // buyers may omit BOTH name AND address per Ervin's GDPR posture
+    // (the operator can issue an invoice to a magánszemély without
+    // recording identifying detail beyond the closed-vocab status).
+    // The PDF skips the heavy buyer-name slot when the field is empty
+    // so a PRIVATE_PERSON-with-no-name body renders cleanly without a
+    // blank line. Empty-after-trim is the discriminator (the renderer
+    // is upstream-of-status so it inspects the field rather than
+    // conditioning on the closed-vocab kind).
+    let mut y = if !party.name.trim().is_empty() {
+        text(ops, "FB", 13, x, y_top - 16, &party.name);
+        y_top - 32
+    } else {
+        y_top - 16
+    };
     for line in &party.address_lines {
         text(ops, "F1", 9, x, y, line);
         y -= 11;
     }
     y -= 4;
-    label_value(ops, x, y, "ADÓSZÁM", &party.tax_number);
-    y -= 12;
+    // PR-97 / ADR-0048 — natural-person buyers (PRIVATE_PERSON) carry
+    // no ADÓSZÁM; the printed-PDF skips the label entirely rather than
+    // rendering a "ADÓSZÁM: " line with an empty value.
+    if !party.tax_number.trim().is_empty() {
+        label_value(ops, x, y, "ADÓSZÁM", &party.tax_number);
+        y -= 12;
+    }
     if is_seller {
         if let Some(v) = &party.bank_account_number {
             label_value(ops, x, y, "BANKSZÁMLASZÁM", v);

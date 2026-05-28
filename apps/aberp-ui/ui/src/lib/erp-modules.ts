@@ -118,7 +118,10 @@ export const MODULES: ErpModule[] = [
     label_hu: "Törzsadatok",
     label_en: "Master Data",
     glyph: "¶",
-    routes: [{ id: "partners", label: "Partners" }],
+    routes: [
+      { id: "partners", label: "Partners" },
+      { id: "products", label: "Products" },
+    ],
   },
   {
     id: "settings",
@@ -259,6 +262,7 @@ export function defaultRouteForArea(area: ErpArea): AppRoute | null {
  * (deny-default) — there is no "Other" or "Unknown" bucket. */
 export type MaintenanceTileStatusKind =
   | "PartnerCount"
+  | "ProductCount"
   | "BankAccountCount"
   | "NavCredStatus";
 
@@ -292,6 +296,15 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Ügyfelek és beszállítók kezelése",
     description_en: "Manage customers & vendors",
     statusKind: "PartnerCount",
+  },
+  {
+    moduleId: "master-data",
+    route: "products",
+    label_hu: "Termékek",
+    label_en: "Products",
+    description_hu: "Katalógus: név, mértékegység, ár",
+    description_en: "Catalog: name, unit of measure, price",
+    statusKind: "ProductCount",
   },
   {
     moduleId: "settings",

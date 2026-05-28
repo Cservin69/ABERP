@@ -371,8 +371,18 @@ pub fn allocate_in_tx(
         });
     }
 
-    // ── Resolve series + fiscal_year. PR-4 supports `Never` only;
-    //    the handler rejected Annual before reaching us.
+    // ── Resolve series + fiscal_year.
+    //
+    // PR-90 / ADR-0045 §2 lifts the pre-PR-90 `AnnualResetUnimplemented`
+    // gate: `AnnualOnFiscalYear` keys the bucket on the invoice's
+    // immutable issue-date year (NOT wall-clock — `args.draft.issue_date`
+    // is the same `OffsetDateTime` the caller stamps onto the invoice
+    // row, so the rendered Year segment and the counter's reset-year
+    // agree by construction). The per-`(series_id, fiscal_year)` keying
+    // on `invoice_sequence_state` was already in place from PR-4, so the
+    // new year naturally takes the INSERT branch below and seeds at
+    // `args.start_value`. `Never` keeps fiscal_year=0 (continuous bucket,
+    // pre-PR-90 behaviour, byte-identical for legacy INV-default rows).
     let series = {
         let mut stmt = tx.prepare(
             "SELECT id, code, reset_policy, fiscal_year, created_at
@@ -390,13 +400,17 @@ pub fn allocate_in_tx(
     };
     let fiscal_year: i32 = match series.reset_policy {
         ResetPolicy::Never => 0,
-        ResetPolicy::AnnualOnFiscalYear => {
-            return Err(BillingError::AnnualResetUnimplemented);
-        }
+        ResetPolicy::AnnualOnFiscalYear => args.draft.issue_date.year(),
     };
 
     // ── ADR-0009 §3 step 1+3: read next_number (creating the row at
-    //    1 if absent), then UPDATE to advance.
+    //    `args.start_value` if absent), then UPDATE to advance.
+    //
+    // PR-90 — `args.start_value` is the operator's template seed
+    // (default 1). It is used ONLY on the first INSERT into the bucket;
+    // subsequent allocations into the same bucket read + advance the
+    // stored `next_number`, preserving the §169 gap-free invariant
+    // within each `(series_id, fiscal_year)` bucket.
     let series_id_str = series.id.to_prefixed_string();
     let now_str = now.format(&Rfc3339)?;
     let allocated: u64 = {
@@ -410,15 +424,16 @@ pub fn allocate_in_tx(
             Some(r) => r? as u64,
             None => {
                 // First allocation for this series/fiscal_year — seed
-                // the state row at next_number = 1 (and we are about
-                // to burn 1 and advance to 2 below).
+                // the state row at `start_value` (we are about to burn
+                // `start_value` and advance to `start_value + 1` below).
+                let seed = args.start_value.max(1);
                 tx.execute(
                     "INSERT INTO invoice_sequence_state
                      (series_id, fiscal_year, next_number, updated_at)
-                     VALUES (?, ?, 1, ?);",
-                    params![&series_id_str, fiscal_year, &now_str],
+                     VALUES (?, ?, ?, ?);",
+                    params![&series_id_str, fiscal_year, seed as i64, &now_str],
                 )?;
-                1
+                seed
             }
         }
     };
@@ -680,6 +695,21 @@ impl BillingStore for DuckDbBillingStore {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
         }
+    }
+
+    fn update_series_reset_policy(
+        &mut self,
+        id: SeriesId,
+        policy: ResetPolicy,
+    ) -> Result<(), BillingError> {
+        let changed = self.conn.execute(
+            "UPDATE invoice_series SET reset_policy = ? WHERE id = ?;",
+            params![reset_policy_to_str(policy), id.to_prefixed_string()],
+        )?;
+        if changed != 1 {
+            return Err(BillingError::SeriesNotFound(id.to_prefixed_string()));
+        }
+        Ok(())
     }
 
     fn allocate_and_insert(

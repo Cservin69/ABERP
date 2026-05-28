@@ -59,7 +59,7 @@ use aberp_mnb_rates::{MnbError, MnbRate, SOURCE as MNB_SOURCE};
 use aberp_nav_transport::NavCredentials;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use duckdb::Connection;
+use duckdb::{params, Connection};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -193,18 +193,44 @@ pub struct AddressJson {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CustomerJson {
+    /// PR-97 / ADR-0048 — closed-vocab buyer-kind discriminant on the
+    /// wire body. Pre-PR-97 bodies omit the field; `#[serde(default)]`
+    /// maps the absence to `Domestic` (the pre-PR-97 implicit posture)
+    /// so storno / modification chains on pre-PR-97 bases continue to
+    /// emit Domestic wire bodies. Persisted onto the
+    /// `InvoiceDraftCreated` audit payload verbatim so the
+    /// tamper-evident trail records the as-of-issuance choice.
+    #[serde(default, rename = "vatStatus")]
+    pub vat_status: crate::nav_xml::CustomerVatStatus,
+    /// PR-97 / ADR-0048 (Ervin override 1) — saved-partner id when
+    /// the SPA's operator picked a buyer via the typeahead. `None`
+    /// for one-off buyers (operator typed a name without selecting)
+    /// and for CLI callers. When `Some(_)`, the issue path increments
+    /// `partners.issued_invoice_count` so subsequent reads return
+    /// `has_issued_invoices: true` and the PartnerForm locks the two
+    /// intrinsic-identity fields (`tax_number` +
+    /// `customer_vat_status`). Storno / modification chain paths do
+    /// NOT increment — the base's increment was already booked.
+    #[serde(default, rename = "partnerId")]
+    pub partner_id: Option<String>,
+    /// PR-97 / ADR-0048 — the field is empty-string for PrivatePerson
+    /// buyers (the SPA sends the disabled-input's empty value
+    /// verbatim). Preflight switches on `vat_status` to enforce the
+    /// per-status invariant (required-when-Domestic,
+    /// forbidden-when-PrivatePerson). Held as `String` (not
+    /// `Option<String>`) on the wire so pre-PR-97 fixtures + CLI
+    /// callers that emit `""` still deserialise unchanged.
     #[serde(rename = "taxNumber")]
     pub tax_number: String,
     pub name: String,
     /// PR-77 / session-101 — NAV business-rule `CUSTOMER_DATA_EXPECTED`
     /// requires a full `<customerAddress>` block whenever
-    /// `customerVatStatus != PRIVATE_PERSON`. The SPA populates this
-    /// field from the operator-selected partner record (PR-54 buyer
-    /// combobox); CLI callers can supply it directly. Optional on the
-    /// wire so pre-PR-77 side-stored `input.json` files still
-    /// deserialize — but the issuance pipeline now refuses any DOMESTIC
-    /// invoice without it (preflight `CustomerAddressMissing` + the
-    /// validator's customerVatStatus-aware required-children rule).
+    /// `customerVatStatus != PRIVATE_PERSON`. PR-97 / ADR-0048 — the
+    /// gate is now CONDITIONAL on `vat_status`: required-when-Domestic;
+    /// optional-when-PrivatePerson (the printed PDF still wants it but
+    /// the NAV wire layer does not). The SPA populates this field from
+    /// the operator-selected partner record (PR-54 buyer combobox);
+    /// CLI callers can supply it directly.
     #[serde(default)]
     pub address: Option<AddressJson>,
 }
@@ -475,8 +501,25 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         "ADR-0031 §5 cap check passed"
     );
 
-    // 5–6. Pre-tx setup: schemas + series.
-    let (conn, series) = pre_tx_setup(db, &series_code)?;
+    // 5a. PR-90 / ADR-0045 §2 — resolve the operator's numbering
+    //     template once. Used immediately to thread the desired
+    //     `reset_policy` into `ensure_series` (so the series row's
+    //     policy reflects the operator's choice) AND retained to render
+    //     the invoice number after the tx commits (avoids a second
+    //     seller.toml read). Loud-fail on parse error: the template
+    //     drives both fiscal-year bucketing and the rendered number,
+    //     so silently falling back to the default would be a
+    //     CLAUDE.md rule 12 violation.
+    let seller_toml_path = crate::setup_seller_info::seller_toml_path_for_tenant(tenant_str)
+        .context("resolve seller.toml path for numbering template")?;
+    let template = crate::numbering::read_numbering_template(&seller_toml_path)
+        .context("read [seller.numbering] template from seller.toml")?;
+
+    // 5–6. Pre-tx setup: schemas + series. PR-90 — `ensure_series` syncs
+    //      the row's `reset_policy` to the template's choice; on a
+    //      mid-stream Never → OnYearChange flip the next allocation
+    //      lands in the issue-year bucket (gap-free within each year).
+    let (conn, series) = pre_tx_setup(db, &series_code, template.reset_policy.to_billing())?;
 
     // 7. Build IssueInvoiceCommand + AllocateArgs for the tx body.
     let command = build_command(&input, &series_code)?;
@@ -542,6 +585,15 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         // `with_notes` builder stamps the same value below so the
         // operator-twin's record of "what was issued" is complete.
         invoice_note: input.invoice_note.clone(),
+        // PR-90 / ADR-0045 §2 — operator-configured counter seed.
+        // Applied only on the first INSERT of any
+        // `(series_id, fiscal_year)` bucket; subsequent allocations
+        // increment from the stored `next_number`. For Ervin's day-one
+        // template (start_value = 1) this is the §169 conventional
+        // start; for migration scenarios (continuing an external
+        // sequence at e.g. 1247) the first invoice of the bucket
+        // begins at that value.
+        start_value: template.start_value,
     };
 
     // 8. One transaction across the billing writes and audit appends.
@@ -575,6 +627,14 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         // calendar dates so an inspector can reconstruct the
         // comfort-zone classification independently.
         input.delivery_date_override.clone(),
+        // PR-97 / ADR-0048 — pass the operator's buyer-kind discriminator
+        // through to the audit payload builder so the tamper-evident
+        // trail captures the as-of-issuance value verbatim.
+        input.customer.vat_status,
+        // PR-97 / ADR-0048 (Ervin override 1) — pass the saved-partner
+        // id (when present on the wire body) for the counter
+        // increment that drives the PartnerForm field-selective lock.
+        input.customer.partner_id.clone(),
     )?;
 
     let invoice = outcome.invoice;
@@ -626,16 +686,31 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
             address_street: input.supplier.address.street,
         },
         customer: CustomerInfo {
-            tax_number: input.customer.tax_number,
+            // PR-97 / ADR-0048 — closed-vocab buyer-kind threaded
+            // from wire body through to NAV emit. Preflight gates the
+            // per-status invariants upstream; the emitter conditions
+            // `<customerVatData>` emission on this value.
+            customer_vat_status: input.customer.vat_status,
+            // PR-97 / ADR-0048 — `Option<String>`. Empty-after-trim
+            // collapses to `None` so PrivatePerson bodies that arrive
+            // with an empty-string tax_number do not synthesise a
+            // malformed `<customerVatData>` block downstream.
+            tax_number: {
+                let trimmed = input.customer.tax_number.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            },
             name: input.customer.name,
-            // PR-77 / session-101 — `<customerAddress>` is required for any
-            // DOMESTIC (non-PRIVATE_PERSON) customerVatStatus. The wire
-            // body's `customer.address` is `Option<_>` so pre-PR-77
-            // CLI-issued bodies still parse; the preflight in
-            // `serve.rs::issue_invoice_request` fires
-            // `CustomerAddressMissing` when an address is required but
-            // absent so the operator surfaces the gap BEFORE the
-            // sequence is burned.
+            // PR-77 / session-101 — `<customerAddress>` is required for
+            // DOMESTIC (non-PRIVATE_PERSON) customerVatStatus and
+            // optional for PrivatePerson per ADR-0048. The wire body's
+            // `customer.address` is `Option<_>` so pre-PR-77 CLI-issued
+            // bodies still parse; preflight gates the
+            // required-when-Domestic case BEFORE the sequence is
+            // burned.
             address: input.customer.address.map(|a| CustomerAddress {
                 country_code: a.country_code,
                 postal_code: a.postal_code,
@@ -644,12 +719,20 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
             }),
         },
     };
-    let xml = nav_xml::render_invoice_data(
+    // PR-89 + PR-90 — render the invoice number from the template we
+    // resolved at pre-tx setup. The issue-date year drives BOTH the
+    // rendered Year segment AND (under OnYearChange) the counter's
+    // reset-year bucket — by construction they cannot disagree.
+    let issue_year = invoice.issue_date.year();
+    let invoice_number = template.render(issue_year, invoice.sequence_number);
+
+    let xml = nav_xml::render_invoice_data_with_number(
         &invoice,
         &series_code,
         &parties,
         currency,
         rate_metadata.as_ref(),
+        Some(&invoice_number),
     )
     .context("render NAV XML")?;
     // PR-9-0 / ADR-0022: runtime <InvoiceData> v3.0 invariant check
@@ -671,7 +754,6 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     nav_xml::write_to_path(&nav_xml_out, &xml)?;
     tracing::info!(path = %nav_xml_out.display(), bytes = xml.len(), "NAV XML written");
 
-    let invoice_number = format!("{}/{:05}", series_code.as_str(), invoice.sequence_number);
     tracing::info!(
         invoice_number = %invoice_number,
         entries_verified = verified,
@@ -712,36 +794,63 @@ pub struct IssuedInvoiceSummary {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Open the tenant DB, run idempotent schema creation for both crates,
-/// and ensure the requested series exists. Returns the Connection
-/// (handed back from the billing store via `into_connection`) and the
-/// resolved `InvoiceSeries`. No allocation occurs here; ADR-0008
-/// §Storage's transactional contract is engaged in `run_single_tx`.
-fn pre_tx_setup(db_path: &Path, series_code: &SeriesCode) -> Result<(Connection, InvoiceSeries)> {
+/// and ensure the requested series exists with the operator's chosen
+/// `reset_policy`. Returns the Connection (handed back from the billing
+/// store via `into_connection`) and the resolved `InvoiceSeries`. No
+/// allocation occurs here; ADR-0008 §Storage's transactional contract is
+/// engaged in `run_single_tx`.
+fn pre_tx_setup(
+    db_path: &Path,
+    series_code: &SeriesCode,
+    template_reset_policy: ResetPolicy,
+) -> Result<(Connection, InvoiceSeries)> {
     let mut billing = DuckDbBillingStore::open(db_path)
         .with_context(|| format!("open billing DuckDB at {}", db_path.display()))?;
     billing.ensure_schema().context("ensure billing schema")?;
-    let series = ensure_series(&mut billing, series_code)?;
+    let series = ensure_series(&mut billing, series_code, template_reset_policy)?;
     let conn = billing.into_connection();
     audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema")?;
     Ok((conn, series))
 }
 
+/// PR-90 / ADR-0045 §2 — auto-create the series with the template's
+/// `reset_policy` when absent; sync the existing series row's policy
+/// when it diverges from the template (operator flipped Never →
+/// OnYearChange in Tenant Settings after the row was created with the
+/// pre-PR-89 Never default). Idempotent: same-policy is a no-op.
 fn ensure_series<S: BillingStore + ?Sized>(
     store: &mut S,
     code: &SeriesCode,
+    template_reset_policy: ResetPolicy,
 ) -> Result<InvoiceSeries> {
-    if let Some(series) = store.find_series_by_code(code)? {
+    if let Some(mut series) = store.find_series_by_code(code)? {
+        if series.reset_policy != template_reset_policy {
+            tracing::info!(
+                series = code.as_str(),
+                from = ?series.reset_policy,
+                to = ?template_reset_policy,
+                "syncing series.reset_policy to template choice (PR-90)"
+            );
+            store
+                .update_series_reset_policy(series.id, template_reset_policy)
+                .context("sync series.reset_policy to template")?;
+            series.reset_policy = template_reset_policy;
+        }
         return Ok(series);
     }
     let series = InvoiceSeries {
         id: SeriesId::new(),
         code: code.clone(),
-        reset_policy: ResetPolicy::Never,
+        reset_policy: template_reset_policy,
         fiscal_year: None,
         created_at: OffsetDateTime::now_utc(),
     };
     store.create_series(&series).context("create series")?;
-    tracing::info!(series = code.as_str(), "auto-created series");
+    tracing::info!(
+        series = code.as_str(),
+        reset_policy = ?template_reset_policy,
+        "auto-created series"
+    );
     Ok(series)
 }
 
@@ -793,6 +902,19 @@ fn run_single_tx(
     // builder so the audit row carries the full triple
     // (invoice_date + payment_deadline + delivery_date + override).
     delivery_date_override: Option<String>,
+    // PR-97 / ADR-0048 — operator's closed-vocab buyer-kind discriminator
+    // from the wire body's `customer.vat_status`. Stamped onto the
+    // `InvoiceDraftCreated` audit payload via `with_customer_vat_status`
+    // so the tamper-evident regulatory trail records the choice
+    // as-of-issuance.
+    customer_vat_status: crate::nav_xml::CustomerVatStatus,
+    // PR-97 / ADR-0048 (Ervin override 1) — saved-partner id when
+    // the SPA picked a buyer via typeahead. When `Some(_)` the issue
+    // path increments `partners.issued_invoice_count` IN THE SAME TX
+    // so the PartnerForm's field-selective lock activates on the next
+    // partner read AND so a rolled-back issuance doesn't leave a
+    // stale counter. `None` for one-off buyers + CLI callers.
+    customer_partner_id: Option<String>,
 ) -> Result<TxOutcome> {
     let tx = conn
         .transaction()
@@ -881,7 +1003,9 @@ fn run_single_tx(
         // carries the operator's SPA-form comfort-zone discriminant
         // verbatim (None for in-range, Some("BeforeInvoiceDate") /
         // Some("AfterPaymentDeadline") for confirmed out-of-range).
-        .with_invoice_dates(&invoice, delivery_date_override.as_deref());
+        .with_invoice_dates(&invoice, delivery_date_override.as_deref())
+        // PR-97 / ADR-0048 — stamp the buyer-kind discriminator.
+        .with_customer_vat_status(customer_vat_status);
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
@@ -891,6 +1015,28 @@ fn run_single_tx(
             Some(idem_str),
         )
         .context("audit_ledger::append_in_tx InvoiceDraftCreated")?;
+
+        // PR-97 / ADR-0048 (Ervin override 1) — increment the partner's
+        // `issued_invoice_count` in the SAME tx. A rolled-back issuance
+        // unwinds the counter alongside the billing + audit writes.
+        // No-op when the wire body did not carry a `partnerId` (one-off
+        // buyer or CLI caller). Idempotent across replays because the
+        // outer `was_fresh` guard skips this branch on replay.
+        //
+        // Direct `tx.execute` instead of the
+        // `partners::increment_issued_invoice_count` helper because
+        // that helper opens its own ensure_schema + execute on a
+        // `Connection`, not a `Transaction`. The partners table is
+        // in the same tenant DB; `tx.execute` is the tx-friendly call.
+        if let Some(partner_id) = customer_partner_id.as_deref() {
+            tx.execute(
+                "UPDATE partners
+                    SET issued_invoice_count = issued_invoice_count + 1
+                    WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL;",
+                params![ledger_meta.tenant_id().as_str(), partner_id],
+            )
+            .context("UPDATE partners SET issued_invoice_count (PR-97 / ADR-0048)")?;
+        }
     } else {
         tracing::info!("replay path: no new audit entries written");
     }

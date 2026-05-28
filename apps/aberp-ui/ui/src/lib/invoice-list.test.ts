@@ -17,14 +17,21 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  EMPTY_FILTER,
   PARTNER_COLUMN_EM_DASH,
   buyerColumnDisplay,
+  compareInvoices,
+  filterInvoices,
+  isFilterEmpty,
   quickActionMeta,
   quickActionsForState,
+  type InvoiceFilterSpec,
+  type InvoiceSortRow,
   type RowQuickAction,
+  type SortKey,
 } from "./invoice-list";
 import { buttonsForState } from "./invoice-actions";
-import type { InvoiceState } from "./api";
+import type { Currency, InvoiceState } from "./api";
 
 // ── buyerColumnDisplay ──────────────────────────────────────────
 
@@ -75,14 +82,16 @@ interface QuickActionExpectation {
 
 // The eleven InvoiceState labels per ADR-0036 §2, with the
 // row-quick-action subset of each state's detail-modal vocab. PR-65
-// surfaces only Download / Submit / Storno at the row level — PollAck
-// and Modification stay detail-modal-only by design (Modification
-// opens a fresh form; PollAck benefits from the modal's larger error
-// surface during the bounded 31s loop).
+// surfaces only Download / Submit / Storno at the row level —
+// Modification stays detail-modal-only by design (it opens a fresh
+// form). PR-95 / session-115 — the poll affordance moved off the
+// button surface entirely onto the NAV-status pictogram in the
+// state column, so the row's quick-action column never carries it.
 const QUICK_ACTION_TABLE: QuickActionExpectation[] = [
   // Ready — operator can submit OR download.
   { state: "Ready", actions: ["Download", "Submit"] },
-  // Submitted — PollAck is detail-modal-only; row keeps Download.
+  // Submitted — pictogram (state column) carries the poll affordance;
+  // row's quick-action column keeps Download only.
   { state: "Submitted", actions: ["Download"] },
   // PendingNavExists — same posture as Submitted at the row level.
   { state: "PendingNavExists", actions: ["Download"] },
@@ -154,8 +163,8 @@ describe("quickActionsForState", () => {
   });
 
   it("row-level quick actions are a strict subset of buttonsForState", () => {
-    // Mirror invariant: the row vocab is narrow by design (PollAck +
-    // Modification stay detail-modal-only). A regression that
+    // Mirror invariant: the row vocab is narrow by design
+    // (Modification stays detail-modal-only). A regression that
     // surfaced a button at the row level which the detail modal
     // refused to render would diverge two surfaces operators expect
     // to agree.
@@ -170,17 +179,20 @@ describe("quickActionsForState", () => {
     }
   });
 
-  it("never surfaces PollAck or Modification at the row level", () => {
+  it("never surfaces Modification at the row level", () => {
     // Counter-pin: a future refactor that widened RowQuickAction to
-    // include PollAck or Modification would break the brief's
-    // explicit row vocab (`📄 PDF / ↗ Submit / ⊘ Storno`). The
-    // module's exported type already excludes both at compile time;
-    // this assertion catches a runtime regression that bypassed the
-    // type.
+    // include Modification would break the brief's explicit row
+    // vocab (`📄 PDF / ↗ Submit / 💰 Pay / ⊘ Storno`). The module's
+    // exported type already excludes it at compile time; this
+    // assertion catches a runtime regression that bypassed the type.
+    // (PR-95 dropped PollAck from the wider button vocab entirely;
+    // there is nothing to counter-pin for it here any more.)
     for (const { state, actions } of QUICK_ACTION_TABLE) {
       const widened = actions as readonly string[];
-      expect(widened.includes("PollAck"), `state=${state} must not include PollAck`).toBe(false);
-      expect(widened.includes("Modification"), `state=${state} must not include Modification`).toBe(false);
+      expect(
+        widened.includes("Modification"),
+        `state=${state} must not include Modification`,
+      ).toBe(false);
     }
   });
 
@@ -274,5 +286,451 @@ describe("quickActionMeta", () => {
       glyph: "💰",
       label: "Mark as paid",
     });
+  });
+});
+
+// ── PR-94 / session-114 — sortable columns + facet filter ───────
+//
+// Pin discipline:
+//   - Per column + both directions (asc/desc).
+//   - Ties broken by invoice_id ascending, regardless of dir.
+//   - Nulls last for the optional columns (partner, total), regardless
+//     of dir.
+//   - Each facet + combinations; needle still works through the
+//     composed helper.
+
+function row(
+  partial: Partial<InvoiceSortRow> & { invoice_id: string },
+): InvoiceSortRow {
+  return {
+    sequence_number: 1,
+    fiscal_year: 2026,
+    state: "Ready",
+    total_gross: 1000,
+    buyer_name: null,
+    currency: "HUF",
+    ...partial,
+  };
+}
+
+describe("compareInvoices — invoice_id column", () => {
+  it("sorts ascending by ULID lex order", () => {
+    const rows = [
+      row({ invoice_id: "01J0C" }),
+      row({ invoice_id: "01J0A" }),
+      row({ invoice_id: "01J0B" }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "invoice_id", "asc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["01J0A", "01J0B", "01J0C"]);
+  });
+  it("sorts descending by ULID lex order", () => {
+    const rows = [
+      row({ invoice_id: "01J0C" }),
+      row({ invoice_id: "01J0A" }),
+      row({ invoice_id: "01J0B" }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "invoice_id", "desc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["01J0C", "01J0B", "01J0A"]);
+  });
+});
+
+describe("compareInvoices — invoice_number column", () => {
+  it("orders by fiscal_year then sequence_number ascending", () => {
+    // The composed `YYYY-NNNNNN` is operator-meaningful; the tuple
+    // compare (year, seq) is the load-bearing contract, NOT lex on
+    // the composed string. Mixing fiscal years exercises the year-
+    // first arm.
+    const rows = [
+      row({ invoice_id: "B", fiscal_year: 2026, sequence_number: 1 }),
+      row({ invoice_id: "A", fiscal_year: 2025, sequence_number: 999 }),
+      row({ invoice_id: "C", fiscal_year: 2026, sequence_number: 2 }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "invoice_number", "asc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["A", "B", "C"]);
+  });
+  it("descending flips the natural order", () => {
+    const rows = [
+      row({ invoice_id: "B", fiscal_year: 2026, sequence_number: 1 }),
+      row({ invoice_id: "A", fiscal_year: 2025, sequence_number: 999 }),
+      row({ invoice_id: "C", fiscal_year: 2026, sequence_number: 2 }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "invoice_number", "desc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["C", "B", "A"]);
+  });
+});
+
+describe("compareInvoices — partner column", () => {
+  it("sorts non-null partners alphabetically (locale-aware)", () => {
+    const rows = [
+      row({ invoice_id: "C", buyer_name: "Charlie Kft." }),
+      row({ invoice_id: "A", buyer_name: "Alpha Kft." }),
+      row({ invoice_id: "B", buyer_name: "Bravo Kft." }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "partner", "asc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["A", "B", "C"]);
+  });
+  it("places null partner rows AFTER named rows in ascending dir", () => {
+    const rows = [
+      row({ invoice_id: "Z", buyer_name: null }),
+      row({ invoice_id: "A", buyer_name: "Alpha Kft." }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "partner", "asc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["A", "Z"]);
+  });
+  it("places null partner rows AFTER named rows in descending dir too", () => {
+    // Nulls-last regardless of direction — spreadsheet convention.
+    // A regression that flipped null-side with dir would shuffle the
+    // em-dash cluster to the TOP on a desc click, breaking the
+    // operator's mental model that 'descending = same data, reversed'.
+    const rows = [
+      row({ invoice_id: "Z", buyer_name: null }),
+      row({ invoice_id: "A", buyer_name: "Alpha Kft." }),
+      row({ invoice_id: "B", buyer_name: "Bravo Kft." }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "partner", "desc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["B", "A", "Z"]);
+  });
+  it("treats blank-or-whitespace partner as null for sort purposes", () => {
+    // Mirror of `buyerColumnDisplay`'s fallback contract.
+    const rows = [
+      row({ invoice_id: "Y", buyer_name: "   " }),
+      row({ invoice_id: "Z", buyer_name: "" }),
+      row({ invoice_id: "A", buyer_name: "Alpha Kft." }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "partner", "asc"));
+    // Blank and empty both treated as null → sort to bottom; their
+    // relative order goes to the invoice_id tiebreaker (Y < Z).
+    expect(rows.map((r) => r.invoice_id)).toEqual(["A", "Y", "Z"]);
+  });
+});
+
+describe("compareInvoices — series_number column", () => {
+  it("sorts numerically ascending (not lex)", () => {
+    // A regression that compared as strings would order 1 < 10 < 2;
+    // the numeric sort must put 2 between 1 and 10.
+    const rows = [
+      row({ invoice_id: "C", sequence_number: 10 }),
+      row({ invoice_id: "A", sequence_number: 1 }),
+      row({ invoice_id: "B", sequence_number: 2 }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "series_number", "asc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["A", "B", "C"]);
+  });
+  it("descending reverses the numeric order", () => {
+    const rows = [
+      row({ invoice_id: "C", sequence_number: 10 }),
+      row({ invoice_id: "A", sequence_number: 1 }),
+      row({ invoice_id: "B", sequence_number: 2 }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "series_number", "desc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["C", "B", "A"]);
+  });
+});
+
+describe("compareInvoices — fiscal_year column", () => {
+  it("sorts ascending then descending numerically", () => {
+    const rows = [
+      row({ invoice_id: "C", fiscal_year: 2026 }),
+      row({ invoice_id: "A", fiscal_year: 2024 }),
+      row({ invoice_id: "B", fiscal_year: 2025 }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "fiscal_year", "asc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["A", "B", "C"]);
+    rows.sort((a, b) => compareInvoices(a, b, "fiscal_year", "desc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["C", "B", "A"]);
+  });
+});
+
+describe("compareInvoices — state column", () => {
+  it("sorts by LIFECYCLE_ORDER ascending (Unknown → Abandoned)", () => {
+    // Mirrors `labels.ts::LIFECYCLE_ORDER`. A regression that fell
+    // through to alphabetical would put `Abandoned` before
+    // `Amended` before `Finalized` — the exact bucket the
+    // lifecycle-natural sort exists to avoid.
+    const rows = [
+      row({ invoice_id: "D", state: "Abandoned" }),
+      row({ invoice_id: "A", state: "Ready" }),
+      row({ invoice_id: "C", state: "Storno" }),
+      row({ invoice_id: "B", state: "Finalized" }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "state", "asc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["A", "B", "C", "D"]);
+  });
+  it("sorts by LIFECYCLE_ORDER descending (Abandoned → Unknown)", () => {
+    const rows = [
+      row({ invoice_id: "D", state: "Abandoned" }),
+      row({ invoice_id: "A", state: "Ready" }),
+      row({ invoice_id: "C", state: "Storno" }),
+      row({ invoice_id: "B", state: "Finalized" }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "state", "desc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["D", "C", "B", "A"]);
+  });
+});
+
+describe("compareInvoices — total column", () => {
+  it("sorts by total_gross numerically by minor units (not string lex)", () => {
+    // The load-bearing pin per the brief: "numeric total by minor-units
+    // not string". A regression that compared total_gross as a string
+    // would put "1000" < "9" — the bug the brief explicitly names.
+    const rows = [
+      row({ invoice_id: "C", total_gross: 1000 }),
+      row({ invoice_id: "A", total_gross: 9 }),
+      row({ invoice_id: "B", total_gross: 100 }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "total", "asc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["A", "B", "C"]);
+  });
+  it("descending reverses numeric order", () => {
+    const rows = [
+      row({ invoice_id: "C", total_gross: 1000 }),
+      row({ invoice_id: "A", total_gross: 9 }),
+      row({ invoice_id: "B", total_gross: 100 }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "total", "desc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["C", "B", "A"]);
+  });
+  it("places null totals AFTER non-null in both directions", () => {
+    // Null-total = draft with no amount; spreadsheet-convention
+    // nulls-last regardless of dir. Operator's mental model: meaningful
+    // values cluster at the top; draftless rows fall through.
+    const rowsAsc = [
+      row({ invoice_id: "Z", total_gross: null }),
+      row({ invoice_id: "A", total_gross: 9 }),
+    ];
+    rowsAsc.sort((a, b) => compareInvoices(a, b, "total", "asc"));
+    expect(rowsAsc.map((r) => r.invoice_id)).toEqual(["A", "Z"]);
+    const rowsDesc = [
+      row({ invoice_id: "Z", total_gross: null }),
+      row({ invoice_id: "A", total_gross: 9 }),
+      row({ invoice_id: "B", total_gross: 1000 }),
+    ];
+    rowsDesc.sort((a, b) => compareInvoices(a, b, "total", "desc"));
+    expect(rowsDesc.map((r) => r.invoice_id)).toEqual(["B", "A", "Z"]);
+  });
+});
+
+describe("compareInvoices — ties + stability", () => {
+  it("breaks ties by invoice_id ascending regardless of dir", () => {
+    // Three rows with identical sort key + dir asc → invoice_id asc.
+    const ascRows = [
+      row({ invoice_id: "C", sequence_number: 5 }),
+      row({ invoice_id: "A", sequence_number: 5 }),
+      row({ invoice_id: "B", sequence_number: 5 }),
+    ];
+    ascRows.sort((a, b) => compareInvoices(a, b, "series_number", "asc"));
+    expect(ascRows.map((r) => r.invoice_id)).toEqual(["A", "B", "C"]);
+    // Same ties + dir desc → invoice_id ASC (tiebreaker NEVER flips).
+    // A regression that flipped the tiebreaker would re-shuffle the
+    // operator's display on every dir toggle for tied rows.
+    const descRows = [
+      row({ invoice_id: "C", sequence_number: 5 }),
+      row({ invoice_id: "A", sequence_number: 5 }),
+      row({ invoice_id: "B", sequence_number: 5 }),
+    ];
+    descRows.sort((a, b) => compareInvoices(a, b, "series_number", "desc"));
+    expect(descRows.map((r) => r.invoice_id)).toEqual(["A", "B", "C"]);
+  });
+});
+
+describe("compareInvoices — coverage", () => {
+  it("covers every SortKey vocab member", () => {
+    // Exhaustiveness counter-pin: a future SortKey member must add a
+    // switch arm in `compareInvoices` (TS-enforced) AND show up here
+    // (runtime-enforced). The two-layer pin matches the LIFECYCLE_ORDER
+    // / LABELS guard in labels.ts.
+    const keys: SortKey[] = [
+      "invoice_id",
+      "invoice_number",
+      "partner",
+      "series_number",
+      "fiscal_year",
+      "state",
+      "total",
+    ];
+    const sample = [
+      row({ invoice_id: "A" }),
+      row({ invoice_id: "B" }),
+    ];
+    for (const k of keys) {
+      // No throw + a number result for each key on a 2-row corpus.
+      const c = compareInvoices(sample[0], sample[1], k, "asc");
+      expect(typeof c).toBe("number");
+    }
+  });
+});
+
+// ── filterInvoices ─────────────────────────────────────────────
+
+function frow(
+  partial: Partial<InvoiceSortRow> & { invoice_id: string },
+): InvoiceSortRow {
+  return row(partial);
+}
+
+const FIXTURES: InvoiceSortRow[] = [
+  frow({
+    invoice_id: "01R001",
+    sequence_number: 1,
+    fiscal_year: 2026,
+    state: "Ready",
+    total_gross: 1000,
+    buyer_name: "Alpha Kft.",
+    currency: "HUF",
+  }),
+  frow({
+    invoice_id: "01F002",
+    sequence_number: 2,
+    fiscal_year: 2026,
+    state: "Finalized",
+    total_gross: 5000,
+    buyer_name: "Bravo Kft.",
+    currency: "HUF",
+  }),
+  frow({
+    invoice_id: "01E003",
+    sequence_number: 3,
+    fiscal_year: 2026,
+    state: "Finalized",
+    total_gross: 10000,
+    buyer_name: "Charlie Kft.",
+    currency: "EUR",
+  }),
+  frow({
+    invoice_id: "01S004",
+    sequence_number: 4,
+    fiscal_year: 2026,
+    state: "Storno",
+    total_gross: 5000,
+    buyer_name: "Delta Kft.",
+    currency: "HUF",
+  }),
+];
+
+describe("filterInvoices — facet gating", () => {
+  it("returns every row when every facet is open (EMPTY_FILTER)", () => {
+    const out = filterInvoices(FIXTURES, EMPTY_FILTER);
+    expect(out.length).toBe(FIXTURES.length);
+    expect(out.map((r) => r.invoice_id)).toEqual([
+      "01R001",
+      "01F002",
+      "01E003",
+      "01S004",
+    ]);
+  });
+  it("state facet narrows to matching state only", () => {
+    const out = filterInvoices(FIXTURES, {
+      needle: "",
+      state: "Finalized",
+      currency: "All",
+    });
+    expect(out.map((r) => r.invoice_id)).toEqual(["01F002", "01E003"]);
+  });
+  it("currency facet narrows to matching currency only", () => {
+    const out = filterInvoices(FIXTURES, {
+      needle: "",
+      state: "All",
+      currency: "EUR",
+    });
+    expect(out.map((r) => r.invoice_id)).toEqual(["01E003"]);
+  });
+  it("state + currency facets AND together", () => {
+    const out = filterInvoices(FIXTURES, {
+      needle: "",
+      state: "Finalized",
+      currency: "HUF",
+    });
+    // Finalized AND HUF — only 01F002 qualifies (01E003 is Finalized
+    // but EUR).
+    expect(out.map((r) => r.invoice_id)).toEqual(["01F002"]);
+  });
+  it("needle ANDs with both facets", () => {
+    // Needle "alpha" matches buyer_name "Alpha Kft." (Ready/HUF). When
+    // facets gate to Finalized/HUF, the needle has no match → empty.
+    const noMatch = filterInvoices(FIXTURES, {
+      needle: "alpha",
+      state: "Finalized",
+      currency: "HUF",
+    });
+    expect(noMatch.length).toBe(0);
+    // Same needle with All facets surfaces the Alpha row.
+    const match = filterInvoices(FIXTURES, {
+      needle: "alpha",
+      state: "All",
+      currency: "All",
+    });
+    expect(match.map((r) => r.invoice_id)).toEqual(["01R001"]);
+  });
+  it("needle finds composed invoice number across facets", () => {
+    // PR-68 contract — substring search across composed `YYYY-NNNNNN`.
+    const out = filterInvoices(FIXTURES, {
+      needle: "2026-000002",
+      state: "All",
+      currency: "All",
+    });
+    expect(out.map((r) => r.invoice_id)).toEqual(["01F002"]);
+  });
+});
+
+describe("filterInvoices — every currency facet value passes through", () => {
+  // Counter-pin per CLAUDE.md rule 9 — a regression collapsing the
+  // currency arm to always-true (or always-false) would slip through
+  // a single-fixture test. Probe each Currency value individually.
+  const cases: Array<{ currency: Currency; expected: string[] }> = [
+    { currency: "HUF", expected: ["01R001", "01F002", "01S004"] },
+    { currency: "EUR", expected: ["01E003"] },
+  ];
+  for (const c of cases) {
+    it(`currency=${c.currency} surfaces only matching rows`, () => {
+      const out = filterInvoices(FIXTURES, {
+        needle: "",
+        state: "All",
+        currency: c.currency,
+      });
+      expect(out.map((r) => r.invoice_id)).toEqual(c.expected);
+    });
+  }
+});
+
+describe("filterInvoices — needle does not bypass the facets", () => {
+  it("needle 'finalized' alone surfaces both Finalized rows", () => {
+    const spec: InvoiceFilterSpec = {
+      needle: "finalized",
+      state: "All",
+      currency: "All",
+    };
+    const out = filterInvoices(FIXTURES, spec);
+    expect(out.map((r) => r.invoice_id)).toEqual(["01F002", "01E003"]);
+  });
+  it("but a currency facet still narrows the needle hits", () => {
+    const spec: InvoiceFilterSpec = {
+      needle: "finalized",
+      state: "All",
+      currency: "EUR",
+    };
+    const out = filterInvoices(FIXTURES, spec);
+    expect(out.map((r) => r.invoice_id)).toEqual(["01E003"]);
+  });
+});
+
+describe("isFilterEmpty", () => {
+  it("returns true for the EMPTY_FILTER constant", () => {
+    expect(isFilterEmpty(EMPTY_FILTER)).toBe(true);
+  });
+  it("returns true for whitespace-only needle + All facets", () => {
+    expect(
+      isFilterEmpty({ needle: "   ", state: "All", currency: "All" }),
+    ).toBe(true);
+  });
+  it("returns false when any facet is engaged", () => {
+    expect(
+      isFilterEmpty({ needle: "x", state: "All", currency: "All" }),
+    ).toBe(false);
+    expect(
+      isFilterEmpty({ needle: "", state: "Finalized", currency: "All" }),
+    ).toBe(false);
+    expect(
+      isFilterEmpty({ needle: "", state: "All", currency: "EUR" }),
+    ).toBe(false);
   });
 });

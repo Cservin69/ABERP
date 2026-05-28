@@ -100,6 +100,21 @@ export function formFromIssuanceInput(
     note: l.note ?? "",
   }));
   return {
+    // PR-97 / ADR-0048 — inherit the base invoice's buyer-kind
+    // discriminator from the side-stored input.json. Pre-PR-97 bases
+    // omit the field and the JSON layer's `vatStatus ?? "Domestic"`
+    // mirrors the backend serde default — keeps chain operations on
+    // pre-PR-97 bases emitting Domestic wire bodies.
+    customerVatStatus: input.customer.vatStatus ?? "Domestic",
+    // PR-97 / ADR-0048 (Ervin override 1) — modification path does
+    // NOT increment `partners.issued_invoice_count` (the base's
+    // counter was already booked at issue time). Carry the
+    // partner_id forward through the form state for type-compatibility
+    // with `IssueInvoiceFormState`; the modification's
+    // `composeModificationBody` does NOT emit it on the wire (the
+    // modification wire body has no `partnerId` field — the backend
+    // does not increment on chain ops).
+    customerPartnerId: input.customer.partnerId ?? null,
     customerTaxNumber: input.customer.taxNumber,
     customerName: input.customer.name,
     // PR-77 / session-101 — inherit the customer-address quartet from
@@ -138,6 +153,12 @@ export function formFromIssuanceInput(
     paymentDeadline: input.paymentDeadline ?? todayIsoDate(),
     deliveryDate: input.deliveryDate ?? todayIsoDate(),
     deliveryDateOverride: null,
+    // PR-92 — type-compatibility with IssueInvoiceFormState. The
+    // modification's compose path does NOT auto-send (the operator
+    // sends the modification PDF manually from its detail page);
+    // the field is present so the form state type-checks against
+    // the shared IssueInvoiceFormState base.
+    emailBuyerOnIssue: false,
   };
 }
 
@@ -155,6 +176,9 @@ export function composeModificationBody(
   // the call a direct delegation.
   return {
     customer: {
+      // PR-97 / ADR-0048 — propagate the inherited buyer-kind onto the
+      // modification's wire body.
+      vatStatus: form.customerVatStatus,
       taxNumber: form.customerTaxNumber.trim(),
       name: form.customerName.trim(),
       address: composeCustomerAddress(form),

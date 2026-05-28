@@ -43,6 +43,9 @@ describe("composeModificationBody", () => {
     const body = composeModificationBody(form);
     expect(body).toEqual({
       customer: {
+        // PR-97 / ADR-0048 — composer emits the buyer-kind discriminator
+        // inherited from the base via `formFromIssuanceInput`.
+        vatStatus: "Domestic",
         taxNumber: "87654321-2-13",
         name: "Vevő Kft.",
         // PR-77 — `address: undefined` when the form's address quartet is blank.

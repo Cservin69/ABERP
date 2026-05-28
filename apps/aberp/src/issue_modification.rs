@@ -249,8 +249,18 @@ pub fn modification_from_inputs(
         check_base_is_modifiable(&ledger, references)?;
     }
 
+    // PR-90 / ADR-0045 §2 — resolve the operator's numbering template
+    // once. Drives both the series's reset_policy sync in
+    // `ensure_series` AND the rendered modification + base invoice
+    // numbers below. Loud-fail on parse error (no silent fallback —
+    // CLAUDE.md rule 12).
+    let seller_toml_path = crate::setup_seller_info::seller_toml_path_for_tenant(tenant_str)
+        .context("resolve seller.toml path for numbering template")?;
+    let template = crate::numbering::read_numbering_template(&seller_toml_path)
+        .context("read [seller.numbering] template from seller.toml")?;
+
     // Pre-tx setup: schemas + series.
-    let (conn, series) = pre_tx_setup(db, &series_code)?;
+    let (conn, series) = pre_tx_setup(db, &series_code, template.reset_policy.to_billing())?;
 
     // Build the modification command.
     let command = build_modification_command(&input, &series_code)?;
@@ -295,6 +305,12 @@ pub fn modification_from_inputs(
         // the base flow through `draft.lines[i].note` naturally.
         // Chain-level note threading lands at PR-83.
         invoice_note: None,
+        // PR-90 — operator-configured counter seed. Modification burns
+        // its own sequence number from the same `(series, fiscal_year)`
+        // bucket; `start_value` only applies on the bucket's first
+        // INSERT, so a modification landing in an existing bucket is
+        // unaffected.
+        start_value: template.start_value,
     };
 
     let outcome = run_single_tx(
@@ -306,11 +322,15 @@ pub fn modification_from_inputs(
         references,
         modification_date,
         nav_xml_out.clone(),
+        // PR-97 / ADR-0048 — pass buyer-kind discriminator from the
+        // base's side-stored input.json through to the audit payload.
+        input.customer.vat_status,
     )?;
 
     let modification = outcome.modification;
     let modification_index = outcome.modification_index;
     let base_sequence_number = outcome.base_sequence_number;
+    let base_issue_year = outcome.base_issue_year;
     let was_fresh = outcome.was_fresh;
     let chain_currency = outcome.chain_currency;
     let chain_rate_metadata = outcome.chain_rate_metadata;
@@ -350,7 +370,19 @@ pub fn modification_from_inputs(
             address_street: input.supplier.address.street,
         },
         customer: CustomerInfo {
-            tax_number: input.customer.tax_number,
+            // PR-97 / ADR-0048 — inherit the base invoice's
+            // `customer.vat_status` so the modification's wire body
+            // mirrors the base's PRIVATE_PERSON / DOMESTIC shape. Same
+            // back-compat posture as the storno path.
+            customer_vat_status: input.customer.vat_status,
+            tax_number: {
+                let trimmed = input.customer.tax_number.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            },
             name: input.customer.name,
             // PR-77 / session-101 — same `customerAddress` inheritance
             // posture as the storno path; the modification's parties
@@ -364,19 +396,26 @@ pub fn modification_from_inputs(
             }),
         },
     };
-    let base_invoice_number = format!("{}/{:05}", series_code.as_str(), base_sequence_number);
+    // PR-89 + PR-90 — render against the template resolved at pre-tx
+    // setup. Base number uses the base's issue year (cross-year
+    // modifications must still cite the base by its original year);
+    // the modification's own number uses the modification's issue year.
+    let base_invoice_number = template.render(base_issue_year, base_sequence_number);
+    let modification_invoice_number =
+        template.render(modification.issue_date.year(), modification.sequence_number);
     let modification_reference = ModificationReference {
         base_invoice_number,
         modification_index,
         modification_issue_date: modification_date.to_string(),
     };
-    let xml = nav_xml::render_modification_data(
+    let xml = nav_xml::render_modification_data_with_number(
         &modification,
         &series_code,
         &parties,
         &modification_reference,
         chain_currency,
         chain_rate_metadata.as_ref(),
+        Some(&modification_invoice_number),
     )
     .context("render NAV modification XML")?;
     aberp_nav_xsd_validator::validate_invoice_data(&xml).context(
@@ -571,32 +610,55 @@ fn check_base_is_modifiable(ledger: &Ledger, base_invoice_id: &str) -> Result<()
 // Pre-tx setup — same shape as issue_storno.rs / issue_invoice.rs
 // ──────────────────────────────────────────────────────────────────────
 
-fn pre_tx_setup(db_path: &Path, series_code: &SeriesCode) -> Result<(Connection, InvoiceSeries)> {
+fn pre_tx_setup(
+    db_path: &Path,
+    series_code: &SeriesCode,
+    template_reset_policy: ResetPolicy,
+) -> Result<(Connection, InvoiceSeries)> {
     let mut billing = DuckDbBillingStore::open(db_path)
         .with_context(|| format!("open billing DuckDB at {}", db_path.display()))?;
     billing.ensure_schema().context("ensure billing schema")?;
-    let series = ensure_series(&mut billing, series_code)?;
+    let series = ensure_series(&mut billing, series_code, template_reset_policy)?;
     let conn = billing.into_connection();
     audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema")?;
     Ok((conn, series))
 }
 
+/// PR-90 / ADR-0045 §2 — same shape as `issue_invoice::ensure_series`
+/// and `issue_storno::ensure_series`.
 fn ensure_series<S: BillingStore + ?Sized>(
     store: &mut S,
     code: &SeriesCode,
+    template_reset_policy: ResetPolicy,
 ) -> Result<InvoiceSeries> {
-    if let Some(series) = store.find_series_by_code(code)? {
+    if let Some(mut series) = store.find_series_by_code(code)? {
+        if series.reset_policy != template_reset_policy {
+            tracing::info!(
+                series = code.as_str(),
+                from = ?series.reset_policy,
+                to = ?template_reset_policy,
+                "syncing series.reset_policy to template choice (PR-90)"
+            );
+            store
+                .update_series_reset_policy(series.id, template_reset_policy)
+                .context("sync series.reset_policy to template")?;
+            series.reset_policy = template_reset_policy;
+        }
         return Ok(series);
     }
     let series = InvoiceSeries {
         id: SeriesId::new(),
         code: code.clone(),
-        reset_policy: ResetPolicy::Never,
+        reset_policy: template_reset_policy,
         fiscal_year: None,
         created_at: OffsetDateTime::now_utc(),
     };
     store.create_series(&series).context("create series")?;
-    tracing::info!(series = code.as_str(), "auto-created series");
+    tracing::info!(
+        series = code.as_str(),
+        reset_policy = ?template_reset_policy,
+        "auto-created series"
+    );
     Ok(series)
 }
 
@@ -609,6 +671,11 @@ struct TxOutcome {
     modification: ReadyInvoice,
     modification_index: u32,
     base_sequence_number: u64,
+    /// PR-89 — calendar year of the BASE invoice's issue date, used so
+    /// `<originalInvoiceNumber>` renders against the base's
+    /// template-Year shape rather than the modification's year. Mirrors
+    /// `issue_storno::TxOutcome::base_issue_year`.
+    base_issue_year: i32,
     was_fresh: bool,
     /// PR-44γ.1 — currency inherited from base per ADR-0037 §4 C6.
     chain_currency: Currency,
@@ -631,6 +698,11 @@ fn run_single_tx(
     base_invoice_id: &str,
     modification_issue_date: &str,
     nav_xml_path: std::path::PathBuf,
+    // PR-97 / ADR-0048 — buyer-kind discriminator inherited from the
+    // base invoice's side-stored input.json. Stamped onto the
+    // modification's `InvoiceDraftCreated` audit payload alongside the
+    // bank snapshot via the chainable builders.
+    customer_vat_status: crate::nav_xml::CustomerVatStatus,
 ) -> Result<TxOutcome> {
     let tx = conn
         .transaction()
@@ -758,7 +830,10 @@ fn run_single_tx(
         }
         // PR-73 / ADR-0040 §addendum — inherit the base's bank-account
         // snapshot onto the modification's audit payload.
-        .with_bank_snapshot(inherited_bank_snapshot.as_ref());
+        .with_bank_snapshot(inherited_bank_snapshot.as_ref())
+        // PR-97 / ADR-0048 — stamp buyer-kind discriminator inherited
+        // from the base invoice.
+        .with_customer_vat_status(customer_vat_status);
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
@@ -799,6 +874,7 @@ fn run_single_tx(
         modification: modification_invoice,
         modification_index,
         base_sequence_number,
+        base_issue_year: base_invoice.issue_date.year(),
         was_fresh,
         chain_currency: inherited_currency,
         chain_rate_metadata: inherited_rate_metadata,

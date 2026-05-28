@@ -30,6 +30,7 @@ export type AppRoute =
   | "tenant"
   | "nav-credentials"
   | "partners"
+  | "products"
   | "maintenance";
 
 /** Default route the SPA falls back to on first paint (or on a hash
@@ -72,6 +73,8 @@ export function parseRoute(hash: string): AppRoute {
       return "nav-credentials";
     case "partners":
       return "partners";
+    case "products":
+      return "products";
     case "maintenance":
       return "maintenance";
     default:

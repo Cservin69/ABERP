@@ -32,6 +32,7 @@ use std::sync::Arc;
 use aberp_audit_ledger::{BinaryHash, TenantId};
 use ulid::Ulid;
 
+use aberp::nav_xml::CustomerVatStatus;
 use aberp::partners::{PartnerInputs, PartnerKind};
 use aberp::serve::{self, AppState, PartnerRouteError};
 
@@ -70,7 +71,9 @@ fn minimal_valid_inputs(display: &str) -> PartnerInputs {
         display_name: display.to_string(),
         legal_name: format!("{} Kft.", display),
         kind: PartnerKind::Customer,
-        tax_number: "12345678-1-42".to_string(),
+        // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic
+        customer_vat_status: CustomerVatStatus::Domestic,
+        tax_number: Some("12345678-1-42".to_string()),
         eu_vat_number: Some("HU12345678".to_string()),
         address_street: Some("Fő utca 1.".to_string()),
         address_postal_code: Some("1011".to_string()),
@@ -109,7 +112,7 @@ fn partners_create_happy_path_returns_populated_partner() {
     assert_eq!(partner.display_name, "BSCE");
     assert_eq!(partner.legal_name, "BSCE Kft.");
     assert_eq!(partner.kind, PartnerKind::Customer);
-    assert_eq!(partner.tax_number, "12345678-1-42");
+    assert_eq!(partner.tax_number.as_deref(), Some("12345678-1-42"));
     assert_eq!(partner.eu_vat_number.as_deref(), Some("HU12345678"));
     assert_eq!(partner.address_city.as_deref(), Some("Budapest"));
     assert_eq!(
@@ -137,7 +140,9 @@ fn partners_create_rejects_invalid_inputs_with_structured_errors() {
         display_name: "   ".to_string(),
         legal_name: "Valid Legal Kft.".to_string(),
         kind: PartnerKind::Both,
-        tax_number: "not-a-tax-number".to_string(),
+        // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic
+        customer_vat_status: CustomerVatStatus::Domestic,
+        tax_number: Some("not-a-tax-number".to_string()),
         eu_vat_number: None,
         address_street: None,
         address_postal_code: None,

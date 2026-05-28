@@ -48,6 +48,7 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "invoices",
   "invoices-new",
   "partners",
+  "products",
   "tenant",
   "nav-credentials",
   "maintenance",
@@ -73,6 +74,7 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   invoices: "invoicing",
   "invoices-new": "invoicing",
   partners: "master-data",
+  products: "master-data",
   tenant: "settings",
   "nav-credentials": "settings",
 };
@@ -86,6 +88,7 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   invoices: "operational",
   "invoices-new": "operational",
   partners: "maintenance",
+  products: "maintenance",
   tenant: "maintenance",
   "nav-credentials": "maintenance",
   maintenance: "maintenance",
@@ -97,7 +100,7 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
 // this set widens alongside — there is no "Other" bucket.
 const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   MaintenanceTileStatusKind
->(["PartnerCount", "BankAccountCount", "NavCredStatus"]);
+>(["PartnerCount", "ProductCount", "BankAccountCount", "NavCredStatus"]);
 
 // Every area must have a stable bilingual label and at least one
 // module — the chrome's topbar gear/back affordance assumes both.

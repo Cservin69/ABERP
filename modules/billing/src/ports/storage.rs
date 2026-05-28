@@ -76,6 +76,17 @@ pub struct AllocateArgs {
     /// on each `LineItem.note` inside `draft.lines` for the same
     /// invariant.
     pub invoice_note: Option<String>,
+    /// PR-90 / ADR-0045 §2 — first value the counter takes when the
+    /// `(series_id, fiscal_year)` bucket is first allocated. The binary
+    /// reads this from the operator's `[seller.numbering].start_value`
+    /// template (default 1); the in-process handler defaults to 1. The
+    /// allocator uses it only on the first INSERT into
+    /// `invoice_sequence_state` for the bucket — subsequent allocations
+    /// increment from the stored `next_number` (gap-free invariant per
+    /// ADR-0009 §3). For `ResetPolicy::OnYearChange` each new fiscal
+    /// year is a fresh bucket and re-applies `start_value`; for `Never`
+    /// the seed applies once and the counter runs continuous forever.
+    pub start_value: u64,
 }
 
 /// Outcome of an `allocate_and_insert` call. The fresh and replay
@@ -116,6 +127,21 @@ pub trait BillingStore: fmt::Debug + Send {
 
     /// Look up a series by ULID.
     fn find_series_by_id(&self, id: SeriesId) -> Result<Option<InvoiceSeries>, BillingError>;
+
+    /// PR-90 / ADR-0045 — update an existing series row's reset policy.
+    /// Used by the binary's `ensure_series` to sync the row to the
+    /// operator's `[seller.numbering].reset_policy` template choice when
+    /// the two diverge (e.g. operator flips Never → OnYearChange in the
+    /// Tenant Settings UI after the row was auto-created with the
+    /// pre-PR-89 Never default). Idempotent: calling with the row's
+    /// existing policy is a no-op. The allocator reads the series row's
+    /// `reset_policy` at every allocation, so a sync here at pre-tx
+    /// setup time takes effect on the next-issued invoice.
+    fn update_series_reset_policy(
+        &mut self,
+        id: SeriesId,
+        policy: crate::domain::series::ResetPolicy,
+    ) -> Result<(), BillingError>;
 
     /// Atomically allocate a sequence number, insert the reservation
     /// row, and insert the invoice row — all in one transaction per

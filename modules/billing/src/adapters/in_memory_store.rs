@@ -67,6 +67,20 @@ impl BillingStore for InMemoryBillingStore {
         Ok(self.series_by_id.get(&id).cloned())
     }
 
+    fn update_series_reset_policy(
+        &mut self,
+        id: SeriesId,
+        policy: crate::domain::series::ResetPolicy,
+    ) -> Result<(), BillingError> {
+        match self.series_by_id.get_mut(&id) {
+            Some(s) => {
+                s.reset_policy = policy;
+                Ok(())
+            }
+            None => Err(BillingError::SeriesNotFound("<unknown id>".to_string())),
+        }
+    }
+
     fn allocate_and_insert(
         &mut self,
         args: AllocateArgs,
@@ -95,9 +109,12 @@ impl BillingStore for InMemoryBillingStore {
             });
         }
 
-        // ── Resolve the series. PR-4 supports `Never` only; the handler
-        //    rejects `AnnualOnFiscalYear` before reaching the store, so
-        //    fiscal_year is always 0 here.
+        // ── Resolve the series + fiscal_year.
+        //
+        // PR-90 / ADR-0045 §2 — `AnnualOnFiscalYear` keys the bucket on
+        // the invoice's immutable issue-date year. `Never` keeps
+        // fiscal_year=0 (continuous, pre-PR-90 behaviour). Mirrors the
+        // DuckDB adapter's `allocate_in_tx` branch.
         let series = self
             .series_by_id
             .get(&args.series_id)
@@ -105,16 +122,17 @@ impl BillingStore for InMemoryBillingStore {
             .ok_or(BillingError::SeriesNotFound("<unknown id>".to_string()))?;
         let fiscal_year: i32 = match series.reset_policy {
             crate::domain::series::ResetPolicy::Never => 0,
-            crate::domain::series::ResetPolicy::AnnualOnFiscalYear => {
-                return Err(BillingError::AnnualResetUnimplemented);
-            }
+            crate::domain::series::ResetPolicy::AnnualOnFiscalYear => args.draft.issue_date.year(),
         };
 
-        // ── Allocate the next number atomically.
+        // ── Allocate the next number atomically. PR-90 — first bucket
+        //    seed comes from `args.start_value` (default 1 for the
+        //    in-process handler). Subsequent allocations advance the
+        //    stored counter; gap-free within the bucket.
         let next = self
             .next_number
             .entry((args.series_id, fiscal_year))
-            .or_insert(1);
+            .or_insert_with(|| args.start_value.max(1));
         let allocated = *next;
         *next = next.checked_add(1).ok_or(BillingError::Invalid(
             "sequence counter overflowed u64::MAX (impossible in practice)",

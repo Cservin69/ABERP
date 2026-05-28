@@ -353,6 +353,16 @@
     const fields = buyerFieldsFromPartner(partner);
     form = {
       ...form,
+      // PR-97 / ADR-0048 — overwrite the form's buyer-kind radio with
+      // the partner's stored value. The operator can still toggle the
+      // radio post-pick (per-invoice override); the audit payload
+      // records the as-of-issuance choice regardless.
+      customerVatStatus: fields.customerVatStatus,
+      // PR-97 / ADR-0048 (Ervin override 1) — stamp the saved-partner
+      // id on the form state. Composer emits it on the wire body so
+      // the backend's issue tx can increment the partner's counter +
+      // flip the lock on subsequent reads.
+      customerPartnerId: partner.id,
       customerName: fields.customerName,
       customerTaxNumber: fields.customerTaxNumber,
       // PR-77 / session-101 — auto-fill the customer address quartet
@@ -667,11 +677,19 @@
            chars without selecting flows through as a one-off
            buyer-name on submit. -->
       <label class="buyer-combobox">
-        <span>Buyer name</span>
+        <span>
+          Buyer name
+          {#if form.customerVatStatus === "PrivatePerson"}
+            <span class="vat-radio__hint">
+              GDPR: magánszemély vevő esetén a név megadása opcionális /
+              optional under GDPR
+            </span>
+          {/if}
+        </span>
         <input
           type="text"
           bind:value={form.customerName}
-          required
+          required={form.customerVatStatus !== "PrivatePerson"}
           role="combobox"
           autocomplete="off"
           spellcheck="false"
@@ -747,12 +765,63 @@
           </p>
         {/if}
       </label>
+      <!-- PR-97 / ADR-0048 — three-option buyer-type radio above the
+           ADÓSZÁM input. `Domestic` is the default + dominant case
+           (preserves pre-PR-97 implicit posture); `PrivatePerson`
+           lands in v1; `Other` is rendered disabled with a v2 hint
+           per ADR-0048 §7. The radio drives the ADÓSZÁM input's
+           `disabled` + `required` flags below. -->
+      <fieldset class="buyer-vat-status">
+        <legend>Vevő típusa / Buyer type</legend>
+        <label class="vat-radio">
+          <input
+            type="radio"
+            name="customerVatStatus"
+            value="Domestic"
+            bind:group={form.customerVatStatus}
+            data-testid="customer-vat-status-domestic"
+          />
+          <span>Adóalany / Domestic business</span>
+        </label>
+        <label class="vat-radio">
+          <input
+            type="radio"
+            name="customerVatStatus"
+            value="PrivatePerson"
+            bind:group={form.customerVatStatus}
+            data-testid="customer-vat-status-private-person"
+          />
+          <span>Magánszemély / Natural person</span>
+        </label>
+        <label class="vat-radio vat-radio--disabled">
+          <input
+            type="radio"
+            name="customerVatStatus"
+            value="Other"
+            disabled
+            data-testid="customer-vat-status-other"
+          />
+          <span>
+            Külföldi / Foreign
+            <span class="vat-radio__hint">v2-ben jön / Coming in v2</span>
+          </span>
+        </label>
+      </fieldset>
       <label>
-        <span>ADÓSZÁM</span>
+        <span>
+          ADÓSZÁM
+          {#if form.customerVatStatus === "PrivatePerson"}
+            <span class="vat-radio__hint">
+              Magánszemély vevő esetén nem kell adószám /
+              no tax number for natural persons
+            </span>
+          {/if}
+        </span>
         <input
           type="text"
           bind:value={form.customerTaxNumber}
-          required
+          required={form.customerVatStatus === "Domestic"}
+          disabled={form.customerVatStatus !== "Domestic"}
           placeholder="87654321-2-13"
           class:input-invalid={customerErrors.taxNumber !== null}
           aria-invalid={customerErrors.taxNumber !== null}
@@ -777,7 +846,7 @@
         <input
           type="text"
           bind:value={form.customerCountryCode}
-          required
+          required={form.customerVatStatus === "Domestic"}
           placeholder="HU"
           maxlength="2"
           data-testid="customer-country-input"
@@ -788,7 +857,7 @@
         <input
           type="text"
           bind:value={form.customerPostalCode}
-          required
+          required={form.customerVatStatus === "Domestic"}
           placeholder="1052"
           data-testid="customer-postal-input"
         />
@@ -798,7 +867,7 @@
         <input
           type="text"
           bind:value={form.customerCity}
-          required
+          required={form.customerVatStatus === "Domestic"}
           placeholder="Budapest"
           data-testid="customer-city-input"
         />
@@ -808,7 +877,7 @@
         <input
           type="text"
           bind:value={form.customerStreet}
-          required
+          required={form.customerVatStatus === "Domestic"}
           placeholder="Váci utca 19."
           data-testid="customer-street-input"
         />
@@ -1181,6 +1250,32 @@
       </label>
     </fieldset>
 
+    <!-- PR-92 / ADR-0047 — default-on auto-send-to-buyer toggle.
+         Checked by default so silence-by-omission cannot suppress a
+         send (the whole point of the app is the buyer receiving the
+         invoice). Operator un-checks to opt this invoice out of the
+         post-issue auto-send; the manual "Email to buyer" button on
+         InvoiceDetail still works either way. -->
+    <fieldset>
+      <legend>Email a vevőnek / Email to buyer</legend>
+      <label class="email-buyer-toggle">
+        <input
+          type="checkbox"
+          bind:checked={form.emailBuyerOnIssue}
+          data-testid="email-buyer-toggle"
+        />
+        <span class="email-buyer-label">
+          <strong>Számla kiküldése a vevőnek / Email this invoice to the buyer</strong>
+          <span class="email-buyer-hint">
+            Bekapcsolva: a számla kiállítása után automatikusan elküldjük
+            PDF-ben a vevő e-mail címére. /
+            Checked: after issuing, automatically emails the PDF to the
+            buyer's contact address.
+          </span>
+        </span>
+      </label>
+    </fieldset>
+
     <footer class="issue-foot">
       <button
         type="submit"
@@ -1450,6 +1545,34 @@
     font-style: italic;
   }
 
+  /* PR-92 / ADR-0047 — email-to-buyer toggle. Same checkbox-with-
+   * label-stack shape every other operator-decision toggle in the
+   * SPA uses. Checked-by-default — silence-by-omission must not
+   * suppress a buyer send. */
+  .email-buyer-toggle {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: var(--space-2);
+  }
+
+  .email-buyer-toggle input[type="checkbox"] {
+    margin-top: 0.25rem;
+    flex: 0 0 auto;
+  }
+
+  .email-buyer-label {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .email-buyer-hint {
+    font-size: var(--type-size-1);
+    color: var(--color-text-muted);
+    font-style: italic;
+  }
+
   /* PR-69 / session-91 — Submit-button count badge surfaces the
    * unresolved-count when preflight rejected the request. */
   .preflight-badge {
@@ -1518,6 +1641,44 @@
     padding: var(--space-2) var(--space-3);
     color: var(--color-text-muted);
     font-size: var(--type-size-xs);
+    font-style: italic;
+  }
+
+  /* PR-97 / ADR-0048 — three-option buyer-type radio. */
+  .buyer-vat-status {
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    padding: var(--space-2) var(--space-3);
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .buyer-vat-status legend {
+    padding: 0 var(--space-1);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-strong);
+  }
+
+  .vat-radio {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-strong);
+    cursor: pointer;
+  }
+
+  .vat-radio--disabled {
+    color: var(--color-text-muted);
+    cursor: not-allowed;
+  }
+
+  .vat-radio__hint {
+    margin-left: var(--space-2);
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
     font-style: italic;
   }
 </style>

@@ -414,15 +414,41 @@ export interface CustomerAddressBody {
   street: string;
 }
 
+/** PR-97 / ADR-0048 — closed-vocab buyer-kind discriminator wire mirror.
+ * Mirrors backend `nav_xml::CustomerVatStatus` (serde PascalCase). v1
+ * ships `Domestic` + `PrivatePerson`; `Other` is named-deferred per
+ * ADR-0048 §7 (the SPA disables the Külföldi radio option with a v2
+ * hint, and the backend's preflight loud-fails an Other body with
+ * `CustomerVatStatusOtherNotSupportedV1`). */
+export type CustomerVatStatusBody = "Domestic" | "PrivatePerson" | "Other";
+
 export interface IssueInvoiceRequest {
   customer: {
+    /** PR-97 / ADR-0048 — closed-vocab buyer kind. Optional on the
+     * wire so pre-PR-97 callers (CLI / fixtures) still type-check;
+     * backend serde defaults to `"Domestic"` when absent, preserving
+     * the pre-PR-97 implicit posture. */
+    vatStatus?: CustomerVatStatusBody;
+    /** PR-97 / ADR-0048 (Ervin override 1) — saved-partner id when
+     * the operator picked a buyer via the typeahead. `null` (or
+     * absent) for one-off buyers and CLI callers. When provided, the
+     * backend increments `partners.issued_invoice_count` in the same
+     * tx, which flips `has_issued_invoices` true and locks
+     * `tax_number` + `customer_vat_status` in the PartnerForm. */
+    partnerId?: string | null;
+    /** PR-97 / ADR-0048 — empty string for `PrivatePerson` buyers
+     * (the SPA's disabled-input emits `""` verbatim); well-formed
+     * `xxxxxxxx-y-zz` for `Domestic`. Held as `string` (not
+     * `string | null`) for wire-compat with pre-PR-97 fixtures. */
     taxNumber: string;
     name: string;
     /** PR-77 / session-101 — full customer address; required for any
      * Hungarian-business buyer (the DOMESTIC customerVatStatus branch).
+     * PR-97 / ADR-0048 — optional under PrivatePerson (NAV wire layer
+     * permits absence; printed-PDF rule lives at the render boundary).
      * Optional on the TS surface so pre-PR-77 callers still type-check;
-     * the backend's preflight (PR-77) rejects an absent or partially-
-     * blank address. */
+     * the backend's preflight rejects an absent or partially-blank
+     * address only when the buyer is Domestic. */
     address?: CustomerAddressBody;
   };
   lines: Array<{
@@ -473,6 +499,38 @@ export interface IssueInvoiceRequest {
    * `InvoiceDraftCreated` audit payload so the tamper-evident
    * regulatory trail records every override. */
   deliveryDateOverride?: "BeforeInvoiceDate" | "AfterPaymentDeadline" | null;
+  /** PR-92 / ADR-0047 — operator's per-invoice opt-out of the
+   * default-on auto-send-to-buyer. The SPA's IssueInvoice form renders
+   * a checkbox defaulted to `true` so silence-by-omission can never
+   * suppress a send. Operator flips it `false` to suppress this
+   * invoice's auto-send; the manual send button on InvoiceDetail
+   * stays available either way. Optional on the wire; the backend
+   * defaults to `true` when absent. */
+  emailBuyerOnIssue?: boolean | null;
+}
+
+/** PR-92 / ADR-0047 — wire shape for the per-invoice email send
+ * outcome, surfaced on both the issue response (auto-send) and the
+ * manual `POST /api/invoices/:id/email` response. */
+export interface EmailRouteOutcome {
+  /** Closed-vocab: `"succeeded"` | `"failed"`. */
+  outcome: "succeeded" | "failed";
+  /** Recipient address actually used (or attempted). */
+  recipient: string;
+  /** Closed-vocab error class on failure; absent on success. */
+  error_class?:
+    | "transport"
+    | "tls"
+    | "auth"
+    | "recipient_rejected"
+    | "compose"
+    | "other";
+  /** Operator-readable detail on failure; absent on success. */
+  error_detail?: string;
+  /** `true` for auto-send-after-issue; `false` for manual button. */
+  auto: boolean;
+  /** `true` iff the NAV XML rode alongside the PDF. */
+  attached_xml: boolean;
 }
 
 /** PR-44ζ / session-59 — wire response body for `POST /invoices/issue`.
@@ -482,6 +540,9 @@ export interface IssueInvoiceResponse {
   invoice_id: string;
   invoice_number: string;
   state: InvoiceState;
+  /** PR-92 — outcome of the default-on auto-send. Present iff the
+   * operator left the toggle on; absent when toggled off. */
+  email?: EmailRouteOutcome;
 }
 
 /** PR-44ζ / session-59 — POST the SPA-composed request body to the
@@ -688,6 +749,10 @@ export async function cancelInvoiceStorno(
  * against a curl bypass). */
 export interface ModificationInvoiceRequest {
   customer: {
+    /** PR-97 / ADR-0048 — same `vatStatus` posture as the fresh
+     * issuance path. The modification's customer block is full-replace
+     * per ADR-0024 §4 and inherits the base invoice's buyer kind. */
+    vatStatus?: CustomerVatStatusBody;
     taxNumber: string;
     name: string;
     /** PR-77 / session-101 — same address surface as
@@ -1088,7 +1153,15 @@ export interface Partner {
   display_name: string;
   legal_name: string;
   kind: PartnerKind;
-  tax_number: string;
+  /** PR-97 / ADR-0048 — closed-vocab buyer-kind discriminator.
+   * Pre-PR-97 rows backfill to `"Domestic"` via the migration's
+   * `DEFAULT 'Domestic'`. Drives whether `tax_number` is required
+   * (`Domestic`) or forbidden (`PrivatePerson`) at the partner-form
+   * validation gate. `Other` is named in the closed vocab but
+   * v1-deferred per ADR-0048 §7. */
+  customer_vat_status: CustomerVatStatusBody;
+  /** PR-97 / ADR-0048 — nullable for non-Domestic statuses. */
+  tax_number: string | null;
   eu_vat_number: string | null;
   address_street: string | null;
   address_postal_code: string | null;
@@ -1112,7 +1185,12 @@ export interface PartnerInputs {
   display_name: string;
   legal_name: string;
   kind: PartnerKind;
-  tax_number: string;
+  /** PR-97 / ADR-0048 — closed-vocab buyer-kind discriminator. The
+   * form's three-option radio binds to this field; backend serde
+   * defaults to `"Domestic"` when absent for pre-PR-97 callers. */
+  customer_vat_status: CustomerVatStatusBody;
+  /** PR-97 / ADR-0048 — nullable for non-Domestic statuses. */
+  tax_number: string | null;
   eu_vat_number: string | null;
   address_street: string | null;
   address_postal_code: string | null;
@@ -1172,6 +1250,102 @@ export async function updatePartner(
  * row stays in the DB for historical-invoice resolution per A182. */
 export async function deletePartner(partnerId: string): Promise<void> {
   await invoke<void>("delete_partner", { partnerId });
+}
+
+// ── PR-91 — products master-data CRUD ────────────────────────────────
+
+/** PR-91 — closed-vocab mirror of NAV v3.0's `unitOfMeasureType` enum
+ * (sans OWN, which is expressed at the outer [`ProductUnit`] level).
+ * Tokens are SCREAMING_SNAKE_CASE on the wire so they agree with the
+ * NAV XML body. Pinned by `nav_unit_serde_round_trip_pin` on the Rust
+ * side; the SPA reads the wire shape strictly via this typed union so
+ * a backend drift surfaces at `npm run check`. See ADR-0046. */
+export type NavUnitOfMeasure =
+  | "PIECE"
+  | "KILOGRAM"
+  | "TON"
+  | "KWH"
+  | "DAY"
+  | "HOUR"
+  | "MINUTE"
+  | "MONTH"
+  | "LITER"
+  | "KILOMETER"
+  | "CUBIC_METER"
+  | "METER"
+  | "LINEAR_METER"
+  | "CARTON"
+  | "PACK";
+
+/** PR-91 — product's unit of measure: either one of NAV's enum tokens
+ * or a free-text label that the future NAV emitter will render as
+ * `OWN` + `<unitOfMeasureOwn>{label}</...>`. Wire form is the Rust
+ * internally-tagged serde shape (`{"kind":"Nav","value":"PIECE"}` /
+ * `{"kind":"Own","value":"liter@15C"}`).
+ *
+ * The canonical Own case is `liter@15C` — temperature-corrected litre
+ * (fuel measure); NAV has plain LITER but no temperature-corrected
+ * variant. See ADR-0046 for the closed-vocab + escape-hatch rationale. */
+export type ProductUnit =
+  | { kind: "Nav"; value: NavUnitOfMeasure }
+  | { kind: "Own"; value: string };
+
+/** PR-91 — single product row. Snake_case JSON mirrors
+ * `aberp::products::Product`. */
+export interface Product {
+  /** Prefixed-ULID `prd_<26-char-ULID>`. */
+  id: string;
+  name: string;
+  unit: ProductUnit;
+  currency: Currency;
+  /** Unit price in the currency's minor units (HUF: whole forints,
+   * EUR: cents) per ADR-0037. The SPA parses operator input via
+   * PR-88's `parseAmountToMinor` rule (bare ints are WHOLE major
+   * units; cents only when an explicit separator is typed). */
+  unit_price_minor: number;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+}
+
+/** PR-91 — request body for `POST /api/products` + `PUT /api/products/:id`. */
+export interface ProductInputs {
+  name: string;
+  unit: ProductUnit;
+  currency: Currency;
+  unit_price_minor: number;
+}
+
+/** PR-91 — `GET /api/products[?search=]`. Case-insensitive prefix
+ * filter on `name`. */
+export async function listProducts(search?: string): Promise<Product[]> {
+  const trimmed = search?.trim();
+  const args = trimmed && trimmed.length > 0 ? { search: trimmed } : {};
+  return invoke<Product[]>("list_products", args);
+}
+
+/** PR-91 — `GET /api/products/:id`. */
+export async function getProduct(productId: string): Promise<Product> {
+  return invoke<Product>("get_product", { productId });
+}
+
+/** PR-91 — `POST /api/products`. */
+export async function createProduct(body: ProductInputs): Promise<Product> {
+  return invoke<Product>("create_product", { body });
+}
+
+/** PR-91 — `PUT /api/products/:id`. */
+export async function updateProduct(
+  productId: string,
+  body: ProductInputs,
+): Promise<Product> {
+  return invoke<Product>("update_product", { productId, body });
+}
+
+/** PR-91 — `DELETE /api/products/:id`. Soft-delete (mirrors
+ * `deletePartner` per A182 — historical references stay resolvable). */
+export async function deleteProduct(productId: string): Promise<void> {
+  await invoke<void>("delete_product", { productId });
 }
 
 // ── PR-72 / session-94 — multi-bank-account routes (PR-B) ─────────────
@@ -1275,4 +1449,126 @@ export async function deleteSellerBank(
   bankId: string,
 ): Promise<SellerBanksListResponse> {
   return invoke<SellerBanksListResponse>("delete_seller_bank", { bankId });
+}
+
+import type { NumberingTemplate } from "./invoice-numbering";
+
+/** PR-89 — `GET /api/seller/numbering`. Returns the operator-
+ * configured invoice-number template (or the default INV-default/NNNNN
+ * shape when no `[seller.numbering]` section is present in
+ * seller.toml). */
+export async function getSellerNumbering(): Promise<NumberingTemplate> {
+  return invoke<NumberingTemplate>("get_seller_numbering");
+}
+
+/** PR-89 — `PUT /api/seller/numbering`. The Invoice numbering builder
+ * PUTs the operator-assembled template here. Backend validates
+ * (closed-vocab on kinds + reset policy, NAV-charset on Literal
+ * segments, exactly-one-counter) and atomically replaces the
+ * `[seller.numbering]` section of seller.toml. Returns the validated
+ * (canonical) template on success; 422 on validation failure. */
+export async function putSellerNumbering(
+  body: NumberingTemplate,
+): Promise<NumberingTemplate> {
+  return invoke<NumberingTemplate>("put_seller_numbering", { body });
+}
+
+// ── PR-92 / ADR-0047 — SMTP email delivery ─────────────────────────
+
+/** PR-92 / ADR-0047 — closed-vocab SMTP transport security. NO
+ * plaintext variant — TLS is mandatory; the backend rejects any
+ * other token. */
+export type SmtpSecurity = "StartTls" | "Tls";
+
+/** PR-92 — wire shape of GET /api/smtp-config when no
+ * `[seller.smtp]` is configured. The SPA renders an empty form. */
+export interface SmtpConfigGetEmpty {
+  configured: false;
+  passwordSet: boolean;
+}
+
+/** PR-92 — wire shape of GET /api/smtp-config when SMTP is
+ * configured. NEVER carries the password — the backend reports a
+ * `passwordSet` boolean instead. */
+export interface SmtpConfigGetPopulated {
+  configured?: true;
+  host: string;
+  port: number;
+  fromAddress: string;
+  fromDisplayName?: string | null;
+  username: string;
+  security: SmtpSecurity;
+  attachXml: boolean;
+  passwordSet: boolean;
+}
+
+export type SmtpConfigGetResponse =
+  | SmtpConfigGetEmpty
+  | SmtpConfigGetPopulated;
+
+/** PR-92 — wire body for PUT /api/smtp-config. `password` is
+ * optional: `null` / absent leaves the existing keychain entry
+ * untouched (so the operator can rotate non-secret fields without
+ * re-typing the password). */
+export interface SmtpConfigPutBody {
+  host: string;
+  port: number;
+  fromAddress: string;
+  fromDisplayName?: string | null;
+  username: string;
+  security: SmtpSecurity;
+  attachXml: boolean;
+  password?: string | null;
+}
+
+/** PR-92 — fetch the current SMTP config + keychain password status. */
+export async function getSmtpConfig(): Promise<SmtpConfigGetResponse> {
+  return invoke<SmtpConfigGetResponse>("get_smtp_config");
+}
+
+/** PR-92 — write the SMTP config (merge-not-replace on seller.toml)
+ * + optionally rotate the password in the keychain. */
+export async function putSmtpConfig(
+  body: SmtpConfigPutBody,
+): Promise<SmtpConfigGetPopulated> {
+  return invoke<SmtpConfigGetPopulated>("put_smtp_config", { body });
+}
+
+/** PR-92 — operator-clicked manual send button on InvoiceDetail.
+ * Returns the same EmailRouteOutcome shape the auto-send-after-issue
+ * surfaces, so a single TS interface drives both renderers. */
+export async function emailInvoiceToBuyer(
+  invoiceId: string,
+): Promise<EmailRouteOutcome> {
+  return invoke<EmailRouteOutcome>("email_invoice_to_buyer", { invoiceId });
+}
+
+/** PR-98 — outcome of the SMTP test-connection probe. Mirrors
+ * `serve::SmtpTestOutcome` on the backend. Shape mirrors
+ * [`EmailRouteOutcome`] so the same banner-rendering helper can be
+ * reused on both surfaces. */
+export interface SmtpTestOutcome {
+  /** Closed-vocab: `"succeeded"` | `"failed"`. */
+  outcome: "succeeded" | "failed";
+  /** Closed-vocab error class on failure; absent on success. */
+  error_class?:
+    | "transport"
+    | "tls"
+    | "auth"
+    | "recipient_rejected"
+    | "compose"
+    | "other";
+  /** Operator-readable detail on failure; absent on success. */
+  error_detail?: string;
+}
+
+/** PR-98 — TenantSettings "Test connection" button. POSTs the same
+ * `SmtpConfigPutBody` shape as `putSmtpConfig` but the backend runs
+ * the TLS handshake + AUTH + NOOP without sending mail or persisting
+ * anything. Leaving `password` empty / null tests against the
+ * existing keychain entry. */
+export async function testSmtpConnection(
+  body: SmtpConfigPutBody,
+): Promise<SmtpTestOutcome> {
+  return invoke<SmtpTestOutcome>("test_smtp_connection", { body });
 }

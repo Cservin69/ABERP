@@ -29,17 +29,32 @@ import type { InvoiceState } from "./api";
 
 /** Closed vocab of operator-visible action buttons that can appear
  * in the invoice-detail modal header. Kept narrow per CLAUDE.md
- * rule 3 (surgical) — five buttons today (PR-47α added `Storno`,
- * PR-47β added `Modification`); a future PR may add `RetrySubmission`
- * / `Recover` / `MarkAbandoned` here when the SPA surfaces those
- * NAV-recovery affordances. */
+ * rule 3 (surgical); a future PR may add `RetrySubmission` /
+ * `Recover` / `MarkAbandoned` here when the SPA surfaces those
+ * NAV-recovery affordances.
+ *
+ * PR-95 / session-115 — `PollAck` removed from the union. The
+ * new 4-state NAV-status pictogram (`./nav-status-pictogram.ts`)
+ * replaces the manual `↻ Lekérés` button: clicking the pictogram
+ * when its state is `InFlight` re-polls NAV (same `pollAck` Tauri
+ * call). The closed-vocab posture in the action-bar therefore drops
+ * the row — the operator's mental model is "the pictogram IS the
+ * poll affordance"; surfacing a duplicate button under "NAV státusz"
+ * would split the operator's eye between two surfaces. The
+ * `pollAck` API function in `./api.ts` is retained verbatim because
+ * the pictogram's click handler still invokes it. */
 export type DetailActionButton =
   | "Submit"
-  | "PollAck"
   | "Storno"
   | "Modification"
   | "Pay"
-  | "Download";
+  | "Download"
+  // PR-92 / ADR-0047 — manual SMTP send button. Surfaces only on
+  // states where the printed PDF exists (Ready → Finalized → Amended
+  // → terminal). The auto-send-after-issue path is independent —
+  // this button is operator-on-demand (e.g., to resend after the
+  // operator updated the buyer's email).
+  | "Email";
 
 /** Per-state action-button visibility table. Returned in operator-
  * reading order (left-to-right on the modal header); the renderer
@@ -62,21 +77,23 @@ export function buttonsForState(
 ): DetailActionButton[] {
   switch (state) {
     case "Ready":
-      // Pre-submission: operator can submit or download.
-      return ["Submit", "Download"];
+      // Pre-submission: operator can submit, email, or download.
+      return ["Submit", "Email", "Download"];
     case "Submitted":
     case "PendingNavExists":
-      // Submitted but no terminal ack yet: operator polls for the ack.
-      // Download stays available throughout the lifecycle per A155 +
-      // PR-44ε.UI (the printed invoice exists from the moment the
-      // draft is created; the NAV ack does not gate the PDF).
-      return ["PollAck", "Download"];
+      // Submitted but no terminal ack yet. PR-95 / session-115 —
+      // the NAV-status pictogram (clickable when InFlight) is now
+      // the poll affordance; the action bar drops the dedicated
+      // PollAck button so the operator's eye lands on a single
+      // poll surface. Download stays available throughout the
+      // lifecycle per A155 + PR-44ε.UI; Email per PR-92.
+      return ["Email", "Download"];
     case "Pending":
       // State-2 Pending without Layer-2 evidence: NAV-recovery is the
       // operator's next move (`retry-submission` / `recover-from-nav`).
       // The SPA does not surface those affordances yet — PR-44η scope
       // is the standard lifecycle only. Download stays available.
-      return ["Download"];
+      return ["Email", "Download"];
     case "Finalized":
       // PR-47α / session-64 — Finalized is the state where storno is
       // legal (ADR-0023 §1: NAV terminal SAVED precondition).
@@ -92,10 +109,13 @@ export function buttonsForState(
       // operations so the operator-most-common action (recording
       // a payment) sits at the natural left-side button position;
       // a paid Finalized invoice retains only the chain operations.
+      // PR-92 / ADR-0047 — Email is always available on a Finalized
+      // invoice (the printed PDF + the NAV-accepted state mean the
+      // operator may resend on demand).
       if (paid) {
-        return ["Storno", "Modification", "Download"];
+        return ["Storno", "Modification", "Email", "Download"];
       }
-      return ["Pay", "Storno", "Modification", "Download"];
+      return ["Pay", "Storno", "Modification", "Email", "Download"];
     case "Amended":
       // PR-47β / session-65 — Amended is the second arm of the
       // modify-after-modify accept set (ADR-0024 §6 default-permit
@@ -104,14 +124,17 @@ export function buttonsForState(
       // ADR-0023 §1 requires Finalized (SAVED) — an Amended base has
       // no remaining SAVED ack at the top of its chain. The CLI's
       // `issue-storno` would loud-fail at the precondition walker.
-      return ["Modification", "Download"];
+      return ["Modification", "Email", "Download"];
     case "Recovered":
     case "Rejected":
     case "Storno":
     case "Abandoned":
     case "Unknown":
-      // Terminal / read-only states: download only.
-      return ["Download"];
+      // Terminal / read-only states: download (and email — operator
+      // may resend an issued invoice's PDF regardless of NAV terminal
+      // state per ADR-0047 §2; e.g. resending a stornoed invoice's
+      // PDF to a buyer for their records).
+      return ["Email", "Download"];
   }
 }
 
@@ -119,13 +142,14 @@ export function buttonsForState(
  * the section labels in the InvoiceDetail action bar so the operator
  * scans a coherent hierarchy rather than an ambiguous row of buttons:
  *
- *   Lifecycle  — moves through the NAV regulatory ladder
- *                (Submit → PollAck). The most-attention-demanding row.
+ *   Lifecycle  — moves through the NAV regulatory ladder (Submit).
+ *                PR-95 dropped the PollAck button from this row; the
+ *                NAV-status pictogram now carries the poll affordance.
  *   Operational — operational-side recording that doesn't change the
  *                NAV state (Pay).
  *   Chain      — issues a downstream chain child (Storno, Modification).
  *                Read as "spawns a new invoice referencing this one."
- *   Export     — operator-deliverable artifacts (Download PDF).
+ *   Export     — operator-deliverable artifacts (Download PDF, Email).
  *
  * Closed-vocab so a new ActionGroup variant requires a paired pin. */
 export type ActionGroup = "Lifecycle" | "Operational" | "Chain" | "Export";
@@ -171,15 +195,6 @@ export function detailActionMeta(button: DetailActionButton): DetailActionMeta {
         tooltip_hu:
           "Beküldi a számlát a NAV Online Számla rendszerébe. A NAV nyugta után az állapot Submitted lesz.",
       };
-    case "PollAck":
-      return {
-        group: "Lifecycle",
-        glyph: "↻",
-        label_hu: "NAV státusz lekérése",
-        label_en: "Poll NAV ack",
-        tooltip_hu:
-          "Lekéri a NAV-tól a feldolgozás státuszát. Eredmény: SAVED (Finalized) vagy ABORTED (Rejected).",
-      };
     case "Pay":
       return {
         group: "Operational",
@@ -215,6 +230,19 @@ export function detailActionMeta(button: DetailActionButton): DetailActionMeta {
         label_en: "Download PDF",
         tooltip_hu:
           "Letölti a nyomtatható PDF számlát. A NAV státusztól függetlenül elérhető.",
+      };
+    case "Email":
+      // PR-92 / ADR-0047 — manual SMTP send. "Email" lands in the
+      // Export group alongside Download because both are buyer-
+      // deliverable artifact channels (PDF on disk vs PDF in
+      // mailbox); the SPA renders them in the same row.
+      return {
+        group: "Export",
+        glyph: "✉",
+        label_hu: "Email a vevőnek",
+        label_en: "Email to buyer",
+        tooltip_hu:
+          "Elküldi a számla PDF-jét a vevő e-mail címére az SMTP beállítások szerint. A küldés sikeréről audit napló készül.",
       };
   }
 }

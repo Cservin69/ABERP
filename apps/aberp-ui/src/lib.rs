@@ -221,11 +221,22 @@ pub fn run() {
             commands::create_partner,
             commands::update_partner,
             commands::delete_partner,
+            commands::list_products,
+            commands::get_product,
+            commands::create_product,
+            commands::update_product,
+            commands::delete_product,
             commands::list_seller_banks,
             commands::create_seller_bank,
             commands::update_seller_bank,
             commands::set_default_seller_bank,
             commands::delete_seller_bank,
+            commands::get_seller_numbering,
+            commands::put_seller_numbering,
+            commands::get_smtp_config,
+            commands::put_smtp_config,
+            commands::test_smtp_connection,
+            commands::email_invoice_to_buyer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -39,6 +39,7 @@ use ulid::Ulid;
 use aberp::audit_payloads::InvoiceDraftCreatedPayload;
 use aberp::issue_invoice::{AddressJson, CustomerJson, LineJson, SupplierJson};
 use aberp::mnb_rates_provider::MnbRatesProvider;
+use aberp::nav_xml::CustomerVatStatus;
 use aberp::serve::{self, AppState, IssueInvoiceRequest};
 
 const TEST_TENANT: &str = "serve_issue_route_test";
@@ -91,6 +92,10 @@ fn fixture_supplier() -> SupplierJson {
 
 fn fixture_customer() -> CustomerJson {
     CustomerJson {
+        // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
+        // Domestic posture for legacy test fixtures.
+        vat_status: CustomerVatStatus::Domestic,
+        partner_id: None,
         tax_number: "87654321-2-13".to_string(),
         name: "Vevő Kft.".to_string(),
         // PR-77 / session-101 — preflight requires customer.address.
@@ -128,6 +133,9 @@ fn fixture_request(currency: Currency) -> IssueInvoiceRequest {
         payment_deadline: None,
         delivery_date: None,
         delivery_date_override: None,
+        // PR-92 — opt out of the default-on auto-send so the issue
+        // integration tests stay SMTP-free.
+        email_buyer_on_issue: Some(false),
     }
 }
 
@@ -400,6 +408,7 @@ async fn issue_route_rejects_empty_lines_with_loud_error() {
         payment_deadline: None,
         delivery_date: None,
         delivery_date_override: None,
+        email_buyer_on_issue: Some(false),
     };
 
     let err = serve::issue_invoice_request(
@@ -450,6 +459,7 @@ async fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
         payment_deadline: None,
         delivery_date: None,
         delivery_date_override: None,
+        email_buyer_on_issue: Some(false),
     };
 
     // PR-53 / session-73 — supplier comes via the new arg, not the

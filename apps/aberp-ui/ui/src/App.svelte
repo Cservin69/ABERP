@@ -63,6 +63,7 @@
   import MaintenanceDashboard from "./routes/MaintenanceDashboard.svelte";
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
   import PartnersList from "./routes/PartnersList.svelte";
+  import ProductsList from "./routes/ProductsList.svelte";
   import SellerConfigWizard from "./routes/SellerConfigWizard.svelte";
   import SetupWizard from "./routes/SetupWizard.svelte";
   import TenantSettings from "./routes/TenantSettings.svelte";
@@ -403,6 +404,8 @@
           <NavCredentialsSettings />
         {:else if route === "partners"}
           <PartnersList />
+        {:else if route === "products"}
+          <ProductsList />
         {:else if route === "maintenance"}
           <MaintenanceDashboard />
         {:else if route === "invoices-new"}

@@ -656,6 +656,10 @@ mod tests {
             payment_deadline: None,
             delivery_date: None,
             delivery_date_override: None,
+            // PR-97 / ADR-0048 — pre-PR-97 ledger fixture; the field
+            // stays `None` so the drain-worker tests' round-trip
+            // preserves the implicit Domestic posture.
+            customer_vat_status: None,
         };
         ledger
             .append(

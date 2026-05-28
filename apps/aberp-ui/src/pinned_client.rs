@@ -161,6 +161,12 @@ mod tests {
 
     #[test]
     fn build_accepts_well_formed_fingerprint() {
+        // PR-92 / ADR-0047 — workspace builds may pull in both rustls
+        // crypto providers (aws-lc-rs + ring via lettre's transitive
+        // deps); install one default so `ClientConfig::builder()`
+        // doesn't panic. The production binary already does this at
+        // boot.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let fp = hex::encode([0x33u8; 32]);
         let client = build(&fp).expect("64-hex-char fingerprint must build a client");
         // Smoke: the client is usable; we don't actually make any

@@ -751,7 +751,11 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // NAV-side XML (purely local audit metadata); mirrors the
         // bundle writer's "no nav/ file" arm in
         // `export_invoice_bundle::extract_nav_xml`.
-        | EventKind::InvoicePaymentRecorded => (None, ""),
+        | EventKind::InvoicePaymentRecorded
+        // PR-92 / ADR-0047 §4 — operational SMTP-emailed entry; no
+        // NAV-side XML (the audit payload carries the recipient +
+        // subject + outcome only). Mirrors the bundle writer.
+        | EventKind::InvoiceEmailedSent => (None, ""),
     };
 
     Ok(NavExtraction {

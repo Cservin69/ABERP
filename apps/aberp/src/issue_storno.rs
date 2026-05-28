@@ -291,10 +291,20 @@ pub fn storno_from_inputs(
         // ledger drops here, releasing the DuckDB read connection
     }
 
+    // 5b. PR-90 / ADR-0045 §2 — resolve the operator's numbering
+    //     template once. Drives both the series's reset_policy sync in
+    //     `ensure_series` AND the rendered storno + base invoice
+    //     numbers below. Loud-fail on parse error (no silent fallback —
+    //     CLAUDE.md rule 12).
+    let seller_toml_path = crate::setup_seller_info::seller_toml_path_for_tenant(tenant_str)
+        .context("resolve seller.toml path for numbering template")?;
+    let template = crate::numbering::read_numbering_template(&seller_toml_path)
+        .context("read [seller.numbering] template from seller.toml")?;
+
     // 6. Pre-tx setup: schemas + series. Reuses the helper shape
     //    `issue_invoice.rs` uses (kept inlined here to avoid a
     //    speculative shared-helper extraction — rule 2).
-    let (conn, series) = pre_tx_setup(db, &series_code)?;
+    let (conn, series) = pre_tx_setup(db, &series_code, template.reset_policy.to_billing())?;
 
     // 7. Build the IssueInvoiceCommand for the STORNO's own content
     //    + AllocateArgs. The storno burns its own sequence number;
@@ -346,6 +356,12 @@ pub fn storno_from_inputs(
         // the base ride on `draft.lines[i].note` naturally — the
         // negation only touches the unit-price sign, not the note.
         invoice_note: storno_reason.clone(),
+        // PR-90 — operator-configured counter seed. The storno burns
+        // its own sequence number from the same `(series, fiscal_year)`
+        // bucket; `start_value` only takes effect on the bucket's first
+        // INSERT, so a storno landing in a bucket that already has
+        // allocations is unaffected.
+        start_value: template.start_value,
     };
 
     // 8. One transaction across base-load + chain-index walk + storno
@@ -364,11 +380,15 @@ pub fn storno_from_inputs(
         // base) onto the `InvoiceDraftCreated` payload so the
         // operator-twin record matches the printed-PDF surface.
         storno_reason.clone(),
+        // PR-97 / ADR-0048 — pass buyer-kind discriminator from the
+        // base's side-stored input.json through to the audit payload.
+        input.customer.vat_status,
     )?;
 
     let storno = outcome.storno;
     let modification_index = outcome.modification_index;
     let base_sequence_number = outcome.base_sequence_number;
+    let base_issue_year = outcome.base_issue_year;
     let was_fresh = outcome.was_fresh;
     let chain_currency = outcome.chain_currency;
     let chain_rate_metadata = outcome.chain_rate_metadata;
@@ -409,16 +429,27 @@ pub fn storno_from_inputs(
             address_street: input.supplier.address.street,
         },
         customer: CustomerInfo {
-            tax_number: input.customer.tax_number,
+            // PR-97 / ADR-0048 — inherit the base invoice's
+            // `customer.vat_status` so the storno wire body mirrors the
+            // base's PRIVATE_PERSON / DOMESTIC shape verbatim. Pre-PR-97
+            // bases omit `vat_status` from the side-stored input.json;
+            // serde defaults to `Domestic` so chain operations on
+            // pre-PR-97 bases continue to emit Domestic wire bodies.
+            customer_vat_status: input.customer.vat_status,
+            tax_number: {
+                let trimmed = input.customer.tax_number.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            },
             name: input.customer.name,
             // PR-77 / session-101 — inherit `customerAddress` from the
-            // base invoice's side-stored `input.json`. Base invoices
-            // issued pre-PR-77 will have `None` here and trip the
-            // validator's customerVatStatus-aware required-children rule
-            // at render time; that is the correct loud-fail posture (the
-            // storno cannot be filed if the base lacks the data NAV
-            // demands), and recovery is to update the base partner's
-            // address in Partners and re-stamp the side-store.
+            // base invoice's side-stored `input.json`. Pre-PR-97 chain
+            // operations on PRIVATE_PERSON bases omit the address (NAV
+            // wire layer permits it); the validator's symmetric rules
+            // pass the resulting body.
             address: input.customer.address.map(|a| CustomerAddress {
                 country_code: a.country_code,
                 postal_code: a.postal_code,
@@ -427,18 +458,26 @@ pub fn storno_from_inputs(
             }),
         },
     };
-    let base_invoice_number = format!("{}/{:05}", series_code.as_str(), base_sequence_number);
+    // PR-89 + PR-90 — render against the template resolved at pre-tx
+    // setup. The BASE invoice's number uses the base's issue year (a
+    // cross-year storno must still emit `ABERP-2025/000017` even when
+    // the storno is issued in 2026). The STORNO's own number uses the
+    // storno's issue year; under OnYearChange that issue year is also
+    // the counter's reset-year bucket (agreement by construction).
+    let base_invoice_number = template.render(base_issue_year, base_sequence_number);
+    let storno_invoice_number = template.render(storno.issue_date.year(), storno.sequence_number);
     let storno_reference = StornoReference {
         base_invoice_number,
         modification_index,
     };
-    let xml = nav_xml::render_storno_data(
+    let xml = nav_xml::render_storno_data_with_number(
         &storno,
         &series_code,
         &parties,
         &storno_reference,
         chain_currency,
         chain_rate_metadata.as_ref(),
+        Some(&storno_invoice_number),
     )
     .context("render NAV storno XML")?;
     aberp_nav_xsd_validator::validate_invoice_data(&xml).context(
@@ -452,10 +491,10 @@ pub fn storno_from_inputs(
     nav_xml::write_to_path(&nav_xml_out, &xml)?;
     tracing::info!(path = %nav_xml_out.display(), bytes = xml.len(), "NAV storno XML written");
 
-    let invoice_number = format!("{}/{:05}", series_code.as_str(), storno.sequence_number);
+    // PR-89 — reuse the template-rendered storno number computed above.
     Ok(StornoIssuedSummary {
         invoice_id: storno.id.to_prefixed_string(),
-        invoice_number,
+        invoice_number: storno_invoice_number,
         modification_index,
         entries_verified: verified,
     })
@@ -617,32 +656,58 @@ impl HasInvoiceId for audit_payloads::InvoiceSubmissionResponsePayload {
 // Pre-tx setup — same shape as issue_invoice.rs
 // ──────────────────────────────────────────────────────────────────────
 
-fn pre_tx_setup(db_path: &Path, series_code: &SeriesCode) -> Result<(Connection, InvoiceSeries)> {
+fn pre_tx_setup(
+    db_path: &Path,
+    series_code: &SeriesCode,
+    template_reset_policy: ResetPolicy,
+) -> Result<(Connection, InvoiceSeries)> {
     let mut billing = DuckDbBillingStore::open(db_path)
         .with_context(|| format!("open billing DuckDB at {}", db_path.display()))?;
     billing.ensure_schema().context("ensure billing schema")?;
-    let series = ensure_series(&mut billing, series_code)?;
+    let series = ensure_series(&mut billing, series_code, template_reset_policy)?;
     let conn = billing.into_connection();
     audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema")?;
     Ok((conn, series))
 }
 
+/// PR-90 / ADR-0045 §2 — mirror of `issue_invoice::ensure_series`:
+/// auto-create the series with the template's `reset_policy`, sync the
+/// existing series row's policy on divergence. Same posture as
+/// `issue_modification::ensure_series` — kept inlined here to avoid a
+/// speculative shared-helper extraction (CLAUDE.md rule 2).
 fn ensure_series<S: BillingStore + ?Sized>(
     store: &mut S,
     code: &SeriesCode,
+    template_reset_policy: ResetPolicy,
 ) -> Result<InvoiceSeries> {
-    if let Some(series) = store.find_series_by_code(code)? {
+    if let Some(mut series) = store.find_series_by_code(code)? {
+        if series.reset_policy != template_reset_policy {
+            tracing::info!(
+                series = code.as_str(),
+                from = ?series.reset_policy,
+                to = ?template_reset_policy,
+                "syncing series.reset_policy to template choice (PR-90)"
+            );
+            store
+                .update_series_reset_policy(series.id, template_reset_policy)
+                .context("sync series.reset_policy to template")?;
+            series.reset_policy = template_reset_policy;
+        }
         return Ok(series);
     }
     let series = InvoiceSeries {
         id: SeriesId::new(),
         code: code.clone(),
-        reset_policy: ResetPolicy::Never,
+        reset_policy: template_reset_policy,
         fiscal_year: None,
         created_at: OffsetDateTime::now_utc(),
     };
     store.create_series(&series).context("create series")?;
-    tracing::info!(series = code.as_str(), "auto-created series");
+    tracing::info!(
+        series = code.as_str(),
+        reset_policy = ?template_reset_policy,
+        "auto-created series"
+    );
     Ok(series)
 }
 
@@ -656,6 +721,14 @@ struct TxOutcome {
     storno: ReadyInvoice,
     modification_index: u32,
     base_sequence_number: u64,
+    /// PR-89 — calendar year of the BASE invoice's issue date. Needed
+    /// so the storno's `<originalInvoiceNumber>` element renders the
+    /// base's number against the same template-Year shape the base was
+    /// issued under (e.g. `ABERP-2025/000017` even when the storno
+    /// itself is issued in 2026). Read from `base_invoice.issue_date`
+    /// inside the tx so the year is consistent with the row the
+    /// audit ledger says is Finalized.
+    base_issue_year: i32,
     was_fresh: bool,
     /// PR-44γ.1 — currency inherited from the base invoice via
     /// `invoice_currency_metadata::inherit_rate_metadata_for_chain`.
@@ -690,6 +763,12 @@ fn run_single_tx(
     // is unconditional but the payload's `invoice_note` field stays
     // `None`.
     storno_reason: Option<String>,
+    // PR-97 / ADR-0048 — buyer-kind discriminator inherited from the
+    // base invoice's side-stored input.json (defaults to `Domestic` for
+    // pre-PR-97 bases via serde). Stamped onto the storno's
+    // `InvoiceDraftCreated` audit payload so the chain operation's
+    // tamper-evident trail mirrors the base's as-of-issuance choice.
+    customer_vat_status: crate::nav_xml::CustomerVatStatus,
 ) -> Result<TxOutcome> {
     let tx = conn
         .transaction()
@@ -841,7 +920,10 @@ fn run_single_tx(
         // `invoice_note` field on the payload carries the storno
         // reason verbatim; per-line notes are pulled off
         // `storno_invoice.lines[i].note` by the builder.
-        .with_notes(&storno_invoice, storno_reason.as_deref());
+        .with_notes(&storno_invoice, storno_reason.as_deref())
+        // PR-97 / ADR-0048 — stamp the buyer-kind discriminator
+        // inherited from the base invoice.
+        .with_customer_vat_status(customer_vat_status);
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
@@ -881,6 +963,7 @@ fn run_single_tx(
         storno: storno_invoice,
         modification_index,
         base_sequence_number,
+        base_issue_year: base_invoice.issue_date.year(),
         was_fresh,
         chain_currency: inherited_currency,
         chain_rate_metadata: inherited_rate_metadata,

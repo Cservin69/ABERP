@@ -37,10 +37,12 @@
     downloadInvoicePdf,
     listInvoices,
     parseNavUpstreamFault,
+    pollAck,
     submitInvoice,
     type InvoiceListItem,
     type InvoiceState,
   } from "../lib/api";
+  import { navStatusPictogram } from "../lib/nav-status-pictogram";
   import {
     LIFECYCLE_ORDER,
     labelMeta,
@@ -50,10 +52,17 @@
   import { formatTotal, filenameForInvoice } from "../lib/format";
   import type { BankAccountSnapshot, Currency } from "../lib/api";
   import {
+    EMPTY_FILTER,
     buyerColumnDisplay,
+    compareInvoices,
+    filterInvoices,
+    isFilterEmpty,
     quickActionMeta,
     quickActionsForState,
+    type InvoiceFilterSpec,
     type RowQuickAction,
+    type SortDir,
+    type SortKey,
   } from "../lib/invoice-list";
   // PR-68 / session-90 — keyboard navigation Tier-1 UX lift.
   // `/` focuses the search box, j/k walk rows, Enter opens the
@@ -62,7 +71,6 @@
   // `../lib/keyboard-nav.ts`; this file wires its closed-vocab
   // `Hotkey` output to the per-list state.
   import {
-    filterInvoicesByNeedle,
     makeHotkeyParserState,
     nextRowIndex,
     parseHotkey,
@@ -86,9 +94,25 @@
   let loadState: "idle" | "loading" | "loaded" | "error" = $state("idle");
   let errorMessage: string | null = $state(null);
 
-  // Filter dropdown — "All" plus one entry per label. Defaults to
-  // "All" so the first paint matches the pre-PR-24 behaviour.
-  let filterLabel: "All" | InvoiceState = $state("All");
+  // PR-94 / session-114 — unified filter spec (needle + state +
+  // currency facets). The `needle` field drives the PR-68 `/`-targeted
+  // substring search; the `state` and `currency` fields drive the new
+  // facet dropdowns next to it. All three AND together; an "All" value
+  // on a facet short-circuits the gate. The previous standalone
+  // `filterLabel` + `searchNeedle` reactive fields are subsumed here so
+  // one object drives every filter surface.
+  let filter: InvoiceFilterSpec = $state({ ...EMPTY_FILTER });
+
+  // PR-94 / session-114 — sortable-columns state. `key === null` keeps
+  // the legacy lifecycle-natural ordering (Unknown → Abandoned, then
+  // invoice_id ascending). Clicking a column header three-cycles:
+  // null → asc → desc → null (reset). Clicking a different column
+  // jumps to (clicked, asc) directly. The renderer shows ▲ / ▼ next
+  // to the active column label.
+  let sort: { key: SortKey | null; dir: SortDir } = $state({
+    key: null,
+    dir: "asc",
+  });
 
   // PR-25 / session-29 — selected invoice id drives the detail modal
   // (`null` keeps it closed; a string opens it and triggers the
@@ -150,15 +174,24 @@
   let actionError: { invoiceId: string; action: RowQuickAction; message: string } | null =
     $state(null);
 
-  // PR-68 / session-90 — keyboard-nav state. `searchNeedle` drives
-  // the client-side substring filter; `focusedRowIndex` tracks the
-  // j/k cursor within `visibleRows` (-1 = no row focused yet so the
-  // first j/k press parks at row 0 per `nextRowIndex`'s posture).
-  // `hintsVisible` toggles the bottom-right hints footer (`?` flips
-  // it; closed-vocab `toggle-hints` hotkey). `searchInputEl` is the
-  // DOM reference the `/` hotkey focuses; bound via Svelte 5
+  // PR-95 / session-115 — per-row pictogram-poll state. Independent
+  // of `busyRow` because the pictogram-poll lives in the State
+  // column, not the Actions column, AND its busy gate must not
+  // disable the Actions buttons (the operator can still download /
+  // submit a different row while a poll is in flight). Tracks which
+  // invoice id is currently being re-polled so the renderer can
+  // swap the pictogram glyph to a spinner-ish "…" affordance.
+  let busyPictogramRow: string | null = $state(null);
+  let pictogramError: { invoiceId: string; message: string } | null = $state(null);
+
+  // PR-68 / session-90 — keyboard-nav state. The needle now lives on
+  // `filter.needle` (PR-94 unified the filter object); `focusedRowIndex`
+  // tracks the j/k cursor within `visibleRows` (-1 = no row focused
+  // yet so the first j/k press parks at row 0 per `nextRowIndex`'s
+  // posture). `hintsVisible` toggles the bottom-right hints footer
+  // (`?` flips it; closed-vocab `toggle-hints` hotkey). `searchInputEl`
+  // is the DOM reference the `/` hotkey focuses; bound via Svelte 5
   // `bind:this`.
-  let searchNeedle: string = $state("");
   let focusedRowIndex: number = $state(-1);
   let hintsVisible: boolean = $state(true);
   let searchInputEl: HTMLInputElement | null = $state(null);
@@ -217,8 +250,8 @@
         // INPUT targets (e.g. the modal-mounted form fields, if any
         // ever bubble) keep their native behaviour.
         if (event.target === searchInputEl) {
-          if (searchNeedle.length > 0) {
-            searchNeedle = "";
+          if (filter.needle.length > 0) {
+            filter = { ...filter, needle: "" };
           } else {
             searchInputEl?.blur();
           }
@@ -241,6 +274,19 @@
         focusedRowIndex = visibleRows.length > 0 ? visibleRows.length - 1 : -1;
         return;
       case "row-open":
+        // PR-94 / session-114 — if a <button> (sort header, refresh,
+        // +New invoice, clear-filters, row quick-action) is the
+        // focused element, the browser's native Enter handler fires
+        // the button's click; emitting row-open on top would
+        // double-fire (toggle the sort AND open the keyboard-focused
+        // row). Suppress here so the button's click is the only
+        // action.
+        if (
+          event.target instanceof HTMLElement &&
+          event.target.tagName === "BUTTON"
+        ) {
+          return;
+        }
         if (focusedRowIndex >= 0 && focusedRowIndex < visibleRows.length) {
           event.preventDefault();
           navStack = [visibleRows[focusedRowIndex].invoice_id];
@@ -356,6 +402,38 @@
     }
   }
 
+  // PR-95 / session-115 — clickable pictogram handler. Invoked when
+  // the operator clicks the NAV-status pictogram on a row whose state
+  // maps to `InFlight` (the actionable arm of the 4-state vocab —
+  // PROCESSING / RECEIVED / Pending / PendingNavExists / Recovered).
+  // Same Tauri command the obsoleted Poll-ack button hit; same
+  // bounded 31s loop on the backend per ADR-0009 §5. On success
+  // refreshes the list so the row's pictogram glyph + state chip
+  // flip if NAV returned a terminal ack; on failure surfaces the
+  // message inline below the table (same A157 posture).
+  //
+  // stopPropagation on the click is the renderer's job — clicking
+  // the pictogram MUST NOT also bubble up to the row's click handler
+  // (which would open the detail modal). The renderer-level
+  // `event.stopPropagation()` keeps the surfaces independent.
+  async function triggerPictogramPoll(row: InvoiceListItem) {
+    if (busyPictogramRow !== null) return;
+    pictogramError = null;
+    busyPictogramRow = row.invoice_id;
+    try {
+      await pollAck(row.invoice_id);
+      await refresh();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      // parseNavUpstreamFault returns null for non-NAV errors; the raw
+      // message is the load-bearing surface for the inline render.
+      parseNavUpstreamFault(message);
+      pictogramError = { invoiceId: row.invoice_id, message };
+    } finally {
+      busyPictogramRow = null;
+    }
+  }
+
   function dispatchQuickAction(row: InvoiceListItem, action: RowQuickAction) {
     if (busyRow !== null) return; // one in-flight at a time
     switch (action) {
@@ -392,24 +470,58 @@
     return `signal-${signal}`;
   }
 
-  // Filter + lifecycle-natural sort. Per ADR-0036 §3 the operator's
-  // mental model walks Unknown → Ready → Pending → PendingNavExists
-  // → Submitted → Recovered → Finalized → Rejected → Storno →
-  // Amended → Abandoned; that ordering mirrors the audit-ledger
-  // ladder in `serve.rs::derive_state`. Within a bucket, secondary
-  // sort by invoice id keeps the display stable across refreshes.
+  // PR-94 / session-114 — filter → sort composition.
+  //
+  // 1. `filterInvoices` AND-combines the needle (PR-68), the state
+  //    facet, and the currency facet (PR-94). EMPTY_FILTER short-
+  //    circuits every gate so the unfiltered display is unchanged.
+  // 2. Sort path:
+  //    - `sort.key === null` → fall back to the lifecycle-natural
+  //      ordering (ADR-0036 §3) the screen has shipped with since
+  //      PR-24. Stable: ties go to invoice_id ascending.
+  //    - `sort.key !== null` → `compareInvoices` (which itself
+  //      tiebreaks on invoice_id ascending regardless of dir).
   let visibleRows = $derived(
-    filterInvoicesByNeedle(
-      rows.filter((r) => filterLabel === "All" || r.state === filterLabel),
-      searchNeedle,
-    )
+    filterInvoices(rows, filter)
       .slice()
       .sort((a, b) => {
-        const dx = lifecycleIndex(a.state) - lifecycleIndex(b.state);
-        if (dx !== 0) return dx;
-        return a.invoice_id.localeCompare(b.invoice_id);
+        if (sort.key === null) {
+          const dx = lifecycleIndex(a.state) - lifecycleIndex(b.state);
+          if (dx !== 0) return dx;
+          return a.invoice_id.localeCompare(b.invoice_id);
+        }
+        return compareInvoices(a, b, sort.key, sort.dir);
       }),
   );
+
+  // PR-94 / session-114 — three-click sort cycle for a column header.
+  // First click on a column: (column, asc). Second click on the same
+  // column: (column, desc). Third click on the same column: reset to
+  // the lifecycle-natural default. Clicking a different column always
+  // jumps to (clicked, asc) directly — the operator's mental model is
+  // "I want to see this column ascending now"; an inherited dir from
+  // the previous column would be a footgun.
+  function onSortClick(key: SortKey) {
+    if (sort.key !== key) {
+      sort = { key, dir: "asc" };
+      return;
+    }
+    if (sort.dir === "asc") {
+      sort = { key, dir: "desc" };
+      return;
+    }
+    sort = { key: null, dir: "asc" };
+  }
+
+  // PR-94 / session-114 — sort-indicator glyph for a column header.
+  // `▲` ascending, `▼` descending, empty when the column is not the
+  // active sort column (or no sort is set). Glyph is the load-bearing
+  // categorical signal per ADR-0017 §"Adversarial review #4" — colour
+  // is not the indicator carrier.
+  function sortIndicator(key: SortKey): string {
+    if (sort.key !== key) return "";
+    return sort.dir === "asc" ? "▲" : "▼";
+  }
 
   // PR-68 / session-90 — keep `focusedRowIndex` valid as the filtered
   // list shrinks. If the operator narrows the search to fewer rows
@@ -430,12 +542,18 @@
     <div class="actions">
       <!-- PR-68 / session-90 — substring search across invoice number,
            ULID, buyer name, and state. `/` focuses this input from
-           anywhere on the page. -->
+           anywhere on the page. PR-94 / session-114 — value lives on
+           the unified `filter.needle` field. -->
       <label class="search">
         <span class="visually-hidden">Search invoices</span>
         <input
           bind:this={searchInputEl}
-          bind:value={searchNeedle}
+          value={filter.needle}
+          oninput={(e) =>
+            (filter = {
+              ...filter,
+              needle: (e.currentTarget as HTMLInputElement).value,
+            })}
           type="search"
           placeholder="Search by number, buyer, state… (press /)"
           autocomplete="off"
@@ -446,13 +564,41 @@
       <label class="filter">
         <span class="filter-label">State</span>
         <select
-          bind:value={filterLabel}
+          value={filter.state}
+          onchange={(e) =>
+            (filter = {
+              ...filter,
+              state: (e.currentTarget as HTMLSelectElement).value as
+                | "All"
+                | InvoiceState,
+            })}
           aria-label="Filter invoices by state"
         >
           <option value="All">All</option>
           {#each LIFECYCLE_ORDER as state (state)}
             <option value={state}>{state}</option>
           {/each}
+        </select>
+      </label>
+      <!-- PR-94 / session-114 — currency facet. Closed-vocab two
+           values today (HUF + EUR per ADR-0037 §3); widening to a
+           third currency lifts here when `Currency` widens. -->
+      <label class="filter">
+        <span class="filter-label">Currency</span>
+        <select
+          value={filter.currency}
+          onchange={(e) =>
+            (filter = {
+              ...filter,
+              currency: (e.currentTarget as HTMLSelectElement).value as
+                | "All"
+                | Currency,
+            })}
+          aria-label="Filter invoices by currency"
+        >
+          <option value="All">All</option>
+          <option value="HUF">HUF</option>
+          <option value="EUR">EUR</option>
         </select>
       </label>
       <button
@@ -480,20 +626,130 @@
   <table class="dense">
     <thead>
       <tr>
-        <th scope="col" class="col-id">Invoice id</th>
+        <!-- PR-94 / session-114 — sortable column headers. Each header
+             is a button that three-cycles asc → desc → reset via
+             `onSortClick`. The ▲/▼ glyph next to the active sort
+             column carries the categorical signal (ADR-0017
+             §"Adversarial review #4"); the column label stays in
+             place. Aria-sort exposes the current direction to
+             assistive tech. -->
+        <th
+          scope="col"
+          class="col-id"
+          aria-sort={sort.key === "invoice_id"
+            ? sort.dir === "asc"
+              ? "ascending"
+              : "descending"
+            : "none"}
+        >
+          <button
+            type="button"
+            class="sort-header"
+            onclick={() => onSortClick("invoice_id")}
+          >
+            <span>Invoice id</span>
+            <span class="sort-indicator" aria-hidden="true">{sortIndicator("invoice_id")}</span>
+          </button>
+        </th>
         <!-- PR-65 / session-86 — Partner column. Positioned between
              Invoice id and the numeric Series # / Fiscal year columns
              so the operator's left-to-right scan answers "who was
              this for?" before "which series number?". -->
-        <th scope="col" class="col-partner">Partner</th>
-        <th scope="col" class="col-num">Series #</th>
-        <th scope="col" class="col-num">Fiscal year</th>
-        <th scope="col" class="col-state">State</th>
-        <th scope="col" class="col-num">Total (gross)</th>
+        <th
+          scope="col"
+          class="col-partner"
+          aria-sort={sort.key === "partner"
+            ? sort.dir === "asc"
+              ? "ascending"
+              : "descending"
+            : "none"}
+        >
+          <button
+            type="button"
+            class="sort-header"
+            onclick={() => onSortClick("partner")}
+          >
+            <span>Partner</span>
+            <span class="sort-indicator" aria-hidden="true">{sortIndicator("partner")}</span>
+          </button>
+        </th>
+        <th
+          scope="col"
+          class="col-num"
+          aria-sort={sort.key === "series_number"
+            ? sort.dir === "asc"
+              ? "ascending"
+              : "descending"
+            : "none"}
+        >
+          <button
+            type="button"
+            class="sort-header right"
+            onclick={() => onSortClick("series_number")}
+          >
+            <span>Series #</span>
+            <span class="sort-indicator" aria-hidden="true">{sortIndicator("series_number")}</span>
+          </button>
+        </th>
+        <th
+          scope="col"
+          class="col-num"
+          aria-sort={sort.key === "fiscal_year"
+            ? sort.dir === "asc"
+              ? "ascending"
+              : "descending"
+            : "none"}
+        >
+          <button
+            type="button"
+            class="sort-header right"
+            onclick={() => onSortClick("fiscal_year")}
+          >
+            <span>Fiscal year</span>
+            <span class="sort-indicator" aria-hidden="true">{sortIndicator("fiscal_year")}</span>
+          </button>
+        </th>
+        <th
+          scope="col"
+          class="col-state"
+          aria-sort={sort.key === "state"
+            ? sort.dir === "asc"
+              ? "ascending"
+              : "descending"
+            : "none"}
+        >
+          <button
+            type="button"
+            class="sort-header"
+            onclick={() => onSortClick("state")}
+          >
+            <span>State</span>
+            <span class="sort-indicator" aria-hidden="true">{sortIndicator("state")}</span>
+          </button>
+        </th>
+        <th
+          scope="col"
+          class="col-num"
+          aria-sort={sort.key === "total"
+            ? sort.dir === "asc"
+              ? "ascending"
+              : "descending"
+            : "none"}
+        >
+          <button
+            type="button"
+            class="sort-header right"
+            onclick={() => onSortClick("total")}
+          >
+            <span>Total (gross)</span>
+            <span class="sort-indicator" aria-hidden="true">{sortIndicator("total")}</span>
+          </button>
+        </th>
         <!-- PR-65 / session-86 — Actions column. Per-row quick-action
              buttons gated by `quickActionsForState`; empty for
              terminal states with only Download (still rendered, kept
-             stable column shape). -->
+             stable column shape). Not sortable — actions have no
+             natural ordering. -->
         <th scope="col" class="col-actions">Actions</th>
       </tr>
     </thead>
@@ -504,14 +760,23 @@
             {#if rows.length === 0}
               No invoices on this tenant yet. Issue one with
               <code>aberp issue-invoice</code> and reload.
-            {:else if searchNeedle.trim().length > 0}
-              No invoices match the search
-              <code>{searchNeedle}</code>{filterLabel !== "All"
-                ? ` and the state filter ${filterLabel}.`
-                : "."}
             {:else}
-              No invoices match the filter
-              <code>{filterLabel}</code>.
+              <!-- PR-94 / session-114 — facet-aware empty state. The
+                   "Clear filters" button resets every facet + the
+                   needle in one click; surfaced ONLY when at least
+                   one facet is engaged (CLAUDE.md rule 12 — the
+                   button has nothing to do when EMPTY_FILTER already
+                   holds, so don't tempt the operator with a no-op). -->
+              No invoices match the current filters.
+              {#if !isFilterEmpty(filter)}
+                <button
+                  type="button"
+                  class="quiet-button clear-filters"
+                  onclick={() => (filter = { ...EMPTY_FILTER })}
+                >
+                  Clear filters
+                </button>
+              {/if}
             {/if}
           </td>
         </tr>
@@ -522,6 +787,8 @@
         {@const isPartnerMissing = row.buyer_name === null || row.buyer_name.trim().length === 0}
         {@const actions = quickActionsForState(row.state, row.payment !== null)}
         {@const isKeyboardFocused = rowIndex === focusedRowIndex}
+        {@const pictogram = navStatusPictogram(row.state)}
+        {@const pictogramBusy = busyPictogramRow === row.invoice_id}
         <tr class:row-focused={isKeyboardFocused}>
           <td class="col-id mono">
             <button
@@ -539,6 +806,41 @@
           <td class="col-num mono">{row.sequence_number}</td>
           <td class="col-num mono">{row.fiscal_year}</td>
           <td class="col-state">
+            <!-- PR-95 / session-115 — NAV-status pictogram. 4-state
+                 closed vocab; click-to-recheck only on `InFlight`.
+                 stopPropagation keeps the row's id-link click
+                 (which opens the detail modal) independent of the
+                 pictogram click. The button vs span split is
+                 ARIA / keyboard discipline: the actionable arm gets
+                 the focusable button affordance; the static arms
+                 render as plain spans (the row id-link is the
+                 keyboard path to inspect those). -->
+            {#if pictogram.actionable}
+              <button
+                type="button"
+                class="nav-pictogram {pictogram.kind_class} actionable"
+                class:busy={pictogramBusy}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  void triggerPictogramPoll(row);
+                }}
+                disabled={busyPictogramRow !== null}
+                aria-label={pictogram.tooltip_en}
+                title={`${pictogram.tooltip_hu} / ${pictogram.tooltip_en}`}
+              >
+                <span aria-hidden="true">
+                  {pictogramBusy ? "…" : pictogram.glyph}
+                </span>
+              </button>
+            {:else}
+              <span
+                class="nav-pictogram {pictogram.kind_class}"
+                aria-label={pictogram.tooltip_en}
+                title={`${pictogram.tooltip_hu} / ${pictogram.tooltip_en}`}
+              >
+                <span aria-hidden="true">{pictogram.glyph}</span>
+              </span>
+            {/if}
             <span
               class="state-pill {signalClass(meta.signal)}"
               title={meta.tooltip}
@@ -603,6 +905,16 @@
     <p class="row-action-error" role="alert">
       {actionError.action} failed for
       <code>{actionError.invoiceId}</code>: {actionError.message}
+    </p>
+  {/if}
+
+  {#if pictogramError !== null}
+    <!-- PR-95 / session-115 — pictogram-poll error surface. Mirrors
+         the `.row-action-error` posture so the operator finds both
+         error classes in the same row beneath the table. -->
+    <p class="row-action-error" role="alert">
+      NAV ack poll failed for
+      <code>{pictogramError.invoiceId}</code>: {pictogramError.message}
     </p>
   {/if}
 
@@ -792,6 +1104,66 @@
     letter-spacing: 0.06em;
   }
 
+  /* PR-94 / session-114 — sortable column header buttons. Reset the
+   * native button chrome so they read as plain header text; the only
+   * visible signal is the cursor and the trailing ▲ / ▼ glyph. Per
+   * ADR-0017 §1-2 (quiet chrome) — no fill, no border. Per
+   * ADR-0017 §"Adversarial review #4" — the glyph is the categorical
+   * signal, not colour. */
+  .sort-header {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+    text-transform: inherit;
+    letter-spacing: inherit;
+    text-align: inherit;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--space-1);
+  }
+
+  .sort-header.right {
+    /* Numeric columns are right-aligned per ADR-0017 §3; the
+     * sortable header inherits that alignment via this modifier. The
+     * `<th>` already has left text-align; we override on the button
+     * so the column heading sits flush-right above the values. */
+    justify-content: flex-end;
+    width: 100%;
+  }
+
+  .sort-header:hover,
+  .sort-header:focus-visible {
+    color: var(--color-text-strong);
+  }
+
+  .sort-header:focus-visible {
+    outline: 1px solid var(--color-text-muted);
+    outline-offset: 2px;
+  }
+
+  .sort-indicator {
+    /* Always reserve a slot so the column width does not jitter as
+     * the operator clicks between columns. The glyph is a single
+     * arrow at the body face; muted text colour matches the inactive
+     * header tint per ADR-0017's quiet posture. */
+    display: inline-block;
+    min-width: 0.75em;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
+  }
+
+  /* PR-94 / session-114 — inline "Clear filters" button inside the
+   * empty-state row. Reuses the quiet-button posture but with extra
+   * top margin so it sits below the message. */
+  .clear-filters {
+    margin-top: var(--space-2);
+  }
+
   table.dense tbody td {
     padding: var(--space-2) var(--space-3);
     border-bottom: 1px solid var(--color-surface-divider);
@@ -851,9 +1223,88 @@
    * 22ch floor still fits the badge alongside the longest chip
    * because PendingNavExists is the only state that pairs with a
    * chain-children flag rarely (the typical chain-base state is
-   * Storno or Amended, both shorter). */
+   * Storno or Amended, both shorter). PR-95 / session-115 — the
+   * NAV-status pictogram lands at the start of the cell (before
+   * the state chip); widen to 26ch so the longest chip + pictogram
+   * still fits without wrapping. */
   .col-state {
-    width: 22ch;
+    width: 26ch;
+  }
+
+  /* PR-95 / session-115 — NAV-status pictogram. Quiet 1-em chip
+   * carrying the 4-state vocab's glyph + per-state border colour
+   * (kind-class). The four kinds map to existing ADR-0017 signal
+   * tokens so the visual palette stays inside the design system.
+   * The actionable arm (InFlight) is a <button> with cursor:pointer;
+   * the three terminal arms are plain spans with cursor:help so the
+   * tooltip-on-hover convention from the state pill is preserved. */
+  .nav-pictogram {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.6em;
+    height: 1.6em;
+    margin-right: var(--space-1);
+    padding: 0;
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 2px;
+    background: var(--color-surface-base);
+    color: var(--color-text-secondary);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    line-height: 1;
+    cursor: help;
+    vertical-align: middle;
+  }
+
+  .nav-pictogram.pictogram-muted {
+    color: var(--color-text-muted);
+    border-color: var(--color-surface-divider);
+  }
+  /* PR-98 — `pictogram-submitted` is the new green-toned
+   * positive-in-progress kind for the post-submit-pre-terminal
+   * `Submitted` / `Recovered` lifecycle pair. Same colour token as
+   * `pictogram-positive` (operator-positive signal: the submit
+   * succeeded) but distinguished from the terminal-positive ✓
+   * pictogram by the ⌛ glyph. The pre-PR-98 `pictogram-warning`
+   * class is retired alongside the collapsed `InFlight` state. */
+  .nav-pictogram.pictogram-submitted {
+    color: var(--color-signal-positive);
+    border-color: var(--color-signal-positive);
+  }
+  .nav-pictogram.pictogram-negative {
+    color: var(--color-signal-negative);
+    border-color: var(--color-signal-negative);
+  }
+  .nav-pictogram.pictogram-positive {
+    color: var(--color-signal-positive);
+    border-color: var(--color-signal-positive);
+  }
+
+  /* PR-95 — actionable variant is a <button>; reset native chrome +
+   * give a pointer cursor so the affordance reads as "click me to
+   * re-poll." Focus-visible outline mirrors the other quiet buttons
+   * in the screen (sort headers, id-link). */
+  button.nav-pictogram.actionable {
+    cursor: pointer;
+  }
+
+  button.nav-pictogram.actionable:hover:not(:disabled) {
+    color: var(--color-text-strong);
+  }
+
+  button.nav-pictogram.actionable:focus-visible {
+    outline: 1px solid var(--color-text-muted);
+    outline-offset: 1px;
+  }
+
+  button.nav-pictogram.actionable:disabled {
+    opacity: 0.7;
+    cursor: progress;
+  }
+
+  button.nav-pictogram.busy {
+    cursor: progress;
   }
 
   /* PR-31 / session-35 — chain-link badge next to the state chip.

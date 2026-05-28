@@ -15,13 +15,14 @@ import {
 } from "./router";
 
 describe("parseRoute", () => {
-  it("maps the six canonical slugs verbatim", () => {
+  it("maps the seven canonical slugs verbatim", () => {
     const cases: { hash: string; expected: AppRoute }[] = [
       { hash: "#/invoices", expected: "invoices" },
       { hash: "#/invoices-new", expected: "invoices-new" },
       { hash: "#/tenant", expected: "tenant" },
       { hash: "#/nav-credentials", expected: "nav-credentials" },
       { hash: "#/partners", expected: "partners" },
+      { hash: "#/products", expected: "products" },
       { hash: "#/maintenance", expected: "maintenance" },
     ];
     for (const { hash, expected } of cases) {
@@ -56,6 +57,7 @@ describe("routeHash", () => {
     expect(routeHash("tenant")).toBe(`${HASH_PREFIX}tenant`);
     expect(routeHash("nav-credentials")).toBe(`${HASH_PREFIX}nav-credentials`);
     expect(routeHash("partners")).toBe(`${HASH_PREFIX}partners`);
+    expect(routeHash("products")).toBe(`${HASH_PREFIX}products`);
     expect(routeHash("maintenance")).toBe(`${HASH_PREFIX}maintenance`);
   });
 
@@ -68,6 +70,7 @@ describe("routeHash", () => {
       "tenant",
       "nav-credentials",
       "partners",
+      "products",
       "maintenance",
     ];
     for (const r of all) {

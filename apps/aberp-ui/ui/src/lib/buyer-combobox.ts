@@ -63,7 +63,9 @@ export function buyerComboboxState(
       (p) =>
         p.display_name.toLowerCase().includes(q) ||
         p.legal_name.toLowerCase().includes(q) ||
-        p.tax_number.toLowerCase().includes(q),
+        // PR-97 / ADR-0048 — tax_number is nullable; PrivatePerson
+        // partners have NULL and fall through to the name match.
+        (p.tax_number?.toLowerCase().includes(q) ?? false),
     )
     .slice(0, maxMatches);
   return { matches, shouldShowDropdown: true };

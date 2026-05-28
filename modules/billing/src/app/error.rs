@@ -45,9 +45,4 @@ pub enum BillingError {
     /// Indicates schema drift or DB corruption.
     #[error("time parse error: {0}")]
     TimeParse(#[from] time::error::Parse),
-
-    /// The `AnnualOnFiscalYear` reset policy is not implemented in PR-4.
-    /// Failing loud rather than silently treating it as `Never`.
-    #[error("AnnualOnFiscalYear reset policy is not implemented yet (named for future PR per ADR-0009 §3)")]
-    AnnualResetUnimplemented,
 }

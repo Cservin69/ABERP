@@ -127,8 +127,18 @@ mod tests {
     /// Per CLAUDE.md rule 12 (fail loud): if either PEM ever fails to
     /// parse, or if rustls ever rejects the cert as a trust anchor,
     /// the build's own tests refuse to pass.
+    ///
+    /// PR-92 / ADR-0047 — `--workspace` test runs may pull in BOTH
+    /// `aws-lc-rs` AND `ring` rustls providers (the latter via
+    /// lettre's transitive deps). `ClientConfig::builder()` needs a
+    /// single default provider; install one explicitly here so the
+    /// test stays robust under both `cargo test -p aberp-nav-transport`
+    /// (single provider) and `cargo test --workspace` (multi-provider)
+    /// configurations. The production binary's `main.rs` does the same
+    /// install at boot.
     #[test]
     fn pinned_client_config_builds() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let _config = build_pinned_client_config()
             .expect("vendored NAV trust anchors must parse — re-run openssl extraction if not");
     }

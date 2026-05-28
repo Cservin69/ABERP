@@ -162,6 +162,40 @@
 /// PR-13 / PR-14 / PR-15 / PR-19 / PR-20, mechanical at this
 /// point.
 ///
+/// PR-92 (ADR-0047) adds `InvoiceEmailedSent` — the operational
+/// "invoice emailed to buyer" event. Operator-twin: there must be a
+/// durable record of WHEN the buyer was sent the invoice, TO WHICH
+/// address, and the OUTCOME (succeeded / failed). Critical because
+/// the SMTP layer is the buyer-communication path — silence-by-
+/// omission ("we don't know if the buyer got it") is the wrong
+/// default for a buyer-comms product per [[aberp-notes-and-email]].
+///
+/// Payload (`InvoiceEmailedSentPayload` in the binary's
+/// `audit_payloads.rs`) carries: `invoice_id`, `idempotency_key`,
+/// `recipient` (the to-address — visible operator data, not a
+/// secret), `subject` (verbatim email subject sent), `outcome`
+/// (closed-vocab `"succeeded"` / `"failed"`), `error_class`
+/// (`None` on succeeded; closed-vocab `"transport"` / `"tls"` /
+/// `"auth"` / `"recipient_rejected"` / `"compose"` / `"other"` on
+/// failed), `error_detail` (operator-readable explanation —
+/// scrubbed of credentials by the SMTP send path), `auto` (bool —
+/// `true` when the post-issue auto-send fired, `false` when the
+/// operator clicked the manual "Email to buyer" button), and
+/// `attached_xml` (bool — did the NAV XML ride along).
+///
+/// CRITICALLY: the payload MUST NOT carry the SMTP password, the
+/// SMTP server host (defence-in-depth — host is in seller.toml and
+/// has its own audit trail elsewhere; including it in every email
+/// audit entry would smear server identity across the ledger), or
+/// the email body bytes. ADR-0047 §4 pins the secret-scrubbing
+/// posture; the unit pin in `tests/audit_payload_emailed_no_secrets`
+/// catches any future field addition that violates it.
+///
+/// The `invoice.` prefix MUST hold so the per-invoice export bundle's
+/// (ADR-0009 §8) `invoice.*` glob picks up the new entries alongside
+/// every other lifecycle entry — same silent-omission-failure-mode
+/// posture every prior PR's prefix-pin test names. PR-92.
+///
 /// PR-70 (ADR-0039) adds `InvoicePaymentRecorded` — the operational
 /// "quick mark as paid" event per the Tier-2-lifted-to-Tier-1
 /// roadmap decision at session 81 (`project_aberp_ux_roadmap.md`).
@@ -506,6 +540,25 @@ pub enum EventKind {
     /// silent-omission-failure-mode posture every prior PR's
     /// prefix-pin test names. PR-70, ADR-0039 §2.
     InvoicePaymentRecorded,
+
+    /// An invoice was emailed to its buyer via SMTP (PR-92, ADR-0047).
+    /// One entry per send ATTEMPT — both successful sends and
+    /// transport / TLS / auth / recipient-rejected failures emit an
+    /// entry so the operator-twin record never has gaps. Payload
+    /// (`InvoiceEmailedSentPayload`) carries `invoice_id`,
+    /// `idempotency_key`, `recipient`, `subject`, `outcome`
+    /// (`"succeeded"` / `"failed"`), optional `error_class`,
+    /// optional `error_detail`, `auto` (post-issue auto-send vs
+    /// operator-clicked manual send), and `attached_xml` (whether
+    /// the NAV XML rode alongside the PDF). NO secrets — see the
+    /// payload type docs and `audit_payload_emailed_no_secrets` pin.
+    ///
+    /// The `invoice.` prefix MUST hold so the per-invoice export
+    /// bundle's (ADR-0009 §8) `invoice.*` glob picks up the new
+    /// entries alongside every other lifecycle entry — same
+    /// silent-omission-failure-mode posture every prior PR's
+    /// prefix-pin test names. PR-92, ADR-0047 §4.
+    InvoiceEmailedSent,
 }
 
 impl EventKind {
@@ -538,6 +591,7 @@ impl EventKind {
             EventKind::InvoiceSubmissionAttemptFailed => "invoice.submission_attempt_failed",
             EventKind::InvoiceCheckPerformed => "invoice.check_performed",
             EventKind::InvoicePaymentRecorded => "invoice.payment_recorded",
+            EventKind::InvoiceEmailedSent => "invoice.emailed_sent",
         }
     }
 
@@ -581,6 +635,7 @@ impl EventKind {
             "invoice.submission_attempt_failed" => Ok(EventKind::InvoiceSubmissionAttemptFailed),
             "invoice.check_performed" => Ok(EventKind::InvoiceCheckPerformed),
             "invoice.payment_recorded" => Ok(EventKind::InvoicePaymentRecorded),
+            "invoice.emailed_sent" => Ok(EventKind::InvoiceEmailedSent),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -620,6 +675,7 @@ mod tests {
             EventKind::InvoiceSubmissionAttemptFailed,
             EventKind::InvoiceCheckPerformed,
             EventKind::InvoicePaymentRecorded,
+            EventKind::InvoiceEmailedSent,
         ];
         for v in variants {
             let s = v.as_str();
@@ -983,6 +1039,48 @@ mod tests {
         assert_ne!(
             EventKind::InvoicePaymentRecorded.as_str(),
             EventKind::InvoiceTechnicalAnnulmentRequested.as_str()
+        );
+    }
+
+    /// PR-92 / ADR-0047 §4: the buyer-facing emailed-sent event. The
+    /// `invoice.` prefix MUST hold so the per-invoice export bundle's
+    /// (ADR-0009 §8) `invoice.*` glob picks up the new entries
+    /// alongside every other lifecycle entry — same silent-omission-
+    /// failure-mode posture every prior PR's prefix-pin test names.
+    #[test]
+    fn pr_92_emailed_sent_kind_uses_invoice_prefix() {
+        assert_eq!(
+            EventKind::InvoiceEmailedSent.as_str(),
+            "invoice.emailed_sent"
+        );
+        assert!(EventKind::InvoiceEmailedSent
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// PR-92 / ADR-0047 §4: deliberate fork from every other kind.
+    /// An emailed-sent event is buyer-communication evidence,
+    /// structurally distinct from every prior lifecycle / payment /
+    /// annulment kind; pinning the distinction here catches a future
+    /// refactor accidentally collapsing emailed-sent onto an
+    /// existing kind.
+    #[test]
+    fn pr_92_emailed_sent_is_distinct_from_all_other_kinds() {
+        assert_ne!(
+            EventKind::InvoiceEmailedSent.as_str(),
+            EventKind::InvoicePaymentRecorded.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceEmailedSent.as_str(),
+            EventKind::InvoiceSubmissionResponse.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceEmailedSent.as_str(),
+            EventKind::InvoiceStornoIssued.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceEmailedSent.as_str(),
+            EventKind::InvoiceModificationIssued.as_str()
         );
     }
 }

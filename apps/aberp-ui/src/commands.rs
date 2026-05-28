@@ -409,6 +409,62 @@ pub async fn delete_partner(state: State<'_, AppState>, partner_id: String) -> R
     forward_delete(&state, &path).await
 }
 
+// ── PR-91 — product CRUD ────────────────────────────────────────────
+
+/// PR-91 — `GET /api/products[?search=]`. The SPA's ProductsList
+/// screen calls this on open. `search` is appended as a query-string
+/// only when non-empty (mirrors `list_partners`).
+#[tauri::command]
+pub async fn list_products(
+    state: State<'_, AppState>,
+    search: Option<String>,
+) -> Result<Value, String> {
+    let path = match search.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(needle) => format!("/api/products?search={}", urlencode(needle)),
+        None => "/api/products".to_string(),
+    };
+    forward_get(&state, &path, true).await
+}
+
+/// PR-91 — `GET /api/products/:id`.
+#[tauri::command]
+pub async fn get_product(state: State<'_, AppState>, product_id: String) -> Result<Value, String> {
+    validate_product_id(&product_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/products/{product_id}");
+    forward_get(&state, &path, true).await
+}
+
+/// PR-91 — `POST /api/products`. ProductForm modal POSTs the composed
+/// inputs body. Validation failures surface as the typed
+/// `{ "error": "validation_failed", "fields": [...] }` envelope, same
+/// A157 shape Partners uses.
+#[tauri::command]
+pub async fn create_product(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/products", body).await
+}
+
+/// PR-91 — `PUT /api/products/:id`.
+#[tauri::command]
+pub async fn update_product(
+    state: State<'_, AppState>,
+    product_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_product_id(&product_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/products/{product_id}");
+    forward_put(&state, &path, body).await
+}
+
+/// PR-91 — `DELETE /api/products/:id`. Soft-delete; the row stays in
+/// the DB so future invoice-line lookups can still resolve product
+/// references (when the line-editor integration lands).
+#[tauri::command]
+pub async fn delete_product(state: State<'_, AppState>, product_id: String) -> Result<(), String> {
+    validate_product_id(&product_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/products/{product_id}");
+    forward_delete(&state, &path).await
+}
+
 /// PR-72 / session-94 — `GET /api/seller/banks`. Used by the SPA's
 /// Tenant Settings page (bank-accounts subsection) + the
 /// SellerConfigWizard's multi-row block to render the current
@@ -465,6 +521,80 @@ pub async fn delete_seller_bank(
     validate_bank_id(&bank_id).map_err(|e| format!("{e:#}"))?;
     let path = format!("/api/seller/banks/{bank_id}");
     forward_delete_returning_json(&state, &path).await
+}
+
+/// PR-89 — `GET /api/seller/numbering`. The Tenant Settings "Invoice
+/// numbering" subsection calls this on open to render the persisted
+/// template (or the default INV-default/NNNNN shape when absent).
+#[tauri::command]
+pub async fn get_seller_numbering(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/seller/numbering", true).await
+}
+
+/// PR-89 — `PUT /api/seller/numbering`. The "Save" button on the
+/// Invoice numbering builder PUTs the assembled template body here.
+/// Backend validates (closed-vocab on segment kinds + reset policy,
+/// NAV-charset on Literal segments, exactly-one-counter, etc.) and
+/// atomically replaces the `[seller.numbering]` section of
+/// seller.toml — preserving identity + bank sections.
+#[tauri::command]
+pub async fn put_seller_numbering(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_put(&state, "/api/seller/numbering", body).await
+}
+
+// ── PR-92 / ADR-0047 — SMTP commands ─────────────────────────────
+
+/// PR-92 — `GET /api/smtp-config`. The Tenant Settings SMTP
+/// subsection calls this on open. Returns the `[seller.smtp]` config
+/// (non-secrets only) + a `passwordSet` flag probing the keychain;
+/// NEVER carries the password itself.
+#[tauri::command]
+pub async fn get_smtp_config(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/smtp-config", true).await
+}
+
+/// PR-92 — `PUT /api/smtp-config`. The SMTP-settings save button
+/// PUTs the operator-typed config here. The body may include an
+/// optional `password` field — if present, the backend writes it to
+/// the OS keychain (the password NEVER lands on disk / in
+/// seller.toml). Non-secret fields are merged into
+/// `[seller.smtp]` without clobbering other sections.
+#[tauri::command]
+pub async fn put_smtp_config(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_put(&state, "/api/smtp-config", body).await
+}
+
+/// PR-98 — `POST /api/seller/smtp/test`. The TenantSettings "Test
+/// connection" button calls this with the operator-typed form values.
+/// Backend opens a TLS handshake + AUTH + NOOP without sending mail
+/// or persisting anything. Returns a typed `SmtpTestOutcome`.
+#[tauri::command]
+pub async fn test_smtp_connection(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/seller/smtp/test", body).await
+}
+
+/// PR-92 — `POST /api/invoices/:id/email`. The "Email to buyer"
+/// manual-send button on InvoiceDetail calls this. The backend
+/// resolves the buyer's email from the partners table, renders the
+/// PDF + optionally attaches the NAV XML, sends over TLS, and writes
+/// the `InvoiceEmailedSent` audit-ledger entry (success OR failure).
+#[tauri::command]
+pub async fn email_invoice_to_buyer(
+    state: State<'_, AppState>,
+    invoice_id: String,
+) -> Result<Value, String> {
+    forward_post(
+        &state,
+        &format!("/api/invoices/{invoice_id}/email"),
+        serde_json::json!({}),
+    )
+    .await
 }
 
 /// PR-45a / session-61 — the SPA's Retry button calls this command
@@ -846,6 +976,25 @@ fn validate_partner_id(s: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// PR-91 — defence-in-depth path-parameter validator for the `:id`
+/// segment on product routes. Mirrors [`validate_partner_id`] (the
+/// `ProductId` newtype is `prd_<26-char-ULID>` — 30 chars total).
+fn validate_product_id(s: &str) -> anyhow::Result<()> {
+    if s.is_empty() {
+        anyhow::bail!("product_id is empty");
+    }
+    if s.len() > 64 {
+        anyhow::bail!("product_id length {} exceeds 64", s.len());
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        anyhow::bail!("product_id `{s}` contains characters outside [A-Za-z0-9_-]");
+    }
+    Ok(())
+}
+
 /// Reject obviously malformed invoice ids before they reach the
 /// backend. The backend itself has its own (looser) parsing — this
 /// is defence in depth against a path-injection attempt from a
@@ -904,6 +1053,18 @@ mod tests {
     #[test]
     fn validate_partner_id_accepts_typical_prefixed_ulid() {
         assert!(validate_partner_id("prt_01ARZ3NDEKTSV4RRFFQ69G5FAV").is_ok());
+    }
+
+    #[test]
+    fn validate_product_id_accepts_typical_prefixed_ulid() {
+        assert!(validate_product_id("prd_01ARZ3NDEKTSV4RRFFQ69G5FAV").is_ok());
+    }
+
+    #[test]
+    fn validate_product_id_rejects_path_traversal() {
+        assert!(validate_product_id("../etc/passwd").is_err());
+        assert!(validate_product_id("prd/foo").is_err());
+        assert!(validate_product_id("").is_err());
     }
 
     #[test]

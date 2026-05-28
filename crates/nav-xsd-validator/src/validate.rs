@@ -412,11 +412,24 @@ fn walk_customer_info(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidation
         "customerName",
         "customerAddress",
     ];
-    // customerVatStatus + customerName are unconditionally required.
-    // customerVatData + customerAddress are conditionally required
-    // based on customerVatStatus value — that branch is enforced
-    // below, AFTER the seen-children list is fully populated.
-    const ORDERED_REQUIRED: &[&str] = &["customerVatStatus", "customerName"];
+    // PR-97 / ADR-0048 (Ervin override 2 / GDPR) — `customerVatStatus`
+    // is now the ONLY unconditionally-required child. `customerName`
+    // moves to the conditional set: required when status !=
+    // PRIVATE_PERSON; optional under PRIVATE_PERSON per Ervin's GDPR
+    // posture. `customerVatData` + `customerAddress` remain
+    // conditionally required for non-PRIVATE_PERSON (PR-77 hold).
+    //
+    // XSD verification status: the public NAV v3.0
+    // `CustomerInfoType` declares `<customerName>` as `minOccurs="0"`
+    // at the schema level; the business-rule layer fires
+    // `CUSTOMER_DATA_EXPECTED` for non-PRIVATE_PERSON missing this
+    // child. The PRIVATE_PERSON-with-no-name shape has not been
+    // exercised against the live NAV-test endpoint as of PR-97;
+    // first PRIVATE_PERSON GDPR-omit-name issuance will confirm or
+    // reveal a NAV business-rule that promotes it back to required.
+    // If NAV rejects, revert this branch to `["customerVatStatus",
+    // "customerName"]` and reinstate the unconditional required pin.
+    const ORDERED_REQUIRED: &[&str] = &["customerVatStatus"];
 
     // PR-77 / session-101 — capture the customerVatStatus text so the
     // post-walk business-rule check can decide whether `customerVatData`
@@ -476,6 +489,23 @@ fn walk_customer_info(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidation
                         return Err(NavXsdValidationError::MissingRequiredChild {
                             parent: PARENT,
                             expected: "customerAddress",
+                        });
+                    }
+                } else {
+                    // PR-97 / ADR-0048 §5 — symmetric NEGATIVE half of
+                    // `CUSTOMER_DATA_EXPECTED`. PRIVATE_PERSON buyers
+                    // MUST NOT carry `<customerVatData>`; NAV rejects
+                    // its presence at the business-rule layer. The
+                    // positive half above is PR-77's hold; this branch
+                    // closes the trap door on the negative half so a
+                    // future emit drift (PrivatePerson body that still
+                    // carries a stray `<customerVatData>`) loud-fails
+                    // at the ADR-0022 invariant check.
+                    if seen.contains(&"customerVatData") {
+                        return Err(NavXsdValidationError::ForbiddenChildUnderStatus {
+                            parent: PARENT,
+                            element: "customerVatData",
+                            status: "PRIVATE_PERSON",
                         });
                     }
                 }
@@ -1768,7 +1798,7 @@ mod tests {
     /// regression that promotes the two elements to unconditionally
     /// required.
     #[test]
-    fn private_person_status_does_not_require_customer_vat_data_or_address() {
+    fn private_person_status_accepts_missing_customer_vat_data_and_address() {
         // Replace the customerInfo block wholesale: PRIVATE_PERSON +
         // bare customerName, no vatData, no address.
         let original = "<customerInfo>\n          <customerVatStatus>DOMESTIC</customerVatStatus>\n          <customerVatData>\n            <customerTaxNumber>\n              <common:taxpayerId>87654321</common:taxpayerId>\n              <common:vatCode>1</common:vatCode>\n              <common:countyCode>42</common:countyCode>\n            </customerTaxNumber>\n          </customerVatData>\n          <customerName>Test Customer Zrt.</customerName>\n          <customerAddress>\n            <common:simpleAddress>\n              <common:countryCode>HU</common:countryCode>\n              <common:postalCode>1052</common:postalCode>\n              <common:city>Budapest</common:city>\n              <common:additionalAddressDetail>Váci utca 19.</common:additionalAddressDetail>\n            </common:simpleAddress>\n          </customerAddress>\n        </customerInfo>";
@@ -1781,6 +1811,76 @@ mod tests {
         let mutated = MIN_VALID.replace(original, replacement);
         validate_invoice_data(mutated.as_bytes())
             .expect("PRIVATE_PERSON must not require customerVatData or customerAddress");
+    }
+
+    /// PR-97 / ADR-0048 §5 — symmetric NEGATIVE half of
+    /// `CUSTOMER_DATA_EXPECTED`. PRIVATE_PERSON buyers MUST NOT carry
+    /// a `<customerVatData>` block; NAV's business-rule layer rejects
+    /// the combination server-side. The validator now models that
+    /// rule locally so the trap door cannot reopen on either a future
+    /// emit regression or a SPA-bypassing CLI body.
+    #[test]
+    fn private_person_status_forbids_customer_vat_data_in_input() {
+        // Build a PRIVATE_PERSON customerInfo body that ILLEGALLY
+        // carries `<customerVatData>` — the validator's new
+        // ForbiddenChildUnderStatus rule must fire.
+        let original = "<customerInfo>\n          <customerVatStatus>DOMESTIC</customerVatStatus>\n          <customerVatData>\n            <customerTaxNumber>\n              <common:taxpayerId>87654321</common:taxpayerId>\n              <common:vatCode>1</common:vatCode>\n              <common:countyCode>42</common:countyCode>\n            </customerTaxNumber>\n          </customerVatData>\n          <customerName>Test Customer Zrt.</customerName>\n          <customerAddress>\n            <common:simpleAddress>\n              <common:countryCode>HU</common:countryCode>\n              <common:postalCode>1052</common:postalCode>\n              <common:city>Budapest</common:city>\n              <common:additionalAddressDetail>Váci utca 19.</common:additionalAddressDetail>\n            </common:simpleAddress>\n          </customerAddress>\n        </customerInfo>";
+        // PRIVATE_PERSON + customerVatData present (the forbidden
+        // combination). `<customerName>` is universally required.
+        let replacement = "<customerInfo>\n          <customerVatStatus>PRIVATE_PERSON</customerVatStatus>\n          <customerVatData>\n            <customerTaxNumber>\n              <common:taxpayerId>87654321</common:taxpayerId>\n              <common:vatCode>1</common:vatCode>\n              <common:countyCode>42</common:countyCode>\n            </customerTaxNumber>\n          </customerVatData>\n          <customerName>Test Private Buyer</customerName>\n        </customerInfo>";
+        assert!(
+            MIN_VALID.contains(original),
+            "MIN_VALID must contain the full customerInfo block this pin replaces"
+        );
+        let mutated = MIN_VALID.replace(original, replacement);
+        let err = validate_invoice_data(mutated.as_bytes())
+            .expect_err("PRIVATE_PERSON + customerVatData must loud-fail");
+        match err {
+            NavXsdValidationError::ForbiddenChildUnderStatus {
+                parent,
+                element,
+                status,
+            } => {
+                assert_eq!(parent, "customerInfo");
+                assert_eq!(element, "customerVatData");
+                assert_eq!(status, "PRIVATE_PERSON");
+            }
+            other => panic!(
+                "expected ForbiddenChildUnderStatus(customerVatData under PRIVATE_PERSON), \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    /// PR-97 / ADR-0048 §5 — guard the PR-77 hold against accidental
+    /// collapse. DOMESTIC buyers still REQUIRE `<customerVatData>` AND
+    /// `<customerAddress>`; pinned here so a future merge that
+    /// rewrites the customer-info walker cannot silently weaken the
+    /// positive half of the rule.
+    #[test]
+    fn domestic_status_still_requires_vat_data_and_address() {
+        // Strip BOTH `<customerVatData>` and `<customerAddress>` from
+        // the DOMESTIC fixture; expect MissingRequiredChild (the
+        // PR-77 positive half).
+        let original = "<customerVatData>\n            <customerTaxNumber>\n              <common:taxpayerId>87654321</common:taxpayerId>\n              <common:vatCode>1</common:vatCode>\n              <common:countyCode>42</common:countyCode>\n            </customerTaxNumber>\n          </customerVatData>\n          <customerName>Test Customer Zrt.</customerName>\n          <customerAddress>\n            <common:simpleAddress>\n              <common:countryCode>HU</common:countryCode>\n              <common:postalCode>1052</common:postalCode>\n              <common:city>Budapest</common:city>\n              <common:additionalAddressDetail>Váci utca 19.</common:additionalAddressDetail>\n            </common:simpleAddress>\n          </customerAddress>\n        ";
+        let replacement = "<customerName>Test Customer Zrt.</customerName>\n        ";
+        assert!(
+            MIN_VALID.contains(original),
+            "MIN_VALID must contain the customerVatData+customerAddress block"
+        );
+        let mutated = MIN_VALID.replace(original, replacement);
+        let err = validate_invoice_data(mutated.as_bytes())
+            .expect_err("DOMESTIC + missing customerVatData must loud-fail");
+        match err {
+            NavXsdValidationError::MissingRequiredChild { parent, expected } => {
+                assert_eq!(parent, "customerInfo");
+                assert!(
+                    expected == "customerVatData" || expected == "customerAddress",
+                    "expected one of the two required children to fire first; got `{expected}`"
+                );
+            }
+            other => panic!("expected MissingRequiredChild for DOMESTIC, got {other:?}"),
+        }
     }
 
     /// PR-10 / ADR-0023: NAV v3.0 storno convention is negative line
@@ -2160,6 +2260,11 @@ mod tests {
                 element: "y",
                 expected_prefix: "common",
                 actual_prefix: "z".into(),
+            },
+            NavXsdValidationError::ForbiddenChildUnderStatus {
+                parent: "x",
+                element: "y",
+                status: "PRIVATE_PERSON",
             },
         ];
 

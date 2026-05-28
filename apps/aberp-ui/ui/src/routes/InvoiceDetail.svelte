@@ -165,6 +165,7 @@
   import {
     cancelInvoiceStorno,
     downloadInvoicePdf,
+    emailInvoiceToBuyer,
     getInvoice,
     markInvoicePaid,
     parseAlreadyPaidError,
@@ -183,6 +184,7 @@
     labelMeta,
     type LabelSignal,
   } from "../lib/labels";
+  import { navStatusPictogram } from "../lib/nav-status-pictogram";
   import {
     actionGroupLabel,
     buttonsForState,
@@ -280,13 +282,23 @@
     | { kind: "polling" }
     | { kind: "cancelling" }
     | { kind: "paying" }
+    | { kind: "emailing" }
     | {
         kind: "error";
-        action: "submit" | "poll" | "cancel" | "pay";
+        action: "submit" | "poll" | "cancel" | "pay" | "email";
         message: string;
         navFault: NavUpstreamFault | null;
       };
   let mutationState: MutationState = $state({ kind: "idle" });
+
+  // PR-92 / ADR-0047 — surface the last email send outcome inline so
+  // the operator sees succeeded/failed + recipient + error class.
+  // Rendered as a status banner under the action bar; cleared on a
+  // fresh email-button click. Also visible in the audit log table —
+  // this state is a fast operator-feedback path on top of the durable
+  // audit-ledger record.
+  let lastEmailOutcome: import("../lib/api").EmailRouteOutcome | null =
+    $state(null);
 
   // PR-80 / session-102 — inline storno confirm panel. The pre-PR-80
   // posture (PR-47α) used a browser-native `window.confirm()` which
@@ -474,6 +486,33 @@
     } catch (err: unknown) {
       downloadState = "error";
       downloadError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  // PR-92 / ADR-0047 — operator-clicked manual "Email to buyer" button.
+  // Independent of the post-issue auto-send path (which fires
+  // server-side when the operator left the toggle on at issuance).
+  // Both paths share the same audit-ledger event kind; the audit
+  // payload's `auto: bool` field discriminates.
+  async function triggerEmailToBuyer() {
+    if (!detail) return;
+    mutationState = { kind: "emailing" };
+    lastEmailOutcome = null;
+    try {
+      const outcome = await emailInvoiceToBuyer(detail.invoice_id);
+      lastEmailOutcome = outcome;
+      // Refetch so the audit-entries table picks up the new
+      // InvoiceEmailedSent row.
+      await load(detail.invoice_id);
+      mutationState = { kind: "idle" };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      mutationState = {
+        kind: "error",
+        action: "email",
+        message,
+        navFault: null,
+      };
     }
   }
 
@@ -725,9 +764,6 @@
       case "Submit":
         void triggerSubmit();
         return;
-      case "PollAck":
-        void triggerPollAck();
-        return;
       case "Pay":
         triggerOpenMarkPaid();
         return;
@@ -739,6 +775,9 @@
         return;
       case "Download":
         void triggerDownload();
+        return;
+      case "Email":
+        void triggerEmailToBuyer();
         return;
     }
   }
@@ -752,8 +791,6 @@
     switch (button) {
       case "Submit":
         return "Beküldés folyamatban…";
-      case "PollAck":
-        return "Lekérés folyamatban…";
       case "Pay":
         return "Fizetés rögzítése…";
       case "Storno":
@@ -762,6 +799,8 @@
         return "Módosítás…";
       case "Download":
         return "Letöltés…";
+      case "Email":
+        return "Email küldése…";
     }
   }
 
@@ -852,7 +891,45 @@
           </nav>
         {/if}
         <span class="detail-label">Invoice</span>
-        <h2 class="detail-id mono">{invoiceId ?? ""}</h2>
+        <div class="detail-id-row">
+          <h2 class="detail-id mono">{invoiceId ?? ""}</h2>
+          {#if detail !== null}
+            <!-- PR-95 / session-115 — NAV-status pictogram in the
+                 detail header. Prominent placement next to the invoice
+                 id so the operator's eye lands on the 4-state ack
+                 signal first. Click-to-recheck on `InFlight` re-polls
+                 NAV (same `pollAck` Tauri call the obsoleted action-bar
+                 PollAck button hit). Terminal states render as plain
+                 spans with the tooltip-on-hover convention. -->
+            {@const pictogram = navStatusPictogram(detail.state)}
+            {@const pictogramBusy = mutationState.kind === "polling"}
+            {#if pictogram.actionable}
+              <button
+                type="button"
+                class="nav-pictogram-detail {pictogram.kind_class} actionable"
+                class:busy={pictogramBusy}
+                onclick={() => void triggerPollAck()}
+                disabled={mutationState.kind !== "idle"}
+                aria-label={pictogram.tooltip_en}
+                title={`${pictogram.tooltip_hu} / ${pictogram.tooltip_en}`}
+                data-testid="nav-pictogram"
+              >
+                <span aria-hidden="true">
+                  {pictogramBusy ? "…" : pictogram.glyph}
+                </span>
+              </button>
+            {:else}
+              <span
+                class="nav-pictogram-detail {pictogram.kind_class}"
+                aria-label={pictogram.tooltip_en}
+                title={`${pictogram.tooltip_hu} / ${pictogram.tooltip_en}`}
+                data-testid="nav-pictogram"
+              >
+                <span aria-hidden="true">{pictogram.glyph}</span>
+              </span>
+            {/if}
+          {/if}
+        </div>
       </div>
       <div class="detail-actions">
         <button
@@ -887,7 +964,8 @@
         mutationState.kind === "submitting" ||
         mutationState.kind === "polling" ||
         mutationState.kind === "cancelling" ||
-        mutationState.kind === "paying"}
+        mutationState.kind === "paying" ||
+        mutationState.kind === "emailing"}
       {#if groups.length > 0}
         <div class="action-bar" role="toolbar" aria-label="Számla műveletek">
           {#each groups as group (group.group)}
@@ -905,9 +983,9 @@
                   {@const meta = detailActionMeta(button)}
                   {@const busy =
                     (button === "Submit" && mutationState.kind === "submitting") ||
-                    (button === "PollAck" && mutationState.kind === "polling") ||
                     (button === "Pay" && mutationState.kind === "paying") ||
                     (button === "Storno" && mutationState.kind === "cancelling") ||
+                    (button === "Email" && mutationState.kind === "emailing") ||
                     (button === "Download" && downloadState === "downloading")}
                   {@const disabled =
                     (button === "Download"
@@ -939,6 +1017,40 @@
               </div>
             </div>
           {/each}
+        </div>
+      {/if}
+
+      {#if lastEmailOutcome !== null}
+        <!-- PR-92 / ADR-0047 — inline email-send outcome banner. Mirror
+             of the audit-ledger entry the backend just wrote; visible
+             to the operator immediately so they don't have to scan the
+             audit log table for confirmation. -->
+        <div
+          class="email-outcome email-outcome--{lastEmailOutcome.outcome}"
+          role={lastEmailOutcome.outcome === "failed" ? "alert" : "status"}
+          data-testid="invoice-email-outcome"
+        >
+          {#if lastEmailOutcome.outcome === "succeeded"}
+            <strong>✉ Email elküldve · Email sent</strong>
+            <p class="email-outcome__detail">
+              Címzett · Recipient: <code>{lastEmailOutcome.recipient}</code>
+              {#if lastEmailOutcome.attached_xml}
+                · NAV XML csatolva · XML attached
+              {/if}
+            </p>
+          {:else}
+            <strong>✉ Email küldés sikertelen · Email failed</strong>
+            <p class="email-outcome__detail">
+              Hibaosztály · Class:
+              <code>{lastEmailOutcome.error_class ?? "other"}</code>
+              · Címzett · Recipient: <code>{lastEmailOutcome.recipient}</code>
+            </p>
+            {#if lastEmailOutcome.error_detail}
+              <p class="email-outcome__detail">
+                {lastEmailOutcome.error_detail}
+              </p>
+            {/if}
+          {/if}
         </div>
       {/if}
 
@@ -1493,12 +1605,84 @@
     color: var(--color-text-secondary);
   }
 
+  .detail-id-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    flex-wrap: wrap;
+  }
+
   .detail-id {
     margin: 0;
     font-size: var(--type-size-lg);
     font-weight: 500;
     color: var(--color-text-strong);
     word-break: break-all;
+  }
+
+  /* PR-95 / session-115 — prominent NAV-status pictogram next to the
+   * detail header's invoice id. Sized larger than the list-row
+   * variant (1.6em there → 2em here) so the operator's eye lands on
+   * the ack signal first. The four kind-classes share the same
+   * signal-token vocabulary as the list-row pictogram so the visual
+   * palette is consistent across surfaces. */
+  .nav-pictogram-detail {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2em;
+    height: 2em;
+    padding: 0;
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    background: var(--color-surface-base);
+    color: var(--color-text-secondary);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-md);
+    line-height: 1;
+    cursor: help;
+  }
+
+  .nav-pictogram-detail.pictogram-muted {
+    color: var(--color-text-muted);
+    border-color: var(--color-surface-divider);
+  }
+  /* PR-98 — `pictogram-submitted` is the green-toned positive-in-
+   * progress kind for the post-submit-pre-terminal `Submitted` /
+   * `Recovered` lifecycle pair. */
+  .nav-pictogram-detail.pictogram-submitted {
+    color: var(--color-signal-positive);
+    border-color: var(--color-signal-positive);
+  }
+  .nav-pictogram-detail.pictogram-negative {
+    color: var(--color-signal-negative);
+    border-color: var(--color-signal-negative);
+  }
+  .nav-pictogram-detail.pictogram-positive {
+    color: var(--color-signal-positive);
+    border-color: var(--color-signal-positive);
+  }
+
+  button.nav-pictogram-detail.actionable {
+    cursor: pointer;
+  }
+
+  button.nav-pictogram-detail.actionable:hover:not(:disabled) {
+    color: var(--color-text-strong);
+  }
+
+  button.nav-pictogram-detail.actionable:focus-visible {
+    outline: 1px solid var(--color-text-muted);
+    outline-offset: 2px;
+  }
+
+  button.nav-pictogram-detail.actionable:disabled {
+    opacity: 0.7;
+    cursor: progress;
+  }
+
+  button.nav-pictogram-detail.busy {
+    cursor: progress;
   }
 
   /* PR-30 — breadcrumb / back-button trail. One quiet `← {id}`
@@ -1677,6 +1861,35 @@
 
   .action-label {
     line-height: 1.2;
+  }
+
+  /* PR-92 / ADR-0047 — inline email-send outcome banner. Sits below
+   * the action bar; positive-signal accent on success, negative on
+   * failure. The audit log table also carries the row — this banner
+   * is the fast operator-feedback path. */
+  .email-outcome {
+    margin: 0 0 var(--space-3) 0;
+    padding: var(--space-2) var(--space-3);
+    background: var(--color-surface-sunken);
+    border: 1px solid var(--color-surface-divider);
+    border-left-width: 4px;
+    border-radius: var(--radius-md, 6px);
+    animation: aberp-fade-in var(--motion-fade-in) both;
+  }
+  .email-outcome--succeeded {
+    border-left-color: var(--color-signal-positive);
+  }
+  .email-outcome--failed {
+    border-left-color: var(--color-signal-negative);
+  }
+  .email-outcome strong {
+    display: block;
+    margin-bottom: var(--space-1);
+  }
+  .email-outcome__detail {
+    margin: 0;
+    font-size: var(--type-size-1);
+    color: var(--color-text-secondary);
   }
 
   /* PR-80 / session-102 — inline storno confirm panel. Sits below the

@@ -9,16 +9,27 @@
 //
 // Pinned by `partners.test.ts`.
 
-import type { Partner, PartnerInputs, PartnerKind } from "./api";
+import type {
+  CustomerVatStatusBody,
+  Partner,
+  PartnerInputs,
+  PartnerKind,
+} from "./api";
 
 /** PR-54 / session-74 — operator-typed form state for the PartnerForm
  * modal. One field per `PartnerInputs` slot; all string-valued so the
  * DOM `bind:value` round-trips cleanly. `kind` is the closed-vocab
- * dropdown's selected literal. */
+ * dropdown's selected literal.
+ *
+ * PR-97 / ADR-0048 — `customerVatStatus` carries the three-option
+ * radio's selected literal. Drives whether `taxNumber` is required
+ * (`Domestic`) or disabled (`PrivatePerson` / v1-deferred `Other`)
+ * at the form layer. */
 export interface PartnerFormState {
   displayName: string;
   legalName: string;
   kind: PartnerKind;
+  customerVatStatus: CustomerVatStatusBody;
   taxNumber: string;
   euVatNumber: string;
   addressStreet: string;
@@ -40,6 +51,10 @@ export function emptyPartnerForm(): PartnerFormState {
     displayName: "",
     legalName: "",
     kind: "Customer",
+    // PR-97 / ADR-0048 — defaults to Domestic. Pre-existing partners
+    // backfilled the same value via the migration; the dominant
+    // operator case is a Hungarian-business buyer.
+    customerVatStatus: "Domestic",
     taxNumber: "",
     euVatNumber: "",
     addressStreet: "",
@@ -61,7 +76,11 @@ export function formFromPartner(partner: Partner): PartnerFormState {
     displayName: partner.display_name,
     legalName: partner.legal_name,
     kind: partner.kind,
-    taxNumber: partner.tax_number,
+    customerVatStatus: partner.customer_vat_status,
+    // PR-97 / ADR-0048 — nullable on the wire (PrivatePerson rows
+    // store NULL). Collapse to empty string so the DOM input bind
+    // value stays typed-as-string.
+    taxNumber: partner.tax_number ?? "",
     euVatNumber: partner.eu_vat_number ?? "",
     addressStreet: partner.address_street ?? "",
     addressPostalCode: partner.address_postal_code ?? "",
@@ -87,7 +106,13 @@ export function composePartnerInputs(
     display_name: form.displayName.trim(),
     legal_name: form.legalName.trim(),
     kind: form.kind,
-    tax_number: form.taxNumber.trim(),
+    customer_vat_status: form.customerVatStatus,
+    // PR-97 / ADR-0048 — nullable. PrivatePerson rows store NULL; the
+    // form's disabled input renders "" which collapses to null here so
+    // the backend column sees the absence verbatim. Domestic rows
+    // require a non-empty value; the backend's `validate_partner_inputs`
+    // surfaces the typed error inline.
+    tax_number: emptyToNull(form.taxNumber),
     eu_vat_number: emptyToNull(form.euVatNumber),
     address_street: emptyToNull(form.addressStreet),
     address_postal_code: emptyToNull(form.addressPostalCode),
@@ -120,6 +145,11 @@ function emptyToNull(s: string): string | null {
  * deferred). */
 export interface BuyerFields {
   customerName: string;
+  /** PR-97 / ADR-0048 — closed-vocab buyer-kind, pulled from the
+   * partner's stored field so the IssueInvoice form's radio reflects
+   * the partner's intrinsic kind. Drives whether the ADÓSZÁM input
+   * stays editable on the issue form. */
+  customerVatStatus: CustomerVatStatusBody;
   customerTaxNumber: string;
   /** PR-77 / session-101 — derived from the partner's
    * `address_country` (free-form on the partner record). Today every
@@ -154,7 +184,12 @@ export interface BuyerFields {
 export function buyerFieldsFromPartner(partner: Partner): BuyerFields {
   return {
     customerName: partner.legal_name,
-    customerTaxNumber: partner.tax_number,
+    customerVatStatus: partner.customer_vat_status,
+    // PR-97 / ADR-0048 — nullable on the partner record (PrivatePerson
+    // rows store NULL). Collapse to empty string for the IssueInvoice
+    // form binding; the form's radio + disabled input states reflect
+    // the customerVatStatus.
+    customerTaxNumber: partner.tax_number ?? "",
     customerCountryCode: hungarianCountryAliasToCode(partner.address_country),
     customerPostalCode: partner.address_postal_code ?? "",
     customerCity: partner.address_city ?? "",
@@ -209,7 +244,9 @@ export function filterPartners(rows: Partner[], needle: string): Partner[] {
     return (
       p.display_name.toLowerCase().includes(q) ||
       p.legal_name.toLowerCase().includes(q) ||
-      p.tax_number.toLowerCase().includes(q)
+      // PR-97 / ADR-0048 — tax_number is nullable; PrivatePerson rows
+      // have NULL and fall through to the display/legal-name match.
+      (p.tax_number?.toLowerCase().includes(q) ?? false)
     );
   });
 }

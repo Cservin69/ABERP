@@ -13,7 +13,11 @@
 // Pinned by `issue-invoice.test.ts` per the A156 / A161 mirror-
 // invariant precedent.
 
-import type { Currency, IssueInvoiceRequest } from "./api";
+import type {
+  Currency,
+  CustomerVatStatusBody,
+  IssueInvoiceRequest,
+} from "./api";
 import { parseAmountToMinor } from "./format";
 import {
   addDays,
@@ -67,6 +71,20 @@ export interface LineFormState {
  * `seller.toml` populated via the wizard). Operator-typed values are
  * customer + currency + line items only. */
 export interface IssueInvoiceFormState {
+  /** PR-97 / ADR-0048 — closed-vocab buyer-kind discriminator. Bound
+   * to the form's three-option radio. Drives whether `customerTaxNumber`
+   * is required + editable (`Domestic`) or disabled + ignored
+   * (`PrivatePerson` — input disabled but visible; `Other` — v1
+   * named-deferred per ADR-0048 §7, the SPA shows the radio option
+   * disabled with a v2 hint). Populated from the operator-selected
+   * partner via `buyerFieldsFromPartner`. */
+  customerVatStatus: CustomerVatStatusBody;
+  /** PR-97 / ADR-0048 (Ervin override 1) — saved-partner id when the
+   * operator picked a buyer via the typeahead; `null` for one-off
+   * buyers (typed name without selecting). Composer emits this on
+   * the wire body so the backend can increment the partner's
+   * counter for the field-selective lock. */
+  customerPartnerId: string | null;
   customerTaxNumber: string;
   customerName: string;
   /** PR-77 / session-101 — customer-address quartet. Populated from
@@ -126,6 +144,12 @@ export interface IssueInvoiceFormState {
    * current value verbatim into the wire body's `deliveryDateOverride`
    * field. */
   deliveryDateOverride: DeliveryDateOverride;
+  /** PR-92 / ADR-0047 — default-on "Email to buyer" toggle. `true`
+   * means the post-issue auto-send fires; `false` means the operator
+   * has opted this invoice out of the auto-send (the manual send
+   * button on InvoiceDetail still works). Seeded to `true` in
+   * `emptyForm` so silence-by-omission can never suppress a send. */
+  emailBuyerOnIssue: boolean;
 }
 
 /** PR-44ζ — sensible defaults for an empty form. The 27% VAT rate is
@@ -141,6 +165,13 @@ export function emptyForm(): IssueInvoiceFormState {
   // YYYY-MM-DD and `addDays` only returns null on malformed input.
   const defaultDeadline = addDays(today, DEFAULT_PAYMENT_OFFSET_DAYS) ?? today;
   return {
+    // PR-97 / ADR-0048 — defaults to Domestic for fresh-form open.
+    // pickPartner overwrites this from the partner's stored field.
+    customerVatStatus: "Domestic",
+    // PR-97 / ADR-0048 (Ervin override 1) — no saved partner picked
+    // yet on form-open; `pickPartner` stamps the id when the operator
+    // selects from the typeahead.
+    customerPartnerId: null,
     customerTaxNumber: "",
     customerName: "",
     // PR-77 / session-101 — customer address fields seed to empty
@@ -169,6 +200,10 @@ export function emptyForm(): IssueInvoiceFormState {
     paymentDeadline: defaultDeadline,
     deliveryDate: today,
     deliveryDateOverride: null,
+    // PR-92 / ADR-0047 — default-on. Silence-by-omission would be
+    // the wrong default for a buyer-comms product (the whole point
+    // of the app is the buyer receiving the invoice).
+    emailBuyerOnIssue: true,
   };
 }
 
@@ -483,6 +518,22 @@ export function composeIssueInvoiceBody(
 ): IssueInvoiceRequest {
   return {
     customer: {
+      // PR-97 / ADR-0048 — closed-vocab buyer kind on the wire. The
+      // backend's serde deserialiser defaults missing to `Domestic`
+      // for back-compat, but the SPA always emits an explicit value
+      // so the operator's radio choice rides on the audit trail.
+      vatStatus: form.customerVatStatus,
+      // PR-97 / ADR-0048 (Ervin override 1) — saved-partner id when
+      // the operator picked a buyer via the typeahead. Backend uses
+      // it to increment the partner's `issued_invoice_count` for the
+      // PartnerForm's field-selective lock.
+      partnerId: form.customerPartnerId,
+      // PR-97 / ADR-0048 — for PrivatePerson buyers, the disabled
+      // input emits `""`. Trim + leave empty so the backend's
+      // preflight sees the empty-string signal and treats it
+      // consistently with the wire-defaulted `Domestic` case (its
+      // CustomerTaxNumberPresentForPrivatePerson gate fires only on
+      // a non-empty value).
       taxNumber: form.customerTaxNumber.trim(),
       name: form.customerName.trim(),
       // PR-77 / session-101 — customer address quartet. Always emit
@@ -490,8 +541,8 @@ export function composeIssueInvoiceBody(
       // trim; the backend preflight rejects partially-blank addresses
       // explicitly so the operator sees the precise gap. If every
       // sub-string is blank we omit the field — that surfaces as
-      // `CustomerAddressMissing` on the preflight rather than as a
-      // body with four empty strings (cleaner operator message).
+      // `CustomerAddressMissing` on the preflight (Domestic) or no-op
+      // for PrivatePerson (NAV wire permits absence).
       address: composeCustomerAddress(form),
     },
     lines: form.lines.map((l) => ({
@@ -544,6 +595,12 @@ export function composeIssueInvoiceBody(
     // range choice. The backend independently re-classifies via
     // `aberp_billing::classify_delivery_date` for defence in depth.
     deliveryDateOverride: form.deliveryDateOverride,
+    // PR-92 / ADR-0047 — operator-typed default-on toggle. The wire
+    // body carries the exact bool the operator set; the backend
+    // defaults to `true` when absent (defence in depth — a future
+    // composer regression that drops this field still produces the
+    // default-on behaviour).
+    emailBuyerOnIssue: form.emailBuyerOnIssue,
   };
 }
 

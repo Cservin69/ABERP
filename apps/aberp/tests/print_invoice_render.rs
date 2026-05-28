@@ -33,7 +33,9 @@ use ulid::Ulid;
 
 use aberp::audit_payloads::InvoiceDraftCreatedPayload;
 use aberp::cli::PrintInvoiceArgs;
-use aberp::nav_xml::{self, CustomerAddress, CustomerInfo, NavParties, SupplierInfo};
+use aberp::nav_xml::{
+    self, CustomerAddress, CustomerInfo, CustomerVatStatus, NavParties, SupplierInfo,
+};
 use aberp::print_invoice;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -80,7 +82,10 @@ fn fixture_parties() -> NavParties {
             address_street: "Test utca 1.".to_string(),
         },
         customer: CustomerInfo {
-            tax_number: "87654321-2-13".to_string(),
+            // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
+            // Domestic posture for legacy test fixtures.
+            customer_vat_status: CustomerVatStatus::Domestic,
+            tax_number: Some("87654321-2-13".to_string()),
             name: "Vevő Kft.".to_string(),
             // PR-77 / session-101 — `customerAddress` required for any
             // DOMESTIC customerVatStatus.

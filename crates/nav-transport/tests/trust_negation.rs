@@ -43,6 +43,12 @@ use aberp_nav_transport::{NavEndpoint, NavTransport};
 
 #[test]
 fn pinned_client_refuses_chains_not_anchored_in_pinset() {
+    // PR-92 / ADR-0047 — `--workspace` builds may pull in both
+    // `aws-lc-rs` AND `ring` rustls providers (the latter via
+    // lettre's transitive deps); rustls needs ONE default. Install
+    // it here to mirror the production binary's `main.rs` boot
+    // posture.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     // Construct the transport the same way production does. We don't
     // actually use the NavEndpoint here — we only need the client's
     // TLS configuration. Either endpoint variant produces an

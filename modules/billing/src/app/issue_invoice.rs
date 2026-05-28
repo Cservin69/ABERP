@@ -16,7 +16,7 @@ use crate::app::error::BillingError;
 use crate::domain::ids::CustomerId;
 use crate::domain::invoice::{DraftInvoice, LineItem, ReadyInvoice};
 use crate::domain::reservation::SequenceReservation;
-use crate::domain::series::{ResetPolicy, SeriesCode};
+use crate::domain::series::SeriesCode;
 use crate::ports::clock::Clock;
 use crate::ports::storage::{AllocateArgs, AllocateOutcome, BillingStore};
 
@@ -189,15 +189,16 @@ where
 
     // 2. Resolve the series. Unknown series is operator-actionable, not
     //    a silent allocator failure.
+    //
+    // PR-90 / ADR-0045 §2 — both reset policies are supported; the
+    // allocator keys the bucket on `(series_id, fiscal_year)` and
+    // resolves `fiscal_year` from the draft's immutable `issue_date`
+    // under `AnnualOnFiscalYear` (or 0 under `Never`). The pre-PR-90
+    // `AnnualResetUnimplemented` gate is lifted; the in-process handler
+    // is no longer the surface that rejects Annual-policy series.
     let series = store
         .find_series_by_code(&cmd.series_code)?
         .ok_or_else(|| BillingError::SeriesNotFound(cmd.series_code.as_str().to_string()))?;
-
-    // PR-4 implements `Never` only. Loud-fail on Annual until the
-    //    follow-up PR fills in year-roll.
-    if matches!(series.reset_policy, ResetPolicy::AnnualOnFiscalYear) {
-        return Err(BillingError::AnnualResetUnimplemented);
-    }
 
     // 3. Build the draft. `issue_date` and `id` are decided here — never
     //    pulled from the command — per ADR-0007 §"Operator-as-threat-actor".
@@ -251,6 +252,11 @@ where
             // is the surface that threads the operator-typed value;
             // the in-process handler defaults to None.
             invoice_note: None,
+            // PR-90 / ADR-0045 §2 — in-process handler defaults the
+            // bucket seed to 1 (the §169 conventional starting value).
+            // The binary's three issuance surfaces read the template's
+            // `[seller.numbering].start_value` and thread it explicitly.
+            start_value: 1,
         },
         issue_date,
     )?;

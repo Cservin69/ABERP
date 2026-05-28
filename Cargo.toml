@@ -256,6 +256,27 @@ fs2 = "0.4"
 lopdf = { version = "0.34", default-features = false, features = ["nom_parser"] }
 pdf-extract = "0.7"
 
+# ── PR-92 additions — SMTP email delivery per ADR-0047 ──────────────
+#
+# `lettre` is the Rust SMTP client. Default features pull in OpenSSL
+# via `native-tls`; we explicitly disable defaults and re-enable ONLY
+# the rustls path (`rustls-tls`) so the workspace stays on a single
+# TLS backend (reqwest + axum-server + lettre all on rustls per
+# ADR-0021 §A6 "rustls everywhere"). The `smtp-transport` feature is
+# the SMTP I/O, `builder` is the typed MIME message builder, `tokio1-rustls-tls`
+# wires the async runtime + rustls together.
+#
+# CRITICAL: there is NO `lettre`-side configuration knob that allows
+# falling back to plaintext after a TLS failure — TLS is mandatory at
+# the type level once a `Tls`-or-`StartTls` parameter is supplied
+# (ADR-0047 §1). The closed-vocab `SmtpSecurity` enum in
+# `apps/aberp/src/smtp_config.rs` ensures the operator-typed config
+# can never produce a plaintext send path.
+#
+# License: MIT/Apache-2.0 dual. Pure-Rust (rustls feature) with no
+# native deps once OpenSSL is excluded.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls", "hostname"] }
+
 # ── PR-9-2 additions — Tauri operator UI shell per ADR-0004 ─────────
 #
 # Tauri 2.x is the desktop runtime. `default-features = false` strips

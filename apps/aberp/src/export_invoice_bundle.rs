@@ -621,7 +621,12 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // payload (paid_at + amount + method + reference) is
         // preserved in chain.jsonl per ADR-0009 §8; nothing
         // lands in the nav/ directory.
-        | EventKind::InvoicePaymentRecorded => None,
+        | EventKind::InvoicePaymentRecorded
+        // PR-92 / ADR-0047 §4 — operational email-sent entry
+        // also carries no NAV-side bytes. The audit payload
+        // (recipient + subject + outcome + scrubbed error
+        // detail) lives in chain.jsonl per ADR-0009 §8.
+        | EventKind::InvoiceEmailedSent => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

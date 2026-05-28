@@ -260,6 +260,7 @@ fn line_note_round_trips_through_allocate_and_load() {
                 rate_metadata: None,
                 bank_snapshot: None,
                 invoice_note: Some("PR-82 round-trip global note".to_string()),
+                start_value: 1,
             },
             OffsetDateTime::now_utc(),
         )

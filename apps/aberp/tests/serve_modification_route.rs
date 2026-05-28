@@ -43,6 +43,7 @@ use aberp::audit_payloads::{
     InvoiceSubmissionResponsePayload,
 };
 use aberp::issue_invoice::{AddressJson, CustomerJson, LineJson, SupplierJson};
+use aberp::nav_xml::CustomerVatStatus;
 use aberp::serve::{self, AppState, ModificationInvoiceRequest, ModificationRouteError};
 
 const TEST_TENANT: &str = "serve_modification_route_test";
@@ -95,6 +96,10 @@ fn fixture_ready_invoice() -> ReadyInvoice {
 fn fixture_request_body(currency: aberp_billing::Currency) -> ModificationInvoiceRequest {
     ModificationInvoiceRequest {
         customer: CustomerJson {
+            // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
+            // Domestic posture for legacy test fixtures.
+            vat_status: CustomerVatStatus::Domestic,
+            partner_id: None,
             tax_number: "87654321-2-13".to_string(),
             name: "Test Buyer Kft.".to_string(),
             // PR-77 / session-101 — preflight requires customer.address.
@@ -256,6 +261,10 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
                 },
             },
             customer: CustomerJson {
+                // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
+                // Domestic posture for legacy test fixtures.
+                vat_status: CustomerVatStatus::Domestic,
+                partner_id: None,
                 tax_number: "87654321-2-13".to_string(),
                 name: "Test Buyer Kft.".to_string(),
                 // PR-77 / session-101 — base invoice must carry an address so

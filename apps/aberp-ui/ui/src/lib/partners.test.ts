@@ -26,6 +26,9 @@ const SAMPLE_PARTNER: Partner = {
   display_name: "BSCE",
   legal_name: "Budapesti Sport-Egyesület Kft.",
   kind: "Customer",
+  // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic posture
+  // for legacy test fixtures.
+  customer_vat_status: "Domestic",
   tax_number: "12345678-1-42",
   eu_vat_number: "HU12345678",
   address_street: "Fő utca 1.",
@@ -177,6 +180,27 @@ describe("buyerFieldsFromPartner", () => {
       "Budapesti Sport-Egyesület Kft.",
     );
     expect(fields.customerTaxNumber).toBe("12345678-1-42");
+  });
+
+  // PR-97 / ADR-0048 — buyer-kind discriminator propagates from the
+  // partner row onto the buyer fields handed to the IssueInvoice form.
+  it("propagates customer_vat_status from the partner record (Domestic)", () => {
+    const fields = buyerFieldsFromPartner(SAMPLE_PARTNER);
+    expect(fields.customerVatStatus).toBe("Domestic");
+  });
+
+  // PR-97 / ADR-0048 — PrivatePerson partners surface customer_vat_status
+  // verbatim AND collapse a NULL tax_number to empty string so the form
+  // binding never receives `null`.
+  it("propagates PrivatePerson status + folds null tax_number to empty string", () => {
+    const privatePerson: Partner = {
+      ...SAMPLE_PARTNER,
+      customer_vat_status: "PrivatePerson",
+      tax_number: null,
+    };
+    const fields = buyerFieldsFromPartner(privatePerson);
+    expect(fields.customerVatStatus).toBe("PrivatePerson");
+    expect(fields.customerTaxNumber).toBe("");
   });
 
   /** PR-77 / session-101 — the partner's address fields flow into the

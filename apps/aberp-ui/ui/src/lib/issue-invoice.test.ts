@@ -55,6 +55,14 @@ describe("composeIssueInvoiceBody", () => {
 
     expect(body).toEqual({
       customer: {
+        // PR-97 / ADR-0048 — closed-vocab buyer-kind. `emptyForm()`
+        // seeds `Domestic` so the legacy golden body assertion gains
+        // the field.
+        vatStatus: "Domestic",
+        // PR-97 / ADR-0048 (Ervin override 1) — `null` because the
+        // test form spread `emptyForm()` without invoking
+        // `pickPartner` (one-off buyer, no saved-partner id).
+        partnerId: null,
         taxNumber: "87654321-2-13",
         name: "Vevő Kft.",
         // PR-77 — `address: undefined` flows out of `composeCustomerAddress`
@@ -85,7 +93,32 @@ describe("composeIssueInvoiceBody", () => {
       paymentDeadline: form.paymentDeadline,
       deliveryDate: form.deliveryDate,
       deliveryDateOverride: null,
+      // PR-92 / ADR-0047 — default-on auto-send toggle. The composer
+      // emits `true` because `emptyForm` seeds the flag to `true`
+      // (silence-by-omission is the wrong default for a buyer-comms
+      // product). The operator must explicitly un-check to suppress.
+      emailBuyerOnIssue: true,
     });
+  });
+
+  // PR-92 / ADR-0047 — auto-send toggle composer pins.
+  it("emits emailBuyerOnIssue=true from a default form (silence-by-omission cannot suppress)", () => {
+    const body = composeIssueInvoiceBody({
+      ...emptyForm(),
+      customerName: "C",
+      customerTaxNumber: "y",
+    });
+    expect(body.emailBuyerOnIssue).toBe(true);
+  });
+
+  it("emits emailBuyerOnIssue=false when the operator opted this invoice out", () => {
+    const body = composeIssueInvoiceBody({
+      ...emptyForm(),
+      customerName: "C",
+      customerTaxNumber: "y",
+      emailBuyerOnIssue: false,
+    });
+    expect(body.emailBuyerOnIssue).toBe(false);
   });
 
   // PR-73 / ADR-0040 §addendum — bank-picker composer pins.
@@ -358,6 +391,43 @@ describe("composeIssueInvoiceBody", () => {
     expect(body.lines.map((l) => l.description)).toEqual(["A", "B", "C"]);
     expect(body.lines.map((l) => l.unitPrice)).toEqual([100, 200, 300]);
     expect(body.lines.map((l) => l.vatRatePercent)).toEqual([27, 5, 0]);
+  });
+
+  // PR-97 / ADR-0048 — composer per buyer-kind branch.
+  describe("PR-97 / ADR-0048 — customer.vatStatus", () => {
+    it("emits vatStatus=Domestic from default form", () => {
+      const body = composeIssueInvoiceBody({
+        ...emptyForm(),
+        customerName: "Vevő Kft.",
+        customerTaxNumber: "87654321-2-13",
+      });
+      expect(body.customer.vatStatus).toBe("Domestic");
+      expect(body.customer.taxNumber).toBe("87654321-2-13");
+    });
+
+    it("emits vatStatus=PrivatePerson + empty taxNumber when the operator picks a natural-person buyer", () => {
+      const body = composeIssueInvoiceBody({
+        ...emptyForm(),
+        customerVatStatus: "PrivatePerson",
+        customerName: "Kovács János",
+        customerTaxNumber: "",
+      });
+      expect(body.customer.vatStatus).toBe("PrivatePerson");
+      expect(body.customer.taxNumber).toBe("");
+    });
+
+    it("emits vatStatus=Other if the form somehow carries it (preflight gate behind)", () => {
+      const body = composeIssueInvoiceBody({
+        ...emptyForm(),
+        customerVatStatus: "Other",
+        customerName: "Foreign Buyer",
+        customerTaxNumber: "",
+      });
+      // The composer is pure — Other passes through here so the
+      // backend's preflight can surface the typed
+      // CustomerVatStatusOtherNotSupportedV1 error.
+      expect(body.customer.vatStatus).toBe("Other");
+    });
   });
 });
 

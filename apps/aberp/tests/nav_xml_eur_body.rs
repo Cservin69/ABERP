@@ -38,7 +38,9 @@
 //!   with `Currency::Eur` and `rate_metadata=None` MUST loud-fail
 //!   (not silently emit a HUF-shaped body for an EUR invoice).
 
-use aberp::nav_xml::{self, CustomerAddress, CustomerInfo, NavParties, SupplierInfo};
+use aberp::nav_xml::{
+    self, CustomerAddress, CustomerInfo, CustomerVatStatus, NavParties, SupplierInfo,
+};
 use aberp_billing::{
     huf_equivalent_round_half_even, Currency, CustomerId, Huf, InvoiceId, LineItem, RateMetadata,
     ReadyInvoice, SeriesCode, SeriesId,
@@ -62,7 +64,10 @@ fn minimal_parties() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
-            tax_number: "87654321-1-42".to_string(),
+            // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
+            // Domestic posture for legacy test fixtures.
+            customer_vat_status: CustomerVatStatus::Domestic,
+            tax_number: Some("87654321-1-42".to_string()),
             name: "Test Customer Zrt.".to_string(),
             // PR-77 / session-101 — `customerAddress` required for any
             // DOMESTIC customerVatStatus.

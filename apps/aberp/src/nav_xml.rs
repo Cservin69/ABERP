@@ -42,6 +42,95 @@ use anyhow::{anyhow, Context, Result};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+
+/// PR-97 / ADR-0048 — closed-vocab discriminant for the buyer's NAV
+/// `customerVatStatus` value. Three variants mirror NAV v3.0's
+/// `customerVatStatusType` (DOMESTIC / PRIVATE_PERSON / OTHER).
+///
+/// **v1 scope:** Domestic + PrivatePerson are fully wired. Other is
+/// named in the enum so a wire body carrying `"Other"` still
+/// deserialises, but every materialising surface (preflight, emitter)
+/// loud-fails at the v1 boundary per ADR-0048 §7. v2 wires Other end-
+/// to-end with EU community-VAT vs non-EU third-state-tax-id sub-
+/// shapes.
+///
+/// Serde uses the Rust PascalCase variant names (`"Domestic"`,
+/// `"PrivatePerson"`, `"Other"`) so the SPA's string-union mirror
+/// reads literally — same shape as [`PartnerKind`]
+/// (`apps/aberp/src/partners.rs`). The NAV wire emits the
+/// SCREAMING_SNAKE token via [`Self::as_nav_token`] — `"DOMESTIC"`,
+/// `"PRIVATE_PERSON"`, `"OTHER"` — pinned by an emit test so a Rust
+/// variant rename cannot silently drift the wire byte.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum CustomerVatStatus {
+    /// Hungarian taxable entity. Today's universal default — the only
+    /// branch the ABERP issuance path supported pre-PR-97. NAV wire
+    /// REQUIRES `<customerVatData>` (structured `<customerTaxNumber>`)
+    /// + `<customerAddress>` for this status.
+    Domestic,
+    /// Hungarian or foreign natural-person buyer (magánszemély). NAV
+    /// wire FORBIDS `<customerVatData>` for this status; `<customerName>`
+    /// is required; `<customerAddress>` is optional at the wire layer
+    /// (Hungarian invoice law still requires it on the printed PDF —
+    /// ADR-0048 §3 open-question #5 lands on "name always, address
+    /// optional" for v1).
+    PrivatePerson,
+    /// Non-Hungarian buyer (EU community VAT or non-EU third-state
+    /// tax-id). v1 named-defers this branch per ADR-0048 §7; the
+    /// preflight emits [`CustomerVatStatusOtherNotSupportedV1`] BEFORE
+    /// the emitter can be reached, and the NAV emitter itself
+    /// loud-fails if it materialises this variant.
+    Other,
+}
+
+impl CustomerVatStatus {
+    /// Render the SCREAMING_SNAKE NAV wire token for this status —
+    /// `"DOMESTIC"` / `"PRIVATE_PERSON"` / `"OTHER"`. Pinned by the
+    /// `customer_vat_status_serde_round_trip` + the byte-verbatim
+    /// emit pins so a Rust variant rename cannot silently drift the
+    /// wire byte.
+    pub fn as_nav_token(&self) -> &'static str {
+        match self {
+            CustomerVatStatus::Domestic => "DOMESTIC",
+            CustomerVatStatus::PrivatePerson => "PRIVATE_PERSON",
+            CustomerVatStatus::Other => "OTHER",
+        }
+    }
+
+    /// Storage round-trip — DuckDB stores the PascalCase variant name
+    /// (`"Domestic"` / `"PrivatePerson"` / `"Other"`) so the column
+    /// reads as the same string the SPA wire body carries. Mirrors
+    /// [`PartnerKind::as_db_str`] for symmetry.
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            CustomerVatStatus::Domestic => "Domestic",
+            CustomerVatStatus::PrivatePerson => "PrivatePerson",
+            CustomerVatStatus::Other => "Other",
+        }
+    }
+
+    /// Storage round-trip — inverse of [`Self::as_db_str`]. Returns
+    /// `None` on an unrecognised input (the row read path loud-fails
+    /// via a typed error rather than silently defaulting).
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "Domestic" => Some(CustomerVatStatus::Domestic),
+            "PrivatePerson" => Some(CustomerVatStatus::PrivatePerson),
+            "Other" => Some(CustomerVatStatus::Other),
+            _ => None,
+        }
+    }
+}
+
+impl Default for CustomerVatStatus {
+    /// Pre-PR-97 wire bodies (and pre-PR-97 partner rows) implicitly
+    /// behaved as Domestic. Preserve that posture as the serde default
+    /// so back-compat reads do NOT drift on a missing field.
+    fn default() -> Self {
+        CustomerVatStatus::Domestic
+    }
+}
 
 /// Supplier + customer party data that the billing module does not own.
 /// Supplied by the input JSON in PR-5; will move into its own module
@@ -238,18 +327,27 @@ pub fn validate_supplier_info(supplier: &SupplierInfo) -> Result<(), SupplierCon
 
 #[derive(Debug, Clone)]
 pub struct CustomerInfo {
-    pub tax_number: String,
+    /// PR-97 / ADR-0048 — closed-vocab buyer-kind discriminant. Drives
+    /// whether [`Self::tax_number`] is required (Domestic) or forbidden
+    /// (PrivatePerson) and whether [`Self::address`] is required at the
+    /// NAV wire layer. Backward-compat default (`Domestic`) keeps every
+    /// pre-PR-97 fixture's behaviour unchanged.
+    pub customer_vat_status: CustomerVatStatus,
+    /// PR-97 / ADR-0048 — nullable for PrivatePerson buyers (NAV
+    /// forbids `<customerVatData>` under PRIVATE_PERSON). For Domestic
+    /// the upstream preflight + partner-form validation guarantee
+    /// `Some(_)`; a Domestic + `None` reaching the emitter is a
+    /// programmer-error loud-fail.
+    pub tax_number: Option<String>,
     pub name: String,
     /// PR-77 / session-101 — NAV v3.0 business-rule
     /// `CUSTOMER_DATA_EXPECTED` requires `<customerAddress>` whenever
-    /// `<customerVatStatus>` is non-PRIVATE_PERSON. ABERP today emits
-    /// `customerVatStatus=DOMESTIC` unconditionally (Hungarian-business
-    /// posture; closed-vocab + private-person branch is named-deferred),
-    /// so the address is required at submit time but the schema allows
-    /// it to be absent — hence `Option<_>`. `None` paired with DOMESTIC
-    /// is caught by `aberp-nav-xsd-validator::walk_customer_info` BEFORE
-    /// the XML reaches NAV; the preflight (`issue_preflight::
-    /// CustomerAddressMissing`) catches it BEFORE the sequence is burned.
+    /// `<customerVatStatus>` is non-PRIVATE_PERSON. PR-97 / ADR-0048
+    /// — `Option<_>` because PRIVATE_PERSON tolerates absence at the
+    /// wire layer (the print-PDF rule is enforced separately at the
+    /// PDF render boundary). DOMESTIC + `None` is caught at preflight
+    /// (`issue_preflight::CustomerAddressMissing`) BEFORE the sequence
+    /// is burned, and at validator time as a defence-in-depth pin.
     pub address: Option<CustomerAddress>,
 }
 
@@ -387,6 +485,32 @@ pub fn render_invoice_data(
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
 ) -> Result<Vec<u8>> {
+    render_invoice_data_with_number(invoice, series_code, parties, currency, rate_metadata, None)
+}
+
+/// PR-89 — variant of [`render_invoice_data`] that accepts a
+/// pre-rendered `invoice_number` override. When `Some(s)`, `s` is
+/// emitted as the `<invoiceNumber>` element verbatim — this is the
+/// path the PR-89 operator-configurable [`crate::numbering`] template
+/// flows through. When `None`, the renderer falls back to the
+/// pre-PR-89 `format!("{}/{:05}", series_code, seq)` shape for
+/// backwards-compat with the existing test corpus + any caller that
+/// has not yet adopted the template path.
+///
+/// The renderer does NOT validate the override string against the NAV
+/// `invoiceNumber` XSD charset — that gate lives at config time in
+/// [`crate::numbering::validate_template`]. By the time a string
+/// reaches this function it is guaranteed to be NAV-legal (loud-fail
+/// in the SPA save endpoint refuses an illegal template before any
+/// invoice is issued under it).
+pub fn render_invoice_data_with_number(
+    invoice: &ReadyInvoice,
+    series_code: &SeriesCode,
+    parties: &NavParties,
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
+    invoice_number_override: Option<&str>,
+) -> Result<Vec<u8>> {
     ensure_rate_metadata_invariant(currency, rate_metadata)?;
 
     let mut buf: Vec<u8> = Vec::new();
@@ -403,8 +527,9 @@ pub fn render_invoice_data(
     w.write_event(Event::Start(root))
         .context("write <InvoiceData>")?;
 
-    let invoice_number = format!("{}/{:05}", series_code.as_str(), invoice.sequence_number,);
-    text_element(&mut w, "invoiceNumber", &invoice_number)?;
+    let legacy = format!("{}/{:05}", series_code.as_str(), invoice.sequence_number,);
+    let invoice_number = invoice_number_override.unwrap_or(&legacy);
+    text_element(&mut w, "invoiceNumber", invoice_number)?;
     // PR-84 — three NAV date fields share one formatter
     // (`nav_date_string`). `invoiceIssueDate` is the server-stamped
     // immutable date; `invoiceDeliveryDate` is the operator-chosen
@@ -523,6 +648,32 @@ pub fn render_storno_data(
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
 ) -> Result<Vec<u8>> {
+    render_storno_data_with_number(
+        invoice,
+        series_code,
+        parties,
+        storno_reference,
+        currency,
+        rate_metadata,
+        None,
+    )
+}
+
+/// PR-89 — variant of [`render_storno_data`] with a pre-rendered
+/// `invoice_number` override. See [`render_invoice_data_with_number`]'s
+/// doc-comment for the override semantics; this is the same path for
+/// storno chains. The `storno_reference.base_invoice_number` is NOT
+/// re-rendered here — the caller composes it (the storno-issue route
+/// renders the BASE's number from the template at storno-issue time).
+pub fn render_storno_data_with_number(
+    invoice: &ReadyInvoice,
+    series_code: &SeriesCode,
+    parties: &NavParties,
+    storno_reference: &StornoReference,
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
+    invoice_number_override: Option<&str>,
+) -> Result<Vec<u8>> {
     // PR-44γ.1 — same C1-wire-side invariant the fresh-issuance renderer
     // enforces: a non-HUF storno without inherited rate metadata is a
     // loud-fail (the chain-currency inheritance path supplies the
@@ -543,8 +694,9 @@ pub fn render_storno_data(
         .context("write <InvoiceData> (storno)")?;
 
     // Storno's OWN invoice number — the cancellation is itself an invoice.
-    let invoice_number = format!("{}/{:05}", series_code.as_str(), invoice.sequence_number);
-    text_element(&mut w, "invoiceNumber", &invoice_number)?;
+    let legacy = format!("{}/{:05}", series_code.as_str(), invoice.sequence_number);
+    let invoice_number = invoice_number_override.unwrap_or(&legacy);
+    text_element(&mut w, "invoiceNumber", invoice_number)?;
     // PR-84 — STORNO chains inherit pre-PR-84 behaviour (delivery +
     // payment mirror the chain-storno's issue date). The storno UX
     // does not surface operator-supplied date pickers yet; `ReadyInvoice`
@@ -641,6 +793,29 @@ pub fn render_modification_data(
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
 ) -> Result<Vec<u8>> {
+    render_modification_data_with_number(
+        invoice,
+        series_code,
+        parties,
+        modification_reference,
+        currency,
+        rate_metadata,
+        None,
+    )
+}
+
+/// PR-89 — variant of [`render_modification_data`] with a pre-rendered
+/// `invoice_number` override. Same override semantics as
+/// [`render_invoice_data_with_number`].
+pub fn render_modification_data_with_number(
+    invoice: &ReadyInvoice,
+    series_code: &SeriesCode,
+    parties: &NavParties,
+    modification_reference: &ModificationReference,
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
+    invoice_number_override: Option<&str>,
+) -> Result<Vec<u8>> {
     // PR-44γ.1 — same C1-wire-side invariant the fresh-issuance renderer
     // enforces: a non-HUF modification without inherited rate metadata
     // loud-fails.
@@ -659,8 +834,9 @@ pub fn render_modification_data(
         .context("write <InvoiceData> (modification)")?;
 
     // Modification's OWN invoice number — the correction is itself an invoice.
-    let invoice_number = format!("{}/{:05}", series_code.as_str(), invoice.sequence_number);
-    text_element(&mut w, "invoiceNumber", &invoice_number)?;
+    let legacy = format!("{}/{:05}", series_code.as_str(), invoice.sequence_number);
+    let invoice_number = invoice_number_override.unwrap_or(&legacy);
+    text_element(&mut w, "invoiceNumber", invoice_number)?;
     // PR-84 — MODIFICATION chains inherit pre-PR-84 behaviour. The
     // modification's `ReadyInvoice` carries
     // `delivery_date == payment_deadline == issue_date.date()` from
@@ -902,25 +1078,76 @@ fn write_supplier(w: &mut Writer<&mut Vec<u8>>, s: &SupplierInfo) -> Result<()> 
 }
 
 fn write_customer(w: &mut Writer<&mut Vec<u8>>, c: &CustomerInfo) -> Result<()> {
-    let parsed = parse_hungarian_tax_number(&c.tax_number)
-        .map_err(|e| anyhow!("customer tax number invalid at NAV-XML render time: {e}"))?;
     w.write_event(Event::Start(BytesStart::new("customerInfo")))?;
-    text_element(w, "customerVatStatus", "DOMESTIC")?;
-    w.write_event(Event::Start(BytesStart::new("customerVatData")))?;
-    w.write_event(Event::Start(BytesStart::new("customerTaxNumber")))?;
-    common_element(w, "taxpayerId", &parsed.taxpayer_id)?;
-    common_element(w, "vatCode", &parsed.vat_code)?;
-    common_element(w, "countyCode", &parsed.county_code)?;
-    w.write_event(Event::End(BytesEnd::new("customerTaxNumber")))?;
-    w.write_event(Event::End(BytesEnd::new("customerVatData")))?;
-    text_element(w, "customerName", &c.name)?;
+    text_element(w, "customerVatStatus", c.customer_vat_status.as_nav_token())?;
+
+    // PR-97 / ADR-0048 §4 — `<customerVatData>` emission is conditional
+    // on the closed-vocab status. Domestic: REQUIRED structured tax
+    // block (PR-50 / PR-66 hold). PrivatePerson: FORBIDDEN — NAV's
+    // CUSTOMER_DATA_EXPECTED rule fires on its presence under
+    // PRIVATE_PERSON. Other: v1 named-deferred per ADR-0048 §7 — the
+    // emitter loud-fails here so a misrouted Other body cannot escape
+    // ABERP onto the wire.
+    match c.customer_vat_status {
+        CustomerVatStatus::Domestic => {
+            let tax_number = c.tax_number.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "Domestic customer requires tax_number at NAV-XML render time \
+                     — preflight + partner-form validation should have caught this upstream \
+                     (ADR-0048 §4)"
+                )
+            })?;
+            let parsed = parse_hungarian_tax_number(tax_number)
+                .map_err(|e| anyhow!("customer tax number invalid at NAV-XML render time: {e}"))?;
+            w.write_event(Event::Start(BytesStart::new("customerVatData")))?;
+            w.write_event(Event::Start(BytesStart::new("customerTaxNumber")))?;
+            common_element(w, "taxpayerId", &parsed.taxpayer_id)?;
+            common_element(w, "vatCode", &parsed.vat_code)?;
+            common_element(w, "countyCode", &parsed.county_code)?;
+            w.write_event(Event::End(BytesEnd::new("customerTaxNumber")))?;
+            w.write_event(Event::End(BytesEnd::new("customerVatData")))?;
+        }
+        CustomerVatStatus::PrivatePerson => {
+            // Intentional no-emit. NAV business-rule forbids
+            // `<customerVatData>` under PRIVATE_PERSON; pinned by
+            // `emitter_writes_customer_info_under_private_person_omits_vat_data`
+            // and the validator's symmetric ForbiddenChildUnderStatus rule.
+        }
+        CustomerVatStatus::Other => {
+            return Err(anyhow!(
+                "ADR-0048 §7: Other-status customer emit is v1 named-deferred \
+                 (use Domestic or PrivatePerson; foreign-buyer support lands in v2)"
+            ));
+        }
+    }
+
+    // PR-97 / ADR-0048 (Ervin override 2 / GDPR) — `<customerName>`
+    // is conditional on the buyer kind. For DOMESTIC / OTHER buyers
+    // the name is required (NAV business-rule layer); the emitter
+    // unconditionally writes it. For PRIVATE_PERSON the name is
+    // OPTIONAL per Ervin's GDPR posture — emit only if the operator
+    // supplied a non-empty value. Empty-after-trim collapses to a
+    // wire body without `<customerName>`. XSD verification: NAV v3.0
+    // `CustomerInfoType` declares `customerName` as `minOccurs="0"`
+    // at the schema level; the first PRIVATE_PERSON + omitted-name
+    // issuance against the live NAV-test endpoint will confirm the
+    // business-rule layer follows.
+    match c.customer_vat_status {
+        CustomerVatStatus::PrivatePerson => {
+            if !c.name.trim().is_empty() {
+                text_element(w, "customerName", &c.name)?;
+            }
+        }
+        _ => {
+            text_element(w, "customerName", &c.name)?;
+        }
+    }
     // PR-77 / session-101 — `<customerAddress>` per NAV v3.0 business-rule
     // `CUSTOMER_DATA_EXPECTED`. Required whenever `customerVatStatus !=
-    // PRIVATE_PERSON`; today the emitter hardcodes DOMESTIC, so a `None`
-    // here is a programmer error caught by `walk_customer_info` at the
-    // ADR-0022 invariant check between render and disk write. Position
-    // is AFTER `<customerName>` per the v3.0 XSD CustomerInfoType
-    // ordering.
+    // PRIVATE_PERSON`; for PrivatePerson buyers the wire layer permits
+    // absence (ADR-0048 §3 open-question #5 + Ervin override 2 GDPR).
+    // Position is AFTER `<customerName>` per the v3.0 XSD
+    // CustomerInfoType ordering.
     if let Some(address) = c.address.as_ref() {
         write_customer_address(w, address)?;
     }
@@ -1395,6 +1622,66 @@ mod tests {
             validate_supplier_info(&s),
             Err(SupplierConfigError::MissingTaxNumber)
         ));
+    }
+
+    // ── PR-97 / ADR-0048 — CustomerVatStatus closed-vocab ────────────
+
+    #[test]
+    fn customer_vat_status_serde_round_trip_pin() {
+        // Each variant must round-trip through serde JSON as its
+        // PascalCase literal. Mirrors `partner_kind_serde_round_trip_pin`
+        // — a variant rename here that drifts from the SPA's string-
+        // union mirror (api.ts::CustomerVatStatusBody) surfaces here
+        // first. CLAUDE.md rule 9.
+        for (variant, literal) in [
+            (CustomerVatStatus::Domestic, "\"Domestic\""),
+            (CustomerVatStatus::PrivatePerson, "\"PrivatePerson\""),
+            (CustomerVatStatus::Other, "\"Other\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(
+                json, literal,
+                "CustomerVatStatus::{:?} must emit {}",
+                variant, literal
+            );
+            let back: CustomerVatStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn customer_vat_status_nav_token_is_screaming_snake() {
+        // The NAV wire token is SCREAMING_SNAKE_CASE (DOMESTIC /
+        // PRIVATE_PERSON / OTHER) — NOT the Rust PascalCase. Pinned
+        // verbatim so a future "let's unify the casing" refactor cannot
+        // silently break the NAV submit.
+        assert_eq!(CustomerVatStatus::Domestic.as_nav_token(), "DOMESTIC");
+        assert_eq!(
+            CustomerVatStatus::PrivatePerson.as_nav_token(),
+            "PRIVATE_PERSON"
+        );
+        assert_eq!(CustomerVatStatus::Other.as_nav_token(), "OTHER");
+    }
+
+    #[test]
+    fn customer_vat_status_db_round_trip() {
+        // PascalCase storage layer matches the wire mirror.
+        for variant in [
+            CustomerVatStatus::Domestic,
+            CustomerVatStatus::PrivatePerson,
+            CustomerVatStatus::Other,
+        ] {
+            let s = variant.as_db_str();
+            assert_eq!(CustomerVatStatus::from_db_str(s), Some(variant));
+        }
+        assert_eq!(CustomerVatStatus::from_db_str("garbage"), None);
+    }
+
+    #[test]
+    fn customer_vat_status_default_is_domestic() {
+        // Pre-PR-97 wire bodies omit the field — serde defaults to
+        // Domestic which matches the pre-PR-97 implicit posture.
+        assert_eq!(CustomerVatStatus::default(), CustomerVatStatus::Domestic);
     }
 
     #[test]

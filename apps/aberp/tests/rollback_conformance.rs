@@ -113,6 +113,7 @@ fn build_allocate_args(series_id: SeriesId) -> AllocateArgs {
         rate_metadata: None,
         bank_snapshot: None,
         invoice_note: None,
+        start_value: 1,
     }
 }
 

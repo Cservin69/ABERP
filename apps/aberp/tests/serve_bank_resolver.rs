@@ -33,6 +33,7 @@ use ulid::Ulid;
 
 use aberp::issue_invoice::{AddressJson, CustomerJson, LineJson, SupplierJson};
 use aberp::mnb_rates_provider::MnbRatesProvider;
+use aberp::nav_xml::CustomerVatStatus;
 use aberp::serve::{self, AppState, IssueInvoiceRequest};
 
 const TEST_TENANT: &str = "serve_bank_resolver_test";
@@ -76,6 +77,10 @@ fn fixture_supplier() -> SupplierJson {
 
 fn fixture_customer() -> CustomerJson {
     CustomerJson {
+        // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
+        // Domestic posture for legacy test fixtures.
+        vat_status: CustomerVatStatus::Domestic,
+        partner_id: None,
         tax_number: "87654321-2-13".to_string(),
         name: "Vevő Kft.".to_string(),
         // PR-77 / session-101 — preflight requires `customer.address`
@@ -112,6 +117,9 @@ fn fixture_request(currency: Currency, bank_account_id: Option<String>) -> Issue
         payment_deadline: None,
         delivery_date: None,
         delivery_date_override: None,
+        // PR-92 — opt out of the default-on auto-send so the bank
+        // resolver tests stay SMTP-free.
+        email_buyer_on_issue: Some(false),
     }
 }
 

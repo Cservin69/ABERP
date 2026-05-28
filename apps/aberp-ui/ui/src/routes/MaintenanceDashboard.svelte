@@ -31,6 +31,7 @@
     getNavCredentialsStatus,
     getSellerInfo,
     listPartners,
+    listProducts,
     listSellerBanks,
     type NavCredentialsStatusResponse,
     type SellerInfoResponse,
@@ -146,6 +147,11 @@
         const rows = await listPartners();
         const n = rows.length;
         return n === 1 ? "1 saved partner" : `${n} saved partners`;
+      }
+      case "ProductCount": {
+        const rows = await listProducts();
+        const n = rows.length;
+        return n === 1 ? "1 saved product" : `${n} saved products`;
       }
       case "BankAccountCount": {
         // Two independent reads — the seller-info legal_name + the

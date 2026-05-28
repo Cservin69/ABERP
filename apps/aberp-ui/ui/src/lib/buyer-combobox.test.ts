@@ -22,6 +22,9 @@ function partner(overrides: Partial<Partner>): Partner {
     display_name: "Example Kft.",
     legal_name: "Example Kereskedelmi Kft.",
     kind: "Customer",
+    // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic posture
+    // for legacy buyer-combobox fixtures.
+    customer_vat_status: "Domestic",
     tax_number: "12345678-2-13",
     eu_vat_number: null,
     address_street: null,
@@ -165,6 +168,8 @@ describe("buyerComboboxState — live wire-shape pin (PR-75 / session-99)", () =
       display_name: "BSCE",
       legal_name: "Budapesti Sport-Egyesület Kft.",
       kind: "Customer",
+      // PR-97 / ADR-0048 — wire-shape pin includes the new field.
+      customer_vat_status: "Domestic",
       tax_number: "22222222-2-22",
       eu_vat_number: "HU22222222",
       address_street: "Üllői út 1.",

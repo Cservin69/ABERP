@@ -44,7 +44,7 @@
 
 use aberp_billing::Currency;
 
-use crate::nav_xml::{parse_hungarian_tax_number, SupplierConfigError};
+use crate::nav_xml::{parse_hungarian_tax_number, CustomerVatStatus, SupplierConfigError};
 use crate::serve::IssueInvoiceRequest;
 
 /// Hungarian Áfa standard-rate closed-vocab. Per current Áfa törvény:
@@ -165,6 +165,23 @@ pub enum InvoicePreflightError {
         selected_currency: Currency,
         invoice_currency: Currency,
     },
+    /// PR-97 / ADR-0048 §6 — `customer.vat_status == PrivatePerson`
+    /// AND `customer.tax_number` is non-empty after trim. NAV's
+    /// business-rule layer rejects PRIVATE_PERSON + `<customerVatData>`
+    /// (the symmetric negative half of `CUSTOMER_DATA_EXPECTED`);
+    /// rather than burn a sequence and discover the rejection at
+    /// submit time, surface it inline at preflight. Carries the
+    /// rejected raw value so the operator sees exactly what the
+    /// disabled input was carrying (usually a copy/paste residue
+    /// after switching the radio).
+    CustomerTaxNumberPresentForPrivatePerson { actual: String },
+    /// PR-97 / ADR-0048 §7 — `customer.vat_status == Other`. v1
+    /// named-defers the foreign-buyer (EU community VAT / non-EU
+    /// third-state-tax-id) branch; preflight surfaces a typed error
+    /// pointing the operator at the radio so the "not yet supported"
+    /// signal is explicit and operator-actionable rather than landing
+    /// silently as a NAV-side ABORTED.
+    CustomerVatStatusOtherNotSupportedV1,
 }
 
 impl InvoicePreflightError {
@@ -191,6 +208,12 @@ impl InvoicePreflightError {
             }
             InvoicePreflightError::SellerBankCurrencyMismatch { .. } => {
                 "SellerBankCurrencyMismatch"
+            }
+            InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson { .. } => {
+                "CustomerTaxNumberPresentForPrivatePerson"
+            }
+            InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1 => {
+                "CustomerVatStatusOtherNotSupportedV1"
             }
         }
     }
@@ -223,6 +246,12 @@ impl InvoicePreflightError {
             InvoicePreflightError::SellerBankMissingForCurrency { .. }
             | InvoicePreflightError::SellerBankCurrencyMismatch { .. } => {
                 "bankAccountId".to_string()
+            }
+            InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson { .. } => {
+                "customer.taxNumber".to_string()
+            }
+            InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1 => {
+                "customer.vatStatus".to_string()
             }
         }
     }
@@ -299,6 +328,18 @@ impl InvoicePreflightError {
                     invoice_currency.iso_code()
                 )
             }
+            InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson { actual } => {
+                format!(
+                    "Magánszemély vevőhöz nem tartozhat adószám (kapott: `{actual}`). \
+                     Természetes személy vevő esetén a NAV szabálya tiltja a `<customerVatData>` \
+                     blokkot — váltson Adóalany típusra, vagy hagyja üresen az ADÓSZÁM mezőt."
+                )
+            }
+            InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1 => {
+                "Külföldi (OTHER) vevő kibocsátása későbbi verzióban érkezik (ADR-0048 §7 / v2). \
+                 Jelenleg csak Adóalany / Magánszemély típusú vevő számlázható."
+                    .to_string()
+            }
         }
     }
 
@@ -365,6 +406,21 @@ impl InvoicePreflightError {
                     selected_currency.iso_code(),
                     invoice_currency.iso_code()
                 )
+            }
+            InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson { actual } => {
+                format!(
+                    "Natural-person (PRIVATE_PERSON) buyers must NOT carry a tax number \
+                     (got `{actual}`). NAV's business-rule layer forbids `<customerVatData>` \
+                     under PRIVATE_PERSON — switch the buyer type to Domestic or clear the \
+                     ADÓSZÁM field."
+                )
+            }
+            InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1 => {
+                "Foreign-buyer (OTHER) issuance is named-deferred to v2 per ADR-0048 §7. \
+                 v1 supports Domestic and PrivatePerson buyers only — pick one of those, \
+                 or wait for the v2 PR that wires the EU community-VAT / non-EU third-state \
+                 tax-id branch."
+                    .to_string()
             }
         }
     }
@@ -435,52 +491,97 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
     let mut errors: Vec<InvoicePreflightError> = Vec::new();
 
     // Customer block.
-    if request.customer.name.trim().is_empty() {
+    //
+    // PR-97 / ADR-0048 (Ervin override 2 / GDPR) — `CustomerNameEmpty`
+    // is now CONDITIONAL on `vat_status != PrivatePerson`. For
+    // natural-person buyers the operator may omit the name per
+    // Ervin's GDPR posture; preflight stays quiet on the empty-name
+    // case under PRIVATE_PERSON. DOMESTIC / OTHER preserve the
+    // pre-PR-97 "name always required" invariant.
+    let name_empty = request.customer.name.trim().is_empty();
+    let is_private_person = matches!(
+        request.customer.vat_status,
+        CustomerVatStatus::PrivatePerson
+    );
+    if name_empty && !is_private_person {
         errors.push(InvoicePreflightError::CustomerNameEmpty);
     }
+
+    // PR-97 / ADR-0048 §6 — preflight is conditional on the
+    // closed-vocab buyer-kind discriminator. Domestic preserves the
+    // PR-69 + PR-77 rules (tax number required & well-formed + full
+    // address required). PrivatePerson inverts the tax-number rule
+    // (must be empty) and relaxes the address rule (optional at the
+    // NAV wire layer). Other surfaces a typed `not-yet-supported`
+    // error so the v1-deferred branch is operator-visible rather
+    // than silently broken at submit time.
     let tax_trimmed = request.customer.tax_number.trim();
-    let mut tax_number_well_formed = false;
-    if tax_trimmed.is_empty() {
-        errors.push(InvoicePreflightError::CustomerTaxNumberMissing);
-    } else {
-        match parse_hungarian_tax_number(tax_trimmed) {
-            Ok(_) => {
-                tax_number_well_formed = true;
-            }
-            Err(SupplierConfigError::MissingTaxNumber) => {
-                // Whitespace-after-trim case is already covered by the
-                // `is_empty` branch above; this arm is theoretically
-                // unreachable but the explicit match keeps the closed-vocab
-                // exhaustive (no `_` wildcard).
+    match request.customer.vat_status {
+        CustomerVatStatus::Domestic => {
+            let mut tax_number_well_formed = false;
+            if tax_trimmed.is_empty() {
                 errors.push(InvoicePreflightError::CustomerTaxNumberMissing);
+            } else {
+                match parse_hungarian_tax_number(tax_trimmed) {
+                    Ok(_) => {
+                        tax_number_well_formed = true;
+                    }
+                    Err(SupplierConfigError::MissingTaxNumber) => {
+                        // Whitespace-after-trim case is already covered by
+                        // the `is_empty` branch above; this arm is
+                        // theoretically unreachable but the explicit match
+                        // keeps the closed-vocab exhaustive.
+                        errors.push(InvoicePreflightError::CustomerTaxNumberMissing);
+                    }
+                    Err(SupplierConfigError::MalformedTaxNumber { input, reason }) => {
+                        errors.push(InvoicePreflightError::CustomerTaxNumberMalformed {
+                            actual: input,
+                            reason,
+                        });
+                    }
+                }
             }
-            Err(SupplierConfigError::MalformedTaxNumber { input, reason }) => {
-                errors.push(InvoicePreflightError::CustomerTaxNumberMalformed {
-                    actual: input,
-                    reason,
+            // PR-77 / session-101 — `customer.address` is required when
+            // the buyer is a Hungarian business AND the tax number is
+            // well-formed. The malformed-tax-number case suppresses the
+            // address gate so the operator has a more proximate problem
+            // to fix first.
+            if tax_number_well_formed {
+                let address_ok = request.customer.address.as_ref().is_some_and(|a| {
+                    !a.country_code.trim().is_empty()
+                        && !a.postal_code.trim().is_empty()
+                        && !a.city.trim().is_empty()
+                        && !a.street.trim().is_empty()
                 });
+                if !address_ok {
+                    errors.push(InvoicePreflightError::CustomerAddressMissing);
+                }
             }
         }
-    }
-
-    // PR-77 / session-101 — `customer.address` is required when the
-    // buyer is a Hungarian business (well-formed tax number → today's
-    // only branch — closed-vocab customerVatStatus is named-deferred).
-    // Address is `Option<AddressJson>` on the wire (pre-PR-77 bodies
-    // omitted it entirely); we also fire when any of the four
-    // sub-fields is blank-after-trim, so a partially-filled partner
-    // record surfaces the same way as a missing one. The fix path is
-    // operator-actionable on the Partners screen — message names that
-    // surface in both Hungarian and English.
-    if tax_number_well_formed {
-        let address_ok = request.customer.address.as_ref().is_some_and(|a| {
-            !a.country_code.trim().is_empty()
-                && !a.postal_code.trim().is_empty()
-                && !a.city.trim().is_empty()
-                && !a.street.trim().is_empty()
-        });
-        if !address_ok {
-            errors.push(InvoicePreflightError::CustomerAddressMissing);
+        CustomerVatStatus::PrivatePerson => {
+            // Symmetric invariant: a natural-person buyer MUST NOT
+            // carry a tax number. The SPA's IssueInvoice form disables
+            // the input under this radio, so a non-empty value reaching
+            // preflight is either operator confusion (radio flipped
+            // after typing the number) or a wire-bypass. Surface
+            // typed so the operator can clear the field inline.
+            if !tax_trimmed.is_empty() {
+                errors.push(
+                    InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson {
+                        actual: tax_trimmed.to_string(),
+                    },
+                );
+            }
+            // PR-97 / ADR-0048 §3 open-question #5 — `<customerAddress>`
+            // is OPTIONAL under PRIVATE_PERSON at the NAV wire layer.
+            // Hungarian invoice law still requires it on the printed
+            // PDF, but the PDF render boundary (not preflight) is the
+            // surface for that rule; preflight stays quiet here so the
+            // operator can issue a PrivatePerson invoice with an
+            // address-light partner record.
+        }
+        CustomerVatStatus::Other => {
+            errors.push(InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1);
         }
     }
 
@@ -518,6 +619,7 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
 mod tests {
     use super::*;
     use crate::issue_invoice::{AddressJson, CustomerJson, LineJson};
+    use crate::nav_xml::CustomerVatStatus;
     use aberp_billing::Currency;
 
     /// PR-77 / session-101 — canonical good-buyer address fixture for
@@ -545,6 +647,10 @@ mod tests {
     fn good_request() -> IssueInvoiceRequest {
         IssueInvoiceRequest {
             customer: CustomerJson {
+                // PR-97 / ADR-0048 — explicit Domestic preserves
+                // pre-PR-97 implicit posture for legacy preflight tests.
+                vat_status: CustomerVatStatus::Domestic,
+                partner_id: None,
                 tax_number: "87654321-2-13".to_string(),
                 name: "Áben Consulting KFT.".to_string(),
                 address: Some(good_customer_address()),
@@ -561,6 +667,11 @@ mod tests {
             payment_deadline: None,
             delivery_date: None,
             delivery_date_override: None,
+            // PR-92 — opt-out the auto-send in preflight fixtures so
+            // none of the preflight tests need a configured SMTP
+            // tenant; the issue route's `unwrap_or(true)` default
+            // still applies for production callers.
+            email_buyer_on_issue: Some(false),
         }
     }
 
@@ -790,6 +901,8 @@ mod tests {
     fn collects_all_errors_in_one_pass_for_multi_failing_request() {
         let r = IssueInvoiceRequest {
             customer: CustomerJson {
+                vat_status: CustomerVatStatus::Domestic,
+                partner_id: None,
                 tax_number: "12345".to_string(), // malformed
                 name: "  ".to_string(),          // blank
                 address: None,                   // PR-77 — also missing
@@ -818,6 +931,7 @@ mod tests {
             payment_deadline: None,
             delivery_date: None,
             delivery_date_override: None,
+            email_buyer_on_issue: Some(false),
         };
         let errs = validate_invoice_preflight(&r);
 
@@ -931,6 +1045,11 @@ mod tests {
                 selected_currency: Currency::Huf,
                 invoice_currency: Currency::Eur,
             },
+            // PR-97 / ADR-0048.
+            InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson {
+                actual: "12345678-1-42".to_string(),
+            },
+            InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1,
         ];
         let kinds: std::collections::HashSet<&'static str> =
             variants.iter().map(|v| v.kind()).collect();
@@ -998,6 +1117,11 @@ mod tests {
                 selected_currency: Currency::Huf,
                 invoice_currency: Currency::Eur,
             },
+            // PR-97 / ADR-0048.
+            InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson {
+                actual: "12345678-1-42".to_string(),
+            },
+            InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1,
         ];
         for v in variants {
             assert!(!v.message_hu().is_empty(), "HU missing for {v:?}");
@@ -1074,5 +1198,140 @@ mod tests {
                 "message must name invoice currency: {body}"
             );
         }
+    }
+
+    // ── PR-97 / ADR-0048 §6 — conditional rules per buyer kind ────────
+
+    /// PrivatePerson buyer with a populated `tax_number` fires the
+    /// symmetric `CustomerTaxNumberPresentForPrivatePerson` variant. The
+    /// NAV business-rule layer rejects this combination; surfacing it at
+    /// preflight prevents the sequence-burn that would otherwise land at
+    /// submit time.
+    #[test]
+    fn fires_customer_tax_number_present_for_private_person() {
+        let mut r = good_request();
+        r.customer.vat_status = CustomerVatStatus::PrivatePerson;
+        r.customer.tax_number = "12345678-1-42".to_string();
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson { actual }
+                    if actual == "12345678-1-42"
+            )),
+            "expected CustomerTaxNumberPresentForPrivatePerson, got {errs:?}"
+        );
+    }
+
+    /// PrivatePerson buyer with NO `tax_number` must NOT fire
+    /// `CustomerTaxNumberMissing` — that gate is now gated on
+    /// `vat_status == Domestic`. The address gate is also suppressed
+    /// (PrivatePerson tolerates address-absent at the NAV wire layer).
+    #[test]
+    fn does_not_fire_customer_tax_number_missing_for_private_person() {
+        let mut r = good_request();
+        r.customer.vat_status = CustomerVatStatus::PrivatePerson;
+        r.customer.tax_number = "".to_string();
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            !errs.contains(&InvoicePreflightError::CustomerTaxNumberMissing),
+            "PrivatePerson + empty tax must NOT fire CustomerTaxNumberMissing, got {errs:?}"
+        );
+    }
+
+    /// PrivatePerson buyer with NO address must NOT fire
+    /// `CustomerAddressMissing` — NAV's wire layer permits
+    /// address-absent under PRIVATE_PERSON (the print-PDF rule lives
+    /// elsewhere per ADR-0048 §3 open-question #5).
+    #[test]
+    fn does_not_fire_customer_address_missing_for_private_person() {
+        let mut r = good_request();
+        r.customer.vat_status = CustomerVatStatus::PrivatePerson;
+        r.customer.tax_number = "".to_string();
+        r.customer.address = None;
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            !errs.contains(&InvoicePreflightError::CustomerAddressMissing),
+            "PrivatePerson + None address must NOT fire CustomerAddressMissing, got {errs:?}"
+        );
+    }
+
+    /// Other buyer kind surfaces the v1 named-deferral error pointing
+    /// at the radio. The SPA's PartnerForm disables the Külföldi
+    /// option, but a wire body still carrying Other (CLI / integration
+    /// test) must not be silently malformed.
+    #[test]
+    fn fires_customer_vat_status_other_not_supported_v1() {
+        let mut r = good_request();
+        r.customer.vat_status = CustomerVatStatus::Other;
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.contains(&InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1),
+            "expected CustomerVatStatusOtherNotSupportedV1, got {errs:?}"
+        );
+    }
+
+    /// Domestic buyer's pre-PR-97 invariants still hold — sanity pin
+    /// that the conditional switch did not regress the Domestic
+    /// branch. A blank tax number still fires
+    /// `CustomerTaxNumberMissing`; a present-but-incomplete address
+    /// still fires `CustomerAddressMissing` (PR-77 hold).
+    #[test]
+    fn domestic_branch_preserves_pre_pr_97_invariants() {
+        let mut r = good_request();
+        r.customer.vat_status = CustomerVatStatus::Domestic;
+        r.customer.tax_number = "".to_string();
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.contains(&InvoicePreflightError::CustomerTaxNumberMissing),
+            "Domestic + empty tax must still fire CustomerTaxNumberMissing, got {errs:?}"
+        );
+    }
+
+    /// PR-97 / ADR-0048 (Ervin override 2 / GDPR) — PrivatePerson
+    /// buyers may omit `customer.name` per the GDPR posture
+    /// ("magánszemély vevő esetén a név megadása opcionális"). The
+    /// preflight must NOT fire `CustomerNameEmpty` on a PRIVATE_PERSON
+    /// body with an empty name.
+    #[test]
+    fn does_not_fire_customer_name_empty_for_private_person() {
+        let mut r = good_request();
+        r.customer.vat_status = CustomerVatStatus::PrivatePerson;
+        r.customer.tax_number = "".to_string();
+        r.customer.name = "".to_string();
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            !errs.contains(&InvoicePreflightError::CustomerNameEmpty),
+            "PrivatePerson + empty name must NOT fire CustomerNameEmpty (GDPR override), got {errs:?}"
+        );
+    }
+
+    /// Domestic + empty name must still fire `CustomerNameEmpty` — the
+    /// PR-97 GDPR relaxation applies ONLY to PRIVATE_PERSON.
+    #[test]
+    fn fires_customer_name_empty_for_domestic_with_blank_name() {
+        let mut r = good_request();
+        r.customer.vat_status = CustomerVatStatus::Domestic;
+        r.customer.name = "   ".to_string();
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.contains(&InvoicePreflightError::CustomerNameEmpty),
+            "Domestic + blank name must still fire CustomerNameEmpty, got {errs:?}"
+        );
+    }
+
+    /// Field-path closed-vocab: the new PR-97 variants route to the
+    /// expected SPA form inputs so the inline-error renderer can target
+    /// them.
+    #[test]
+    fn pr_97_variants_route_to_expected_fields() {
+        let private_person_with_tax =
+            InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson {
+                actual: "x".to_string(),
+            };
+        assert_eq!(private_person_with_tax.field_path(), "customer.taxNumber");
+
+        let other = InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1;
+        assert_eq!(other.field_path(), "customer.vatStatus");
     }
 }

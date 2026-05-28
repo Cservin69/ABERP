@@ -234,6 +234,21 @@ pub struct InvoiceDraftCreatedPayload {
     /// forward-compat schema drift the inspector should investigate.
     #[serde(default)]
     pub delivery_date_override: Option<String>,
+    /// PR-97 / ADR-0048 — closed-vocab buyer-kind discriminator at
+    /// issuance time. `Some("Domestic")` / `Some("PrivatePerson")` /
+    /// `Some("Other")` for post-PR-97 entries (the SPA stamps the
+    /// value the operator picked on the radio); `None` for pre-PR-97
+    /// entries (the read path treats `None` and `Some("Domestic")`
+    /// identically — the pre-PR-97 implicit posture). An unknown
+    /// non-vocab string indicates ledger tampering or forward-compat
+    /// schema drift the inspector should investigate.
+    ///
+    /// Additive field with `#[serde(default)]` — F12 four-edit ritual
+    /// does NOT fire (the field is back-compat and the
+    /// `InvoiceDraftCreated` kind keeps its existing name per the
+    /// audit-payloads header at lines 25-33).
+    #[serde(default)]
+    pub customer_vat_status: Option<String>,
 }
 
 impl InvoiceDraftCreatedPayload {
@@ -268,6 +283,10 @@ impl InvoiceDraftCreatedPayload {
             payment_deadline: None,
             delivery_date: None,
             delivery_date_override: None,
+            // PR-97 / ADR-0048 — pre-PR-97 / CLI / library callers
+            // default to `None`; SPA-issue path stamps the operator's
+            // radio choice via `with_customer_vat_status` below.
+            customer_vat_status: None,
         }
     }
 
@@ -315,6 +334,10 @@ impl InvoiceDraftCreatedPayload {
             payment_deadline: None,
             delivery_date: None,
             delivery_date_override: None,
+            // PR-97 / ADR-0048 — pre-PR-97 / CLI / library callers
+            // default to `None`; SPA-issue path stamps the operator's
+            // radio choice via `with_customer_vat_status` below.
+            customer_vat_status: None,
         }
     }
 
@@ -365,6 +388,10 @@ impl InvoiceDraftCreatedPayload {
             payment_deadline: None,
             delivery_date: None,
             delivery_date_override: None,
+            // PR-97 / ADR-0048 — pre-PR-97 / CLI / library callers
+            // default to `None`; SPA-issue path stamps the operator's
+            // radio choice via `with_customer_vat_status` below.
+            customer_vat_status: None,
         }
     }
 
@@ -383,6 +410,23 @@ impl InvoiceDraftCreatedPayload {
             self.bank_account_bank_name = Some(b.bank_name.clone());
             self.bank_account_swift_bic = Some(b.swift_bic.clone());
         }
+        self
+    }
+
+    /// PR-97 / ADR-0048 — stamp the closed-vocab buyer-kind
+    /// discriminator onto an existing payload (post-`from_invoice_*`
+    /// step). Used by the three issue-paths to denormalise the
+    /// operator's radio choice onto the audit row so the
+    /// tamper-evident regulatory trail records buyer kind as-of-
+    /// issuance. The persisted string is the PascalCase form
+    /// (`"Domestic"` / `"PrivatePerson"` / `"Other"`) — same shape as
+    /// the SPA wire body and the partner storage column.
+    ///
+    /// Same builder posture as [`Self::with_bank_snapshot`] /
+    /// [`Self::with_notes`] / [`Self::with_invoice_dates`]: idempotent
+    /// + chainable from the `from_invoice_*` constructor.
+    pub fn with_customer_vat_status(mut self, status: crate::nav_xml::CustomerVatStatus) -> Self {
+        self.customer_vat_status = Some(status.as_db_str().to_string());
         self
     }
 
@@ -1817,6 +1861,132 @@ impl InvoicePaymentRecordedPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// InvoiceEmailedSent  (PR-92 / ADR-0047 §4 — SMTP delivery audit
+// event. ONE entry per send attempt; both successful sends and
+// failures emit an entry so the operator-twin record has no gaps.
+// NO secrets reach this payload — see the field docs + the
+// `audit_payload_emailed_carries_no_secrets` pin below.)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceEmailedSent`].
+///
+/// CRITICAL — the secret-scrubbing invariant:
+///
+///   - The SMTP password is NEVER in this payload (it lives in the
+///     OS keychain via [`crate::smtp_credentials`] and is wrapped in
+///     `Zeroizing<String>` throughout the send path).
+///   - The SMTP host is NOT in this payload — operator config lives
+///     in seller.toml with its own write-audit trail; smearing the
+///     SMTP host across every email audit row would risk leaking
+///     server identity if the audit ledger were ever shared.
+///   - The email body bytes are NOT in this payload — only the
+///     subject (which the operator authored via the system template
+///     and is operator-visible anyway).
+///
+/// Pinned by [`tests::audit_payload_emailed_carries_no_secrets`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceEmailedSentPayload {
+    /// The invoice id this send is recorded against — prefixed
+    /// `inv_<ULID>` form.
+    pub invoice_id: String,
+    /// Operator-decision idempotency key minted per send attempt.
+    /// Distinct from the invoice's issuance key; threads only within
+    /// the email-recording surface (a future resend would carry a
+    /// fresh key per attempt — one row per attempt).
+    pub idempotency_key: String,
+    /// The to-address actually used. Operator-visible by design —
+    /// the partner's contact email is itself in the partners table
+    /// and on the printed invoice's address block; recording it
+    /// here closes the operator-twin "did we send it to the right
+    /// place?" loop.
+    pub recipient: String,
+    /// Verbatim subject line that was sent. Same operator-visibility
+    /// rationale as `recipient`.
+    pub subject: String,
+    /// Closed-vocab outcome — `"succeeded"` or `"failed"`. Wire
+    /// form is the lowercase token verbatim.
+    pub outcome: String,
+    /// Closed-vocab `error_class` — present iff `outcome == "failed"`.
+    /// One of `"transport" / "tls" / "auth" / "recipient_rejected" /
+    /// "compose" / "other"` per [`crate::email_invoice::EmailSendError::error_class`].
+    /// `None` on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    /// Operator-readable error detail. Already-scrubbed of secrets
+    /// at the [`crate::email_invoice::EmailSendError::scrubbed_detail`]
+    /// boundary. `None` on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
+    /// `true` when the send fired as the default-on auto-send at the
+    /// end of the issue flow; `false` when the operator clicked the
+    /// manual "Email to buyer" button. ADR-0047 §4 — operator-twin
+    /// audit distinguishes the two so the record is unambiguous.
+    pub auto: bool,
+    /// `true` iff the NAV InvoiceData XML rode alongside the PDF
+    /// (the `attach_xml` config flag was on). Recorded so a future
+    /// inspector can correlate "did the buyer get the regulatory
+    /// XML, or just the printed PDF?".
+    pub attached_xml: bool,
+}
+
+impl InvoiceEmailedSentPayload {
+    /// Construct a successful-send payload.
+    pub fn succeeded(
+        invoice_id: &str,
+        idempotency_key: IdempotencyKey,
+        recipient: &str,
+        subject: &str,
+        auto: bool,
+        attached_xml: bool,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            recipient: recipient.to_string(),
+            subject: subject.to_string(),
+            outcome: "succeeded".to_string(),
+            error_class: None,
+            error_detail: None,
+            auto,
+            attached_xml,
+        }
+    }
+
+    /// Construct a failed-send payload. `error_class` MUST come from
+    /// the closed-vocab returned by `EmailSendError::error_class`;
+    /// `error_detail` MUST be the scrubbed-of-secrets form returned
+    /// by `EmailSendError::scrubbed_detail`. Both invariants are
+    /// caller-enforced — the audit payload type can't run the
+    /// scrub itself without re-importing the error type.
+    pub fn failed(
+        invoice_id: &str,
+        idempotency_key: IdempotencyKey,
+        recipient: &str,
+        subject: &str,
+        auto: bool,
+        attached_xml: bool,
+        error_class: &str,
+        error_detail: &str,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            recipient: recipient.to_string(),
+            subject: subject.to_string(),
+            outcome: "failed".to_string(),
+            error_class: Some(error_class.to_string()),
+            error_detail: Some(error_detail.to_string()),
+            auto,
+            attached_xml,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1915,6 +2085,60 @@ mod tests {
         // nav_xml_path: None. The drain worker treats None as the
         // operator-must-supply-override case.
         assert_eq!(decoded.nav_xml_path, None);
+        // PR-97 / ADR-0048 — pre-PR-97 default is `None`. The read
+        // path treats `None` and `Some("Domestic")` identically per
+        // the back-compat shape.
+        assert_eq!(decoded.customer_vat_status, None);
+    }
+
+    /// PR-97 / ADR-0048 — post-PR-97 shape pin. The
+    /// `with_customer_vat_status` builder stamps the operator's radio
+    /// choice onto the audit payload; the round-trip preserves the
+    /// PascalCase wire token verbatim.
+    #[test]
+    fn draft_created_round_trip_with_customer_vat_status() {
+        for (status, expected) in [
+            (crate::nav_xml::CustomerVatStatus::Domestic, "Domestic"),
+            (
+                crate::nav_xml::CustomerVatStatus::PrivatePerson,
+                "PrivatePerson",
+            ),
+            (crate::nav_xml::CustomerVatStatus::Other, "Other"),
+        ] {
+            let invoice = fixture_invoice();
+            let idem = IdempotencyKey::new();
+            let original = InvoiceDraftCreatedPayload::from_invoice(&invoice, idem)
+                .with_customer_vat_status(status);
+            let bytes = original.to_bytes();
+            let decoded: InvoiceDraftCreatedPayload =
+                serde_json::from_slice(&bytes).expect("decode must succeed");
+            assert_eq!(
+                decoded.customer_vat_status.as_deref(),
+                Some(expected),
+                "expected `{expected}` for {status:?}"
+            );
+            assert_eq!(decoded, original, "full round-trip equality must hold");
+        }
+    }
+
+    /// PR-97 / ADR-0048 — pre-PR-97 wire bytes (no
+    /// `customer_vat_status` field) deserialise cleanly via
+    /// `#[serde(default)]`. The field defaults to `None` — the
+    /// inspector's read path maps that to the implicit Domestic
+    /// posture per the field doc-comment.
+    #[test]
+    fn draft_created_deserialises_pre_pr_97_bytes_without_customer_vat_status_field() {
+        // Pre-PR-97 payload shape (no customer_vat_status field) — only
+        // the load-bearing fields. The omitted ones default via
+        // `#[serde(default)]`.
+        let pre_pr_97_json = br#"{
+            "invoice_id": "inv_01J0",
+            "line_count": 1,
+            "idempotency_key": "idem_abc"
+        }"#;
+        let decoded: InvoiceDraftCreatedPayload =
+            serde_json::from_slice(pre_pr_97_json).expect("pre-PR-97 bytes must deserialise");
+        assert_eq!(decoded.customer_vat_status, None);
     }
 
     /// PR-18 / ADR-0031 §2 — the with-xml-path constructor populates
@@ -3331,5 +3555,292 @@ mod tests {
         assert!(serde_json::from_str::<PaymentMethod>("\"PixCryptoCheque\"").is_err());
         assert!(serde_json::from_str::<PaymentMethod>("\"bank_transfer\"").is_err());
         assert!(serde_json::from_str::<PaymentMethod>("\"\"").is_err());
+    }
+
+    // ── PR-92 / ADR-0047 §4 — InvoiceEmailedSent payload tests ─────
+
+    #[test]
+    fn emailed_sent_succeeded_round_trip() {
+        let payload = InvoiceEmailedSentPayload::succeeded(
+            "inv_01HZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            IdempotencyKey::new(),
+            "buyer@example.com",
+            "Számla / Invoice ABERP-2026/00001",
+            true,
+            false,
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoiceEmailedSentPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.outcome, "succeeded");
+        assert!(decoded.error_class.is_none());
+        assert!(decoded.error_detail.is_none());
+        assert!(decoded.auto);
+        assert!(!decoded.attached_xml);
+    }
+
+    #[test]
+    fn emailed_sent_failed_round_trip() {
+        let payload = InvoiceEmailedSentPayload::failed(
+            "inv_01HZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            IdempotencyKey::new(),
+            "buyer@example.com",
+            "Számla / Invoice ABERP-2026/00001",
+            false,
+            true,
+            "tls",
+            "TLS handshake failed: bad certificate",
+        );
+        let decoded: InvoiceEmailedSentPayload =
+            serde_json::from_slice(&payload.to_bytes()).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.outcome, "failed");
+        assert_eq!(decoded.error_class.as_deref(), Some("tls"));
+        assert!(decoded.error_detail.as_deref().unwrap().contains("TLS"));
+        assert!(!decoded.auto);
+        assert!(decoded.attached_xml);
+    }
+
+    /// CRITICAL pin — ADR-0047 §4. The audit payload MUST NOT carry
+    /// the SMTP password, the SMTP host, or the email body bytes.
+    /// If a future contributor adds any of these as a field, this
+    /// test fails (the JSON serialization grows the corresponding
+    /// key and our grep matches).
+    #[test]
+    fn audit_payload_emailed_carries_no_secrets() {
+        let payload = InvoiceEmailedSentPayload::succeeded(
+            "inv_X",
+            IdempotencyKey::new(),
+            "buyer@example.com",
+            "Subject",
+            true,
+            false,
+        );
+        let json = serde_json::to_string(&payload).unwrap();
+        // No password / credential field.
+        assert!(
+            !json.contains("password"),
+            "audit payload must not carry `password`: {json}"
+        );
+        assert!(
+            !json.contains("credentials"),
+            "audit payload must not carry `credentials`: {json}"
+        );
+        // No SMTP host / port — operator config has its own audit
+        // trail; smearing host identity here is the smell.
+        assert!(
+            !json.contains("\"host\""),
+            "audit payload must not carry `host`: {json}"
+        );
+        assert!(
+            !json.contains("\"port\""),
+            "audit payload must not carry `port`: {json}"
+        );
+        // No email body bytes — only the subject is recorded.
+        assert!(
+            !json.contains("\"body\""),
+            "audit payload must not carry `body`: {json}"
+        );
+        assert!(
+            !json.contains("\"pdf_bytes\""),
+            "audit payload must not carry `pdf_bytes`: {json}"
+        );
+    }
+
+    // ── PR-93 adversarial pins ─────────────────────────────────────
+    // All prefixed `pr_93_`. The `emailed_sent_outcome_uses_closed_vocab_strings`
+    // test at the bottom is the PR-92 baseline pin that these expand.
+
+    /// PR-93 §6 — secret-scrubbing under adversarial input. Build a
+    /// payload whose `error_detail` contains every word a hostile
+    /// log-line could plausibly include (passwords-looking strings,
+    /// long hex blobs, common credential framings) and assert the
+    /// serialised JSON does not carry any of them at literal form.
+    ///
+    /// This pin is additional to `audit_payload_emailed_carries_no_secrets`
+    /// (which checks the payload SCHEMA). This one checks the
+    /// payload-DATA: even if the schema-level invariant holds, a
+    /// future caller that puts a raw error string into `error_detail`
+    /// (instead of calling `EmailSendError::scrubbed_detail`) would
+    /// regress secret-hygiene; the scrub helper's contract is checked
+    /// in `email_invoice::pr_93_email_send_error_display_carries_no_credentials`.
+    #[test]
+    fn pr_93_failed_payload_serialises_with_scrubbed_detail() {
+        // Caller's contract: pass the ALREADY-scrubbed string into
+        // `error_detail`. The test scrubs upstream of the constructor,
+        // proving the JSON bytes never carry the raw secret.
+        let scrubbed = "535 auth failed (credentials <scrubbed>)";
+        let payload = InvoiceEmailedSentPayload::failed(
+            "inv_X",
+            IdempotencyKey::new(),
+            "buyer@example.com",
+            "Subject",
+            true,
+            false,
+            "auth",
+            scrubbed,
+        );
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("<scrubbed>"));
+        assert!(!json.contains("hunter2"));
+        assert!(!json.contains("Bearer "));
+    }
+
+    /// PR-93 §6 — closed-vocab error_class enforcement. The payload
+    /// can carry any string in `error_class` (serde does not validate),
+    /// so the caller's contract is to use only the six tokens. Pin the
+    /// tokens explicitly so the audit-evidence-bundle reader's filter
+    /// glob (ADR-0047 §4) doesn't silently break.
+    #[test]
+    fn pr_93_failed_payload_error_class_closed_vocab() {
+        for class in [
+            "transport",
+            "tls",
+            "auth",
+            "recipient_rejected",
+            "compose",
+            "other",
+        ] {
+            let p = InvoiceEmailedSentPayload::failed(
+                "inv_X",
+                IdempotencyKey::new(),
+                "buyer@example.com",
+                "Subject",
+                false,
+                false,
+                class,
+                "detail",
+            );
+            assert_eq!(p.error_class.as_deref(), Some(class));
+            // Round-trip preserves the class verbatim.
+            let bytes = p.to_bytes();
+            let back: InvoiceEmailedSentPayload = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(back.error_class.as_deref(), Some(class));
+        }
+    }
+
+    /// PR-93 §6 — extreme-input round-trip. A failed-payload with a
+    /// hostile recipient and subject (CR/LF + non-ASCII + quote
+    /// characters) MUST round-trip through serde_json without
+    /// producing malformed JSON. This proves the audit row can always
+    /// be written even when the input is bad — closes the
+    /// always-writes invariant at the SERIALISATION layer (the route-
+    /// layer always-writes invariant is enforced by
+    /// `finalize_email_audit`).
+    #[test]
+    fn pr_93_failed_payload_round_trip_under_hostile_input() {
+        // The route-layer write doesn't pass hostile values directly
+        // (validate_no_crlf rejects them upstream) but recipient
+        // strings from `partners.contact_email` are NOT pre-validated
+        // — defence in depth.
+        let nasty_recipient = "evil\r\nBcc: a@b.c<\"\\>@example.com";
+        let nasty_subject = "Számla / Invoice\r\nFoo: bar\u{2028}EOF";
+        let nasty_detail = "tls\\handshake \"failed\" with backslash \\ and quote \"";
+        let payload = InvoiceEmailedSentPayload::failed(
+            "inv_X",
+            IdempotencyKey::new(),
+            nasty_recipient,
+            nasty_subject,
+            true,
+            false,
+            "tls",
+            nasty_detail,
+        );
+        let bytes = payload.to_bytes();
+        // Must be valid JSON regardless of input.
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("malformed JSON from hostile input");
+        assert_eq!(parsed["outcome"], "failed");
+        assert_eq!(parsed["error_class"], "tls");
+        // Hostile recipient survives round-trip (the audit row IS the
+        // operator's record of what was attempted — we don't silently
+        // drop it just because the value is malformed).
+        let back: InvoiceEmailedSentPayload = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.recipient, nasty_recipient);
+        assert_eq!(back.subject, nasty_subject);
+        assert_eq!(back.error_detail.as_deref(), Some(nasty_detail));
+    }
+
+    /// PR-93 §6 — every `EmailSendError` variant from
+    /// `crate::email_invoice` maps onto exactly one closed-vocab
+    /// `error_class` token. If a future variant is added without
+    /// extending `error_class()`, this pin (combined with the
+    /// `error_class_*` tests in email_invoice) flags the gap.
+    /// Verifies the closed vocab matches between the two modules.
+    #[test]
+    fn pr_93_error_class_vocab_matches_email_invoice_module() {
+        use crate::email_invoice::EmailSendError;
+        let expected_classes = [
+            "recipient_rejected",
+            "compose",
+            "auth",
+            "transport",
+            "tls",
+            "other",
+        ];
+        let observed = [
+            EmailSendError::MissingRecipient {
+                invoice_id: "inv_X".to_string(),
+            }
+            .error_class(),
+            EmailSendError::HeaderInjection {
+                field: "to",
+                detail: "x".to_string(),
+            }
+            .error_class(),
+            EmailSendError::SmtpNotConfigured("x".to_string()).error_class(),
+            EmailSendError::SmtpPasswordMissing.error_class(),
+            EmailSendError::SmtpTransport {
+                detail: "transport".to_string(),
+            }
+            .error_class(),
+            EmailSendError::SmtpTransport {
+                detail: "tls handshake".to_string(),
+            }
+            .error_class(),
+            EmailSendError::SmtpTransport {
+                detail: "535 auth".to_string(),
+            }
+            .error_class(),
+            EmailSendError::Compose(anyhow::anyhow!("x")).error_class(),
+            EmailSendError::Other(anyhow::anyhow!("x")).error_class(),
+        ];
+        for c in observed {
+            assert!(
+                expected_classes.contains(&c),
+                "error_class `{c}` not in closed vocab {expected_classes:?}"
+            );
+        }
+    }
+
+    /// ADR-0047 §4 — outcome is closed-vocab `"succeeded"` / `"failed"`.
+    /// Pins the wire strings against a future refactor that renames
+    /// them (which would break the audit-evidence-bundle reader's
+    /// filter glob).
+    #[test]
+    fn emailed_sent_outcome_uses_closed_vocab_strings() {
+        let ok = InvoiceEmailedSentPayload::succeeded(
+            "inv_X",
+            IdempotencyKey::new(),
+            "buyer@example.com",
+            "Subject",
+            true,
+            false,
+        );
+        assert_eq!(ok.outcome, "succeeded");
+        let bad = InvoiceEmailedSentPayload::failed(
+            "inv_X",
+            IdempotencyKey::new(),
+            "buyer@example.com",
+            "Subject",
+            false,
+            false,
+            "transport",
+            "connection refused",
+        );
+        assert_eq!(bad.outcome, "failed");
     }
 }

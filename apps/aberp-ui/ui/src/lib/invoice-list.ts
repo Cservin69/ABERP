@@ -11,7 +11,9 @@
 
 import type { DetailActionButton } from "./invoice-actions";
 import { buttonsForState } from "./invoice-actions";
-import type { InvoiceState } from "./api";
+import type { Currency, InvoiceState } from "./api";
+import { lifecycleIndex } from "./labels";
+import { filterInvoicesByNeedle, type InvoiceSearchRow } from "./keyboard-nav";
 
 /** PR-65 / session-86 — quiet em-dash placeholder for the Partner
  * column when the backend has no buyer name to surface (CLI-issued
@@ -45,13 +47,13 @@ export function buyerColumnDisplay(name: string | null): string {
  * buttons. Subset of the detail modal's [`DetailActionButton`]
  * vocab: only the three operator-named-as-load-bearing buttons
  * (Download / Submit / Storno) make sense as one-click row
- * affordances. PollAck stays detail-modal-only because its
- * bounded 31s poll loop benefits from the modal's larger error
- * surface; Modification stays modal-only because it OPENS a fresh
- * form (the operator edits the corrected body), not a one-click
- * action. Per CLAUDE.md rule 3 (surgical) the narrow vocab is
- * the surface area the brief explicitly named — adding the other
- * two would inherit two new failure modes for no operator gain. */
+ * affordances. PR-95 / session-115 — PollAck was removed from the
+ * wider DetailActionButton vocab entirely; the NAV-status pictogram
+ * in the state column now carries the poll affordance (clickable on
+ * InFlight rows). Modification stays modal-only because it OPENS a
+ * fresh form (the operator edits the corrected body), not a one-
+ * click action. Per CLAUDE.md rule 3 (surgical) the narrow vocab is
+ * the surface area the brief explicitly named. */
 export type RowQuickAction = Extract<
   DetailActionButton,
   "Download" | "Submit" | "Storno" | "Pay"
@@ -115,4 +117,267 @@ export function quickActionMeta(action: RowQuickAction): QuickActionMeta {
     case "Storno":
       return { glyph: "⊘", label: "Cancel (storno)" };
   }
+}
+
+// ─── PR-94 / session-114 — sortable columns + quick-filter facets ──────
+//
+// Two pure helpers extend the list-row Tier-1 UX surface as Ervin's
+// invoice volume climbs ahead of the 2026-06-10 go-live:
+//
+//   1. `compareInvoices` — per-column comparator. Stable, direction-
+//      aware, with "nulls last regardless of dir" for the optional
+//      columns (partner, total). Tiebreaker on `invoice_id` so the
+//      render order is reproducible across refreshes.
+//   2. `filterInvoices` — facet filter (state + currency) composed
+//      with the existing PR-68 needle filter from `./keyboard-nav`.
+//      The facets AND with the needle (every filter must accept the
+//      row).
+//
+// The comparator is a pure (a, b, key, dir) → number so the Svelte
+// renderer can call `rows.slice().sort((a, b) => compareInvoices(a, b,
+// sortKey, sortDir))` and rely on Array.prototype.sort's stable
+// guarantee (ES2019+). Per the brief, all sorting is client-side over
+// the loaded list — server-side pagination is named-deferred until
+// the list outgrows a single fetch.
+
+/** PR-94 / session-114 — closed-vocab of columns the operator can
+ * sort by. Mirrors the renderable column set on `InvoiceList.svelte`
+ * (invoice_id, invoice_number = fiscal_year + sequence_number,
+ * partner = buyer_name, series_number = sequence_number, fiscal_year,
+ * state, total = total_gross). No date column exists on the list-row
+ * wire shape today (date columns are detail-modal-only); when one
+ * lands as an addition to `InvoiceListItem`, lift it here as a new
+ * key + a switch arm in [`compareInvoices`]. */
+export type SortKey =
+  | "invoice_id"
+  | "invoice_number"
+  | "partner"
+  | "series_number"
+  | "fiscal_year"
+  | "state"
+  | "total";
+
+/** PR-94 / session-114 — sort direction. */
+export type SortDir = "asc" | "desc";
+
+/** PR-94 / session-114 — structural shape the comparator inspects.
+ * Mirrors the columns currently rendered on the list table; widening
+ * `InvoiceListItem` later is a transparent additive change because
+ * each `compareInvoices` consumer only reads the named columns. */
+export interface InvoiceSortRow {
+  invoice_id: string;
+  sequence_number: number;
+  fiscal_year: number;
+  state: InvoiceState | string;
+  total_gross: number | null;
+  buyer_name: string | null;
+  currency: Currency;
+}
+
+/** PR-94 / session-114 — pure comparator. Returns a `(a, b) → number`
+ * suitable for `Array.prototype.sort`. Stable in modern JS; ties go
+ * to `invoice_id` ascending so the render order is reproducible
+ * across refreshes (CLAUDE.md rule 12 — don't let render order silently
+ * shuffle on identical inputs).
+ *
+ * Null discipline (CLAUDE.md rule 12 — fail visible, not silent):
+ *
+ *   - `partner` null → sorts AFTER every non-null partner regardless
+ *     of `dir`. Operators reading the column want the meaningful
+ *     values grouped; the em-dash placeholder cluster sits at the
+ *     bottom whether ascending or descending. Same convention as
+ *     spreadsheet apps (Excel / Numbers / Sheets) which all
+ *     "nulls last" by default.
+ *   - `total` null → same posture; no-total rows are drafts with no
+ *     amount-meaningful sort position. Cluster at the bottom.
+ *
+ * Mixed-currency total sort caveat: `total_gross` is in MINOR units
+ * of the row's currency (whole HUF for HUF, cents for EUR per
+ * `InvoiceListItem.total_gross`'s contract). A mixed-currency list
+ * sorted by total produces operator-surprising results (a €1 EUR
+ * invoice (100 cents) sorts between 99 HUF and 101 HUF). The
+ * currency-facet filter is the affordance for resolving this:
+ * filter to a single currency, THEN sort by total. The comparator
+ * itself stays pure and currency-blind so the helper is composable
+ * with whatever facet the operator chose. Pinned by
+ * `compare_invoices_total_uses_minor_units_not_string`. */
+export function compareInvoices<R extends InvoiceSortRow>(
+  a: R,
+  b: R,
+  key: SortKey,
+  dir: SortDir,
+): number {
+  // Null-last carve-out FIRST — applied before the dir flip so the
+  // sentinel side stays at the bottom regardless of ascending /
+  // descending choice (operator's mental model: meaningful values
+  // group at top in both directions; em-dash / no-total cluster sinks).
+  const nullCmp = nullsLastCompare(a, b, key);
+  if (nullCmp !== null) {
+    // Both-null falls through to the invoice_id tiebreaker; one-side-
+    // null returns the sentinel direction directly (no dir flip).
+    if (nullCmp !== 0) return nullCmp;
+    return invoiceIdTiebreak(a, b);
+  }
+  const cmp = rawCompare(a, b, key);
+  if (cmp !== 0) return dir === "asc" ? cmp : -cmp;
+  return invoiceIdTiebreak(a, b);
+}
+
+/** PR-94 / session-114 — invoice_id tiebreaker. Ascending regardless
+ * of the user-selected sort dir. A regression that flipped the
+ * tiebreaker with dir would silently re-shuffle the operator's display
+ * on every dir toggle for tied rows (e.g., two rows with the same
+ * total + currency); pinned by
+ * `compareInvoices — ties + stability`. */
+function invoiceIdTiebreak<R extends InvoiceSortRow>(a: R, b: R): number {
+  if (a.invoice_id < b.invoice_id) return -1;
+  if (a.invoice_id > b.invoice_id) return 1;
+  return 0;
+}
+
+/** PR-94 / session-114 — null-handling carve-out. Returns:
+ *   - `null` if neither side is null on the key (delegate to
+ *     `rawCompare` for the typed compare).
+ *   - `0` if both sides are null on the key (delegate to the
+ *     invoice_id tiebreaker via the outer caller).
+ *   - `1` if `a` is null + `b` is non-null (sort a AFTER b).
+ *   - `-1` if `b` is null + `a` is non-null (sort b AFTER a).
+ *
+ * The return is dir-invariant — the outer caller does NOT apply the
+ * dir flip. This is the load-bearing fix for the "nulls cluster at
+ * the top when descending" regression that a naive flip would
+ * produce. */
+function nullsLastCompare<R extends InvoiceSortRow>(
+  a: R,
+  b: R,
+  key: SortKey,
+): number | null {
+  switch (key) {
+    case "partner": {
+      const an = normalisePartner(a.buyer_name);
+      const bn = normalisePartner(b.buyer_name);
+      if (an === null && bn === null) return 0;
+      if (an === null) return 1;
+      if (bn === null) return -1;
+      return null;
+    }
+    case "total": {
+      if (a.total_gross === null && b.total_gross === null) return 0;
+      if (a.total_gross === null) return 1;
+      if (b.total_gross === null) return -1;
+      return null;
+    }
+    default:
+      return null;
+  }
+}
+
+function rawCompare<R extends InvoiceSortRow>(
+  a: R,
+  b: R,
+  key: SortKey,
+): number {
+  switch (key) {
+    case "invoice_id":
+      // ULIDs are lex-ordered = timestamp-ordered; string compare is
+      // both correct and stable.
+      if (a.invoice_id < b.invoice_id) return -1;
+      if (a.invoice_id > b.invoice_id) return 1;
+      return 0;
+    case "invoice_number": {
+      // Natural order on the composed `YYYY-NNNNNN`: fiscal_year
+      // first, then sequence_number. Lexicographic compare on the
+      // composed string would also work because both halves are
+      // zero-padded fixed-width, but the tuple compare is the
+      // load-bearing contract (a future change to either width would
+      // silently break the string form).
+      if (a.fiscal_year !== b.fiscal_year) return a.fiscal_year - b.fiscal_year;
+      return a.sequence_number - b.sequence_number;
+    }
+    case "partner": {
+      // Locale-aware compare on the trimmed name for operator-natural
+      // ordering (Hungarian collation differs from byte-wise lex on
+      // accented chars). Nulls handled upstream by `nullsLastCompare`.
+      const an = normalisePartner(a.buyer_name);
+      const bn = normalisePartner(b.buyer_name);
+      // The non-null assertion is safe — `nullsLastCompare` already
+      // returned non-null only when BOTH sides have a normalised name.
+      return (an as string).localeCompare(bn as string);
+    }
+    case "series_number":
+      return a.sequence_number - b.sequence_number;
+    case "fiscal_year":
+      return a.fiscal_year - b.fiscal_year;
+    case "state":
+      // Lifecycle-natural index per `labels.ts::LIFECYCLE_ORDER`.
+      // Mirrors the default secondary sort the renderer already
+      // applies; lifting it into the comparator lets the operator
+      // click the State header to explicitly order by lifecycle.
+      return lifecycleIndex(a.state) - lifecycleIndex(b.state);
+    case "total": {
+      // Numeric on minor units. Nulls handled upstream.
+      return (a.total_gross as number) - (b.total_gross as number);
+    }
+  }
+}
+
+function normalisePartner(name: string | null): string | null {
+  if (name === null) return null;
+  const trimmed = name.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/** PR-94 / session-114 — quick-filter facet spec. `state === "All"`
+ * means "every state passes"; `currency === "All"` means "every
+ * currency passes". `needle` is the same substring search the PR-68
+ * `/` input drives — facets AND with the needle (every filter must
+ * accept the row for the row to render). */
+export interface InvoiceFilterSpec {
+  needle: string;
+  state: "All" | InvoiceState;
+  currency: "All" | Currency;
+}
+
+/** PR-94 / session-114 — empty filter (every facet open). The
+ * "Clear filters" button on the empty-state resets to this. */
+export const EMPTY_FILTER: InvoiceFilterSpec = {
+  needle: "",
+  state: "All",
+  currency: "All",
+};
+
+/** PR-94 / session-114 — `true` iff the spec has every facet open
+ * AND no search needle. Used by the renderer to decide whether to
+ * surface the "Clear filters" button on the empty-state. */
+export function isFilterEmpty(spec: InvoiceFilterSpec): boolean {
+  return (
+    spec.needle.trim().length === 0 &&
+    spec.state === "All" &&
+    spec.currency === "All"
+  );
+}
+
+/** PR-94 / session-114 — facet + needle filter. Composes with
+ * `filterInvoicesByNeedle` (PR-68) so the existing `/`-search
+ * behaviour is unchanged when only the needle is set; the state +
+ * currency facets AND with the needle on top.
+ *
+ * The state facet matches the row's `state` field exactly (case-
+ * sensitive — the wire shape is the closed-vocab `InvoiceState`
+ * union). The currency facet matches the row's `currency` field
+ * exactly (closed-vocab `"HUF" | "EUR"`). An "All" value on either
+ * facet short-circuits the predicate so the helper does no work
+ * when the operator hasn't engaged the facet. */
+export function filterInvoices<R extends InvoiceSortRow & InvoiceSearchRow>(
+  rows: R[],
+  spec: InvoiceFilterSpec,
+): R[] {
+  const stateGate = spec.state === "All";
+  const currencyGate = spec.currency === "All";
+  const faceted = rows.filter((r) => {
+    if (!stateGate && r.state !== spec.state) return false;
+    if (!currencyGate && r.currency !== spec.currency) return false;
+    return true;
+  });
+  return filterInvoicesByNeedle(faceted, spec.needle);
 }

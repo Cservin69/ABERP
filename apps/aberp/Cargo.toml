@@ -134,6 +134,21 @@ base64 = { workspace = true }
 tar = { workspace = true }
 zstd = { workspace = true }
 
+# PR-92 additions — SMTP email delivery per ADR-0047.
+#
+# `lettre` is the SMTP client used by `email_invoice.rs` to send the
+# rendered PDF (+ optional NAV XML) to the buyer's email. Workspace
+# pin is `default-features = false` + rustls-only — there is no
+# OpenSSL / native-tls in our dependency graph.
+lettre = { workspace = true }
+# `zeroize` is needed because the SMTP send path threads a
+# `Zeroizing<String>` password through the keychain → lettre boundary
+# (the password ends up in lettre's `Credentials::new` `String` arg,
+# but the upstream `Zeroizing` wrapper still scrubs the buffer after
+# the credentials object is dropped). Workspace already pins zeroize
+# from PR-7-A's NAV-creds path.
+zeroize = { workspace = true }
+
 [dev-dependencies]
 # Integration tests need `Actor::test_only` (rollback_conformance.rs).
 # Enabling the feature here keeps it OUT of the production [dependencies]
