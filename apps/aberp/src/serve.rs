@@ -2077,6 +2077,17 @@ struct InvoiceDetailResponse {
     /// text. Pre-PR-82 invoices return an empty array regardless of
     /// `lines` shape.
     line_notes: Vec<LineNoteView>,
+    /// PR-99 Item 5 — the three operator-meaningful invoice dates,
+    /// canonical YYYY-MM-DD. Always Some on post-PR-84 invoices (the
+    /// billing crate populates the columns at issuance time);
+    /// pre-PR-84 rows fall back to the issue date for all three so
+    /// the SPA never has to render an em-dash. The detail-modal
+    /// meta-grid renders all three with bilingual labels (Számla
+    /// kelte / Issue date — Fizetési határidő / Payment deadline —
+    /// Teljesítési dátum / Delivery date).
+    issue_date: Option<String>,
+    payment_deadline: Option<String>,
+    delivery_date: Option<String>,
 }
 
 /// PR-82 — one per-line note row on the detail wire shape. Surfaces
@@ -2490,6 +2501,22 @@ pub struct IssueInvoiceRequest {
     /// every other SPA-typed field in this struct.
     #[serde(default, rename = "emailBuyerOnIssue")]
     pub email_buyer_on_issue: Option<bool>,
+    /// PR-99 Item 4 Part B — operator's per-invoice opt-out of the
+    /// default-on auto-submit-to-NAV-on-issue. Mirrors
+    /// `email_buyer_on_issue` exactly: optional on the wire so pre-
+    /// PR-99 callers still type-check, absent → defaults to `true`
+    /// server-side at the `submit_to_nav_on_issue.unwrap_or(true)`
+    /// seam in `handle_issue_invoice`. When `true` the issuance
+    /// handler fires the same `submit_invoice_request` +
+    /// `poll_ack_request` path the manual button hits — no body
+    /// bypass; identical audit-ledger footprint (one
+    /// `InvoiceSubmissionAttempt` row, one `InvoiceSubmissionResponse`
+    /// row, one or more `InvoiceAckStatus` rows from the poll).
+    /// Failures are tolerated (the invoice remains in `Ready` /
+    /// `Submitted`) so a transient NAV outage doesn't undo the
+    /// issuance commit.
+    #[serde(default, rename = "submitToNavOnIssue")]
+    pub submit_to_nav_on_issue: Option<bool>,
 }
 
 /// Response body for `POST /invoices/issue`. The SPA reads
@@ -2958,6 +2985,10 @@ async fn handle_issue_invoice(
     // (default-on) per ADR-0047 §2 — silence-by-omission is the wrong
     // default for a buyer-comms product.
     let email_buyer_flag = request.email_buyer_on_issue.unwrap_or(true);
+    // PR-99 Item 4 Part B — same posture for auto-submit-to-NAV.
+    // Default-on so the dominant path (issue + submit + see SAVED
+    // inside the same minute) doesn't require a second operator click.
+    let submit_to_nav_flag = request.submit_to_nav_on_issue.unwrap_or(true);
     // Snapshot the customer's tax number for the post-issue lookup —
     // `request` is consumed by `issue_invoice_request`.
     let customer_tax_number_for_email = request.customer.tax_number.clone();
@@ -2994,6 +3025,45 @@ async fn handle_issue_invoice(
                     )
                     .await,
                 );
+            }
+            // PR-99 Item 4 Part B — default-on auto-submit-to-NAV. Fires
+            // the same path the manual button hits so the audit-ledger
+            // footprint is identical (one InvoiceSubmissionAttempt +
+            // one InvoiceSubmissionResponse from `submit_invoice_request`;
+            // one or more InvoiceAckStatus rows from `poll_ack_request`).
+            // Best-effort: a NAV-side failure leaves the invoice in
+            // `Ready` (submit failed) or `Submitted` (submit fine, poll
+            // failed) so the SPA's pictogram remains actionable. We log
+            // but do NOT propagate — the issuance commit is already
+            // durable and the operator can retry via the InvoiceDetail
+            // surface.
+            if submit_to_nav_flag {
+                match submit_invoice_request(&state, &summary.invoice_id).await {
+                    Ok(_) => {
+                        // Submit succeeded — kick the bounded poll loop
+                        // so the audit ledger picks up the terminal ack
+                        // (SAVED / ABORTED) before the operator's next
+                        // navigation. Same toleration posture: poll
+                        // failure stays the pictogram in Submitted; the
+                        // operator's manual re-poll affordance still
+                        // works.
+                        if let Err(e) = poll_ack_request(&state, &summary.invoice_id).await {
+                            tracing::warn!(
+                                invoice_id = %summary.invoice_id,
+                                error = ?e,
+                                "auto-poll-after-submit failed; pictogram stays actionable"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            invoice_id = %summary.invoice_id,
+                            error = ?e,
+                            "auto-submit-on-issue failed; invoice remains Ready, \
+                             operator can submit manually from InvoiceDetail"
+                        );
+                    }
+                }
             }
             Json(IssueInvoiceResponse {
                 invoice_id: summary.invoice_id,
@@ -7359,6 +7429,7 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         bank_snapshot,
         invoice_note,
         line_notes,
+        invoice_dates,
     ) = match billing {
         Some(row) => {
             // PR-82 — assemble the per-line notes view by walking
@@ -7384,6 +7455,15 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
                     })
                 })
                 .collect();
+            // PR-99 Item 5 — three dates surfaced to the detail wire.
+            // `ready_invoice.issue_date` is OffsetDateTime; the other
+            // two are `Date`. All three render as canonical YYYY-MM-DD
+            // for the SPA (the SPA's renderer reformats to the
+            // operator's locale display form).
+            let date_fmt = ::time::macros::format_description!("[year]-[month]-[day]");
+            let issue_date = row.ready_invoice.issue_date.date().format(date_fmt).ok();
+            let payment_deadline = row.ready_invoice.payment_deadline.format(date_fmt).ok();
+            let delivery_date = row.ready_invoice.delivery_date.format(date_fmt).ok();
             (
                 row.ready_invoice.sequence_number,
                 row.ready_invoice.fiscal_year,
@@ -7392,6 +7472,7 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
                 row.bank_snapshot,
                 row.invoice_note,
                 line_notes_view,
+                (issue_date, payment_deadline, delivery_date),
             )
         }
         None => (
@@ -7408,6 +7489,7 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
             None,
             None,
             Vec::new(),
+            (None, None, None),
         ),
     };
     // PR-33 / session-37 — typed wire emit of the latest NAV ack
@@ -7442,6 +7524,10 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         // preview what the buyer will see on the printed PDF.
         invoice_note,
         line_notes,
+        // PR-99 Item 5 — three dates rendered on the detail meta-grid.
+        issue_date: invoice_dates.0,
+        payment_deadline: invoice_dates.1,
+        delivery_date: invoice_dates.2,
     }))
 }
 
@@ -9195,6 +9281,9 @@ mod tests {
             bank_account: None,
             invoice_note: None,
             line_notes: Vec::new(),
+            issue_date: None,
+            payment_deadline: None,
+            delivery_date: None,
         };
         let v = serde_json::to_value(&empty).expect("InvoiceDetailResponse must always serialise");
         let arr = v
@@ -9241,6 +9330,9 @@ mod tests {
             bank_account: None,
             invoice_note: None,
             line_notes: Vec::new(),
+            issue_date: None,
+            payment_deadline: None,
+            delivery_date: None,
         };
         let v =
             serde_json::to_value(&with_chain).expect("InvoiceDetailResponse must always serialise");
@@ -9409,6 +9501,9 @@ mod tests {
             bank_account: None,
             invoice_note: None,
             line_notes: Vec::new(),
+            issue_date: None,
+            payment_deadline: None,
+            delivery_date: None,
         };
         let v = serde_json::to_value(&none).expect("InvoiceDetailResponse must always serialise");
         assert!(
@@ -9447,6 +9542,9 @@ mod tests {
                 bank_account: None,
                 invoice_note: None,
                 line_notes: Vec::new(),
+                issue_date: None,
+                payment_deadline: None,
+                delivery_date: None,
             };
             let v =
                 serde_json::to_value(&some).expect("InvoiceDetailResponse must always serialise");
@@ -9721,6 +9819,9 @@ mod tests {
             bank_account: None,
             invoice_note: None,
             line_notes: Vec::new(),
+            issue_date: None,
+            payment_deadline: None,
+            delivery_date: None,
         };
         let v = serde_json::to_value(&huf).expect("InvoiceDetailResponse must always serialise");
         assert_eq!(
@@ -9761,6 +9862,9 @@ mod tests {
             bank_account: None,
             invoice_note: None,
             line_notes: Vec::new(),
+            issue_date: None,
+            payment_deadline: None,
+            delivery_date: None,
         };
         let v = serde_json::to_value(&eur).expect("InvoiceDetailResponse must always serialise");
         assert_eq!(

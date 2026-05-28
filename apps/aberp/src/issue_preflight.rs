@@ -672,6 +672,10 @@ mod tests {
             // tenant; the issue route's `unwrap_or(true)` default
             // still applies for production callers.
             email_buyer_on_issue: Some(false),
+            // PR-99 Item 4 Part B — same opt-out posture for the
+            // auto-submit-to-NAV toggle. Preflight unit tests do not
+            // exercise the NAV submit path.
+            submit_to_nav_on_issue: Some(false),
         }
     }
 
@@ -932,6 +936,7 @@ mod tests {
             delivery_date: None,
             delivery_date_override: None,
             email_buyer_on_issue: Some(false),
+            submit_to_nav_on_issue: Some(false),
         };
         let errs = validate_invoice_preflight(&r);
 

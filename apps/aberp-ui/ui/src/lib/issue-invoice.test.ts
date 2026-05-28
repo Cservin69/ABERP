@@ -98,7 +98,38 @@ describe("composeIssueInvoiceBody", () => {
       // (silence-by-omission is the wrong default for a buyer-comms
       // product). The operator must explicitly un-check to suppress.
       emailBuyerOnIssue: true,
+      // PR-99 Item 4 Part B — default-on submit-to-NAV toggle, same
+      // mirror posture as `emailBuyerOnIssue`.
+      submitToNavOnIssue: true,
     });
+  });
+
+  // PR-99 Item 4 Part B — submit-to-NAV toggle composer pins.
+  it("emits submitToNavOnIssue=true from a default form (silence-by-omission cannot suppress)", () => {
+    const body = composeIssueInvoiceBody({
+      ...emptyForm(),
+      customerName: "C",
+      customerTaxNumber: "y",
+      customerCountryCode: "HU",
+      customerPostalCode: "1052",
+      customerCity: "Budapest",
+      customerStreet: "Test 1.",
+    });
+    expect(body.submitToNavOnIssue).toBe(true);
+  });
+
+  it("emits submitToNavOnIssue=false when the operator unchecks the toggle", () => {
+    const body = composeIssueInvoiceBody({
+      ...emptyForm(),
+      customerName: "C",
+      customerTaxNumber: "y",
+      customerCountryCode: "HU",
+      customerPostalCode: "1052",
+      customerCity: "Budapest",
+      customerStreet: "Test 1.",
+      submitToNavOnIssue: false,
+    });
+    expect(body.submitToNavOnIssue).toBe(false);
   });
 
   // PR-92 / ADR-0047 — auto-send toggle composer pins.

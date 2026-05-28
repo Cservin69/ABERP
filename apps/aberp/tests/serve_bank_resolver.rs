@@ -120,6 +120,7 @@ fn fixture_request(currency: Currency, bank_account_id: Option<String>) -> Issue
         // PR-92 — opt out of the default-on auto-send so the bank
         // resolver tests stay SMTP-free.
         email_buyer_on_issue: Some(false),
+        submit_to_nav_on_issue: Some(false),
     }
 }
 

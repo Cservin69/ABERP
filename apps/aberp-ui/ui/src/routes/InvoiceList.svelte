@@ -357,10 +357,17 @@
     busyRow = { invoiceId: row.invoice_id, action: "Submit" };
     try {
       await submitInvoice(row.invoice_id);
-      // Refresh so the row's state chip flips to Submitted (and the
-      // quick-action button set switches from Submit → PollAck which
-      // is detail-modal-only; the row's actions column thins to PDF
-      // only on the next render).
+      // PR-99 Item 3 — auto-poll once the submit returns so the row's
+      // pictogram + state chip advance to terminal (Finalized /
+      // Rejected) without forcing the operator to click the pictogram
+      // a second time. Best-effort: poll failure (network blip, 31s
+      // timeout while NAV is still on PROCESSING) leaves the row in
+      // Submitted with the pictogram actionable for a manual retry.
+      try {
+        await pollAck(row.invoice_id);
+      } catch (_pollErr) {
+        // Tolerated; pictogram stays clickable.
+      }
       await refresh();
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);

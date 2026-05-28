@@ -195,6 +195,7 @@
   import {
     filenameForInvoice,
     formatHufEquivalent,
+    formatInvoiceDate,
     formatRate,
     formatRateDate,
     formatTotal,
@@ -299,6 +300,43 @@
   // audit-ledger record.
   let lastEmailOutcome: import("../lib/api").EmailRouteOutcome | null =
     $state(null);
+
+  // PR-99 Item 4 Part A — derive the most-recent successful
+  // InvoiceEmailedSent audit entry so the action bar can swap the
+  // "Email" affordance for a "↻ Újraküldés / Re-send" button + show a
+  // "✉ Elküldve HH:MM" status. Pre-PR-99 the operator issued with the
+  // default-on email toggle, the auto-send fired (audit row written),
+  // but the detail view's action bar still showed "Email a vevőnek"
+  // as a primary affordance — implying nothing had been sent. The
+  // derived shape carries the wall-clock time of the latest send and
+  // the recipient line. Failed sends are NOT included here (operator
+  // sees them via `lastEmailOutcome` after a manual click + via the
+  // audit table); a failure does not block re-sending.
+  let lastSuccessfulEmail = $derived.by(() => {
+    if (!detail) return null;
+    // Walk in reverse (audit_entries is monotonic on seq, so the
+    // most-recent success is the last matching entry).
+    for (let i = detail.audit_entries.length - 1; i >= 0; i -= 1) {
+      const entry = detail.audit_entries[i];
+      if (entry.kind !== "InvoiceEmailedSent") continue;
+      const p = entry.payload as { outcome?: unknown; recipient?: unknown };
+      if (p && p.outcome === "succeeded" && typeof p.recipient === "string") {
+        return { occurredAt: entry.occurred_at, recipient: p.recipient };
+      }
+    }
+    return null;
+  });
+
+  function formatEmailSentTime(rfc3339: string): string {
+    // RFC3339 → "HH:MM" wall-clock in the operator's local zone.
+    // Falls back to the raw string on parse failure so we never hide
+    // the audit data behind an opaque dash.
+    const d = new Date(rfc3339);
+    if (Number.isNaN(d.getTime())) return rfc3339;
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return `${hh}:${mm}`;
+  }
 
   // PR-80 / session-102 — inline storno confirm panel. The pre-PR-80
   // posture (PR-47α) used a browser-native `window.confirm()` which
@@ -527,11 +565,23 @@
     mutationState = { kind: "submitting" };
     try {
       await submitInvoice(detail.invoice_id);
-      // Refetch so the audit-entries table picks up the new
-      // InvoiceSubmissionAttempt + InvoiceSubmissionResponse rows
-      // AND the state chip flips to `Submitted`. The fetched detail
-      // is the same shape `getInvoice` already returns — no special
-      // handling required.
+      // PR-99 Item 3 — auto-poll once the submit returns. Pre-PR-99 the
+      // operator had to click the pictogram (or the legacy Lekérés
+      // button before PR-95) AFTER the submit to advance the state from
+      // Submitted → Finalized. Without that click, NAV-side SAVED never
+      // propagated into the SPA's audit ledger, so the pictogram stayed
+      // ⌛, the Latest ack chip stayed `—`, and the action bar never
+      // grew the Storno button (which is Finalized-gated). The poll is
+      // best-effort: a poll failure (network blip, 31s timeout while
+      // NAV still on PROCESSING) leaves the invoice in Submitted with
+      // the pictogram clickable so the operator can re-poll later.
+      mutationState = { kind: "polling" };
+      try {
+        await pollAck(detail.invoice_id);
+      } catch (_pollErr) {
+        // Tolerated: the audit ledger still has the submit entries; the
+        // pictogram remains actionable for a manual retry.
+      }
       await load(detail.invoice_id);
       mutationState = { kind: "idle" };
     } catch (err: unknown) {
@@ -979,6 +1029,26 @@
                 {groupLabel.label_hu}
               </p>
               <div class="action-group-buttons">
+                {#if group.group === "Export" && lastSuccessfulEmail !== null}
+                  <!-- PR-99 Item 4 Part A — once an `InvoiceEmailedSent`
+                       succeeded audit row exists for this invoice, show
+                       the sent-status pill so the operator sees the
+                       record at a glance. The Email button below is
+                       swapped to a Re-send affordance so re-sends are
+                       still possible but the first-time-send affordance
+                       does not visually hide the fact that NAV-side
+                       state has already moved on. -->
+                  <p class="email-sent-status" data-testid="email-sent-status">
+                    <span class="action-glyph" aria-hidden="true">✉</span>
+                    <span>
+                      Elküldve {formatEmailSentTime(lastSuccessfulEmail.occurredAt)}
+                      · Sent {formatEmailSentTime(lastSuccessfulEmail.occurredAt)}
+                    </span>
+                    <code class="email-sent-recipient">
+                      {lastSuccessfulEmail.recipient}
+                    </code>
+                  </p>
+                {/if}
                 {#each group.buttons as button (button)}
                   {@const meta = detailActionMeta(button)}
                   {@const busy =
@@ -992,13 +1062,21 @@
                       ? downloadState === "downloading" || mutationBusy
                       : mutationBusy) ||
                     (button === "Storno" && stornoConfirmOpen)}
+                  {@const resend =
+                    button === "Email" && lastSuccessfulEmail !== null}
+                  {@const labelHu = resend ? "Újraküldés" : meta.label_hu}
+                  {@const labelEn = resend ? "Re-send" : meta.label_en}
+                  {@const glyph = resend ? "↻" : meta.glyph}
+                  {@const tooltip = resend
+                    ? "Újabb e-mail küldése a vevőnek (új audit-bejegyzéssel)."
+                    : meta.tooltip_hu}
                   <button
                     type="button"
                     class="action-button {busy ? 'action-button-busy' : ''}"
                     onclick={() => dispatchAction(button)}
                     disabled={disabled}
-                    aria-label={meta.label_en}
-                    title={meta.tooltip_hu}
+                    aria-label={labelEn}
+                    title={tooltip}
                     data-testid={`action-button-${button}`}
                   >
                     {#if busy}
@@ -1007,10 +1085,8 @@
                         {actionBusyLabel(button)}
                       </span>
                     {:else}
-                      <span class="action-glyph" aria-hidden="true"
-                        >{meta.glyph}</span
-                      >
-                      <span class="action-label">{meta.label_hu}</span>
+                      <span class="action-glyph" aria-hidden="true">{glyph}</span>
+                      <span class="action-label">{labelHu}</span>
                     {/if}
                   </button>
                 {/each}
@@ -1238,6 +1314,28 @@
         <dd class="mono">{detail.sequence_number}</dd>
         <dt>Fiscal year</dt>
         <dd class="mono">{detail.fiscal_year}</dd>
+        <!-- PR-99 Item 5 — the three operator-meaningful invoice
+             dates. PR-84 added the picker on the IssueInvoice form;
+             this PR surfaces all three on the detail meta-grid so the
+             operator can verify what was actually committed (the
+             server stamps the immutable issue date from its own
+             clock; payment_deadline + delivery_date land from the
+             form). Bilingual labels per ADR-0036's HU + EN
+             affordance precedent; date format matches the printed
+             PDF (YYYY. MM. DD.) so cross-referencing the document is
+             eye-friction-free. -->
+        <dt>Számla kelte / Issue date</dt>
+        <dd class="mono" data-testid="detail-issue-date">
+          {formatInvoiceDate(detail.issue_date)}
+        </dd>
+        <dt>Fizetési határidő / Payment deadline</dt>
+        <dd class="mono" data-testid="detail-payment-deadline">
+          {formatInvoiceDate(detail.payment_deadline)}
+        </dd>
+        <dt>Teljesítési dátum / Delivery date</dt>
+        <dd class="mono" data-testid="detail-delivery-date">
+          {formatInvoiceDate(detail.delivery_date)}
+        </dd>
         <dt>State</dt>
         <dd>
           <span
@@ -1799,7 +1897,31 @@
   .action-group-buttons {
     display: flex;
     flex-wrap: wrap;
+    align-items: center;
     gap: var(--space-2);
+  }
+
+  /* PR-99 Item 4 Part A — inline "Elküldve HH:MM" status pill rendered
+   * before the Re-send button inside the Export group. Operator-
+   * facing surface only; the audit log table carries the durable
+   * record. */
+  .email-sent-status {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    margin: 0 var(--space-1) 0 0;
+    padding: var(--space-1) var(--space-3);
+    background: var(--color-surface-sunken);
+    border: 1px solid var(--color-signal-positive);
+    border-radius: var(--radius-md, 6px);
+    color: var(--color-signal-positive);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+  }
+
+  .email-sent-recipient {
+    font-family: var(--type-family-mono);
+    color: var(--color-text-secondary);
   }
 
   /* PR-80 / session-102 — operator action button. Sized larger than

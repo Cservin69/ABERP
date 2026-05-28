@@ -148,12 +148,23 @@
           </label>
 
           <label class="field">
-            <span class="field__label">Legal name *</span>
+            <span class="field__label">
+              Legal name
+              {#if form.customerVatStatus !== "PrivatePerson"}
+                *
+              {/if}
+              {#if form.customerVatStatus === "PrivatePerson"}
+                <span class="field__hint">
+                  Magánszemély vevő esetén opcionális (GDPR) /
+                  optional under GDPR for natural persons
+                </span>
+              {/if}
+            </span>
             <input
               type="text"
               bind:value={form.legalName}
               autocomplete="organization"
-              required
+              required={form.customerVatStatus !== "PrivatePerson"}
               aria-invalid={fieldErrors.legal_name !== undefined}
             />
             {#if fieldErrors.legal_name !== undefined}

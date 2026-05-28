@@ -331,6 +331,13 @@ export interface InvoiceDetail {
    * + the note text. The detail modal renders this beneath the
    * global note so the operator sees "Line 1 (Widget A): ...". */
   line_notes: LineNoteView[];
+  /** PR-99 Item 5 — the three operator-meaningful invoice dates,
+   * canonical YYYY-MM-DD strings. `null` for pre-PR-84 invoices that
+   * never recorded the columns; the detail modal renders an em-dash
+   * in that case. For new-issuance invoices all three are populated. */
+  issue_date: string | null;
+  payment_deadline: string | null;
+  delivery_date: string | null;
 }
 
 /** PR-82 — one row in the detail-modal's per-line note list.
@@ -507,6 +514,17 @@ export interface IssueInvoiceRequest {
    * stays available either way. Optional on the wire; the backend
    * defaults to `true` when absent. */
   emailBuyerOnIssue?: boolean | null;
+  /** PR-99 Item 4 Part B — operator's per-invoice opt-out of the
+   * default-on auto-submit-to-NAV-on-issue. Mirrors the email toggle's
+   * semantics: bound to a default-`true` checkbox on the IssueInvoice
+   * form so silence-by-omission lands every invoice with NAV inside the
+   * same operator session that issued it. When `true` AND issuance
+   * succeeds, the backend fires the same path the manual `POST
+   * /api/invoices/:id/submit` route hits (no body bypass; identical
+   * audit-ledger footprint). When `false` the operator handles submit
+   * manually from InvoiceDetail later. Optional on the wire; absent
+   * defaults to `true`. */
+  submitToNavOnIssue?: boolean | null;
 }
 
 /** PR-92 / ADR-0047 — wire shape for the per-invoice email send

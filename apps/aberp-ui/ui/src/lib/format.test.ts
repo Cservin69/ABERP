@@ -14,6 +14,7 @@ import { describe, expect, it } from "vitest";
 import {
   filenameForInvoice,
   formatHufEquivalent,
+  formatInvoiceDate,
   formatRate,
   formatRateDate,
   formatTotal,
@@ -148,6 +149,28 @@ describe("formatRateDate", () => {
     // invoices and a non-empty string for EUR), but the
     // formatter must not crash if a future migration emits one.
     expect(formatRateDate("")).toBe("");
+  });
+});
+
+describe("formatInvoiceDate", () => {
+  // PR-99 Item 5 — Hungarian-locale display form (`YYYY. MM. DD.`)
+  // for the three invoice dates rendered on the detail meta-grid.
+  // Matches the printed-PDF formatting so the operator's eye can
+  // cross-reference the on-screen detail with the document.
+  it("formats a canonical ISO date in HU display form", () => {
+    expect(formatInvoiceDate("2026-05-22")).toBe("2026. 05. 22.");
+  });
+
+  it("renders null as the em-dash placeholder", () => {
+    expect(formatInvoiceDate(null)).toBe("—");
+  });
+
+  it("passes a malformed string through verbatim (fail loud)", () => {
+    // Defensive — a backend drift that emits a non-ISO form
+    // surfaces visibly rather than via a silent locale formatter
+    // crash. CLAUDE.md rule 12.
+    expect(formatInvoiceDate("not-a-date")).toBe("not-a-date");
+    expect(formatInvoiceDate("2026/05/22")).toBe("2026/05/22");
   });
 });
 

@@ -428,7 +428,16 @@ pub fn validate_partner_inputs(inputs: &PartnerInputs) -> Result<(), Vec<Validat
             message: "display name is required".to_string(),
         });
     }
-    if inputs.legal_name.trim().is_empty() {
+    // PR-99 Item 1 — `legal_name` is operator-optional when the partner
+    // is a `PrivatePerson`. Same GDPR posture as ADR-0048's
+    // customerName/customerAddress: a natural-person buyer must not be
+    // forced to disclose a legal-style name (companies have a legal
+    // name; natural persons may not, and recording one we never need
+    // for compliance is bad data hygiene). Domestic + Other still
+    // require it loud.
+    if inputs.customer_vat_status != CustomerVatStatus::PrivatePerson
+        && inputs.legal_name.trim().is_empty()
+    {
         errors.push(ValidationError {
             field: "legal_name",
             message: "legal name is required".to_string(),
@@ -1229,6 +1238,67 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.field == "tax_number"),
             "must flag tax_number; got {errors:?}"
+        );
+    }
+
+    // ── PR-99 Item 1 — legal_name conditional on customer_vat_status ──
+
+    #[test]
+    fn validate_partner_inputs_accepts_private_person_with_empty_legal_name() {
+        // PR-99 Item 1 — PrivatePerson buyers should be creatable
+        // WITHOUT a legal_name. Same GDPR reasoning as ADR-0048: a
+        // natural-person buyer must not be forced to disclose a
+        // legal-style name. Ervin's blocker for go-live was that
+        // creating a natural-person partner failed because the form
+        // demanded a legal name; this pin guarantees the validator
+        // accepts an empty legal_name under PrivatePerson.
+        let inputs = PartnerInputs {
+            customer_vat_status: CustomerVatStatus::PrivatePerson,
+            tax_number: None,
+            display_name: "Kovács János".to_string(),
+            legal_name: "".to_string(),
+            kind: PartnerKind::Customer,
+            ..minimal_valid_inputs()
+        };
+        assert!(
+            validate_partner_inputs(&inputs).is_ok(),
+            "PrivatePerson + empty legal_name must be accepted"
+        );
+    }
+
+    #[test]
+    fn validate_partner_inputs_accepts_private_person_with_whitespace_legal_name() {
+        // Empty-after-trim is treated the same as truly empty per the
+        // existing trim posture across the validator.
+        let inputs = PartnerInputs {
+            customer_vat_status: CustomerVatStatus::PrivatePerson,
+            tax_number: None,
+            display_name: "Kovács János".to_string(),
+            legal_name: "   ".to_string(),
+            kind: PartnerKind::Customer,
+            ..minimal_valid_inputs()
+        };
+        assert!(validate_partner_inputs(&inputs).is_ok());
+    }
+
+    #[test]
+    fn validate_partner_inputs_rejects_domestic_with_empty_legal_name() {
+        // Domestic (and Other) STILL require legal_name. The PR-99
+        // override is PrivatePerson-only; relaxing the rule for
+        // Domestic would degrade NAV-printed-invoice readability.
+        let inputs = PartnerInputs {
+            customer_vat_status: CustomerVatStatus::Domestic,
+            tax_number: Some("12345678-1-42".to_string()),
+            display_name: "BSCE".to_string(),
+            legal_name: "".to_string(),
+            kind: PartnerKind::Customer,
+            ..minimal_valid_inputs()
+        };
+        let errors =
+            validate_partner_inputs(&inputs).expect_err("Domestic + empty legal_name must reject");
+        assert!(
+            errors.iter().any(|e| e.field == "legal_name"),
+            "must flag legal_name; got {errors:?}"
         );
     }
 

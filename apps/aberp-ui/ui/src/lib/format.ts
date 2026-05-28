@@ -135,6 +135,19 @@ export function formatRateDate(date: string): string {
   return date;
 }
 
+/** PR-99 Item 5 — format an ISO-8601 `YYYY-MM-DD` date string in the
+ * Hungarian locale display form `YYYY. MM. DD.` used on the printed
+ * PDF (the operator's reference surface). A malformed input passes
+ * through verbatim so a backend drift surfaces visibly per
+ * CLAUDE.md rule 12. `null` renders as the em-dash placeholder, same
+ * posture as `formatTotal(null, _)`. */
+export function formatInvoiceDate(date: string | null): string {
+  if (date === null) return "—";
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (!match) return date;
+  return `${match[1]}. ${match[2]}. ${match[3]}.`;
+}
+
 /** PR-44ε.UI / session-58 — build the browser-side download filename
  * for the printed-invoice PDF. The Rust side emits the same shape on
  * the `Content-Disposition` header (`serve::pdf_filename_for_invoice`),

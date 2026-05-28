@@ -159,6 +159,11 @@ export function formFromIssuanceInput(
     // the field is present so the form state type-checks against
     // the shared IssueInvoiceFormState base.
     emailBuyerOnIssue: false,
+    // PR-99 Item 4 Part B — same type-compatibility shim. The
+    // modification path does NOT auto-submit; the operator handles
+    // the storno/amendment NAV submission manually via the detail
+    // surface.
+    submitToNavOnIssue: false,
   };
 }
 

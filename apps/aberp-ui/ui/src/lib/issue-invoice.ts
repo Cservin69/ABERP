@@ -60,6 +60,19 @@ export interface LineFormState {
    * `null` on the wire so the backend sees a clean "no note"
    * signal. Recipient-facing only — NEVER reaches the NAV XML. */
   note: string;
+  /** PR-100 — UI-only state that records the currency of the product
+   * the operator most-recently picked for this line. Set by
+   * `pickProduct()` in IssueInvoice.svelte; cleared when the operator
+   * picks a different product, when the form's currency changes to
+   * match (the mismatch is resolved), or when the operator dismisses
+   * the warning. `null` for one-off lines (operator typed a free-text
+   * description) and for autofills where the product's currency
+   * already matches the invoice. The composer does NOT read this
+   * field — it never reaches the wire body. Travelling on the line
+   * (rather than a sibling `Record<number, …>` on the component)
+   * keeps the per-line warning state correct across add/remove-line
+   * shuffles. */
+  productCurrencyAtPick?: Currency | null;
 }
 
 /** PR-44ζ — top-level form state. Captures every operator-typed
@@ -150,6 +163,15 @@ export interface IssueInvoiceFormState {
    * button on InvoiceDetail still works). Seeded to `true` in
    * `emptyForm` so silence-by-omission can never suppress a send. */
   emailBuyerOnIssue: boolean;
+  /** PR-99 Item 4 Part B — default-on "Submit to NAV on issue" toggle.
+   * Mirrors the email toggle's posture: `true` lets the backend fire
+   * the same `/api/invoices/:id/submit` path immediately after the
+   * issue tx commits (and then poll for the terminal ack), so the
+   * operator does not have to navigate to InvoiceDetail and click
+   * Submit a second time. `false` leaves the invoice in `Ready` so
+   * the operator can submit manually later (the typical use case is
+   * a draft the operator wants to review more before NAV sees it). */
+  submitToNavOnIssue: boolean;
 }
 
 /** PR-44ζ — sensible defaults for an empty form. The 27% VAT rate is
@@ -204,6 +226,10 @@ export function emptyForm(): IssueInvoiceFormState {
     // the wrong default for a buyer-comms product (the whole point
     // of the app is the buyer receiving the invoice).
     emailBuyerOnIssue: true,
+    // PR-99 Item 4 Part B — default-on. The dominant operator path
+    // is "issue + submit + see SAVED" inside the same minute; opting
+    // out is the rare case (drafting before NAV sees it).
+    submitToNavOnIssue: true,
   };
 }
 
@@ -224,6 +250,8 @@ export function emptyLine(): LineFormState {
     vatRatePercent: 27,
     // PR-82 — per-line note seeds blank; operator opt-in.
     note: "",
+    // PR-100 — no product picked yet on a fresh line.
+    productCurrencyAtPick: null,
   };
 }
 
@@ -601,6 +629,10 @@ export function composeIssueInvoiceBody(
     // composer regression that drops this field still produces the
     // default-on behaviour).
     emailBuyerOnIssue: form.emailBuyerOnIssue,
+    // PR-99 Item 4 Part B — mirror posture for the auto-submit-to-NAV
+    // toggle. Same default-true semantics on both ends; the backend's
+    // `submit_to_nav_on_issue.unwrap_or(true)` mirrors `email_buyer`.
+    submitToNavOnIssue: form.submitToNavOnIssue,
   };
 }
 

@@ -53,9 +53,11 @@
   import {
     issueInvoice,
     listPartners,
+    listProducts,
     listSellerBanks,
     type Currency,
     type Partner,
+    type Product,
     type SellerBankResponse,
   } from "../lib/api";
   import {
@@ -76,6 +78,8 @@
   import { daysBetween } from "../lib/invoice-dates";
   import { buyerFieldsFromPartner } from "../lib/partners";
   import { buyerComboboxState } from "../lib/buyer-combobox";
+  import { productLineComboboxState } from "../lib/product-combobox";
+  import { formatMinorToInput } from "../lib/format";
 
   interface Props {
     /** Invoked with the freshly-issued invoice id when the backend
@@ -118,6 +122,22 @@
    * list + current `form.customerName` value. */
   let buyerDropdownOpen = $state(false);
   let buyerHighlight = $state(-1); // -1 = no row highlighted
+
+  // ── PR-100 — product combobox on each line's description input ──
+  // Cache the saved-products list once on mount; the combobox filters
+  // client-side. Failure surfaces visibly via `productsLoadError`
+  // (same posture as `partnersLoadError` so the operator gets a Retry
+  // affordance instead of a "no match" hint indistinguishable from a
+  // genuine empty catalog).
+  //
+  // Only ONE line's dropdown is open at a time (the line whose
+  // description input is focused); we track that as a nullable index
+  // rather than a `Record<number, boolean>` so the close-on-blur of
+  // one line and the open-on-focus of another never race.
+  let savedProducts: Product[] = $state([]);
+  let productsLoadError: string | null = $state(null);
+  let productDropdownOpenLineIndex: number | null = $state(null);
+  let productHighlight = $state(-1);
   /** PR-50 / session-70 — when the backend's `400` body carries the
    * `missing_seller_config` discriminant, hold the typed shape so the
    * template can render the operator-actionable `config_path` +
@@ -237,6 +257,172 @@
     }),
   );
 
+  /** PR-100 — lazy load of the saved-products list on mount. Same
+   * failure-isolated posture as `loadPartners` (PR-75): on reject we
+   * surface the error visibly via `productsLoadError` instead of
+   * silently swallowing it, so the operator can distinguish "fetch
+   * failed" from "no match." The combobox falls back to free-text
+   * entry either way (the line description input is unchanged in its
+   * raw text-input behaviour). */
+  async function loadProducts() {
+    try {
+      const response = await listProducts();
+      savedProducts = response;
+      productsLoadError = null;
+    } catch (err: unknown) {
+      savedProducts = [];
+      productsLoadError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  /** PR-100 — derived combobox state PER LINE. Each line's
+   * description input has its own dropdown (the operator can be on
+   * any line); we read the needle from `form.lines[lineIndex].description`
+   * inside the template via this helper so the matches array updates
+   * reactively as the operator types. */
+  function productComboboxFor(lineIndex: number) {
+    const line = form.lines[lineIndex];
+    if (!line) {
+      return { matches: [], shouldShowDropdown: false };
+    }
+    return productLineComboboxState({
+      needle: line.description,
+      savedProducts,
+    });
+  }
+
+  /** PR-100 — operator clicked / Enter-selected a saved product row
+   * on `lineIndex`'s dropdown. Autofills `description` + `unitPriceInput`
+   * (the unit-price input is parsed at compose time per PR-88; we
+   * write the formatted major-units string the operator would have
+   * typed). Currency mismatch is captured on the line so the inline
+   * warning surfaces; the operator decides to switch the invoice
+   * currency, edit the price, or pick a different product.
+   *
+   * After autofill, the operator can still edit any field. Editing
+   * does not auto-unbind a "from product X" link — there is no such
+   * binding in v1 (the autofill is convenience, not a reference). */
+  function pickProduct(lineIndex: number, product: Product) {
+    const updatedLines = form.lines.map((line, i) => {
+      if (i !== lineIndex) return line;
+      return {
+        ...line,
+        description: product.name,
+        // PR-88 — format the minor-unit count into the operator-
+        // editable input string. Format using the PRODUCT's currency
+        // so the displayed value matches the product's saved price
+        // even when the invoice currency differs; the warning below
+        // surfaces the mismatch so the operator can't silently
+        // miscount cents-vs-forints.
+        unitPriceInput: formatMinorToInput(product.unit_price_minor, product.currency),
+        productCurrencyAtPick:
+          product.currency !== form.currency ? product.currency : null,
+      };
+    });
+    form = { ...form, lines: updatedLines };
+    productDropdownOpenLineIndex = null;
+    productHighlight = -1;
+  }
+
+  function onProductInput(lineIndex: number) {
+    productDropdownOpenLineIndex = lineIndex;
+    const matches = productComboboxFor(lineIndex).matches;
+    productHighlight = matches.length > 0 ? 0 : -1;
+  }
+
+  function onProductFocus(lineIndex: number) {
+    const view = productComboboxFor(lineIndex);
+    if (view.shouldShowDropdown) {
+      productDropdownOpenLineIndex = lineIndex;
+      if (view.matches.length > 0 && productHighlight < 0) {
+        productHighlight = 0;
+      }
+    }
+  }
+
+  function onProductBlur() {
+    // Delay close so a mousedown on a row still fires its handler
+    // before the dropdown unmounts (mirror of the buyer combobox).
+    setTimeout(() => {
+      productDropdownOpenLineIndex = null;
+    }, 150);
+  }
+
+  function onProductKeyDown(lineIndex: number, event: KeyboardEvent) {
+    const view = productComboboxFor(lineIndex);
+    const rows = view.matches.length;
+    switch (event.key) {
+      case "ArrowDown":
+        if (rows === 0) return;
+        event.preventDefault();
+        productDropdownOpenLineIndex = lineIndex;
+        productHighlight = (productHighlight + 1) % rows;
+        break;
+      case "ArrowUp":
+        if (rows === 0) return;
+        event.preventDefault();
+        productDropdownOpenLineIndex = lineIndex;
+        productHighlight = (productHighlight - 1 + rows) % rows;
+        break;
+      case "Enter":
+        if (
+          productDropdownOpenLineIndex === lineIndex &&
+          productHighlight >= 0 &&
+          productHighlight < rows
+        ) {
+          event.preventDefault();
+          pickProduct(lineIndex, view.matches[productHighlight]);
+        }
+        break;
+      case "Escape":
+        if (productDropdownOpenLineIndex === lineIndex) {
+          event.preventDefault();
+          productDropdownOpenLineIndex = null;
+          productHighlight = -1;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** PR-100 — operator dismissed the currency-mismatch chip on a line.
+   * Clears the per-line warning state without touching the autofilled
+   * price (the operator can leave the autofilled value if they intend
+   * to type it under a different currency, or edit it themselves). */
+  function dismissCurrencyMismatch(lineIndex: number) {
+    form = {
+      ...form,
+      lines: form.lines.map((line, i) =>
+        i === lineIndex ? { ...line, productCurrencyAtPick: null } : line,
+      ),
+    };
+  }
+
+  /** PR-100 — when the form's currency changes, any per-line warnings
+   * whose product currency now MATCHES the invoice currency are
+   * resolved silently. The remaining warnings stay visible so the
+   * operator still sees the mismatch on lines that didn't get fixed.
+   * Effect-driven (rather than baked into the currency select's
+   * onchange) so paths that mutate `form.currency` elsewhere — e.g.
+   * a future ADR-0037 widening — don't bypass the reconciliation. */
+  $effect(() => {
+    const invoiceCurrency = form.currency;
+    const next = form.lines.map((line) => {
+      if (
+        line.productCurrencyAtPick !== null &&
+        line.productCurrencyAtPick !== undefined &&
+        line.productCurrencyAtPick === invoiceCurrency
+      ) {
+        return { ...line, productCurrencyAtPick: null };
+      }
+      return line;
+    });
+    if (next.some((l, i) => l !== form.lines[i])) {
+      form = { ...form, lines: next };
+    }
+  });
+
   // When the currency changes, re-default the picker to that
   // currency's `is_default` entry. If no entry exists for the new
   // currency, blank the selection — the no-default-for-currency
@@ -336,6 +522,10 @@
   onMount(() => {
     void loadSellerBanks();
     void loadPartners();
+    // PR-100 — same mount-once lazy load posture as partners; the
+    // products list is operator-scale and the combobox filters
+    // client-side.
+    void loadProducts();
     window.addEventListener("keydown", handleWindowKeydown);
   });
 
@@ -765,48 +955,88 @@
           </p>
         {/if}
       </label>
-      <!-- PR-97 / ADR-0048 — three-option buyer-type radio above the
-           ADÓSZÁM input. `Domestic` is the default + dominant case
-           (preserves pre-PR-97 implicit posture); `PrivatePerson`
-           lands in v1; `Other` is rendered disabled with a v2 hint
-           per ADR-0048 §7. The radio drives the ADÓSZÁM input's
-           `disabled` + `required` flags below. -->
-      <fieldset class="buyer-vat-status">
-        <legend>Vevő típusa / Buyer type</legend>
-        <label class="vat-radio">
-          <input
-            type="radio"
-            name="customerVatStatus"
-            value="Domestic"
-            bind:group={form.customerVatStatus}
-            data-testid="customer-vat-status-domestic"
-          />
-          <span>Adóalany / Domestic business</span>
-        </label>
-        <label class="vat-radio">
-          <input
-            type="radio"
-            name="customerVatStatus"
-            value="PrivatePerson"
-            bind:group={form.customerVatStatus}
-            data-testid="customer-vat-status-private-person"
-          />
-          <span>Magánszemély / Natural person</span>
-        </label>
-        <label class="vat-radio vat-radio--disabled">
-          <input
-            type="radio"
-            name="customerVatStatus"
-            value="Other"
-            disabled
-            data-testid="customer-vat-status-other"
-          />
-          <span>
-            Külföldi / Foreign
-            <span class="vat-radio__hint">v2-ben jön / Coming in v2</span>
-          </span>
-        </label>
-      </fieldset>
+      <!-- PR-97 / ADR-0048 — three-option buyer-type radio. PR-99
+           Item 6 — the radio is HIDDEN when the operator picked a
+           saved partner; the status is DERIVED from the partner
+           record and rendered read-only as a badge so per-invoice
+           overrides cannot diverge from the partner-level
+           classification (which is locked post-issuance per PR-97).
+           For one-off buyers (no partner match — the operator typed
+           a fresh name) the radio is still active because there's no
+           partner record to derive from; the preflight rules
+           (PrivatePerson + empty tax = OK; Domestic + empty tax =
+           error) still apply. The "× Töröl / Clear" affordance on
+           the badge lets the operator drop the partner association
+           and switch back to the one-off radio path. -->
+      {#if form.customerPartnerId !== null}
+        <fieldset class="buyer-vat-status">
+          <legend>Vevő típusa / Buyer type</legend>
+          <p class="vat-derived-badge" data-testid="customer-vat-status-derived">
+            <span class="vat-derived-glyph" aria-hidden="true">●</span>
+            <span class="vat-derived-label">
+              {#if form.customerVatStatus === "Domestic"}
+                Adóalany / Domestic business
+              {:else if form.customerVatStatus === "PrivatePerson"}
+                Magánszemély / Natural person
+              {:else}
+                Külföldi / Foreign
+              {/if}
+            </span>
+            <button
+              type="button"
+              class="vat-derived-clear"
+              onclick={() => {
+                form = { ...form, customerPartnerId: null };
+              }}
+              data-testid="customer-vat-status-clear"
+              title="Partner-társítás bontása + szabad típusválasztás visszakapcsolása / Drop partner association and re-enable the radio"
+            >
+              × Töröl / Clear
+            </button>
+          </p>
+          <p class="vat-radio__hint">
+            A típus a kiválasztott partner adataiból származik. /
+            Derived from the selected partner record.
+          </p>
+        </fieldset>
+      {:else}
+        <fieldset class="buyer-vat-status">
+          <legend>Vevő típusa / Buyer type</legend>
+          <label class="vat-radio">
+            <input
+              type="radio"
+              name="customerVatStatus"
+              value="Domestic"
+              bind:group={form.customerVatStatus}
+              data-testid="customer-vat-status-domestic"
+            />
+            <span>Adóalany / Domestic business</span>
+          </label>
+          <label class="vat-radio">
+            <input
+              type="radio"
+              name="customerVatStatus"
+              value="PrivatePerson"
+              bind:group={form.customerVatStatus}
+              data-testid="customer-vat-status-private-person"
+            />
+            <span>Magánszemély / Natural person</span>
+          </label>
+          <label class="vat-radio vat-radio--disabled">
+            <input
+              type="radio"
+              name="customerVatStatus"
+              value="Other"
+              disabled
+              data-testid="customer-vat-status-other"
+            />
+            <span>
+              Külföldi / Foreign
+              <span class="vat-radio__hint">v2-ben jön / Coming in v2</span>
+            </span>
+          </label>
+        </fieldset>
+      {/if}
       <label>
         <span>
           ADÓSZÁM
@@ -1117,16 +1347,92 @@
       {/if}
       {#each form.lines as line, index (index)}
         <div class="line">
-          <label class="wide">
+          <!-- PR-100 — description input doubles as a product
+               typeahead combobox. Type to filter saved products by
+               name; click or Enter on a highlighted row to autofill
+               the description + unit price. A no-match flow-through
+               leaves the typed value as a one-off line description
+               (mirror of the PR-74 buyer combobox posture). -->
+          <label class="wide product-combobox">
             <span>Description</span>
             <input
               type="text"
               bind:value={line.description}
               required
+              role="combobox"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="Type to search saved products or enter a one-off description…"
+              oninput={() => onProductInput(index)}
+              onfocus={() => onProductFocus(index)}
+              onblur={onProductBlur}
+              onkeydown={(e) => onProductKeyDown(index, e)}
+              aria-autocomplete="list"
+              aria-expanded={productDropdownOpenLineIndex === index && productComboboxFor(index).shouldShowDropdown}
+              aria-controls={`product-combobox-listbox-${index}`}
               class:input-invalid={lineErrors[index]?.description !== undefined}
               aria-invalid={lineErrors[index]?.description !== undefined}
               data-testid={`line-${index}-description-input`}
             />
+            {#if productDropdownOpenLineIndex === index && productComboboxFor(index).shouldShowDropdown}
+              <ul
+                id={`product-combobox-listbox-${index}`}
+                class="product-dropdown"
+                role="listbox"
+                data-testid={`product-combobox-dropdown-${index}`}
+              >
+                {#if productsLoadError !== null}
+                  <li
+                    class="product-dropdown__hint"
+                    aria-live="polite"
+                    data-testid={`product-combobox-load-error-${index}`}
+                  >
+                    A termékek betöltése sikertelen: {productsLoadError}.
+                    <br />
+                    Could not load saved products. Free-text description
+                    is still available.
+                    <button
+                      type="button"
+                      class="quiet-button"
+                      onmousedown={(e) => {
+                        e.preventDefault();
+                        productsLoadError = null;
+                        void loadProducts();
+                      }}
+                      data-testid={`product-combobox-retry-${index}`}
+                    >Retry</button>
+                  </li>
+                {:else if productComboboxFor(index).matches.length === 0}
+                  <li
+                    class="product-dropdown__hint"
+                    aria-live="polite"
+                    data-testid={`product-combobox-no-match-${index}`}
+                  >
+                    Nincs találat — a beírt szöveg egyedi sorként megy. /
+                    No saved product matches — typed value will be used as a one-off description.
+                  </li>
+                {/if}
+                {#each productComboboxFor(index).matches as match, mIdx (match.id)}
+                  <li
+                    class="product-dropdown__row"
+                    role="option"
+                    aria-selected={mIdx === productHighlight}
+                    data-highlight={mIdx === productHighlight}
+                    data-testid={`product-combobox-row-${index}-${mIdx}`}
+                    onmousedown={(e) => {
+                      e.preventDefault();
+                      pickProduct(index, match);
+                    }}
+                  >
+                    <span class="product-dropdown__name">{match.name}</span>
+                    <span class="product-dropdown__meta">
+                      ({formatMinorToInput(match.unit_price_minor, match.currency)} {match.currency},
+                      {match.unit.kind === "Own" ? match.unit.value : match.unit.value.toLowerCase()})
+                    </span>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
           </label>
           <label class="narrow">
             <span>Qty</span>
@@ -1222,6 +1528,39 @@
             {/each}
           </div>
         {/if}
+        <!-- PR-100 — currency-mismatch warning. Surfaced when the
+             operator picked a product whose currency differs from the
+             invoice currency. The autofill copies the product's price
+             verbatim (no silent conversion); the operator decides
+             whether to switch the invoice currency, edit the price,
+             pick a different product, or dismiss the warning. The
+             chip clears automatically when the invoice currency
+             becomes a match (reactive via $effect). -->
+        {#if line.productCurrencyAtPick && line.productCurrencyAtPick !== form.currency}
+          <p
+            class="line-currency-mismatch"
+            role="alert"
+            data-testid={`line-${index}-currency-mismatch`}
+          >
+            <span class="inline-error-hu">
+              ⚠ A termék pénzneme {line.productCurrencyAtPick}, de a számla
+              {form.currency} pénznemű — kérjük ellenőrizze az árat.
+            </span>
+            <span class="inline-error-en">
+              Product currency is {line.productCurrencyAtPick} but the invoice
+              is in {form.currency} — please verify the price.
+            </span>
+            <button
+              type="button"
+              class="quiet-button line-currency-mismatch__dismiss"
+              onclick={() => dismissCurrencyMismatch(index)}
+              data-testid={`line-${index}-currency-mismatch-dismiss`}
+              aria-label="Dismiss currency mismatch warning"
+            >
+              × Bezár / Dismiss
+            </button>
+          </p>
+        {/if}
       {/each}
       <button type="button" class="quiet-button" onclick={addLine}>
         + Add line
@@ -1255,9 +1594,14 @@
          send (the whole point of the app is the buyer receiving the
          invoice). Operator un-checks to opt this invoice out of the
          post-issue auto-send; the manual "Email to buyer" button on
-         InvoiceDetail still works either way. -->
+         InvoiceDetail still works either way.
+         PR-99 Item 4 Part B — paired "Submit to NAV on issue" toggle
+         below uses the same posture: default-on so the dominant path
+         (issue + submit + see SAVED inside the same minute) requires
+         no second click; un-check leaves the invoice Ready for a
+         manual review-then-submit later. -->
     <fieldset>
-      <legend>Email a vevőnek / Email to buyer</legend>
+      <legend>Számla kiküldése / Post-issue actions</legend>
       <label class="email-buyer-toggle">
         <input
           type="checkbox"
@@ -1265,12 +1609,28 @@
           data-testid="email-buyer-toggle"
         />
         <span class="email-buyer-label">
-          <strong>Számla kiküldése a vevőnek / Email this invoice to the buyer</strong>
+          <strong>Email a vevőnek / Email this invoice to the buyer</strong>
           <span class="email-buyer-hint">
             Bekapcsolva: a számla kiállítása után automatikusan elküldjük
             PDF-ben a vevő e-mail címére. /
             Checked: after issuing, automatically emails the PDF to the
             buyer's contact address.
+          </span>
+        </span>
+      </label>
+      <label class="email-buyer-toggle">
+        <input
+          type="checkbox"
+          bind:checked={form.submitToNavOnIssue}
+          data-testid="submit-to-nav-toggle"
+        />
+        <span class="email-buyer-label">
+          <strong>Beküldés NAV-ra / Submit to NAV on issue</strong>
+          <span class="email-buyer-hint">
+            Bekapcsolva: a kiállítás után azonnal beküldjük a NAV
+            rendszerébe és lekérdezzük a végleges nyugtát. /
+            Checked: immediately submits to NAV after issuing and polls
+            for the terminal ack.
           </span>
         </span>
       </label>
@@ -1680,5 +2040,138 @@
     font-size: var(--type-size-xs);
     color: var(--color-text-muted);
     font-style: italic;
+  }
+
+  /* PR-99 Item 6 — derived (partner-sourced) buyer-type badge. Read-
+   * only by design: the radio is intentionally absent when a partner
+   * is selected so the operator cannot override the partner's
+   * classification on a per-invoice basis (the partner-level lock
+   * lands at PR-97). The clear-button drops the partner association
+   * so the radio re-appears for one-off buyers. */
+  .vat-derived-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin: 0;
+    padding: var(--space-1) var(--space-3);
+    background: var(--color-surface-sunken);
+    border: 1px solid var(--color-surface-divider);
+    border-left: 3px solid var(--color-signal-positive);
+    border-radius: var(--radius-md, 6px);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-primary);
+  }
+
+  .vat-derived-glyph {
+    color: var(--color-signal-positive);
+    font-size: var(--type-size-md);
+    line-height: 1;
+  }
+
+  .vat-derived-label {
+    color: var(--color-text-strong);
+    font-weight: 500;
+  }
+
+  .vat-derived-clear {
+    margin-left: var(--space-2);
+    padding: 0 var(--space-2);
+    background: transparent;
+    color: var(--color-text-muted);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: var(--radius-md, 6px);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-xs);
+    cursor: pointer;
+  }
+
+  .vat-derived-clear:hover {
+    color: var(--color-text-strong);
+    border-color: var(--color-text-muted);
+  }
+
+  /* PR-100 — product combobox dropdown styles. Mirror of the buyer
+   * combobox (above) so the operator sees the same affordance shape
+   * on both the buyer field and per-line description fields. */
+  label.product-combobox {
+    position: relative;
+  }
+
+  .product-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 10;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    max-height: 280px;
+    overflow-y: auto;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  }
+
+  .product-dropdown__row {
+    padding: var(--space-2) var(--space-3);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    border-bottom: 1px solid var(--color-surface-divider);
+  }
+
+  .product-dropdown__row:last-child {
+    border-bottom: none;
+  }
+
+  .product-dropdown__row[data-highlight="true"] {
+    background: var(--color-surface-divider);
+  }
+
+  .product-dropdown__name {
+    color: var(--color-text-strong);
+    font-size: var(--type-size-sm);
+    font-weight: 500;
+  }
+
+  .product-dropdown__meta {
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
+    font-family: var(--type-family-mono);
+  }
+
+  .product-dropdown__hint {
+    padding: var(--space-2) var(--space-3);
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
+    font-style: italic;
+  }
+
+  /* PR-100 — currency mismatch chip. Same visual weight as the
+   * inline preflight errors above but with a softer dismiss button
+   * (operator action, not a server-side error). */
+  .line-currency-mismatch {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: var(--space-1) 0 var(--space-2) var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    background: var(--color-surface-sunken);
+    border: 1px solid var(--color-signal-warning, var(--color-surface-divider));
+    border-left: 3px solid var(--color-signal-warning, var(--color-text-muted));
+    border-radius: var(--radius-md, 6px);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+  }
+
+  .line-currency-mismatch__dismiss {
+    align-self: flex-start;
+    margin-top: var(--space-1);
+    padding: 0 var(--space-2);
+    font-size: var(--type-size-xs);
   }
 </style>
