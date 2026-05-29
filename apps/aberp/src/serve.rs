@@ -351,6 +351,34 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         products::ensure_schema(&conn).context("ensure products schema at serve boot")?;
     }
 
+    // Session 152b — reconcile the audit-ledger mirror against the DB
+    // at boot. The mirror (`<db>.audit.log`) is a derivable cache, not
+    // a source of truth. If the operator nuked the DuckDB per the
+    // dev-DB-disposable rule but left the mirror in place, the mirror
+    // is now AHEAD of the fresh DB; pre-152b the first post-commit
+    // `sync_mirror` 500'd ("mirror is ahead of DB"), skipping the NAV
+    // XML write and cascading into a submit 500. Boot reconciliation
+    // truncates the ahead mirror back to the DB's max seq (and handles
+    // missing / behind / corrupt / hash-mismatch). Idempotent on a
+    // healthy state. Per-write `sync_mirror` still loud-fails on
+    // mid-process divergence — that IS a runtime bug.
+    tracing::info!("boot step: reconciling audit-ledger mirror with DB (idempotent recovery)");
+    {
+        let _s = tracing::info_span!("serve.recover_audit_mirror").entered();
+        let conn = Connection::open(&args.db).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for audit-ledger mirror recovery",
+                args.db.display()
+            )
+        })?;
+        aberp_audit_ledger::ensure_schema(&conn)
+            .context("ensure audit-ledger schema at serve boot")?;
+        let mirror_path = aberp_audit_ledger::mirror_path_for(&args.db);
+        let action = aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror_path)
+            .context("reconcile audit-ledger mirror with DB at serve boot")?;
+        tracing::info!(?action, "audit-ledger mirror reconciled at boot");
+    }
+
     // 2. Resolve / generate the loopback cert + key.
     tracing::info!("boot step: preparing serve-artifacts directory");
     let artifacts_dir = serve_artifacts_dir(&args.tenant)?;

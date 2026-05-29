@@ -412,6 +412,224 @@ pub fn sync_mirror(
     Ok(new_head_seq)
 }
 
+/// What boot-time reconciliation did to make the mirror consistent
+/// with the DB. Session 152b — the mirror is a derivable cache, not a
+/// source of truth: between processes, boot restores the invariant
+/// instead of letting the next post-commit [`sync_mirror`] 500.
+///
+/// Each variant carries the entry count so the boot log names the
+/// magnitude loudly per CLAUDE.md rule 12.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAction {
+    /// Mirror already agreed with the DB (head seqs equal, last
+    /// `entry_hash` matched). Idempotent no-op.
+    Unchanged,
+    /// Mirror file was absent; created fresh from DB entries
+    /// `[1..=db_max_seq]`.
+    Created { entries_written: u64 },
+    /// Mirror was behind the DB; replayed the missing DB entries
+    /// `[mirror_max_seq+1..=db_max_seq]`.
+    Extended { entries_added: u64 },
+    /// Mirror was ahead of the DB (the dev-DB-nuke case — operator
+    /// deleted the DuckDB but left the mirror). Truncated to the DB's
+    /// max seq by rewriting `[1..=db_max_seq]` from the DB.
+    Truncated { entries_dropped: u64 },
+    /// Mirror was the same length as the DB but its last `entry_hash`
+    /// disagreed (or the mirror file was corrupt/unparseable). Full
+    /// rebuild from the DB.
+    Rebuilt { entries_written: u64 },
+}
+
+/// Boot-time reconciliation of the mirror against the DB. Session
+/// 152b / Part A. Called once per process at serve boot AFTER
+/// [`crate::ensure_schema`] succeeds, and BEFORE any request can
+/// trigger a per-write [`sync_mirror`].
+///
+/// The DB is the source of truth; the mirror is a derivable cache.
+/// This function restores the between-process invariant
+/// "mirror == DB" without ever mutating a DB entry. The decision
+/// tree (Part B):
+///
+/// - mirror file missing → create fresh from DB → [`RecoveryAction::Created`]
+/// - mirror behind DB → replay missing entries → [`RecoveryAction::Extended`]
+/// - mirror ahead of DB → truncate to DB max seq → [`RecoveryAction::Truncated`]
+/// - equal length, last hash matches → [`RecoveryAction::Unchanged`]
+/// - equal length, last hash differs, OR mirror corrupt → full
+///   rebuild → [`RecoveryAction::Rebuilt`]
+///
+/// Idempotent: a second call on a healthy state returns
+/// [`RecoveryAction::Unchanged`].
+///
+/// # Errors
+///
+/// - `AppendError::Storage(_)` for DuckDB read failures.
+/// - `AppendError::MirrorIo(_)` for filesystem I/O failures OTHER than
+///   `NotFound` (a `NotFound` is the "missing mirror" case, handled
+///   as `Created`). A disk/permission failure is loud, not silently
+///   "recovered".
+///
+/// A `MirrorCorrupt` from the read path is NOT surfaced — it is
+/// reinterpreted as "rebuild the cache" (the whole point of treating
+/// the mirror as derivable).
+pub fn ensure_consistent_with_db(
+    conn: &Connection,
+    mirror_path: &Path,
+) -> Result<RecoveryAction, AppendError> {
+    let db_max_seq = read_db_max_seq(conn)?;
+
+    // Read the mirror. Missing → Created. Corrupt/unparseable →
+    // Rebuilt. Any other I/O error (permissions, disk) is loud.
+    let mirror_entries = match read_mirror_entries(mirror_path) {
+        Ok(entries) => entries,
+        Err(AppendError::MirrorIo(io)) if io.kind() == std::io::ErrorKind::NotFound => {
+            let written = rebuild_mirror_from_db(conn, mirror_path)?;
+            tracing::info!(
+                mirror_path = %mirror_path.display(),
+                entries_written = written,
+                db_max_seq,
+                "audit_mirror_recovered action=created (mirror file was absent)"
+            );
+            return Ok(RecoveryAction::Created {
+                entries_written: written,
+            });
+        }
+        Err(AppendError::MirrorCorrupt { reason }) => {
+            let written = rebuild_mirror_from_db(conn, mirror_path)?;
+            tracing::warn!(
+                mirror_path = %mirror_path.display(),
+                entries_written = written,
+                db_max_seq,
+                %reason,
+                "audit_mirror_recovered action=rebuilt (mirror file was corrupt)"
+            );
+            return Ok(RecoveryAction::Rebuilt {
+                entries_written: written,
+            });
+        }
+        Err(other) => return Err(other),
+    };
+
+    let mirror_max_seq = mirror_entries.last().map(|e| e.seq).unwrap_or(0);
+
+    if mirror_max_seq < db_max_seq {
+        let added = append_db_entries_after(conn, mirror_path, mirror_max_seq)?;
+        tracing::info!(
+            mirror_path = %mirror_path.display(),
+            mirror_max_seq,
+            db_max_seq,
+            entries_added = added,
+            "audit_mirror_recovered action=extended (mirror was behind DB)"
+        );
+        Ok(RecoveryAction::Extended {
+            entries_added: added,
+        })
+    } else if mirror_max_seq > db_max_seq {
+        let dropped = mirror_max_seq - db_max_seq;
+        tracing::warn!(
+            mirror_path = %mirror_path.display(),
+            mirror_max_seq,
+            db_max_seq,
+            entries_dropped = dropped,
+            "audit_mirror_recovered action=truncated (mirror was AHEAD of DB — \
+             dev-DB-nuke; mirror truncated to DB max seq)"
+        );
+        rebuild_mirror_from_db(conn, mirror_path)?;
+        Ok(RecoveryAction::Truncated {
+            entries_dropped: dropped,
+        })
+    } else if db_max_seq == 0 {
+        // Both empty (mirror file present but zero entries, DB empty).
+        Ok(RecoveryAction::Unchanged)
+    } else {
+        // Equal non-zero length: compare last entry_hash. The chain
+        // is a hash chain, so the head hash is a sound proxy for the
+        // whole prefix's integrity (Part B "equal" branch).
+        let db_head = read_db_entry_at_seq(conn, db_max_seq)?;
+        let db_hash = db_head.map(|e| hex::encode(e.entry_hash.as_bytes()));
+        let mirror_hash = mirror_entries.last().map(|e| e.entry_hash.clone());
+        if db_hash == mirror_hash {
+            Ok(RecoveryAction::Unchanged)
+        } else {
+            let written = rebuild_mirror_from_db(conn, mirror_path)?;
+            tracing::warn!(
+                mirror_path = %mirror_path.display(),
+                db_max_seq,
+                entries_written = written,
+                "audit_mirror_recovered action=rebuilt (head entry_hash disagreed with DB)"
+            );
+            Ok(RecoveryAction::Rebuilt {
+                entries_written: written,
+            })
+        }
+    }
+}
+
+/// Read the DB's max entry seq (0 if the table is empty). Reuses the
+/// storage layer's `SELECT_HEAD` projection.
+fn read_db_max_seq(conn: &Connection) -> Result<u64, AppendError> {
+    let mut stmt = conn.prepare(crate::storage::schema::SELECT_HEAD)?;
+    let mut rows = stmt.query_map([], row_to_entry_for_mirror)?;
+    match rows.next() {
+        Some(r) => Ok(r?.seq.as_u64()),
+        None => Ok(0),
+    }
+}
+
+/// Truncate the mirror and rewrite it from the DB's full entry set
+/// `[1..=db_max_seq]`. Used by the Created, Truncated, and Rebuilt
+/// recovery paths — in all three `up_to == db_max_seq`, so the full
+/// DB scan IS `[1..=db_max_seq]`. Returns the entry count written.
+fn rebuild_mirror_from_db(conn: &Connection, mirror_path: &Path) -> Result<u64, AppendError> {
+    let entries = read_db_entries_after(conn, 0)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .read(true)
+        .open(mirror_path)
+        .map_err(AppendError::MirrorIo)?;
+    file.lock_exclusive().map_err(AppendError::MirrorIo)?;
+    let mut written: u64 = 0;
+    for entry in &entries {
+        let record = MirrorEntry::from_entry(entry)?;
+        let line = encode_line(&record)?;
+        (&file).write_all(&line).map_err(AppendError::MirrorIo)?;
+        written += 1;
+    }
+    (&file).flush().map_err(AppendError::MirrorIo)?;
+    file.sync_all().map_err(AppendError::MirrorIo)?;
+    Ok(written)
+}
+
+/// Append DB entries with `seq > after_seq` to the existing mirror.
+/// The Extended recovery path. Returns the count appended.
+fn append_db_entries_after(
+    conn: &Connection,
+    mirror_path: &Path,
+    after_seq: u64,
+) -> Result<u64, AppendError> {
+    let entries = read_db_entries_after(conn, after_seq)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(mirror_path)
+        .map_err(AppendError::MirrorIo)?;
+    file.lock_exclusive().map_err(AppendError::MirrorIo)?;
+    let mut added: u64 = 0;
+    for entry in &entries {
+        let record = MirrorEntry::from_entry(entry)?;
+        let line = encode_line(&record)?;
+        (&file).write_all(&line).map_err(AppendError::MirrorIo)?;
+        added += 1;
+    }
+    if added > 0 {
+        (&file).flush().map_err(AppendError::MirrorIo)?;
+        file.sync_all().map_err(AppendError::MirrorIo)?;
+    }
+    Ok(added)
+}
+
 /// Read DB entries with `seq > after_seq`, in ascending seq order.
 /// Mirror-internal helper; mirrors `Ledger::entries` but with a
 /// seq-bound filter so the sync path doesn't load the full ledger
@@ -782,6 +1000,185 @@ mod tests {
             file_bytes.starts_with(&re_encoded),
             "encoded line must match the bytes on disk"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Session 152b — boot-time `ensure_consistent_with_db` recovery.
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn ensure_consistent_creates_empty_mirror_on_fresh_db() {
+        // Fresh DB + no mirror file → create (empty) mirror, Created{0}.
+        let dir = tempdir_under_target();
+        let mirror = dir.join("fresh.audit.log");
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let action = ensure_consistent_with_db(&conn, &mirror).unwrap();
+        assert_eq!(action, RecoveryAction::Created { entries_written: 0 });
+        assert!(mirror.exists(), "mirror file must be created");
+        assert_eq!(read_mirror_entries(&mirror).unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_consistent_creates_mirror_backfilled_from_db() {
+        // DB has entries, mirror absent → create + backfill, Created{2}.
+        let dir = tempdir_under_target();
+        let mirror = dir.join("missing.audit.log");
+        let (conn, _meta) = open_conn_with_two_entries();
+        assert!(!mirror.exists());
+
+        let action = ensure_consistent_with_db(&conn, &mirror).unwrap();
+        assert_eq!(action, RecoveryAction::Created { entries_written: 2 });
+        let entries = read_mirror_entries(&mirror).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[1].seq, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_consistent_unchanged_when_mirror_in_sync() {
+        // DB + mirror in sync → Unchanged.
+        let dir = tempdir_under_target();
+        let mirror = dir.join("insync.audit.log");
+        let (conn, meta) = open_conn_with_two_entries();
+        sync_mirror(&conn, &meta, &mirror).unwrap();
+
+        let action = ensure_consistent_with_db(&conn, &mirror).unwrap();
+        assert_eq!(action, RecoveryAction::Unchanged);
+        assert_eq!(read_mirror_entries(&mirror).unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_consistent_extends_when_mirror_behind_db() {
+        // DB ahead of mirror (mirror was synced, then DB grew) →
+        // replay missing entries, Extended{count}.
+        let dir = tempdir_under_target();
+        let mirror = dir.join("behind.audit.log");
+        let (mut conn, meta) = open_conn_with_two_entries();
+        sync_mirror(&conn, &meta, &mirror).unwrap();
+        assert_eq!(read_mirror_entries(&mirror).unwrap().len(), 2);
+
+        // DB grows to 4 while the mirror stays at 2.
+        append_one(&mut conn, &meta, "idem-3", b"payload-3");
+        append_one(&mut conn, &meta, "idem-4", b"payload-4");
+
+        let action = ensure_consistent_with_db(&conn, &mirror).unwrap();
+        assert_eq!(action, RecoveryAction::Extended { entries_added: 2 });
+        let entries = read_mirror_entries(&mirror).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[3].seq, 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_consistent_truncates_when_mirror_ahead_of_db_dev_nuke() {
+        // THE dev-DB-nuke case: operator rm'd the DuckDB but left the
+        // mirror in place. Old DB had 2 entries; mirror synced to them.
+        // A FRESH DB now holds ONE new entry → mirror is AHEAD by 1.
+        // Boot must truncate the mirror to the fresh DB's max seq and
+        // rewrite it from the FRESH chain (not the stale mirror bytes).
+        let dir = tempdir_under_target();
+        let mirror = dir.join("ahead.audit.log");
+        let (conn_old, meta_old) = open_conn_with_two_entries();
+        sync_mirror(&conn_old, &meta_old, &mirror).unwrap();
+        assert_eq!(read_mirror_entries(&mirror).unwrap().len(), 2);
+
+        let mut conn_fresh = Connection::open_in_memory().unwrap();
+        ensure_schema(&conn_fresh).unwrap();
+        let meta_fresh = mk_meta();
+        append_one(&mut conn_fresh, &meta_fresh, "fresh-1", b"fresh-payload-1");
+
+        let action = ensure_consistent_with_db(&conn_fresh, &mirror).unwrap();
+        assert_eq!(action, RecoveryAction::Truncated { entries_dropped: 1 });
+
+        let entries = read_mirror_entries(&mirror).unwrap();
+        assert_eq!(entries.len(), 1, "mirror truncated to fresh DB max seq");
+        assert_eq!(entries[0].seq, 1);
+        // The rewritten head must match the FRESH DB entry, proving the
+        // rewrite sourced the DB and not the stale mirror line.
+        let db_entry = read_db_entry_at_seq(&conn_fresh, 1).unwrap().unwrap();
+        assert_eq!(
+            entries[0].entry_hash,
+            hex::encode(db_entry.entry_hash.as_bytes())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_consistent_rebuilds_on_head_hash_mismatch() {
+        // Equal length but mirror head entry_hash disagrees → Rebuilt.
+        let dir = tempdir_under_target();
+        let mirror = dir.join("mismatch.audit.log");
+        let (conn, meta) = open_conn_with_two_entries();
+        sync_mirror(&conn, &meta, &mirror).unwrap();
+
+        let entries = read_mirror_entries(&mirror).unwrap();
+        let mut tampered = entries.clone();
+        tampered[1].entry_hash = "00".repeat(32);
+        let mut bytes = Vec::new();
+        for r in &tampered {
+            bytes.extend_from_slice(&encode_line(r).unwrap());
+        }
+        std::fs::write(&mirror, &bytes).unwrap();
+
+        let action = ensure_consistent_with_db(&conn, &mirror).unwrap();
+        assert_eq!(action, RecoveryAction::Rebuilt { entries_written: 2 });
+        let rebuilt = read_mirror_entries(&mirror).unwrap();
+        assert_eq!(rebuilt.len(), 2);
+        let db_head = read_db_entry_at_seq(&conn, 2).unwrap().unwrap();
+        assert_eq!(
+            rebuilt[1].entry_hash,
+            hex::encode(db_head.entry_hash.as_bytes()),
+            "rebuilt head must match DB head"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_consistent_rebuilds_on_corrupt_mirror() {
+        // A corrupt mirror (partial trailing line) is reinterpreted as
+        // "rebuild the cache" rather than surfaced as an error — the
+        // whole point of treating the mirror as derivable.
+        let dir = tempdir_under_target();
+        let mirror = dir.join("corrupt.audit.log");
+        let (conn, meta) = open_conn_with_two_entries();
+        sync_mirror(&conn, &meta, &mirror).unwrap();
+
+        let bytes = std::fs::read(&mirror).unwrap();
+        assert_eq!(bytes.last().copied(), Some(b'\n'));
+        std::fs::write(&mirror, &bytes[..bytes.len() - 1]).unwrap();
+
+        let action = ensure_consistent_with_db(&conn, &mirror).unwrap();
+        assert_eq!(action, RecoveryAction::Rebuilt { entries_written: 2 });
+        assert_eq!(read_mirror_entries(&mirror).unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_consistent_is_idempotent() {
+        // Run twice: first Created, second Unchanged.
+        let dir = tempdir_under_target();
+        let mirror = dir.join("idem-recover.audit.log");
+        let (conn, _meta) = open_conn_with_two_entries();
+
+        let first = ensure_consistent_with_db(&conn, &mirror).unwrap();
+        assert_eq!(first, RecoveryAction::Created { entries_written: 2 });
+        let second = ensure_consistent_with_db(&conn, &mirror).unwrap();
+        assert_eq!(second, RecoveryAction::Unchanged);
+        assert_eq!(read_mirror_entries(&mirror).unwrap().len(), 2);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
