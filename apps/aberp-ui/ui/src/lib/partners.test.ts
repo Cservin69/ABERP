@@ -167,6 +167,46 @@ describe("composePartnerInputs", () => {
       expect(body.kind).toBe(kind);
     }
   });
+
+  // Session-150 — partner master-data is LENIENT at save: a stub
+  // partner with no address SAVES successfully (all four address slots
+  // fold to null). The §169 buyer-address requirement is enforced at
+  // invoice-issuance preflight, NOT at partner save.
+  it("saves a partner with an empty address (all four slots null)", () => {
+    const body = composePartnerInputs({
+      ...emptyPartnerForm(),
+      displayName: "Stub",
+      legalName: "Stub Kft.",
+      taxNumber: "12345678-1-42",
+      addressStreet: "",
+      addressPostalCode: "  ",
+      addressCity: "",
+      addressCountry: "",
+    });
+    expect(body.address_street).toBeNull();
+    expect(body.address_postal_code).toBeNull();
+    expect(body.address_city).toBeNull();
+    expect(body.address_country).toBeNull();
+  });
+
+  // Session-150 — a partner saved WITH an address persists all four
+  // structured fields (trimmed) verbatim onto the wire body.
+  it("persists all four address fields when present", () => {
+    const body = composePartnerInputs({
+      ...emptyPartnerForm(),
+      displayName: "Vevő",
+      legalName: "Vevő Kft.",
+      taxNumber: "12345678-1-42",
+      addressStreet: "  Váci utca 19.  ",
+      addressPostalCode: " 1052 ",
+      addressCity: " Budapest ",
+      addressCountry: " HU ",
+    });
+    expect(body.address_street).toBe("Váci utca 19.");
+    expect(body.address_postal_code).toBe("1052");
+    expect(body.address_city).toBe("Budapest");
+    expect(body.address_country).toBe("HU");
+  });
 });
 
 describe("buyerFieldsFromPartner", () => {

@@ -1695,6 +1695,37 @@ mod tests {
         );
     }
 
+    /// Session-150 — the NAV WIRE-side data-minimisation for
+    /// PrivatePerson is PRESERVED: with `address: None` the emitter
+    /// omits `<customerAddress>` entirely (the `if let Some(address)`
+    /// gate in `write_customer`). The §169 buyer-address obligation is
+    /// enforced at issuance preflight + on the printed PDF, NOT by
+    /// changing this wire emit (ADR-0048 amendment 2026-05-29, Part G).
+    /// Pins that session-150 did not touch nav_xml.rs's customer emit.
+    #[test]
+    fn write_customer_omits_address_for_private_person_without_address() {
+        let c = CustomerInfo {
+            customer_vat_status: CustomerVatStatus::PrivatePerson,
+            tax_number: None,
+            name: "Teszt Magánszemély".to_string(),
+            address: None,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            write_customer(&mut w, &c).expect("write_customer");
+        }
+        let xml = String::from_utf8(buf).expect("utf8");
+        assert!(
+            !xml.contains("<customerAddress>"),
+            "PRIVATE_PERSON + no address must omit <customerAddress> on the wire, got: {xml}"
+        );
+        assert!(
+            !xml.contains("<customerVatData>"),
+            "PRIVATE_PERSON must omit <customerVatData> on the wire, got: {xml}"
+        );
+    }
+
     #[test]
     fn supplier_config_error_display_names_the_input() {
         let err = SupplierConfigError::MalformedTaxNumber {

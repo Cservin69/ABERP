@@ -156,8 +156,11 @@
    * `lineErrorFor`. Errors with an un-routable field_path fall through
    * to the general error block at the top of the form (so a
    * forward-compat variant never silently drops). */
-  let customerErrors: { name: InvoicePreflightErrorItem | null; taxNumber: InvoicePreflightErrorItem | null } =
-    $state({ name: null, taxNumber: null });
+  let customerErrors: {
+    name: InvoicePreflightErrorItem | null;
+    taxNumber: InvoicePreflightErrorItem | null;
+    address: InvoicePreflightErrorItem | null;
+  } = $state({ name: null, taxNumber: null, address: null });
   let linesContainerError: InvoicePreflightErrorItem | null = $state(null);
   let lineErrors: Record<number, Partial<Record<"description" | "quantity" | "unitPrice" | "vatRatePercent", InvoicePreflightErrorItem>>> =
     $state({});
@@ -449,7 +452,7 @@
   });
 
   function routePreflightErrors(body: InvoicePreflightErrorBody) {
-    customerErrors = { name: null, taxNumber: null };
+    customerErrors = { name: null, taxNumber: null, address: null };
     linesContainerError = null;
     lineErrors = {};
     unroutedPreflightErrors = [];
@@ -482,7 +485,7 @@
 
   function clearPreflightErrors() {
     preflightErrors = null;
-    customerErrors = { name: null, taxNumber: null };
+    customerErrors = { name: null, taxNumber: null, address: null };
     linesContainerError = null;
     lineErrors = {};
     unroutedPreflightErrors = [];
@@ -1058,19 +1061,20 @@
           </p>
         {/if}
       </label>
-      <!-- PR-77 / session-101 — customer address quartet. NAV's
-           `CUSTOMER_DATA_EXPECTED` business rule requires the full
-           address for every Hungarian-business buyer; the partner
-           combobox pre-fills these fields, but they remain editable
-           so the operator can correct typos before submitting. The
-           preflight surfaces the per-field gap (or
-           `CustomerAddressMissing` for an all-blank quartet) inline. -->
+      <!-- PR-77 / session-101 + session-150 — customer address quartet.
+           Áfa tv. §169 mandates the buyer address on the printed invoice
+           for ALL customer types (Domestic AND PrivatePerson; ADR-0048
+           amendment 2026-05-29). The partner combobox pre-fills these
+           fields, but they remain editable so the operator can correct
+           typos before submitting. The preflight surfaces an
+           all-blank/incomplete address as `CustomerAddressMissing`,
+           routed to the inline §169 chip below. -->
       <label>
         <span>Country code (ISO 3166-1)</span>
         <input
           type="text"
           bind:value={form.customerCountryCode}
-          required={form.customerVatStatus === "Domestic"}
+          required={form.customerVatStatus !== "Other"}
           placeholder="HU"
           maxlength="2"
           data-testid="customer-country-input"
@@ -1081,7 +1085,7 @@
         <input
           type="text"
           bind:value={form.customerPostalCode}
-          required={form.customerVatStatus === "Domestic"}
+          required={form.customerVatStatus !== "Other"}
           placeholder="1052"
           data-testid="customer-postal-input"
         />
@@ -1091,7 +1095,7 @@
         <input
           type="text"
           bind:value={form.customerCity}
-          required={form.customerVatStatus === "Domestic"}
+          required={form.customerVatStatus !== "Other"}
           placeholder="Budapest"
           data-testid="customer-city-input"
         />
@@ -1101,11 +1105,17 @@
         <input
           type="text"
           bind:value={form.customerStreet}
-          required={form.customerVatStatus === "Domestic"}
+          required={form.customerVatStatus !== "Other"}
           placeholder="Váci utca 19."
           data-testid="customer-street-input"
         />
       </label>
+      {#if customerErrors.address}
+        <p class="inline-error" data-testid="customer-address-error" data-kind={customerErrors.address.kind}>
+          <span class="inline-error-hu">{customerErrors.address.message_hu}</span>
+          <span class="inline-error-en">{customerErrors.address.message_en}</span>
+        </p>
+      {/if}
     </fieldset>
 
     <fieldset>

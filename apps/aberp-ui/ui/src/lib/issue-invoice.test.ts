@@ -592,6 +592,33 @@ describe("parseInvoicePreflightErrors — per-variant rendering pins", () => {
       message_en:
         "Customer ADÓSZÁM `1234` is not a valid Hungarian tax number (expected three dash-separated segments); expected `xxxxxxxx-y-zz`, e.g. `87654321-2-13`.",
     },
+    // Session-150 — §169 buyer-address gate. Previously missing from
+    // the front-end closed-vocab; a backend `CustomerAddressMissing`
+    // collapsed the whole parse to null and no chip rendered.
+    {
+      kind: "CustomerAddressMissing",
+      field_path: "customer.address",
+      message_hu:
+        "A vevő címe kötelező a számlán (Áfa tv. §169) — pótold a partner adatlapján (ország, irányítószám, város, utca).",
+      message_en:
+        "Buyer address required per §169 — fix the partner record (country, postal code, city, street).",
+    },
+    // PR-97 / ADR-0048 — reachable via the PrivatePerson / foreign-buyer
+    // paths; added to the front-end vocab alongside CustomerAddressMissing.
+    {
+      kind: "CustomerTaxNumberPresentForPrivatePerson",
+      field_path: "customer.taxNumber",
+      message_hu:
+        "Magánszemély vevőhöz nem tartozhat adószám (kapott: `12345678-2-13`).",
+      message_en:
+        "A private-person buyer must not carry a tax number (got `12345678-2-13`).",
+    },
+    {
+      kind: "CustomerVatStatusOtherNotSupportedV1",
+      field_path: "customer.vatStatus",
+      message_hu: "Külföldi (OTHER) vevő kibocsátása későbbi verzióban érkezik.",
+      message_en: "Foreign (OTHER) buyer issuance lands in a later version.",
+    },
     {
       kind: "InvoiceLinesEmpty",
       field_path: "lines",
@@ -655,6 +682,33 @@ describe("parseInvoicePreflightErrors — per-variant rendering pins", () => {
       expect(parsed!.errors[0].message_en).toBe(v.message_en);
     });
   }
+
+  // Session-150 — end-to-end: a blocked issuance whose preflight
+  // returns the §169 buyer-address error parses into the typed body,
+  // routes to the address group, and carries the §169 citation in BOTH
+  // languages so the operator-facing chip is bilingual and actionable.
+  it("surfaces the §169 buyer-address chip with a bilingual message", () => {
+    const raw = preflightBodyJson([
+      {
+        kind: "CustomerAddressMissing",
+        field_path: "customer.address",
+        message_hu:
+          "A vevő címe kötelező a számlán (Áfa tv. §169) — pótold a partner adatlapján (ország, irányítószám, város, utca).",
+        message_en:
+          "Buyer address required per §169 — fix the partner record (country, postal code, city, street).",
+      },
+    ]);
+    const parsed = parseInvoicePreflightErrors(raw);
+    expect(parsed).not.toBeNull();
+    const item = parsed!.errors[0];
+    expect(item.kind).toBe("CustomerAddressMissing");
+    expect(targetForFieldPath(item.field_path)).toEqual({
+      kind: "customer",
+      field: "address",
+    });
+    expect(item.message_hu).toContain("§169");
+    expect(item.message_en).toContain("§169");
+  });
 
   it("collects multiple errors in array order (no dedup, no reorder)", () => {
     const raw = preflightBodyJson([
@@ -745,6 +799,16 @@ describe("targetForFieldPath — closed-vocab router", () => {
     expect(targetForFieldPath("customer.taxNumber")).toEqual({
       kind: "customer",
       field: "taxNumber",
+    });
+  });
+
+  // Session-150 — the §169 buyer-address error routes to the address
+  // field group so it renders inline (bilingual) rather than dropping
+  // into the HU-only unrouted catch-all.
+  it("routes customer.address to the customer-address group", () => {
+    expect(targetForFieldPath("customer.address")).toEqual({
+      kind: "customer",
+      field: "address",
     });
   });
 

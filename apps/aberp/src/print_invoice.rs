@@ -219,7 +219,13 @@ pub fn render_to_bytes(
     };
     let customer = PartyInfo {
         name: parsed.customer_name.clone(),
-        address_lines: Vec::new(),
+        // Session-150 — buyer address from the NAV XML snapshot (Áfa tv.
+        // §169 mandates it on the printed invoice for all customer
+        // types). The on-disk NAV XML is the audit-immutable record;
+        // partner-record edits after issuance do not mutate it. Empty
+        // for pre-session-150 PrivatePerson invoices whose XML omitted
+        // `<customerAddress>` — the renderer skips empty lines.
+        address_lines: parsed.customer_address_lines.clone(),
         tax_number: parsed.customer_tax_number.clone(),
         bank_account_number: None,
         iban: None,
@@ -415,6 +421,14 @@ pub struct ParsedNavInvoice {
     pub supplier_address_lines: Vec<String>,
     pub customer_tax_number: String,
     pub customer_name: String,
+    /// Session-150 — buyer address lines parsed from `<customerAddress>`
+    /// (the four `<common:simpleAddress>` children in document order:
+    /// countryCode, postalCode, city, additionalAddressDetail). Empty
+    /// for invoices whose NAV XML carries no `<customerAddress>` block
+    /// — e.g. PrivatePerson invoices issued before session-150 made the
+    /// buyer address §169-mandatory at preflight. Mirrors
+    /// [`Self::supplier_address_lines`].
+    pub customer_address_lines: Vec<String>,
     pub lines: Vec<ParsedNavLine>,
 }
 
@@ -436,6 +450,7 @@ impl ParsedNavInvoice {
             supplier_address_lines: Vec::new(),
             customer_tax_number: String::new(),
             customer_name: String::new(),
+            customer_address_lines: Vec::new(),
             lines: Vec::new(),
         }
     }
@@ -505,6 +520,14 @@ pub fn parse_nav_invoice_xml(bytes: &[u8]) -> Result<ParsedNavInvoice> {
                         address_in = Some("supplier");
                         address_buf.clear();
                     }
+                    // Session-150 — buyer address, same simpleAddress
+                    // child shape as supplierAddress. Reuses the shared
+                    // `address_buf` (the two blocks are siblings, never
+                    // nested) cleared on entry.
+                    "customerAddress" => {
+                        address_in = Some("customer");
+                        address_buf.clear();
+                    }
                     _ => {}
                 }
             }
@@ -513,8 +536,12 @@ pub fn parse_nav_invoice_xml(bytes: &[u8]) -> Result<ParsedNavInvoice> {
                 if name == "line" && cur_line.is_some() {
                     out.lines.push(cur_line.take().unwrap());
                 }
-                if name == "supplierAddress" && address_in.is_some() {
+                if name == "supplierAddress" && address_in == Some("supplier") {
                     out.supplier_address_lines = std::mem::take(&mut address_buf);
+                    address_in = None;
+                }
+                if name == "customerAddress" && address_in == Some("customer") {
+                    out.customer_address_lines = std::mem::take(&mut address_buf);
                     address_in = None;
                 }
                 let _popped = path.pop();
@@ -1182,5 +1209,85 @@ swift_bic = "OTPVHUHB"
         );
         assert_eq!(fields.bank_name.as_deref(), Some("Revolut"));
         assert_eq!(fields.swift_bic.as_deref(), Some("REVOLT21"));
+    }
+
+    /// Session-150 — the parser extracts `<customerAddress>` into
+    /// `customer_address_lines` (the four simpleAddress children in
+    /// document order), independent of the supplier address. Pins the
+    /// PR-104 unblock: the renderer's customer party is no longer fed a
+    /// hardcoded `Vec::new()`.
+    #[test]
+    fn parses_customer_address_lines_from_nav_xml() {
+        let xml = r#"<InvoiceData xmlns:common="http://schemas.nav.gov.hu/NTCA/1.0/common">
+  <invoiceNumber>TST-2024-1</invoiceNumber>
+  <invoiceMain><invoice><invoiceHead>
+    <supplierInfo>
+      <supplierName>Eladó Kft</supplierName>
+      <supplierAddress><common:simpleAddress>
+        <common:countryCode>HU</common:countryCode>
+        <common:postalCode>1011</common:postalCode>
+        <common:city>Budapest</common:city>
+        <common:additionalAddressDetail>Fő utca 1.</common:additionalAddressDetail>
+      </common:simpleAddress></supplierAddress>
+    </supplierInfo>
+    <customerInfo>
+      <customerName>Teszt Vevő Kft</customerName>
+      <customerAddress><common:simpleAddress>
+        <common:countryCode>HU</common:countryCode>
+        <common:postalCode>1052</common:postalCode>
+        <common:city>Budapest</common:city>
+        <common:additionalAddressDetail>Váci utca 19.</common:additionalAddressDetail>
+      </common:simpleAddress></customerAddress>
+    </customerInfo>
+  </invoiceHead>
+  <invoiceLines><line><lineDescription>tétel</lineDescription></line></invoiceLines>
+  </invoice></invoiceMain>
+</InvoiceData>"#;
+        let parsed = parse_nav_invoice_xml(xml.as_bytes()).expect("parse fixture XML");
+        assert_eq!(parsed.customer_name, "Teszt Vevő Kft");
+        assert_eq!(
+            parsed.customer_address_lines,
+            vec![
+                "HU".to_string(),
+                "1052".to_string(),
+                "Budapest".to_string(),
+                "Váci utca 19.".to_string(),
+            ],
+            "buyer address lines must parse from <customerAddress>"
+        );
+        // Regression guard: the supplier address still parses
+        // independently and is not clobbered by the customer block.
+        assert_eq!(
+            parsed.supplier_address_lines,
+            vec![
+                "HU".to_string(),
+                "1011".to_string(),
+                "Budapest".to_string(),
+                "Fő utca 1.".to_string(),
+            ],
+        );
+    }
+
+    /// Session-150 — an invoice whose NAV XML carries no
+    /// `<customerAddress>` (e.g. a pre-session-150 PrivatePerson
+    /// invoice) yields empty `customer_address_lines`; the renderer
+    /// then skips the (absent) buyer-address lines rather than panicking.
+    #[test]
+    fn customer_address_lines_empty_when_block_absent() {
+        let xml = r#"<InvoiceData>
+  <invoiceNumber>TST-2024-2</invoiceNumber>
+  <invoiceMain><invoice><invoiceHead>
+    <customerInfo><customerName>Magánszemély</customerName></customerInfo>
+  </invoiceHead>
+  <invoiceLines><line><lineDescription>tétel</lineDescription></line></invoiceLines>
+  </invoice></invoiceMain>
+</InvoiceData>"#;
+        let parsed = parse_nav_invoice_xml(xml.as_bytes()).expect("parse fixture XML");
+        assert_eq!(parsed.customer_name, "Magánszemély");
+        assert!(
+            parsed.customer_address_lines.is_empty(),
+            "no <customerAddress> ⇒ empty lines, got {:?}",
+            parsed.customer_address_lines
+        );
     }
 }

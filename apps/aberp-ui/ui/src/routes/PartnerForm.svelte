@@ -262,10 +262,14 @@
             />
           </label>
 
-          <h3 class="section">Address</h3>
+          <!-- Session-150 — bilingual (HU primary) address block. All
+               four fields optional at SAVE time (the operator can stub a
+               partner); the §169 buyer-address requirement fires at
+               invoice-issuance preflight, not here. -->
+          <h3 class="section">Cím / Address</h3>
 
           <label class="field">
-            <span class="field__label">Street</span>
+            <span class="field__label">Cím / Address line</span>
             <input
               type="text"
               bind:value={form.addressStreet}
@@ -274,7 +278,7 @@
           </label>
 
           <label class="field">
-            <span class="field__label">Postal code</span>
+            <span class="field__label">Irányítószám / Postal code</span>
             <input
               type="text"
               bind:value={form.addressPostalCode}
@@ -283,7 +287,7 @@
           </label>
 
           <label class="field">
-            <span class="field__label">City</span>
+            <span class="field__label">Város / City</span>
             <input
               type="text"
               bind:value={form.addressCity}
@@ -292,7 +296,7 @@
           </label>
 
           <label class="field">
-            <span class="field__label">Country</span>
+            <span class="field__label">Ország / Country</span>
             <input
               type="text"
               bind:value={form.addressCountry}

@@ -1002,4 +1002,63 @@ mod tests {
             "buyer name must be emitted as a Tj text run; ops: {ops:?}"
         );
     }
+
+    /// Session-150 — the buyer address lines are rendered on the printed
+    /// invoice BELOW the buyer name (Áfa tv. §169 mandates the buyer
+    /// address for every customer type; ADR-0048 amendment 2026-05-29).
+    /// Pins that `write_party` emits each address line as a Tj run AND
+    /// that its baseline sits below the name's baseline.
+    #[test]
+    fn write_party_renders_buyer_address_below_name() {
+        let buyer = PartyInfo {
+            name: "Teszt Vevo Kft".to_string(),
+            address_lines: vec![
+                "HU".to_string(),
+                "1052 Budapest".to_string(),
+                "Vaci utca 19.".to_string(),
+            ],
+            tax_number: "12345678-2-13".to_string(),
+            bank_account_number: None,
+            iban: None,
+            bank_name: None,
+            swift_bic: None,
+        };
+        let mut ops: Vec<Operation> = Vec::new();
+        write_party(&mut ops, "Vevő", &buyer, 40, 600, false);
+
+        // Walk ops tracking the y from each `Td` so the y of each `Tj`
+        // run can be recovered (BT, Tf, rg, Td(x,y), Tj, ET sequence).
+        let y_of = |needle: &str| -> Option<i64> {
+            let want = text::winansi_bytes(needle);
+            let mut last_y: Option<i64> = None;
+            for op in &ops {
+                if op.operator == "Td" {
+                    if let Some(Object::Integer(y)) = op.operands.get(1) {
+                        last_y = Some(*y);
+                    }
+                } else if op.operator == "Tj" {
+                    if let Some(Object::String(bytes, _)) = op.operands.first() {
+                        if *bytes == want {
+                            return last_y;
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        let name_y = y_of("Teszt Vevo Kft").expect("buyer name must render");
+        let addr_y = y_of("1052 Budapest").expect("buyer address line must render");
+        assert!(
+            addr_y < name_y,
+            "address line (y={addr_y}) must sit below the buyer name (y={name_y})"
+        );
+        // Every address line renders.
+        for line in ["HU", "1052 Budapest", "Vaci utca 19."] {
+            assert!(
+                y_of(line).is_some(),
+                "address line {line:?} must be emitted as a Tj run"
+            );
+        }
+    }
 }

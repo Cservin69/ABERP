@@ -740,3 +740,28 @@ These are the points the v1 build PR will need explicit answers on; they are NOT
 3. **DuckDB CHECK constraint on the conditional invariant.** Confirm DuckDB tolerates `CHECK ((customer_vat_status = 'Domestic' AND tax_number IS NOT NULL) OR …)` — if not, the invariant lives only at the application layer + a runtime guard.
 4. **PartnerForm sub-radio for v2.** When `Other` ships, is the EU vs non-EU distinction a sub-radio or a free-text field with auto-classification? (Free-text + classify-on-save loses operator-visible intent; sub-radio matches the ADR-0046 closed-vocab posture.) v2 PR decides; flagged here.
 5. **Printed-PDF address for PrivatePerson.** NAV's wire rule does not require `<customerAddress>` under PRIVATE_PERSON, but Hungarian invoice law DOES require an address on the printed document. The PDF model already handles `Option<CustomerAddress>` — should the PartnerForm REQUIRE the address quartet for PrivatePerson buyers (to satisfy the print rule even though the wire rule doesn't), or leave it optional? Default recommendation: keep optional in v1, surface as a "fill in for the PDF" hint; revisit if a printed invoice ships without an address.
+
+## Amendment 2026-05-29 (Session 150) — Override 2 PDF half reverted
+
+Override 2 in the original ADR omitted name + address from the PDF for PRIVATE_PERSON
+buyers on GDPR-conservative grounds. Hungarian ÁFA Act §169 (research captured in
+Session 129 memo) mandates buyer name AND address on the printed/PDF invoice for
+ALL customer types including natural persons. GDPR Art. 6(1)(c) legal-obligation
+basis covers the collection precisely because §169 mandates it — no GDPR conflict.
+
+Decision: Override 2's PDF half is reverted. The PDF carries buyer name + address
+for all customer types. The wire-side data-minimisation (omit customerVatData for
+PRIVATE_PERSON, customerAddress per NAV XSD's existing PrivatePerson rules) is
+preserved unchanged.
+
+Session 148 made name unconditional. This session (150) makes address unconditional
+on the same legal foundation.
+
+This also closes Open question #5 (printed-PDF address for PrivatePerson): the answer
+is REQUIRE the address at issuance preflight for PrivatePerson, not merely hint for
+the PDF. The partner-form address quartet stays OPTIONAL at save time (operator may
+stub a partner); the §169 gate fires at invoice-issuance preflight
+(`issue_preflight::customer_address_complete`, fired for Domestic AND PrivatePerson)
+and the printed PDF renders the buyer address from the audit-immutable NAV XML
+snapshot. nav_xml.rs's `write_customer` is UNCHANGED — `<customerAddress>` is still
+emitted only when present, preserving the wire-side data-minimisation.

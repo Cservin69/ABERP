@@ -91,15 +91,17 @@ pub enum InvoicePreflightError {
         actual: String,
         reason: &'static str,
     },
-    /// PR-77 / session-101 — `customer.address` absent (or any of its
-    /// four sub-fields blank) when `customer.tax_number` is present
-    /// and well-formed (= business buyer; today the only branch the
-    /// pipeline supports). NAV business-rule `CUSTOMER_DATA_EXPECTED`
-    /// requires `<customerAddress>` whenever `customerVatStatus` is
-    /// non-PRIVATE_PERSON; the emitter hardcodes DOMESTIC for any
-    /// Hungarian-tax-number buyer, so a missing address is a guaranteed
-    /// NAV-side ABORTED rejection. Catching it at preflight time
-    /// prevents the sequence-burn that bit invoice 18.
+    /// PR-77 / session-101 + session-150 — `customer.address` absent
+    /// (or any of its four sub-fields blank). Fires for ALL customer
+    /// types: for Domestic it is additionally gated on a well-formed
+    /// tax number (the malformed case is a more proximate fix); for
+    /// PrivatePerson it fires unconditionally per Áfa tv. §169 (the
+    /// printed/PDF invoice mandates the buyer address for every customer
+    /// type — ADR-0048 amendment 2026-05-29 reverts the PR-97 override-2
+    /// carve-out). Originally PR-77 also prevented the NAV-side
+    /// `CUSTOMER_DATA_EXPECTED` ABORTED that burned invoice 18; that
+    /// protection is preserved for Domestic. See
+    /// [`customer_address_complete`].
     ///
     /// Surfaced as the typed-400 wire body the SPA's
     /// `parseInvoicePreflightErrors` consumes; the SPA's combobox-
@@ -274,9 +276,8 @@ impl InvoicePreflightError {
                 )
             }
             InvoicePreflightError::CustomerAddressMissing => {
-                "Az ügyfél címe kötelező (ország, irányítószám, város, utca) — \
-                 a NAV szabálya szerint cég vagy nem-magánszemély vevő esetén a teljes cím \
-                 megadása kötelező. Egészítse ki a Partnerek képernyőn az ügyfél adatait."
+                "A vevő címe kötelező a számlán (Áfa tv. §169) — pótold a partner adatlapján \
+                 (ország, irányítószám, város, utca)."
                     .to_string()
             }
             InvoicePreflightError::InvoiceLinesEmpty => {
@@ -358,10 +359,8 @@ impl InvoicePreflightError {
                 )
             }
             InvoicePreflightError::CustomerAddressMissing => {
-                "Customer address is required (country, postal code, city, street) — \
-                 NAV's `CUSTOMER_DATA_EXPECTED` business rule requires a full address \
-                 whenever the buyer is not a private individual. Enrich the partner \
-                 record on the Partners screen and retry."
+                "Buyer address required per §169 — fix the partner record \
+                 (country, postal code, city, street)."
                     .to_string()
             }
             InvoicePreflightError::InvoiceLinesEmpty => {
@@ -476,6 +475,26 @@ fn translate_reason_hu(reason: &str) -> &'static str {
     }
 }
 
+/// Session-150 — a buyer address is "complete" for invoicing iff all
+/// four structured sub-fields are non-empty after trim. Shared by the
+/// Domestic and PrivatePerson preflight arms: Áfa tv. §169 mandates the
+/// buyer address on the printed/PDF invoice for ALL customer types
+/// (PR-104 / ADR-0048 amendment 2026-05-29 reverts the PR-97 override-2
+/// carve-out). Postal code is required — NOT relaxed — because every
+/// v1-supported buyer is Hungarian (the `Other` foreign-buyer branch is
+/// named-deferred) and a HU address always carries an irányítószám;
+/// NAV's `<common:simpleAddress>` XSD also rejects an empty
+/// `<postalCode>` on the wire, so allowing it here would re-introduce
+/// the invoice-18 sequence-burn (PR-77).
+fn customer_address_complete(address: &Option<crate::issue_invoice::AddressJson>) -> bool {
+    address.as_ref().is_some_and(|a| {
+        !a.country_code.trim().is_empty()
+            && !a.postal_code.trim().is_empty()
+            && !a.city.trim().is_empty()
+            && !a.street.trim().is_empty()
+    })
+}
+
 /// PR-69 / session-91 — pure-fn pre-issuance validator per ADR-0038.
 /// Returns ALL errors in one pass so the operator can fix every issue
 /// at once instead of discovering them one-per-resubmit. Pure: no I/O,
@@ -541,16 +560,8 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
             // well-formed. The malformed-tax-number case suppresses the
             // address gate so the operator has a more proximate problem
             // to fix first.
-            if tax_number_well_formed {
-                let address_ok = request.customer.address.as_ref().is_some_and(|a| {
-                    !a.country_code.trim().is_empty()
-                        && !a.postal_code.trim().is_empty()
-                        && !a.city.trim().is_empty()
-                        && !a.street.trim().is_empty()
-                });
-                if !address_ok {
-                    errors.push(InvoicePreflightError::CustomerAddressMissing);
-                }
+            if tax_number_well_formed && !customer_address_complete(&request.customer.address) {
+                errors.push(InvoicePreflightError::CustomerAddressMissing);
             }
         }
         CustomerVatStatus::PrivatePerson => {
@@ -567,13 +578,20 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
                     },
                 );
             }
-            // PR-97 / ADR-0048 §3 open-question #5 — `<customerAddress>`
-            // is OPTIONAL under PRIVATE_PERSON at the NAV wire layer.
-            // Hungarian invoice law still requires it on the printed
-            // PDF, but the PDF render boundary (not preflight) is the
-            // surface for that rule; preflight stays quiet here so the
-            // operator can issue a PrivatePerson invoice with an
-            // address-light partner record.
+            // Session-150 — Áfa tv. §169 mandates the buyer address on
+            // the printed/PDF invoice for ALL customer types including
+            // natural persons. The PR-97 / Ervin-override-2 carve-out
+            // that let a PrivatePerson invoice issue with an
+            // address-light partner record is REVERTED (ADR-0048
+            // amendment 2026-05-29; same legal foundation as session-148
+            // for the buyer name). The NAV WIRE layer still permits
+            // address-absence under PRIVATE_PERSON — `write_customer`
+            // only emits `<customerAddress>` when present — so this
+            // preflight gate is the §169 enforcement point, not
+            // nav_xml.rs (which is unchanged).
+            if !customer_address_complete(&request.customer.address) {
+                errors.push(InvoicePreflightError::CustomerAddressMissing);
+            }
         }
         CustomerVatStatus::Other => {
             errors.push(InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1);
@@ -1225,8 +1243,9 @@ mod tests {
 
     /// PrivatePerson buyer with NO `tax_number` must NOT fire
     /// `CustomerTaxNumberMissing` — that gate is now gated on
-    /// `vat_status == Domestic`. The address gate is also suppressed
-    /// (PrivatePerson tolerates address-absent at the NAV wire layer).
+    /// `vat_status == Domestic`. (The §169 address gate DOES fire for
+    /// PrivatePerson now — session-150 — so this test keeps a full
+    /// address on the request to isolate the tax-number signal.)
     #[test]
     fn does_not_fire_customer_tax_number_missing_for_private_person() {
         let mut r = good_request();
@@ -1239,20 +1258,87 @@ mod tests {
         );
     }
 
-    /// PrivatePerson buyer with NO address must NOT fire
-    /// `CustomerAddressMissing` — NAV's wire layer permits
-    /// address-absent under PRIVATE_PERSON (the print-PDF rule lives
-    /// elsewhere per ADR-0048 §3 open-question #5).
+    /// Session-150 — PrivatePerson buyer with NO address now FIRES
+    /// `CustomerAddressMissing`. Áfa tv. §169 mandates the buyer address
+    /// on the printed/PDF invoice for ALL customer types; the PR-97 /
+    /// ADR-0048 override-2 carve-out (PrivatePerson tolerates
+    /// address-absent) is reverted on the same legal foundation as the
+    /// session-148 buyer-name rule. (Inverts the former
+    /// `does_not_fire_customer_address_missing_for_private_person`.)
     #[test]
-    fn does_not_fire_customer_address_missing_for_private_person() {
+    fn fires_customer_address_missing_for_private_person() {
         let mut r = good_request();
         r.customer.vat_status = CustomerVatStatus::PrivatePerson;
         r.customer.tax_number = "".to_string();
         r.customer.address = None;
         let errs = validate_invoice_preflight(&r);
         assert!(
-            !errs.contains(&InvoicePreflightError::CustomerAddressMissing),
-            "PrivatePerson + None address must NOT fire CustomerAddressMissing, got {errs:?}"
+            errs.contains(&InvoicePreflightError::CustomerAddressMissing),
+            "PrivatePerson + None address must fire CustomerAddressMissing (§169), got {errs:?}"
+        );
+    }
+
+    /// Session-150 — the §169 buyer-address rule fires for EVERY
+    /// customer type when the address is absent. Mirrors
+    /// `fires_customer_name_empty_for_every_customer_type`. (Other also
+    /// surfaces its v1-deferral error, but the address gate fires
+    /// regardless for Domestic and PrivatePerson; Other short-circuits
+    /// before the address check, so it is exercised in
+    /// `fires_customer_vat_status_other_not_supported_v1` instead.)
+    #[test]
+    fn fires_customer_address_missing_for_domestic_and_private_person() {
+        for (vat_status, tax) in [
+            (CustomerVatStatus::Domestic, "12345678-2-13"),
+            (CustomerVatStatus::PrivatePerson, ""),
+        ] {
+            let mut r = good_request();
+            r.customer.vat_status = vat_status;
+            r.customer.tax_number = tax.to_string();
+            r.customer.address = None;
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.contains(&InvoicePreflightError::CustomerAddressMissing),
+                "{vat_status:?} + None address must fire CustomerAddressMissing (§169), got {errs:?}"
+            );
+        }
+    }
+
+    /// Session-150 — happy path: a buyer with a complete address issues
+    /// cleanly (no `CustomerAddressMissing`) for every supported
+    /// customer type. Pins that the §169 gate does not over-fire.
+    #[test]
+    fn does_not_fire_customer_address_missing_when_address_present() {
+        for (vat_status, tax) in [
+            (CustomerVatStatus::Domestic, "12345678-2-13"),
+            (CustomerVatStatus::PrivatePerson, ""),
+        ] {
+            let mut r = good_request();
+            r.customer.vat_status = vat_status;
+            r.customer.tax_number = tax.to_string();
+            r.customer.address = Some(good_customer_address());
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                !errs.contains(&InvoicePreflightError::CustomerAddressMissing),
+                "{vat_status:?} + complete address must NOT fire CustomerAddressMissing, got {errs:?}"
+            );
+        }
+    }
+
+    /// Session-150 — the §169 address message names the statute in both
+    /// languages so the SPA's inline chip is operator-actionable.
+    /// Mirrors `customer_name_empty_message_names_section_169`.
+    #[test]
+    fn customer_address_missing_message_names_section_169() {
+        let e = InvoicePreflightError::CustomerAddressMissing;
+        assert!(
+            e.message_hu().contains("§169"),
+            "HU message must cite §169, got {}",
+            e.message_hu()
+        );
+        assert!(
+            e.message_en().contains("§169"),
+            "EN message must cite §169, got {}",
+            e.message_en()
         );
     }
 

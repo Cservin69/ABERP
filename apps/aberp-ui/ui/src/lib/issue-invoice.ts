@@ -364,6 +364,16 @@ export type InvoicePreflightErrorKind =
   | "CustomerNameEmpty"
   | "CustomerTaxNumberMissing"
   | "CustomerTaxNumberMalformed"
+  // Session-150 — §169 buyer-address gate. Was missing from the
+  // front-end closed-vocab, so a backend `CustomerAddressMissing`
+  // collapsed the entire preflight parse to `null` and the operator saw
+  // no §169 chip. Now exhaustive again per the union's invariant.
+  | "CustomerAddressMissing"
+  // PR-97 / ADR-0048 — reachable via the PrivatePerson / foreign-buyer
+  // paths the session-150 address gate now exercises. Added alongside
+  // CustomerAddressMissing to restore the documented exhaustive vocab.
+  | "CustomerTaxNumberPresentForPrivatePerson"
+  | "CustomerVatStatusOtherNotSupportedV1"
   | "InvoiceLinesEmpty"
   | "LineItemDescriptionEmpty"
   | "LineItemQuantityZero"
@@ -468,6 +478,9 @@ function isKnownPreflightKind(s: string): s is InvoicePreflightErrorKind {
     case "CustomerNameEmpty":
     case "CustomerTaxNumberMissing":
     case "CustomerTaxNumberMalformed":
+    case "CustomerAddressMissing":
+    case "CustomerTaxNumberPresentForPrivatePerson":
+    case "CustomerVatStatusOtherNotSupportedV1":
     case "InvoiceLinesEmpty":
     case "LineItemDescriptionEmpty":
     case "LineItemQuantityZero":
@@ -492,7 +505,7 @@ function isKnownPreflightKind(s: string): s is InvoicePreflightErrorKind {
  * than dropping it. Same posture as the closed-vocab kind guard
  * above. */
 export type PreflightFieldTarget =
-  | { kind: "customer"; field: "name" | "taxNumber" }
+  | { kind: "customer"; field: "name" | "taxNumber" | "address" }
   | { kind: "lines" }
   | { kind: "bankAccountId" }
   | {
@@ -509,6 +522,13 @@ export function targetForFieldPath(
   }
   if (fieldPath === "customer.taxNumber") {
     return { kind: "customer", field: "taxNumber" };
+  }
+  // Session-150 — route the §169 buyer-address error to the address
+  // field group so it renders inline (bilingual) beneath the address
+  // inputs rather than dropping into the unrouted catch-all (which
+  // shows the HU message only).
+  if (fieldPath === "customer.address") {
+    return { kind: "customer", field: "address" };
   }
   if (fieldPath === "lines") {
     return { kind: "lines" };
