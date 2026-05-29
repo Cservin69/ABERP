@@ -48,6 +48,7 @@ pub mod products;
 pub mod recover_from_nav;
 pub mod request_technical_annulment;
 pub mod retry_submission;
+pub mod secrets_cache;
 pub mod seller_banks;
 pub mod serve;
 pub mod setup_nav_credentials;

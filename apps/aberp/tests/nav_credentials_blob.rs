@@ -270,6 +270,7 @@ fn rotation_preserves_other_three_fields() {
         tenant: tenant_id,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),
         session_token: Arc::new("test-token".to_string()),
+        secrets_cache: aberp::secrets_cache::SecretsCache::empty(),
         boot_state: Arc::new(std::sync::RwLock::new(
             aberp::serve::ServeBootState::Ready {
                 operator_login: "lg-pre".to_string(),

@@ -190,6 +190,7 @@ fn build_state(wired: &WiredInvoice) -> AppState {
         // PR-46α / session-62 — Ready boot state (see
         // `serve_setup_nav_credentials_route.rs` for the
         // NeedsSetup-path coverage).
+        secrets_cache: aberp::secrets_cache::SecretsCache::empty(),
         boot_state: Arc::new(std::sync::RwLock::new(
             aberp::serve::ServeBootState::Ready {
                 operator_login: "test-operator".to_string(),

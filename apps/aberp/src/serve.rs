@@ -117,6 +117,7 @@ use crate::partners::{self, Partner, PartnerInputs, ValidationError as PartnerVa
 use crate::poll_ack;
 use crate::print_invoice;
 use crate::products::{self, Product, ProductInputs, ValidationError as ProductValidationError};
+use crate::secrets_cache::SecretsCache;
 use crate::seller_banks::{self, SellerBankEntry, SellerBanks, SellerBanksError};
 use crate::setup_nav_credentials::{self, NavCredentialInputs, SetupCredentialsError};
 use crate::setup_seller_info::{
@@ -277,6 +278,32 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         }
     };
 
+    // Session-149 — read the SMTP password into the in-process cache
+    // NOW, while we are still inside the boot keychain-read burst
+    // (session token → NAV blob → SMTP password). Doing it here means
+    // the OS sees one contiguous prompt burst on a freshly-rebuilt
+    // binary, so the operator's Always-Allow consolidates and no SMTP
+    // prompt surprises them later (e.g. opening Maintenance → Tenants).
+    // Skips the read silently if `[seller.smtp]` is absent; never
+    // hard-fails boot on a missing/locked SMTP item (see SecretsCache).
+    tracing::info!(
+        "boot step: reading SMTP password from OS keychain (may prompt for keychain access if \
+         [seller.smtp] is configured)"
+    );
+    let secrets_cache = {
+        let _s = tracing::info_span!("serve.smtp_password").entered();
+        match setup_seller_info::seller_toml_path_for_tenant(&args.tenant) {
+            Ok(path) => SecretsCache::init_at_boot(&args.tenant, &path),
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "could not resolve seller.toml path at boot — SMTP password cache left empty"
+                );
+                SecretsCache::empty()
+            }
+        }
+    };
+
     // PR-73a / hotfix — run the idempotent billing schema migrations
     // at boot so an existing pre-PR-73 tenant DB picks up the five
     // `bank_account_*` columns on `invoice` before the first
@@ -371,6 +398,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         binary_hash: binary_hash_handle,
         session_token: Arc::new(session_token.clone()),
         boot_state: Arc::new(std::sync::RwLock::new(initial_boot_state)),
+        secrets_cache,
     };
 
     // 5. Build the axum router.
@@ -793,6 +821,12 @@ pub struct AppState {
     /// the operator-login string; `NeedsSetup` means the keychain is
     /// empty and only the setup route responds to mutations.
     pub boot_state: Arc<std::sync::RwLock<ServeBootState>>,
+    /// Session-149 — in-process secrets cache populated during the boot
+    /// keychain-read burst. The SMTP password is read ONCE at boot and
+    /// served from here for every post-boot consumer (Settings GET/PUT,
+    /// email send, test connection), so the OS keychain is never read
+    /// lazily mid-session. See [`SecretsCache`].
+    pub secrets_cache: SecretsCache,
 }
 
 fn build_router(state: AppState) -> Router {
@@ -6276,8 +6310,11 @@ async fn handle_get_smtp_config(headers: HeaderMap, State(state): State<AppState
     }
     match get_smtp_config_request(&state) {
         Ok(Some(cfg)) => {
-            let password_set =
-                smtp_credentials::password_is_set(state.tenant.as_str()).unwrap_or(false);
+            // Session-149 — answer from the in-process cache populated
+            // at boot, NEVER probe the keychain here (this GET fires on
+            // every Maintenance → Tenants open; a lazy keychain read was
+            // the source of the surprise ACL prompt).
+            let password_set = state.secrets_cache.is_smtp_password_set();
             Json(SmtpConfigGetResponse {
                 host: cfg.host,
                 port: cfg.port,
@@ -6291,8 +6328,11 @@ async fn handle_get_smtp_config(headers: HeaderMap, State(state): State<AppState
             .into_response()
         }
         Ok(None) => {
-            let password_set =
-                smtp_credentials::password_is_set(state.tenant.as_str()).unwrap_or(false);
+            // Session-149 — answer from the in-process cache populated
+            // at boot, NEVER probe the keychain here (this GET fires on
+            // every Maintenance → Tenants open; a lazy keychain read was
+            // the source of the surprise ACL prompt).
+            let password_set = state.secrets_cache.is_smtp_password_set();
             Json(SmtpConfigGetEmpty {
                 configured: false,
                 password_set,
@@ -6340,8 +6380,11 @@ async fn handle_put_smtp_config(
     }
     match put_smtp_config_request(&state, wire) {
         Ok(cfg) => {
-            let password_set =
-                smtp_credentials::password_is_set(state.tenant.as_str()).unwrap_or(false);
+            // Session-149 — answer from the in-process cache populated
+            // at boot, NEVER probe the keychain here (this GET fires on
+            // every Maintenance → Tenants open; a lazy keychain read was
+            // the source of the surprise ACL prompt).
+            let password_set = state.secrets_cache.is_smtp_password_set();
             Json(SmtpConfigGetResponse {
                 host: cfg.host,
                 port: cfg.port,
@@ -6391,11 +6434,18 @@ pub fn put_smtp_config_request(
     smtp_config_mod::write_smtp_section(&path, &cfg).context("write [seller.smtp] section")?;
     if let Some(password) = wire.password {
         if !password.is_empty() {
+            // Operator-initiated WRITE — stays on the keychain (Part D).
             smtp_credentials::write_password(state.tenant.as_str(), &password).map_err(|e| {
                 SmtpConfigPutError::KeychainBackend(format!(
                     "rotate SMTP password in keychain: {e}"
                 ))
             })?;
+            // Session-149 — refresh the in-process cache so subsequent
+            // reads (email send, test connection, the passwordSet flag)
+            // see the new value WITHOUT re-reading the keychain.
+            state
+                .secrets_cache
+                .refresh_smtp_password_after_write(zeroize::Zeroizing::new(password));
         }
     }
     Ok(cfg)
@@ -6458,25 +6508,21 @@ async fn handle_test_smtp_connection(
     // Password: operator may have typed a new one (test that), or
     // left blank (test the existing keychain entry — same posture as
     // the PUT body's null-leaves-untouched semantics).
+    // Session-149 — when the operator leaves the password blank, test
+    // the existing password from the in-process cache (populated at
+    // boot / refreshed on the last PUT). NEVER re-read the keychain
+    // here — that lazy read was a source of the surprise ACL prompt.
     let password: zeroize::Zeroizing<String> = match wire.password.as_deref() {
         Some(p) if !p.is_empty() => zeroize::Zeroizing::new(p.to_string()),
-        _ => match smtp_credentials::read_password(state.tenant.as_str()) {
-            Ok(p) => p,
-            Err(smtp_credentials::SmtpCredentialsError::Missing { .. }) => {
+        _ => match state.secrets_cache.smtp_password() {
+            Some(p) => p,
+            None => {
                 let body = SmtpTestOutcome {
                     outcome: "failed",
                     error_class: Some("auth"),
                     error_detail: Some(
-                        "no password entered AND no existing keychain password set".to_string(),
+                        "no password entered AND no existing SMTP password set".to_string(),
                     ),
-                };
-                return (StatusCode::OK, Json(body)).into_response();
-            }
-            Err(other) => {
-                let body = SmtpTestOutcome {
-                    outcome: "failed",
-                    error_class: Some("other"),
-                    error_detail: Some(format!("read keychain password: {other}")),
                 };
                 return (StatusCode::OK, Json(body)).into_response();
             }
@@ -6629,23 +6675,26 @@ pub async fn send_invoice_email_route(
     let supplier_legal_name = supplier_from_seller_toml(state.tenant.as_str())
         .map(|s| s.name)
         .unwrap_or_else(|_| "ABERP".to_string());
-    // Load SMTP config + keychain password.
-    let (cfg, password) =
-        match email_invoice::load_smtp_credentials(state.tenant.as_str(), &seller_toml_path) {
-            Ok(t) => t,
-            Err(e) => {
-                return finalize_email_audit(
-                    state,
-                    invoice_id,
-                    operator_login,
-                    trigger,
-                    Err(e),
-                    recipient_email,
-                    String::new(),
-                    false,
-                );
-            }
-        };
+    // Load SMTP config (from disk) + the password from the boot-
+    // populated in-process cache (session-149 — no keychain read here).
+    let (cfg, password) = match email_invoice::load_smtp_credentials(
+        state.secrets_cache.smtp_password(),
+        &seller_toml_path,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return finalize_email_audit(
+                state,
+                invoice_id,
+                operator_login,
+                trigger,
+                Err(e),
+                recipient_email,
+                String::new(),
+                false,
+            );
+        }
+    };
     // Resolve XML attachment path iff attach_xml is on.
     let xml_path_buf = if cfg.attach_xml {
         resolve_invoice_xml_path(state, invoice_id).ok()

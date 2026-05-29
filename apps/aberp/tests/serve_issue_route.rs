@@ -69,6 +69,7 @@ fn build_state(db_path: PathBuf) -> AppState {
         // [`ServeBootState::Ready`] variant. Tests construct the
         // Ready state directly; the in-process setup-route flip path
         // is covered by `serve_setup_nav_credentials_route.rs`.
+        secrets_cache: aberp::secrets_cache::SecretsCache::empty(),
         boot_state: Arc::new(std::sync::RwLock::new(
             aberp::serve::ServeBootState::Ready {
                 operator_login: "test-operator".to_string(),

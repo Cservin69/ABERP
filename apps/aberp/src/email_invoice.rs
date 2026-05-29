@@ -23,8 +23,10 @@
 //!      sanitized to reject CR/LF — see [`validate_no_crlf`] +
 //!      [`compose_subject`] + the lettre `Address::new` parse.
 //!   5. Sends via the operator-configured SMTP server using
-//!      [`crate::smtp_config::SmtpConfig`] for non-secrets +
-//!      [`crate::smtp_credentials::read_password`] for the password.
+//!      [`crate::smtp_config::SmtpConfig`] for non-secrets + the
+//!      boot-cached SMTP password from
+//!      [`crate::secrets_cache::SecretsCache`] (session-149) for the
+//!      password.
 //!      TLS is MANDATORY — see [`build_transport`] — the function
 //!      panics rather than silently falls back to plaintext (CLAUDE.md
 //!      rule 12).
@@ -78,7 +80,6 @@ use crate::audit_payloads::InvoiceEmailedSentPayload;
 use crate::binary_hash;
 use crate::print_invoice;
 use crate::smtp_config::{self, SmtpConfig, SmtpSecurity};
-use crate::smtp_credentials;
 
 /// Typed outcome of a send attempt. Maps onto the
 /// `InvoiceEmailedSentPayload.outcome` + `error_class` audit fields
@@ -647,12 +648,21 @@ pub fn sanitize_invoice_number_for_filename(s: &str) -> String {
         .collect()
 }
 
-/// Look up the SMTP config + password for `tenant`. Combined helper
+/// Combine the non-secret SMTP config (read from `[seller.smtp]` on
+/// disk) with the `cached_password` the caller pulled from the
+/// in-process [`crate::secrets_cache::SecretsCache`]. Combined helper
 /// because both the route layer and the auto-send path always need
 /// both halves; threading them separately invites a future call site
 /// to forget one and silently degrade.
+///
+/// Session-149 — the password is NO LONGER read from the keychain
+/// here. It is sourced from the boot-populated cache and passed in by
+/// the caller, so this seam never touches `security-framework`. A
+/// `None` cached password (SMTP not configured, or the boot read found
+/// no item) maps to the typed `SmtpPasswordMissing` — same operator
+/// UX as before, minus the lazy keychain read.
 pub fn load_smtp_credentials(
-    tenant: &str,
+    cached_password: Option<Zeroizing<String>>,
     seller_toml_path: &Path,
 ) -> Result<(SmtpConfig, Zeroizing<String>), EmailSendError> {
     let cfg = match smtp_config::read_smtp_config(seller_toml_path).map_err(|e| {
@@ -669,17 +679,7 @@ pub fn load_smtp_credentials(
             )));
         }
     };
-    let password = match smtp_credentials::read_password(tenant) {
-        Ok(p) => p,
-        Err(smtp_credentials::SmtpCredentialsError::Missing { .. }) => {
-            return Err(EmailSendError::SmtpPasswordMissing);
-        }
-        Err(other) => {
-            return Err(EmailSendError::Compose(anyhow!(
-                "read SMTP password from keychain: {other}"
-            )));
-        }
-    };
+    let password = cached_password.ok_or(EmailSendError::SmtpPasswordMissing)?;
     Ok((cfg, password))
 }
 

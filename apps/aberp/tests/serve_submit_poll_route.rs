@@ -68,6 +68,7 @@ fn build_state(db_path: PathBuf) -> AppState {
         session_token: Arc::new("test-token".to_string()),
         // PR-46α / session-62 — Ready boot state. `operator_login`
         // moved inside [`ServeBootState::Ready`].
+        secrets_cache: aberp::secrets_cache::SecretsCache::empty(),
         boot_state: Arc::new(std::sync::RwLock::new(
             aberp::serve::ServeBootState::Ready {
                 operator_login: "test-operator".to_string(),

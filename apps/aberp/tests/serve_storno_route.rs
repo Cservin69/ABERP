@@ -62,6 +62,7 @@ fn build_state(db_path: PathBuf) -> AppState {
         tenant,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),
         session_token: Arc::new("test-token".to_string()),
+        secrets_cache: aberp::secrets_cache::SecretsCache::empty(),
         boot_state: Arc::new(std::sync::RwLock::new(
             aberp::serve::ServeBootState::Ready {
                 operator_login: "test-operator".to_string(),

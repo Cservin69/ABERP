@@ -178,6 +178,7 @@ fn build_state(boot_state: ServeBootState, tenant: &str) -> AppState {
         tenant: tenant_id,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),
         session_token: Arc::new("test-token".to_string()),
+        secrets_cache: aberp::secrets_cache::SecretsCache::empty(),
         boot_state: Arc::new(std::sync::RwLock::new(boot_state)),
     }
 }
