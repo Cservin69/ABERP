@@ -632,7 +632,12 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // `invoice.*` glob never sweeps it into a bundle), so this arm
         // is reached only if it ever appeared in an entry list; the
         // payload (acknowledged_at + tenant) lives in chain.jsonl.
-        | EventKind::FirstProdLaunchAcknowledged => None,
+        | EventKind::FirstProdLaunchAcknowledged
+        // S171 — system-lifecycle upgrade-snapshot mismatch (the
+        // boot-time pre-upgrade safety check detected drift in
+        // [seller.smtp] / [seller.numbering]). Also `system.`-scoped,
+        // never sweeps a per-invoice bundle; no NAV bytes.
+        | EventKind::UpgradeSnapshotMismatch => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

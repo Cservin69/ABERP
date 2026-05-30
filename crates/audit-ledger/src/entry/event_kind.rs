@@ -574,6 +574,23 @@ pub enum EventKind {
     /// real submission — a legal-grade event worth the unusual move of
     /// writing to the audit trail from a `/health` endpoint.
     FirstProdLaunchAcknowledged,
+
+    /// S171 / PR-171 — the boot-time upgrade-snapshot check (see
+    /// `apps/aberp/src/serve.rs::check_upgrade_snapshot`) detected a
+    /// delta between the operator's pre-upgrade snapshot of
+    /// `[seller.smtp]` + `[seller.numbering]` (written by
+    /// `tools/snapshot-prod.sh` into
+    /// `~/.aberp/<tenant>/.upgrade-snapshot.toml`) and the current
+    /// `seller.toml`. The check refuses to start, but appends THIS
+    /// audit entry first so the divergence is permanently recorded
+    /// in the hash chain — even if the operator resolves it by
+    /// `mv`-ing the snapshot file to `.acknowledged-*`. Payload
+    /// (`UpgradeSnapshotMismatchPayload`) carries the list of
+    /// changed field names and the tenant. Like
+    /// `FirstProdLaunchAcknowledged` this is a system-lifecycle
+    /// event, not invoice-scoped, so it carries the `system.` prefix
+    /// and never enters a per-invoice export bundle.
+    UpgradeSnapshotMismatch,
 }
 
 impl EventKind {
@@ -608,6 +625,7 @@ impl EventKind {
             EventKind::InvoicePaymentRecorded => "invoice.payment_recorded",
             EventKind::InvoiceEmailedSent => "invoice.emailed_sent",
             EventKind::FirstProdLaunchAcknowledged => "system.first_prod_launch_acknowledged",
+            EventKind::UpgradeSnapshotMismatch => "system.upgrade_snapshot_mismatch",
         }
     }
 
@@ -653,6 +671,7 @@ impl EventKind {
             "invoice.payment_recorded" => Ok(EventKind::InvoicePaymentRecorded),
             "invoice.emailed_sent" => Ok(EventKind::InvoiceEmailedSent),
             "system.first_prod_launch_acknowledged" => Ok(EventKind::FirstProdLaunchAcknowledged),
+            "system.upgrade_snapshot_mismatch" => Ok(EventKind::UpgradeSnapshotMismatch),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -694,6 +713,7 @@ mod tests {
             EventKind::InvoicePaymentRecorded,
             EventKind::InvoiceEmailedSent,
             EventKind::FirstProdLaunchAcknowledged,
+            EventKind::UpgradeSnapshotMismatch,
         ];
         for v in variants {
             let s = v.as_str();
@@ -724,6 +744,25 @@ mod tests {
             .as_str()
             .starts_with("system."));
         assert!(!EventKind::FirstProdLaunchAcknowledged
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// S171: `UpgradeSnapshotMismatch` is also system-lifecycle (the
+    /// pre-upgrade snapshot check at boot detected drift in
+    /// `[seller.smtp]` or `[seller.numbering]`); same prefix
+    /// invariant as S166 above so the per-invoice export bundle
+    /// glob never sweeps it.
+    #[test]
+    fn s171_upgrade_snapshot_mismatch_kind_uses_system_prefix() {
+        assert_eq!(
+            EventKind::UpgradeSnapshotMismatch.as_str(),
+            "system.upgrade_snapshot_mismatch"
+        );
+        assert!(EventKind::UpgradeSnapshotMismatch
+            .as_str()
+            .starts_with("system."));
+        assert!(!EventKind::UpgradeSnapshotMismatch
             .as_str()
             .starts_with("invoice."));
     }

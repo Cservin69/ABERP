@@ -2018,6 +2018,55 @@ impl FirstProdLaunchAcknowledgedPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// UpgradeSnapshotMismatch (S171)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::UpgradeSnapshotMismatch`].
+///
+/// Written at boot when the upgrade-snapshot check
+/// (`serve::check_upgrade_snapshot`) detects drift between the operator's
+/// pre-upgrade snapshot of `[seller.smtp]` + `[seller.numbering]` and the
+/// current on-disk `seller.toml`. Each delta names a single dotted field
+/// path (e.g., `"seller.smtp.host"`) plus its expected and actual values
+/// — the operator-visible bilingual error is rendered from this list.
+///
+/// The audit entry is written BEFORE the boot is refused, so the
+/// divergence is permanently hash-chained even if the operator later
+/// resolves the situation by `mv`-ing the snapshot file. `tenant` is
+/// captured verbatim from `ServeArgs.tenant`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpgradeSnapshotMismatchPayload {
+    pub tenant: String,
+    pub detected_at: String,
+    pub deltas: Vec<UpgradeSnapshotDelta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpgradeSnapshotDelta {
+    pub field: String,
+    pub expected: String,
+    pub actual: String,
+}
+
+impl UpgradeSnapshotMismatchPayload {
+    pub fn new(
+        tenant: impl Into<String>,
+        detected_at: impl Into<String>,
+        deltas: Vec<UpgradeSnapshotDelta>,
+    ) -> Self {
+        Self {
+            tenant: tenant.into(),
+            detected_at: detected_at.into(),
+            deltas,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 

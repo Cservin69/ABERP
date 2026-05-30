@@ -9,7 +9,16 @@
 #   1. The full tenant directory `~/.aberp/<tenant>/` as a gzipped tar.
 #      That's seller.toml + the DuckDB file + audit log + side-store
 #      invoice directories + the .first-launch-acknowledged touchfile.
-#   2. A password-protected zip of the per-tenant macOS keychain
+#   2. A pre-upgrade contract file at
+#      `~/.aberp/<tenant>/.upgrade-snapshot.toml` containing the
+#      `[seller.smtp]` + `[seller.numbering]` sections extracted
+#      verbatim from the current seller.toml. The next-boot of the
+#      ABERP binary (S171 / PR-171) reads this file and refuses to
+#      start if either section drifted vs the on-disk seller.toml —
+#      defense-in-depth against a future S170-class regression in
+#      any write surface that might silently drop one of these
+#      load-bearing safety sections.
+#   3. A password-protected zip of the per-tenant macOS keychain
 #      entries (NAV credentials blob + SMTP password). The operator
 #      types the encryption password interactively at zip-creation;
 #      we never write the keychain values unencrypted anywhere on
@@ -95,8 +104,63 @@ echo "${c_yel}  ABERP biztonsági mentés — bérlő=${TENANT}${c_rst}" >&2
 echo "${c_yel}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c_rst}" >&2
 echo
 
-# ---------- 1) tarball the tenant dir ---------------------------------------
-echo "${c_dim}[1/2] tarball ${TENANT_DIR} → ${SNAPSHOT_TGZ}${c_rst}" >&2
+# ---------- 1) write the .upgrade-snapshot.toml contract file ---------------
+# Drop a copy of [seller.smtp] + [seller.numbering] (extracted from the
+# current seller.toml) at ~/.aberp/<tenant>/.upgrade-snapshot.toml.
+# The next boot of the ABERP binary (S171) compares it against the
+# current seller.toml; on mismatch it loud-fails and refuses to start.
+# This is the load-bearing trust-code-not-operator guard against any
+# future regression in a seller.toml write surface.
+#
+# Done BEFORE the tarball so the tarball captures a self-consistent
+# pair: the snapshot file + the seller.toml it was extracted from.
+SELLER_TOML="${TENANT_DIR}/seller.toml"
+SNAPSHOT_CONTRACT="${TENANT_DIR}/.upgrade-snapshot.toml"
+echo "${c_dim}[1/3] writing upgrade contract → ${SNAPSHOT_CONTRACT}${c_rst}" >&2
+if [[ ! -f "$SELLER_TOML" ]]; then
+  echo "${c_yel}[skip]${c_rst} seller.toml not present at ${SELLER_TOML}" >&2
+  echo "${c_yel}[skip]${c_rst} (first-launch wizard has not run yet — boot-time check will be a no-op)" >&2
+else
+  python3 - "$SELLER_TOML" "$SNAPSHOT_CONTRACT" <<'PYEOF'
+import sys, pathlib
+src = pathlib.Path(sys.argv[1])
+dst = pathlib.Path(sys.argv[2])
+body = src.read_text(encoding='utf-8')
+keep = ('seller.smtp', 'seller.numbering')
+out_lines = [
+    '# ABERP upgrade snapshot — written by tools/snapshot-prod.sh',
+    '# Captures [seller.smtp] + [seller.numbering] for the boot-time',
+    '# S171 upgrade-snapshot check. Do NOT hand-edit. On next boot of',
+    '# the ABERP binary, these sections are compared against the live',
+    '# seller.toml; any drift refuses the boot until the operator',
+    '# either restores from the snapshot tarball or explicitly',
+    '# acknowledges the drift (see the boot error message for the',
+    '# exact `mv` command).',
+    '',
+]
+in_keep = False
+for raw in body.splitlines():
+    s = raw.strip()
+    if s.startswith('[[') and s.endswith(']]'):
+        in_keep = False
+        continue
+    if s.startswith('[') and s.endswith(']'):
+        inner = s[1:-1].strip()
+        in_keep = inner in keep
+        if in_keep:
+            out_lines.append(raw)
+        continue
+    if in_keep:
+        out_lines.append(raw)
+dst.write_text('\n'.join(out_lines) + '\n', encoding='utf-8')
+PYEOF
+  chmod 0600 "$SNAPSHOT_CONTRACT"
+  echo "${c_grn}[ ok ]${c_rst} upgrade contract written: $SNAPSHOT_CONTRACT" >&2
+  echo "${c_grn}[ ok ]${c_rst} frissítési pillanatkép kész: $SNAPSHOT_CONTRACT" >&2
+fi
+
+# ---------- 2) tarball the tenant dir ---------------------------------------
+echo "${c_dim}[2/3] tarball ${TENANT_DIR} → ${SNAPSHOT_TGZ}${c_rst}" >&2
 # Tar from the parent so the tarball expands to `<tenant>/...` on restore.
 tar -C "${HOME}/.aberp" -czf "$SNAPSHOT_TGZ" "${TENANT}"
 chmod 0600 "$SNAPSHOT_TGZ"
@@ -104,7 +168,7 @@ TGZ_SIZE="$(du -h "$SNAPSHOT_TGZ" | awk '{print $1}')"
 echo "${c_grn}[ ok ]${c_rst} tarball written ($TGZ_SIZE): $SNAPSHOT_TGZ" >&2
 echo "${c_grn}[ ok ]${c_rst} tarball kész ($TGZ_SIZE): $SNAPSHOT_TGZ" >&2
 
-# ---------- 2) keychain dump + encrypted zip --------------------------------
+# ---------- 3) keychain dump + encrypted zip --------------------------------
 # Tempfile + cleanup. NEVER print the dump contents.
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aberp-snapshot.XXXXXX")"
 trap 'shred -uz "${TMP_DIR}"/* 2>/dev/null || rm -rf "${TMP_DIR}"' EXIT
@@ -159,8 +223,8 @@ chmod 0600 "$DUMP_FILE"
 # Encrypt to zip. `zip -e` prompts for a password twice on stderr.
 # Operator types it interactively — we never see it.
 echo >&2
-echo "${c_yel}[2/2] encrypting keychain dump → ${KEYCHAIN_ZIP}${c_rst}" >&2
-echo "${c_yel}[2/2] kulcstartó-másolat titkosítása → ${KEYCHAIN_ZIP}${c_rst}" >&2
+echo "${c_yel}[3/3] encrypting keychain dump → ${KEYCHAIN_ZIP}${c_rst}" >&2
+echo "${c_yel}[3/3] kulcstartó-másolat titkosítása → ${KEYCHAIN_ZIP}${c_rst}" >&2
 echo "${c_dim}      zip will prompt for an encryption password — pick one you can remember;${c_rst}" >&2
 echo "${c_dim}      a zip jelszót fog kérni — válassz olyat, amit meg tudsz jegyezni;${c_rst}" >&2
 echo "${c_dim}      restore needs it.${c_rst}" >&2

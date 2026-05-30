@@ -758,7 +758,10 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::InvoiceEmailedSent
         // S166 — system-lifecycle first-prod-launch acknowledgement;
         // no NAV-side XML. Mirrors the bundle writer's no-bytes arm.
-        | EventKind::FirstProdLaunchAcknowledged => (None, ""),
+        | EventKind::FirstProdLaunchAcknowledged
+        // S171 — system-lifecycle upgrade-snapshot mismatch; no
+        // NAV-side XML. Mirrors the bundle writer's no-bytes arm.
+        | EventKind::UpgradeSnapshotMismatch => (None, ""),
     };
 
     Ok(NavExtraction {

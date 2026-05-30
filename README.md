@@ -1,113 +1,149 @@
 # ABERP
 
-Modular multi-tenant ERP. Rust backend, Tauri + Svelte local UI, cloud UI later.
-First production surface: NAV-compliant invoicing for a single tenant.
-First real-world user: a CNC manufacturing company (inventory, logistics, CAD/CAM).
+A small-business ERP focused on **Hungarian NAV Online Számla v3.0**
+invoicing. Rust backend, Tauri 2 + Svelte 5 desktop UI, append-only
+hash-chained audit ledger. Runs locally on the operator's own machine;
+no SaaS dependency. Single-maintainer, non-commercial, open-source.
 
-The order of operations is deliberate: foundation, then ADRs, then build. The
-spine passed its first full-spine adversarial review at the close of session 4
-(see `docs/reviews/`); the workspace scaffold — commit #1's first PR — landed
-in session 5. Further ADRs land just-in-time when their named triggers fire
-(see `adr/README.md` Deferred section).
+> **License — PolyForm Noncommercial 1.0.0.** ABERP is free for
+> non-commercial use. See [`LICENSE`](LICENSE) for the full terms. If
+> you want to use it commercially, contact the maintainer.
 
-## Layout
-
-```
-ABERP/
-  README.md           ← you are here
-  FOUNDATION.md       ← the architectural spine — every ADR must be consistent with it
-  CLAUDE.md           ← project-wide working agreement
-  LICENSE
-  Cargo.toml          ← workspace manifest, pinned deps per ADR-0021
-  Cargo.lock          ← committed pin set per ADR-0007 §Supply chain
-  rust-toolchain.toml ← Rust 1.85.0 (MSRV floor) per ADR-0021
-  adr/
-    README.md         ← ADR index, numbering, status lifecycle, review cadence
-    0001-*.md ... 0021-*.md
-  docs/
-    threat-model.md
-    id-prefixes.md
-    research/         ← raw research notes (NAV/Billingo, stack baseline)
-    reviews/          ← adversarial review records
-  crates/
-    audit-ledger/     ← tamper-evident audit ledger (ADR-0008)
-    nav-transport/    ← NAV TLS transport + credentials (ADR-0009 §4, ADR-0020)
-    nav-xsd-validator/← <InvoiceData> v3.0 runtime invariant check (ADR-0022)
-  modules/
-    billing/          ← NAV invoice issuing (ADR-0009)
-  apps/
-    aberp/            ← the CLI binary
-    aberp-ui/         ← Tauri 2 + Svelte 5 operator UI shell (ADR-0004)
-```
-
-## Reading order
-
-1. `FOUNDATION.md` — the spine. Read this first.
-2. `adr/README.md` — how ADRs work in this project.
-3. The numbered ADRs — read in order; later ADRs assume earlier ones.
-
-## Working principles (non-negotiable)
-
-These come from the project's working agreement and apply to every change:
-
-- **Think before coding.** State assumptions; don't guess.
-- **Simplicity first.** Minimum code, no speculative abstractions.
-- **Surgical changes.** Touch only what the task requires.
-- **Goal-driven.** Define success criteria up front, loop until verified.
-- **Use the model for judgment, not for routing or deterministic transforms.**
-- **Surface conflicts, don't average them.** Two patterns? Pick one explicitly.
-- **Read before you write.** No duplicate functions next to identical ones.
-- **Tests verify intent, not just behavior.** A test that can't fail when business logic changes is wrong.
-- **Match codebase conventions.** Don't fork patterns silently.
-- **Fail loud.** "Completed successfully" with 14% silently skipped is the worst class of bug.
+> **Hungarian invoicing law is the operator's responsibility.** ABERP
+> submits to NAV per the v3.0 spec, but the operator is the legally
+> responsible party for the content of their invoices. ABERP is a tool;
+> compliance is yours.
 
 ## Status
 
-Build phase. Workspace scaffold landed in session 5; the supply-chain CI,
-audit-ledger crate, billing module, and the NAV-XML-on-disk binary (commit
-#1's success criterion) land across the rest of session 5's PRs. See
-`adr/README.md` for the design ledger and `git log` for landed commits.
+Pre-release pilot. The first production cutover is imminent (PROD_v1.x).
+Real money flows through the pilot; the test path is the default for any
+build that does not pass `--features production`.
 
-## Production cutover & releases
+## Prerequisites
 
-Dev work happens on `main`. Each production release is a branch on
-origin named `PROD_vMAJOR.MINOR` (uppercase, underscore) — the operator
-clones from that branch on the prod machine and builds locally.
+- **Rust toolchain** — stable channel (currently 1.88+). `rust-toolchain.toml`
+  pins the channel, so `rustup` resolves the right version on first build.
+- **Node.js 20+** with **npm** — package-lock.json is the lockfile; do
+  not switch to pnpm/yarn without converting it.
+- **macOS** — shipped binaries target macOS only at this stage. Linux
+  and Windows are not currently supported (the Tauri shell and the
+  keychain integration would need per-OS work).
+- **`iconutil`** — preinstalled on macOS; required for icon generation.
 
-The compile-time `production` Cargo feature is the load-bearing switch:
+No system-wide installs beyond those. Build artifacts land under
+`target/` and `apps/aberp-ui/ui/dist/`; runtime data lives under
+`~/.aberp/<tenant>/`.
 
-- **Without** `--features production` (every dev build) — NAV calls
-  route to `api-test.onlineszamla.nav.gov.hu`, invoice numbers are
-  prefixed `TEST-`, and the prod endpoint is structurally unreachable
-  (`assert_endpoint_allowed`).
-- **With** `--features production` — NAV calls route to the real
-  `api.onlineszamla.nav.gov.hu`, the `TEST-` prefix is dropped, and
-  boot-time sanity checks enforce that the binary is running as
-  `tenant=prod` with the documented seller identity.
+## Dev quickstart
 
-Release workflow:
+From a fresh clone on macOS:
 
 ```bash
-# On dev: publish the release branch.
-./run/release.sh PROD_v1.0     # validates main+clean, refuses if branch
-                               # exists on origin, then pushes
-                               # main:refs/heads/PROD_v1.0
+git clone <this-repo-url> ABERP
+cd ABERP
 
-# On the prod machine: clone the release branch and launch.
-git clone --branch PROD_v1.0 <origin-url> ABERP-prod
-cd ABERP-prod
-./run/run_prod.sh              # builds with --features production,
-                               # launches the Tauri shell
+# 1. Build the Rust workspace (downloads + compiles deps; one-time).
+cargo build
+
+# 2. Build the Svelte SPA bundle (Tauri's webview loads this in dev too).
+cd apps/aberp-ui/ui
+npm install
+npm run build
+cd -
+
+# 3. Launch the desktop app (Tauri 2 dev loop: tauri-CLI spawns Vite
+#    AND the Rust shell in one process group, hot-reload enabled).
+./run/run_desktop.sh
 ```
 
-The full manual cutover procedure — first-time prod branch creation,
-seller.toml template, NAV+SMTP credential setup, smoke-invoice
-checklist, rollback, ongoing update workflow — is documented in
-**[`docs/CUTOVER_RUNBOOK.md`](docs/CUTOVER_RUNBOOK.md)**.
+The dev build talks to the NAV **test** endpoint
+(`api-test.onlineszamla.nav.gov.hu`); invoice numbers are prefixed
+`TEST-`. The production endpoint is structurally unreachable from a
+non-production build.
 
-> **The dev-DB-disposable rule reverses at prod cutover.** Once
-> `~/.aberp/prod/aberp.duckdb` holds a single issued invoice, it is
-> the legal record. Every schema change must be forward-compatible
-> from that point onward; the audit ledger is already append-only
-> (ADR-0008). Snapshot the DB before any upgrade — see the runbook
-> Step 9.
+Local data — seller profile, NAV credentials, SMTP password, DuckDB,
+issued invoices, audit ledger — lives under `~/.aberp/<tenant>/`
+(default tenant: `dev`).
+
+## Production install
+
+Full procedure with the first-time prod branch creation,
+seller.toml template, NAV + SMTP credential setup, smoke-invoice
+checklist, rollback, and ongoing update workflow:
+
+→ **[`docs/CUTOVER_RUNBOOK.md`](docs/CUTOVER_RUNBOOK.md)**
+
+Short version: each production release is a branch on origin named
+`PROD_vMAJOR.MINOR`. On the prod machine:
+
+```bash
+git clone --branch PROD_v1.0 <origin-url> ABERP-prod
+cd ABERP-prod
+./run/run_prod.sh   # builds with --features production, launches the shell
+```
+
+`./run/release.sh PROD_v1.0` is the dev-side script that publishes a
+release branch from `main`.
+
+## Updating an existing prod install
+
+→ **[`docs/CUTOVER_RUNBOOK.md` § Step 9](docs/CUTOVER_RUNBOOK.md)**
+
+Always run `./tools/snapshot-prod.sh` before switching release branches.
+It tarballs `~/.aberp/<tenant>/`, encrypts the keychain entries, AND
+drops `~/.aberp/<tenant>/.upgrade-snapshot.toml` — a small contract
+file the next boot of the new binary compares against the post-upgrade
+`seller.toml`. The binary REFUSES to start if `[seller.smtp]` or
+`[seller.numbering]` drifted, so you don't need to remember to verify
+them manually.
+
+## Project structure
+
+```
+ABERP/
+  README.md            ← you are here
+  LICENSE              ← PolyForm Noncommercial 1.0.0
+  FOUNDATION.md        ← architectural spine — every ADR must be consistent with it
+  CLAUDE.md            ← project-wide working agreement
+  Cargo.toml           ← workspace manifest, pinned deps
+  rust-toolchain.toml  ← channel = stable
+  adr/                 ← Architecture Decision Records, numbered + indexed
+  docs/
+    CUTOVER_RUNBOOK.md ← prod cutover + update workflow (the source of truth)
+    threat-model.md
+    research/          ← raw research notes (NAV / Billingo / stack baseline)
+    reviews/           ← adversarial review records
+  crates/
+    audit-ledger/      ← tamper-evident append-only ledger (ADR-0008)
+    nav-transport/     ← NAV TLS transport + credentials (ADR-0009 §4, ADR-0020)
+    nav-xsd-validator/ ← <InvoiceData> v3.0 runtime invariant check (ADR-0022)
+    aberp-verify/      ← external-auditor evidence-bundle verifier
+  modules/
+    billing/           ← NAV invoice issuing (ADR-0009)
+  apps/
+    aberp/             ← the Rust backend (HTTPS+JSON localhost service)
+    aberp-ui/          ← Tauri 2 shell + Svelte 5 SPA (ADR-0004)
+  run/                 ← launcher scripts (dev / prod / release)
+  tools/               ← operational scripts (snapshot-prod.sh, icons)
+```
+
+## Contributing
+
+This is a single-maintainer project; there is no formal support
+guarantee, SLA, or roadmap for external feature requests. If you
+spot a bug — open an issue on GitHub with a minimal repro. PRs are
+welcome but unsolicited large rewrites are unlikely to land.
+
+The working agreement in [`CLAUDE.md`](CLAUDE.md) describes the
+non-negotiable principles that apply to every change (think before
+coding, simplicity first, surgical changes, fail loud, etc.). PRs
+that ignore those principles will be sent back.
+
+## Further reading
+
+1. [`FOUNDATION.md`](FOUNDATION.md) — the architectural spine.
+2. [`adr/README.md`](adr/README.md) — how ADRs work; numbered ADRs in
+   order, later ones assume earlier ones.
+3. [`docs/CUTOVER_RUNBOOK.md`](docs/CUTOVER_RUNBOOK.md) — the prod
+   cutover + update procedure.

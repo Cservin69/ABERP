@@ -61,3 +61,4 @@ pub mod smtp_credentials;
 pub mod submission_queue;
 pub mod submit_annulment;
 pub mod submit_invoice;
+pub mod upgrade_snapshot;

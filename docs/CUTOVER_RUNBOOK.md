@@ -462,7 +462,13 @@ feature to reach prod:
 #    (seller.toml + DuckDB + side-store invoices + audit log + first-
 #    launch touchfile) AND the per-tenant macOS keychain entries
 #    (NAV credentials blob + SMTP password) into a password-protected
-#    zip. Snapshots land in ~/aberp-snapshots/.
+#    zip. Snapshots land in ~/aberp-snapshots/. It ALSO drops a small
+#    contract file at ~/.aberp/prod/.upgrade-snapshot.toml carrying
+#    the [seller.smtp] + [seller.numbering] sections — the next boot
+#    of the new binary compares it against the post-upgrade
+#    seller.toml and REFUSES to start if either section drifted
+#    (S171). You don't need to manually verify SMTP + numbering
+#    after the upgrade; the binary catches it.
 ./tools/snapshot-prod.sh
 # (will prompt twice for an encryption password — pick one you can
 #  remember; you need it to restore.)

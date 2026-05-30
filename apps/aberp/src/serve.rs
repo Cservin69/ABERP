@@ -127,6 +127,7 @@ use crate::setup_seller_info::{
 use crate::smtp_config::{self as smtp_config_mod, SmtpConfig, SmtpSecurity};
 use crate::smtp_credentials;
 use crate::submit_invoice;
+use crate::upgrade_snapshot;
 use async_trait::async_trait;
 
 /// Default keychain service-name prefix for the session token (one per
@@ -545,6 +546,95 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         if let Some(msg) = report.fatal {
             eprintln!("{msg}");
             std::process::exit(1);
+        }
+
+        // S171 / PR-171 — upgrade-snapshot check. If the operator ran
+        // `tools/snapshot-prod.sh` before this upgrade, a
+        // `.upgrade-snapshot.toml` sits alongside `seller.toml` carrying
+        // the pre-upgrade `[seller.smtp]` + `[seller.numbering]`
+        // sections; we compare against the current seller.toml and
+        // refuse to start on drift. See `crate::upgrade_snapshot` for
+        // the trust-code-not-operator rationale and the four-scenario
+        // unit tests.
+        if let Some(seller_path) = seller_path.as_ref() {
+            let snapshot_path = seller_path.with_file_name(".upgrade-snapshot.toml");
+            let _s = tracing::info_span!("serve.upgrade_snapshot_check").entered();
+            match upgrade_snapshot::check_upgrade_snapshot(seller_path, &snapshot_path) {
+                Ok(upgrade_snapshot::Outcome::Absent) => {
+                    tracing::info!(
+                        "upgrade-snapshot check: no .upgrade-snapshot.toml present — skipping"
+                    );
+                }
+                Ok(upgrade_snapshot::Outcome::Matches) => {
+                    use time::format_description::well_known::Rfc3339;
+                    use time::OffsetDateTime;
+                    let ts = OffsetDateTime::now_utc()
+                        .format(&Rfc3339)
+                        .unwrap_or_else(|_| "verified".to_string());
+                    // Sanitize the timestamp for use in a filename: keep
+                    // ASCII alphanumerics + `-`, replace everything else
+                    // (the `:` in RFC3339) with `-`.
+                    let safe_ts: String = ts
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric() || c == '-' {
+                                c
+                            } else {
+                                '-'
+                            }
+                        })
+                        .collect();
+                    if let Err(e) = upgrade_snapshot::mark_verified(&snapshot_path, &safe_ts) {
+                        tracing::warn!(
+                            error = %format!("{e:#}"),
+                            "upgrade-snapshot matched but rename failed; \
+                             boot continues — next boot will re-check (harmless)"
+                        );
+                    } else {
+                        tracing::info!(
+                            "upgrade-snapshot check: matched current seller.toml — boot proceeding"
+                        );
+                    }
+                }
+                Ok(upgrade_snapshot::Outcome::Mismatch { deltas }) => {
+                    use time::format_description::well_known::Rfc3339;
+                    use time::OffsetDateTime;
+                    let detected_at = OffsetDateTime::now_utc()
+                        .format(&Rfc3339)
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    // Best-effort audit append BEFORE the exit so the
+                    // divergence is permanently hash-chained even if
+                    // the operator later resolves it by mv-ing the
+                    // snapshot file. A failure to append is logged but
+                    // does NOT mask the refusal-to-boot.
+                    if let Err(e) = record_upgrade_snapshot_mismatch_audit(
+                        &args.db,
+                        &args.tenant,
+                        &binary_hash_handle,
+                        &deltas,
+                        &detected_at,
+                    ) {
+                        tracing::warn!(
+                            error = %format!("{e:#}"),
+                            "could not write UpgradeSnapshotMismatch audit entry; refusing boot anyway"
+                        );
+                    }
+                    let msg = upgrade_snapshot::format_bilingual_error(&deltas, &snapshot_path);
+                    eprintln!("{msg}");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    // Parse failure on the snapshot file — surface and
+                    // continue. The check is opt-in (operator must have
+                    // run snapshot-prod.sh), so a malformed file is the
+                    // operator's responsibility; loud-fail-on-parse
+                    // would hold the binary hostage to a bad file.
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "upgrade-snapshot check errored — treating as Absent"
+                    );
+                }
+            }
         }
     }
 
@@ -2340,6 +2430,54 @@ fn record_first_prod_launch_audit(
             None,
         )
         .context("append FirstProdLaunchAcknowledged audit entry")?;
+    Ok(())
+}
+
+/// S171 / PR-171 — append a single `UpgradeSnapshotMismatch` entry to
+/// the on-disk audit ledger from the boot path. Called BEFORE the boot
+/// refuses with exit(1) so the divergence is permanently hash-chained
+/// even if the operator resolves it by `mv`-ing the snapshot file.
+///
+/// `tenant_str` comes from `ServeArgs.tenant`; `binary_hash_handle` is
+/// the boot-thread handle (we block on `wait` — we're about to exit
+/// anyway). The synthetic actor's `user_id` (`"system:upgrade-snapshot-check"`)
+/// names the boot-time origin so an auditor can distinguish this from
+/// operator-driven entries.
+fn record_upgrade_snapshot_mismatch_audit(
+    db_path: &std::path::Path,
+    tenant_str: &str,
+    binary_hash_handle: &BinaryHashHandle,
+    deltas: &[upgrade_snapshot::Delta],
+    detected_at: &str,
+) -> Result<()> {
+    let tenant = TenantId::new(tenant_str.to_string())
+        .ok_or_else(|| anyhow!("tenant id empty for upgrade-snapshot audit"))?;
+    let binary_hash = binary_hash_handle
+        .wait()
+        .context("await binary hash for upgrade-snapshot audit")?;
+    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
+        .context("open audit ledger to record upgrade-snapshot mismatch")?;
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), "system:upgrade-snapshot-check");
+    let payload = audit_payloads::UpgradeSnapshotMismatchPayload::new(
+        tenant_str.to_string(),
+        detected_at.to_string(),
+        deltas
+            .iter()
+            .map(|d| audit_payloads::UpgradeSnapshotDelta {
+                field: d.field.clone(),
+                expected: d.expected.clone(),
+                actual: d.actual.clone(),
+            })
+            .collect(),
+    );
+    ledger
+        .append(
+            EventKind::UpgradeSnapshotMismatch,
+            payload.to_bytes(),
+            actor,
+            None,
+        )
+        .context("append UpgradeSnapshotMismatch audit entry")?;
     Ok(())
 }
 
