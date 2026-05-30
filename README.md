@@ -70,8 +70,9 @@ audit-ledger crate, billing module, and the NAV-XML-on-disk binary (commit
 
 ## Production cutover & releases
 
-Dev work happens on `main`. Production releases live on the `prod` branch
-and as annotated `prod-vMAJOR.MINOR.PATCH` tags.
+Dev work happens on `main`. Each production release is a branch on
+origin named `PROD_vMAJOR.MINOR` (uppercase, underscore) — the operator
+clones from that branch on the prod machine and builds locally.
 
 The compile-time `production` Cargo feature is the load-bearing switch:
 
@@ -87,9 +88,16 @@ The compile-time `production` Cargo feature is the load-bearing switch:
 Release workflow:
 
 ```bash
-./run/release.sh prod-v0.1.0   # validates main+clean, fmt, builds with
-                               # --features production, tags locally
-./run/run_prod.sh              # launches the prod binary (Tauri shell)
+# On dev: publish the release branch.
+./run/release.sh PROD_v1.0     # validates main+clean, refuses if branch
+                               # exists on origin, then pushes
+                               # main:refs/heads/PROD_v1.0
+
+# On the prod machine: clone the release branch and launch.
+git clone --branch PROD_v1.0 <origin-url> ABERP-prod
+cd ABERP-prod
+./run/run_prod.sh              # builds with --features production,
+                               # launches the Tauri shell
 ```
 
 The full manual cutover procedure — first-time prod branch creation,
