@@ -755,7 +755,10 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // PR-92 / ADR-0047 §4 — operational SMTP-emailed entry; no
         // NAV-side XML (the audit payload carries the recipient +
         // subject + outcome only). Mirrors the bundle writer.
-        | EventKind::InvoiceEmailedSent => (None, ""),
+        | EventKind::InvoiceEmailedSent
+        // S166 — system-lifecycle first-prod-launch acknowledgement;
+        // no NAV-side XML. Mirrors the bundle writer's no-bytes arm.
+        | EventKind::FirstProdLaunchAcknowledged => (None, ""),
     };
 
     Ok(NavExtraction {

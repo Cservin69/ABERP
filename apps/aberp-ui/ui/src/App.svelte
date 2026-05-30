@@ -58,6 +58,8 @@
     subscribeRoute,
     type AppRoute,
   } from "./lib/router";
+  import FirstProdLaunchModal from "./routes/FirstProdLaunchModal.svelte";
+  import { shouldShowFirstProdLaunchModal } from "./lib/first-prod-launch";
   import InvoiceList from "./routes/InvoiceList.svelte";
   import IssueInvoice from "./routes/IssueInvoice.svelte";
   import MaintenanceDashboard from "./routes/MaintenanceDashboard.svelte";
@@ -215,6 +217,13 @@
     }
   }
 
+  // S166 — after the operator confirms the first-production launch,
+  // re-probe /health so `first_prod_launch_required` flips to false and
+  // the FirstProdLaunchModal unmounts, revealing the normal app.
+  async function onFirstProdLaunchAcknowledged() {
+    await probe();
+  }
+
   async function onRetryClick() {
     retryInFlight = true;
     try {
@@ -245,6 +254,11 @@
 
   let bootErr = $derived(bootErrorMessage(bootSnapshot));
   let latestLog = $derived(latestLogLine(bootSnapshot));
+
+  // S166 — block the main routes behind the one-time first-production-
+  // launch confirmation while `/health` reports it as required. Always
+  // false on dev/test builds (the backend reports false there).
+  let firstProdLaunchRequired = $derived(shouldShowFirstProdLaunchModal(healthInfo));
 </script>
 
 <div class="frame">
@@ -319,6 +333,14 @@
   </header>
 
   {#if viewMode === "ready"}
+    {#if firstProdLaunchRequired}
+      <!-- S166 — block every main route behind the one-time
+           first-production-launch confirmation until the operator
+           acknowledges. The modal POSTs the acknowledgement, then
+           `onFirstProdLaunchAcknowledged` re-probes /health, flipping
+           the flag false and unmounting this branch. -->
+      <FirstProdLaunchModal onAcknowledged={onFirstProdLaunchAcknowledged} />
+    {:else}
     <div class="layout">
       <nav
         class="sidenav"
@@ -453,6 +475,7 @@
         {/if}
       </main>
     </div>
+    {/if}
   {:else}
   <main>
     {#if viewMode === "setup"}

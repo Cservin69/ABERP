@@ -626,7 +626,13 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // also carries no NAV-side bytes. The audit payload
         // (recipient + subject + outcome + scrubbed error
         // detail) lives in chain.jsonl per ADR-0009 §8.
-        | EventKind::InvoiceEmailedSent => None,
+        | EventKind::InvoiceEmailedSent
+        // S166 — system-lifecycle first-prod-launch acknowledgement
+        // carries no NAV bytes. It is also NOT invoice-scoped (the
+        // `invoice.*` glob never sweeps it into a bundle), so this arm
+        // is reached only if it ever appeared in an entry list; the
+        // payload (acknowledged_at + tenant) lives in chain.jsonl.
+        | EventKind::FirstProdLaunchAcknowledged => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

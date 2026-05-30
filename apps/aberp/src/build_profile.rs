@@ -37,6 +37,27 @@ pub const IS_PRODUCTION_BUILD: bool = false;
 /// never resets or skips a sequence number.
 pub const INVOICE_NUMBER_TEST_PREFIX: &str = if IS_PRODUCTION_BUILD { "" } else { "TEST-" };
 
+/// S166 / prod-prep PR #2 — the tenant identity a build is allowed to
+/// run as, used by the boot sanity check (`serve::sanity_check_environment`).
+///
+/// Returns `Some((tenant_name, expected_tax_number))` on a PRODUCTION
+/// build — the documented prod entity (Áben Consulting Kft.). A prod
+/// binary that finds a seller.toml with a different `tax_number` refuses
+/// to start: hülye-biztos protection so a prod build can only ever run
+/// against the one documented prod identity.
+///
+/// Returns `None` on a dev/test build — dev tenants can have arbitrary
+/// identity, so the sanity check enforces nothing there. The value is
+/// NOT hardcoded at the check site; this helper is the single source of
+/// truth (CLAUDE.md rule 8).
+pub fn expected_tenant_identity() -> Option<(&'static str, &'static str)> {
+    if IS_PRODUCTION_BUILD {
+        Some(("prod", "24904362-2-41"))
+    } else {
+        None
+    }
+}
+
 /// The NAV endpoint this build targets. Production builds hit the real
 /// `api.onlineszamla.nav.gov.hu`; every other build hits the
 /// `api-test.onlineszamla.nav.gov.hu` conformance host.

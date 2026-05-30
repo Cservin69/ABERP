@@ -23,6 +23,17 @@ pub async fn health(state: State<'_, AppState>) -> Result<Value, String> {
     forward_get(&state, "/health", false).await
 }
 
+/// S166 / prod-prep PR #2 — `POST /health/acknowledge-first-prod-launch`.
+/// The `FirstProdLaunchModal` POSTs here when the operator types `ABERP`
+/// and clicks Proceed on the one-time first-production-launch confirm.
+/// No body — the backend stamps the `~/.aberp/prod/.first-launch-acknowledged`
+/// touchfile and writes the permanent `FirstProdLaunchAcknowledged` audit
+/// entry. Returns `{ acknowledged_at }`.
+#[tauri::command]
+pub async fn acknowledge_first_prod_launch(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_post(&state, "/health/acknowledge-first-prod-launch", Value::Null).await
+}
+
 /// `GET /invoices` — authenticated; returns the list shape derived
 /// per ADR-0009 §2.
 #[tauri::command]

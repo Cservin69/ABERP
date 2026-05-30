@@ -559,6 +559,21 @@ pub enum EventKind {
     /// silent-omission-failure-mode posture every prior PR's
     /// prefix-pin test names. PR-92, ADR-0047 §4.
     InvoiceEmailedSent,
+
+    /// The operator acknowledged the one-time first-production-launch
+    /// confirmation (S166, prod-prep PR #2). Written by the
+    /// `/health/acknowledge-first-prod-launch` route when the operator
+    /// types `ABERP` and clicks Proceed on the first launch of a
+    /// production binary. Payload (`FirstProdLaunchAcknowledgedPayload`)
+    /// carries `acknowledged_at` (RFC3339) and `tenant`.
+    ///
+    /// NOT an `invoice.`-scoped event — there is no invoice in flight; it
+    /// is a system-lifecycle event, so it carries the `system.` prefix.
+    /// Preserving it in the ledger gives a permanent, hash-chained record
+    /// that a human consented to real fiscal operation before the first
+    /// real submission — a legal-grade event worth the unusual move of
+    /// writing to the audit trail from a `/health` endpoint.
+    FirstProdLaunchAcknowledged,
 }
 
 impl EventKind {
@@ -592,6 +607,7 @@ impl EventKind {
             EventKind::InvoiceCheckPerformed => "invoice.check_performed",
             EventKind::InvoicePaymentRecorded => "invoice.payment_recorded",
             EventKind::InvoiceEmailedSent => "invoice.emailed_sent",
+            EventKind::FirstProdLaunchAcknowledged => "system.first_prod_launch_acknowledged",
         }
     }
 
@@ -636,6 +652,7 @@ impl EventKind {
             "invoice.check_performed" => Ok(EventKind::InvoiceCheckPerformed),
             "invoice.payment_recorded" => Ok(EventKind::InvoicePaymentRecorded),
             "invoice.emailed_sent" => Ok(EventKind::InvoiceEmailedSent),
+            "system.first_prod_launch_acknowledged" => Ok(EventKind::FirstProdLaunchAcknowledged),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -676,6 +693,7 @@ mod tests {
             EventKind::InvoiceCheckPerformed,
             EventKind::InvoicePaymentRecorded,
             EventKind::InvoiceEmailedSent,
+            EventKind::FirstProdLaunchAcknowledged,
         ];
         for v in variants {
             let s = v.as_str();
@@ -688,6 +706,26 @@ mod tests {
     fn from_storage_str_rejects_unknown() {
         assert!(EventKind::from_storage_str("invoice.future_kind").is_err());
         assert!(EventKind::from_storage_str("").is_err());
+    }
+
+    /// S166 specifically: `FirstProdLaunchAcknowledged` is a
+    /// system-lifecycle event, NOT invoice-scoped. Its on-disk string
+    /// MUST carry the `system.` prefix (and NOT `invoice.`) so the
+    /// per-invoice export bundle's `invoice.*` glob never sweeps a
+    /// boot-acknowledgement entry into an invoice's evidence bundle.
+    /// The inverse of the `*_use_invoice_prefix` pins above.
+    #[test]
+    fn s166_first_prod_launch_kind_uses_system_prefix() {
+        assert_eq!(
+            EventKind::FirstProdLaunchAcknowledged.as_str(),
+            "system.first_prod_launch_acknowledged"
+        );
+        assert!(EventKind::FirstProdLaunchAcknowledged
+            .as_str()
+            .starts_with("system."));
+        assert!(!EventKind::FirstProdLaunchAcknowledged
+            .as_str()
+            .starts_with("invoice."));
     }
 
     /// PR-7-B-3 specifically: the three new on-disk strings must

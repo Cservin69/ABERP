@@ -371,10 +371,28 @@ export interface HealthResponse {
    * production`. Drives the Tenant-Settings invoice-number preview's
    * `TEST-` prefix (shown on dev/test builds, dropped on production). */
   is_production_build: boolean;
+  /** S166 — `true` on a production build whose one-time first-launch
+   * ceremony has not yet been acknowledged. While true, the SPA blocks
+   * its main routes behind the `FirstProdLaunchModal`. Always `false` on
+   * dev/test builds. */
+  first_prod_launch_required: boolean;
 }
 
 export async function health(): Promise<HealthResponse> {
   return invoke<HealthResponse>("health");
+}
+
+/** `POST /health/acknowledge-first-prod-launch` response. */
+export interface AcknowledgeFirstProdLaunchResponse {
+  acknowledged_at: string;
+}
+
+/** S166 — record the operator's one-time consent to real fiscal
+ * operation. Writes the touchfile + a permanent audit entry on the
+ * backend; after it resolves, a fresh `health()` reports
+ * `first_prod_launch_required: false`. */
+export async function acknowledgeFirstProdLaunch(): Promise<AcknowledgeFirstProdLaunchResponse> {
+  return invoke<AcknowledgeFirstProdLaunchResponse>("acknowledge_first_prod_launch");
 }
 
 export async function listInvoices(): Promise<InvoiceListItem[]> {

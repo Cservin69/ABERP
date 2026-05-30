@@ -225,6 +225,135 @@ fn print_boot_banner(tenant: &str) {
     }
 }
 
+/// S166 / prod-prep PR #2 — outcome of [`sanity_check_environment`].
+///
+/// `fatal` is `Some(bilingual message)` when a check failed in a way that
+/// must refuse the boot; the caller prints it to stderr and `exit(1)`.
+/// `warnings` are non-fatal advisories the caller logs via `tracing::warn!`.
+pub(crate) struct SanityReport {
+    pub fatal: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+/// S166 / prod-prep PR #2 — the SECOND refuse-to-start guard pass, after
+/// [`guard_tenant_matches_build`]. That guard cross-checks the build vs
+/// the tenant NAME; this one cross-checks the build vs the on-disk +
+/// keychain ENVIRONMENT.
+///
+/// PRODUCTION builds enforce:
+///   A. seller.toml identity — a PRESENT seller.toml whose `tax_number`
+///      differs from the documented prod entity is FATAL. (A *missing*
+///      seller.toml is NOT fatal here: the existing `NeedsSellerConfig`
+///      boot state drives the seller-config wizard.)
+///   B. NAV credentials — missing creds are FATAL only if the first-launch
+///      ceremony was already completed (touchfile present) — that means
+///      the keychain entries were deleted out from under a configured
+///      install. Missing creds + no touchfile is the legitimate
+///      first-launch path: not fatal, the wizard will populate them.
+///   C. SMTP — a missing `[seller.smtp]` is a WARNING, not fatal: the
+///      operator can still issue invoices, auto-email just won't fire.
+///
+/// Dev/test builds enforce NOTHING (any identity, creds may be absent,
+/// SMTP silent) — the dev loop is unchanged.
+///
+/// All inputs are injected (not read inside) so the decision logic is
+/// unit-testable without a keychain, a `HOME`, or a prod build.
+pub(crate) fn sanity_check_environment(
+    is_production: bool,
+    expected_identity: Option<(&str, &str)>,
+    seller_tax_number: Option<&str>,
+    nav_creds_present: bool,
+    first_launch_acknowledged: bool,
+    smtp_configured: bool,
+) -> SanityReport {
+    let mut report = SanityReport {
+        fatal: None,
+        warnings: Vec::new(),
+    };
+    if !is_production {
+        // Dev/test: no enforcement. The caller logs the (dev) group line.
+        return report;
+    }
+
+    let tenant_name = expected_identity.map(|(t, _)| t).unwrap_or("prod");
+
+    // A. seller.toml identity consistency.
+    if let Some((_, expected_tax)) = expected_identity {
+        match seller_tax_number {
+            Some(tax) if tax == expected_tax => {
+                tracing::info!(
+                    tax_number = tax,
+                    "sanity (A): seller.toml identity matches the documented prod entity"
+                );
+            }
+            Some(other) => {
+                let lines = [
+                    format!("❌ FATAL: PRODUCTION build expects seller.toml tax_number {expected_tax} (Áben Consulting Kft.)"),
+                    format!("            but found {other}. Refusing to start."),
+                    "   This is hülye-biztos protection: a prod binary must only run against the documented prod identity.".to_string(),
+                    format!("   Either: fix seller.toml at ~/.aberp/{tenant_name}/seller.toml, OR"),
+                    "   rebuild without --features production for dev use.".to_string(),
+                    String::new(),
+                    format!("❌ VÉGZETES: az ÉLES build a(z) {expected_tax} adószámot várja a seller.toml-ban (Áben Consulting Kft.),"),
+                    format!("            de {other} szerepel. Az indítás megtagadva."),
+                    "   Ez hülye-biztos védelem: éles bináris kizárólag a dokumentált éles identitással futhat.".to_string(),
+                    format!("   Vagy: javítsd a seller.toml-t itt: ~/.aberp/{tenant_name}/seller.toml, VAGY"),
+                    "   fordítsd újra a --features production kapcsoló nélkül fejlesztői használatra.".to_string(),
+                ];
+                report.fatal = Some(lines.join("\n"));
+            }
+            None => {
+                tracing::info!(
+                    "sanity (A): seller.toml absent / identity-incomplete — deferring to the \
+                     NeedsSellerConfig wizard (not fatal)"
+                );
+            }
+        }
+    }
+
+    // B. NAV credentials present (or legitimately in first-launch).
+    if nav_creds_present {
+        tracing::info!("sanity (B): NAV credentials present in keychain");
+    } else if first_launch_acknowledged {
+        let lines = [
+            "❌ FATAL: PRODUCTION build can't find NAV credentials in keychain.".to_string(),
+            "   The first-launch ceremony was completed previously but the keychain entries are gone.".to_string(),
+            format!("   Either: re-run the first-launch wizard (clear ~/.aberp/{tenant_name}/.first-launch-acknowledged), OR"),
+            "   restore the keychain entries.".to_string(),
+            String::new(),
+            "❌ VÉGZETES: az ÉLES build nem találja a NAV hitelesítő adatokat a kulcstartóban.".to_string(),
+            "   A first-launch ceremónia korábban lezárult, de a kulcstartó-bejegyzések eltűntek.".to_string(),
+            format!("   Vagy: futtasd újra a first-launch varázslót (töröld: ~/.aberp/{tenant_name}/.first-launch-acknowledged), VAGY"),
+            "   állítsd vissza a kulcstartó-bejegyzéseket.".to_string(),
+        ];
+        // Prefer the first fatal (A) if it already fired — the operator
+        // fixes identity first, reboots, then sees this if still broken.
+        if report.fatal.is_none() {
+            report.fatal = Some(lines.join("\n"));
+        }
+    } else {
+        tracing::info!(
+            "sanity (B): NAV credentials absent and first-launch not yet acknowledged — the \
+             first-launch wizard will populate them (not fatal)"
+        );
+    }
+
+    // C. SMTP configured (warning only).
+    if smtp_configured {
+        tracing::info!("sanity (C): [seller.smtp] is configured");
+    } else {
+        report.warnings.push(
+            "[seller.smtp] is not configured — invoices can still be issued, but auto-email \
+             will not fire. Configure SMTP via Maintenance → Tenants to enable delivery. / \
+             Az [seller.smtp] nincs beállítva — a számlák kiállíthatók, de az automatikus \
+             e-mail nem indul el. Állítsd be az SMTP-t a Karbantartás → Bérlők menüben."
+                .to_string(),
+        );
+    }
+
+    report
+}
+
 pub fn run(args: &ServeArgs) -> Result<()> {
     // S165 / deliverable #5 — hülye-biztos cross-stream guard. Runs
     // FIRST, before the binary-hash thread, keychain, or DB are touched,
@@ -373,6 +502,51 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             }
         }
     };
+
+    // S166 / prod-prep PR #2 — the SECOND refuse-to-start guard pass.
+    // `guard_tenant_matches_build` (above) cross-checked the build vs the
+    // tenant NAME; this cross-checks the build vs the on-disk + keychain
+    // ENVIRONMENT. Runs after the keychain-read burst so it reuses the
+    // already-computed `initial_boot_state` (NeedsSetup ⟺ NAV creds
+    // missing) — no second keychain read, no second ACL prompt. Prod
+    // builds enforce; dev builds are a no-op (sanity_check_environment
+    // returns an empty report).
+    {
+        let group = if build_profile::IS_PRODUCTION_BUILD {
+            "boot step: sanity checks (prod)"
+        } else {
+            "boot step: sanity checks (dev)"
+        };
+        tracing::info!("{group}");
+        let _s = tracing::info_span!("serve.sanity_checks").entered();
+        let seller_path = setup_seller_info::seller_toml_path_for_tenant(&args.tenant).ok();
+        let seller_tax_number = seller_path
+            .as_ref()
+            .and_then(|p| setup_seller_info::read_seller_identity(p).ok().flatten())
+            .map(|id| id.tax_number);
+        let smtp_configured = seller_path
+            .as_ref()
+            .map(|p| matches!(smtp_config_mod::read_smtp_config(p), Ok(Some(_))))
+            .unwrap_or(false);
+        let nav_creds_present = !matches!(initial_boot_state, ServeBootState::NeedsSetup);
+        let first_launch_acknowledged = crate::first_launch::is_acknowledged(&args.tenant);
+
+        let report = sanity_check_environment(
+            build_profile::IS_PRODUCTION_BUILD,
+            build_profile::expected_tenant_identity(),
+            seller_tax_number.as_deref(),
+            nav_creds_present,
+            first_launch_acknowledged,
+            smtp_configured,
+        );
+        for w in &report.warnings {
+            tracing::warn!("sanity check warning: {w}");
+        }
+        if let Some(msg) = report.fatal {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    }
 
     // PR-73a / hotfix — run the idempotent billing schema migrations
     // at boot so an existing pre-PR-73 tenant DB picks up the five
@@ -995,6 +1169,14 @@ pub const NAV_POLL_DAEMON_CONCURRENCY: usize = 50;
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(handle_health))
+        // S166 / prod-prep PR #2 — the operator's one-time consent to
+        // real fiscal operation. A `/health` subroute (read by the SPA's
+        // first-launch modal) that, unusually, writes to the audit
+        // ledger: the human acknowledgment is a legal-grade event.
+        .route(
+            "/health/acknowledge-first-prod-launch",
+            post(handle_acknowledge_first_prod_launch),
+        )
         .route("/invoices", get(handle_list_invoices))
         .route("/invoices/issue", post(handle_issue_invoice))
         .route("/invoices/:id", get(handle_get_invoice))
@@ -2016,6 +2198,13 @@ struct HealthResponse {
     /// prefix from the Tenant-Settings invoice-number live preview on a
     /// production build (so the preview matches what actually emits).
     is_production_build: bool,
+    /// S166 — `true` when this is a production build whose one-time
+    /// first-launch ceremony has NOT yet been acknowledged (the
+    /// `~/.aberp/<tenant>/.first-launch-acknowledged` touchfile is
+    /// absent). The SPA blocks its main routes behind the
+    /// `FirstProdLaunchModal` while this is true. Always `false` on
+    /// dev/test builds.
+    first_prod_launch_required: bool,
 }
 
 async fn handle_health(State(state): State<AppState>) -> Response {
@@ -2033,6 +2222,9 @@ async fn handle_health(State(state): State<AppState>) -> Response {
             binary_hash: hex::encode(hash.as_bytes()),
             nav_xsd_version: aberp_nav_xsd_validator::NAV_XSD_VERSION,
             is_production_build: crate::build_profile::IS_PRODUCTION_BUILD,
+            first_prod_launch_required: crate::first_launch::first_prod_launch_required(
+                state.tenant.as_str(),
+            ),
         })
         .into_response(),
         Err(e) => (
@@ -2041,6 +2233,114 @@ async fn handle_health(State(state): State<AppState>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// S166 / prod-prep PR #2 — response shape for the first-prod-launch
+/// acknowledgement route. Carries the RFC3339 instant stamped into the
+/// touchfile + audit entry.
+#[derive(Serialize)]
+struct AcknowledgeFirstProdLaunchResponse {
+    acknowledged_at: String,
+}
+
+/// `POST /health/acknowledge-first-prod-launch` — the operator's one-time
+/// consent to real fiscal operation (S166). Writes the
+/// `~/.aberp/<tenant>/.first-launch-acknowledged` touchfile AND a
+/// permanent, hash-chained `FirstProdLaunchAcknowledged` audit entry.
+///
+/// Idempotent: re-acknowledging rewrites the touchfile stamp and appends
+/// a fresh audit entry (a re-consent is itself worth recording). Requires
+/// a valid bearer + Ready boot state, like every other mutation route —
+/// the SPA only surfaces the modal once the backend is Ready, so the
+/// operator login the audit entry records is always resolvable.
+async fn handle_acknowledge_first_prod_launch(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match acknowledge_first_prod_launch(&state, &operator_login) {
+        Ok(acknowledged_at) => {
+            Json(AcknowledgeFirstProdLaunchResponse { acknowledged_at }).into_response()
+        }
+        Err(e) => internal_error("acknowledge_first_prod_launch", e),
+    }
+}
+
+/// Library core of [`handle_acknowledge_first_prod_launch`]: stamp the
+/// touchfile, then append the audit entry. Returns the RFC3339 stamp.
+fn acknowledge_first_prod_launch(state: &AppState, operator_login: &str) -> Result<String> {
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    let tenant = state.tenant.as_str();
+    let acknowledged_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .context("format first-launch acknowledgement timestamp")?;
+
+    // 1. Touchfile — the gate the `/health` route reads. Written FIRST so
+    //    that if the audit append later fails, the gate is still
+    //    satisfied and the operator is not trapped behind the modal; the
+    //    append failure loud-fails the request (surfacing the problem)
+    //    without re-prompting forever.
+    crate::first_launch::write_acknowledgement(tenant, &acknowledged_at)
+        .context("write first-launch acknowledgement touchfile")?;
+
+    // 2. Audit ledger — permanent, hash-chained record of the human
+    //    consent. The unusual move (a `/health` subroute writing audit)
+    //    is deliberate: this is a legal-grade event.
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute for first-launch acknowledgement")?;
+    record_first_prod_launch_audit(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        &acknowledged_at,
+    )?;
+
+    tracing::info!(
+        tenant = tenant,
+        at = %acknowledged_at,
+        "boot_step: first prod launch acknowledged"
+    );
+    Ok(acknowledged_at)
+}
+
+/// Append a single `FirstProdLaunchAcknowledged` entry to the on-disk
+/// audit ledger. Split from [`acknowledge_first_prod_launch`] so the
+/// ledger-write half is unit-testable against a scratch DuckDB without
+/// constructing an [`AppState`] or mutating `HOME` (the touchfile-write
+/// half is pinned separately in `crate::first_launch`).
+fn record_first_prod_launch_audit(
+    db_path: &std::path::Path,
+    tenant: TenantId,
+    binary_hash: aberp_audit_ledger::BinaryHash,
+    operator_login: &str,
+    acknowledged_at: &str,
+) -> Result<()> {
+    let tenant_str = tenant.as_str().to_string();
+    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
+        .context("open audit ledger to record first-launch acknowledgement")?;
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    let payload =
+        audit_payloads::FirstProdLaunchAcknowledgedPayload::new(acknowledged_at, tenant_str);
+    ledger
+        .append(
+            EventKind::FirstProdLaunchAcknowledged,
+            payload.to_bytes(),
+            actor,
+            None,
+        )
+        .context("append FirstProdLaunchAcknowledged audit entry")?;
+    Ok(())
 }
 
 /// PR-28 / ADR-0036 §9 — typed wire shape for the eleven UI labels
@@ -8603,6 +8903,179 @@ mod tests {
     use super::*;
     use aberp_audit_ledger::{Actor, BinaryHash, Ledger, TenantId};
     use aberp_billing::IdempotencyKey;
+
+    // ──────────────────────────────────────────────────────────────
+    // S166 / prod-prep PR #2 — boot sanity check (sanity_check_environment)
+    // ──────────────────────────────────────────────────────────────
+
+    const PROD_IDENTITY: Option<(&str, &str)> = Some(("prod", "24904362-2-41"));
+
+    /// A prod build with a PRESENT seller.toml whose tax_number differs
+    /// from the documented prod entity refuses to start (fatal). The
+    /// brief's required pin.
+    #[test]
+    fn sanity_prod_wrong_tax_number_is_fatal() {
+        let report = sanity_check_environment(
+            true,
+            PROD_IDENTITY,
+            Some("99999999-9-99"),
+            true,  // nav creds present
+            false, // first launch not acknowledged
+            true,  // smtp configured
+        );
+        let msg = report.fatal.expect("wrong tax_number must be fatal");
+        assert!(
+            msg.contains("24904362-2-41"),
+            "names the expected tax_number"
+        );
+        assert!(msg.contains("99999999-9-99"), "names the found tax_number");
+        // Bilingual — both the EN and HU fatal lines present.
+        assert!(msg.contains("Refusing to start"));
+        assert!(msg.contains("Az indítás megtagadva"));
+    }
+
+    /// A prod build whose seller.toml matches the expected prod entity
+    /// passes (no fatal). The brief's required pin.
+    #[test]
+    fn sanity_prod_matching_tax_number_passes() {
+        let report = sanity_check_environment(
+            true,
+            PROD_IDENTITY,
+            Some("24904362-2-41"),
+            true,
+            false,
+            true,
+        );
+        assert!(
+            report.fatal.is_none(),
+            "matching identity must not be fatal"
+        );
+    }
+
+    /// A dev build skips the tax_number check entirely — any identity is
+    /// accepted, no fatal, no warnings. The brief's required pin.
+    #[test]
+    fn sanity_dev_build_skips_tax_number_check() {
+        let report = sanity_check_environment(
+            false,
+            None, // dev: no expected identity
+            Some("literally-anything"),
+            false, // dev: creds may be absent
+            false,
+            false, // dev: smtp may be absent
+        );
+        assert!(report.fatal.is_none(), "dev build enforces nothing");
+        assert!(report.warnings.is_empty(), "dev build is silent");
+    }
+
+    /// A missing seller.toml (None tax_number) is NOT fatal in prod — the
+    /// existing NeedsSellerConfig wizard handles that path.
+    #[test]
+    fn sanity_prod_missing_seller_toml_defers_to_wizard() {
+        let report = sanity_check_environment(true, PROD_IDENTITY, None, true, false, true);
+        assert!(
+            report.fatal.is_none(),
+            "missing seller.toml defers, not fatal"
+        );
+    }
+
+    /// Prod, identity OK, but NAV creds gone AND the ceremony was already
+    /// completed → fatal (keychain entries deleted under a configured
+    /// install).
+    #[test]
+    fn sanity_prod_missing_creds_after_acknowledgement_is_fatal() {
+        let report = sanity_check_environment(
+            true,
+            PROD_IDENTITY,
+            Some("24904362-2-41"),
+            false, // creds gone
+            true,  // but ceremony already done
+            true,
+        );
+        let msg = report
+            .fatal
+            .expect("missing creds post-ceremony must be fatal");
+        assert!(msg.contains("NAV credentials"));
+        assert!(msg.contains("kulcstartó"), "bilingual HU line present");
+    }
+
+    /// Prod, identity OK, NAV creds absent but first launch NOT yet
+    /// acknowledged → the legitimate first-launch path: not fatal.
+    #[test]
+    fn sanity_prod_missing_creds_before_first_launch_is_not_fatal() {
+        let report = sanity_check_environment(
+            true,
+            PROD_IDENTITY,
+            Some("24904362-2-41"),
+            false, // creds absent
+            false, // first launch not acknowledged
+            true,
+        );
+        assert!(report.fatal.is_none(), "first-launch path is not fatal");
+    }
+
+    /// Prod with everything else OK but SMTP unconfigured → a WARNING,
+    /// never fatal.
+    #[test]
+    fn sanity_prod_missing_smtp_warns_but_is_not_fatal() {
+        let report = sanity_check_environment(
+            true,
+            PROD_IDENTITY,
+            Some("24904362-2-41"),
+            true,
+            false,
+            false, // smtp NOT configured
+        );
+        assert!(report.fatal.is_none(), "missing SMTP is not fatal");
+        assert_eq!(report.warnings.len(), 1, "one SMTP warning emitted");
+        assert!(report.warnings[0].contains("seller.smtp"));
+    }
+
+    /// The acknowledge route's audit half: `record_first_prod_launch_audit`
+    /// MUST append exactly one `FirstProdLaunchAcknowledged` entry whose
+    /// payload round-trips the timestamp + tenant. Scratch on-disk DuckDB,
+    /// no `tempfile` dep, no `HOME` mutation (the touchfile half is pinned
+    /// in `crate::first_launch`). The brief's POST-endpoint pin.
+    #[test]
+    fn record_first_prod_launch_audit_appends_one_entry() {
+        let scratch = std::env::temp_dir().join(format!(
+            "aberp-s166-ack-{}-{:?}",
+            ulid::Ulid::new(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let db_path = scratch.join("test.duckdb");
+        {
+            let conn = Connection::open(&db_path).expect("open scratch duckdb");
+            aberp_audit_ledger::ensure_schema(&conn).expect("ensure audit schema");
+        }
+
+        let tenant = TenantId::new("test").expect("tenant id");
+        let bh = BinaryHash::from_bytes([0u8; 32]);
+        record_first_prod_launch_audit(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator-login",
+            "2026-06-01T08:00:00Z",
+        )
+        .expect("record audit entry");
+
+        let ledger = Ledger::open(&db_path, tenant, bh).expect("reopen ledger");
+        let entries = ledger.entries().expect("read entries");
+        let acks: Vec<_> = entries
+            .iter()
+            .filter(|e| e.kind == EventKind::FirstProdLaunchAcknowledged)
+            .collect();
+        assert_eq!(acks.len(), 1, "exactly one acknowledgement entry");
+        let payload: audit_payloads::FirstProdLaunchAcknowledgedPayload =
+            serde_json::from_slice(&acks[0].payload).expect("payload parses");
+        assert_eq!(payload.acknowledged_at, "2026-06-01T08:00:00Z");
+        assert_eq!(payload.tenant, "test");
+        assert_eq!(acks[0].actor.user_id, "operator-login");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 
     /// PR-44η / session-60 — `parse_supplier_tax_number_from_xml`
     /// MUST extract the 8-digit base supplier tax number from a

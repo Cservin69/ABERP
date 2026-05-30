@@ -1987,6 +1987,37 @@ impl InvoiceEmailedSentPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// FirstProdLaunchAcknowledged (S166)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::FirstProdLaunchAcknowledged`].
+///
+/// Written exactly once per production installation, by the
+/// `/health/acknowledge-first-prod-launch` route, when the operator
+/// confirms the one-time first-launch ceremony (S166). `acknowledged_at`
+/// is the RFC3339 instant the touchfile was written; `tenant` is the
+/// tenant the prod binary runs as (always `"prod"` today, but recorded
+/// verbatim rather than assumed). No secrets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirstProdLaunchAcknowledgedPayload {
+    pub acknowledged_at: String,
+    pub tenant: String,
+}
+
+impl FirstProdLaunchAcknowledgedPayload {
+    pub fn new(acknowledged_at: impl Into<String>, tenant: impl Into<String>) -> Self {
+        Self {
+            acknowledged_at: acknowledged_at.into(),
+            tenant: tenant.into(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 

@@ -198,6 +198,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::health,
+            commands::acknowledge_first_prod_launch,
             commands::list_invoices,
             commands::get_invoice,
             commands::get_audit,
