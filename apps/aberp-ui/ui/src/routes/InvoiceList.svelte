@@ -792,7 +792,7 @@
         {@const isPartnerMissing = row.buyer_name === null || row.buyer_name.trim().length === 0}
         {@const actions = quickActionsForState(row.state, row.payment !== null)}
         {@const isKeyboardFocused = rowIndex === focusedRowIndex}
-        {@const pictogram = navStatusPictogram(row.state)}
+        {@const pictogram = navStatusPictogram(row.state, row.payment !== null)}
         {@const pictogramBusy = busyPictogramRow === row.invoice_id}
         <tr class:row-focused={isKeyboardFocused}>
           <td class="col-id mono">
@@ -846,13 +846,25 @@
                 <span aria-hidden="true">{pictogram.glyph}</span>
               </span>
             {/if}
-            <span
-              class="state-pill {signalClass(meta.signal)}"
-              title={meta.tooltip}
-            >
-              <span class="state-icon" aria-hidden="true">{meta.icon}</span>
-              <span class="state-text">{row.state}</span>
-            </span>
+            <!-- Session 162 — a paid invoice collapses to the single
+                 bag-of-coins pictogram (above). Ervin's ask: "on paid
+                 invoices no need to stack statuses like green check,
+                 Finalised, Paid. One final is enough as it supposed to
+                 have all priors." Paid is a strict superset of the
+                 SAVED-ack `Finalized` state (mark-as-paid is Finalized-
+                 gated), so the bag-of-coins implies it — the regulatory
+                 state chip + the separate Paid pill are dropped to avoid
+                 the stack. The chain badge still renders (it's an
+                 orthogonal "this invoice has children" signal). -->
+            {#if pictogram.state !== "Paid"}
+              <span
+                class="state-pill {signalClass(meta.signal)}"
+                title={meta.tooltip}
+              >
+                <span class="state-icon" aria-hidden="true">{meta.icon}</span>
+                <span class="state-text">{row.state}</span>
+              </span>
+            {/if}
             {#if row.has_chain_children}
               <span
                 class="chain-badge"
@@ -860,13 +872,14 @@
                 title="This invoice is the base of a storno or amendment chain — open the row to inspect."
               >↘</span>
             {/if}
-            {#if row.payment !== null}
+            {#if row.payment !== null && pictogram.state !== "Paid"}
               <!-- PR-70 / ADR-0039 §2 — operational Paid badge next to
-                   the regulatory state chip. Parallel signal: the
-                   state chip continues to render the NAV ladder
-                   verbatim (e.g. `Finalized` — the SAVED-ack terminal),
-                   the Paid badge announces that an operational payment
-                   record exists. -->
+                   the regulatory state chip, shown ONLY when the
+                   pictogram did NOT already collapse to the Paid
+                   bag-of-coins (i.e. a payment recorded against a
+                   non-`Final` invoice — a defensive case the pictogram
+                   leaves on its base mapping; the pill then still
+                   announces the payment record). -->
               <span
                 class="state-pill paid-pill"
                 title={`Paid on ${row.payment.paid_at}`}

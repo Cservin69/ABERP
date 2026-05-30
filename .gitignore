@@ -104,3 +104,8 @@ CLAUDE.md
 # Notes from one design/build session to the next. Not part of
 # the repo's design or code history; not for collaborators.
 /_handoffs/
+
+# --- Claude Code session runtime (local-only) ---------------
+# Per-session scheduler lock (sessionId + pid); runtime junk, never
+# part of the repo's history.
+.claude/scheduled_tasks.lock

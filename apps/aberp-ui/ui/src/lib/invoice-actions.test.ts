@@ -30,11 +30,27 @@ import {
   actionGroupLabel,
   buttonsForState,
   detailActionMeta,
+  emailButtonState,
   groupButtons,
+  navSubmitButtonState,
   type ActionGroup,
   type DetailActionButton,
 } from "./invoice-actions";
-import type { InvoiceState } from "./api";
+import type { AuditEntryView, InvoiceState } from "./api";
+
+/** Minimal audit-entry factory for the session-162 button-state pins.
+ * Only `kind` + `payload` drive the derivations; the other fields are
+ * filled with placeholders so the fixtures read as real ledger rows. */
+function entry(kind: string, payload: unknown = null): AuditEntryView {
+  return {
+    seq: 0,
+    kind,
+    actor: "test",
+    occurred_at: "2026-05-30T10:00:00Z",
+    chain_base_invoice_id: null,
+    payload,
+  };
+}
 
 interface Expected {
   state: InvoiceState;
@@ -49,11 +65,18 @@ const TABLE: Expected[] = [
   // Submitted — Response audit entry exists, no terminal ack yet.
   // PR-95 / session-115 — the pictogram (clickable when InFlight)
   // carries the poll affordance; the action bar drops the PollAck
-  // button. Email + Download.
-  { state: "Submitted", buttons: ["Email", "Download"] },
+  // button.
+  // Session 162 — "Submit" re-surfaces here as a DISABLED in-flight
+  // indicator ("Beküldés folyamatban… / Submitting…" via
+  // `navSubmitButtonState`) so the operator sees the daemon's
+  // auto-submit is under way; it never fires a second submit (the
+  // backend would 409 a re-submit on a non-`Ready` state).
+  { state: "Submitted", buttons: ["Submit", "Email", "Download"] },
   // PendingNavExists — state-2 Pending + Layer-2 Exists evidence.
-  // Same posture as Submitted at the action-bar level (pictogram
-  // owns poll); Email + Download.
+  // No Submit (re-submit is 409-gated to `Ready`; the pictogram owns
+  // re-poll); Email + Download. Session 162 keeps this row distinct
+  // from Submitted so the disabled in-flight indicator shows ONLY on
+  // the genuine operator-submitted-NAV-processing state.
   { state: "PendingNavExists", buttons: ["Email", "Download"] },
   // Pending — state-2 Pending without Layer-2 evidence. The
   // operator's next move is NAV-recovery (`retry-submission` /
@@ -111,14 +134,20 @@ describe("buttonsForState", () => {
     });
   }
 
-  it("Submit button only appears on Ready", () => {
-    // Counter-pin: the only state in the table that includes "Submit"
-    // is `Ready`. A regression that surfaced "Submit" on a
-    // post-submission state would surface as a 409 from the backend.
+  it("Submit button appears only on Ready (clickable) and Submitted (disabled in-flight)", () => {
+    // Counter-pin: the Submit button surfaces on exactly two states.
+    // `Ready` — the only state where `submit_invoice_request` accepts a
+    // POST (clickable). `Submitted` — session 162's DISABLED in-flight
+    // indicator; the component renders it via `navSubmitButtonState`
+    // with `disabled: true`, so it never fires a second submit (the
+    // backend would 409 a re-submit on a non-`Ready` state). A
+    // regression that surfaced a CLICKABLE Submit on any post-Ready
+    // state would produce that 409; the disabled-on-Submitted invariant
+    // is pinned by the `navSubmitButtonState` tests below.
     const statesWithSubmit = TABLE.filter((row) =>
       row.buttons.includes("Submit"),
     ).map((row) => row.state);
-    expect(statesWithSubmit).toEqual(["Ready"]);
+    expect(statesWithSubmit).toEqual(["Ready", "Submitted"]);
   });
 
   it("Storno button only appears on Finalized", () => {
@@ -340,14 +369,16 @@ describe("buttonsForState", () => {
     expect(groups).toEqual(["Lifecycle", "Export"]);
   });
 
-  it("groupButtons of buttonsForState('Submitted') yields only Export", () => {
+  it("groupButtons of buttonsForState('Submitted') yields Lifecycle/Export", () => {
     // Mid-flight state — PR-95 / session-115 dropped the PollAck
-    // button (the pictogram carries the poll affordance), so the
-    // Submitted action bar contains only Email + Download (both in
-    // Export). No Lifecycle, Operational, or Chain section renders.
+    // button (the pictogram carries the poll affordance). Session 162
+    // re-surfaces "Submit" (Lifecycle) as a DISABLED in-flight
+    // indicator, so the Submitted action bar shows the Lifecycle
+    // section (the "Submitting…" button) plus Export (Email +
+    // Download). No Operational or Chain section renders.
     const buttons = buttonsForState("Submitted", false);
     const groups = groupButtons(buttons).map((g) => g.group);
-    expect(groups).toEqual(["Export"]);
+    expect(groups).toEqual(["Lifecycle", "Export"]);
   });
 
   it("actionGroupLabel returns bilingual labels for every group", () => {
@@ -388,5 +419,115 @@ describe("buttonsForState", () => {
       expect(buttonsForState(state, false).includes("Pay")).toBe(false);
       expect(buttonsForState(state, true).includes("Pay")).toBe(false);
     }
+  });
+});
+
+// Session 162 — audit-driven button-state helpers. Each kind is pinned
+// with a distinct (label, glyph, disabled) triple so a derivation that
+// collapsed to a constant cannot pass vacuously (CLAUDE.md rule 9).
+describe("navSubmitButtonState", () => {
+  it("no submission attempt → not_submitted (enabled, 'Beküldés a NAV-hoz')", () => {
+    const s = navSubmitButtonState([entry("InvoiceDraftCreated")]);
+    expect(s.kind).toBe("not_submitted");
+    expect(s.label_hu).toBe("Beküldés a NAV-hoz");
+    expect(s.label_en).toBe("Submit to NAV");
+    expect(s.disabled).toBe(false);
+  });
+
+  it("attempt + no terminal ack → in_flight (DISABLED, 'Beküldés folyamatban…')", () => {
+    // The post-issue daemon has POSTed but NAV is still PROCESSING.
+    const s = navSubmitButtonState([
+      entry("InvoiceSubmissionAttempt"),
+      entry("InvoiceSubmissionResponse"),
+      entry("InvoiceAckStatus", { ack_status: "PROCESSING" }),
+    ]);
+    expect(s.kind).toBe("in_flight");
+    expect(s.label_hu).toBe("Beküldés folyamatban…");
+    expect(s.label_en).toBe("Submitting…");
+    // Disabled so the operator can't double-submit (a re-submit on a
+    // non-`Ready` state would 409 at the backend).
+    expect(s.disabled).toBe(true);
+  });
+
+  it("terminal SAVED ack → saved (disabled — re-submit is 409-gated)", () => {
+    const s = navSubmitButtonState([
+      entry("InvoiceSubmissionAttempt"),
+      entry("InvoiceAckStatus", { ack_status: "SAVED" }),
+    ]);
+    expect(s.kind).toBe("saved");
+    expect(s.disabled).toBe(true);
+  });
+
+  it("SAVED wins over a prior PROCESSING (precedence, not order)", () => {
+    const s = navSubmitButtonState([
+      entry("InvoiceSubmissionAttempt"),
+      entry("InvoiceAckStatus", { ack_status: "PROCESSING" }),
+      entry("InvoiceAckStatus", { ack_status: "SAVED" }),
+    ]);
+    expect(s.kind).toBe("saved");
+  });
+
+  it("terminal ABORTED ack → failed", () => {
+    const s = navSubmitButtonState([
+      entry("InvoiceSubmissionAttempt"),
+      entry("InvoiceAckStatus", { ack_status: "ABORTED" }),
+    ]);
+    expect(s.kind).toBe("failed");
+    expect(s.label_hu).toBe("Beküldés sikertelen");
+    expect(s.disabled).toBe(true);
+  });
+
+  it("transport-class InvoiceSubmissionAttemptFailed → failed", () => {
+    const s = navSubmitButtonState([
+      entry("InvoiceSubmissionAttempt"),
+      entry("InvoiceSubmissionAttemptFailed", { error_class: "transport" }),
+    ]);
+    expect(s.kind).toBe("failed");
+  });
+
+  it("empty audit trail → not_submitted", () => {
+    expect(navSubmitButtonState([]).kind).toBe("not_submitted");
+  });
+});
+
+describe("emailButtonState", () => {
+  it("no email attempt → idle ('Email a vevőnek', ✉)", () => {
+    const s = emailButtonState([entry("InvoiceDraftCreated")]);
+    expect(s.kind).toBe("idle");
+    expect(s.label_hu).toBe("Email a vevőnek");
+    expect(s.label_en).toBe("Email to buyer");
+    expect(s.glyph).toBe("✉");
+  });
+
+  it("succeeded send → sent ('Újraküldés', ↻)", () => {
+    const s = emailButtonState([
+      entry("InvoiceEmailedSent", { outcome: "succeeded", recipient: "a@b.hu" }),
+    ]);
+    expect(s.kind).toBe("sent");
+    expect(s.label_hu).toBe("Újraküldés");
+    expect(s.label_en).toBe("Re-send");
+    expect(s.glyph).toBe("↻");
+  });
+
+  it("failed send → failed ('Újraküldés', ↻)", () => {
+    const s = emailButtonState([
+      entry("InvoiceEmailedSent", { outcome: "failed", recipient: "a@b.hu" }),
+    ]);
+    expect(s.kind).toBe("failed");
+    expect(s.label_hu).toBe("Újraküldés");
+  });
+
+  it("latest send wins — a failure followed by a successful re-send → sent", () => {
+    // Entries are append-only; the most-recent InvoiceEmailedSent
+    // decides the label so a recovered re-send reads as sent, not failed.
+    const s = emailButtonState([
+      entry("InvoiceEmailedSent", { outcome: "failed", recipient: "a@b.hu" }),
+      entry("InvoiceEmailedSent", { outcome: "succeeded", recipient: "a@b.hu" }),
+    ]);
+    expect(s.kind).toBe("sent");
+  });
+
+  it("empty audit trail → idle", () => {
+    expect(emailButtonState([]).kind).toBe("idle");
   });
 });

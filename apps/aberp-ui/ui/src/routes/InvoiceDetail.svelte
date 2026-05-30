@@ -196,7 +196,9 @@
     actionGroupLabel,
     buttonsForState,
     detailActionMeta,
+    emailButtonState,
     groupButtons,
+    navSubmitButtonState,
     type DetailActionButton,
   } from "../lib/invoice-actions";
   import {
@@ -1092,7 +1094,10 @@
                  NAV (same `pollAck` Tauri call the obsoleted action-bar
                  PollAck button hit). Terminal states render as plain
                  spans with the tooltip-on-hover convention. -->
-            {@const pictogram = navStatusPictogram(detail.state)}
+            {@const pictogram = navStatusPictogram(
+              detail.state,
+              detail.payment !== null,
+            )}
             {@const pictogramBusy = mutationState.kind === "polling"}
             {#if pictogram.actionable}
               <button
@@ -1151,6 +1156,16 @@
     {#if detail}
       {@const buttons = buttonsForState(detail.state, detail.payment !== null)}
       {@const groups = groupButtons(buttons)}
+      <!-- Session 162 — audit-driven button states. The post-issue daemon
+           (S158 + S161) fires auto-submit + auto-email in the background;
+           these derive the live label/affordance from the audit ledger so
+           the operator sees the work is under way instead of an idle
+           button. `navSubmit` drives the "Send to NAV" button (in-flight
+           → disabled "Submitting…"); `email` drives the "Send email"
+           button (succeeded/failed → "Újraküldés"). Both read the same
+           `detail.audit_entries` the live poll refreshes. -->
+      {@const navSubmit = navSubmitButtonState(detail.audit_entries)}
+      {@const email = emailButtonState(detail.audit_entries)}
       {@const mutationBusy =
         mutationState.kind === "submitting" ||
         mutationState.kind === "polling" ||
@@ -1192,8 +1207,19 @@
                 {/if}
                 {#each group.buttons as button (button)}
                   {@const meta = detailActionMeta(button)}
+                  <!-- Session 162 — the "Send to NAV" button shows the
+                       daemon's auto-submit as in flight. When the audit
+                       ledger has an `InvoiceSubmissionAttempt` but no
+                       terminal ack, `navSubmit.kind` is `in_flight`: the
+                       button renders DISABLED as "Beküldés folyamatban…"
+                       so the operator sees the submit started and can't
+                       fire a second one (a re-submit on a non-`Ready`
+                       state would 409). -->
+                  {@const navInFlight =
+                    button === "Submit" && navSubmit.kind === "in_flight"}
                   {@const busy =
-                    (button === "Submit" && mutationState.kind === "submitting") ||
+                    (button === "Submit" &&
+                      (mutationState.kind === "submitting" || navInFlight)) ||
                     (button === "Pay" && mutationState.kind === "paying") ||
                     (button === "Storno" && mutationState.kind === "cancelling") ||
                     (button === "Email" && mutationState.kind === "emailing") ||
@@ -1202,18 +1228,34 @@
                     (button === "Download"
                       ? downloadState === "downloading" || mutationBusy
                       : mutationBusy) ||
-                    (button === "Storno" && stornoConfirmOpen)}
-                  {@const resend =
-                    button === "Email" && lastSuccessfulEmail !== null}
-                  {@const labelHu = resend ? "Újraküldés" : meta.label_hu}
-                  {@const labelEn = resend ? "Re-send" : meta.label_en}
-                  {@const glyph = resend ? "↻" : meta.glyph}
-                  {@const tooltip = resend
-                    ? "Újabb e-mail küldése a vevőnek (új audit-bejegyzéssel)."
-                    : meta.tooltip_hu}
+                    (button === "Storno" && stornoConfirmOpen) ||
+                    navInFlight}
+                  <!-- Session 162 — the "Send email" button reflects the
+                       last send's audit outcome. `email.kind`: `idle`
+                       (first-time "Email a vevőnek"), `sent` (succeeded →
+                       "Újraküldés"), or `failed` (last send failed →
+                       "Újraküldés" + a red error marker). The success
+                       timestamp pill above is driven by
+                       `lastSuccessfulEmail` separately. -->
+                  {@const emailFailed =
+                    button === "Email" && email.kind === "failed"}
+                  {@const labelHu =
+                    button === "Email" ? email.label_hu : meta.label_hu}
+                  {@const labelEn =
+                    button === "Email" ? email.label_en : meta.label_en}
+                  {@const glyph =
+                    button === "Email" ? email.glyph : meta.glyph}
+                  {@const tooltip =
+                    button === "Email" && email.kind !== "idle"
+                      ? emailFailed
+                        ? "Az utolsó e-mail küldés sikertelen volt — kattints az újraküldéshez · Last send failed — click to re-send."
+                        : "Újabb e-mail küldése a vevőnek (új audit-bejegyzéssel)."
+                      : meta.tooltip_hu}
                   <button
                     type="button"
-                    class="action-button {busy ? 'action-button-busy' : ''}"
+                    class="action-button {busy ? 'action-button-busy' : ''} {emailFailed
+                      ? 'action-button-error'
+                      : ''}"
                     onclick={() => dispatchAction(button)}
                     disabled={disabled}
                     aria-label={labelEn}
@@ -2115,6 +2157,16 @@
   .action-button-busy {
     cursor: progress !important;
     opacity: 0.8;
+  }
+
+  /* Session 162 — the Email button when the LAST send failed (audit-
+     derived). A red-toned border + glyph marks the failure so the
+     operator sees it on reload (not only in the transient post-click
+     `lastEmailOutcome` banner); the button stays enabled so a re-send
+     is one click away. */
+  .action-button-error {
+    color: var(--color-signal-negative);
+    border-color: var(--color-signal-negative);
   }
 
   .action-button-danger {

@@ -89,7 +89,16 @@ export function quickActionsForState(
   // index order. Decoupling them keeps each surface's UX intent
   // independent.
   if (detail.includes("Download")) out.push("Download");
-  if (detail.includes("Submit")) out.push("Submit");
+  // Session 162 — Submit surfaces as a row quick-action ONLY on `Ready`,
+  // the one state where a click legally submits (`submit_invoice_request`
+  // 409s a re-submit on any other state). `buttonsForState` also returns
+  // Submit on the in-flight `Submitted` state, but there it is a DISABLED
+  // "Beküldés folyamatban…" indicator the detail dialog renders — a row
+  // quick-action has no disabled affordance, so a clickable row Submit on
+  // `Submitted` would bypass the precondition guard and 409. Gating on
+  // `Ready` keeps the row affordance clickable-legal (the mirror
+  // invariant's intent) while the detail dialog owns the in-flight view.
+  if (detail.includes("Submit") && state === "Ready") out.push("Submit");
   if (detail.includes("Pay")) out.push("Pay");
   if (detail.includes("Storno")) out.push("Storno");
   return out;

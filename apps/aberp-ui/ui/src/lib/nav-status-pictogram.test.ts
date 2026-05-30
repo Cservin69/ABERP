@@ -183,3 +183,61 @@ describe("navStatusPictogram", () => {
     }
   });
 });
+
+// Session 162 — the operational-paid superset. `isPaid` collapses a
+// NAV-terminal-positive (Final) invoice into the single bag-of-coins
+// pictogram so the State column / detail header read ONE final visual
+// instead of the pre-162 `✓ + Finalized + Paid` stack. Pinned per
+// CLAUDE.md rule 9 — the assertions below cannot pass vacuously: the
+// "marked-paid but no prior terminal" row asserts the Paid glyph does
+// NOT appear, so a derivation that returned Paid unconditionally would
+// fail it.
+describe("navStatusPictogram — Paid superset (session 162)", () => {
+  it("Final + isPaid → Paid (bag-of-coins, Kifizetve/Paid)", () => {
+    // The canonical paid invoice: NAV said SAVED (Finalized) AND a
+    // payment record exists. Collapses to the bag-of-coins pictogram.
+    const meta = navStatusPictogram("Finalized", true);
+    expect(meta.state).toBe("Paid");
+    expect(meta.glyph).toBe("💰");
+    expect(meta.tooltip_hu).toBe("Kifizetve");
+    expect(meta.tooltip_en).toBe("Paid");
+    expect(meta.kind_class).toBe("pictogram-positive");
+    expect(meta.actionable).toBe(false);
+  });
+
+  it("Storno / Amended + isPaid → Paid (Final-based chain states qualify)", () => {
+    // Storno + Amended both map to the `Final` base (SAVED-based chain
+    // heads), so a payment record against them collapses to Paid too.
+    for (const state of ["Storno", "Amended"] as const) {
+      expect(navStatusPictogram(state, true).state).toBe("Paid");
+    }
+  });
+
+  it("Finalized WITHOUT isPaid stays Final (not Paid)", () => {
+    // The unpaid baseline: a SAVED invoice with no payment record keeps
+    // the terminal-positive ✓ pictogram. A regression that returned
+    // Paid for every Final invoice would fail here.
+    const meta = navStatusPictogram("Finalized", false);
+    expect(meta.state).toBe("Final");
+    expect(meta.glyph).toBe("✓");
+  });
+
+  it("isPaid omitted defaults to unpaid (backward-compatible call site)", () => {
+    // Existing single-arg call sites (the pre-162 List/Detail renders,
+    // the exhaustive TABLE above) must keep returning the unpaid base.
+    expect(navStatusPictogram("Finalized").state).toBe("Final");
+  });
+
+  it("marked-paid but base NOT terminal → base mapping, NOT Paid (defensive)", () => {
+    // Mark-as-paid is `Finalized`-gated at the backend route (ADR-0039
+    // §2), so a payment on a non-Final invoice should be impossible. If
+    // it ever occurs (a backend precondition breach), the derivation
+    // surfaces the anomaly via the base pictogram rather than masking it
+    // behind the Paid glyph (CLAUDE.md rule 12 — fail visible).
+    for (const state of ["Ready", "Submitted", "Pending", "Rejected"] as const) {
+      const meta = navStatusPictogram(state, true);
+      expect(meta.state).not.toBe("Paid");
+      expect(meta.state).toBe(navStatusPictogram(state, false).state);
+    }
+  });
+});

@@ -47,7 +47,17 @@ export type NavPictogramState =
   | "NotSubmitted"
   | "Submitted"
   | "Rejected"
-  | "Final";
+  | "Final"
+  // Session 162 — operational-paid superset of `Final`. An invoice that
+  // is NAV-terminal-positive (SAVED → `Final`) AND carries a payment
+  // record collapses to ONE visual: the bag-of-coins pictogram. Ervin's
+  // ask (2026-05-29): "on paid invoices no need to stack statuses like
+  // green check, Finalised, Paid. One final is enough as it supposed to
+  // have all priors." Paid is a strict superset of Final (mark-as-paid
+  // is `Finalized`-gated at the backend route per ADR-0039), so the
+  // bag-of-coins implies the prior SAVED-ack state; the renderer drops
+  // the separate `Finalized` chip + `Paid` pill when this state shows.
+  | "Paid";
 
 /** Display + behaviour affordance for one of the four pictogram states.
  * Mirrors `LabelMeta` in `labels.ts` shape-wise (glyph + tooltip), but
@@ -114,7 +124,42 @@ export interface NavPictogramMeta {
  * rule 12 (fail visible, not silent). */
 export function navStatusPictogram(
   state: InvoiceState | string,
+  isPaid: boolean = false,
 ): NavPictogramMeta {
+  const base = basePictogram(state);
+  // Session 162 — Paid is a strict superset of `Final`. Collapse the
+  // (Final + payment-recorded) pair into the single bag-of-coins
+  // pictogram so the operator reads ONE final visual instead of the
+  // pre-162 stack (`✓` pictogram + `Finalized` chip + `Paid` pill).
+  // Defensive: only Final invoices can carry a payment (mark-as-paid is
+  // `Finalized`-gated at the backend route per ADR-0039 §2), so an
+  // `isPaid` on a non-Final base — which would indicate a backend
+  // precondition breach — falls through to the base mapping rather than
+  // masking the anomaly behind the Paid glyph (CLAUDE.md rule 12).
+  if (isPaid && base.state === "Final") {
+    return {
+      state: "Paid",
+      // Bag-of-coins — Ervin's named glyph ("the bag of coins
+      // pictogram as I loved it"). Same 💰 the mark-as-paid action
+      // uses, so the operator recognises the affordance→state pair.
+      // The green-toned `pictogram-positive` border carries the
+      // NAV-accepted (SAVED) signal the bag's own emoji colour cannot;
+      // green-border + bag = "accepted AND paid" in one square.
+      glyph: "💰",
+      tooltip_hu: "Kifizetve",
+      tooltip_en: "Paid",
+      kind_class: "pictogram-positive",
+      actionable: false,
+    };
+  }
+  return base;
+}
+
+/** The unpaid base mapping — `InvoiceState` → one of the four
+ * NAV-ladder pictogram states. Factored out of `navStatusPictogram` so
+ * the operational-paid superset layers cleanly on top without
+ * duplicating the eleven-state switch. */
+function basePictogram(state: InvoiceState | string): NavPictogramMeta {
   switch (state) {
     case "Unknown":
     case "Ready":

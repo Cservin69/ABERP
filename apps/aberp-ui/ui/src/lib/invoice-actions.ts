@@ -25,7 +25,7 @@
 // visual hierarchy on the operator's daily console) so it lives next
 // to `buttonsForState` and is pinned by the same test file.
 
-import type { InvoiceState } from "./api";
+import type { AuditEntryView, InvoiceState } from "./api";
 
 /** Closed vocab of operator-visible action buttons that can appear
  * in the invoice-detail modal header. Kept narrow per CLAUDE.md
@@ -80,13 +80,32 @@ export function buttonsForState(
       // Pre-submission: operator can submit, email, or download.
       return ["Submit", "Email", "Download"];
     case "Submitted":
-    case "PendingNavExists":
       // Submitted but no terminal ack yet. PR-95 / session-115 —
       // the NAV-status pictogram (clickable when InFlight) is now
       // the poll affordance; the action bar drops the dedicated
       // PollAck button so the operator's eye lands on a single
       // poll surface. Download stays available throughout the
       // lifecycle per A155 + PR-44ε.UI; Email per PR-92.
+      //
+      // Session 162 — re-surface "Submit" here as a DISABLED in-flight
+      // indicator. Ervin's ask (2026-05-29): when the post-issue daemon
+      // auto-submits, the detail dialog's "Send to NAV" button looked
+      // idle, so the operator could not tell the submit had started.
+      // The button renders here only while NAV is processing; the
+      // component reads `navSubmitButtonState` to label it
+      // "Beküldés folyamatban… / Submitting…" and keep it DISABLED, so
+      // it never fires a second `submitInvoice` (the backend would 409
+      // a re-submit on a non-`Ready` state per `submit_invoice_request`).
+      // On the terminal ack the state leaves `Submitted` and the button
+      // drops; re-checking is the pictogram's job, not a resend.
+      return ["Submit", "Email", "Download"];
+    case "PendingNavExists":
+      // PendingNavExists — NAV has the submission but the local ledger
+      // lacks the Response/ack pair. Download + Email only; no Submit
+      // (re-submit is 409-gated to `Ready`, and the pictogram drives
+      // re-poll). Kept separate from `Submitted` per session 162 so the
+      // disabled in-flight Submit indicator shows ONLY on the genuine
+      // operator-submitted-NAV-processing state.
       return ["Email", "Download"];
     case "Pending":
       // State-2 Pending without Layer-2 evidence: NAV-recovery is the
@@ -290,4 +309,188 @@ export function actionGroupLabel(group: ActionGroup): {
     case "Export":
       return { label_hu: "Export", label_en: "Export" };
   }
+}
+
+// ── Session 162 — audit-driven button state for the detail dialog ────
+//
+// Ervin's ask (2026-05-29): when the operator issues with auto-submit-
+// to-NAV + auto-email toggled on, the detail dialog opens (S158) and the
+// post-issue daemon (S158 + S161) fires those actions in the background.
+// The "Send to NAV" / "Send email" buttons showed their idle labels, so
+// the operator could not tell anything had started. These helpers derive
+// the button's label/affordance from the live audit ledger (the same
+// audit-immutable, derive-never-write pattern that powers the pictogram).
+//
+// Audit-vocabulary reality (verified against
+// `crates/audit-ledger/.../event_kind.rs`, NOT the brief's guessed
+// names): NAV submit writes `InvoiceSubmissionAttempt` (before the POST
+// returns), then `InvoiceSubmissionResponse` + `InvoiceAckStatus`
+// (ack_status RECEIVED/PROCESSING/SAVED/ABORTED), or
+// `InvoiceSubmissionAttemptFailed` on a transport-class failure. Email
+// writes exactly ONE `InvoiceEmailedSent` per send attempt (payload
+// `outcome: "succeeded" | "failed"`) — there is NO queued/started event,
+// so email "in flight" is NOT observable from the ledger (see the
+// `emailButtonState` doc comment).
+
+/** Closed vocab of the NAV-submit button's audit-derived states.
+ * `not_submitted` → operator hasn't submitted; `in_flight` → submitted,
+ * NAV processing (no terminal ack yet); `saved` → NAV accepted (SAVED);
+ * `failed` → NAV rejected (ABORTED) or the attempt failed at transport.
+ *
+ * The action bar renders the NAV-submit button ONLY on `Ready`
+ * (`not_submitted`) and the in-flight `Submitted` state (`in_flight`,
+ * shown DISABLED). The `saved` / `failed` arms are derivation-complete
+ * and pinned, but NOT surfaced as a button: re-submit is 409-gated to
+ * `Ready` at `serve::submit_invoice_request`, so a "Resend to NAV"
+ * affordance would always error — re-checking a terminal invoice is the
+ * NAV-status pictogram's job, not a resubmit. */
+export type NavSubmitButtonKind =
+  | "not_submitted"
+  | "in_flight"
+  | "saved"
+  | "failed";
+
+export interface NavSubmitButtonState {
+  kind: NavSubmitButtonKind;
+  /** Hungarian visible label — operator's native language. */
+  label_hu: string;
+  /** English label — screen-reader aria-label fallback. */
+  label_en: string;
+  /** Leading glyph. `…` for in-flight (paired with a CSS spinner). */
+  glyph: string;
+  /** Whether the button is disabled. True for `in_flight` (the operator
+   * must not double-submit while NAV is processing) and the two terminal
+   * arms (no legal re-submit). False only for `not_submitted`. */
+  disabled: boolean;
+}
+
+/** Read the `ack_status` string off an `InvoiceAckStatus` payload.
+ * Mirrors `invoice-timeline.ts::readAckStatus`; narrows defensively so a
+ * malformed payload reads as `null` (no terminal) rather than crashing. */
+function readAckStatus(payload: unknown): string | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const ack = (payload as { ack_status?: unknown }).ack_status;
+  return typeof ack === "string" ? ack : null;
+}
+
+/** Derive the NAV-submit button's audit state from an invoice's audit
+ * entries (any order — the predicates are presence-based, not
+ * positional). Precedence: a SAVED ack wins (terminal positive); else an
+ * ABORTED ack or a transport-class `InvoiceSubmissionAttemptFailed` is
+ * terminal negative; else a bare `InvoiceSubmissionAttempt` is in flight;
+ * else nothing has been submitted. Pinned by `invoice-actions.test.ts`. */
+export function navSubmitButtonState(
+  entries: AuditEntryView[],
+): NavSubmitButtonState {
+  let hasAttempt = false;
+  let hasSaved = false;
+  let hasFailed = false;
+  for (const e of entries) {
+    if (e.kind === "InvoiceSubmissionAttempt") hasAttempt = true;
+    else if (e.kind === "InvoiceSubmissionAttemptFailed") hasFailed = true;
+    else if (e.kind === "InvoiceAckStatus") {
+      const ack = readAckStatus(e.payload);
+      if (ack === "SAVED") hasSaved = true;
+      else if (ack === "ABORTED") hasFailed = true;
+    }
+  }
+  if (hasSaved) {
+    return {
+      kind: "saved",
+      label_hu: "Beküldve",
+      label_en: "Submitted to NAV",
+      glyph: "✓",
+      disabled: true,
+    };
+  }
+  if (hasFailed) {
+    return {
+      kind: "failed",
+      label_hu: "Beküldés sikertelen",
+      label_en: "Submission failed",
+      glyph: "⚠",
+      disabled: true,
+    };
+  }
+  if (hasAttempt) {
+    return {
+      kind: "in_flight",
+      label_hu: "Beküldés folyamatban…",
+      label_en: "Submitting…",
+      glyph: "…",
+      disabled: true,
+    };
+  }
+  return {
+    kind: "not_submitted",
+    label_hu: "Beküldés a NAV-hoz",
+    label_en: "Submit to NAV",
+    glyph: "↗",
+    disabled: false,
+  };
+}
+
+/** Closed vocab of the email button's audit-derived states. `idle` → no
+ * send recorded yet (first-time affordance); `sent` → the latest send
+ * succeeded (re-send affordance + the operator sees the "Elküldve {time}"
+ * pill the component derives separately); `failed` → the latest send
+ * failed (re-send affordance + an error marker).
+ *
+ * NO `in_flight` arm: the ledger writes exactly one `InvoiceEmailedSent`
+ * per send ATTEMPT (success OR failure) and has NO queued/started event,
+ * so an in-flight send is not observable from the audit ledger. The
+ * manual-click in-flight is surfaced by the component's `mutationState`
+ * ('emailing'); the post-issue daemon's auto-send in-flight has no
+ * observable signal and is deliberately NOT faked (CLAUDE.md rule 12). */
+export type EmailButtonKind = "idle" | "sent" | "failed";
+
+export interface EmailButtonState {
+  kind: EmailButtonKind;
+  label_hu: string;
+  label_en: string;
+  glyph: string;
+}
+
+/** Read the `outcome` string off an `InvoiceEmailedSent` payload. */
+function readEmailOutcome(payload: unknown): string | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const outcome = (payload as { outcome?: unknown }).outcome;
+  return typeof outcome === "string" ? outcome : null;
+}
+
+/** Derive the email button's audit state from an invoice's audit
+ * entries. The LATEST `InvoiceEmailedSent` (highest seq — entries are
+ * append-only, so the last matching entry) decides the label: a prior
+ * failed send followed by a successful re-send reads as `sent`. Pinned by
+ * `invoice-actions.test.ts`. */
+export function emailButtonState(entries: AuditEntryView[]): EmailButtonState {
+  let latestOutcome: string | null = null;
+  for (const e of entries) {
+    if (e.kind === "InvoiceEmailedSent") {
+      const outcome = readEmailOutcome(e.payload);
+      if (outcome !== null) latestOutcome = outcome;
+    }
+  }
+  if (latestOutcome === "succeeded") {
+    return {
+      kind: "sent",
+      label_hu: "Újraküldés",
+      label_en: "Re-send",
+      glyph: "↻",
+    };
+  }
+  if (latestOutcome === "failed") {
+    return {
+      kind: "failed",
+      label_hu: "Újraküldés",
+      label_en: "Re-send",
+      glyph: "↻",
+    };
+  }
+  return {
+    kind: "idle",
+    label_hu: "Email a vevőnek",
+    label_en: "Email to buyer",
+    glyph: "✉",
+  };
 }
