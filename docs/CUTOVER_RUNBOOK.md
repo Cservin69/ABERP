@@ -1,6 +1,7 @@
 # ABERP production cutover runbook
 
-**Last updated:** 2026-05-30 — Session 169 / PR-169.
+**Last updated:** 2026-05-30 — Session 169 / PR-169 (icons + Tauri SPA
+embed + runbook + release.sh).
 **Audience:** Ervin (sole operator).
 **Language:** EN-primary; HU clarifications inline where they help at the
 machine.
@@ -114,16 +115,35 @@ helyre. Minden következő lépés ebből a mappából fut.
 
 ---
 
-## Step 2a — Verify Tauri icons are populated (CRITICAL)
+## Step 2a — Pre-build sanity checks (CRITICAL)
 
-**Tauri 2 fails silently on missing or malformed app icons.** The build
-succeeds, the window opens, but the WebView never initialises and the
-operator sees a blank white screen with no error in the logs. The
-2026-05-30 cutover hit this exact failure mode on a fresh clone.
+Two fresh-clone gotchas can both surface as a white window with no logs.
+Verify them BEFORE running `run_prod.sh` so the diagnosis time isn't lost
+later.
 
-The release branch ships placeholder icons at
-`apps/aberp-ui/icons/`. Verify they exist and have non-zero size before
-building:
+**(i) SPA embedding — the real 2026-05-30 culprit.** `apps/aberp-ui/ui/dist/`
+holds the built SPA. The directory is gitignored, so a fresh clone has
+NO built SPA. `run_prod.sh` (S169-onward) runs `npm install && npm run build`
+in `apps/aberp-ui/ui/` automatically before cargo, then sanity-checks
+`dist/index.html` exists. The Tauri dep also has the `custom-protocol`
+feature enabled (PR-169) so the release binary serves embedded assets via
+the `tauri://localhost` scheme instead of falling back to `devUrl`. If
+either condition is missing, the binary opens a window that tries to load
+`http://localhost:5173` (Vite dev server), and you see a white screen
+unless Vite is running in parallel.
+
+You don't usually need to do anything for (i) — `run_prod.sh` handles it.
+But you can confirm the binary embeds the SPA after a build:
+
+```bash
+strings target/release/aberp-ui | grep -c "svelte-"
+# Expect a large number (hundreds+). Zero means the SPA isn't embedded —
+# do NOT launch; re-run run_prod.sh from a clean tree.
+```
+
+**(ii) Tauri icons.** `apps/aberp-ui/icons/` must contain non-zero icon
+files. Missing or zero-byte icons can also cause a silent WebView init
+failure (NSImage init returns nil on bad icon data).
 
 ```bash
 ls -l apps/aberp-ui/icons/
@@ -131,8 +151,8 @@ ls -l apps/aberp-ui/icons/
 #         icon.png, icon.icns, icon.ico
 ```
 
-If any file is missing or zero-byte, regenerate from the script (the
-icons are derived; the source script is committed):
+The release branch ships placeholder icons. If any file is missing or
+zero-byte, regenerate from the script:
 
 ```bash
 python3 tools/generate-icons.py
@@ -161,7 +181,26 @@ seller wizard** (PR-51 / session 71). No hand-editing required.
 ./run/run_prod.sh
 ```
 
-What happens:
+What `run_prod.sh` does on first launch (S169 — newly load-bearing):
+
+0. `(cd apps/aberp-ui/ui && npm install --silent && npm run build)` —
+   builds the SPA into `ui/dist/`. The Tauri compiler embeds these
+   files into the release binary; without them you get a white window
+   on launch (see Troubleshooting).
+1. Sanity-checks `apps/aberp-ui/ui/dist/index.html` is non-zero. Aborts
+   loud if not.
+2. `cargo build --release --features production --bin aberp`
+3. `cargo build --release --features production --bin aberp-ui` —
+   the tauri dep has the `custom-protocol` feature always-on (PR-169,
+   `apps/aberp-ui/Cargo.toml`), which registers the `tauri://localhost`
+   URI scheme the WebView uses to serve the embedded SPA in release
+   builds. Without that feature, the binary falls back to `devUrl`
+   (Vite at :5173) — the 2026-05-30 failure mode.
+4. `cargo run --release --features production --bin aberp-ui` launches
+   the Tauri shell. The shell spawns `aberp serve` as a subprocess
+   and the SPA loads from embedded assets.
+
+What happens inside the binary as it boots:
 
 1. Backend boots, detects `~/.aberp/prod/seller.toml` is absent (or
    identity-incomplete) → boot state `NeedsSellerConfig`.
@@ -451,12 +490,45 @@ többi automatikus.
 aberp-ui, but the window renders fully white. No errors in stdout,
 stderr, or the Console.app system log.
 
-**Cause:** missing or malformed Tauri app icons under
-`apps/aberp-ui/icons/`. macOS `NSImage` init returns nil on a
-zero-byte or missing icon file; the WebView never reaches `loadURL`;
-the window stays at the initial white frame.
+**Most likely cause (S169 — was the 2026-05-30 cutover root cause):**
+the release binary is loading the SPA from `http://localhost:5173`
+(Vite dev server) instead of from embedded assets. Two prerequisites
+must BOTH be true for the embed path to work:
+
+1. `apps/aberp-ui/Cargo.toml` has `custom-protocol` in the tauri dep's
+   feature list. PR-169 added it (always-on); if your branch predates
+   that commit, the binary cannot serve embedded assets regardless of
+   `frontendDist`.
+2. `apps/aberp-ui/ui/dist/index.html` exists at the time `cargo build`
+   runs. `dist/` is gitignored — fresh clones have nothing here.
+   PR-169 `run_prod.sh` runs `npm install && npm run build` before
+   cargo to guarantee this.
+
+**Quick diagnosis:**
+
+```bash
+# Is anything listening on the Vite port? In prod you want NO.
+lsof -i :5173
+
+# Does the built binary contain the SPA?
+strings target/release/aberp-ui | grep -c "svelte-"
+#   >100 → SPA is embedded. White screen is NOT this cause.
+#   0    → SPA missing from binary. Re-run with the fix below.
+```
 
 **Fix:**
+
+```bash
+# Force a fully clean rebuild.
+cargo clean -p aberp-ui
+rm -rf apps/aberp-ui/ui/dist apps/aberp-ui/ui/node_modules
+./run/run_prod.sh
+```
+
+If you confirm SPA strings are >100 AND :5173 is empty AND the window
+is still white, the secondary cause is **missing or malformed Tauri
+icons** under `apps/aberp-ui/icons/`. macOS `NSImage` init returns nil
+on bad icon data; the WebView never reaches `loadURL`.
 
 ```bash
 ls -l apps/aberp-ui/icons/

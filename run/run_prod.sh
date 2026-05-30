@@ -126,11 +126,40 @@ echo >&2
 # time gate covers both halves of the process group.
 cd "$REPO_ROOT" || { echo "${c_red}[fail]${c_rst} repo not at $REPO_ROOT" >&2; exit 2; }
 
+# S169 / PR-169 — build the SPA into ui/dist BEFORE cargo build.
+# tauri::generate_context!() embeds frontendDist (= apps/aberp-ui/ui/dist)
+# at compile time. ui/dist is gitignored, so a fresh prod clone has no
+# built SPA; raw `cargo build` would link an aberp-ui binary with empty
+# embedded assets, and the tauri:// scheme handler would 404 — at which
+# point the WebView falls back to devUrl and the operator sees a blank
+# window. The SPA build below + custom-protocol feature on the tauri
+# dep (apps/aberp-ui/Cargo.toml) together make the release binary
+# self-contained (no Vite needed).
+readonly UI_DIR="${REPO_ROOT}/apps/aberp-ui/ui"
+readonly UI_DIST="${UI_DIR}/dist"
+
+echo "${c_dim}[ui] (cd apps/aberp-ui/ui && npm install --silent)${c_rst}" >&2
+(cd "$UI_DIR" && npm install --silent) \
+  || { echo "${c_red}[fail]${c_rst} npm install in $UI_DIR failed" >&2; exit 4; }
+
+echo "${c_dim}[ui] (cd apps/aberp-ui/ui && npm run build)${c_rst}" >&2
+(cd "$UI_DIR" && npm run build) \
+  || { echo "${c_red}[fail]${c_rst} npm run build in $UI_DIR failed" >&2; exit 4; }
+
+if [[ ! -s "$UI_DIST/index.html" ]]; then
+  echo "${c_red}[fail]${c_rst} SPA build did not produce $UI_DIST/index.html" >&2
+  echo "        the Tauri binary will embed nothing and fall back to devUrl." >&2
+  echo "${c_red}[hiba]${c_rst} A SPA build nem hozta létre a $UI_DIST/index.html fájlt;" >&2
+  echo "        a Tauri bináris üresen embedelne, a WebView devUrl-re esne vissza." >&2
+  exit 4
+fi
+echo "${c_grn}[ ok ]${c_rst} SPA built; $UI_DIST/index.html present" >&2
+
 echo "${c_dim}[build] cargo build --release --features production --bin aberp${c_rst}" >&2
 cargo build --release --features production --bin aberp
 
 echo "${c_dim}[build] cargo build --release --features production --bin aberp-ui${c_rst}" >&2
-cargo build --release --bin aberp-ui
+cargo build --release --features production --bin aberp-ui
 
 echo
 echo "${c_grn}[launch]${c_rst} starting ABERP in PRODUCTION mode..." >&2

@@ -48,7 +48,17 @@ tauri-build = { workspace = true }
 # `wry` is re-enabled here as the platform web-renderer feature; the
 # workspace pin keeps default-features off so cross-platform variants
 # can swap renderers without churning the workspace line.
-tauri = { workspace = true, features = ["wry"] }
+#
+# S169 / PR-169 — `custom-protocol` is the feature that registers the
+# `tauri://` URI scheme used by release builds to serve the embedded
+# SPA assets from `frontendDist` (per tauri.conf.json). Without it, a
+# `cargo build --release` binary cannot reach its own embedded SPA at
+# runtime and falls back to `devUrl` (http://localhost:5173), which
+# requires Vite running in a parallel terminal — exactly the failure
+# Ervin worked around during the 2026-05-30 cutover. In debug builds,
+# Tauri uses devUrl regardless of this flag (HMR), so keeping
+# custom-protocol always-on costs nothing for the dev loop.
+tauri = { workspace = true, features = ["wry", "custom-protocol"] }
 
 # Binary boundary: anyhow per ADR-0021 Part A item 2 (same posture as
 # apps/aberp's main.rs).
