@@ -65,6 +65,9 @@ use crate::audit_payloads::InvoiceDraftCreatedPayload;
 use crate::binary_hash;
 use crate::cli::PrintInvoiceArgs;
 use crate::invoice_bank_snapshot::load_invoice_bank_snapshot_in_tx;
+use crate::issue_invoice::{AddressJson, CustomerJson, InvoiceInputJson};
+use crate::nav_xml::CustomerVatStatus;
+use crate::serve::sibling_input_json_path;
 
 // ──────────────────────────────────────────────────────────────────────
 // Entry points
@@ -217,16 +220,20 @@ pub fn render_to_bytes(
         bank_name: supplier_bank.bank_name,
         swift_bic: supplier_bank.swift_bic,
     };
+    // S168 — for PRIVATE_PERSON buyers the NAV wire suppresses
+    // `<customerName>` + `<customerAddress>` per ADR-0048 amendment
+    // 2026-05-29 (NAV business rule CUSTOMER_DATA_NOT_EXPECTED). The PDF
+    // must still carry both fields per Áfa tv. §169 when the operator
+    // entered them, so we re-source from the operator's audit-immutable
+    // `<ULID>.input.json` side-store (PR-47α). For DOMESTIC / OTHER
+    // invoices, and for CLI-issued invoices without an input.json
+    // sibling, the NAV-XML values flow through unchanged.
+    let operator_customer = load_operator_customer_input(&xml_path)?;
+    let customer_pdf = derive_customer_pdf_fields(&parsed, operator_customer.as_ref());
     let customer = PartyInfo {
-        name: parsed.customer_name.clone(),
-        // Session-150 — buyer address from the NAV XML snapshot (Áfa tv.
-        // §169 mandates it on the printed invoice for all customer
-        // types). The on-disk NAV XML is the audit-immutable record;
-        // partner-record edits after issuance do not mutate it. Empty
-        // for pre-session-150 PrivatePerson invoices whose XML omitted
-        // `<customerAddress>` — the renderer skips empty lines.
-        address_lines: parsed.customer_address_lines.clone(),
-        tax_number: parsed.customer_tax_number.clone(),
+        name: customer_pdf.name,
+        address_lines: customer_pdf.address_lines,
+        tax_number: customer_pdf.tax_number,
         bank_account_number: None,
         iban: None,
         bank_name: None,
@@ -943,6 +950,107 @@ fn supplier_bank_fields(
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// S168 — PRIVATE_PERSON PDF buyer-block re-source
+// ──────────────────────────────────────────────────────────────────────
+
+/// Buyer fields the PDF renderer needs in a single struct so the
+/// override switch reads as one branch rather than a triple-shuffle of
+/// local mutables in `render_to_bytes`.
+struct CustomerPdfFields {
+    name: String,
+    address_lines: Vec<String>,
+    tax_number: String,
+}
+
+/// S168 — resolve the buyer-block fields the PDF renderer ultimately
+/// consumes.
+///
+/// **DOMESTIC / OTHER (and any path with no operator input.json):**
+/// passthrough — the NAV XML on disk carries `<customerName>` and
+/// `<customerAddress>` and they have been parsed into
+/// [`ParsedNavInvoice`] already.
+///
+/// **PRIVATE_PERSON (per the operator's input.json `vat_status`):** the
+/// NAV wire body suppresses `<customerName>` + `<customerAddress>` per
+/// ADR-0048 amendment 2026-05-29 (NAV business rule
+/// `CUSTOMER_DATA_NOT_EXPECTED`), so the parser yields empty strings /
+/// empty vec for both fields. The printed PDF must still carry the
+/// buyer's name + address per Áfa tv. §169 when the operator entered
+/// them; we re-source from `CustomerJson` (the operator's
+/// audit-immutable snapshot side-stored at issuance time). Tax number
+/// is force-cleared for PRIVATE_PERSON regardless of what either source
+/// carries — ADR-0048 §1 forbids it on a natural-person buyer.
+fn derive_customer_pdf_fields(
+    parsed: &ParsedNavInvoice,
+    operator_input: Option<&CustomerJson>,
+) -> CustomerPdfFields {
+    let mut fields = CustomerPdfFields {
+        name: parsed.customer_name.clone(),
+        address_lines: parsed.customer_address_lines.clone(),
+        tax_number: parsed.customer_tax_number.clone(),
+    };
+
+    if let Some(cust) = operator_input {
+        if cust.vat_status == CustomerVatStatus::PrivatePerson {
+            fields.name = cust.name.clone();
+            fields.address_lines = cust
+                .address
+                .as_ref()
+                .map(address_lines_from_input_json)
+                .unwrap_or_default();
+            fields.tax_number.clear();
+        }
+    }
+
+    fields
+}
+
+/// Mirror the parser's `<customerAddress>` line layout — countryCode →
+/// postalCode → city → street — and drop empty fields so the renderer
+/// does not waste a row on a blank line. Matches the same order +
+/// empty-skip the NAV-XML parser uses for `<common:simpleAddress>` so
+/// PRIVATE_PERSON PDFs look identical in shape to DOMESTIC PDFs.
+fn address_lines_from_input_json(addr: &AddressJson) -> Vec<String> {
+    [
+        addr.country_code.as_str(),
+        addr.postal_code.as_str(),
+        addr.city.as_str(),
+        addr.street.as_str(),
+    ]
+    .iter()
+    .filter(|s| !s.is_empty())
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
+/// S168 — read the operator's `CustomerJson` from the sibling
+/// `<ULID>.input.json` written at issuance (PR-47α). Returns `None`
+/// when the side-store does not exist (CLI-issued invoices, pre-PR-47α
+/// SPA invoices) so the renderer falls back to the NAV-XML-parsed
+/// fields. Parse failure on an existing file is a loud error per
+/// CLAUDE.md rule 12.
+fn load_operator_customer_input(xml_path: &Path) -> Result<Option<CustomerJson>> {
+    let input_json_path = sibling_input_json_path(xml_path);
+    let bytes = match fs::read(&input_json_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(anyhow!(
+                "read sibling input.json at {} for printed-invoice buyer override: {e}",
+                input_json_path.display()
+            ))
+        }
+    };
+    let input: InvoiceInputJson = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parse sibling input.json at {} for printed-invoice buyer override",
+            input_json_path.display()
+        )
+    })?;
+    Ok(Some(input.customer))
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Seller-info TOML
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1266,6 +1374,232 @@ swift_bic = "OTPVHUHB"
                 "Budapest".to_string(),
                 "Fő utca 1.".to_string(),
             ],
+        );
+    }
+
+    // ── S168 — PRIVATE_PERSON PDF buyer-block re-source ───────────────
+
+    /// Synthesise a `ParsedNavInvoice` whose customer slots mirror a
+    /// PRIVATE_PERSON NAV body — `<customerName>` and `<customerAddress>`
+    /// absent (Session-154), so the parser returns empty strings / empty
+    /// vec. The fixture keeps the supplier + line fields valid for the
+    /// downstream renderer, though the unit tests below only assert on
+    /// the customer-PDF derivation so those fields are not exercised.
+    fn private_person_parsed_with_empty_customer_block() -> ParsedNavInvoice {
+        let mut p = ParsedNavInvoice::empty();
+        p.invoice_number = "TST-2026-S168".to_string();
+        p.issue_date = Date::from_calendar_date(2026, time::Month::May, 30).unwrap();
+        p.lines.push(ParsedNavLine::default());
+        // Customer block as Session-154 leaves it for PRIVATE_PERSON:
+        // NAV XML suppressed both customerName + customerAddress, parser
+        // produced empties. Tax number was already empty (forbidden).
+        p
+    }
+
+    /// Synthesise a DOMESTIC `ParsedNavInvoice` — NAV XML carries name +
+    /// address + structured tax number. Used to pin the passthrough
+    /// branch (operator input never wins over NAV XML for non-private
+    /// statuses).
+    fn domestic_parsed_with_populated_customer_block() -> ParsedNavInvoice {
+        let mut p = ParsedNavInvoice::empty();
+        p.invoice_number = "TST-2026-S168".to_string();
+        p.issue_date = Date::from_calendar_date(2026, time::Month::May, 30).unwrap();
+        p.lines.push(ParsedNavLine::default());
+        p.customer_name = "Domestic Kft".to_string();
+        p.customer_address_lines = vec![
+            "HU".to_string(),
+            "1011".to_string(),
+            "Budapest".to_string(),
+            "Fő utca 1.".to_string(),
+        ];
+        p.customer_tax_number = "12345678-2-13".to_string();
+        p
+    }
+
+    fn private_person_input(name: &str, address: Option<AddressJson>) -> CustomerJson {
+        CustomerJson {
+            vat_status: CustomerVatStatus::PrivatePerson,
+            partner_id: None,
+            tax_number: String::new(),
+            name: name.to_string(),
+            address,
+        }
+    }
+
+    fn full_address() -> AddressJson {
+        AddressJson {
+            country_code: "HU".to_string(),
+            postal_code: "1052".to_string(),
+            city: "Budapest".to_string(),
+            street: "Váci utca 19.".to_string(),
+        }
+    }
+
+    /// S168 — table row 1: PRIVATE_PERSON buyer with name + address both
+    /// present on the operator's input.json. PDF must render both —
+    /// pre-fix the buyer block was empty because the NAV XML strips
+    /// both fields for PRIVATE_PERSON (Session-154).
+    #[test]
+    fn private_person_pdf_renders_name_and_address_when_both_present() {
+        let parsed = private_person_parsed_with_empty_customer_block();
+        let input = private_person_input("Kovács János", Some(full_address()));
+        let fields = derive_customer_pdf_fields(&parsed, Some(&input));
+
+        assert_eq!(fields.name, "Kovács János");
+        assert_eq!(
+            fields.address_lines,
+            vec![
+                "HU".to_string(),
+                "1052".to_string(),
+                "Budapest".to_string(),
+                "Váci utca 19.".to_string(),
+            ],
+        );
+        assert!(
+            fields.tax_number.is_empty(),
+            "PRIVATE_PERSON must never render a tax number (ADR-0048 §1)"
+        );
+    }
+
+    /// S168 — table row 2: PRIVATE_PERSON buyer with name only (address
+    /// genuinely omitted in input.json). PDF renders the name, no
+    /// address line. Pre-fix even the name was empty.
+    #[test]
+    fn private_person_pdf_renders_name_only_when_address_absent() {
+        let parsed = private_person_parsed_with_empty_customer_block();
+        let input = private_person_input("Kovács János", None);
+        let fields = derive_customer_pdf_fields(&parsed, Some(&input));
+
+        assert_eq!(fields.name, "Kovács János");
+        assert!(
+            fields.address_lines.is_empty(),
+            "no input.json address ⇒ no PDF address line, got {:?}",
+            fields.address_lines
+        );
+        assert!(fields.tax_number.is_empty());
+    }
+
+    /// S168 — table row 3 (unusual): PRIVATE_PERSON buyer with address
+    /// but no name. PDF renders the address; the name slot stays blank.
+    /// Confirms the override does not gate the address on a populated
+    /// name (the two fields are independently optional under §169 when
+    /// the operator chose to enter only one).
+    #[test]
+    fn private_person_pdf_renders_address_only_when_name_absent() {
+        let parsed = private_person_parsed_with_empty_customer_block();
+        let input = private_person_input("", Some(full_address()));
+        let fields = derive_customer_pdf_fields(&parsed, Some(&input));
+
+        assert!(
+            fields.name.is_empty(),
+            "input.json name was empty; override must not invent one"
+        );
+        assert_eq!(
+            fields.address_lines,
+            vec![
+                "HU".to_string(),
+                "1052".to_string(),
+                "Budapest".to_string(),
+                "Váci utca 19.".to_string(),
+            ],
+        );
+        assert!(fields.tax_number.is_empty());
+    }
+
+    /// S168 — table row 4: PRIVATE_PERSON buyer with neither name nor
+    /// address (genuine anonymous). PDF buyer block is empty; the
+    /// renderer's `write_party` already tolerates an empty name + zero
+    /// address lines (it just skips the corresponding draws).
+    #[test]
+    fn private_person_pdf_empty_when_neither_name_nor_address_present() {
+        let parsed = private_person_parsed_with_empty_customer_block();
+        let input = private_person_input("", None);
+        let fields = derive_customer_pdf_fields(&parsed, Some(&input));
+
+        assert!(fields.name.is_empty());
+        assert!(fields.address_lines.is_empty());
+        assert!(fields.tax_number.is_empty());
+    }
+
+    /// S168 — table row 5: tax_number must NEVER render for a
+    /// PRIVATE_PERSON buyer, even if the parsed NAV body somehow still
+    /// carries one (legacy ledger entry, future leak). Defense-in-depth
+    /// for ADR-0048 §1's closed-vocab invariant.
+    #[test]
+    fn private_person_pdf_force_clears_tax_number_even_if_parsed_carried_one() {
+        let mut parsed = private_person_parsed_with_empty_customer_block();
+        // Pre-Session-154 wire bodies could still hold a stray tax
+        // number under PRIVATE_PERSON; pin that the PDF suppresses it.
+        parsed.customer_tax_number = "12345678-2-13".to_string();
+        let input = private_person_input("Kovács János", Some(full_address()));
+        let fields = derive_customer_pdf_fields(&parsed, Some(&input));
+
+        assert!(
+            fields.tax_number.is_empty(),
+            "PRIVATE_PERSON PDF must not surface a tax number — ADR-0048 §1"
+        );
+    }
+
+    /// S168 — DOMESTIC passthrough: even when an operator input.json is
+    /// present and carries different name/address strings, the DOMESTIC
+    /// path keeps reading from the audit-immutable NAV XML. Only the
+    /// PRIVATE_PERSON branch overrides — Session-150's posture for
+    /// DOMESTIC ("NAV XML is the regulatory record") is preserved.
+    #[test]
+    fn domestic_pdf_passes_through_nav_xml_values() {
+        let parsed = domestic_parsed_with_populated_customer_block();
+        let input = CustomerJson {
+            vat_status: CustomerVatStatus::Domestic,
+            partner_id: None,
+            tax_number: "12345678-2-13".to_string(),
+            name: "different name in input.json".to_string(),
+            address: Some(full_address()),
+        };
+        let fields = derive_customer_pdf_fields(&parsed, Some(&input));
+
+        assert_eq!(fields.name, "Domestic Kft", "NAV XML wins for DOMESTIC");
+        assert_eq!(
+            fields.address_lines,
+            vec![
+                "HU".to_string(),
+                "1011".to_string(),
+                "Budapest".to_string(),
+                "Fő utca 1.".to_string(),
+            ],
+        );
+        assert_eq!(fields.tax_number, "12345678-2-13");
+    }
+
+    /// S168 — CLI-issued PRIVATE_PERSON path (no input.json side-store).
+    /// The override is `None` so the NAV-XML-parsed values flow through
+    /// unchanged. For PRIVATE_PERSON that means empty name + address —
+    /// historical behaviour, out of scope for this fix (CLI callers
+    /// never had the input.json side-store).
+    #[test]
+    fn private_person_pdf_falls_back_to_nav_xml_when_no_input_json() {
+        let parsed = private_person_parsed_with_empty_customer_block();
+        let fields = derive_customer_pdf_fields(&parsed, None);
+
+        assert!(fields.name.is_empty());
+        assert!(fields.address_lines.is_empty());
+        assert!(fields.tax_number.is_empty());
+    }
+
+    /// S168 — address-line mirror of the NAV-XML parser's empty-skip:
+    /// blank fields on the operator's input.json are dropped rather
+    /// than rendered as blank PDF rows. Matches
+    /// `parses_customer_address_lines_from_nav_xml`'s shape.
+    #[test]
+    fn address_lines_from_input_json_drops_blank_fields() {
+        let addr = AddressJson {
+            country_code: "HU".to_string(),
+            postal_code: String::new(),
+            city: "Budapest".to_string(),
+            street: String::new(),
+        };
+        assert_eq!(
+            address_lines_from_input_json(&addr),
+            vec!["HU".to_string(), "Budapest".to_string()]
         );
     }
 
