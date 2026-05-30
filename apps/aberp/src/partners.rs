@@ -1575,4 +1575,68 @@ mod tests {
         // 4 chars prefix + 26-char ULID = 30 total
         assert_eq!(id.len(), 30, "prefixed PartnerId must be 30 chars");
     }
+
+    // ── S164 — email recipient lookup must key on partner_id ──────────
+
+    /// A PrivatePerson partner carries NO tax_number (ADR-0048) yet may
+    /// hold one or more contact emails. The pre-S164 email send path
+    /// looked the partner up by tax_number, so it could NEVER find a
+    /// PrivatePerson buyer and loud-failed "no contact email" even when
+    /// emails were configured. This pins the fix: the partner is found
+    /// by its durable id (the key `resolve_recipient_email` now uses),
+    /// its multi-address `contact_email` parses to BOTH addresses, AND
+    /// the old tax-number lookup with the empty buyer tax string finds
+    /// nothing (documenting why the old path failed).
+    #[test]
+    fn private_person_recipient_found_by_id_not_by_empty_tax_number() {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        ensure_schema(&conn).expect("schema");
+        let tenant = "test-tenant";
+
+        let inputs = PartnerInputs {
+            display_name: "Szilvi férje".to_string(),
+            legal_name: "Szilvi férje".to_string(),
+            kind: PartnerKind::Customer,
+            customer_vat_status: CustomerVatStatus::PrivatePerson,
+            tax_number: None,
+            contact_email: Some("ervin@aben.ch, ervin.csengeri@gmail.com".to_string()),
+            ..minimal_valid_inputs()
+        };
+        let created =
+            create_partner(&conn, tenant, &inputs).expect("create private-person partner");
+        assert!(
+            created.tax_number.is_none(),
+            "PrivatePerson partner must persist with no tax_number"
+        );
+
+        // The S164 lookup key — by durable id — finds the partner and
+        // its full multi-address contact email.
+        let by_id = get_partner(&conn, tenant, &created.id)
+            .expect("get_partner by id")
+            .expect("partner present by id");
+        let emails = parse_emails(
+            by_id
+                .contact_email
+                .as_deref()
+                .expect("contact_email present"),
+        );
+        assert_eq!(
+            emails,
+            vec![
+                "ervin@aben.ch".to_string(),
+                "ervin.csengeri@gmail.com".to_string()
+            ],
+            "both configured addresses must parse out of contact_email"
+        );
+
+        // The pre-S164 lookup key — by tax_number — fails: a
+        // PrivatePerson buyer's tax string is empty, and no row matches.
+        let by_empty_tax =
+            find_partner_by_tax_number(&conn, tenant, "").expect("tax lookup must not error");
+        assert!(
+            by_empty_tax.is_none(),
+            "empty buyer tax_number must NOT resolve the PrivatePerson partner — \
+             this is the bug S164 fixes by keying on partner_id"
+        );
+    }
 }

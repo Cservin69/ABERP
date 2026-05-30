@@ -3139,8 +3139,11 @@ async fn handle_issue_invoice(
     // Default-on so the dominant path (issue + submit + see SAVED
     // inside the same minute) doesn't require a second operator click.
     let submit_to_nav_flag = request.submit_to_nav_on_issue.unwrap_or(true);
-    // Snapshot the customer's tax number for the post-issue lookup —
-    // `request` is consumed by `issue_invoice_request`.
+    // Snapshot the customer's identity for the post-issue email lookup —
+    // `request` is consumed by `issue_invoice_request`. S164 — the
+    // partner_id is the durable lookup key (PrivatePerson buyers carry
+    // no tax_number, so the tax-number-only lookup never found them).
+    let customer_partner_id_for_email = request.customer.partner_id.clone();
     let customer_tax_number_for_email = request.customer.tax_number.clone();
 
     match issue_invoice_request(
@@ -3190,6 +3193,7 @@ async fn handle_issue_invoice(
             let task_invoice_number = summary.invoice_number.clone();
             let task_state = state.clone();
             let task_login = operator_login.clone();
+            let task_customer_partner_id = customer_partner_id_for_email;
             let task_customer_tax = customer_tax_number_for_email;
             tokio::spawn(async move {
                 if email_buyer_flag {
@@ -3200,6 +3204,7 @@ async fn handle_issue_invoice(
                         &task_state,
                         &task_invoice_id,
                         &task_invoice_number,
+                        task_customer_partner_id.as_deref(),
                         &task_customer_tax,
                         &task_login,
                     )
@@ -3271,6 +3276,7 @@ async fn auto_send_after_issue(
     state: &AppState,
     invoice_id: &str,
     invoice_number: &str,
+    customer_partner_id: Option<&str>,
     customer_tax_number: &str,
     operator_login: &str,
 ) -> EmailRouteOutcomeBody {
@@ -3278,6 +3284,7 @@ async fn auto_send_after_issue(
         state,
         invoice_id,
         invoice_number,
+        customer_partner_id,
         customer_tax_number,
         operator_login,
         SendTrigger::AutoOnIssue,
@@ -6725,15 +6732,19 @@ async fn handle_email_invoice_to_buyer(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    // Resolve the customer tax_number by reading the side-stored
+    // Resolve the customer identity by reading the side-stored
     // input.json (PR-47α) — that's the operator-typed source of
     // truth, distinct from the partner table (which may have been
-    // edited post-issuance). The send path looks up the partner by
-    // tax_number to get the current contact_email.
-    let customer_tax_number = match resolve_customer_tax_number(&state, &invoice_id) {
-        Ok(tn) => tn,
+    // edited post-issuance). S164 — the send path looks up the partner
+    // by durable partner_id (tax_number as legacy fallback) to get the
+    // current contact_email.
+    let (customer_partner_id, customer_tax_number) = match resolve_customer_identity(
+        &state,
+        &invoice_id,
+    ) {
+        Ok(id) => id,
         Err(e) => {
-            tracing::warn!(invoice_id = %invoice_id, error = %e, "resolve customer tax_number for email");
+            tracing::warn!(invoice_id = %invoice_id, error = %e, "resolve customer identity for email");
             return (
                 StatusCode::NOT_FOUND,
                 Json(error_body(format!(
@@ -6763,6 +6774,7 @@ async fn handle_email_invoice_to_buyer(
         &state,
         &invoice_id,
         &invoice_number,
+        customer_partner_id.as_deref(),
         &customer_tax_number,
         &operator_login,
         SendTrigger::Manual,
@@ -6789,13 +6801,15 @@ pub async fn send_invoice_email_route(
     state: &AppState,
     invoice_id: &str,
     invoice_number: &str,
+    customer_partner_id: Option<&str>,
     customer_tax_number: &str,
     operator_login: &str,
     trigger: SendTrigger,
 ) -> EmailRouteOutcomeBody {
-    // Resolve the buyer's contact email from the partners table.
-    let recipient_lookup =
-        resolve_recipient_email(state, customer_tax_number).unwrap_or_else(|e| {
+    // Resolve the buyer's contact email from the partners table —
+    // S164: by durable partner_id first, tax_number as legacy fallback.
+    let recipient_lookup = resolve_recipient_email(state, customer_partner_id, customer_tax_number)
+        .unwrap_or_else(|e| {
             tracing::warn!(invoice_id = %invoice_id, error = %e, "resolve_recipient_email");
             None
         });
@@ -7013,15 +7027,26 @@ fn finalize_email_audit(
 /// email. `Err` for I/O / parse failures.
 fn resolve_recipient_email(
     state: &AppState,
+    partner_id: Option<&str>,
     customer_tax_number: &str,
 ) -> Result<Option<(String, Option<String>)>> {
     let conn = Connection::open(&*state.db_path)
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    let p = match partners::find_partner_by_tax_number(
-        &conn,
-        state.tenant.as_str(),
-        customer_tax_number,
-    )? {
+    // S164 — resolve the partner by its durable id FIRST. PrivatePerson
+    // buyers (ADR-0048) are FORBIDDEN from carrying a tax_number, so a
+    // tax-number lookup can never find them — it returns `None` and the
+    // send path loud-fails "buyer has no contact email" even when the
+    // partner record holds one (or several). The saved-partner id is the
+    // stable identity the SPA threads through input.json; fall back to
+    // the tax-number lookup only for legacy / CLI invoices that never
+    // carried a partner_id.
+    let p = match partner_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => partners::get_partner(&conn, state.tenant.as_str(), id)?,
+        None => {
+            partners::find_partner_by_tax_number(&conn, state.tenant.as_str(), customer_tax_number)?
+        }
+    };
+    let p = match p {
         Some(p) => p,
         None => return Ok(None),
     };
@@ -7033,8 +7058,14 @@ fn resolve_recipient_email(
 }
 
 /// Look up the side-stored input.json for the invoice, parse it, and
-/// return the customer's tax_number.
-fn resolve_customer_tax_number(state: &AppState, invoice_id: &str) -> Result<String> {
+/// return the customer's `(partner_id, tax_number)` — the durable
+/// identity the email recipient lookup keys on. S164 — partner_id is
+/// the primary key (PrivatePerson buyers carry no tax_number); the
+/// tax_number stays as the legacy fallback for pre-partner-id invoices.
+fn resolve_customer_identity(
+    state: &AppState,
+    invoice_id: &str,
+) -> Result<(Option<String>, String)> {
     let ledger = Ledger::open(
         &*state.db_path,
         state.tenant.clone(),
@@ -7059,7 +7090,7 @@ fn resolve_customer_tax_number(state: &AppState, invoice_id: &str) -> Result<Str
             input_json_path.display()
         )
     })?;
-    Ok(input.customer.tax_number)
+    Ok((input.customer.partner_id, input.customer.tax_number))
 }
 
 fn resolve_invoice_xml_path(state: &AppState, invoice_id: &str) -> Result<PathBuf> {
