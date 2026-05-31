@@ -54,16 +54,22 @@
 //!
 //! # What this module DELIBERATELY does NOT do
 //!
-//!   - It does NOT fetch the full NAV InvoiceData XML via
-//!     `queryInvoiceData`. The digest carries enough typed fields
-//!     for the v1 `ap_invoice` row (supplier, totals, dates,
-//!     currency); a future PR can layer `queryInvoiceData` ingestion
-//!     on top to populate `nav_xml_path` (S177's optional field) —
-//!     additive over this PR. The S178 brief asked for the per-digest
-//!     `queryInvoiceData` fanout, but the conservative call is to ship
-//!     digest-only ingestion now (fewer NAV calls, no full-XML parser
-//!     needed) and add the XML fetch in a focused follow-on when an
-//!     audit-evidence consumer needs the bytes.
+//!   - (S197 update) The follow-on `queryInvoiceData` XML fetch IS
+//!     wired now — see [`fetch_and_persist_xml_for_row`]. Per digest
+//!     newly inserted (or backfill: previously ingested with
+//!     `nav_xml_path` still NULL), the daemon issues one
+//!     `queryInvoiceData INBOUND` call, base64-decodes the inner
+//!     `<invoiceData>` blob via
+//!     [`crate::restore_from_nav_extract::extract_inner_invoice_data_xml`]
+//!     (the S196 helper — same NAV envelope shape), writes the bytes
+//!     to `~/.aberp/<tenant>/ap-artifacts/<apinv_id>.xml`, and
+//!     UPDATEs `ap_invoice.nav_xml_path`. Per-row failures (HTTP
+//!     non-success, base64 / parse error, file IO) are CONTAINED —
+//!     they `tracing::warn!` and leave the row's `nav_xml_path`
+//!     NULL; the next cycle re-attempts. The XML fetch is
+//!     idempotent: rows with `nav_xml_path` already set are skipped.
+//!     Concurrency stays sequential (one queryInvoiceData at a time
+//!     per cycle) per the daemon's gentle-on-NAV posture.
 //!   - It does NOT short-circuit on `outcome != IngestOutcome::Created`.
 //!     The daemon walks every page and counts both inserts + skips so
 //!     the cycle entry is honest about the volume seen, not just the
@@ -85,6 +91,7 @@ use ulid::Ulid;
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, BinaryHash, EventKind, Ledger, TenantId};
 use aberp_billing::IdempotencyKey;
+use aberp_nav_transport::operations::query_invoice_data;
 use aberp_nav_transport::operations::query_invoice_digest::{
     self, InvoiceDigest, QueryInvoiceDigestPage,
 };
@@ -93,6 +100,7 @@ use aberp_nav_transport::{NavCredentials, NavEndpoint, NavTransport};
 
 use crate::audit_payloads::IncomingInvoiceSyncCycleCompletedPayload;
 use crate::incoming_invoices::{self, IngestOutcome, IngestionInput};
+use crate::restore_from_nav_extract;
 
 /// Boot delay before the first daemon tick. 30s gives `serve`'s
 /// other boot tasks (NAV poll daemon recovery, mirror reconciliation)
@@ -263,6 +271,15 @@ pub async fn run_one_cycle(inputs: CycleInputs, trigger: CycleTrigger) -> Result
     }
 }
 
+/// S197 — one row that the per-page ingest pass surfaced as needing
+/// an XML follow-on fetch. `Created` rows always need fetch; an
+/// `AlreadyExists` row needs fetch only if its `nav_xml_path` was
+/// still NULL from a prior digest-only cycle (backfill posture).
+struct XmlFetchTarget {
+    id: String,
+    invoice_number: String,
+}
+
 async fn run_cycle_inner(
     inputs: &CycleInputs,
     date_from: &str,
@@ -304,15 +321,24 @@ async fn run_cycle_inner(
         // DuckDB INSERT + chain-verify + mirror-sync calls. One
         // `spawn_blocking` per page keeps the boundary-cross count at
         // O(pages) instead of O(digests).
+        //
+        // S197 — the blocking pass ALSO classifies each row's XML-
+        // fetch need: `Created` always needs fetch; `AlreadyExists`
+        // needs fetch only when the row's existing `nav_xml_path` is
+        // still NULL (backfill posture for digests previously ingested
+        // pre-S197). The async XML fanout runs AFTER the spawn_blocking
+        // returns so the queryInvoiceData HTTP calls are NOT held on
+        // the blocking pool.
         let digests = page_result.digests;
         let db_path = inputs.db_path.clone();
         let tenant = inputs.tenant.clone();
         let binary_hash = inputs.binary_hash;
         let operator_login = inputs.operator_login.clone();
         let ap_artifacts_dir = inputs.ap_artifacts_dir.clone();
-        let (page_ingested, page_skipped) = tokio::task::spawn_blocking(move || {
+        let (page_ingested, page_skipped, xml_targets) = tokio::task::spawn_blocking(move || {
             let mut ingested: u64 = 0;
             let mut skipped: u64 = 0;
+            let mut targets: Vec<XmlFetchTarget> = Vec::new();
             for digest in digests {
                 match digest_to_ingestion_input(&digest) {
                     Ok(input) => {
@@ -324,8 +350,39 @@ async fn run_cycle_inner(
                             &ap_artifacts_dir,
                             input,
                         ) {
-                            Ok(IngestOutcome::Created { .. }) => ingested += 1,
-                            Ok(IngestOutcome::AlreadyExists { .. }) => skipped += 1,
+                            Ok(IngestOutcome::Created { id }) => {
+                                ingested += 1;
+                                targets.push(XmlFetchTarget {
+                                    id,
+                                    invoice_number: digest.invoice_number.clone(),
+                                });
+                            }
+                            Ok(IngestOutcome::AlreadyExists { id }) => {
+                                skipped += 1;
+                                // S197 backfill — re-read the row's
+                                // `nav_xml_path`; queue the fetch only
+                                // when still NULL. A DB read failure
+                                // here is non-fatal: surface as warn
+                                // and skip the row this cycle.
+                                match incoming_invoices::get_nav_xml_path(
+                                    &db_path,
+                                    tenant.as_str(),
+                                    &id,
+                                ) {
+                                    Ok(None) => targets.push(XmlFetchTarget {
+                                        id,
+                                        invoice_number: digest.invoice_number.clone(),
+                                    }),
+                                    Ok(Some(_)) => {}
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            ap_invoice_id = %id,
+                                            error = ?e,
+                                            "get_nav_xml_path failed; XML backfill skipped this cycle"
+                                        );
+                                    }
+                                }
+                            }
                             Err(e) => {
                                 // A single-digest ingest failure must NOT
                                 // abort the whole cycle — the digest is
@@ -353,18 +410,166 @@ async fn run_cycle_inner(
                     }
                 }
             }
-            (ingested, skipped)
+            (ingested, skipped, targets)
         })
         .await
         .map_err(|join_err| anyhow!("AP sync per-page ingest task panicked: {join_err}"))?;
         ingested_count += page_ingested;
         skipped_count += page_skipped;
 
+        // S197 — sequential queryInvoiceData fan-out per row needing
+        // XML enrichment. Per-row failures are contained (warn + leave
+        // nav_xml_path NULL); the next cycle re-attempts. Sequential
+        // (one NAV call at a time) per the daemon's gentle-on-NAV
+        // posture documented in the module header.
+        let mut xml_fetch_ok: u64 = 0;
+        let mut xml_fetch_err: u64 = 0;
+        for target in xml_targets {
+            match fetch_and_persist_xml_for_row(
+                &transport,
+                &inputs.credentials,
+                &inputs.tax_number_8,
+                &inputs.db_path,
+                &inputs.tenant,
+                &inputs.ap_artifacts_dir,
+                &target,
+            )
+            .await
+            {
+                Ok(()) => xml_fetch_ok += 1,
+                Err(e) => {
+                    xml_fetch_err += 1;
+                    tracing::warn!(
+                        ap_invoice_id = %target.id,
+                        invoice_number = %target.invoice_number,
+                        error = %format!("{e:#}"),
+                        "AP queryInvoiceData fetch failed; nav_xml_path stays NULL — next cycle re-attempts"
+                    );
+                }
+            }
+        }
+        if xml_fetch_ok > 0 || xml_fetch_err > 0 {
+            tracing::info!(
+                page,
+                xml_fetched = xml_fetch_ok,
+                xml_failed = xml_fetch_err,
+                "AP queryInvoiceData fetches complete for page"
+            );
+        }
+
         if page >= available_page {
             return Ok((ingested_count, skipped_count, page));
         }
         page += 1;
     }
+}
+
+/// S197 — fetch the full NAV InvoiceData XML for ONE just-ingested (or
+/// previously-ingested but XML-less) `ap_invoice` row. Pipeline:
+///
+///   1. `queryInvoiceData INBOUND` for the row's NAV invoice number.
+///   2. Base64-decode the inner `<invoiceData>` blob via the S196
+///      [`restore_from_nav_extract::extract_inner_invoice_data_xml`]
+///      helper (same NAV envelope shape; not duplicated here).
+///   3. Persist the inner XML bytes to
+///      `<ap_artifacts_dir>/<ap_invoice_id>.xml`.
+///   4. `UPDATE ap_invoice SET nav_xml_path = ?` via
+///      [`incoming_invoices::set_nav_xml_path`].
+///
+/// Every error path returns `Err(...)`; the caller (the cycle loop)
+/// turns it into a `warn!` and continues — one row's XML fetch failure
+/// must NOT abort the cycle. No audit entry is written for the success
+/// path: the `IncomingInvoiceIngested` payload covering the row has
+/// already landed; the XML fetch is operator-invisible enrichment.
+async fn fetch_and_persist_xml_for_row(
+    transport: &NavTransport,
+    credentials: &NavCredentials,
+    tax_number_8: &str,
+    db_path: &std::path::Path,
+    tenant: &TenantId,
+    ap_artifacts_dir: &std::path::Path,
+    target: &XmlFetchTarget,
+) -> Result<()> {
+    let outcome = query_invoice_data::call(
+        transport,
+        credentials,
+        tax_number_8,
+        &target.invoice_number,
+        InvoiceDirection::Inbound,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "queryInvoiceData INBOUND for {} (ap_invoice_id={})",
+            target.invoice_number, target.id
+        )
+    })?;
+
+    let response_xml = outcome.response_xml;
+    let db_path_owned = db_path.to_path_buf();
+    let tenant_owned = tenant.clone();
+    let artifacts_dir_owned = ap_artifacts_dir.to_path_buf();
+    let target_id = target.id.clone();
+    let target_invoice_number = target.invoice_number.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        persist_xml_for_row(
+            &response_xml,
+            &db_path_owned,
+            tenant_owned.as_str(),
+            &artifacts_dir_owned,
+            &target_id,
+            &target_invoice_number,
+        )
+    })
+    .await
+    .map_err(|join_err| anyhow!("AP XML persist task panicked: {join_err}"))??;
+    Ok(())
+}
+
+/// S197 — synchronous persist half of [`fetch_and_persist_xml_for_row`].
+/// Split out so the spawn_blocking closure is one call and the unit
+/// tests can exercise the extract → write → UPDATE pipeline without
+/// standing up a `NavTransport`. `response_xml` is the verbatim
+/// `<QueryInvoiceDataResponse>` envelope NAV returned; the helper
+/// base64-decodes the inner `<invoiceData>` blob and persists those
+/// bytes (the supplier's original `<InvoiceData>` XML root).
+fn persist_xml_for_row(
+    response_xml: &[u8],
+    db_path: &std::path::Path,
+    tenant: &str,
+    ap_artifacts_dir: &std::path::Path,
+    ap_invoice_id: &str,
+    invoice_number: &str,
+) -> Result<()> {
+    let inner = restore_from_nav_extract::extract_inner_invoice_data_xml(response_xml)
+        .with_context(|| {
+            format!(
+                "base64-decode <invoiceData> for {} (ap_invoice_id={})",
+                invoice_number, ap_invoice_id
+            )
+        })?;
+    std::fs::create_dir_all(ap_artifacts_dir).with_context(|| {
+        format!(
+            "create AP artifacts directory at {}",
+            ap_artifacts_dir.display()
+        )
+    })?;
+    let file_path = ap_artifacts_dir.join(format!("{}.xml", ap_invoice_id));
+    std::fs::write(&file_path, &inner)
+        .with_context(|| format!("write AP NAV XML artifact to {}", file_path.display()))?;
+    incoming_invoices::set_nav_xml_path(
+        db_path,
+        tenant,
+        ap_invoice_id,
+        &file_path.to_string_lossy(),
+    )
+    .with_context(|| {
+        format!(
+            "UPDATE ap_invoice.nav_xml_path for ap_invoice_id={}",
+            ap_invoice_id
+        )
+    })?;
+    Ok(())
 }
 
 /// Convert a NAV digest row into an [`IngestionInput`] suitable for
@@ -705,5 +910,135 @@ mod tests {
     fn cycle_trigger_audit_strings_are_closed_vocab() {
         assert_eq!(CycleTrigger::Daemon.as_audit_str(), "daemon");
         assert_eq!(CycleTrigger::Manual.as_audit_str(), "manual");
+    }
+
+    /// S197 — `persist_xml_for_row` happy path: decodes the NAV
+    /// envelope's `<invoiceData>` base64 blob, writes the inner bytes
+    /// to `<artifacts_dir>/<ap_invoice_id>.xml`, and UPDATEs the row's
+    /// `nav_xml_path` column. Defends the extract → write → UPDATE
+    /// pipeline against a future refactor that splits any leg of it
+    /// from the others.
+    #[test]
+    fn persist_xml_for_row_writes_file_and_updates_column() {
+        use base64::Engine;
+        use incoming_invoices::{IngestOutcome, IngestionInput};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "aberp-s197-persist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db_path = tmp.join("tenant.duckdb");
+        let artifacts_dir = tmp.join("ap-artifacts");
+
+        let tenant = aberp_audit_ledger::TenantId::new("t1".to_string()).expect("fixture tenant");
+        let binary_hash = aberp_audit_ledger::BinaryHash::from_bytes([0u8; 32]);
+        let input = IngestionInput {
+            supplier_tax_number: "12345678".into(),
+            supplier_name: "Supplier Kft.".into(),
+            supplier_address: None,
+            nav_invoice_number: "SUP-2026/000001".into(),
+            issue_date: "2026-05-30".into(),
+            delivery_date: None,
+            payment_deadline: None,
+            total_net_minor: 100_000,
+            total_vat_minor: 27_000,
+            total_gross_minor: 127_000,
+            currency: "HUF".into(),
+            nav_xml: None,
+        };
+        let outcome = incoming_invoices::ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            binary_hash,
+            "operator",
+            &artifacts_dir,
+            input,
+        )
+        .expect("fixture ingest");
+        let id = match outcome {
+            IngestOutcome::Created { id } => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        // Pre-condition — fresh ingest has no XML path.
+        assert_eq!(
+            incoming_invoices::get_nav_xml_path(&db_path, tenant.as_str(), &id).unwrap(),
+            None
+        );
+
+        // Build a NAV-envelope fixture carrying a base64'd inner blob —
+        // same shape S196's restore extract exercises.
+        let inner = b"<InvoiceData><supplierInfo/><customerInfo/></InvoiceData>";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(inner);
+        let response_xml = format!(
+            "<QueryInvoiceDataResponse><invoiceDataResult><invoiceData>{b64}</invoiceData></invoiceDataResult></QueryInvoiceDataResponse>"
+        );
+
+        persist_xml_for_row(
+            response_xml.as_bytes(),
+            &db_path,
+            tenant.as_str(),
+            &artifacts_dir,
+            &id,
+            "SUP-2026/000001",
+        )
+        .expect("persist must succeed");
+
+        // The on-disk artifact carries the decoded inner bytes.
+        let file_path = artifacts_dir.join(format!("{}.xml", id));
+        let bytes = std::fs::read(&file_path).expect("artifact must exist");
+        assert_eq!(bytes, inner);
+
+        // The row's nav_xml_path now points at the file.
+        let path = incoming_invoices::get_nav_xml_path(&db_path, tenant.as_str(), &id)
+            .unwrap()
+            .expect("nav_xml_path must be populated");
+        assert_eq!(path, file_path.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// S197 — malformed NAV envelope (missing `<invoiceData>` element)
+    /// loud-fails per CLAUDE.md rule 12. The caller (the cycle loop)
+    /// turns this into a `warn!` and continues; the test pins that the
+    /// failure surface stays loud at the helper layer rather than
+    /// silently leaving `nav_xml_path` as the empty string or some
+    /// other coerced value.
+    #[test]
+    fn persist_xml_for_row_loud_fails_on_missing_invoice_data_element() {
+        let tmp = std::env::temp_dir().join(format!(
+            "aberp-s197-persist-bad-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db_path = tmp.join("tenant.duckdb");
+        let artifacts_dir = tmp.join("ap-artifacts");
+
+        // No ingest — `extract_inner_invoice_data_xml` fails BEFORE the
+        // UPDATE leg, so the row's absence is irrelevant to the assertion.
+        let response_xml = b"<QueryInvoiceDataResponse></QueryInvoiceDataResponse>";
+        let err = persist_xml_for_row(
+            response_xml,
+            &db_path,
+            "t1",
+            &artifacts_dir,
+            "apinv_01HRQXYZABCDEFGHJKMNPQRST",
+            "SUP-2026/000001",
+        )
+        .expect_err("missing <invoiceData> must loud-fail");
+        assert!(
+            format!("{err:#}").contains("missing <invoiceData>"),
+            "loud-fail message must name the missing element; got: {err:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

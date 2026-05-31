@@ -18,10 +18,13 @@
   //   - per-row detail page (a click on supplier name reveals the
   //     full address in a tooltip — not enough operator demand for a
   //     full detail modal yet).
-  //   - NAV XML download. The on-disk path is stored in
-  //     `nav_xml_path`; the SPA does not expose it.
   //   - approve workflow / payment execution / PO matching. The brief
   //     is explicit: v1 is mirror + 3-state mark, nothing more.
+  //
+  // S197 / PR-197 — NAV XML download. The "Download XML" button is
+  // shown per-row when `nav_xml_path` is populated (the S197 follow-on
+  // queryInvoiceData fetch wrote the bytes to disk); hidden otherwise
+  // (digest-only fallback row, next sync cycle will re-attempt).
 
   import { onMount } from "svelte";
   import {
@@ -30,6 +33,7 @@
     markIncomingOutstanding,
     markIncomingIrrelevant,
     syncIncomingInvoicesNow,
+    downloadIncomingXml,
     type IncomingInvoice,
     type SyncIncomingNowResponse,
     type Currency,
@@ -202,6 +206,63 @@
       const { [inv.id]: _drop, ...rest } = mutatingIds;
       mutatingIds = rest;
     }
+  }
+
+  // S197 / PR-197 — fetch the on-disk NAV XML via the Tauri command
+  // and trigger a browser-native save via a synthetic `<a download>`
+  // click. Mirrors `downloadInvoicePdf`'s posture in InvoiceDetail —
+  // the SPA does NOT keep the blob URL around; revoking immediately
+  // after the click is enough for Chromium / WebKit.
+  async function onDownloadXml(inv: IncomingInvoice) {
+    if (mutatingIds[inv.id]) return;
+    mutatingIds = { ...mutatingIds, [inv.id]: true };
+    try {
+      const blob = await downloadIncomingXml(inv.id);
+      const safeSupplier = sanitizeFilenamePart(inv.supplier_tax_number);
+      const safeInvoice = sanitizeFilenamePart(inv.nav_invoice_number);
+      const filename = `${safeSupplier}_${safeInvoice}.xml`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err: unknown) {
+      errorMessage = err instanceof Error ? err.message : String(err);
+    } finally {
+      const { [inv.id]: _drop, ...rest } = mutatingIds;
+      mutatingIds = rest;
+    }
+  }
+
+  /** S197 / PR-197 — mirror of the backend's `sanitize_filename_part`
+   * so the SPA-fallback download filename (when the server's
+   * `Content-Disposition` header is ignored by the browser/Tauri
+   * runtime) matches the server-emitted one. */
+  function sanitizeFilenamePart(s: string): string {
+    let out = "";
+    for (const ch of s) {
+      const code = ch.charCodeAt(0);
+      if (
+        ch === "/" ||
+        ch === "\\" ||
+        ch === ":" ||
+        ch === "*" ||
+        ch === "?" ||
+        ch === '"' ||
+        ch === "<" ||
+        ch === ">" ||
+        ch === "|" ||
+        code < 0x20
+      ) {
+        out += "_";
+      } else {
+        out += ch;
+      }
+    }
+    return out;
   }
 
   function applyStatusChange(
@@ -633,6 +694,17 @@
                   title="Nem releváns (indoklás kötelező)"
                 >
                   Nem releváns…
+                </button>
+              {/if}
+              {#if inv.nav_xml_path !== null}
+                <button
+                  type="button"
+                  class="row-action"
+                  disabled={isMutating}
+                  onclick={() => void onDownloadXml(inv)}
+                  title="NAV XML letöltése (Download NAV XML)"
+                >
+                  XML
                 </button>
               {/if}
             </td>

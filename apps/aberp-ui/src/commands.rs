@@ -695,6 +695,23 @@ pub async fn sync_incoming_invoices_now(state: State<'_, AppState>) -> Result<Va
     forward_post(&state, "/api/incoming-invoices/sync-now", Value::Null).await
 }
 
+/// S197 / PR-197 — `GET /api/incoming-invoices/:id/xml`. Returns the
+/// raw NAV InvoiceData XML bytes for an AP-side row whose S197
+/// `queryInvoiceData` follow-on fetch has populated `nav_xml_path`.
+/// Body is `application/xml`, not JSON — relays through
+/// [`forward_get_bytes`] (the same binary-body seam the PDF download
+/// uses). The SPA wraps the `Vec<u8>` in a `Blob` for the
+/// browser-native save dialog.
+#[tauri::command]
+pub async fn download_incoming_xml(
+    state: State<'_, AppState>,
+    incoming_id: String,
+) -> Result<Vec<u8>, String> {
+    validate_invoice_id(&incoming_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/incoming-invoices/{incoming_id}/xml");
+    forward_get_bytes(&state, &path).await
+}
+
 /// S180 / PR-180 — operator-clicked NAV-as-DR restore wizard.
 /// `POST /api/restore-from-nav-outgoing { year }`. Synchronous (walks
 /// 12 months × pagination against NAV); the SPA gates the click on

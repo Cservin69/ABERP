@@ -1507,6 +1507,19 @@ fn build_router(state: AppState) -> Router {
             "/api/incoming-invoices/sync-now",
             post(handle_sync_incoming_now),
         )
+        // S197 / PR-197 — XML download for an AP-side row whose S197
+        // `queryInvoiceData` follow-on fetch has populated
+        // `nav_xml_path`. Returns the on-disk InvoiceData XML bytes
+        // verbatim with `Content-Type: application/xml` + a
+        // `Content-Disposition: attachment` filename built from
+        // supplier + invoice number. 404 when the row is missing OR
+        // when `nav_xml_path` is still NULL (the digest-only fallback;
+        // operator sees a disabled button in the SPA, so this route
+        // 404 is defence-in-depth against direct curl calls).
+        .route(
+            "/api/incoming-invoices/:id/xml",
+            get(handle_get_incoming_invoice_xml),
+        )
         // S180 / PR-180 — NAV-as-DR restore wizard. POST { year }
         // walks NAV's `queryInvoiceDigest OUTBOUND` view for that
         // year and mirrors each new digest into the local
@@ -7069,6 +7082,124 @@ async fn handle_sync_incoming_now(headers: HeaderMap, State(state): State<AppSta
     }
 }
 
+/// S197 / PR-197 — `GET /api/incoming-invoices/:id/xml`. Serves the
+/// on-disk NAV InvoiceData XML for one AP-side row whose
+/// `nav_xml_path` is populated. The S197 follow-on `queryInvoiceData`
+/// fetch writes those bytes; this route exposes them to the operator
+/// (the SPA's "Download XML" button).
+///
+/// Failure surfaces:
+///   - 404 when the row is missing OR `nav_xml_path` is NULL (digest-
+///     only fallback row, fetch has not yet succeeded). One status to
+///     cover both — the operator cannot distinguish them, and the SPA
+///     gates the button on `nav_xml_path != null`.
+///   - 500 when the on-disk file is unreadable (truncated artifact
+///     directory, permissions drift). Loud-fail per CLAUDE.md rule 12.
+async fn handle_get_incoming_invoice_xml(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let db_path = state.db_path.clone();
+    let tenant = state.tenant.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        incoming_invoices::get_incoming(&db_path, tenant.as_str(), &id_for_task)
+    })
+    .await;
+    let row = match result {
+        Ok(Ok(Some(row))) => row,
+        Ok(Ok(None)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(error_body(format!("incoming invoice {id} not found"))),
+            )
+                .into_response();
+        }
+        Ok(Err(e)) => return internal_error("get_incoming_invoice_xml:lookup", e),
+        Err(join_err) => {
+            return internal_error(
+                "get_incoming_invoice_xml:lookup:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    let xml_path = match row.nav_xml_path.as_deref() {
+        Some(p) => p.to_string(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(error_body(format!(
+                    "incoming invoice {id} has no NAV XML on disk yet — the AP-sync daemon's queryInvoiceData fetch has not succeeded (the next cycle will re-attempt)"
+                ))),
+            )
+                .into_response();
+        }
+    };
+    let xml_path_for_task = xml_path.clone();
+    let read_result = tokio::task::spawn_blocking(move || std::fs::read(&xml_path_for_task)).await;
+    let bytes = match read_result {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            return internal_error(
+                "get_incoming_invoice_xml:read",
+                anyhow!("read NAV XML artifact at {xml_path}: {e}"),
+            );
+        }
+        Err(join_err) => {
+            return internal_error(
+                "get_incoming_invoice_xml:read:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    let filename = incoming_xml_filename(&row.supplier_tax_number, &row.nav_invoice_number);
+    let disposition = format!("attachment; filename=\"{filename}\"");
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/xml".to_string(),
+            ),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// S197 / PR-197 — filename for the Content-Disposition header on the
+/// AP XML download. Built from `<supplier_tax_number>_<invoice_number>.xml`
+/// with `/` and other reserved-on-Windows path chars sanitised to `_`
+/// so the browser-saved file is openable on every operator host.
+fn incoming_xml_filename(supplier_tax_number: &str, invoice_number: &str) -> String {
+    let safe_supplier = sanitize_filename_part(supplier_tax_number);
+    let safe_invoice = sanitize_filename_part(invoice_number);
+    format!("{safe_supplier}_{safe_invoice}.xml")
+}
+
+/// Replace filesystem-reserved characters with `_`. Conservative set:
+/// path separators (`/`, `\\`), Windows-reserved metas (`:`, `*`, `?`,
+/// `"`, `<`, `>`, `|`), plus control chars (`\0` through `\x1f`). The
+/// rest of the operator-typed string (Unicode letters, digits, hyphens,
+/// dots) passes through verbatim. CLAUDE.md rule 5 — code, not model,
+/// answers this deterministic transform.
+fn sanitize_filename_part(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect()
+}
+
 /// Build the `CycleInputs` for the AP-sync daemon / manual route.
 /// Loads NAV credentials from the keychain, resolves the tenant's
 /// 8-digit tax number head from seller.toml, picks the compile-time
@@ -10782,6 +10913,48 @@ mod tests {
             pdf_filename_for_invoice("S2026-000001"),
             "invoice_S2026-000001.pdf",
         );
+    }
+
+    /// S197 / PR-197 — `Content-Disposition` filename for the AP XML
+    /// download. Built from `<supplier_tax>_<invoice_number>.xml`;
+    /// filesystem-reserved chars MUST be sanitised so the
+    /// browser-saved file opens cleanly on every operator host
+    /// (Windows refuses `/`, `:`, `*`, `?` in filenames; the
+    /// supplier-issued invoice numbers carry `/` routinely per NAV
+    /// convention).
+    #[test]
+    fn incoming_xml_filename_sanitises_reserved_chars() {
+        assert_eq!(
+            incoming_xml_filename("12345678", "SUP-2026/000001"),
+            "12345678_SUP-2026_000001.xml",
+        );
+        assert_eq!(
+            incoming_xml_filename("87654321", "INV\\2026:001"),
+            "87654321_INV_2026_001.xml",
+        );
+        assert_eq!(
+            incoming_xml_filename("11112222", "OK-2026-001"),
+            "11112222_OK-2026-001.xml",
+        );
+    }
+
+    /// S197 / PR-197 — `sanitize_filename_part` is the per-char
+    /// transform. CLAUDE.md rule 5 — code (not model) handles this
+    /// deterministic mapping; the test pins every reserved class.
+    #[test]
+    fn sanitize_filename_part_maps_every_reserved_class() {
+        // Path separators.
+        assert_eq!(sanitize_filename_part("a/b"), "a_b");
+        assert_eq!(sanitize_filename_part("a\\b"), "a_b");
+        // Windows-reserved metas.
+        assert_eq!(
+            sanitize_filename_part("a:b*c?d\"e<f>g|h"),
+            "a_b_c_d_e_f_g_h"
+        );
+        // Control chars.
+        assert_eq!(sanitize_filename_part("a\x00b\x1fc"), "a_b_c");
+        // Unicode + dots pass through verbatim.
+        assert_eq!(sanitize_filename_part("Árvíztűrő.2026"), "Árvíztűrő.2026");
     }
 
     #[test]

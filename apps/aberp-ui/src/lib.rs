@@ -248,6 +248,8 @@ pub fn run() {
             commands::mark_incoming_outstanding,
             commands::mark_incoming_irrelevant,
             commands::sync_incoming_invoices_now,
+            // S197 / PR-197 — XML download per AP row.
+            commands::download_incoming_xml,
             // S180 / PR-180 — NAV-as-DR restore wizard. Two
             // commands: trigger the wizard (POST { year }) and list
             // already-restored rows.

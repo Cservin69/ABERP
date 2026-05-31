@@ -1769,6 +1769,21 @@ export async function syncIncomingInvoicesNow(): Promise<SyncIncomingNowResponse
   return invoke<SyncIncomingNowResponse>("sync_incoming_invoices_now");
 }
 
+/** S197 / PR-197 — fetch the raw NAV InvoiceData XML bytes for one
+ * AP-side row whose `nav_xml_path` is populated. The backend serves
+ * `application/xml`; the Tauri command relays the bytes as
+ * `Vec<u8>` and we re-wrap them in a `Blob` for the browser-native
+ * save dialog (same posture as `downloadInvoicePdf`). Errors (404
+ * when `nav_xml_path` is still NULL, 500 on disk read failure)
+ * propagate as the rejected promise per the existing AP-action
+ * surface. */
+export async function downloadIncomingXml(incomingId: string): Promise<Blob> {
+  const bytes = await invoke<number[]>("download_incoming_xml", {
+    incomingId,
+  });
+  return new Blob([new Uint8Array(bytes)], { type: "application/xml" });
+}
+
 // ── S180 / PR-180 — NAV-as-DR restore wizard ────────────────────────
 
 /** Mirror of `restore_from_nav_outgoing::RestoreSummary`. The wizard

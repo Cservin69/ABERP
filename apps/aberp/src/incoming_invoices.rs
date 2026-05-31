@@ -819,6 +819,76 @@ pub fn get_incoming(db_path: &Path, tenant: &str, id: &str) -> Result<Option<Inc
     }
 }
 
+/// S197 — read the `nav_xml_path` column for one `ap_invoice` row.
+/// Returns `Ok(None)` BOTH when the row is missing AND when the row
+/// exists with `nav_xml_path` NULL — disambiguation is not needed by
+/// the AP-sync follow-on-fetch caller (which has just inserted /
+/// found the row by id, so absence is unreachable in practice).
+pub fn get_nav_xml_path(
+    db_path: &Path,
+    tenant: &str,
+    ap_invoice_id: &str,
+) -> Result<Option<String>> {
+    let conn = Connection::open(db_path).with_context(|| {
+        format!(
+            "open tenant DuckDB at {} for ap_invoice nav_xml_path read",
+            db_path.display()
+        )
+    })?;
+    ensure_schema(&conn).context("ensure ap_invoice schema (nav_xml_path read)")?;
+    let mut stmt = conn.prepare(
+        "SELECT nav_xml_path FROM ap_invoice
+          WHERE tenant_id = ? AND id = ? LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![tenant, ap_invoice_id])?;
+    if let Some(row) = rows.next()? {
+        let v: Option<String> = row.get(0)?;
+        Ok(v)
+    } else {
+        Ok(None)
+    }
+}
+
+/// S197 — set the `nav_xml_path` column for one `ap_invoice` row. Used
+/// by the AP-sync follow-on `queryInvoiceData` fetch (additive: enriches
+/// a row the S178 daemon already ingested digest-first). Plain UPDATE,
+/// no audit entry — the `IncomingInvoiceIngested` payload that already
+/// landed at ingest time covered the row; this is operator-invisible
+/// enrichment, not a state change. The row's `updated_at` bumps so
+/// the SPA refresh-time sort surfaces the enrichment.
+pub fn set_nav_xml_path(
+    db_path: &Path,
+    tenant: &str,
+    ap_invoice_id: &str,
+    xml_path: &str,
+) -> Result<()> {
+    let conn = Connection::open(db_path).with_context(|| {
+        format!(
+            "open tenant DuckDB at {} for ap_invoice nav_xml_path UPDATE",
+            db_path.display()
+        )
+    })?;
+    ensure_schema(&conn).context("ensure ap_invoice schema (nav_xml_path UPDATE)")?;
+    let now = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .context("format updated_at as Rfc3339 (nav_xml_path UPDATE)")?;
+    let affected = conn.execute(
+        "UPDATE ap_invoice
+            SET nav_xml_path = ?, updated_at = ?
+          WHERE tenant_id = ? AND id = ?",
+        params![xml_path, &now, tenant, ap_invoice_id],
+    )?;
+    if affected == 0 {
+        return Err(anyhow!(
+            "set_nav_xml_path matched 0 rows for tenant={} ap_invoice_id={} \
+             (caller passed an unknown id — schema or wire drift?)",
+            tenant,
+            ap_invoice_id
+        ));
+    }
+    Ok(())
+}
+
 fn row_to_incoming(row: &duckdb::Row<'_>) -> Result<IncomingInvoice> {
     Ok(IncomingInvoice {
         id: row.get(0)?,
@@ -1808,5 +1878,64 @@ mod tests {
         .unwrap();
         assert_eq!(paid.len(), 1);
         assert_eq!(paid[0].local_status, "Paid");
+    }
+
+    /// S197 — fresh ingest carries NULL `nav_xml_path` (the S178 daemon
+    /// ingests digest-first); the S197 follow-on `queryInvoiceData`
+    /// fetch reads via [`get_nav_xml_path`] to decide whether to fetch,
+    /// then writes the on-disk path via [`set_nav_xml_path`].
+    #[test]
+    fn nav_xml_path_helpers_round_trip() {
+        let dir = ScopedTempDir::new("nav-xml-path");
+        let db_path = dir.path().join("tenant.duckdb");
+        let artifacts_dir = dir.path().join("ap-artifacts");
+        let tenant = fixture_tenant();
+        let bh = fixture_binary_hash();
+
+        let outcome = ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            fixture_input(),
+        )
+        .unwrap();
+        let id = match outcome {
+            IngestOutcome::Created { id } => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        // Fresh ingest with `nav_xml: None` writes NULL.
+        let before = get_nav_xml_path(&db_path, tenant.as_str(), &id).unwrap();
+        assert_eq!(before, None);
+
+        // Set a path; readback matches.
+        set_nav_xml_path(&db_path, tenant.as_str(), &id, "/tmp/example.xml").unwrap();
+        let after = get_nav_xml_path(&db_path, tenant.as_str(), &id).unwrap();
+        assert_eq!(after.as_deref(), Some("/tmp/example.xml"));
+    }
+
+    /// S197 — `set_nav_xml_path` against an unknown id loud-fails per
+    /// CLAUDE.md rule 12. A silent 0-row UPDATE would mask wire / schema
+    /// drift on the follow-on-fetch path.
+    #[test]
+    fn set_nav_xml_path_loud_fails_on_unknown_id() {
+        let dir = ScopedTempDir::new("nav-xml-path-unknown");
+        let db_path = dir.path().join("tenant.duckdb");
+        let tenant = fixture_tenant();
+        // Pre-create schema (no row).
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            ensure_schema(&conn).unwrap();
+        }
+        let err = set_nav_xml_path(
+            &db_path,
+            tenant.as_str(),
+            "apinv_01HRQXYZABCDEFGHJKMNPQRST",
+            "/tmp/x.xml",
+        )
+        .expect_err("must loud-fail on unknown id");
+        assert!(format!("{err:#}").contains("matched 0 rows"));
     }
 }
