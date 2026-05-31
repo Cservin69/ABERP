@@ -83,7 +83,7 @@ else
 fi
 
 die() {
-  echo "${c_red}[fail]${c_rst} $*" >&2
+  echo "${c_red}[fail]${c_rst} $1" >&2
   exit "${2:-2}"
 }
 warn() { echo "${c_yel}[warn]${c_rst} $*" >&2; }
@@ -302,7 +302,7 @@ $(git status --short)
 HU: A munkafa nem tiszta a váltás után — valami baj van." 5
 fi
 
-current_branch="$(git rev-parse --abbrev-ref HEAD)"
+current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || current_branch="UNKNOWN"
 if [[ "$current_branch" != "$version" ]]; then
   die "current branch is '$current_branch' but expected '$version'" 5
 fi
