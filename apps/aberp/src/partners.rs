@@ -790,6 +790,63 @@ pub fn find_partner_by_tax_number(
     }
 }
 
+/// S196 / PR-196 — find a `PrivatePerson` partner by `(legal_name,
+/// address_country, address_postal_code, address_city, address_street)`
+/// tuple. Used by the NAV-as-DR restore wizard's catalog-extraction
+/// pass to dedupe natural-person buyers that lack a tax_number (so
+/// [`find_partner_by_tax_number`] cannot key on them). All five
+/// components are matched case-insensitively after trim — same
+/// canonicalisation the extract module applies to NAV-XML candidates
+/// before issuing this lookup, so a wire body that varies only in
+/// casing or surrounding whitespace dedupes cleanly.
+///
+/// NULL columns on the DB side compare equal to the NULL-equivalent
+/// input (`None`) via the `IS NOT DISTINCT FROM` predicate — DuckDB
+/// supports this directly. A trimmed-empty input is mapped to NULL
+/// at the caller in the extract module so storage-side NULLs survive
+/// the round-trip.
+pub fn find_partner_by_name_and_address(
+    conn: &Connection,
+    tenant: &str,
+    legal_name: &str,
+    address_country: Option<&str>,
+    address_postal_code: Option<&str>,
+    address_city: Option<&str>,
+    address_street: Option<&str>,
+) -> Result<Option<Partner>> {
+    ensure_schema(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, display_name, legal_name, kind, tax_number,
+                eu_vat_number, address_street, address_postal_code, address_city,
+                address_country, bank_account, contact_email, contact_phone,
+                customer_vat_status, issued_invoice_count, created_at, updated_at, deleted_at
+         FROM partners
+         WHERE tenant_id = ?
+           AND deleted_at IS NULL
+           AND LOWER(legal_name) = LOWER(?)
+           AND LOWER(address_country)     IS NOT DISTINCT FROM LOWER(?)
+           AND LOWER(address_postal_code) IS NOT DISTINCT FROM LOWER(?)
+           AND LOWER(address_city)        IS NOT DISTINCT FROM LOWER(?)
+           AND LOWER(address_street)      IS NOT DISTINCT FROM LOWER(?)
+         LIMIT 1;",
+    )?;
+    let mut rows = stmt.query_map(
+        params![
+            tenant,
+            legal_name,
+            address_country,
+            address_postal_code,
+            address_city,
+            address_street,
+        ],
+        row_to_partner,
+    )?;
+    match rows.next() {
+        Some(r) => Ok(Some(r??)),
+        None => Ok(None),
+    }
+}
+
 /// List active partners for the tenant. `search` is a case-insensitive
 /// prefix filter applied to `display_name` OR `legal_name`. Result is
 /// ordered by `display_name` ASC (the natural typeahead order).

@@ -104,7 +104,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, BinaryHash, EventKind, Ledger, TenantId};
-use aberp_billing::IdempotencyKey;
+use aberp_billing::{Currency, IdempotencyKey};
+use aberp_nav_transport::error::NavTransportError;
+use aberp_nav_transport::operations::query_invoice_data;
 use aberp_nav_transport::operations::query_invoice_digest::{
     self, InvoiceDigest, QueryInvoiceDigestPage,
 };
@@ -119,6 +121,7 @@ use time::{format_description::FormatItem, macros, OffsetDateTime};
 use ulid::Ulid;
 
 use crate::audit_payloads::InvoiceRestoredFromNavPayload;
+use crate::restore_from_nav_extract::{self, ExtractionDelta};
 
 /// Earliest year the wizard accepts. NAV's Online Számla / data-
 /// submission system went live in 2018; pre-2018 invoices were not
@@ -327,6 +330,12 @@ fn load_already_restored_cache(
 
 /// One wizard run's summary. Returned to the HTTP route which echoes
 /// the body verbatim to the SPA.
+///
+/// S196 / PR-196 — extended with partner + product catalog-extraction
+/// counters. Pre-S196 fields are unchanged so the SPA's existing
+/// `RestoreSummary` reader continues to work; the new fields are
+/// additive (extra JSON keys ignored by the pre-S196 SPA build, picked
+/// up by the post-S196 SPA build).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RestoreSummary {
     pub year: i32,
@@ -335,6 +344,47 @@ pub struct RestoreSummary {
     pub errored: u64,
     pub pages_walked: u32,
     pub elapsed_ms: u64,
+    /// S196 — partners inserted into the local `partners` table from
+    /// freshly restored invoice `<customerInfo>` blocks.
+    #[serde(default)]
+    pub partners_restored: u64,
+    /// S196 — partner candidates that matched an existing row by the
+    /// dedup key (`tax_number` for DOMESTIC; `(legal_name, address)`
+    /// for PRIVATE_PERSON).
+    #[serde(default)]
+    pub partners_skipped_duplicate: u64,
+    /// S196 — partner extraction failures (NAV-side queryInvoiceData
+    /// non-OK, missing required fields, validator rejection). The
+    /// invoice itself is already restored; this counter tracks the
+    /// extraction sub-step only.
+    #[serde(default)]
+    pub partners_errored: u64,
+    /// S196 — products inserted into the local `products` table from
+    /// freshly restored invoice `<invoiceLines>` blocks.
+    #[serde(default)]
+    pub products_restored: u64,
+    /// S196 — product candidates that matched an existing row by the
+    /// dedup key `(name, ProductUnit)` and carried the same price.
+    /// Subsumes price-drift cases (those increment `*_price_varies`
+    /// alongside this counter).
+    #[serde(default)]
+    pub products_skipped_duplicate: u64,
+    /// S196 — per-line product extraction failures.
+    #[serde(default)]
+    pub products_errored: u64,
+    /// S196 — subset of `products_skipped_duplicate` where the
+    /// candidate's price DIFFERED from the stored row's price; the
+    /// stored price was updated to the last-seen value. v3 polish
+    /// target: surface as a per-row `price_varies` flag on the
+    /// product itself.
+    #[serde(default)]
+    pub products_price_varies: u64,
+    /// S196 — `queryInvoiceData` calls that failed entirely (NAV
+    /// transport, HTTP non-success, parse error). The invoice's
+    /// restored_invoice row is still intact; only the catalog
+    /// extraction for it was lost.
+    #[serde(default)]
+    pub invoice_extraction_errored: u64,
 }
 
 /// Validate the operator-supplied year. Same loud-fail posture as
@@ -421,10 +471,11 @@ pub async fn run(inputs: RestoreInputs) -> Result<RestoreSummary> {
     let mut total_skipped: u64 = 0;
     let mut total_errored: u64 = 0;
     let mut total_pages: u32 = 0;
+    let mut total_extraction = ExtractionDelta::default();
 
     for month in 1u8..=12 {
         let (date_from, date_to) = month_window(inputs.year, month)?;
-        let (restored, skipped, errored, pages) = walk_month(
+        let outcome = walk_month(
             &inputs,
             &transport,
             &date_from,
@@ -432,10 +483,11 @@ pub async fn run(inputs: RestoreInputs) -> Result<RestoreSummary> {
             &mut already_restored_cache,
         )
         .await?;
-        total_restored += restored;
-        total_skipped += skipped;
-        total_errored += errored;
-        total_pages += pages;
+        total_restored += outcome.restored;
+        total_skipped += outcome.skipped;
+        total_errored += outcome.errored;
+        total_pages += outcome.pages;
+        total_extraction.add(outcome.extraction);
     }
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -446,7 +498,26 @@ pub async fn run(inputs: RestoreInputs) -> Result<RestoreSummary> {
         errored: total_errored,
         pages_walked: total_pages,
         elapsed_ms,
+        partners_restored: total_extraction.partners_restored,
+        partners_skipped_duplicate: total_extraction.partners_skipped_duplicate,
+        partners_errored: total_extraction.partners_errored,
+        products_restored: total_extraction.products_restored,
+        products_skipped_duplicate: total_extraction.products_skipped_duplicate,
+        products_errored: total_extraction.products_errored,
+        products_price_varies: total_extraction.products_price_varies,
+        invoice_extraction_errored: total_extraction.invoice_extraction_errored,
     })
+}
+
+/// S196 — one month-walk's outputs. Pre-S196 returned a 4-tuple;
+/// extraction counters added on top so the per-month aggregation in
+/// [`run`] stays a single accumulator pass.
+struct MonthOutcome {
+    restored: u64,
+    skipped: u64,
+    errored: u64,
+    pages: u32,
+    extraction: ExtractionDelta,
 }
 
 async fn walk_month(
@@ -455,11 +526,12 @@ async fn walk_month(
     date_from: &str,
     date_to: &str,
     already_restored_cache: &mut AlreadyRestoredCache,
-) -> Result<(u64, u64, u64, u32)> {
+) -> Result<MonthOutcome> {
     let mut restored: u64 = 0;
     let mut skipped: u64 = 0;
     let mut errored: u64 = 0;
     let mut page: u32 = 1;
+    let mut month_extraction = ExtractionDelta::default();
 
     loop {
         if page > MAX_PAGES_PER_MONTH {
@@ -471,7 +543,13 @@ async fn walk_month(
                  operator should narrow the year or contact support"
             );
             errored = errored.saturating_add(1);
-            return Ok((restored, skipped, errored, page - 1));
+            return Ok(MonthOutcome {
+                restored,
+                skipped,
+                errored,
+                pages: page - 1,
+                extraction: month_extraction,
+            });
         }
 
         let page_result: QueryInvoiceDigestPage = match query_invoice_digest::call(
@@ -496,7 +574,13 @@ async fn walk_month(
                      continuing to next month"
                 );
                 errored = errored.saturating_add(1);
-                return Ok((restored, skipped, errored, page.saturating_sub(1)));
+                return Ok(MonthOutcome {
+                    restored,
+                    skipped,
+                    errored,
+                    pages: page.saturating_sub(1),
+                    extraction: month_extraction,
+                });
             }
         };
 
@@ -508,6 +592,15 @@ async fn walk_month(
         // O(pages) instead of O(digests). The cache is `mem::take`n
         // into the closure and threaded back out so the mutation
         // posture (one cache for the whole month-walk) is preserved.
+        //
+        // S196 — alongside `(restored, skipped, errored)` counters the
+        // closure now collects a `fresh_restored: Vec<FreshRestored>`
+        // listing the invoices that landed as `Restored` this page.
+        // After the blocking pool returns, the async caller fans those
+        // out to one `queryInvoiceData` call + catalog extraction per
+        // entry. The extraction step itself uses another `spawn_blocking`
+        // for the XML parse + partner/product DB inserts so the worker
+        // is not held across the synchronous DB work.
         let digests = page_result.digests;
         let db_path = inputs.db_path.clone();
         let tenant = inputs.tenant.clone();
@@ -515,7 +608,7 @@ async fn walk_month(
         let operator_login = inputs.operator_login.clone();
         let year = inputs.year;
         let cache_taken = std::mem::take(already_restored_cache);
-        let (cache_returned, page_restored, page_skipped, page_errored) =
+        let (cache_returned, page_restored, page_skipped, page_errored, fresh_restored) =
             tokio::task::spawn_blocking(move || {
                 let ctx = DigestContext {
                     db_path: &db_path,
@@ -528,9 +621,30 @@ async fn walk_month(
                 let mut r: u64 = 0;
                 let mut s: u64 = 0;
                 let mut er: u64 = 0;
+                let mut fresh: Vec<FreshRestored> = Vec::new();
                 for digest in &digests {
                     match process_digest(&ctx, digest, &mut cache) {
-                        Ok(ProcessOutcome::Restored) => r += 1,
+                        Ok(ProcessOutcome::Restored) => {
+                            r += 1;
+                            // process_digest already validated currency
+                            // against the closed vocab; the re-parse here
+                            // cannot fail in practice but loud-fails
+                            // defensively if it does (CLAUDE.md rule 12).
+                            match parse_digest_currency(digest) {
+                                Ok(currency) => fresh.push(FreshRestored {
+                                    invoice_number: digest.invoice_number.clone(),
+                                    currency,
+                                }),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        invoice_number = %digest.invoice_number,
+                                        error = ?e,
+                                        "S196: post-restore currency re-parse failed; \
+                                         catalog extraction skipped for this invoice"
+                                    );
+                                }
+                            }
+                        }
                         Ok(ProcessOutcome::Skipped) => s += 1,
                         Err(e) => {
                             tracing::warn!(
@@ -542,7 +656,7 @@ async fn walk_month(
                         }
                     }
                 }
-                (cache, r, s, er)
+                (cache, r, s, er, fresh)
             })
             .await
             .map_err(|join_err| anyhow!("restore wizard per-page task panicked: {join_err}"))?;
@@ -551,11 +665,207 @@ async fn walk_month(
         skipped += page_skipped;
         errored += page_errored;
 
+        // S196 — async fan-out of catalog extraction per fresh-restored
+        // invoice. Sequential here (one queryInvoiceData at a time) —
+        // NAV's per-tenant rate limits favour serial calls and the
+        // wizard is operator-paced (one operator click per cycle).
+        for fresh in fresh_restored {
+            let delta = extract_catalog_for_invoice(
+                &inputs.db_path,
+                &inputs.tenant,
+                &inputs.tax_number_8,
+                &inputs.credentials,
+                transport,
+                &fresh.invoice_number,
+                fresh.currency,
+            )
+            .await;
+            month_extraction.add(delta);
+        }
+
         if page >= available_page {
-            return Ok((restored, skipped, errored, page));
+            return Ok(MonthOutcome {
+                restored,
+                skipped,
+                errored,
+                pages: page,
+                extraction: month_extraction,
+            });
         }
         page += 1;
     }
+}
+
+/// S196 — one freshly-restored invoice, captured by the per-page
+/// blocking-pool worker and consumed by the async extraction fan-out.
+#[derive(Debug, Clone)]
+struct FreshRestored {
+    invoice_number: String,
+    currency: Currency,
+}
+
+/// S196 — map a digest's wire-form currency string to the closed-vocab
+/// [`Currency`] enum the extract module needs. Loud-fails on any value
+/// outside `{HUF, EUR}` so a NAV-side schema drift surfaces immediately.
+fn parse_digest_currency(digest: &InvoiceDigest) -> Result<Currency> {
+    match digest.currency.as_deref() {
+        Some("HUF") => Ok(Currency::Huf),
+        Some("EUR") => Ok(Currency::Eur),
+        Some(other) => Err(anyhow!(
+            "digest for invoice_number={} carries currency `{}` outside closed vocab (HUF | EUR)",
+            digest.invoice_number,
+            other,
+        )),
+        None => Err(anyhow!(
+            "digest for invoice_number={} missing <currency>",
+            digest.invoice_number
+        )),
+    }
+}
+
+/// S196 — for one freshly-restored invoice: call `queryInvoiceData`
+/// against NAV, decode the base64 `<invoiceData>` blob, parse the
+/// inner `<customerInfo>` + `<invoiceLines>` blocks, and upsert the
+/// candidates into the local `partners` + `products` tables. Returns
+/// an [`ExtractionDelta`] the caller accumulates.
+///
+/// Per-invoice failures are CONTAINED here: any error path (NAV
+/// transport, HTTP non-success, base64 decode, XML parse, DB upsert)
+/// surfaces as a `tracing::warn!` + an `invoice_extraction_errored`
+/// counter increment, NOT a propagated `Err(...)`. The wizard's
+/// primary contract is the invoice restore itself, which has already
+/// landed by the time this function runs.
+async fn extract_catalog_for_invoice(
+    db_path: &Path,
+    tenant: &TenantId,
+    tax_number_8: &str,
+    credentials: &NavCredentials,
+    transport: &NavTransport,
+    invoice_number: &str,
+    currency: Currency,
+) -> ExtractionDelta {
+    let outcome = match query_invoice_data::call(
+        transport,
+        credentials,
+        tax_number_8,
+        invoice_number,
+        InvoiceDirection::Outbound,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(
+                invoice_number = invoice_number,
+                error = %nav_transport_error_message(&e),
+                "S196: queryInvoiceData failed; catalog extraction skipped for this invoice"
+            );
+            return ExtractionDelta {
+                invoice_extraction_errored: 1,
+                ..Default::default()
+            };
+        }
+    };
+
+    let response_xml = outcome.response_xml;
+    let db_path_owned = db_path.to_path_buf();
+    let tenant_owned = tenant.clone();
+    let invoice_number_owned = invoice_number.to_string();
+
+    // Synchronous XML parse + DB upserts on the blocking pool so the
+    // tokio worker is not held across the per-candidate DuckDB writes.
+    let join_result = tokio::task::spawn_blocking(move || {
+        let inner = match restore_from_nav_extract::extract_inner_invoice_data_xml(&response_xml) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    invoice_number = invoice_number_owned.as_str(),
+                    error = ?e,
+                    "S196: failed to decode <invoiceData> base64 blob; catalog extraction skipped"
+                );
+                return ExtractionDelta {
+                    invoice_extraction_errored: 1,
+                    ..Default::default()
+                };
+            }
+        };
+        let customer = match restore_from_nav_extract::parse_customer_info(&inner) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    invoice_number = invoice_number_owned.as_str(),
+                    error = ?e,
+                    "S196: failed to parse <customerInfo> from inner InvoiceData XML"
+                );
+                return ExtractionDelta {
+                    invoice_extraction_errored: 1,
+                    ..Default::default()
+                };
+            }
+        };
+        let lines = match restore_from_nav_extract::parse_invoice_lines(&inner, currency) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(
+                    invoice_number = invoice_number_owned.as_str(),
+                    error = ?e,
+                    "S196: failed to parse <invoiceLines> from inner InvoiceData XML"
+                );
+                return ExtractionDelta {
+                    invoice_extraction_errored: 1,
+                    ..Default::default()
+                };
+            }
+        };
+        let conn = match restore_from_nav_extract::open_for_extract(&db_path_owned) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    invoice_number = invoice_number_owned.as_str(),
+                    error = ?e,
+                    "S196: failed to open tenant DB for catalog extraction"
+                );
+                return ExtractionDelta {
+                    invoice_extraction_errored: 1,
+                    ..Default::default()
+                };
+            }
+        };
+        restore_from_nav_extract::apply_candidates(
+            &conn,
+            tenant_owned.as_str(),
+            &invoice_number_owned,
+            &customer,
+            &lines,
+            currency,
+        )
+    })
+    .await;
+
+    match join_result {
+        Ok(delta) => delta,
+        Err(join_err) => {
+            tracing::warn!(
+                invoice_number = invoice_number,
+                error = ?join_err,
+                "S196: catalog-extraction blocking task panicked; counter increments \
+                 for invoice_extraction_errored"
+            );
+            ExtractionDelta {
+                invoice_extraction_errored: 1,
+                ..Default::default()
+            }
+        }
+    }
+}
+
+/// Render a [`NavTransportError`] as a short string for the
+/// `tracing::warn!` payload. The full Debug form is fine but variant
+/// names (`QueryInvoiceDataRetryable { code, message }` etc.) ride
+/// cleanly through `Display` on each variant; collapse here so the
+/// log line carries a one-line message regardless of variant.
+fn nav_transport_error_message(e: &NavTransportError) -> String {
+    format!("{e}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

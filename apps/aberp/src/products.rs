@@ -336,6 +336,45 @@ pub fn get_product(conn: &Connection, tenant: &str, id: &str) -> Result<Option<P
     }
 }
 
+/// S196 / PR-196 — find a product by `(name, ProductUnit)` tuple,
+/// scoped to the tenant. Used by the NAV-as-DR restore wizard's
+/// catalog-extraction pass to dedupe products parsed from restored
+/// invoice line items. Name match is case-insensitive after trim
+/// (same canonicalisation the extract module applies before issuing
+/// the lookup). Unit match is byte-exact on the two-column DB form
+/// (`unit_kind` + `unit_value`) — round-tripped through
+/// [`unit_to_db_columns`] for the input side. Soft-deleted rows are
+/// excluded so a future "restore deleted product" surface does not
+/// silently resurrect rows through this path.
+pub fn find_product_by_name_and_unit(
+    conn: &Connection,
+    tenant: &str,
+    name: &str,
+    unit: &ProductUnit,
+) -> Result<Option<Product>> {
+    ensure_schema(conn)?;
+    let (unit_kind, unit_value) = unit_to_db_columns(unit);
+    let mut stmt = conn.prepare(
+        "SELECT id, name, unit_kind, unit_value, currency,
+                unit_price_minor, created_at, updated_at, deleted_at
+         FROM products
+         WHERE tenant_id = ?
+           AND deleted_at IS NULL
+           AND LOWER(name) = LOWER(?)
+           AND unit_kind = ?
+           AND unit_value = ?
+         LIMIT 1;",
+    )?;
+    let mut rows = stmt.query_map(
+        params![tenant, name, unit_kind, &unit_value],
+        row_to_product,
+    )?;
+    match rows.next() {
+        Some(r) => Ok(Some(r??)),
+        None => Ok(None),
+    }
+}
+
 /// List active products for the tenant. `search` is a case-insensitive
 /// prefix filter on `name`. Result is `ORDER BY name ASC`.
 pub fn list_products(
