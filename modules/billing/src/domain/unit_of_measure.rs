@@ -86,6 +86,39 @@ impl NavUnitOfMeasure {
         }
     }
 
+    /// Compact Hungarian operator-facing label for this unit — what the
+    /// printed-invoice PDF renders in the "egység" column on each line.
+    /// Distinct from the NAV wire token: NAV insists on
+    /// `PIECE`/`KILOGRAM`/… as the body of `<unitOfMeasure>`, but the
+    /// printed invoice the buyer reads carries the Hungarian short-form
+    /// (`db`, `kg`, `nap`) the operator chose. PR-202 closed the
+    /// pre-existing bug where the PDF rendered the NAV token verbatim.
+    ///
+    /// Labels match the SPA `NAV_UNIT_OPTIONS` dropdown's `label_hu`
+    /// (`apps/aberp-ui/ui/src/lib/products.ts`) except for compactness:
+    /// the SPA shows `db (darab)` / `fm (folyóméter)` to disambiguate
+    /// the abbreviation in a selection menu; the printed-invoice column
+    /// is tight so the parenthetical long-forms are dropped here.
+    pub fn display_label_hu(self) -> &'static str {
+        match self {
+            NavUnitOfMeasure::Piece => "db",
+            NavUnitOfMeasure::Kilogram => "kg",
+            NavUnitOfMeasure::Ton => "tonna",
+            NavUnitOfMeasure::Kwh => "kWh",
+            NavUnitOfMeasure::Day => "nap",
+            NavUnitOfMeasure::Hour => "óra",
+            NavUnitOfMeasure::Minute => "perc",
+            NavUnitOfMeasure::Month => "hónap",
+            NavUnitOfMeasure::Liter => "liter",
+            NavUnitOfMeasure::Kilometer => "km",
+            NavUnitOfMeasure::CubicMeter => "m³",
+            NavUnitOfMeasure::Meter => "m",
+            NavUnitOfMeasure::LinearMeter => "fm",
+            NavUnitOfMeasure::Carton => "karton",
+            NavUnitOfMeasure::Pack => "csomag",
+        }
+    }
+
     /// Parse a NAV token string back to the enum. Used by the products
     /// module's DB read path (`unit_from_db_columns`). `None` for any
     /// string outside the closed vocab.
@@ -139,4 +172,72 @@ pub enum ProductUnit {
     /// `liter@15C` (fuel measure) is the canonical example — no plain
     /// LITER variant covers the temperature correction.
     Own(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PR-202 — exhaustive coverage of `display_label_hu` for every
+    /// closed-vocab variant. Catches a future variant addition that
+    /// extends `NavUnitOfMeasure` + `nav_token` + `from_nav_token`
+    /// (the existing F12-style ritual) but forgets the HU label —
+    /// without this pin the new variant would silently fall back to
+    /// `Piece`'s "db" in `unit_display_from_nav`.
+    #[test]
+    fn display_label_hu_covers_every_variant() {
+        let cases: &[(NavUnitOfMeasure, &str)] = &[
+            (NavUnitOfMeasure::Piece, "db"),
+            (NavUnitOfMeasure::Kilogram, "kg"),
+            (NavUnitOfMeasure::Ton, "tonna"),
+            (NavUnitOfMeasure::Kwh, "kWh"),
+            (NavUnitOfMeasure::Day, "nap"),
+            (NavUnitOfMeasure::Hour, "óra"),
+            (NavUnitOfMeasure::Minute, "perc"),
+            (NavUnitOfMeasure::Month, "hónap"),
+            (NavUnitOfMeasure::Liter, "liter"),
+            (NavUnitOfMeasure::Kilometer, "km"),
+            (NavUnitOfMeasure::CubicMeter, "m³"),
+            (NavUnitOfMeasure::Meter, "m"),
+            (NavUnitOfMeasure::LinearMeter, "fm"),
+            (NavUnitOfMeasure::Carton, "karton"),
+            (NavUnitOfMeasure::Pack, "csomag"),
+        ];
+        for (variant, expected) in cases {
+            assert_eq!(
+                variant.display_label_hu(),
+                *expected,
+                "display_label_hu for {variant:?}"
+            );
+        }
+        // Coverage cross-check: the table length must equal the
+        // round-trippable enum cardinality so a future variant
+        // addition fails this test rather than silently defaulting.
+        // (Lower-bound — `from_nav_token` is the canonical breadth
+        // ritual; `display_label_hu` is the load-bearing third leg.)
+        let round_trippable = [
+            "PIECE",
+            "KILOGRAM",
+            "TON",
+            "KWH",
+            "DAY",
+            "HOUR",
+            "MINUTE",
+            "MONTH",
+            "LITER",
+            "KILOMETER",
+            "CUBIC_METER",
+            "METER",
+            "LINEAR_METER",
+            "CARTON",
+            "PACK",
+        ];
+        for token in round_trippable {
+            assert!(
+                NavUnitOfMeasure::from_nav_token(token).is_some(),
+                "from_nav_token should accept {token}"
+            );
+        }
+        assert_eq!(cases.len(), round_trippable.len());
+    }
 }

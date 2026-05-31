@@ -50,7 +50,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use aberp_audit_ledger::{BinaryHash, EventKind, Ledger, TenantId};
-use aberp_billing::{self as billing, BankAccountSnapshot, Currency, RateMetadata};
+use aberp_billing::{
+    self as billing, BankAccountSnapshot, Currency, NavUnitOfMeasure, RateMetadata,
+};
 use aberp_invoice_pdf::{render_invoice, InvoiceModel, LineItem as PdfLine, PartyInfo, TenantLogo};
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
@@ -279,7 +281,7 @@ pub fn render_to_bytes(
         .map(|(idx, l)| PdfLine {
             description: l.description.clone(),
             quantity: l.quantity,
-            unit: "PIECE".to_string(),
+            unit: unit_display_from_nav(&l.unit_of_measure, l.unit_of_measure_own.as_deref()),
             unit_price_minor: native_to_minor(&l.unit_price_native, currency),
             net_minor: native_to_minor(&l.net_native, currency),
             vat_rate_percent: l.vat_rate_percent,
@@ -497,6 +499,18 @@ pub struct ParsedNavLine {
     /// `1` on the printed PDF; the renderer now shows the full value with
     /// the Hungarian comma.
     pub quantity: Decimal,
+    /// PR-202 — NAV `<unitOfMeasure>` element body verbatim (one of the
+    /// closed-vocab tokens `PIECE`/`KILOGRAM`/…/`DAY`, the literal `OWN`,
+    /// or — defensively — empty for a malformed/pre-S159 body that wrote
+    /// no element). [`unit_display_from_nav`] consumes this together with
+    /// [`Self::unit_of_measure_own`] to produce the operator-facing
+    /// Hungarian label the PDF column renders.
+    pub unit_of_measure: String,
+    /// PR-202 — NAV `<unitOfMeasureOwn>` free-text companion. NAV's
+    /// LineType permits this ONLY when `<unitOfMeasure>` is the literal
+    /// `OWN`; for every closed-vocab variant it is absent and this stays
+    /// `None`.
+    pub unit_of_measure_own: Option<String>,
     /// Native-currency unit price as written on the wire — `"1000"` for
     /// HUF (integer forints), `"12.34"` for EUR (two-decimal cents
     /// rendered as euros-and-cents). Converted to minor units by
@@ -741,6 +755,15 @@ fn handle_text(
                 line.quantity = Decimal::from_str(value)
                     .map_err(|e| anyhow!("<quantity> `{value}` parse: {e}"))?;
             }
+            // PR-202 — capture the unit-of-measure pair so the PDF renders
+            // the operator's actual unit instead of the pre-PR-202
+            // hardcoded "PIECE". NAV's LineType places `<unitOfMeasure>`
+            // after `<quantity>` and (when the value is `OWN`) follows
+            // it with `<unitOfMeasureOwn>`; the parser captures both
+            // verbatim and `unit_display_from_nav` resolves the
+            // operator-facing label.
+            "unitOfMeasure" => line.unit_of_measure = value.to_string(),
+            "unitOfMeasureOwn" => line.unit_of_measure_own = Some(value.to_string()),
             "unitPrice" => line.unit_price_native = value.to_string(),
             "lineNetAmount" => line.net_native = value.to_string(),
             "lineVatAmount" => line.vat_native = value.to_string(),
@@ -1305,6 +1328,40 @@ fn load_brand_primary_color(seller_toml_path: &Path) -> Result<Option<(f32, f32,
 // ──────────────────────────────────────────────────────────────────────
 // Cosmetic helpers
 // ──────────────────────────────────────────────────────────────────────
+
+/// PR-202 — map a NAV `<unitOfMeasure>` (`+ <unitOfMeasureOwn>`) pair
+/// parsed off the on-disk wire body to the operator-facing Hungarian
+/// label the PDF column renders.
+///
+/// Resolution order:
+///   1. **`OWN`** with a non-empty companion → return the companion
+///      verbatim (operator-typed free-text label such as `liter@15C`).
+///   2. **Closed-vocab NAV token** known to
+///      [`NavUnitOfMeasure::from_nav_token`] → return that variant's
+///      [`NavUnitOfMeasure::display_label_hu`] (compact HU: `db`, `kg`,
+///      `nap`, …).
+///   3. **Unknown token** (including empty / future NAV additions, and
+///      `OWN` with no/empty companion) → fall back to `"db"`. PIECE is
+///      the historically-most-common unit and matches the SPA's default
+///      (`NAV_UNIT_OPTIONS[0]` + `emptyProductForm().unitSelection`); a
+///      sensible default keeps the column from going blank on a
+///      malformed body. The pre-PR-202 hardcode also defaulted to
+///      PIECE — by-product chosen here for byte-stable fallback.
+fn unit_display_from_nav(unit_token: &str, own_label: Option<&str>) -> String {
+    if unit_token == "OWN" {
+        if let Some(label) = own_label {
+            let trimmed = label.trim();
+            if !trimmed.is_empty() {
+                return label.to_string();
+            }
+        }
+        return NavUnitOfMeasure::Piece.display_label_hu().to_string();
+    }
+    match NavUnitOfMeasure::from_nav_token(unit_token) {
+        Some(token) => token.display_label_hu().to_string(),
+        None => NavUnitOfMeasure::Piece.display_label_hu().to_string(),
+    }
+}
 
 /// Map NAV's `<paymentMethod>` wire vocabulary to the Hungarian
 /// operator-facing label the reference template uses. Unknown values
@@ -1940,5 +1997,142 @@ swift_bic = "OTPVHUHB"
             logo.is_none(),
             "dim-cap rejection ⇒ Ok(None) at the orchestrator"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // PR-202 — `<unitOfMeasure>` parser + display-label resolver
+    // ──────────────────────────────────────────────────────────────────
+
+    /// PR-202 — the parser captures both the closed-vocab NAV token and
+    /// (when present) the `OWN` free-text companion verbatim. Pre-PR-202
+    /// the parser ignored both elements; the renderer then hardcoded
+    /// "PIECE" for every line, so a NAP-billed product printed as PIECE.
+    #[test]
+    fn parser_captures_unit_of_measure_and_own_companion() {
+        let xml = r#"<InvoiceData>
+  <invoiceNumber>TST-2026-1</invoiceNumber>
+  <invoiceMain><invoice><invoiceHead>
+    <customerInfo><customerName>X</customerName></customerInfo>
+  </invoiceHead>
+  <invoiceLines>
+    <line>
+      <lineDescription>Tanácsadás</lineDescription>
+      <quantity>2</quantity>
+      <unitOfMeasure>DAY</unitOfMeasure>
+      <unitPrice>50000</unitPrice>
+    </line>
+    <line>
+      <lineDescription>Üzemanyag</lineDescription>
+      <quantity>10</quantity>
+      <unitOfMeasure>OWN</unitOfMeasure>
+      <unitOfMeasureOwn>liter@15C</unitOfMeasureOwn>
+      <unitPrice>500</unitPrice>
+    </line>
+  </invoiceLines>
+  </invoice></invoiceMain>
+</InvoiceData>"#;
+        let parsed = parse_nav_invoice_xml(xml.as_bytes()).expect("parse fixture XML");
+        assert_eq!(parsed.lines.len(), 2);
+        assert_eq!(parsed.lines[0].unit_of_measure, "DAY");
+        assert!(
+            parsed.lines[0].unit_of_measure_own.is_none(),
+            "closed-vocab line carries no <unitOfMeasureOwn>"
+        );
+        assert_eq!(parsed.lines[1].unit_of_measure, "OWN");
+        assert_eq!(
+            parsed.lines[1].unit_of_measure_own.as_deref(),
+            Some("liter@15C"),
+            "OWN line's free-text companion must round-trip verbatim"
+        );
+    }
+
+    /// PR-202 — closed-vocab NAV token → compact HU label. The reported
+    /// bug: a NAP-billed line printed as "PIECE". Pin the load-bearing
+    /// resolution.
+    #[test]
+    fn unit_display_resolves_closed_vocab_to_compact_hu_label() {
+        assert_eq!(unit_display_from_nav("DAY", None), "nap");
+        assert_eq!(unit_display_from_nav("PIECE", None), "db");
+        assert_eq!(unit_display_from_nav("KILOGRAM", None), "kg");
+        assert_eq!(unit_display_from_nav("HOUR", None), "óra");
+        assert_eq!(unit_display_from_nav("LINEAR_METER", None), "fm");
+        assert_eq!(unit_display_from_nav("CUBIC_METER", None), "m³");
+    }
+
+    /// PR-202 — `OWN` + free-text companion: render the companion
+    /// verbatim. `liter@15C` is the canonical fuel-measure example.
+    #[test]
+    fn unit_display_own_returns_free_text_companion_verbatim() {
+        assert_eq!(unit_display_from_nav("OWN", Some("liter@15C")), "liter@15C");
+        assert_eq!(
+            unit_display_from_nav("OWN", Some("zsák (50kg)")),
+            "zsák (50kg)"
+        );
+    }
+
+    /// PR-202 — `OWN` with missing / blank companion → fall back to "db"
+    /// (PIECE's HU label, same default as the SPA's empty form). Keeps
+    /// the column from going blank on a malformed body that emitted
+    /// `<unitOfMeasure>OWN</...>` but no `<unitOfMeasureOwn>` — the NAV
+    /// XSD validator rejects this at issuance, so on-disk bodies are
+    /// well-formed by construction; this is defence-in-depth for a
+    /// hypothetical tampered/legacy body.
+    #[test]
+    fn unit_display_own_without_companion_falls_back_to_db() {
+        assert_eq!(unit_display_from_nav("OWN", None), "db");
+        assert_eq!(unit_display_from_nav("OWN", Some("")), "db");
+        assert_eq!(unit_display_from_nav("OWN", Some("   ")), "db");
+    }
+
+    /// PR-202 — unknown / empty token → fall back to "db". A future NAV
+    /// schema extension that adds a new token surfaces as "db" on
+    /// printed invoices issued against the pre-update binary (rather
+    /// than a blank column or a panic). Empty token is the legacy /
+    /// malformed-body path.
+    #[test]
+    fn unit_display_unknown_token_falls_back_to_db() {
+        assert_eq!(unit_display_from_nav("", None), "db");
+        assert_eq!(
+            unit_display_from_nav("FUTURE_NAV_VARIANT", None),
+            "db",
+            "unknown token does not panic, does not leak the raw token to the PDF",
+        );
+    }
+
+    /// PR-202 — end-to-end pin via the parser: a 2-line invoice (DAY +
+    /// OWN/liter@15C) yields the two expected PDF labels after parse +
+    /// resolve. Mirrors what `render_to_bytes` does end-to-end without
+    /// requiring the full ledger + DuckDB scaffolding.
+    #[test]
+    fn parser_to_pdf_label_pipeline_yields_nap_and_own_label() {
+        let xml = r#"<InvoiceData>
+  <invoiceNumber>TST-2026-2</invoiceNumber>
+  <invoiceMain><invoice><invoiceHead>
+    <customerInfo><customerName>X</customerName></customerInfo>
+  </invoiceHead>
+  <invoiceLines>
+    <line>
+      <lineDescription>Tanácsadás</lineDescription>
+      <quantity>1</quantity>
+      <unitOfMeasure>DAY</unitOfMeasure>
+      <unitPrice>50000</unitPrice>
+    </line>
+    <line>
+      <lineDescription>Üzemanyag</lineDescription>
+      <quantity>10</quantity>
+      <unitOfMeasure>OWN</unitOfMeasure>
+      <unitOfMeasureOwn>liter@15C</unitOfMeasureOwn>
+      <unitPrice>500</unitPrice>
+    </line>
+  </invoiceLines>
+  </invoice></invoiceMain>
+</InvoiceData>"#;
+        let parsed = parse_nav_invoice_xml(xml.as_bytes()).expect("parse fixture XML");
+        let labels: Vec<String> = parsed
+            .lines
+            .iter()
+            .map(|l| unit_display_from_nav(&l.unit_of_measure, l.unit_of_measure_own.as_deref()))
+            .collect();
+        assert_eq!(labels, vec!["nap".to_string(), "liter@15C".to_string()]);
     }
 }
