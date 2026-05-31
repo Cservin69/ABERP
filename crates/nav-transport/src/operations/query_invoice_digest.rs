@@ -106,6 +106,14 @@ pub struct InvoiceDigest {
 pub struct QueryInvoiceDigestPage {
     pub current_page: u32,
     pub available_page: u32,
+    /// NAV's published OSA 3.0 `InvoiceDigestResultType` does NOT
+    /// declare `<availableLine>`; real prod responses omit it
+    /// (session-189 bug). The parser defaults to 0 when absent
+    /// rather than loud-failing. No code reads this today —
+    /// kept as the verbatim value NAV sends if a future schema
+    /// revision adds the element back. **Do not turn this into
+    /// an `Option<u64>`** without first re-verifying no callers
+    /// rely on the u64 typing.
     pub available_line: u64,
     pub digests: Vec<InvoiceDigest>,
 }
@@ -314,10 +322,21 @@ pub(crate) fn parse_digest_page(xml: &[u8]) -> Result<QueryInvoiceDigestPage, Na
         buf.clear();
     }
 
-    // Empty pages are legal: zero invoices in the date range → NAV
-    // still returns `<invoiceDigestResult>` with `availableLine=0`
-    // and zero `<invoiceDigest>` children. The pagination scalars'
-    // absence is loud-fail per CLAUDE.md rule 12.
+    // Pagination posture, pinned against the published NAV OSA 3.0
+    // `InvoiceDigestResultType` (`invoiceApi.xsd`):
+    //
+    //   - `<currentPage>` and `<availablePage>` are REQUIRED in the
+    //     XSD (no `minOccurs="0"`). A response missing either is
+    //     schema drift and loud-fails per CLAUDE.md rule 12 —
+    //     silently defaulting to 1 would let the daemon think it
+    //     had exhausted pagination after page 1 and silently drop
+    //     pages 2..N.
+    //   - `<availableLine>` is NOT in the NAV XSD at all (the field
+    //     was carried into this parser from an earlier draft, never
+    //     emitted by NAV). The session-189 prod bug was the
+    //     `.ok_or(...)` here firing on every empty-INBOUND tenant
+    //     boot. Default to 0 when absent; if NAV ever does emit it
+    //     in a future schema revision, we still capture the value.
     let current_page = current_page.ok_or_else(|| {
         NavTransportError::QueryInvoiceDigestResponseParse(
             "queryInvoiceDigest response missing <currentPage>".to_string(),
@@ -328,11 +347,7 @@ pub(crate) fn parse_digest_page(xml: &[u8]) -> Result<QueryInvoiceDigestPage, Na
             "queryInvoiceDigest response missing <availablePage>".to_string(),
         )
     })?;
-    let available_line = available_line.ok_or_else(|| {
-        NavTransportError::QueryInvoiceDigestResponseParse(
-            "queryInvoiceDigest response missing <availableLine>".to_string(),
-        )
-    })?;
+    let available_line = available_line.unwrap_or(0);
 
     // A digest with empty `invoice_number` or `supplier_tax_number`
     // is unusable for the AP-sync daemon's dedup key. Loud-fail per
@@ -610,15 +625,16 @@ mod tests {
         }
     }
 
-    /// A response missing the pagination scalars loud-fails.
-    /// Pinned because a silent zero-default would let the AP-sync
-    /// daemon think it had exhausted pagination after page 1 and
-    /// silently drop pages 2..N.
+    /// `<currentPage>` is REQUIRED per the NAV OSA 3.0 XSD; absence
+    /// is schema drift and must loud-fail. Pinned because a silent
+    /// 1-default would mask NAV regressing on a required field, and
+    /// could let the daemon stall on page 1 forever.
     #[test]
-    fn parse_digest_page_loud_fails_on_missing_pagination() {
+    fn parse_digest_page_loud_fails_on_missing_current_page() {
         let body = br#"<?xml version="1.0" encoding="UTF-8"?>
 <QueryInvoiceDigestResponse>
   <invoiceDigestResult>
+    <availablePage>1</availablePage>
     <invoiceDigest>
       <invoiceNumber>X</invoiceNumber>
       <supplierTaxNumber>1</supplierTaxNumber>
@@ -626,6 +642,140 @@ mod tests {
   </invoiceDigestResult>
 </QueryInvoiceDigestResponse>"#;
         let err = parse_digest_page(body).expect_err("must loud-fail");
+        match err {
+            NavTransportError::QueryInvoiceDigestResponseParse(msg) => {
+                assert!(msg.contains("currentPage"), "{msg}");
+            }
+            other => panic!("expected QueryInvoiceDigestResponseParse, got {other:?}"),
+        }
+    }
+
+    /// `<availablePage>` is REQUIRED per the NAV OSA 3.0 XSD; absence
+    /// is schema drift and must loud-fail. Pinned because a silent
+    /// zero-default would let the daemon think it had exhausted
+    /// pagination after page 1 and silently drop pages 2..N.
+    #[test]
+    fn parse_digest_page_loud_fails_on_missing_available_page() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<QueryInvoiceDigestResponse>
+  <invoiceDigestResult>
+    <currentPage>1</currentPage>
+    <invoiceDigest>
+      <invoiceNumber>X</invoiceNumber>
+      <supplierTaxNumber>1</supplierTaxNumber>
+    </invoiceDigest>
+  </invoiceDigestResult>
+</QueryInvoiceDigestResponse>"#;
+        let err = parse_digest_page(body).expect_err("must loud-fail");
+        match err {
+            NavTransportError::QueryInvoiceDigestResponseParse(msg) => {
+                assert!(msg.contains("availablePage"), "{msg}");
+            }
+            other => panic!("expected QueryInvoiceDigestResponseParse, got {other:?}"),
+        }
+    }
+
+    /// **Session-189 prod regression pin.** NAV's real INBOUND digest
+    /// response for a tenant with zero supplier-issued invoices in the
+    /// window OMITS `<availableLine>` entirely (the element was never
+    /// in the official NAV OSA 3.0 XSD — see
+    /// https://github.com/nav-gov-hu/Online-Invoice `invoiceApi.xsd`,
+    /// `InvoiceDigestResultType`). Before PR-189 this loud-failed at
+    /// boot on every empty-INBOUND tenant. After PR-189 the field
+    /// defaults to 0 and the daemon proceeds.
+    #[test]
+    fn parse_digest_page_tolerates_missing_available_line_empty_inbound() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<QueryInvoiceDigestResponse xmlns="http://schemas.nav.gov.hu/OSA/3.0/api"
+                            xmlns:common="http://schemas.nav.gov.hu/NTCA/1.0/common">
+  <common:result>
+    <common:funcCode>OK</common:funcCode>
+  </common:result>
+  <invoiceDigestResult>
+    <currentPage>1</currentPage>
+    <availablePage>1</availablePage>
+  </invoiceDigestResult>
+</QueryInvoiceDigestResponse>"#;
+        let page = parse_digest_page(body).expect("empty INBOUND must parse cleanly");
+        assert_eq!(page.current_page, 1);
+        assert_eq!(page.available_page, 1);
+        assert_eq!(
+            page.available_line, 0,
+            "absent <availableLine> defaults to 0"
+        );
+        assert!(page.digests.is_empty(), "empty INBOUND has zero digests");
+    }
+
+    /// Mirror of the empty-INBOUND fixture but with one real digest
+    /// row, still without `<availableLine>`. Pins that the daemon's
+    /// dedup path is not blocked by the missing scalar when the
+    /// payload otherwise carries usable data — defence-in-depth on
+    /// the same XSD-conformance posture as the empty case.
+    #[test]
+    fn parse_digest_page_tolerates_missing_available_line_with_digest() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<QueryInvoiceDigestResponse xmlns="http://schemas.nav.gov.hu/OSA/3.0/api"
+                            xmlns:common="http://schemas.nav.gov.hu/NTCA/1.0/common">
+  <common:result>
+    <common:funcCode>OK</common:funcCode>
+  </common:result>
+  <invoiceDigestResult>
+    <currentPage>1</currentPage>
+    <availablePage>1</availablePage>
+    <invoiceDigest>
+      <invoiceNumber>SUP-2026/0042</invoiceNumber>
+      <invoiceDirection>INBOUND</invoiceDirection>
+      <supplierTaxNumber>12345678</supplierTaxNumber>
+      <supplierName>Supplier Kft.</supplierName>
+      <invoiceIssueDate>2026-05-20</invoiceIssueDate>
+      <currency>HUF</currency>
+    </invoiceDigest>
+  </invoiceDigestResult>
+</QueryInvoiceDigestResponse>"#;
+        let page = parse_digest_page(body).expect("digest+no-availableLine must parse");
+        assert_eq!(page.available_line, 0);
+        assert_eq!(page.digests.len(), 1);
+        assert_eq!(page.digests[0].invoice_number, "SUP-2026/0042");
+        assert_eq!(page.digests[0].supplier_tax_number, "12345678");
+    }
+
+    /// Multi-page result: `availablePage=3, currentPage=1`. Pins
+    /// that the daemon's pagination loop sees `current < available`
+    /// and will continue (the parser surfaces both scalars truthfully;
+    /// the daemon's `if page >= available_page` check is the gate).
+    #[test]
+    fn parse_digest_page_reports_multi_page_truthfully() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<QueryInvoiceDigestResponse xmlns="http://schemas.nav.gov.hu/OSA/3.0/api"
+                            xmlns:common="http://schemas.nav.gov.hu/NTCA/1.0/common">
+  <common:result>
+    <common:funcCode>OK</common:funcCode>
+  </common:result>
+  <invoiceDigestResult>
+    <currentPage>1</currentPage>
+    <availablePage>3</availablePage>
+    <invoiceDigest>
+      <invoiceNumber>SUP-PAGE1-A</invoiceNumber>
+      <supplierTaxNumber>11111111</supplierTaxNumber>
+    </invoiceDigest>
+  </invoiceDigestResult>
+</QueryInvoiceDigestResponse>"#;
+        let page = parse_digest_page(body).expect("multi-page parse");
+        assert_eq!(page.current_page, 1);
+        assert_eq!(page.available_page, 3);
+        assert!(
+            page.current_page < page.available_page,
+            "daemon continuation gate must remain `<`"
+        );
+    }
+
+    /// Malformed XML must loud-fail — defence against the opposite
+    /// class of bug. The tolerance added in PR-189 is for `<availableLine>`
+    /// only; corrupt bytes are not "tolerated as empty" by the parser.
+    #[test]
+    fn parse_digest_page_loud_fails_on_malformed_xml() {
+        let body = br#"<QueryInvoiceDigestResponse><invoiceDigestResult><currentPage>1</currentPage><availablePage>1</availabl"#;
+        let err = parse_digest_page(body).expect_err("corrupt XML must loud-fail");
         assert!(matches!(
             err,
             NavTransportError::QueryInvoiceDigestResponseParse(_)
