@@ -579,6 +579,15 @@ export interface IssueInvoiceRequest {
    * `#[serde(default)]` resolves an absent value to `"TRANSFER"`,
    * preserving the pre-S160 hardcoded emit. See [`InvoicePaymentMethod`]. */
   paymentMethod?: InvoicePaymentMethod;
+  /** PR-203 / S203 — operator-typed per-invoice email recipient override
+   * ("Email-címzett(ek)"). Comma-separated address list (the canonical
+   * `", "` shape the backend already emits for `partner.contact_email`).
+   * `null` / absent → the send-path resolver falls back to the partner
+   * master record's `contact_email`. Validated server-side at
+   * `validate_issue_request`; a malformed value surfaces as 400 BEFORE
+   * the issuance commits. Editing this field NEVER writes back to the
+   * partner master — it is a one-off per-invoice override. */
+  emailRecipientOverride?: string | null;
 }
 
 /** S160 / ADR-0050 — per-invoice payment method (Fizetési mód). Mirror
@@ -864,6 +873,12 @@ export interface ModificationInvoiceRequest {
   /** Optional series code; backend defaults to `"INV-default"` when
    * omitted. Same posture as [`IssueInvoiceRequest.series`]. */
   series?: string;
+  /** PR-203 / S203 — per-modification email recipient override. The
+   * SPA's modification form pre-fills from the base's stored value (via
+   * `GET /issuance-input`) but the operator can edit per-modification.
+   * `null` / absent → resolver falls back to the partner master record.
+   * Same wire shape as [`IssueInvoiceRequest.emailRecipientOverride`]. */
+  emailRecipientOverride?: string | null;
 }
 
 /** PR-47β / session-65 — wire response body for

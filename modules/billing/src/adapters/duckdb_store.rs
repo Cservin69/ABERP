@@ -145,6 +145,18 @@ CREATE TABLE IF NOT EXISTS invoice (
     -- non-NULL.
     payment_deadline       DATE,
     delivery_date          DATE,
+    -- PR-203 / S203 — operator-typed per-invoice email recipient override
+    -- ("Email-címzett(ek)"). Comma-separated address list (the canonical
+    -- shape `partners::join_emails_canonical` already emits for
+    -- `partners.contact_email`); NULL when the operator left it blank.
+    -- The send-path resolver consults this column FIRST (override-then-
+    -- partner-fallback-then-skip ladder); editing it here NEVER writes
+    -- back to the partner master record — it is a one-off per-invoice
+    -- override for one-off buyers, ad-hoc CC requests, and operators who
+    -- want a different address on THIS invoice without churning the
+    -- partner row. Pre-PR-203 rows pick up the column NULL via
+    -- MIGRATE_PR_203_SQL; the resolver falls back to partner.email there.
+    email_recipient_override VARCHAR,
     UNIQUE (series_id, fiscal_year, sequence_number)
 );
 
@@ -272,6 +284,21 @@ ALTER TABLE invoice_line ADD COLUMN IF NOT EXISTS note         VARCHAR;
 const MIGRATE_PR_84_SQL: &str = "
 ALTER TABLE invoice ADD COLUMN IF NOT EXISTS payment_deadline DATE;
 ALTER TABLE invoice ADD COLUMN IF NOT EXISTS delivery_date    DATE;
+";
+
+/// PR-203 / S203 — additive migration for the per-invoice
+/// `email_recipient_override` column. Idempotent via
+/// `ADD COLUMN IF NOT EXISTS`; safe on fresh + pre-PR-203 DBs (the
+/// `CREATE TABLE IF NOT EXISTS` posture means fresh DBs already have
+/// the column; the ALTER is a no-op there).
+///
+/// No backfill `UPDATE` runs here — pre-PR-203 rows had no operator-
+/// chosen override to recover, and NULL is the natural representation of
+/// "use the partner.email fallback" (the send-path resolver's
+/// override-then-partner-fallback ladder treats NULL the same as a
+/// pre-PR-203 row).
+const MIGRATE_PR_203_SQL: &str = "
+ALTER TABLE invoice ADD COLUMN IF NOT EXISTS email_recipient_override VARCHAR;
 ";
 
 /// S157 — widen `invoice_line.quantity` from `INTEGER` to
@@ -586,6 +613,15 @@ pub fn allocate_in_tx(
     // `apps/aberp/tests/nav_xml_notes_never_leak.rs` enforces the
     // byte-identical invariant on the wire output.
     let invoice_note = args.invoice_note.clone();
+    // PR-203 / S203 — per-invoice email recipient override. Comma-
+    // separated address list (canonical `", "` separator); NULL when
+    // the operator left the field blank. Persisted verbatim so the
+    // send-path resolver (`resolve_recipient_email` in `serve.rs`)
+    // consults it as the first rung of the override-then-partner-
+    // fallback-then-skip ladder. The wire validator at the route
+    // boundary already rejected malformed shapes; this seam stores
+    // operator-typed truth.
+    let email_recipient_override = args.email_recipient_override.clone();
     // PR-84 — invoice-date columns rendered as canonical YYYY-MM-DD
     // strings (DuckDB's DATE type casts the ISO string at column-write
     // per the declared `DATE` type, same posture as `exchange_rate_date`).
@@ -606,8 +642,9 @@ pub fn allocate_in_tx(
           bank_account_id, bank_account_currency, bank_account_number,
           bank_account_bank_name, bank_account_swift_bic,
           invoice_note,
-          payment_deadline, delivery_date)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+          payment_deadline, delivery_date,
+          email_recipient_override)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
         params![
             draft.id.to_prefixed_string(),
             &series_id_str,
@@ -629,6 +666,7 @@ pub fn allocate_in_tx(
             &invoice_note,
             &payment_deadline_str,
             &delivery_date_str,
+            &email_recipient_override,
         ],
     )?;
 
@@ -712,6 +750,11 @@ impl BillingStore for DuckDbBillingStore {
         // NULL rows so byte-on-wire behaviour is preserved for pre-PR-84
         // invoices.
         self.conn.execute_batch(MIGRATE_PR_84_SQL)?;
+        // PR-203 / S203 — additive migration for the per-invoice
+        // `email_recipient_override` column. Idempotent; old DBs gain it
+        // NULL and the send-path resolver continues falling back to
+        // partner.email for those rows.
+        self.conn.execute_batch(MIGRATE_PR_203_SQL)?;
         // S157 — widen `invoice_line.quantity` to DECIMAL on pre-S157 DBs.
         // Guarded on the column type so the (non-idempotent-cheap)
         // drop/rename rebuild runs exactly once; fresh DBs already created
@@ -1114,6 +1157,33 @@ pub fn load_invoice_note_in_tx(
     invoice_id_str: &str,
 ) -> Result<Option<String>, BillingError> {
     let mut stmt = tx.prepare("SELECT invoice_note FROM invoice WHERE id = ?;")?;
+    let mut rows = stmt.query_map([invoice_id_str], |r| r.get::<_, Option<String>>(0))?;
+    match rows.next() {
+        Some(r) => Ok(r?),
+        None => Ok(None),
+    }
+}
+
+/// PR-203 / S203 — read the per-invoice email recipient override off the
+/// `invoice.email_recipient_override` column. `None` when the column is
+/// NULL (operator left the field blank OR pre-PR-203 row) AND when the
+/// invoice row does not exist (caller path surfaces the missing-invoice
+/// case as `None`).
+///
+/// Same posture as [`load_invoice_note_in_tx`]: free function so the
+/// binary's send-path resolver can call it inside its own read tx
+/// alongside other invoice-column reads (no `BillingStore` trait method).
+///
+/// Returned string is the OPERATOR-TYPED comma-separated address list;
+/// the caller (`serve::resolve_recipient_email`) feeds it through
+/// `partners::parse_emails` to split into individual addresses for the
+/// `Mailbox` build. NEVER consulted by the NAV XML emitter — the column
+/// is recipient-routing storage only.
+pub fn load_email_recipient_override_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    invoice_id_str: &str,
+) -> Result<Option<String>, BillingError> {
+    let mut stmt = tx.prepare("SELECT email_recipient_override FROM invoice WHERE id = ?;")?;
     let mut rows = stmt.query_map([invoice_id_str], |r| r.get::<_, Option<String>>(0))?;
     match rows.next() {
         Some(r) => Ok(r?),

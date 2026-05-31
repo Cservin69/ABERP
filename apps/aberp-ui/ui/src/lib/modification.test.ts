@@ -72,6 +72,8 @@ describe("composeModificationBody", () => {
       ],
       currency: "HUF",
       modificationDate: "2026-05-24",
+      // PR-203 / S203 — empty form has no override; composer emits null.
+      emailRecipientOverride: null,
     });
   });
 

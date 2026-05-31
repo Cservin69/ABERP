@@ -3394,6 +3394,21 @@ pub struct IssueInvoiceRequest {
     /// (ADR-0050).
     #[serde(default, rename = "paymentMethod")]
     pub payment_method: aberp_billing::PaymentMethod,
+    /// PR-203 / S203 — operator-typed per-invoice email recipient
+    /// override ("Email-címzett(ek)"). Comma-separated address list
+    /// (canonical `", "` separator); `None`/absent → the send-path
+    /// resolver falls back to the partner master record's
+    /// `contact_email` (today's behaviour, pre-PR-203). Validated at
+    /// `validate_issue_request` via `partners::parse_and_validate_emails`
+    /// so a malformed shape surfaces as 400 BEFORE the issuance
+    /// commits; defence in depth at the SMTP send-time guard
+    /// (`validate_no_crlf` + per-token shape on the `Mailbox` build).
+    ///
+    /// Persisted on `invoice.email_recipient_override` (NOT on the
+    /// partner record) — editing it here is a one-off per-invoice
+    /// override that NEVER writes back to the partner master.
+    #[serde(default, rename = "emailRecipientOverride")]
+    pub email_recipient_override: Option<String>,
 }
 
 /// Response body for `POST /invoices/issue`. The SPA reads
@@ -4160,7 +4175,52 @@ fn validate_issue_request(
     // seller.toml and dispatches the same typed
     // `missing_seller_config` 400 if the file is missing OR the tax
     // number's shape fails.
+    // PR-203 / S203 — per-invoice email recipient override. When the
+    // operator supplied a value, parse + validate every comma-segment
+    // (reuses `partners::parse_and_validate_emails`: same RFC-5322 shape
+    // gate and the same comma/semicolon/whitespace tolerance as
+    // `partners.contact_email`). Reject as 400 with the offender named
+    // so the SPA's inline-error renderer can highlight the input;
+    // pre-PR-203 callers / CLI omit the field → no validation runs.
+    if let Some(raw) = request.email_recipient_override.as_deref() {
+        if !raw.trim().is_empty() {
+            if let Err(msg) = partners::parse_and_validate_emails(raw) {
+                return Err(IssueRequestValidationError::Plain(format!(
+                    "email recipient override is malformed: {msg}"
+                )));
+            }
+        }
+    }
     Ok(())
+}
+
+/// PR-203 / S203 — public closed-vocab mirror of
+/// [`IssueRequestValidationError`] for integration tests. The internal
+/// enum stays private (the route layer is the only production consumer);
+/// this mirror lets the `tests/email_recipient_override.rs` pin check
+/// the validator's classification without exposing the enum's body.
+#[derive(Debug)]
+pub enum IssueRequestValidationOutcome {
+    /// The request passed every gate; the issuance pipeline can proceed.
+    Ok,
+    /// A plain string-shape rule rejected the request. Carries the
+    /// operator-readable message the route layer renders inline.
+    Plain(String),
+}
+
+/// PR-203 / S203 — test-only re-entry into [`validate_issue_request`].
+/// `pub` so the integration test in `tests/email_recipient_override.rs`
+/// can exercise the validator directly. The function body delegates
+/// verbatim — keeps the test surface and production surface byte-for-
+/// byte identical (a future contributor who edits the validator sees
+/// the test fail on the same line).
+pub fn validate_issue_request_for_test(
+    request: &IssueInvoiceRequest,
+) -> IssueRequestValidationOutcome {
+    match validate_issue_request(request) {
+        Ok(()) => IssueRequestValidationOutcome::Ok,
+        Err(IssueRequestValidationError::Plain(msg)) => IssueRequestValidationOutcome::Plain(msg),
+    }
 }
 
 /// PR-50 / session-70 — typed validation error for the issue route.
@@ -4263,6 +4323,19 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         // S160 — operator's payment-method dropdown choice (Fizetési mód),
         // defaulting to `Transfer` when the wire body omits it.
         payment_method: request.payment_method,
+        // PR-203 / S203 — operator-typed per-invoice email recipient
+        // override. Normalised here (trim → empty-as-None) so the
+        // downstream resolver doesn't have to filter blanks. The wire
+        // shape already passed `validate_issue_request`'s parse gate,
+        // so a `Some(_)` survives as a validated comma-separated list.
+        email_recipient_override: request.email_recipient_override.and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }),
     };
     // PR-47α / session-64 — side-store the InvoiceInputJson alongside
     // the NAV-XML output path so the SPA storno route can reconstruct
@@ -5188,6 +5261,17 @@ pub struct ModificationInvoiceRequest {
     /// `StornoInvoiceRequest::submit_to_nav_on_storno`; absent → `true`.
     #[serde(default, rename = "submitToNavOnModification")]
     pub submit_to_nav_on_modification: Option<bool>,
+    /// PR-203 / S203 — operator-typed per-invoice email recipient
+    /// override for THIS modification (Fizetési mód's sibling field on
+    /// the SPA's modification form pre-fills from the base's stored
+    /// override but is editable per-invoice). Same camelCase / posture
+    /// as `IssueInvoiceRequest::email_recipient_override`; absent / blank
+    /// → the send-path resolver falls back to the partner master's
+    /// `contact_email`. Validated at request-build time below; the
+    /// modification's own `invoice.email_recipient_override` row carries
+    /// the operator's edit independent of the base's value.
+    #[serde(default, rename = "emailRecipientOverride")]
+    pub email_recipient_override: Option<String>,
 }
 
 /// PR-47β / session-65 — wire response body for
@@ -5520,7 +5604,27 @@ pub fn modification_invoice_request(
         // `payment_method` round-trips via `#[serde(default)]`). Full
         // base-inheritance for the SPA route is a follow-up (see ADR-0050).
         payment_method: aberp_billing::PaymentMethod::default(),
+        // PR-203 / S203 — operator-typed per-modification email recipient
+        // override. The SPA's modification form pre-fills it from the
+        // base's stored value (via `GET /issuance-input` → base's
+        // `input.json`); the operator's edit on THIS form lands here.
+        // Validated below before reaching `issue_modification`.
+        email_recipient_override: request.email_recipient_override.and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }),
     };
+    if let Some(raw) = input.email_recipient_override.as_deref() {
+        if let Err(msg) = partners::parse_and_validate_emails(raw) {
+            return Err(ModificationRouteError::BadRequest(format!(
+                "email recipient override is malformed: {msg}"
+            )));
+        }
+    }
     let series = request.series.as_deref().unwrap_or(DEFAULT_SERIES_CODE);
 
     // 6. Dispatch into the library helper.
@@ -8657,13 +8761,22 @@ pub async fn send_invoice_email_route(
     operator_login: &str,
     trigger: SendTrigger,
 ) -> EmailRouteOutcomeBody {
-    // Resolve the buyer's contact email from the partners table —
-    // S164: by durable partner_id first, tax_number as legacy fallback.
-    let recipient_lookup = resolve_recipient_email(state, customer_partner_id, customer_tax_number)
-        .unwrap_or_else(|e| {
-            tracing::warn!(invoice_id = %invoice_id, error = %e, "resolve_recipient_email");
-            None
-        });
+    // Resolve the buyer's contact email — S203 ladder:
+    //   1. per-invoice override (`invoice.email_recipient_override`,
+    //      operator-typed at issue / modification time)
+    //   2. partner master record `contact_email` (S164: by durable
+    //      partner_id first, tax_number as legacy fallback)
+    //   3. None → MissingRecipient (audit-log skip, banner the operator)
+    // The override-first rung is what unblocks one-off / inline buyers
+    // that don't yet have a Partners row, and lets the operator override
+    // the partner's default address for a single send without churning
+    // the master record.
+    let recipient_lookup =
+        resolve_recipient_email(state, invoice_id, customer_partner_id, customer_tax_number)
+            .unwrap_or_else(|e| {
+                tracing::warn!(invoice_id = %invoice_id, error = %e, "resolve_recipient_email");
+                None
+            });
     let (recipient_email, recipient_display_name) = match recipient_lookup {
         Some((email, name)) if !email.trim().is_empty() => (email, name),
         _ => {
@@ -8871,26 +8984,69 @@ fn finalize_email_audit(
     body
 }
 
-/// Resolve the buyer's contact email by reading the side-stored
-/// input.json (PR-47α) for the invoice's tax number, then looking up
-/// the partner record. Returns `Ok(Some((email, display_name)))` on
-/// hit, `Ok(None)` when no partner matches or the partner has no
-/// email. `Err` for I/O / parse failures.
+/// Resolve the buyer's contact email — three-rung S203 ladder:
+///
+///   1. **Per-invoice override** (`invoice.email_recipient_override`,
+///      operator-typed at issue / modification time). When `Some(_)`
+///      and non-blank, this short-circuits the lookup; the partner
+///      master record is NOT consulted (the override is a one-off
+///      per-invoice routing choice, and a one-off / inline buyer may
+///      have no partner row at all). Storno chains inherit the base
+///      invoice's override via the base's side-stored `input.json`
+///      (see `issue_storno::storno_from_inputs`).
+///   2. **Partner master `contact_email`** (S164 posture preserved
+///      unchanged). PrivatePerson buyers carry no tax_number so the
+///      durable `partner_id` is the primary key; tax_number is the
+///      legacy fallback for pre-partner-id invoices.
+///   3. **`None`** → `MissingRecipient` at the caller, audit-log
+///      skip, the SPA's send button is greyed with "(no recipient)".
+///
+/// Returns `Ok(Some((email, display_name)))` on hit. The display name
+/// is `Some(_)` only when the recipient came from a partner row; an
+/// override-sourced address has no display name attached (the operator
+/// chose the address, not a displayable identity for it — lettre's
+/// `Mailbox` happily renders bare addresses).
+///
+/// `Err` for DuckDB / parse failures only. A missing override row
+/// (post-PR-203 invoice but column reads NULL — pre-PR-203 invoice OR
+/// operator left it blank) falls through to rung 2 normally.
 fn resolve_recipient_email(
     state: &AppState,
+    invoice_id: &str,
     partner_id: Option<&str>,
     customer_tax_number: &str,
 ) -> Result<Option<(String, Option<String>)>> {
-    let conn = Connection::open(&*state.db_path)
+    let mut conn = Connection::open(&*state.db_path)
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    // S164 — resolve the partner by its durable id FIRST. PrivatePerson
-    // buyers (ADR-0048) are FORBIDDEN from carrying a tax_number, so a
-    // tax-number lookup can never find them — it returns `None` and the
-    // send path loud-fails "buyer has no contact email" even when the
-    // partner record holds one (or several). The saved-partner id is the
-    // stable identity the SPA threads through input.json; fall back to
-    // the tax-number lookup only for legacy / CLI invoices that never
-    // carried a partner_id.
+    // PR-203 / S203 — rung 1: per-invoice override.
+    let override_value = {
+        let tx = conn
+            .transaction()
+            .context("begin read tx for email-recipient override lookup")?;
+        let v = aberp_billing::load_email_recipient_override_in_tx(&tx, invoice_id)
+            .with_context(|| format!("read invoice.email_recipient_override for {invoice_id}"))?;
+        tx.commit()
+            .context("commit read tx for email-recipient override lookup")?;
+        v
+    };
+    if let Some(raw) = override_value {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            // The override survived the issue-route `parse_and_validate_emails`
+            // gate; pass through verbatim. The send-time `validate_no_crlf`
+            // + per-Mailbox `lettre::Address::new` gate is the defence-
+            // in-depth second line for hand-edited DuckDB or curl bypass.
+            return Ok(Some((trimmed.to_string(), None)));
+        }
+    }
+    // S164 — rung 2: partner master record. Resolve the partner by its
+    // durable id FIRST. PrivatePerson buyers (ADR-0048) are FORBIDDEN
+    // from carrying a tax_number, so a tax-number lookup can never find
+    // them — it returns `None` and the send path loud-fails "buyer has
+    // no contact email" even when the partner record holds one (or
+    // several). The saved-partner id is the stable identity the SPA
+    // threads through input.json; fall back to the tax-number lookup
+    // only for legacy / CLI invoices that never carried a partner_id.
     let p = match partner_id.map(str::trim).filter(|s| !s.is_empty()) {
         Some(id) => partners::get_partner(&conn, state.tenant.as_str(), id)?,
         None => {

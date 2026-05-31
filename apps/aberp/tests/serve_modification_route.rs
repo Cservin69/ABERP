@@ -135,6 +135,9 @@ fn fixture_request_body(currency: aberp_billing::Currency) -> ModificationInvoic
         // NAV from the precondition-test surface.
         email_buyer_on_modification: Some(false),
         submit_to_nav_on_modification: Some(false),
+        // PR-203 / S203 — modification fixture leaves the override unset;
+        // the resolver falls back to partner.email (today's behaviour).
+        email_recipient_override: None,
     }
 }
 
@@ -308,6 +311,9 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
             delivery_date_override: None,
             // S160 — fixture uses the default payment method (Transfer).
             payment_method: aberp_billing::PaymentMethod::default(),
+            // PR-203 / S203 — fixture leaves the override unset; the
+            // base's resolver continues to fall back to partner.email.
+            email_recipient_override: None,
         },
         &db_path,
         TEST_TENANT,

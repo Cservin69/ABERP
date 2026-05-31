@@ -177,6 +177,13 @@ export function formFromIssuanceInput(
     // follow-up per ADR-0050 §Consequences); the field is present so the
     // shared form-state type-checks.
     paymentMethod: input.paymentMethod ?? "TRANSFER",
+    // PR-203 / S203 — modification form inherits the per-invoice email
+    // recipient override from the base's side-stored issuance input. The
+    // operator can edit it for THIS modification (the modification's own
+    // override is persisted on its OWN invoice row — base unchanged).
+    // Pre-PR-203 bases emit `null` here; the form opens with an empty
+    // field and the operator can type one for this send.
+    emailRecipientOverride: input.emailRecipientOverride ?? "",
   };
 }
 
@@ -223,6 +230,13 @@ export function composeModificationBody(
     })),
     currency: form.currency,
     modificationDate: form.modificationDate.trim(),
+    // PR-203 / S203 — per-modification email recipient override. Blank-
+    // after-trim becomes `null` on the wire so the backend resolver sees
+    // the "no override, fall back to partner.email" signal verbatim.
+    emailRecipientOverride:
+      form.emailRecipientOverride.trim() === ""
+        ? null
+        : form.emailRecipientOverride.trim(),
   };
 }
 

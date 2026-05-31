@@ -313,6 +313,15 @@ pub fn modification_from_inputs(
         // the base flow through `draft.lines[i].note` naturally.
         // Chain-level note threading lands at PR-83.
         invoice_note: None,
+        // PR-203 / S203 — operator-typed per-modification email recipient
+        // override. The SPA's modification form re-binds this from the
+        // operator's edit (validated at the route boundary); CLI
+        // modifications inherit the base's value through the base's
+        // side-stored `input.json` round-trip (default `None` for
+        // pre-PR-203 bases). Persisted on the modification's OWN
+        // `invoice.email_recipient_override` row — independent of the
+        // base's value going forward.
+        email_recipient_override: input.email_recipient_override.clone(),
         // PR-90 — operator-configured counter seed. Modification burns
         // its own sequence number from the same `(series, fiscal_year)`
         // bucket; `start_value` only applies on the bucket's first

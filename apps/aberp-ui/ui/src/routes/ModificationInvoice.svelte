@@ -215,6 +215,10 @@
       customerPostalCode: fields.customerPostalCode,
       customerCity: fields.customerCity,
       customerStreet: fields.customerStreet,
+      // PR-203 / S203 — re-pre-fill from the newly-picked partner. The
+      // operator may have edited the override mid-modification; switching
+      // partners here resets the override to the new partner's master.
+      emailRecipientOverride: fields.emailRecipientOverride,
     };
     buyerTypeahead = partner.display_name;
   }
@@ -599,6 +603,30 @@
       <button type="button" class="quiet-button" onclick={addLine}>
         + Add line
       </button>
+    </fieldset>
+
+    <!-- PR-203 / S203 — per-modification email recipient override. Pre-
+         filled from the base's stored value via `formFromIssuanceInput`;
+         editable per-modification (the modification's own
+         `invoice.email_recipient_override` row carries the operator's
+         edit independent of the base). NEVER writes back to the partner
+         master record. -->
+    <fieldset disabled={modalState === "prefilling"}>
+      <legend>Email-címzett(ek) / Email recipient(s)</legend>
+      <label>
+        <input
+          type="text"
+          bind:value={form.emailRecipientOverride}
+          data-testid="mod-email-recipient-override-input"
+          autocomplete="off"
+          placeholder="pl. vevo@example.com, masik@example.com"
+        />
+        <span class="invoice-note-hint">
+          Vesszővel elválasztva. Egyszeri — nem mentődik a partnerhez. /
+          Comma-separated. One-off per modification; never saved back to
+          the partner record.
+        </span>
+      </label>
     </fieldset>
 
     <footer class="modification-foot">

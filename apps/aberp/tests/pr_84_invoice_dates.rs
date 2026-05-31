@@ -169,6 +169,7 @@ fn duckdb_round_trip_preserves_payment_deadline_and_delivery_date() {
                 rate_metadata: None,
                 bank_snapshot: None,
                 invoice_note: None,
+                email_recipient_override: None,
                 start_value: 1,
             },
             now,

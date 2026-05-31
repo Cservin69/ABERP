@@ -252,6 +252,11 @@ where
             // is the surface that threads the operator-typed value;
             // the in-process handler defaults to None.
             invoice_note: None,
+            // PR-203 / S203 — per-invoice email recipient override.
+            // Same posture as `invoice_note`: the binary's SPA-issue
+            // route is the surface that threads the operator-typed
+            // value; the in-process handler defaults to `None`.
+            email_recipient_override: None,
             // PR-90 / ADR-0045 §2 — in-process handler defaults the
             // bucket seed to 1 (the §169 conventional starting value).
             // The binary's three issuance surfaces read the template's

@@ -143,6 +143,7 @@ fn fixture_request(currency: Currency) -> IssueInvoiceRequest {
         email_buyer_on_issue: Some(false),
         submit_to_nav_on_issue: Some(false),
         payment_method: aberp_billing::PaymentMethod::default(),
+        email_recipient_override: None,
     }
 }
 
@@ -425,6 +426,7 @@ async fn issue_route_rejects_empty_lines_with_loud_error() {
         email_buyer_on_issue: Some(false),
         submit_to_nav_on_issue: Some(false),
         payment_method: aberp_billing::PaymentMethod::default(),
+        email_recipient_override: None,
     };
 
     let err = serve::issue_invoice_request(
@@ -478,6 +480,7 @@ async fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
         email_buyer_on_issue: Some(false),
         submit_to_nav_on_issue: Some(false),
         payment_method: aberp_billing::PaymentMethod::default(),
+        email_recipient_override: None,
     };
 
     // PR-53 / session-73 — supplier comes via the new arg, not the

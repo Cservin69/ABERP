@@ -107,6 +107,9 @@ describe("composeIssueInvoiceBody", () => {
       // S160 / ADR-0050 — payment method seeds to `TRANSFER` (Átutalás)
       // in `emptyForm`, matching the pre-S160 hardcoded emit.
       paymentMethod: "TRANSFER",
+      // PR-203 / S203 — empty form has no recipient override; composer
+      // emits `null` so the backend resolver falls back to partner.email.
+      emailRecipientOverride: null,
     });
   });
 

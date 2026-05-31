@@ -130,6 +130,13 @@ pub enum CycleTrigger {
     Daemon,
     /// Operator-clicked `/api/incoming-invoices/sync-now`.
     Manual,
+    /// PR-203 / S203 — one chunk of the year-to-date bootstrap sweep
+    /// that fires on the FIRST process boot after PR-203 lands (or any
+    /// boot whose audit ledger has no prior `bootstrap-year` cycle row,
+    /// so the bootstrap re-runs after an audit-ledger wipe). One audit
+    /// row PER MONTH CHUNK so the operator can see exactly which
+    /// month-window pulled what.
+    BootstrapYear,
 }
 
 impl CycleTrigger {
@@ -137,6 +144,9 @@ impl CycleTrigger {
         match self {
             CycleTrigger::Daemon => "daemon",
             CycleTrigger::Manual => "manual",
+            // PR-203 / S203 — closed-vocab token consumed by the SPA's
+            // audit-row renderer + the bootstrap-already-ran detector.
+            CycleTrigger::BootstrapYear => "bootstrap-year",
         }
     }
 }
@@ -182,6 +192,13 @@ where
 {
     let build_inputs = Arc::new(build_inputs);
     tokio::time::sleep(Duration::from_secs(BOOT_DELAY_SECS)).await;
+    // PR-203 / S203 — one-shot year-to-date bootstrap on the FIRST boot
+    // tick. The sentinel scan inside `run_bootstrap_year_once` short-
+    // circuits on subsequent boots whose audit ledger already records
+    // a `bootstrap-year` cycle, so this is a guarded once-per-DB sweep
+    // (re-runs after wipe/restore, idempotent at the digest UNIQUE on
+    // overlap).
+    run_bootstrap_year_once(&*build_inputs).await;
     loop {
         match build_inputs() {
             Ok(inputs) => match run_one_cycle(inputs, CycleTrigger::Daemon).await {
@@ -211,8 +228,28 @@ where
 /// The cycle audit entry fires UNCONDITIONALLY at the end (success
 /// or loud-failure) so the audit trail has zero gaps.
 pub async fn run_one_cycle(inputs: CycleInputs, trigger: CycleTrigger) -> Result<CycleSummary> {
-    let started = Instant::now();
     let (date_from, date_to) = compute_date_window(OffsetDateTime::now_utc())?;
+    run_one_cycle_for_window(inputs, trigger, date_from, date_to).await
+}
+
+/// PR-203 / S203 — run one sync cycle for an EXPLICIT date window.
+/// The 30-day rolling window helper [`run_one_cycle`] delegates to this
+/// after computing its own window; the year-to-date bootstrap calls
+/// this once per month chunk with the chunk's start/end.
+///
+/// Same audit + idempotency posture as [`run_one_cycle`]: one
+/// `IncomingInvoiceSyncCycleCompleted` audit row per call (success OR
+/// loud-failure); per-digest idempotency on the
+/// `(tenant, supplier_tax_number, nav_invoice_number)` UNIQUE so
+/// overlapping windows during bootstrap re-ingest as `AlreadyExists` /
+/// skip rather than duplicating rows.
+pub async fn run_one_cycle_for_window(
+    inputs: CycleInputs,
+    trigger: CycleTrigger,
+    date_from: String,
+    date_to: String,
+) -> Result<CycleSummary> {
+    let started = Instant::now();
     let result = run_cycle_inner(&inputs, &date_from, &date_to).await;
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -688,6 +725,235 @@ fn compute_date_window(now_utc: OffsetDateTime) -> Result<(String, String)> {
     Ok((from.format(&ISO_DATE)?, today.format(&ISO_DATE)?))
 }
 
+/// PR-203 / S203 — pause between bootstrap month chunks. Two seconds
+/// matches the daemon's "gentle on NAV" posture: ~6 NAV calls per
+/// minute for the digest sweep, well under any plausible rate-limit
+/// ceiling AND polite enough that an operator-clocked boot sweep
+/// finishes in well under a minute for a typical year-to-date that
+/// has only one or two months of inbound invoices.
+pub const BOOTSTRAP_CHUNK_THROTTLE_SECS: u64 = 2;
+
+/// PR-203 / S203 — split a year-to-date window into calendar-month
+/// chunks. Each chunk is `(date_from, date_to)` as canonical
+/// `YYYY-MM-DD` strings. The last chunk is clamped to `now_utc.date()`
+/// — running this mid-month produces a final chunk ending on today,
+/// not the last day of the month.
+///
+/// Returns an empty vector when `now_utc` falls before Jan 1 of its
+/// own year (structurally impossible but defended for completeness)
+/// or when calendar arithmetic underflows. Output ordering is
+/// chronological: chunk 0 is January; chunk N is the current month.
+///
+/// Example: `now_utc = 2026-05-31` produces 5 chunks:
+///   (2026-01-01, 2026-01-31), (2026-02-01, 2026-02-28),
+///   (2026-03-01, 2026-03-31), (2026-04-01, 2026-04-30),
+///   (2026-05-01, 2026-05-31).
+///
+/// Example mid-month: `now_utc = 2026-03-15` produces 3 chunks ending
+/// with `(2026-03-01, 2026-03-15)` — the final chunk does not run
+/// past today.
+///
+/// `pub` because the unit tests below pin the chunker independently
+/// of the daemon's wiring; the bootstrap runner is the only
+/// production consumer.
+pub fn year_to_date_month_chunks(now_utc: OffsetDateTime) -> Result<Vec<(String, String)>> {
+    let today = now_utc.date();
+    let year = today.year();
+    let mut chunks = Vec::new();
+    // Iterate months 1..=today.month(); the last chunk's end is
+    // clamped to `today` rather than the month's last day.
+    let mut month_num: u8 = 1;
+    let today_month: u8 = today.month() as u8;
+    while month_num <= today_month {
+        let month = time::Month::try_from(month_num)
+            .map_err(|e| anyhow!("invalid month number {month_num}: {e}"))?;
+        let first = time::Date::from_calendar_date(year, month, 1)
+            .map_err(|e| anyhow!("YYYY-MM-01 calendar build failed: {e}"))?;
+        // Last day of this calendar month: compute the first day of
+        // the next month, subtract one day. December (12) wraps to
+        // January of year+1 — handled via the `checked_add` ladder so
+        // a future Date::MAX-edge contributor sees the loud-fail.
+        let last_of_month = if month_num == 12 {
+            time::Date::from_calendar_date(year, time::Month::December, 31)
+                .map_err(|e| anyhow!("Dec-31 calendar build failed: {e}"))?
+        } else {
+            let next_month = time::Month::try_from(month_num + 1)
+                .map_err(|e| anyhow!("invalid next-month number: {e}"))?;
+            time::Date::from_calendar_date(year, next_month, 1)
+                .map_err(|e| anyhow!("next-month-01 calendar build failed: {e}"))?
+                .checked_sub(time::Duration::days(1))
+                .ok_or_else(|| anyhow!("date underflow clamping month end"))?
+        };
+        // Final-chunk clamp: don't sweep beyond today.
+        let chunk_end = if last_of_month > today {
+            today
+        } else {
+            last_of_month
+        };
+        chunks.push((first.format(&ISO_DATE)?, chunk_end.format(&ISO_DATE)?));
+        month_num += 1;
+    }
+    Ok(chunks)
+}
+
+/// PR-203 / S203 — read every audit-ledger entry; return `true` iff at
+/// least one `IncomingInvoiceSyncCycleCompleted` payload's `trigger`
+/// field equals `"bootstrap-year"`. The bootstrap pass is one-shot
+/// detected through THIS audit sentinel (not a file marker) so a
+/// dev-DB nuke / restore re-runs the bootstrap automatically — which
+/// is the operator-correct behaviour (the local DuckDB is the
+/// authoritative AP mirror and a fresh DB has nothing to mirror).
+///
+/// Returns `Err` only on ledger read / payload decode failure. A
+/// pre-PR-203 audit trail (no bootstrap-year rows by definition)
+/// returns `Ok(false)` so the bootstrap fires once on first launch
+/// after this PR lands.
+fn bootstrap_year_already_recorded(
+    db_path: &std::path::Path,
+    tenant: TenantId,
+    binary_hash: BinaryHash,
+) -> Result<bool> {
+    let ledger = Ledger::open(db_path, tenant, binary_hash).with_context(|| {
+        format!(
+            "open audit ledger at {} for bootstrap-year sentinel scan",
+            db_path.display()
+        )
+    })?;
+    let entries = ledger
+        .entries()
+        .context("read audit-ledger entries to look for prior bootstrap-year row")?;
+    for entry in entries.iter() {
+        if entry.kind == EventKind::IncomingInvoiceSyncCycleCompleted {
+            // PR-203 / S203 — decode the payload only enough to read
+            // the `trigger` token. Tolerate decode failure on this
+            // narrow read by treating as "not bootstrap" so a malformed
+            // legacy row does not block the sweep.
+            if let Ok(payload) =
+                serde_json::from_slice::<IncomingInvoiceSyncCycleCompletedPayload>(&entry.payload)
+            {
+                if payload.trigger == CycleTrigger::BootstrapYear.as_audit_str() {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// PR-203 / S203 — one-shot year-to-date bootstrap sweep. Walks
+/// [`year_to_date_month_chunks`] in chronological order, runs
+/// [`run_one_cycle_for_window`] per chunk with
+/// [`CycleTrigger::BootstrapYear`], sleeps
+/// [`BOOTSTRAP_CHUNK_THROTTLE_SECS`] between chunks. Per-chunk
+/// failures are logged and the sweep continues (a single bad month
+/// must not block the rest of the year). The audit-row count
+/// downstream consumers see is one per chunk attempted, not just
+/// per success.
+///
+/// Conservative choice flag: **bootstrap-only**. The brief's
+/// alternative was "always iterate the full year on every tick" which
+/// would amortise the cost across many cycles but multiply NAV traffic
+/// by ~12. Bootstrap is state-dependent (relies on the audit-ledger
+/// sentinel above) but cheaper at steady state. Documented in the PR
+/// body so the operator can request a re-run via a future
+/// `bootstrap-sync-now` route if a wipe-and-restore loses the
+/// sentinel — which is also the design's natural recovery posture
+/// (the sentinel scan returns `false` after wipe → bootstrap re-runs).
+async fn run_bootstrap_year_once(build_inputs: &(dyn Fn() -> Result<CycleInputs> + Send + Sync)) {
+    let inputs = match build_inputs() {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "AP bootstrap-year skipped (build_inputs failed); next daemon tick will retry"
+            );
+            return;
+        }
+    };
+
+    // Sentinel check — already done? Skip silently.
+    match bootstrap_year_already_recorded(
+        &inputs.db_path,
+        inputs.tenant.clone(),
+        inputs.binary_hash,
+    ) {
+        Ok(true) => {
+            tracing::info!("AP bootstrap-year sweep already recorded in audit ledger; skipping");
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "AP bootstrap-year sentinel scan failed; running bootstrap as defence in depth \
+                 (idempotent at the digest UNIQUE so re-running is safe)"
+            );
+        }
+    }
+
+    let chunks = match year_to_date_month_chunks(OffsetDateTime::now_utc()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "AP bootstrap-year chunk computation failed; skipping bootstrap"
+            );
+            return;
+        }
+    };
+    let chunk_count = chunks.len();
+    tracing::info!(
+        chunk_count,
+        "AP bootstrap-year sweep starting; one cycle per calendar month chunk"
+    );
+
+    for (idx, (date_from, date_to)) in chunks.into_iter().enumerate() {
+        // Rebuild inputs per chunk so a mid-sweep NAV-credentials
+        // rotation is picked up (mirrors the daemon's per-tick rebuild
+        // posture).
+        let chunk_inputs = match build_inputs() {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    chunk_index = idx,
+                    "AP bootstrap-year chunk skipped (build_inputs failed)"
+                );
+                continue;
+            }
+        };
+        match run_one_cycle_for_window(
+            chunk_inputs,
+            CycleTrigger::BootstrapYear,
+            date_from.clone(),
+            date_to.clone(),
+        )
+        .await
+        {
+            Ok(summary) => tracing::info!(
+                chunk_index = idx,
+                date_from = %date_from,
+                date_to = %date_to,
+                ingested = summary.ingested_count,
+                skipped = summary.skipped_count,
+                "AP bootstrap-year chunk complete"
+            ),
+            Err(e) => tracing::warn!(
+                chunk_index = idx,
+                date_from = %date_from,
+                date_to = %date_to,
+                error = %format!("{e:#}"),
+                "AP bootstrap-year chunk failed; sweep continues with next month"
+            ),
+        }
+        if idx + 1 < chunk_count {
+            tokio::time::sleep(Duration::from_secs(BOOTSTRAP_CHUNK_THROTTLE_SECS)).await;
+        }
+    }
+    tracing::info!("AP bootstrap-year sweep complete");
+    let _ = inputs; // silence the unused-binding lint on the first build_inputs call.
+}
+
 /// S191 — owned-arg variant called from inside `spawn_blocking`. The
 /// pre-S191 `write_cycle_audit_entry(&CycleInputs, &CycleSummary)`
 /// borrowed `inputs`, which the move-closure boundary forbids;
@@ -910,6 +1176,103 @@ mod tests {
     fn cycle_trigger_audit_strings_are_closed_vocab() {
         assert_eq!(CycleTrigger::Daemon.as_audit_str(), "daemon");
         assert_eq!(CycleTrigger::Manual.as_audit_str(), "manual");
+        // PR-203 / S203 — closed-vocab triple. Adding a fourth variant
+        // means updating: the SPA audit-row renderer (the SPA renders
+        // the bare token today since no per-row label exists yet) AND
+        // `bootstrap_year_already_recorded`'s string comparison.
+        assert_eq!(CycleTrigger::BootstrapYear.as_audit_str(), "bootstrap-year");
+    }
+
+    /// PR-203 / S203 — end-of-May bootstrap. With `now_utc = 2026-05-31`
+    /// the chunker MUST return exactly 5 chunks covering Jan, Feb, Mar,
+    /// Apr, and May 1 .. May 31. Pins the `(date_from, date_to)` strings
+    /// against the canonical YYYY-MM-DD format so a future format-string
+    /// drift would surface here.
+    #[test]
+    fn year_to_date_month_chunks_for_end_of_may_returns_five() {
+        let now = datetime!(2026-05-31 12:00:00 UTC);
+        let chunks = year_to_date_month_chunks(now).expect("chunks ok");
+        assert_eq!(
+            chunks,
+            vec![
+                ("2026-01-01".to_string(), "2026-01-31".to_string()),
+                ("2026-02-01".to_string(), "2026-02-28".to_string()),
+                ("2026-03-01".to_string(), "2026-03-31".to_string()),
+                ("2026-04-01".to_string(), "2026-04-30".to_string()),
+                ("2026-05-01".to_string(), "2026-05-31".to_string()),
+            ],
+            "year-to-date chunks for 2026-05-31 must cover Jan..May in calendar-month rows"
+        );
+    }
+
+    /// PR-203 / S203 — mid-month clamp. With `now_utc = 2026-03-15` the
+    /// final chunk must end on 2026-03-15, NOT 2026-03-31. The clamp is
+    /// the invariant that lets the bootstrap run mid-day without
+    /// querying digests dated after `now`.
+    #[test]
+    fn year_to_date_month_chunks_clamps_final_chunk_to_today() {
+        let now = datetime!(2026-03-15 09:00:00 UTC);
+        let chunks = year_to_date_month_chunks(now).expect("chunks ok");
+        assert_eq!(chunks.len(), 3, "Jan, Feb, Mar (clamped)");
+        assert_eq!(
+            chunks.last(),
+            Some(&("2026-03-01".to_string(), "2026-03-15".to_string())),
+            "final chunk must clamp to today, not month-end"
+        );
+    }
+
+    /// PR-203 / S203 — January-only edge. Running the bootstrap on
+    /// 2026-01-05 must yield exactly one chunk `(Jan 1, Jan 5)` rather
+    /// than zero chunks (which would silently no-op the bootstrap on
+    /// fresh January DBs) or a confused Jan 1..31 (which would sweep
+    /// dates that haven't happened yet).
+    #[test]
+    fn year_to_date_month_chunks_january_only() {
+        let now = datetime!(2026-01-05 23:59:59 UTC);
+        let chunks = year_to_date_month_chunks(now).expect("chunks ok");
+        assert_eq!(
+            chunks,
+            vec![("2026-01-01".to_string(), "2026-01-05".to_string())],
+            "January-only bootstrap must produce exactly one clamped chunk"
+        );
+    }
+
+    /// PR-203 / S203 — December rollover. Running the bootstrap on
+    /// 2026-12-31 must yield exactly 12 chunks ending with
+    /// `(Dec 1, Dec 31)`. Pins the `month_num == 12` branch which
+    /// would otherwise underflow the "first day of next month minus
+    /// one" pattern.
+    #[test]
+    fn year_to_date_month_chunks_full_year_dec_31() {
+        let now = datetime!(2026-12-31 12:00:00 UTC);
+        let chunks = year_to_date_month_chunks(now).expect("chunks ok");
+        assert_eq!(chunks.len(), 12, "full-year sweep");
+        assert_eq!(
+            chunks.last(),
+            Some(&("2026-12-01".to_string(), "2026-12-31".to_string())),
+            "December branch must end on Dec 31, not roll into next year"
+        );
+        assert_eq!(
+            chunks.first(),
+            Some(&("2026-01-01".to_string(), "2026-01-31".to_string())),
+            "January chunk must start on Jan 1"
+        );
+    }
+
+    /// PR-203 / S203 — leap-day handling. 2024 had Feb 29; the chunker
+    /// must produce `(Feb 1, Feb 29)` for a 2024 sweep, not `Feb 28`.
+    /// Pins the `time::Date::from_calendar_date(next_month, 1) - 1 day`
+    /// pattern that's the canonical "last day of this month" idiom.
+    #[test]
+    fn year_to_date_month_chunks_handles_leap_day_february() {
+        let now = datetime!(2024-03-15 00:00:00 UTC);
+        let chunks = year_to_date_month_chunks(now).expect("chunks ok");
+        // chunks[1] is February in a 0-indexed list.
+        assert_eq!(
+            chunks[1],
+            ("2024-02-01".to_string(), "2024-02-29".to_string()),
+            "Feb 2024 leap-year chunk must end on Feb 29"
+        );
     }
 
     /// S197 — `persist_xml_for_row` happy path: decodes the NAV

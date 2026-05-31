@@ -168,6 +168,13 @@ export interface BuyerFields {
   customerPostalCode: string;
   customerCity: string;
   customerStreet: string;
+  /** PR-203 / S203 — partner's master `contact_email` (comma-separated
+   * canonical form), to seed the IssueInvoice / Modification form's
+   * per-invoice email recipient override input. Empty string when the
+   * partner has no `contact_email` (PrivatePerson rows often do); the
+   * operator can type one for THIS invoice without touching the partner
+   * master. */
+  emailRecipientOverride: string;
 }
 
 /** PR-54 / session-74 — pluck the IssueInvoice/Modification buyer
@@ -200,6 +207,12 @@ export function buyerFieldsFromPartner(partner: Partner): BuyerFields {
     customerPostalCode: partner.address_postal_code ?? "",
     customerCity: partner.address_city ?? "",
     customerStreet: partner.address_street ?? "",
+    // PR-203 / S203 — pre-fill the IssueInvoice per-invoice email
+    // recipient override from the partner master's `contact_email`.
+    // The form value is editable in place; editing NEVER writes back to
+    // the partner master. Empty string when the partner has no email
+    // (the form's input stays blank for the operator to type).
+    emailRecipientOverride: partner.contact_email ?? "",
   };
 }
 

@@ -193,6 +193,15 @@ export interface IssueInvoiceFormState {
    * `paymentMethod`; the backend snapshots it on the invoice and emits
    * `<paymentMethod>{token}</...>`. */
   paymentMethod: InvoicePaymentMethod;
+  /** PR-203 / S203 — operator-typed per-invoice email recipient override
+   * ("Email-címzett(ek)"). Comma-separated address list; empty string
+   * means "no override, fall back to partner.email". When a saved
+   * partner is picked via the typeahead, `pickPartner` pre-fills this
+   * from `partner.contact_email`; the operator can edit it for THIS
+   * invoice only — editing does NOT write back to the partner master.
+   * One-off / inline buyers (no partner picked) start with an empty
+   * field; operator types directly to enable the send. */
+  emailRecipientOverride: string;
 }
 
 /** PR-44ζ — sensible defaults for an empty form. The 27% VAT rate is
@@ -255,6 +264,10 @@ export function emptyForm(): IssueInvoiceFormState {
     // the pre-S160 hardcoded behaviour. The operator overrides per
     // invoice (primarily Készpénz for rare cash payments).
     paymentMethod: DEFAULT_PAYMENT_METHOD,
+    // PR-203 / S203 — recipient override seeds empty. A picked partner's
+    // `pickPartner` callback overwrites this from `partner.contact_email`;
+    // a one-off / inline buyer keeps it empty until the operator types.
+    emailRecipientOverride: "",
   };
 }
 
@@ -696,6 +709,11 @@ export function composeIssueInvoiceBody(
     // verbatim as the bare NAV token. The backend snapshots it on the
     // invoice and emits `<paymentMethod>`; absent → `TRANSFER` default.
     paymentMethod: form.paymentMethod,
+    // PR-203 / S203 — per-invoice email recipient override. Blank-after-
+    // trim becomes `null` so the backend resolver sees the "no override,
+    // fall back to partner.email" signal verbatim (matches the existing
+    // `blankToNull` posture for invoiceNote / per-line note channels).
+    emailRecipientOverride: blankToNull(form.emailRecipientOverride),
   };
 }
 

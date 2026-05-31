@@ -185,6 +185,27 @@ pub struct InvoiceInputJson {
     /// is the on-disk `input.json` + NAV XML.
     #[serde(default, rename = "paymentMethod")]
     pub payment_method: PaymentMethod,
+    /// PR-203 / S203 — operator-typed per-invoice email recipient
+    /// override ("Email-címzett(ek)"). Comma-separated address list
+    /// (the canonical `", "` separator the codebase already emits for
+    /// `partners.contact_email`); `None` when the operator left it
+    /// blank. The send-path resolver consults this column FIRST in the
+    /// override-then-partner-fallback-then-skip ladder.
+    ///
+    /// Wire token is camelCase to match every other operator-typed
+    /// field in this struct. `#[serde(default)]` keeps pre-PR-203
+    /// side-stored bodies readable (storno / modification on a pre-PR-203
+    /// base deserialise with `email_recipient_override: None` and the
+    /// resolver continues to fall back to the partner record).
+    ///
+    /// Storno chains inherit by this round-trip — the storno route
+    /// reads the base's side-stored `input.json` verbatim and the
+    /// deserialised `InvoiceInputJson` carries the field straight into
+    /// `storno_from_inputs`'s `AllocateArgs`. The operator can re-edit
+    /// the field on the modification form (the modification handler
+    /// re-binds it from the wire body).
+    #[serde(default, rename = "emailRecipientOverride")]
+    pub email_recipient_override: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -614,6 +635,14 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         // `with_notes` builder stamps the same value below so the
         // operator-twin's record of "what was issued" is complete.
         invoice_note: input.invoice_note.clone(),
+        // PR-203 / S203 — operator-typed per-invoice email recipient
+        // override threaded straight from the (camelCase) wire body
+        // through `InvoiceInputJson` to the `invoice.email_recipient_override`
+        // DuckDB column. Send-path resolver consults this column FIRST
+        // (override-then-partner-fallback-then-skip); a `None` here
+        // preserves the pre-S203 behaviour (resolver falls back to the
+        // partner master record's `contact_email`).
+        email_recipient_override: input.email_recipient_override.clone(),
         // PR-90 / ADR-0045 §2 — operator-configured counter seed.
         // Applied only on the first INSERT of any
         // `(series_id, fiscal_year)` bucket; subsequent allocations

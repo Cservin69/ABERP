@@ -127,6 +127,7 @@ fn fixture_request(currency: Currency, bank_account_id: Option<String>) -> Issue
         email_buyer_on_issue: Some(false),
         submit_to_nav_on_issue: Some(false),
         payment_method: aberp_billing::PaymentMethod::default(),
+        email_recipient_override: None,
     }
 }
 

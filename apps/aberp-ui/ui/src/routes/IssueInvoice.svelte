@@ -575,6 +575,11 @@
       customerPostalCode: fields.customerPostalCode,
       customerCity: fields.customerCity,
       customerStreet: fields.customerStreet,
+      // PR-203 / S203 — pre-fill the per-invoice email recipient override
+      // from the partner master's `contact_email`. Editable for THIS
+      // invoice only; the operator can add / remove / replace addresses
+      // and editing NEVER writes back to the partner master record.
+      emailRecipientOverride: fields.emailRecipientOverride,
     };
     buyerDropdownOpen = false;
     buyerHighlight = -1;
@@ -1655,6 +1660,31 @@
             Checked: after issuing, automatically emails the PDF to the
             buyer's contact address.
           </span>
+        </span>
+      </label>
+      <!-- PR-203 / S203 — per-invoice email recipient override. Pre-fills
+           from the picked partner's `contact_email` when a saved partner
+           is selected; stays empty for one-off / inline buyers so the
+           operator can type a one-time address (previously impossible —
+           PR-203's primary blocker). Editing here is ONE-OFF and does
+           NOT write back to the partner master. Validated server-side
+           at the issue route (`parse_and_validate_emails`); a malformed
+           value returns 400. -->
+      <label class="invoice-note">
+        <span class="line-note-label">
+          Email-címzett(ek) / Email recipient(s)
+        </span>
+        <input
+          type="text"
+          bind:value={form.emailRecipientOverride}
+          data-testid="email-recipient-override-input"
+          autocomplete="off"
+          placeholder="pl. vevo@example.com, masik@example.com"
+        />
+        <span class="invoice-note-hint">
+          Vesszővel elválasztva. Egyszeri — nem mentődik a partnerhez. /
+          Comma-separated. One-off per invoice; never saved back to the
+          partner record.
         </span>
       </label>
       <label class="email-buyer-toggle">

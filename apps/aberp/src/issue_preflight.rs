@@ -705,6 +705,7 @@ mod tests {
             submit_to_nav_on_issue: Some(false),
             // S160 — preflight fixtures use the default payment method.
             payment_method: aberp_billing::PaymentMethod::default(),
+            email_recipient_override: None,
         }
     }
 
@@ -997,6 +998,7 @@ mod tests {
             submit_to_nav_on_issue: Some(false),
             // S160 — preflight fixtures use the default payment method.
             payment_method: aberp_billing::PaymentMethod::default(),
+            email_recipient_override: None,
         };
         let errs = validate_invoice_preflight(&r);
 

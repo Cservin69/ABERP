@@ -365,6 +365,16 @@ pub fn storno_from_inputs(
         // the base ride on `draft.lines[i].note` naturally — the
         // negation only touches the unit-price sign, not the note.
         invoice_note: storno_reason.clone(),
+        // PR-203 / S203 — per-storno email recipient override INHERITED
+        // verbatim from the base's side-stored `input.json` (the storno
+        // route parses the base's `InvoiceInputJson` whole and we read
+        // the override straight off it). Persisted on the storno's OWN
+        // `invoice.email_recipient_override` row so the storno's send-
+        // path resolver reaches a buyer-routing answer without walking
+        // the chain. Pre-PR-203 bases carry `None`, which the resolver
+        // treats identically to today's "no override — fall back to
+        // partner.email" behaviour.
+        email_recipient_override: input.email_recipient_override.clone(),
         // PR-90 — operator-configured counter seed. The storno burns
         // its own sequence number from the same `(series, fiscal_year)`
         // bucket; `start_value` only takes effect on the bucket's first

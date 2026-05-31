@@ -76,6 +76,18 @@ pub struct AllocateArgs {
     /// on each `LineItem.note` inside `draft.lines` for the same
     /// invariant.
     pub invoice_note: Option<String>,
+    /// PR-203 / S203 — operator-typed per-invoice email recipient
+    /// override ("Email-címzett(ek)"). Comma-separated address list
+    /// (canonical `", "` separator the codebase already emits for
+    /// `partners.contact_email`); `None` when the operator left it
+    /// blank. The send path consults this column FIRST in the
+    /// override-then-partner-fallback-then-skip ladder. Persisted to
+    /// `invoice.email_recipient_override`. Editing it on Issue / Modify
+    /// NEVER writes back to the partner master record — it is a one-off
+    /// per-invoice override. Storno chains inherit via the base's
+    /// side-stored `input.json` round-trip (the storno's allocator pulls
+    /// the field straight off the deserialised `InvoiceInputJson`).
+    pub email_recipient_override: Option<String>,
     /// PR-90 / ADR-0045 §2 — first value the counter takes when the
     /// `(series_id, fiscal_year)` bucket is first allocated. The binary
     /// reads this from the operator's `[seller.numbering].start_value`
