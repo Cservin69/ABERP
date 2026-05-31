@@ -16,6 +16,10 @@ path = "src/lib.rs"
 [dependencies]
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# PR-209 / S213 — `CancellationToken` plumbed into `run_daemon_forever`
+# so the quote-intake poll loop exits within the shutdown timeout
+# instead of letting tokio drop the task mid-await.
+tokio-util = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

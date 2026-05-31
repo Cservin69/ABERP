@@ -87,6 +87,7 @@ use anyhow::{anyhow, Context, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use time::{format_description::FormatItem, macros, OffsetDateTime};
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, BinaryHash, EventKind, Ledger, TenantId};
@@ -186,20 +187,47 @@ pub struct CycleInputs {
 /// re-spawns. The audit chain remains the source of truth for
 /// `ingested_count` / `skipped_count` per cycle, so a missed cycle is
 /// recoverable on the next tick.
-pub async fn run_daemon_forever<F>(build_inputs: F)
+///
+/// PR-209 / S213 — `cancel` is the shutdown token. The boot-delay
+/// sleep, the bootstrap-year sweep, and the steady-cadence sleep all
+/// race against `cancel.cancelled()` so a Ctrl-C / window-close
+/// during a 30-minute idle window exits within the shutdown timeout
+/// instead of waiting out the cadence. Cancellation between cycles
+/// is silent — the daemon has nothing in flight to flush.
+pub async fn run_daemon_forever<F>(build_inputs: F, cancel: CancellationToken)
 where
     F: Fn() -> Result<CycleInputs> + Send + Sync + 'static,
 {
     let build_inputs = Arc::new(build_inputs);
-    tokio::time::sleep(Duration::from_secs(BOOT_DELAY_SECS)).await;
+    tokio::select! {
+        _ = cancel.cancelled() => return,
+        _ = tokio::time::sleep(Duration::from_secs(BOOT_DELAY_SECS)) => {}
+    }
     // PR-203 / S203 — one-shot year-to-date bootstrap on the FIRST boot
     // tick. The sentinel scan inside `run_bootstrap_year_once` short-
     // circuits on subsequent boots whose audit ledger already records
     // a `bootstrap-year` cycle, so this is a guarded once-per-DB sweep
     // (re-runs after wipe/restore, idempotent at the digest UNIQUE on
     // overlap).
-    run_bootstrap_year_once(&*build_inputs).await;
+    //
+    // PR-209 / S213 — bootstrap is itself a long-running sweep
+    // (≤ 12 month-window queries). Race against shutdown so a
+    // first-boot shutdown doesn't stall the coordinator for minutes.
+    tokio::select! {
+        _ = cancel.cancelled() => return,
+        _ = run_bootstrap_year_once(&*build_inputs) => {}
+    }
     loop {
+        // PR-209 / S213 — check the token BEFORE each cycle.
+        // run_one_cycle's NAV calls have their own timeouts; if a
+        // cycle is in flight when shutdown fires it finishes (worst-
+        // case ~30s) and the next loop iteration observes the
+        // cancellation. Acceptable: the shutdown timeout (5s default)
+        // would name `ap-sync` as a timeout_kill in that case, which
+        // accurately reports the situation.
+        if cancel.is_cancelled() {
+            return;
+        }
         match build_inputs() {
             Ok(inputs) => match run_one_cycle(inputs, CycleTrigger::Daemon).await {
                 Ok(summary) => {
@@ -219,7 +247,10 @@ where
                 "AP auto-sync skipped (build_inputs failed; will retry on next tick)"
             ),
         }
-        tokio::time::sleep(Duration::from_secs(CADENCE_SECS)).await;
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_secs(CADENCE_SECS)) => {}
+        }
     }
 }
 

@@ -744,6 +744,20 @@ pub enum EventKind {
     /// export bundle's `invoice.*` glob MUST NEVER sweep this.
     /// F12 four-edit ritual fires once.
     QuoteIntakePollCompleted,
+
+    /// S213 / PR-209 — ONE per `aberp serve` shutdown. The
+    /// graceful-shutdown coordinator (`apps/aberp/src/shutdown.rs`)
+    /// emits this row exactly once at the end of its drain pass,
+    /// just before `std::process::exit(0)`. Payload
+    /// (`aberp::audit_payloads::DaemonShutdownCompletedPayload`)
+    /// names each registered daemon's outcome (clean / timeout) so
+    /// a postmortem can ask "why did NAV poll always time out?"
+    /// without grepping log files.
+    ///
+    /// `system.`-prefixed — never sweeps a per-outgoing-invoice
+    /// export bundle. The payload carries shutdown telemetry only;
+    /// no NAV bytes. F12 four-edit ritual fires once.
+    DaemonShutdownCompleted,
 }
 
 impl EventKind {
@@ -786,6 +800,7 @@ impl EventKind {
             }
             EventKind::InvoiceRestoredFromNav => "system.invoice_restored_from_nav",
             EventKind::QuoteIntakePollCompleted => "system.quote_intake_poll_completed",
+            EventKind::DaemonShutdownCompleted => "system.daemon_shutdown_completed",
         }
     }
 
@@ -839,6 +854,7 @@ impl EventKind {
             }
             "system.invoice_restored_from_nav" => Ok(EventKind::InvoiceRestoredFromNav),
             "system.quote_intake_poll_completed" => Ok(EventKind::QuoteIntakePollCompleted),
+            "system.daemon_shutdown_completed" => Ok(EventKind::DaemonShutdownCompleted),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -886,6 +902,7 @@ mod tests {
             EventKind::IncomingInvoiceSyncCycleCompleted,
             EventKind::InvoiceRestoredFromNav,
             EventKind::QuoteIntakePollCompleted,
+            EventKind::DaemonShutdownCompleted,
         ];
         for v in variants {
             let s = v.as_str();

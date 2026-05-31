@@ -72,6 +72,21 @@ publish = false
 # Async runtime — ADR-0021 Part A, item 1.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "time", "sync", "signal"] }
 
+# PR-209 / S213 — graceful shutdown via `CancellationToken`. The
+# `tokio-util` crate is the canonical home for `CancellationToken`
+# (tokio core deliberately keeps coordination primitives out of the
+# main crate). Pulled in here because EVERY long-lived daemon (NAV
+# poll, AP sync, quote-intake) selects on `token.cancelled()` so a
+# Tauri window-close / Ctrl-C in `run_prod.sh` actually stops the
+# backend instead of leaving zombie tokio tasks holding the port. The
+# coordinator itself lives in `apps/aberp/src/shutdown.rs`; the
+# workspace pin keeps the version line consistent across the three
+# daemon-hosting crates that consume it.
+#
+# `rt` feature is the runtime-coordination half (CancellationToken +
+# DropGuard). No native deps; MIT-licensed.
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+
 # PR-60 / session-80 — `async-trait` is needed to declare `async fn`s on
 # the dyn-compatible `MnbRatesProvider` trait. Without it, native
 # `async fn` in trait methods would break object safety (the trait is

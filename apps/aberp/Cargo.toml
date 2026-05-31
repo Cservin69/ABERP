@@ -117,6 +117,12 @@ tracing-subscriber = { workspace = true }
 # inheriting cleanly is cheaper than diverging.
 tokio = { workspace = true }
 
+# PR-209 / S213 — `CancellationToken` consumed by every long-lived
+# daemon (NAV poll, AP sync, quote-intake) so a Ctrl-C / window-close
+# actually stops the backend instead of leaving zombie tokio tasks.
+# Coordinator lives in `src/shutdown.rs`.
+tokio-util = { workspace = true }
+
 # `keyring` is needed in production because the binary's
 # `setup-nav-credentials` subcommand WRITES to the keychain — the
 # library `aberp-nav-transport` only owns the READ path

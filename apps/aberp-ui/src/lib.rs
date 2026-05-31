@@ -62,6 +62,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use tauri::Manager;
@@ -261,8 +262,115 @@ pub fn run() {
             commands::test_quote_intake_connection,
             commands::list_quote_intake,
         ])
+        .on_window_event(handle_window_event)
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// PR-209 / S213 — Tauri window-event handler. Intercepts
+/// `CloseRequested` (Cmd+Q / red traffic-light / Alt+F4) to give the
+/// embedded `aberp serve` subprocess time to drain its daemons
+/// gracefully before the shell drops the `Child` (which would otherwise
+/// SIGKILL it via `kill_on_drop(true)` and leave NAV poll daemons
+/// uncancelled mid-await).
+///
+/// Pre-PR-209 path: `Child::drop` fires inside Tauri's runtime
+/// shutdown → SIGKILL → backend dies with no audit row, no daemon
+/// cleanup, no chance to flush mid-flight DB writes. Worse, on
+/// macOS Cmd+Q on the WebView would sometimes exit the shell before
+/// the runtime got to drop the Child, leaving a zombie backend
+/// holding the loopback port — exactly the symptom Ervin hit on the
+/// PROD_v2.0 cutover night.
+///
+/// Post-PR-209 path: `prevent_close()` keeps the window alive while
+/// a detached tokio task sends SIGTERM to the backend PID, sleeps
+/// the shutdown budget (5s default + 1s slack for the audit row
+/// write + mirror sync), then calls `AppHandle::exit(0)` which
+/// drops the Child cleanly (or SIGKILLs whatever's left if the
+/// backend ignored SIGTERM — at that point the operator's only
+/// option is to file a bug, but the shell still exits in bounded
+/// time).
+///
+/// Unix only — Windows uses `Child::kill` (SIGKILL-equivalent) at
+/// drop time, which is what the pre-PR-209 path already did. A
+/// future PR can add Windows-side graceful shutdown via the JobObject
+/// API; for now Ervin's prod runs on macOS so the Unix branch is
+/// what matters.
+fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
+    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        // Hold the window open until our drain task explicitly
+        // exits the app. Without this the WebView vanishes and the
+        // operator stares at a missing window for the 6s drain.
+        api.prevent_close();
+        let app_handle = window.app_handle().clone();
+        // Tauri's setup hook installs the Manager on the main
+        // thread; window events fire there too. Spawn the drain on
+        // tokio so we don't block the event loop.
+        tauri::async_runtime::spawn(async move {
+            drain_backend_then_exit(app_handle).await;
+        });
+    }
+}
+
+/// PR-209 / S213 — send SIGTERM to the backend subprocess, wait the
+/// drain budget, then exit the Tauri shell cleanly.
+async fn drain_backend_then_exit(app_handle: tauri::AppHandle) {
+    let state = app_handle.state::<AppState>();
+    let backend_guard = state.backend.lock().await;
+    let pid_opt: Option<u32> = if let Some(backend) = backend_guard.as_ref() {
+        backend.child.lock().await.id()
+    } else {
+        None
+    };
+    drop(backend_guard);
+
+    if let Some(pid) = pid_opt {
+        #[cfg(unix)]
+        {
+            // Use the system `kill` binary rather than a `libc::kill`
+            // FFI call — aberp-ui forbids unsafe code (see main.rs
+            // `#![forbid(unsafe_code)]`) and `Command::new("kill")`
+            // is the supported portable Unix path. `kill -TERM` is
+            // the signal `aberp serve` listens for in its
+            // `tokio::signal::unix` handler (see
+            // `apps/aberp/src/serve.rs` PR-209 wiring).
+            tracing::info!(pid, "Tauri close: sending SIGTERM to aberp serve");
+            let kill_result = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+            if let Err(e) = kill_result {
+                tracing::warn!(
+                    pid,
+                    error = %e,
+                    "could not spawn `kill -TERM`; relying on Child::drop SIGKILL"
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tracing::info!(
+                pid,
+                "Tauri close on non-unix platform: relying on Child::drop \
+                 (SIGKILL-equivalent)"
+            );
+        }
+    } else {
+        tracing::warn!(
+            "Tauri close: no backend PID known (backend never started or already \
+             exited); shell will exit immediately"
+        );
+    }
+
+    // Give the backend its shutdown budget (5s default for the
+    // coordinator + 1s slack for the audit row write + mirror sync).
+    // 6s matches the worst-case observed in dev runs; the floor +
+    // ceiling are owned by `apps/aberp/src/shutdown.rs`'s
+    // `shutdown_timeout_from_env` so a future env-var tweak doesn't
+    // require a Tauri-side change.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    tracing::info!("Tauri close: drain budget elapsed; exiting shell");
+    app_handle.exit(0);
 }
 
 /// Read the tenant identifier from `ABERP_TENANT`, defaulting to

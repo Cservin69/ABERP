@@ -667,7 +667,11 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // `system.`-scoped — never sweeps a per-outgoing-invoice
         // bundle. The payload carries cycle counts + cadence telemetry,
         // not NAV bytes.
-        | EventKind::QuoteIntakePollCompleted => None,
+        | EventKind::QuoteIntakePollCompleted
+        // S213 / PR-209 — graceful-shutdown coordinator event.
+        // `system.`-scoped — process-lifecycle telemetry never
+        // belongs in a per-invoice export bundle.
+        | EventKind::DaemonShutdownCompleted => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

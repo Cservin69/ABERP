@@ -786,7 +786,11 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // S210 / PR-204 — quote-intake daemon cycle event.
         // `system.`-scoped; the payload is poll telemetry, not NAV
         // XML bytes. Same no-bytes posture as the other system kinds.
-        | EventKind::QuoteIntakePollCompleted => (None, ""),
+        | EventKind::QuoteIntakePollCompleted
+        // S213 / PR-209 — graceful-shutdown coordinator's per-shutdown
+        // event. `system.`-scoped; the payload names registered
+        // daemons + their clean/timeout outcome, not NAV bytes.
+        | EventKind::DaemonShutdownCompleted => (None, ""),
     };
 
     Ok(NavExtraction {

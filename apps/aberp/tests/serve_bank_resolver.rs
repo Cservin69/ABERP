@@ -63,6 +63,7 @@ fn build_state(db_path: PathBuf) -> AppState {
                 operator_login: "test-operator".to_string(),
             },
         )),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
     }
 }
 

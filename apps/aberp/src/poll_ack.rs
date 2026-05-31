@@ -88,6 +88,7 @@ use aberp_nav_transport::{
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::audit_payloads;
@@ -791,6 +792,12 @@ pub struct PollDaemonInputs {
 /// How the two-phase poll schedule ended. `Terminal` carries the NAV
 /// outcome whose `response_xml` becomes the single audit entry the
 /// daemon writes; `GaveUp` carries the operator-visible reason.
+/// `Cancelled` is the PR-209 / S213 shape — the
+/// [`ShutdownCoordinator`](crate::shutdown::ShutdownCoordinator)
+/// fired its token between polls so the daemon exits without writing
+/// a terminal audit row. The invoice stays in its current state and
+/// the next app-boot recovery pass re-spawns the daemon to keep
+/// chasing the NAV ack.
 #[derive(Debug)]
 enum PollScheduleResult {
     Terminal {
@@ -799,6 +806,9 @@ enum PollScheduleResult {
     },
     GaveUp {
         reason: String,
+        polls: u64,
+    },
+    Cancelled {
         polls: u64,
     },
 }
@@ -817,7 +827,10 @@ enum PollScheduleResult {
 /// network hiccup must not end it. A *non-retryable* error (e.g. NAV
 /// schema drift surfaced as a parse failure) still ends the daemon
 /// immediately — retrying cannot help, and the invoice stays actionable.
-async fn drive_poll_schedule<F, Fut>(mut poll_once: F) -> PollScheduleResult
+async fn drive_poll_schedule<F, Fut>(
+    mut poll_once: F,
+    cancel: CancellationToken,
+) -> PollScheduleResult
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<QueryTransactionStatusOutcome, AttemptError>>,
@@ -861,18 +874,38 @@ where
         }};
     }
 
-    // Phase 1 — fast exponential backoff.
+    // Phase 1 — fast exponential backoff. PR-209 / S213 — race each
+    // sleep + each poll-attempt against the shutdown token so a
+    // mid-backoff cancellation exits within the shutdown timeout
+    // instead of waiting out the next 60s sleep. Cancellation during
+    // an in-flight NAV call cancels the poll itself; the daemon
+    // exits without writing a terminal row and the next app-boot
+    // recovery pass re-spawns it.
     for delay in PHASE1_DELAYS_SECS {
-        tokio::time::sleep(Duration::from_secs(delay)).await;
-        handle!(poll_once().await);
+        tokio::select! {
+            _ = cancel.cancelled() => return PollScheduleResult::Cancelled { polls },
+            _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return PollScheduleResult::Cancelled { polls },
+            outcome = poll_once() => handle!(outcome),
+        }
     }
 
     // Phase 2 — steady daemon. No expiry: runs until terminal, a
-    // non-retryable error, the error cap, or process shutdown (the task
-    // dies with the process; app-boot recovery re-spawns it).
+    // non-retryable error, the error cap, or shutdown cancellation
+    // (PR-209 / S213). Pre-PR-209 only "the task dies with the
+    // process" stopped it — the process never died because the
+    // daemon held it alive, exactly the bug PR-209 closes.
     loop {
-        tokio::time::sleep(Duration::from_secs(PHASE2_INTERVAL_SECS)).await;
-        handle!(poll_once().await);
+        tokio::select! {
+            _ = cancel.cancelled() => return PollScheduleResult::Cancelled { polls },
+            _ = tokio::time::sleep(Duration::from_secs(PHASE2_INTERVAL_SECS)) => {}
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return PollScheduleResult::Cancelled { polls },
+            outcome = poll_once() => handle!(outcome),
+        }
     }
 }
 
@@ -890,6 +923,7 @@ where
 pub async fn run_nav_poll_daemon(
     inputs: PollDaemonInputs,
     semaphore: Arc<Semaphore>,
+    cancel: CancellationToken,
 ) -> Result<()> {
     let _permit = semaphore
         .acquire()
@@ -898,14 +932,17 @@ pub async fn run_nav_poll_daemon(
 
     let transport = NavTransport::new(inputs.endpoint).context("build NAV transport for daemon")?;
 
-    let result = drive_poll_schedule(|| {
-        run_one_attempt(
-            &transport,
-            &inputs.credentials,
-            &inputs.tax_number_8,
-            &inputs.transaction_id,
-        )
-    })
+    let result = drive_poll_schedule(
+        || {
+            run_one_attempt(
+                &transport,
+                &inputs.credentials,
+                &inputs.tax_number_8,
+                &inputs.transaction_id,
+            )
+        },
+        cancel,
+    )
     .await;
 
     match result {
@@ -927,6 +964,26 @@ pub async fn run_nav_poll_daemon(
                 reason = %reason,
                 "NAV poll daemon stopped without a terminal status; \
                  invoice stays Submitted/actionable for a manual poll"
+            );
+            Ok(())
+        }
+        PollScheduleResult::Cancelled { polls } => {
+            // PR-209 / S213 — shutdown cancelled this daemon between
+            // (or during) polls. The invoice stays in its current
+            // state (Submitted or whatever the chain reports) and
+            // the next `aberp serve` boot's recovery scan re-spawns
+            // a fresh daemon for it via the same
+            // `query_non_terminal_invoices` walk. No audit row —
+            // mid-shutdown bookkeeping noise would force the
+            // operator to read past the cancellation when
+            // postmortem-ing the *real* terminal status that lands
+            // after restart.
+            tracing::info!(
+                invoice_id = %inputs.invoice_id,
+                transaction_id = %inputs.transaction_id,
+                polls,
+                "NAV poll daemon cancelled by shutdown; invoice stays current \
+                 state, app-boot recovery will re-spawn next launch"
             );
             Ok(())
         }
@@ -1107,7 +1164,7 @@ mod tests {
                 Ok(ok_outcome(ProcessingStatus::Processing))
             }
         });
-        let result = drive_poll_schedule(poll).await;
+        let result = drive_poll_schedule(poll, CancellationToken::new()).await;
         match result {
             PollScheduleResult::Terminal { outcome, polls } => {
                 assert_eq!(polls, 7, "terminal SAVED on the 7th poll");
@@ -1135,7 +1192,7 @@ mod tests {
                 Ok(ok_outcome(ProcessingStatus::Processing))
             }
         });
-        let result = drive_poll_schedule(poll).await;
+        let result = drive_poll_schedule(poll, CancellationToken::new()).await;
         match result {
             PollScheduleResult::Terminal { polls, .. } => {
                 assert_eq!(polls, 18);
@@ -1167,7 +1224,7 @@ mod tests {
             3 => Ok(ok_outcome(ProcessingStatus::Processing)),
             _ => Ok(ok_outcome(ProcessingStatus::Saved)),
         });
-        let result = drive_poll_schedule(poll).await;
+        let result = drive_poll_schedule(poll, CancellationToken::new()).await;
         match result {
             PollScheduleResult::Terminal { polls, .. } => assert_eq!(polls, 5),
             other => panic!("expected Terminal despite transient errors, got {other:?}"),
@@ -1180,7 +1237,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn daemon_gives_up_after_consecutive_error_cap() {
         let (poll, _log) = scripted(|_| Err(AttemptError::Retryable("down".into())));
-        let result = drive_poll_schedule(poll).await;
+        let result = drive_poll_schedule(poll, CancellationToken::new()).await;
         match result {
             PollScheduleResult::GaveUp { polls, .. } => {
                 assert_eq!(polls, MAX_CONSECUTIVE_DAEMON_ERRORS as u64);
@@ -1194,7 +1251,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn daemon_gives_up_immediately_on_non_retryable() {
         let (poll, _log) = scripted(|_| Err(AttemptError::NonRetryable("schema drift".into())));
-        let result = drive_poll_schedule(poll).await;
+        let result = drive_poll_schedule(poll, CancellationToken::new()).await;
         match result {
             PollScheduleResult::GaveUp { polls, reason } => {
                 assert_eq!(polls, 1);
@@ -1211,10 +1268,13 @@ mod tests {
         let calls = Rc::new(RefCell::new(0usize));
         let result = {
             let calls = calls.clone();
-            drive_poll_schedule(move || {
-                *calls.borrow_mut() += 1;
-                async move { Ok(ok_outcome(ProcessingStatus::Aborted)) }
-            })
+            drive_poll_schedule(
+                move || {
+                    *calls.borrow_mut() += 1;
+                    async move { Ok(ok_outcome(ProcessingStatus::Aborted)) }
+                },
+                CancellationToken::new(),
+            )
             .await
         };
         match result {
@@ -1229,6 +1289,56 @@ mod tests {
             1,
             "exactly one poll for a first-poll terminal"
         );
+    }
+
+    /// PR-209 / S213 — cancelling the token mid-schedule exits with
+    /// `Cancelled` without polling further. Pin guards the
+    /// graceful-shutdown contract: the next app-boot recovery pass
+    /// is responsible for re-spawning the daemon, NOT a terminal
+    /// audit row written under the wrong premise.
+    #[tokio::test(start_paused = true)]
+    async fn daemon_cancel_token_exits_with_cancelled() {
+        let cancel = CancellationToken::new();
+        let cancel_for_spawn = cancel.clone();
+        // After ~5s virtual time, fire cancellation. The daemon is
+        // in its phase-1 sleep at this point (first delay = 1s, then
+        // 2s, then 4s — 7s elapsed at the 3rd poll). Firing at 5s
+        // catches the schedule mid-sleep, not mid-poll.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            cancel_for_spawn.cancel();
+        });
+        let (poll, _log) = scripted(|_| Ok(ok_outcome(ProcessingStatus::Processing)));
+        let result = drive_poll_schedule(poll, cancel).await;
+        match result {
+            PollScheduleResult::Cancelled { polls } => {
+                // 1s sleep + 1 poll, 2s sleep + 1 poll = 2 polls
+                // by the time cancellation fires at 5s.
+                assert!(
+                    polls <= 3,
+                    "expected ≤ 3 polls before cancellation, got {polls}"
+                );
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    /// PR-209 / S213 — a token cancelled BEFORE the first sleep
+    /// completes exits at the very first `select!` arm with zero
+    /// polls. Conservative pin: a token that was already cancelled
+    /// at spawn time must NOT slip a single poll through.
+    #[tokio::test(start_paused = true)]
+    async fn daemon_pre_cancelled_token_exits_with_zero_polls() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (poll, _log) = scripted(|_| Ok(ok_outcome(ProcessingStatus::Processing)));
+        let result = drive_poll_schedule(poll, cancel).await;
+        match result {
+            PollScheduleResult::Cancelled { polls } => {
+                assert_eq!(polls, 0, "pre-cancelled token must not poll");
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
     }
 
     /// The transaction-id lookup helper: a payload whose invoice_id
