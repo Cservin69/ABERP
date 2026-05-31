@@ -1154,6 +1154,14 @@ pub fn parse_seller_toml(body: &str) -> Result<SellerToml> {
 // PR-176 — tenant-logo convention load
 // ──────────────────────────────────────────────────────────────────────
 
+/// PR-185 / Fix B — maximum logo file size on disk. Anything larger
+/// is rejected at the orchestrator BEFORE the bytes hit the decoder.
+/// A 50×50pt header logo is well under 100 KB in practice; 2 MiB is
+/// two orders of magnitude over what an operator would supply
+/// intentionally. Bump (e.g. to 4 MiB) if a real operator hits it —
+/// this is a sanity cap, not a quota.
+const MAX_LOGO_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
 /// PR-176 — read the operator-supplied tenant logo from the convention
 /// path. Anchored on the same directory as the seller-info TOML, so
 /// the explicit `--seller-toml` override path naturally co-locates the
@@ -1161,31 +1169,83 @@ pub fn parse_seller_toml(body: &str) -> Result<SellerToml> {
 /// directories) while the default `~/.aberp/<tenant>/seller.toml`
 /// keeps the logo at `~/.aberp/<tenant>/logo.png`.
 ///
-/// File absent → `Ok(None)`: the renderer falls back to the pre-PR-176
-/// text-only header. Decoding the bytes is also done here (rather than
-/// returning raw bytes for the renderer to decode) so a malformed PNG
-/// surfaces at the orchestrator boundary, which has anyhow context for
-/// the operator-actionable error message.
+/// PR-185 / Fix A + B — legal-document rendering must NEVER be blocked
+/// by a branding asset. Every logo-path failure (missing parent,
+/// over-size file, IO error, decode failure, dimension cap from
+/// [`TenantLogo::from_png_bytes`]) downgrades to a `tracing::warn!`
+/// and returns `Ok(None)`. The renderer then falls back to the
+/// pre-PR-176 text-only header; the operator sees the WARN line on
+/// the next look at the log and can re-export or remove the PNG.
+/// Pre-PR-185 behavior propagated the error to a 500 from
+/// `GET /api/invoices/:id/pdf` (and a non-zero exit from
+/// `aberp print-invoice`) — recovery required "delete the file" with
+/// no actionable error pointing at the path.
+///
+/// The `Result<...>` return is retained for forward compatibility; in
+/// the current shape every path returns `Ok(...)` and the function is
+/// effectively infallible from the caller's perspective.
 fn load_tenant_logo(seller_toml_path: &Path) -> Result<Option<TenantLogo>> {
-    let logo_path = seller_toml_path
-        .parent()
-        .map(|parent| parent.join("logo.png"))
-        .ok_or_else(|| {
-            anyhow!(
-                "seller_toml path {} has no parent directory — cannot resolve logo.png alongside it",
-                seller_toml_path.display()
-            )
-        })?;
-    let bytes = match fs::read(&logo_path) {
-        Ok(b) => b,
+    let Some(parent) = seller_toml_path.parent() else {
+        tracing::warn!(
+            seller_toml = %seller_toml_path.display(),
+            "seller_toml path has no parent directory — skipping tenant logo (text-only header). \
+             | A seller_toml elérési útnak nincs szülőkönyvtára — címer kihagyva (csak szöveges fejléc)."
+        );
+        return Ok(None);
+    };
+    let logo_path = parent.join("logo.png");
+
+    let metadata = match fs::metadata(&logo_path) {
+        Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
-            return Err(anyhow!("read tenant logo at {}: {e}", logo_path.display()));
+            tracing::warn!(
+                logo_path = %logo_path.display(),
+                error = %e,
+                "tenant logo stat failed — falling back to text-only header. \
+                 | Címer fájl-stat hiba — csak szöveges fejléc."
+            );
+            return Ok(None);
         }
     };
-    let logo = TenantLogo::from_png_bytes(&bytes)
-        .with_context(|| format!("decode tenant logo PNG at {}", logo_path.display()))?;
-    Ok(Some(logo))
+
+    let size = metadata.len();
+    if size > MAX_LOGO_FILE_BYTES {
+        tracing::warn!(
+            logo_path = %logo_path.display(),
+            size_bytes = size,
+            cap_bytes = MAX_LOGO_FILE_BYTES,
+            "tenant logo exceeds size cap — falling back to text-only header. \
+             | A címer mérete meghaladja a méretkorlátot — csak szöveges fejléc."
+        );
+        return Ok(None);
+    }
+
+    let bytes = match fs::read(&logo_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                logo_path = %logo_path.display(),
+                error = %e,
+                "tenant logo read failed — falling back to text-only header. \
+                 | Címer beolvasási hiba — csak szöveges fejléc."
+            );
+            return Ok(None);
+        }
+    };
+
+    match TenantLogo::from_png_bytes(&bytes) {
+        Ok(logo) => Ok(Some(logo)),
+        Err(e) => {
+            tracing::warn!(
+                logo_path = %logo_path.display(),
+                error = %e,
+                "tenant logo PNG decode failed — falling back to text-only header. \
+                 | A címer PNG dekódolása sikertelen — csak szöveges fejléc."
+            );
+            Ok(None)
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1673,6 +1733,158 @@ swift_bic = "OTPVHUHB"
             parsed.customer_address_lines.is_empty(),
             "no <customerAddress> ⇒ empty lines, got {:?}",
             parsed.customer_address_lines
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // PR-185 / S185 — load_tenant_logo tests
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Per-test tempdir (no `tempfile` dep — mirrors the ScopedTempDir
+    /// pattern in `incoming_invoices.rs`). Best-effort cleanup at drop.
+    struct ScopedTempDir(std::path::PathBuf);
+
+    impl ScopedTempDir {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let path = std::env::temp_dir().join(format!("aberp-s185-{label}-{pid}-{nanos}-{seq}"));
+            std::fs::create_dir_all(&path).expect("create scoped tempdir");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScopedTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Build a minimal valid PNG of `w`×`h` solid colour. Same shape as
+    /// the synth_png helper in `crates/invoice-pdf/src/logo.rs` tests —
+    /// duplicated here rather than re-exported to keep the test surface
+    /// of `aberp-invoice-pdf` tight.
+    fn synth_png(w: u32, h: u32, color_type: png::ColorType, pixel: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, w, h);
+            encoder.set_color(color_type);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            let mut buf = Vec::with_capacity((w as usize) * (h as usize) * pixel.len());
+            for _ in 0..(w as usize) * (h as usize) {
+                buf.extend_from_slice(pixel);
+            }
+            writer.write_image_data(&buf).expect("png write data");
+        }
+        out
+    }
+
+    #[test]
+    fn load_tenant_logo_absent_file_returns_none() {
+        // Pre-existing contract — pin it. `seller_toml_path` itself need
+        // NOT exist; only the directory is consulted (for the sibling
+        // logo.png lookup).
+        let dir = ScopedTempDir::new("logo-absent");
+        let seller_toml = dir.path().join("seller.toml");
+        let logo = load_tenant_logo(&seller_toml).expect("absent logo is not an error");
+        assert!(
+            logo.is_none(),
+            "absent logo ⇒ Ok(None), got {:?}",
+            logo.is_some()
+        );
+    }
+
+    #[test]
+    fn load_tenant_logo_valid_png_returns_some() {
+        // Sanity baseline — a well-formed PNG decodes through the
+        // unchanged happy path and yields `Some(TenantLogo)`.
+        let dir = ScopedTempDir::new("logo-ok");
+        let logo_path = dir.path().join("logo.png");
+        std::fs::write(
+            &logo_path,
+            synth_png(4, 3, png::ColorType::Rgb, &[10, 20, 30]),
+        )
+        .expect("write valid logo");
+        let seller_toml = dir.path().join("seller.toml");
+        let logo = load_tenant_logo(&seller_toml).expect("happy path");
+        let logo = logo.expect("Some");
+        assert_eq!(logo.width, 4);
+        assert_eq!(logo.height, 3);
+    }
+
+    #[test]
+    fn load_tenant_logo_malformed_png_returns_none_not_error() {
+        // PR-185 / Fix A — a malformed PNG MUST NOT propagate an error
+        // to the caller. The previous behaviour returned `Err(...)`
+        // which surfaced as a 500 from `GET /api/invoices/:id/pdf` and
+        // a non-zero exit from `aberp print-invoice`, blocking the
+        // operator's invoice over a branding asset.
+        let dir = ScopedTempDir::new("logo-malformed");
+        let logo_path = dir.path().join("logo.png");
+        // 4 random bytes — not a PNG signature, not a valid header.
+        std::fs::write(&logo_path, [0xde, 0xad, 0xbe, 0xef]).expect("write malformed logo");
+        let seller_toml = dir.path().join("seller.toml");
+        let logo = load_tenant_logo(&seller_toml)
+            .expect("malformed logo must NOT propagate Err — fall back to text-only header");
+        assert!(
+            logo.is_none(),
+            "malformed PNG ⇒ Ok(None), so renderer falls through to text-only header"
+        );
+    }
+
+    #[test]
+    fn load_tenant_logo_oversize_file_returns_none() {
+        // PR-185 / Fix B — file-on-disk size cap. A 3 MiB file (over
+        // the 2 MiB cap) must short-circuit BEFORE the bytes hit
+        // `fs::read` / the decoder, returning Ok(None).
+        let dir = ScopedTempDir::new("logo-oversize");
+        let logo_path = dir.path().join("logo.png");
+        let oversize = vec![0u8; (MAX_LOGO_FILE_BYTES as usize) + 1];
+        std::fs::write(&logo_path, &oversize).expect("write oversize logo");
+        let seller_toml = dir.path().join("seller.toml");
+        let logo = load_tenant_logo(&seller_toml).expect("over-size logo falls back, not errors");
+        assert!(logo.is_none(), "over-size file ⇒ Ok(None)");
+    }
+
+    #[test]
+    fn load_tenant_logo_oversize_dimensions_returns_none() {
+        // PR-185 / Fix B — the dimension cap inside
+        // `TenantLogo::from_png_bytes` returns LogoDecode; the
+        // orchestrator must catch it and degrade to Ok(None) so the
+        // PDF still renders with a text-only header.
+        let dir = ScopedTempDir::new("logo-oversize-dim");
+        let logo_path = dir.path().join("logo.png");
+        // Width just beyond MAX_LOGO_DIMENSION; encoded size stays
+        // well under the file-byte cap so we exercise the decoder
+        // dim check, not the disk-size check.
+        let png = synth_png(
+            aberp_invoice_pdf::MAX_LOGO_DIMENSION + 1,
+            1,
+            png::ColorType::Grayscale,
+            &[0],
+        );
+        assert!(
+            (png.len() as u64) <= MAX_LOGO_FILE_BYTES,
+            "test fixture must not trip the file-byte cap (got {} bytes)",
+            png.len()
+        );
+        std::fs::write(&logo_path, &png).expect("write oversize-dim logo");
+        let seller_toml = dir.path().join("seller.toml");
+        let logo = load_tenant_logo(&seller_toml).expect("over-dim logo falls back, not errors");
+        assert!(
+            logo.is_none(),
+            "dim-cap rejection ⇒ Ok(None) at the orchestrator"
         );
     }
 }

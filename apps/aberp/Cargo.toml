@@ -184,6 +184,13 @@ tokio = { workspace = true, features = ["test-util"] }
 lopdf = { workspace = true }
 pdf-extract = { workspace = true }
 
+# PR-185 / S185 — `print_invoice::tests::load_tenant_logo_*` synthesise
+# minimal PNGs (RGB / oversized-dimension) to verify the corrupt-logo
+# fallback and dimension-cap rejection paths. The `png` crate is
+# already in the workspace via `crates/invoice-pdf`'s production deps,
+# so lifting it to a dev-dep here adds no new transitive cost.
+png = { workspace = true }
+
 # PR-22 / ADR-0035 — the end-to-end writer-verifier round-trip test
 # at `tests/verify_bundle_round_trip.rs` exercises the real
 # `export_invoice_bundle::run` producer against `aberp_verify::

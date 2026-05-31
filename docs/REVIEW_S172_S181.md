@@ -64,6 +64,20 @@ template configured — confirm none does and it stays 🟡.
   still, the brief explicitly named this risk and the code does not address it.
   Recommended future PR: call `decoder.set_limits(png::Limits { bytes: 16 * 1024 * 1024 })`
   defensively at the top of `from_png_bytes`.
+  > **ADDRESSED-BY-PR-185.** Three defences in depth: (1) a 2 MiB
+  > file-size cap in `print_invoice::load_tenant_logo` (new
+  > `MAX_LOGO_FILE_BYTES`), checked via `fs::metadata` BEFORE the bytes
+  > hit `fs::read`; (2) a `MAX_LOGO_DIMENSION` (4096×4096) check on
+  > `read_info()`'s reported width/height in `from_png_bytes`, BEFORE
+  > the `output_buffer_size()` allocation; (3) an explicit
+  > `Decoder::set_limits(png::Limits { bytes: MAX_PNG_DECODE_BYTES })`
+  > matched to the dimension cap, defending against a future png-crate
+  > upgrade that relaxes the default. New tests
+  > `rejects_png_width_above_cap` / `rejects_png_height_above_cap` /
+  > `load_tenant_logo_oversize_file_returns_none` /
+  > `load_tenant_logo_oversize_dimensions_returns_none` pin all three
+  > layers. The dimension cap composes with the Fix-A fallback below
+  > so an oversized PNG also degrades to a text-only header.
 
 - **S176 — alpha-drop produces visible non-zero RGB on transparent pixels, contradicting
   the doc comment.** `crates/invoice-pdf/src/logo.rs:80-99` drops the alpha channel
@@ -76,6 +90,23 @@ template configured — confirm none does and it stays 🟡.
   encoded under the alpha". PNG optimizers commonly fill alpha=0 pixels with
   garbage RGB. Recommended future PR: composite `rgb = rgb * alpha + white * (1-alpha)`
   in the Rgba arm.
+  > **ADDRESSED-BY-PR-185.** New `composite_over_white(src, alpha)`
+  > helper in `crates/invoice-pdf/src/logo.rs` integer-blends every
+  > non-opaque pixel against the white page background:
+  > `out = round((src·α + 255·(255-α)) / 255)`. Both the Rgba arm
+  > and the GrayscaleAlpha arm now route through it. α=255 stays
+  > lossless (the +127 rounding term plus `255·0` collapses to src);
+  > α=0 collapses to 255 (white); α=128 produces the expected
+  > half-blend. The pre-existing `decodes_rgba_drops_alpha` test
+  > (which asserted the BUGGY behaviour `[200,100,50,0] → [200,100,50]`)
+  > is replaced by `rgba_transparent_pixels_composite_to_white`
+  > (`α=0 → [255,255,255]`), plus three new pins:
+  > `rgba_opaque_pixels_pass_rgb_through_unchanged`,
+  > `rgba_half_alpha_blends_with_white`, and
+  > `grayscale_alpha_transparent_pixels_composite_to_white`.
+  > `composite_over_white_helper_matches_formula` locks the integer
+  > rounding to known points so future refactors can't silently
+  > re-introduce off-by-one drift.
 
 - **S176 — a malformed `logo.png` blocks all printed PDFs (download + email
   attach + CLI print).** `apps/aberp/src/print_invoice.rs:204-205` wraps the
@@ -85,6 +116,22 @@ template configured — confirm none does and it stays 🟡.
   but the operator may not know to look there. Issue path is NOT affected (only
   PDF render). Recommended future PR: downgrade decode failure to a tracing
   `warn!` + render text-only, mirroring the absent-file path.
+  > **ADDRESSED-BY-PR-185.** `load_tenant_logo` in
+  > `apps/aberp/src/print_invoice.rs` no longer propagates errors on
+  > the logo path. Every failure mode — missing seller_toml parent,
+  > stat failure, file over the 2 MiB cap, read IO error, PNG decode
+  > failure (including the new dimension cap from Fix B) — is caught
+  > and downgraded to a bilingual `tracing::warn!` (EN + HU) +
+  > `Ok(None)`, so the renderer falls back to the pre-PR-176
+  > text-only header. The `Result<_>` return type is retained for
+  > forward compatibility but every current arm returns `Ok(...)`,
+  > making the function effectively infallible from the orchestrator's
+  > perspective. The legal document renders; the branding asset
+  > defects surface in the operator's log instead of in a 500.
+  > Test `load_tenant_logo_malformed_png_returns_none_not_error`
+  > pins the contract by writing `[0xde, 0xad, 0xbe, 0xef]` to
+  > `logo.png` and asserting the render proceeds with `Ok(None)`
+  > (pre-PR-185 this returned `Err(...)`).
 
 - **S177 — `find_existing_id` + INSERT are not atomic.** 
   `apps/aberp/src/incoming_invoices.rs:429-504`: the idempotency check at line 429

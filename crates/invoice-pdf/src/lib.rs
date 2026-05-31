@@ -56,7 +56,7 @@ use thiserror::Error;
 
 use aberp_billing::Currency;
 
-pub use logo::TenantLogo;
+pub use logo::{TenantLogo, MAX_LOGO_DIMENSION};
 pub use model::{InvoiceModel, LineItem, PartyInfo};
 
 /// A4 page width in PDF points (210 mm × 72/25.4).

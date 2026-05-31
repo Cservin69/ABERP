@@ -25,6 +25,7 @@ dependencies = [
  "lettre",
  "lopdf",
  "pdf-extract",
+ "png 0.17.16",
  "quick-xml 0.36.2",
  "rcgen",
  "rust_decimal",
