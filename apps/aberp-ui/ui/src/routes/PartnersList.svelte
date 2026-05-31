@@ -38,6 +38,15 @@
     loadPartnerListPrefs,
     savePartnerListPrefs,
   } from "../lib/partner-list-persistence";
+  // PR-193 / session-193 — CSV export of the currently-displayed
+  // (filtered) partner set. Tier-4 "invisible excellence" lift for
+  // the bookkeeper who wants a master-data snapshot in their
+  // spreadsheet.
+  import {
+    composeCsv,
+    csvFilenameTimestamp,
+    downloadCsv,
+  } from "../lib/csv-export";
   import PartnerForm from "./PartnerForm.svelte";
 
   let rows: Partner[] = $state([]);
@@ -194,6 +203,54 @@
   function kindLabel(kind: Partner["kind"]): string {
     return kind;
   }
+
+  // PR-193 / session-193 — compose a single "Street, 1011 Budapest,
+  // Hungary"-style address cell from the four nullable address
+  // columns. Nulls / empty strings are dropped (no stray ", , ,").
+  function composePartnerAddress(partner: Partner): string {
+    const cityLine =
+      [partner.address_postal_code, partner.address_city]
+        .filter((s): s is string => s !== null && s.trim().length > 0)
+        .join(" ");
+    const parts = [
+      partner.address_street,
+      cityLine.length > 0 ? cityLine : null,
+      partner.address_country,
+    ].filter((s): s is string => s !== null && s.trim().length > 0);
+    return parts.join(", ");
+  }
+
+  // PR-193 / session-193 — CSV export of the currently-filtered
+  // partner set. Columns match the screen's master-data shape with
+  // the full composed address (the screen collapses to City only) +
+  // the VAT-status discriminator the bookkeeper needs to read
+  // PrivatePerson rows correctly (`tax_number` is null on those per
+  // ADR-0048).
+  function exportCsv() {
+    const headers = [
+      "Display name",
+      "Legal name",
+      "Kind",
+      "VAT status",
+      "Tax number",
+      "EU VAT",
+      "Address",
+      "Email",
+    ];
+    const rowsOut: unknown[][] = filtered.map((p) => [
+      p.display_name,
+      p.legal_name,
+      p.kind,
+      p.customer_vat_status,
+      p.tax_number ?? "",
+      p.eu_vat_number ?? "",
+      composePartnerAddress(p),
+      p.contact_email ?? "",
+    ]);
+    const csv = composeCsv(headers, rowsOut);
+    const filename = `aberp-partners-${csvFilenameTimestamp()}.csv`;
+    downloadCsv(filename, csv);
+  }
 </script>
 
 <section class="page" aria-labelledby="page-title">
@@ -223,6 +280,17 @@
         spellcheck="false"
       />
     </label>
+    <!-- PR-193 / session-193 — CSV export of the currently-filtered
+         rows. Disabled when nothing would be exported. -->
+    <button
+      type="button"
+      class="quiet-button"
+      onclick={exportCsv}
+      disabled={filtered.length === 0}
+      title="Export the currently displayed partners to a CSV file"
+    >
+      Export CSV
+    </button>
   </div>
 
   {#if loadState === "loading"}
@@ -375,6 +443,13 @@
 
   .page__toolbar {
     margin-bottom: var(--space-3);
+    /* PR-193 / session-193 — flex so the new "Export CSV" button
+     * sits next to the search input with a consistent gap. The
+     * pre-PR-193 toolbar held only the search input, so a flex
+     * layout was redundant; the second affordance lifts it. */
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
   }
 
   .page__search input {

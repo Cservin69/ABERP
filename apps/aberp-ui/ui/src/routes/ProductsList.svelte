@@ -26,6 +26,13 @@
     saveProductListPrefs,
   } from "../lib/product-list-persistence";
   import { filterProducts, unitLabel } from "../lib/products";
+  // PR-193 / session-193 — CSV export of the currently-displayed
+  // (filtered) product set. Tier-4 "invisible excellence" lift.
+  import {
+    composeCsv,
+    csvFilenameTimestamp,
+    downloadCsv,
+  } from "../lib/csv-export";
   import ProductForm from "./ProductForm.svelte";
 
   let rows: Product[] = $state([]);
@@ -167,6 +174,25 @@
       deleteError = err instanceof Error ? err.message : String(err);
     }
   }
+
+  // PR-193 / session-193 — CSV export of the currently-filtered
+  // product set. Columns match the screen (Name / Unit / Unit price)
+  // with the currency as its own column (the screen renders it next
+  // to the price via `formatTotal`) so a bookkeeper sorting by price
+  // can also sort by currency. The price is emitted in MAJOR units
+  // (HUF passes through; EUR cents → euros) to match the operator's
+  // mental model from the screen.
+  function exportCsv() {
+    const headers = ["Name", "Unit", "Currency", "Unit price"];
+    const rowsOut: unknown[][] = filtered.map((p) => {
+      const priceMajor =
+        p.currency === "EUR" ? p.unit_price_minor / 100 : p.unit_price_minor;
+      return [p.name, unitLabel(p.unit), p.currency, priceMajor];
+    });
+    const csv = composeCsv(headers, rowsOut);
+    const filename = `aberp-products-${csvFilenameTimestamp()}.csv`;
+    downloadCsv(filename, csv);
+  }
 </script>
 
 <section class="page" aria-labelledby="page-title">
@@ -198,6 +224,17 @@
         spellcheck="false"
       />
     </label>
+    <!-- PR-193 / session-193 — CSV export of the currently-filtered
+         rows. Disabled when nothing would be exported. -->
+    <button
+      type="button"
+      class="quiet-button"
+      onclick={exportCsv}
+      disabled={filtered.length === 0}
+      title="Export the currently displayed products to a CSV file"
+    >
+      Export CSV
+    </button>
   </div>
 
   {#if loadState === "loading"}
@@ -350,6 +387,12 @@
 
   .page__toolbar {
     margin-bottom: var(--space-3);
+    /* PR-193 / session-193 — flex so the new "Export CSV" button
+     * sits next to the search input with a consistent gap. The
+     * pre-PR-193 toolbar held only the search input. */
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
   }
 
   .page__search input {

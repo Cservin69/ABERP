@@ -71,6 +71,14 @@
     loadInvoiceListPrefs,
     saveInvoiceListPrefs,
   } from "../lib/invoice-list-persistence";
+  // PR-193 / session-193 — CSV export of the currently-displayed
+  // (filtered + sorted) row set. Tier-4 "invisible excellence" lift
+  // for the bookkeeper who wants this view in their spreadsheet.
+  import {
+    composeCsv,
+    csvFilenameTimestamp,
+    downloadCsv,
+  } from "../lib/csv-export";
   // PR-68 / session-90 — keyboard navigation Tier-1 UX lift.
   // `/` focuses the search box, j/k walk rows, Enter opens the
   // focused row's detail, `g g`/`G` jump to top/bottom, `?` toggles
@@ -512,6 +520,56 @@
       }),
   );
 
+  // PR-193 / session-193 — compose the CSV from the currently-displayed
+  // (filter + sort applied) row set and trigger a browser download.
+  // Columns match what the operator sees on screen plus a couple of
+  // bookkeeper-useful additions (composed invoice number, raw amount
+  // in major units, currency code). Storno rows negate `total_gross`
+  // for display the same way the table cell does — the CSV must
+  // match what the operator copied from screen, not the audit-stored
+  // positive form. EUR amounts divide by 100 to get major units; HUF
+  // passes through (no sub-unit). `null` totals (draft rows that
+  // never had a total persisted) render as empty cells.
+  function exportCsv() {
+    const headers = [
+      "Invoice ID",
+      "Invoice number",
+      "Partner",
+      "Series #",
+      "Fiscal year",
+      "State",
+      "Total gross",
+      "Currency",
+      "Paid",
+    ];
+    const rowsOut: unknown[][] = visibleRows.map((row) => {
+      const composedNumber = `${row.fiscal_year}-${String(row.sequence_number).padStart(6, "0")}`;
+      const partner =
+        row.buyer_name === null || row.buyer_name.trim().length === 0
+          ? ""
+          : row.buyer_name;
+      let totalMajor: number | string = "";
+      if (row.total_gross !== null) {
+        const signed = row.is_storno ? -row.total_gross : row.total_gross;
+        totalMajor = row.currency === "EUR" ? signed / 100 : signed;
+      }
+      return [
+        row.invoice_id,
+        composedNumber,
+        partner,
+        row.sequence_number,
+        row.fiscal_year,
+        row.state,
+        totalMajor,
+        row.currency,
+        row.payment !== null ? "Yes" : "No",
+      ];
+    });
+    const csv = composeCsv(headers, rowsOut);
+    const filename = `aberp-invoices-${csvFilenameTimestamp()}.csv`;
+    downloadCsv(filename, csv);
+  }
+
   // PR-94 / session-114 — three-click sort cycle for a column header.
   // First click on a column: (column, asc). Second click on the same
   // column: (column, desc). Third click on the same column: reset to
@@ -642,6 +700,19 @@
         disabled={loadState === "loading"}
       >
         Refresh
+      </button>
+      <!-- PR-193 / session-193 — CSV export of the currently-displayed
+           rows (post-filter, post-sort). Disabled when nothing would
+           be exported so the operator does not get a 1-line headers-
+           only file. -->
+      <button
+        type="button"
+        class="quiet-button"
+        onclick={exportCsv}
+        disabled={visibleRows.length === 0}
+        title="Export the currently displayed rows to a CSV file"
+      >
+        Export CSV
       </button>
       <button
         type="button"
