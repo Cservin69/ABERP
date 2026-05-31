@@ -207,10 +207,15 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
     //    `NumberingTemplate::render_for_build` so dev builds carry
     //    the build-profile `TEST-` prefix (matching the base's
     //    original emit) AND any operator-configured template
-    //    (year/literal segments) is honoured. Pre-S173 the format
-    //    was hardcoded `"{series_code}/{seq:05}"`, which silently
-    //    omitted the prefix in dev and ignored custom templates —
-    //    one of the two stale-format gaps S165 flagged.
+    //    (year/literal segments) is honoured.
+    //
+    //    S184 NOTE — this render path is vulnerable to the same
+    //    seller.toml-literal-drift class that S184 closed in
+    //    `issue_storno` + `issue_modification` (by reading the base's
+    //    actual `<invoiceNumber>` from its on-disk NAV XML instead of
+    //    re-rendering). Observer was NOT confirmed broken in S184 (no
+    //    NAV-ABORTED ack against an observe call). Flagged as
+    //    follow-up alongside `request_technical_annulment`.
     let seller_toml_path = crate::setup_seller_info::seller_toml_path_for_tenant(&args.tenant)
         .context("resolve seller.toml path for numbering template")?;
     let template = crate::numbering::read_numbering_template(&seller_toml_path)
@@ -322,22 +327,23 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
     Ok(())
 }
 
-/// Open the billing store, load the base invoice's row, and
-/// render the NAV-facing invoice number via the operator-
-/// configured numbering template. Returns the rendered number
-/// + the bare sequence number (the latter is operator-visible
-/// in the summary line).
+/// Open the billing store, load the base invoice's row, and render the
+/// NAV-facing invoice number via the operator-configured numbering
+/// template. Returns the rendered number + the bare sequence number
+/// (the latter is operator-visible in the summary line).
 ///
-/// S173 — pre-S173 this also loaded the `InvoiceSeries` row to
-/// compose `"{series_code}/{seq:05}"` directly. That format
-/// silently dropped (a) the build-profile `TEST-` prefix on dev
-/// builds and (b) any operator-configured template segments
-/// (Year / wider Counter pad / custom literals). The render now
-/// goes through [`crate::numbering::NumberingTemplate::render_for_build`]
-/// using the base invoice's own `issue_date.year()` so a
-/// cross-year observe call still emits the original year — same
-/// posture `issue_storno` / `issue_modification` already use for
-/// the base storno/modification reference.
+/// S173 — pre-S173 this composed `"{series_code}/{seq:05}"` directly.
+/// That format silently dropped (a) the build-profile `TEST-` prefix
+/// on dev builds and (b) any operator-configured template segments.
+/// The render now goes through
+/// [`crate::numbering::NumberingTemplate::render_for_build`] using the
+/// base invoice's own `issue_date.year()` so a cross-year observe call
+/// still emits the original year.
+///
+/// S184 NOTE — same drift caveat as
+/// `request_technical_annulment::check_base_is_annullable` (see that
+/// function's S184 NOTE). The defensive on-disk-XML read added in S184
+/// for `issue_storno` / `issue_modification` is pending here too.
 fn load_base_nav_invoice_number(
     db_path: &Path,
     invoice_id: &str,

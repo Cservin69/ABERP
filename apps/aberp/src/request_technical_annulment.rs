@@ -426,11 +426,18 @@ fn check_base_is_annullable(
 
     // S183 — year sourced from the base invoice's `issue_date.year()`
     // (loaded by [`load_base_invoice_issue_year`] in `run`), NOT from
-    // any `time_wall.year()` on the audit entries. The two diverge for
-    // back-dated invoices; matching the posture every other
-    // base-reference render uses (`issue_storno`, `issue_modification`,
-    // `observe_receiver_confirmation`) closes the silent NAV-side
-    // mismatch named in the PR-182 review.
+    // any `time_wall.year()` on the audit entries.
+    //
+    // S184 NOTE — this `render_for_build(year, seq)` shape is
+    // vulnerable to the same seller.toml-literal-drift class that
+    // S184 closed in `issue_storno` + `issue_modification` (by reading
+    // the base's actual `<invoiceNumber>` from its on-disk NAV XML
+    // instead of re-rendering). Annulment was NOT confirmed broken in
+    // S184 (no NAV ABORTED ack against an annulment). Flagged as
+    // follow-up: the defensive fix here means restructuring the test
+    // ledger fixtures to plumb on-disk XML + InvoiceDraftCreated
+    // payloads. The same defensive fix is also pending for
+    // `observe_receiver_confirmation::load_base_nav_invoice_number`.
     let base_invoice_number = template.render_for_build(base_issue_year, base_sequence_number);
     Ok(AnnulmentPrecondition {
         base_invoice_number,

@@ -771,8 +771,8 @@ pub fn render_storno_data_with_number(
     // Storno carries <invoiceReference>, so every line MUST carry a
     // <lineModificationReference> (ADR-0049 §NAV emit / NAV
     // LINE_MODIFICATION_EXPECTED). lineNumberReference is 1:1 with the
-    // base line position; lineOperation is MODIFY (the negated line
-    // modifies the original).
+    // base line position; lineOperation is CREATE per NAV's INVALID_
+    // LINE_OPERATION business rule (S184) — see `CHAIN_LINE_OPERATION`.
     write_lines(
         &mut w,
         &negated_lines,
@@ -1341,14 +1341,28 @@ fn format_native_amount(minor_units: i64, currency: Currency) -> String {
 }
 
 /// `<lineOperation>` value for STORNO and MODIFY chain bodies (ADR-0049
-/// §NAV emit). NAV's `LINE_OPERATION` enum is `{CREATE, MODIFY}`; every
-/// line of a storno is a referenced-line correction (the negated amounts
-/// modify the original), so `MODIFY` is the fit. `CREATE` is reserved for
-/// a brand-new line added on top of a modification — not a path either
-/// emitter takes today (storno is 1:1 with the base; the modification
-/// emitter is a full-replace of the same lines). Pinned as `MODIFY` for
-/// both; session 156 flagged the storno value for NAV-XSD confirmation.
-const CHAIN_LINE_OPERATION: &str = "MODIFY";
+/// §NAV emit). NAV's `LINE_OPERATION` enum is `{CREATE, MODIFY}` per the
+/// v3.0 XSD, but the runtime business rule is stricter: every line of a
+/// chain body (storno OR modification) MUST be `CREATE`. NAV rejects
+/// `MODIFY` with business-rule `INVALID_LINE_OPERATION` and the
+/// operator-visible message "Módosító vagy érvénytelenítő számláról
+/// beküldött adatszolgáltatásban a lineOperation elem értéknek minden
+/// esetben „CREATE"-nek kell lennie" — "On a data report submitted from
+/// a modifying or invalidating invoice, the lineOperation element's
+/// value must always be CREATE."
+///
+/// S184 — was `"MODIFY"` (S156 / ADR-0049's initial guess; that session
+/// 156 doc explicitly flagged the value for NAV-XSD confirmation).
+/// Confirmed `"CREATE"` from a live NAV ABORTED ack (transaction
+/// `5EF1QF3Y1W9HIFNW`, base `TEST-TEST-ABERP/2026/0042`) whose
+/// `businessValidationMessages` named the rule above verbatim. NAV's
+/// data warehouse stores each invoice line as a fact row: a chain body
+/// is a NEW submission that introduces fresh fact rows (the negation in
+/// storno's case; the full-replace values in modification's case) so
+/// those fresh rows are `CREATE`-d, not `MODIFY`-d. `MODIFY` would only
+/// apply to the (extremely rare) meta-correction of a previously-
+/// submitted chain line itself.
+const CHAIN_LINE_OPERATION: &str = "CREATE";
 
 /// Emit the per-line `<lineModificationReference>` block (ADR-0049
 /// §NAV emit). Present only on chain bodies (storno / modification) —
@@ -1633,6 +1647,97 @@ fn text_element(w: &mut Writer<&mut Vec<u8>>, tag: &str, value: &str) -> Result<
     w.write_event(Event::Text(BytesText::new(value)))?;
     w.write_event(Event::End(BytesEnd::new(tag.to_string())))?;
     Ok(())
+}
+
+/// S184 — read the BASE invoice's `<invoiceNumber>` element text from an
+/// on-disk NAV InvoiceData XML file. This is the canonical record of
+/// what NAV has on file for that invoice: the chain emitter (storno /
+/// modification) MUST reference the BASE by the exact string NAV saw on
+/// the original `manageInvoice` POST, or NAV rejects with the business-
+/// rule `INVALID_INVOICE_REFERENCE` ("A módosítás vagy érvénytelenítés
+/// olyan okiratra hivatkozik, amire vonatkozóan nem történt
+/// adatszolgáltatás" — "the modification / invalidation references a
+/// document for which no data has been reported"). Pre-S184 the chain
+/// emitters re-derived the base's number via
+/// `NumberingTemplate::render_for_build(base_year, base_seq)` — which
+/// works IFF the seller.toml literal + `INVOICE_NUMBER_TEST_PREFIX` were
+/// identical at base-issuance time AND chain-emit time. Any operator
+/// edit to the seller.toml literal (or a build-prefix flip mid-stream)
+/// silently drifts the reference. The on-disk XML is immune: it was
+/// written at base-issuance and never re-rewritten, so its
+/// `<invoiceNumber>` is exactly what NAV received.
+///
+/// Tolerates the `xmlns="…/OSA/3.0/data"` default-namespace declaration
+/// on the root by matching on the local element name only (NAV's emit
+/// is namespaced; our renderer also is). Loud-fails when:
+///   - the file cannot be opened or read (operator deleted it — chain
+///     issuance MUST fail loud rather than burn a sequence number
+///     against an unrecoverable reference);
+///   - the XML is malformed past quick_xml's lenient threshold;
+///   - no `<invoiceNumber>` element appears before `</invoice>` of the
+///     first invoice block (the base XML is tampered).
+pub fn read_invoice_number_from_xml(path: &std::path::Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "read base NAV XML at {} to extract <invoiceNumber> for chain reference (S184)",
+            path.display()
+        )
+    })?;
+    let xml = std::str::from_utf8(&bytes).with_context(|| {
+        format!(
+            "base NAV XML at {} is not valid UTF-8 (S184)",
+            path.display()
+        )
+    })?;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut depth: u32 = 0;
+    loop {
+        match reader.read_event().with_context(|| {
+            format!(
+                "parse base NAV XML at {} while seeking <invoiceNumber> (S184)",
+                path.display()
+            )
+        })? {
+            quick_xml::events::Event::Start(e) => {
+                depth += 1;
+                // Match by local name (strip any `prefix:` if NAV emit uses one).
+                let name = e.name();
+                let local = name.local_name();
+                if local.as_ref() == b"invoiceNumber" {
+                    let text = reader
+                        .read_text(e.to_end().name())
+                        .with_context(|| {
+                            format!(
+                                "read text of <invoiceNumber> in base NAV XML at {} (S184)",
+                                path.display()
+                            )
+                        })?
+                        .into_owned();
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() {
+                        return Err(anyhow!(
+                            "base NAV XML at {} has an empty <invoiceNumber> element (S184)",
+                            path.display()
+                        ));
+                    }
+                    return Ok(trimmed.to_string());
+                }
+            }
+            quick_xml::events::Event::End(_) => {
+                depth = depth.saturating_sub(1);
+            }
+            quick_xml::events::Event::Eof => {
+                return Err(anyhow!(
+                    "base NAV XML at {} has no <invoiceNumber> element \
+                     (file is tampered or empty; depth reached {} before EOF) (S184)",
+                    path.display(),
+                    depth
+                ));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Write the rendered XML to a file path.

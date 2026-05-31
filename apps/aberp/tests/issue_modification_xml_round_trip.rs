@@ -264,8 +264,13 @@ fn modification_xml_carries_line_modification_reference() {
         "lineNumberReference must be the original line position (1); body:\n{body}"
     );
     assert!(
-        body.contains("<lineOperation>MODIFY</lineOperation>"),
-        "lineOperation must be MODIFY for a modification line; body:\n{body}"
+        body.contains("<lineOperation>CREATE</lineOperation>"),
+        "S184 — lineOperation must be CREATE for a modification line per \
+         NAV INVALID_LINE_OPERATION business rule; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<lineOperation>MODIFY</lineOperation>"),
+        "S184 — must not emit MODIFY (regression guard: pre-S184 emit); body:\n{body}"
     );
 
     validate_invoice_data(&xml).expect(
@@ -309,4 +314,177 @@ fn modification_xml_invoice_number_is_the_modifications_own_seq() {
         body.contains("<originalInvoiceNumber>INV-default/00007</originalInvoiceNumber>"),
         "originalInvoiceNumber must be INV-default/00007: {body}"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S184 — reverse-regression + invariant pins (modification-side
+// parallel of the storno tests in issue_storno_xml_round_trip.rs).
+// ──────────────────────────────────────────────────────────────────────
+
+fn minimal_parties_private_person() -> NavParties {
+    NavParties {
+        supplier: SupplierInfo {
+            tax_number: "12345678-1-42".to_string(),
+            name: "ABERP Supplier Kft.".to_string(),
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1011".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Fő utca 1.".to_string(),
+        },
+        customer: CustomerInfo {
+            // S154 / ADR-0048 — PRIVATE_PERSON suppresses tax + address.
+            customer_vat_status: CustomerVatStatus::PrivatePerson,
+            tax_number: None,
+            name: "Kovács József".to_string(),
+            address: None,
+        },
+    }
+}
+
+/// S184 reverse-regression pin — PRIVATE_PERSON modification MUST
+/// emit `<customerVatStatus>` only; no customerName / customerAddress /
+/// customerVatData on the NAV wire (S154 / ADR-0048 — NAV's
+/// CUSTOMER_DATA_NOT_EXPECTED rule). Parallels the storno-side pin.
+#[test]
+fn modification_xml_private_person_emits_vat_status_only() {
+    let modification = build_minimal_modification_invoice();
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties_private_person();
+    let reference = minimal_modification_reference();
+    let xml = nav_xml::render_modification_data(
+        &modification,
+        &series,
+        &parties,
+        &reference,
+        Currency::Huf,
+        None,
+    )
+    .expect("PRIVATE_PERSON modification renders");
+    let body = std::str::from_utf8(&xml).unwrap();
+
+    assert!(
+        body.contains("<customerVatStatus>PRIVATE_PERSON</customerVatStatus>"),
+        "PRIVATE_PERSON modification MUST declare its vatStatus; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<customerVatData>"),
+        "S154 — PRIVATE_PERSON modification MUST NOT emit <customerVatData>; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<customerName>"),
+        "S154 — PRIVATE_PERSON modification MUST NOT emit <customerName> on \
+         the NAV wire (CUSTOMER_DATA_NOT_EXPECTED); body:\n{body}"
+    );
+    assert!(
+        !body.contains("<customerAddress>"),
+        "S154 — PRIVATE_PERSON modification MUST NOT emit <customerAddress> \
+         on the NAV wire; body:\n{body}"
+    );
+    validate_invoice_data(&xml)
+        .expect("PRIVATE_PERSON modification MUST pass the v3.0 invariant check");
+}
+
+/// S184 invariant pin — the modification's `<originalInvoiceNumber>`
+/// must round-trip the caller-supplied `base_invoice_number` verbatim
+/// across exotic shapes (the same drift class S184 closed at the call
+/// site for storno). Parallels the storno-side test.
+#[test]
+fn modification_xml_original_invoice_number_round_trips_verbatim() {
+    let cases = &[
+        "INV-default/00001",
+        "TEST-ABERP/2026/0042",
+        "TEST-TEST-ABERP/2026/0042",
+        "ABERP-2025/000017",
+        "1/2026",
+    ];
+    for original_number in cases {
+        let modification = build_minimal_modification_invoice();
+        let series = SeriesCode::new("INV-default".to_string()).unwrap();
+        let parties = minimal_parties();
+        let reference = ModificationReference {
+            base_invoice_number: (*original_number).to_string(),
+            modification_index: 1,
+            modification_issue_date: "2026-05-21".to_string(),
+        };
+        let xml = nav_xml::render_modification_data(
+            &modification,
+            &series,
+            &parties,
+            &reference,
+            Currency::Huf,
+            None,
+        )
+        .expect("modification renders");
+        let body = std::str::from_utf8(&xml).unwrap();
+        let expected = format!("<originalInvoiceNumber>{original_number}</originalInvoiceNumber>");
+        assert!(
+            body.contains(&expected),
+            "S184 — `<originalInvoiceNumber>` must round-trip verbatim. \
+             Expected `{expected}`; body:\n{body}"
+        );
+    }
+}
+
+/// S184 invariant pin — the modification's lineOperation MUST be
+/// `CREATE` across multi-line input variations. Parallels the storno
+/// test; same `INVALID_LINE_OPERATION` business-rule evidence.
+#[test]
+fn modification_line_operation_is_create_across_input_variations() {
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+    let reference = minimal_modification_reference();
+
+    let mut multi = build_minimal_modification_invoice();
+    multi.lines = vec![
+        LineItem {
+            description: "L1".to_string(),
+            quantity: rust_decimal::Decimal::from(1),
+            unit_price: Huf(1000),
+            vat_rate_basis_points: 2700,
+            note: None,
+            unit: None,
+        },
+        LineItem {
+            description: "L2".to_string(),
+            quantity: rust_decimal::Decimal::from(2),
+            unit_price: Huf(500),
+            vat_rate_basis_points: 2700,
+            note: None,
+            unit: None,
+        },
+        LineItem {
+            description: "L3 (zero vat)".to_string(),
+            quantity: rust_decimal::Decimal::from(1),
+            unit_price: Huf(123),
+            vat_rate_basis_points: 0,
+            note: None,
+            unit: None,
+        },
+    ];
+    let xml = nav_xml::render_modification_data(
+        &multi,
+        &series,
+        &parties,
+        &reference,
+        Currency::Huf,
+        None,
+    )
+    .unwrap();
+    let body = std::str::from_utf8(&xml).unwrap();
+    let create_count = body
+        .matches("<lineOperation>CREATE</lineOperation>")
+        .count();
+    let modify_count = body
+        .matches("<lineOperation>MODIFY</lineOperation>")
+        .count();
+    assert_eq!(
+        create_count, 3,
+        "every modification line must emit lineOperation=CREATE; body:\n{body}"
+    );
+    assert_eq!(
+        modify_count, 0,
+        "no modification line may emit lineOperation=MODIFY; body:\n{body}"
+    );
+    validate_invoice_data(&xml)
+        .expect("multi-line modification with CREATE ops must pass the v3.0 invariant check");
 }

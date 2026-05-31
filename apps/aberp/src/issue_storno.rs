@@ -284,12 +284,21 @@ pub fn storno_from_inputs(
     // 5. Pre-flight precondition: base must be Finalized (last ack =
     //    SAVED). Open a fresh Ledger for the read; close it before
     //    opening the write transaction so the file lock is released.
-    {
+    //    S184 — same read pass extracts the BASE invoice's on-disk NAV
+    //    XML path (recorded on the base's `InvoiceDraftCreated` payload
+    //    per ADR-0031 §2) so the storno emit reads the base's actual
+    //    `<invoiceNumber>` and references NAV by the exact string NAV
+    //    saw on the original `manageInvoice` POST. Seller.toml literal
+    //    edits between base issuance and storno would otherwise drift
+    //    `template.render_for_build(base_year, base_seq)` away from NAV's
+    //    record → INVALID_INVOICE_REFERENCE ABORTED ack.
+    let base_nav_xml_path = {
         let ledger = Ledger::open(db, tenant.clone(), binary_hash_bytes)
             .context("open audit ledger for storno precondition check")?;
         check_base_is_finalized(&ledger, references)?;
+        find_base_nav_xml_path_for_chain(&ledger, references)?
         // ledger drops here, releasing the DuckDB read connection
-    }
+    };
 
     // 5b. PR-90 / ADR-0045 §2 — resolve the operator's numbering
     //     template once. Drives both the series's reset_policy sync in
@@ -458,17 +467,27 @@ pub fn storno_from_inputs(
             }),
         },
     };
-    // PR-89 + PR-90 — render against the template resolved at pre-tx
-    // setup. The BASE invoice's number uses the base's issue year (a
-    // cross-year storno must still emit `ABERP-2025/000017` even when
-    // the storno is issued in 2026). The STORNO's own number uses the
-    // storno's issue year; under OnYearChange that issue year is also
-    // the counter's reset-year bucket (agreement by construction).
-    // S165 — both numbers carry the build-profile prefix via
-    // `render_for_build`. The base storno-reference must match the
-    // original emit (same build, same prefix); the storno's own number
-    // gets the same prefix.
-    let base_invoice_number = template.render_for_build(base_issue_year, base_sequence_number);
+    // S184 — read the BASE invoice's `<invoiceNumber>` from its on-disk
+    // NAV XML. That string IS the canonical record of what NAV saw on
+    // the original `manageInvoice` POST (the XML was written at base
+    // issuance time and never re-rewritten). Re-deriving via
+    // `template.render_for_build(base_year, base_seq)` is fragile: any
+    // operator edit to the seller.toml numbering literal between base
+    // issuance and storno emission silently drifts the rendered string
+    // → NAV ABORTED with INVALID_INVOICE_REFERENCE. The on-disk read
+    // is immune to that drift. CLAUDE.md rule 12 — fail loud (the
+    // helper bails if the XML is missing / malformed / lacks the
+    // element) rather than silently substituting a possibly-wrong
+    // render.
+    //
+    // The STORNO's own number IS a fresh emit (NAV has not seen it yet)
+    // so it uses the current template — its render is what NAV will
+    // record on the storno's first `manageInvoice` POST. base_issue_year
+    // is unused now; left as a `_` to preserve the audit-payload contract
+    // for future readers (the chain payload still records
+    // base_sequence_number for ADR-0023 §3 denormalization).
+    let _base_issue_year = base_issue_year;
+    let base_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path)?;
     let storno_invoice_number =
         template.render_for_build(storno.issue_date.year(), storno.sequence_number);
     let storno_reference = StornoReference {
@@ -613,6 +632,66 @@ fn check_base_is_finalized(ledger: &Ledger, base_invoice_id: &str) -> Result<()>
             base_invoice_id
         ),
     }
+}
+
+/// S184 — walk the audit ledger for the most-recent
+/// `InvoiceDraftCreated` entry matching `base_invoice_id` and return
+/// its `nav_xml_path` field. Loud-fail when:
+///   - no `InvoiceDraftCreated` exists for the base (impossible past
+///     PR-18 because the precondition check above already required
+///     `InvoiceSubmissionResponse` for the same id — which can't exist
+///     without a prior draft — but documented in the error message
+///     for the inspector);
+///   - the matching payload has `nav_xml_path = None` (pre-PR-18 audit
+///     entry; matches `find_draft_xml_path` in serve.rs).
+///
+/// Uses the same payload decode + walk shape as
+/// `check_base_is_finalized` so a tampered ledger surfaces a named-
+/// reason error rather than a silent re-render-from-template fallback
+/// (CLAUDE.md rule 12).
+pub(crate) fn find_base_nav_xml_path_for_chain(
+    ledger: &Ledger,
+    base_invoice_id: &str,
+) -> Result<std::path::PathBuf> {
+    let entries = ledger.entries().context(
+        "read audit ledger entries to resolve base nav_xml_path for storno chain reference (S184)",
+    )?;
+    // Walk newest → oldest. A base invoice's nav_xml_path is set
+    // exactly once (at issuance); any subsequent draft for the same id
+    // would be a tampering signature.
+    for entry in entries.iter().rev() {
+        if entry.kind != EventKind::InvoiceDraftCreated {
+            continue;
+        }
+        let payload: audit_payloads::InvoiceDraftCreatedPayload =
+            serde_json::from_slice(&entry.payload).map_err(|e| {
+                anyhow!(
+                    "InvoiceDraftCreated audit payload (seq {}) failed typed decode: {e} \
+                     — audit ledger appears tampered or schema-drifted (S184 base-XML lookup)",
+                    entry.seq.as_u64()
+                )
+            })?;
+        if payload.invoice_id == base_invoice_id {
+            let path_str = payload.nav_xml_path.ok_or_else(|| {
+                anyhow!(
+                    "base invoice {} has an InvoiceDraftCreated audit entry without \
+                     `nav_xml_path` (pre-PR-18 issuance) — chain emission cannot \
+                     recover the base's NAV-side invoice number for the \
+                     `<originalInvoiceNumber>` reference. Manual recovery: read the \
+                     base's queryInvoiceData response_xml from the audit ledger and \
+                     fall back to the CLI's `aberp issue-storno --in <PATH>` flow.",
+                    base_invoice_id
+                )
+            })?;
+            return Ok(std::path::PathBuf::from(path_str));
+        }
+    }
+    Err(anyhow!(
+        "base invoice {} has no InvoiceDraftCreated audit entry — chain emission \
+         requires a recorded NAV XML path to bind `<originalInvoiceNumber>` to \
+         the byte-exact string NAV holds on file (S184)",
+        base_invoice_id
+    ))
 }
 
 /// Decode a typed audit payload and return whether its `invoice_id`
@@ -1437,5 +1516,203 @@ mod tests {
             msg.contains("no NAV submission response"),
             "inv_A should be NeverSubmitted regardless of inv_B's state: got {msg}"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // S184 — chain-helper invariants.
+    //
+    // `find_base_nav_xml_path_for_chain` MUST return the path recorded
+    // on the base's most-recent `InvoiceDraftCreated` audit payload,
+    // even when several entries for unrelated invoices precede it.
+    // Loud-fails with named-reason errors on:
+    //   - no InvoiceDraftCreated entry for the base id (pre-PR-18 case)
+    //   - InvoiceDraftCreated payload with nav_xml_path = None
+    //     (pre-PR-18 audit entry)
+    //
+    // Composition with `nav_xml::read_invoice_number_from_xml` is what
+    // S184 wired into the chain emit path; the two helpers together
+    // MUST round-trip the base's actual NAV-side number byte-for-byte,
+    // independent of any seller.toml literal at chain-emit time.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// S184 — `find_base_nav_xml_path_for_chain` returns the
+    /// `nav_xml_path` from the matching InvoiceDraftCreated payload.
+    /// Property-style across multiple unrelated entries preceding the
+    /// match — the most-recent matching entry wins (walk newest →
+    /// oldest).
+    #[test]
+    fn find_base_nav_xml_path_for_chain_returns_recorded_path() {
+        let tenant = TenantId::new("t1".to_string()).unwrap();
+        let bh = BinaryHash::from_bytes([0u8; 32]);
+        let mut ledger = Ledger::open_in_memory(tenant, bh).unwrap();
+        let actor = Actor::from_local_cli("sess".to_string(), "test-user");
+
+        // Decoy InvoiceDraftCreated for a DIFFERENT invoice — must
+        // NOT match.
+        ledger
+            .append(
+                EventKind::InvoiceDraftCreated,
+                draft_payload_literal_id("inv_other", "/decoy/should/not/match.xml"),
+                actor.clone(),
+                None,
+            )
+            .unwrap();
+
+        // The actual base's draft — literal id `inv_A`.
+        let base_path = "/Users/aben/.aberp/test/issued/base42.xml";
+        ledger
+            .append(
+                EventKind::InvoiceDraftCreated,
+                draft_payload_literal_id("inv_A", base_path),
+                actor,
+                None,
+            )
+            .unwrap();
+
+        let resolved = find_base_nav_xml_path_for_chain(&ledger, "inv_A")
+            .expect("base id with InvoiceDraftCreated must resolve");
+        assert_eq!(resolved, std::path::PathBuf::from(base_path));
+    }
+
+    /// S184 — loud-fail when no InvoiceDraftCreated exists for the base.
+    /// Pre-PR-18 audit ledgers (no nav_xml_path stamped) are operator-
+    /// recoverable via the CLI `--in <PATH>` fallback; the error
+    /// message names this explicitly per CLAUDE.md rule 12.
+    #[test]
+    fn find_base_nav_xml_path_for_chain_loud_fails_when_no_draft() {
+        let tenant = TenantId::new("t1".to_string()).unwrap();
+        let bh = BinaryHash::from_bytes([0u8; 32]);
+        let ledger = Ledger::open_in_memory(tenant, bh).unwrap();
+        let err = find_base_nav_xml_path_for_chain(&ledger, "inv_missing")
+            .expect_err("missing draft MUST loud-fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("InvoiceDraftCreated") && msg.contains("inv_missing"),
+            "error must name the missing draft + the id: {msg}"
+        );
+    }
+
+    /// S184 — full composition end-to-end:
+    /// `find_base_nav_xml_path_for_chain` + `read_invoice_number_from_xml`
+    /// returns the base XML's `<invoiceNumber>` byte-exactly, INDEPENDENT
+    /// of any in-flight seller.toml change. This is the core S184
+    /// invariant: the chain emit references NAV by the string NAV holds
+    /// on file (= the base XML on disk), NOT by what
+    /// `template.render_for_build(base_year, base_seq)` produces at the
+    /// time the storno is emitted.
+    ///
+    /// Property-style across:
+    ///   - single TEST- prefix (today's seller.toml literal)
+    ///   - DOUBLE TEST- prefix (the prod-drift case Ervin hit at base
+    ///     0042: `TEST-TEST-ABERP/2026/0042`)
+    ///   - no prefix (pre-S165 case)
+    ///   - exotic literal (single-counter format)
+    #[test]
+    fn chain_base_number_round_trips_independent_of_template() {
+        use ulid::Ulid;
+
+        let scratch_dir = std::env::temp_dir()
+            .join("aberp-s184-chain-base-roundtrip")
+            .join(format!("{}", Ulid::new()));
+        std::fs::create_dir_all(&scratch_dir).expect("create scratch dir");
+
+        let cases = &[
+            // (label, actual base XML number)
+            ("single TEST-", "TEST-ABERP/2026/0042"),
+            // The Ervin-PROD drift case verbatim: seller.toml literal
+            // was `TEST-ABERP/...` PLUS render_for_build added another
+            // `TEST-` → on-disk XML carries DOUBLE prefix.
+            ("DOUBLE TEST- (Ervin drift)", "TEST-TEST-ABERP/2026/0042"),
+            ("no prefix", "ABERP/2026/0042"),
+            ("single-counter literal", "1/2026"),
+            ("with full S165 4-digit year template", "ABERP-2025/000017"),
+        ];
+
+        for (label, base_number) in cases {
+            // 1. Write a base XML on disk with the chosen number.
+            let xml_path = scratch_dir.join(format!("{}.xml", Ulid::new()));
+            let xml = format!(
+                "<?xml version=\"1.0\"?>\n\
+                 <InvoiceData xmlns=\"http://schemas.nav.gov.hu/OSA/3.0/data\">\
+                   <invoiceNumber>{base_number}</invoiceNumber>\
+                   <invoiceMain/>\
+                 </InvoiceData>"
+            );
+            std::fs::write(&xml_path, xml.as_bytes()).expect("write xml");
+
+            // 2. Build a ledger with an InvoiceDraftCreated pointing at
+            //    that path.
+            let tenant = TenantId::new("t1".to_string()).unwrap();
+            let bh = BinaryHash::from_bytes([0u8; 32]);
+            let mut ledger = Ledger::open_in_memory(tenant, bh).unwrap();
+            let actor = Actor::from_local_cli("sess".to_string(), "test-user");
+            ledger
+                .append(
+                    EventKind::InvoiceDraftCreated,
+                    draft_payload_literal_id("inv_base", xml_path.to_str().unwrap()),
+                    actor,
+                    None,
+                )
+                .unwrap();
+
+            // 3. Compose the chain helpers.
+            let resolved_path = find_base_nav_xml_path_for_chain(&ledger, "inv_base")
+                .unwrap_or_else(|e| panic!("{label}: find path: {e:#}"));
+            assert_eq!(resolved_path, xml_path, "{label}: path round-trip");
+            let resolved_number = crate::nav_xml::read_invoice_number_from_xml(&resolved_path)
+                .unwrap_or_else(|e| panic!("{label}: read number: {e:#}"));
+            assert_eq!(
+                resolved_number, *base_number,
+                "{label}: the chain helpers MUST return the base XML's \
+                 actual <invoiceNumber> byte-for-byte (S184 invariant)"
+            );
+        }
+    }
+
+    /// S184 — defence-in-depth: the chain helpers MUST loud-fail when
+    /// the base XML on disk is missing (operator deleted the file) or
+    /// has been replaced with a non-NAV file. Better to fail than
+    /// silently fall back to a re-rendered (possibly drifted) number.
+    #[test]
+    fn chain_base_number_loud_fails_when_xml_file_is_missing() {
+        let tenant = TenantId::new("t1".to_string()).unwrap();
+        let bh = BinaryHash::from_bytes([0u8; 32]);
+        let mut ledger = Ledger::open_in_memory(tenant, bh).unwrap();
+        let actor = Actor::from_local_cli("sess".to_string(), "test-user");
+        let missing_path = "/Users/aben/aberp-s184-missing/does-not-exist.xml";
+        ledger
+            .append(
+                EventKind::InvoiceDraftCreated,
+                draft_payload_literal_id("inv_base", missing_path),
+                actor,
+                None,
+            )
+            .unwrap();
+        let resolved = find_base_nav_xml_path_for_chain(&ledger, "inv_base").unwrap();
+        assert_eq!(resolved, std::path::PathBuf::from(missing_path));
+        let err = crate::nav_xml::read_invoice_number_from_xml(&resolved)
+            .expect_err("missing base XML MUST loud-fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does-not-exist") || msg.contains("missing"),
+            "missing-file error must name the path: {msg}"
+        );
+    }
+
+    /// Helper — build an `InvoiceDraftCreated` payload with a LITERAL
+    /// `invoice_id` string (not a ULID-derived one). Mirrors the shape
+    /// the S184 chain-walk pin tests in `serve.rs` use. Carries only
+    /// the fields `find_base_nav_xml_path_for_chain` reads
+    /// (`invoice_id` + `nav_xml_path`); other fields are absent because
+    /// the payload type uses `#[serde(default)]` across the additive
+    /// PR-44γ / PR-73 / PR-82 / PR-84 / PR-97 fields.
+    fn draft_payload_literal_id(invoice_id: &str, nav_xml_path: &str) -> Vec<u8> {
+        let payload = serde_json::json!({
+            "invoice_id": invoice_id,
+            "line_count": 1,
+            "idempotency_key": IdempotencyKey::new().to_canonical_string(),
+            "nav_xml_path": nav_xml_path,
+        });
+        serde_json::to_vec(&payload).expect("encode draft payload")
     }
 }

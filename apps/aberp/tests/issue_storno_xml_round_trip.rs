@@ -236,9 +236,11 @@ fn storno_xml_invoice_number_is_the_stornos_own_seq() {
 /// `<lineModificationReference>` on every `<line>`, or NAV ABORTS the
 /// submit with business rule `LINE_MODIFICATION_EXPECTED`. The reference
 /// carries `<lineNumberReference>` (the original line's position) +
-/// `<lineOperation>MODIFY</lineOperation>`, positioned directly AFTER
-/// `<lineNumber>` per NAV `LineType` ordering. This is the intent-pin
-/// for the fix that unblocked a SAVED storno end-to-end.
+/// `<lineOperation>CREATE</lineOperation>` per S184 — NAV's
+/// `INVALID_LINE_OPERATION` business rule requires `CREATE` (not
+/// `MODIFY`) for every chain-body line. The `<lineModificationReference>`
+/// is positioned directly AFTER `<lineNumber>` per NAV `LineType`
+/// ordering.
 #[test]
 fn storno_xml_carries_line_modification_reference_after_line_number() {
     let storno = build_minimal_storno_invoice();
@@ -260,8 +262,13 @@ fn storno_xml_carries_line_modification_reference_after_line_number() {
         "lineNumberReference must be the original line position (1); body:\n{body}"
     );
     assert!(
-        body.contains("<lineOperation>MODIFY</lineOperation>"),
-        "lineOperation must be MODIFY for a storno line; body:\n{body}"
+        body.contains("<lineOperation>CREATE</lineOperation>"),
+        "S184 — lineOperation must be CREATE for a storno line per NAV \
+         INVALID_LINE_OPERATION business rule; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<lineOperation>MODIFY</lineOperation>"),
+        "S184 — must not emit MODIFY (regression guard: pre-S184 emit); body:\n{body}"
     );
 
     // Ordering: <lineNumber> first, then <lineModificationReference>,
@@ -286,4 +293,399 @@ fn storno_xml_carries_line_modification_reference_after_line_number() {
     // Round-trip: the body carrying the new element must still validate.
     validate_invoice_data(&xml)
         .expect("storno body with <lineModificationReference> must pass the v3.0 invariant check");
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S184 — reverse-regression pins.
+//
+// The S184 change to `CHAIN_LINE_OPERATION` flipped storno + modification
+// from `MODIFY` to `CREATE` (NAV business rule INVALID_LINE_OPERATION,
+// confirmed against transaction `5EF1QF3Y1W9HIFNW`). The on-disk read
+// of the base's `<invoiceNumber>` replaced the seller-toml-template
+// re-render (NAV business rule INVALID_INVOICE_REFERENCE on the same
+// transaction). These tests pin both, plus a PRIVATE_PERSON storno
+// emit (S154 / ADR-0048) and the cross-customer-shape invariant Ervin
+// asked for in S184b.
+// ──────────────────────────────────────────────────────────────────────
+
+fn minimal_parties_private_person() -> NavParties {
+    NavParties {
+        supplier: SupplierInfo {
+            tax_number: "12345678-1-42".to_string(),
+            name: "ABERP Supplier Kft.".to_string(),
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1011".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Fő utca 1.".to_string(),
+        },
+        customer: CustomerInfo {
+            // S154 / ADR-0048 — PRIVATE_PERSON buyers carry NO tax number
+            // (NAV business rule INVALID_CUSTOMER_VAT_STATUS rejects
+            // `<customerVatData>` for PRIVATE_PERSON) and NO address
+            // (ADR-0048 §addendum — address is optional for
+            // PRIVATE_PERSON; NAV permits its absence on chain bodies
+            // too per PR-77).
+            customer_vat_status: CustomerVatStatus::PrivatePerson,
+            tax_number: None,
+            name: "Kovács József".to_string(),
+            address: None,
+        },
+    }
+}
+
+/// S184 reverse-regression pin (S154 / ADR-0048 anchor). The storno
+/// of a PRIVATE_PERSON base MUST emit `<customerVatStatus>` only —
+/// the S154 amendment (`apps/aberp/src/nav_xml.rs:1178+`) suppresses
+/// `<customerName>` AND `<customerAddress>` AND `<customerVatData>`
+/// on the NAV wire for PRIVATE_PERSON because NAV's
+/// `CUSTOMER_DATA_NOT_EXPECTED` business rule ABORTS any submission
+/// carrying them ("Magánszemély vevő adatai nem adhatók meg."). PR-148/
+/// 150 had emitted name + address unconditionally; S154 separates the
+/// wire (suppressed) from the PDF (always rendered, §169 Áfa tv.). This
+/// pin guards against the S184 changes accidentally re-routing
+/// PRIVATE_PERSON storno through the DOMESTIC emit branch.
+#[test]
+fn storno_xml_private_person_emits_vat_status_only() {
+    let storno = build_minimal_storno_invoice();
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties_private_person();
+    let reference = minimal_storno_reference();
+    let xml =
+        nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
+            .expect("PRIVATE_PERSON storno renders");
+    let body = std::str::from_utf8(&xml).unwrap();
+
+    assert!(
+        body.contains("<customerVatStatus>PRIVATE_PERSON</customerVatStatus>"),
+        "PRIVATE_PERSON storno MUST declare its vatStatus; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<customerVatData>"),
+        "S154 / ADR-0048 — PRIVATE_PERSON storno MUST NOT emit \
+         <customerVatData>; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<customerTaxNumber>"),
+        "S154 / ADR-0048 — PRIVATE_PERSON storno MUST NOT emit \
+         <customerTaxNumber>; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<customerName>"),
+        "S154 — PRIVATE_PERSON storno MUST NOT emit <customerName> on \
+         the NAV wire (CUSTOMER_DATA_NOT_EXPECTED); the printed PDF \
+         path renders it separately per §169 Áfa tv.; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<customerAddress>"),
+        "S154 — PRIVATE_PERSON storno MUST NOT emit <customerAddress> \
+         on the NAV wire (CUSTOMER_DATA_NOT_EXPECTED); body:\n{body}"
+    );
+
+    // Validator round-trip — the v3.0 invariant walker MUST accept the
+    // PRIVATE_PERSON storno shape (no customerVatData / customerName /
+    // customerAddress).
+    validate_invoice_data(&xml).expect("PRIVATE_PERSON storno MUST pass the v3.0 invariant check");
+}
+
+/// S184 invariant pin — the storno's `<customerVatStatus>` element MUST
+/// match the `NavParties::customer.customer_vat_status` field for every
+/// closed-vocab buyer kind. Property-style across the full vocab
+/// (DOMESTIC, PRIVATE_PERSON; OTHER deferred per ADR-0048). A
+/// regression that drops the discriminator (e.g. always emits
+/// DOMESTIC) would silently corrupt PRIVATE_PERSON chains; this fires
+/// loud at compile time of every variant.
+#[test]
+fn storno_xml_customer_vat_status_round_trips_across_closed_vocab() {
+    let cases: &[(CustomerVatStatus, &str, fn() -> NavParties)] = &[
+        (CustomerVatStatus::Domestic, "DOMESTIC", minimal_parties),
+        (
+            CustomerVatStatus::PrivatePerson,
+            "PRIVATE_PERSON",
+            minimal_parties_private_person,
+        ),
+    ];
+    for (variant, wire, mk_parties) in cases {
+        let storno = build_minimal_storno_invoice();
+        let series = SeriesCode::new("INV-default".to_string()).unwrap();
+        let parties = mk_parties();
+        let reference = minimal_storno_reference();
+        let xml = nav_xml::render_storno_data(
+            &storno,
+            &series,
+            &parties,
+            &reference,
+            Currency::Huf,
+            None,
+        )
+        .expect("storno renders");
+        let body = std::str::from_utf8(&xml).unwrap();
+        let expected = format!("<customerVatStatus>{wire}</customerVatStatus>");
+        assert!(
+            body.contains(&expected),
+            "{variant:?} storno must emit `{expected}`; body:\n{body}"
+        );
+        validate_invoice_data(&xml)
+            .expect("storno body must pass the v3.0 invariant check across vat-status vocab");
+    }
+}
+
+/// S184 invariant pin — the storno's `<originalInvoiceNumber>` MUST be
+/// byte-identical to the `StornoReference::base_invoice_number` the
+/// emitter is handed. Defends against the regression class S184 closed
+/// at the call site (where pre-S184 the call site re-derived via
+/// `template.render_for_build`, which drifted under seller.toml literal
+/// edits): a future caller might be tempted to "fix" the reference at
+/// the emitter level (silently stripping a prefix or substituting from
+/// the storno's own series); this pin fails loud.
+#[test]
+fn storno_xml_original_invoice_number_round_trips_verbatim() {
+    let cases = &[
+        "INV-default/00001",
+        "TEST-ABERP/2026/0042",
+        "TEST-TEST-ABERP/2026/0042", // S184 — the actual NAV-side string Ervin's prod drift produced
+        "ABERP-2025/000017",
+        "1/2026", // operator-configured single-counter literal
+    ];
+    for original_number in cases {
+        let storno = build_minimal_storno_invoice();
+        let series = SeriesCode::new("INV-default".to_string()).unwrap();
+        let parties = minimal_parties();
+        let reference = StornoReference {
+            base_invoice_number: (*original_number).to_string(),
+            modification_index: 1,
+        };
+        let xml = nav_xml::render_storno_data(
+            &storno,
+            &series,
+            &parties,
+            &reference,
+            Currency::Huf,
+            None,
+        )
+        .expect("storno renders");
+        let body = std::str::from_utf8(&xml).unwrap();
+        let expected = format!("<originalInvoiceNumber>{original_number}</originalInvoiceNumber>");
+        assert!(
+            body.contains(&expected),
+            "S184 — `<originalInvoiceNumber>` must round-trip the caller-\
+             supplied string verbatim. Expected `{expected}`; body:\n{body}"
+        );
+    }
+}
+
+/// S184 invariant pin — `read_invoice_number_from_xml` round-trips
+/// every byte of `<invoiceNumber>` from a freshly-emitted NAV InvoiceData
+/// XML. Pairs the renderer + reader (the same two-source-of-truth
+/// pattern PR-10 documented for emitter ↔ validator). A regression
+/// that quotes / escapes / trims either side of the round-trip surfaces
+/// here at the emit-then-read boundary BEFORE it can drift NAV
+/// references silently. Property-style across DOMESTIC + PRIVATE_PERSON
+/// + EUR currency.
+#[test]
+fn read_invoice_number_from_xml_round_trips_across_emit_shapes() {
+    use aberp_billing::{IdempotencyKey, ReadyInvoice};
+    use ulid::Ulid;
+
+    let scratch_dir = std::env::temp_dir()
+        .join("aberp-s184-read-roundtrip")
+        .join(format!("{}", Ulid::new()));
+    std::fs::create_dir_all(&scratch_dir).expect("create scratch dir");
+
+    // Build a base "plain" invoice fixture (NOT a storno) so the reader
+    // is exercised against the same shape the chain emitter will see.
+    fn build_plain_invoice() -> ReadyInvoice {
+        ReadyInvoice {
+            id: InvoiceId::new(),
+            series_id: SeriesId::new(),
+            customer_id: CustomerId::new(),
+            lines: vec![LineItem {
+                description: "Test megnevezés".to_string(),
+                quantity: rust_decimal::Decimal::from(1),
+                unit_price: Huf(1000),
+                vat_rate_basis_points: 2700,
+                note: None,
+                unit: None,
+            }],
+            issue_date: time::OffsetDateTime::now_utc(),
+            payment_deadline: time::OffsetDateTime::now_utc().date(),
+            delivery_date: time::OffsetDateTime::now_utc().date(),
+            sequence_number: 42,
+            fiscal_year: 2026,
+        }
+    }
+
+    let cases: &[(&str, fn() -> NavParties)] = &[
+        ("DOMESTIC fixture", minimal_parties),
+        ("PRIVATE_PERSON fixture", minimal_parties_private_person),
+    ];
+
+    let exotic_numbers = &[
+        "INV-default/00042",
+        "TEST-ABERP/2026/0042",
+        "TEST-TEST-ABERP/2026/0042",
+        "ABERP-2025/000017",
+    ];
+
+    for (label, mk_parties) in cases {
+        for &number in exotic_numbers {
+            let invoice = build_plain_invoice();
+            let _idem = IdempotencyKey::new();
+            let series = SeriesCode::new("INV-default".to_string()).unwrap();
+            let parties = mk_parties();
+            // Use render_invoice_data_with_number so we control the
+            // emitted `<invoiceNumber>` precisely.
+            let xml = nav_xml::render_invoice_data_with_number(
+                &invoice,
+                &series,
+                &parties,
+                Currency::Huf,
+                None,
+                aberp_billing::PaymentMethod::default(),
+                Some(number),
+            )
+            .expect("plain invoice renders");
+
+            let path = scratch_dir.join(format!("{}.xml", Ulid::new()));
+            std::fs::write(&path, &xml).expect("write xml");
+
+            let read_back = nav_xml::read_invoice_number_from_xml(&path).unwrap_or_else(|e| {
+                panic!("{label}: read_invoice_number_from_xml({number}) failed: {e:#}")
+            });
+            assert_eq!(
+                read_back, number,
+                "{label} / {number}: round-trip must be byte-identical"
+            );
+        }
+    }
+}
+
+/// S184 — `read_invoice_number_from_xml` MUST fail loud (not return an
+/// empty string or a fallback) when the file is missing, empty, or
+/// lacks the `<invoiceNumber>` element. CLAUDE.md rule 12. A silent
+/// fallback would let a chain emitter ship `<originalInvoiceNumber>` =
+/// some default and NAV would ABORT exactly the way S184 fixed.
+#[test]
+fn read_invoice_number_from_xml_loud_fails_on_missing_or_malformed() {
+    use ulid::Ulid;
+
+    let scratch_dir = std::env::temp_dir()
+        .join("aberp-s184-loud-fail")
+        .join(format!("{}", Ulid::new()));
+    std::fs::create_dir_all(&scratch_dir).expect("create scratch dir");
+
+    // Missing file.
+    let nonexistent = scratch_dir.join("missing.xml");
+    let err = nav_xml::read_invoice_number_from_xml(&nonexistent)
+        .expect_err("missing file MUST fail loud");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("missing.xml"),
+        "missing-file error must name the path: {msg}"
+    );
+
+    // XML without an <invoiceNumber> element.
+    let no_elem_path = scratch_dir.join("no-elem.xml");
+    std::fs::write(
+        &no_elem_path,
+        b"<?xml version=\"1.0\"?>\n<InvoiceData xmlns=\"http://schemas.nav.gov.hu/OSA/3.0/data\">\
+          <invoiceMain/></InvoiceData>",
+    )
+    .unwrap();
+    let err = nav_xml::read_invoice_number_from_xml(&no_elem_path)
+        .expect_err("XML missing <invoiceNumber> MUST fail loud");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("invoiceNumber") || msg.contains("tampered") || msg.contains("EOF"),
+        "missing-element error must name what's missing: {msg}"
+    );
+
+    // Empty <invoiceNumber> element.
+    let empty_elem_path = scratch_dir.join("empty-elem.xml");
+    std::fs::write(
+        &empty_elem_path,
+        b"<?xml version=\"1.0\"?>\n<InvoiceData xmlns=\"http://schemas.nav.gov.hu/OSA/3.0/data\">\
+          <invoiceNumber></invoiceNumber></InvoiceData>",
+    )
+    .unwrap();
+    let err = nav_xml::read_invoice_number_from_xml(&empty_elem_path)
+        .expect_err("empty <invoiceNumber> MUST fail loud");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("empty"),
+        "empty-element error must say so: {msg}"
+    );
+}
+
+/// S184 — the lineOperation regression guard's most important property:
+/// for ANY storno + modification shape, the emitted XML MUST carry
+/// `<lineOperation>CREATE</lineOperation>` and MUST NOT carry
+/// `<lineOperation>MODIFY</lineOperation>`. Pinned against multi-line
+/// + alternative-currency fixtures because the bug was at the rendering
+/// constant level — variation in the input space MUST NOT vary the
+/// output here.
+#[test]
+fn storno_line_operation_is_create_across_input_variations() {
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+    let reference = minimal_storno_reference();
+
+    // Single line.
+    let single = build_minimal_storno_invoice();
+    let xml1 =
+        nav_xml::render_storno_data(&single, &series, &parties, &reference, Currency::Huf, None)
+            .unwrap();
+    let body1 = std::str::from_utf8(&xml1).unwrap();
+    assert!(body1.contains("<lineOperation>CREATE</lineOperation>"));
+    assert!(!body1.contains("<lineOperation>MODIFY</lineOperation>"));
+
+    // Multi-line.
+    let mut multi = build_minimal_storno_invoice();
+    multi.lines = vec![
+        LineItem {
+            description: "L1".to_string(),
+            quantity: rust_decimal::Decimal::from(1),
+            unit_price: Huf(1000),
+            vat_rate_basis_points: 2700,
+            note: None,
+            unit: None,
+        },
+        LineItem {
+            description: "L2".to_string(),
+            quantity: rust_decimal::Decimal::from(2),
+            unit_price: Huf(500),
+            vat_rate_basis_points: 2700,
+            note: None,
+            unit: None,
+        },
+        LineItem {
+            description: "L3 (zero vat)".to_string(),
+            quantity: rust_decimal::Decimal::from(1),
+            unit_price: Huf(123),
+            vat_rate_basis_points: 0,
+            note: None,
+            unit: None,
+        },
+    ];
+    let xml2 =
+        nav_xml::render_storno_data(&multi, &series, &parties, &reference, Currency::Huf, None)
+            .unwrap();
+    let body2 = std::str::from_utf8(&xml2).unwrap();
+    let create_count = body2
+        .matches("<lineOperation>CREATE</lineOperation>")
+        .count();
+    let modify_count = body2
+        .matches("<lineOperation>MODIFY</lineOperation>")
+        .count();
+    assert_eq!(
+        create_count, 3,
+        "every storno line must emit lineOperation=CREATE; body:\n{body2}"
+    );
+    assert_eq!(
+        modify_count, 0,
+        "no storno line may emit lineOperation=MODIFY; body:\n{body2}"
+    );
+
+    // The validator round-trip for the multi-line variation.
+    validate_invoice_data(&xml2)
+        .expect("multi-line storno with CREATE ops must pass the v3.0 invariant check");
 }

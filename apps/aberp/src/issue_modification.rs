@@ -243,11 +243,19 @@ pub fn modification_from_inputs(
     // Pre-flight precondition: base is Finalized OR already Amended,
     // and not Storno-cancelled. Read-only ledger; drop before opening
     // the write transaction.
-    {
+    // S184 — same read pass extracts the BASE invoice's on-disk NAV XML
+    // path so the modification emit reads the base's actual
+    // `<invoiceNumber>` for the chain reference instead of re-deriving
+    // via the current numbering template. See `find_base_nav_xml_path`
+    // in `issue_storno.rs` for the rationale + the NAV ABORTED ack that
+    // forced this change (INVALID_INVOICE_REFERENCE on seller.toml
+    // literal drift).
+    let base_nav_xml_path = {
         let ledger = Ledger::open(db, tenant.clone(), binary_hash_bytes)
             .context("open audit ledger for modification precondition check")?;
         check_base_is_modifiable(&ledger, references)?;
-    }
+        crate::issue_storno::find_base_nav_xml_path_for_chain(&ledger, references)?
+    };
 
     // PR-90 / ADR-0045 §2 — resolve the operator's numbering template
     // once. Drives both the series's reset_policy sync in
@@ -396,15 +404,19 @@ pub fn modification_from_inputs(
             }),
         },
     };
-    // PR-89 + PR-90 — render against the template resolved at pre-tx
-    // setup. Base number uses the base's issue year (cross-year
-    // modifications must still cite the base by its original year);
-    // the modification's own number uses the modification's issue year.
-    // S165 — both numbers carry the build-profile prefix via
-    // `render_for_build`. The base was emitted under the same build's
-    // prefix at its own issuance, so re-rendering it here with the same
-    // prefix keeps the modification reference byte-identical to the base.
-    let base_invoice_number = template.render_for_build(base_issue_year, base_sequence_number);
+    // S184 — read the BASE's `<invoiceNumber>` from its on-disk NAV XML
+    // (canonical record of what NAV holds on file). Re-deriving via
+    // `template.render_for_build(base_year, base_seq)` would drift if
+    // the seller.toml numbering literal was edited between base
+    // issuance and modification emission. See
+    // `crate::nav_xml::read_invoice_number_from_xml` for the failure
+    // mode + NAV ABORTED ack that forced this change. base_issue_year
+    // is now unused for the wire reference; preserved as `_` because the
+    // payload contract still records `base_sequence_number` for
+    // ADR-0024 §7 denormalization.
+    let _base_issue_year = base_issue_year;
+    let _base_sequence_number = base_sequence_number;
+    let base_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path)?;
     let modification_invoice_number =
         template.render_for_build(modification.issue_date.year(), modification.sequence_number);
     let modification_reference = ModificationReference {
