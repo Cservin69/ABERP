@@ -63,8 +63,10 @@
 //! annulment decision regardless of whether the operator's
 //! workstation has a keychain.
 
+use std::path::Path;
+
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
-use aberp_billing::IdempotencyKey;
+use aberp_billing::{self as billing, DuckDbBillingStore, IdempotencyKey};
 use anyhow::{anyhow, bail, Context, Result};
 use duckdb::Connection;
 use quick_xml::events::Event;
@@ -150,14 +152,26 @@ pub fn run(args: &RequestTechnicalAnnulmentArgs) -> Result<()> {
     //    match the base's actual emit on the NAV testbed), and
     //    (b) ignored any tenant with a non-default series template.
     //    One of the two stale-format gaps S165 flagged.
+    //
+    //    S183 — also load the base invoice's `issue_date.year()` from
+    //    the billing row so a cross-year annulment cites the base by
+    //    its ORIGINAL issue year (matching the posture
+    //    `issue_storno` / `issue_modification` /
+    //    `observe_receiver_confirmation` already use). Pre-S183 the
+    //    year was captured from the `InvoiceSequenceReserved` audit
+    //    entry's `time_wall.year()` — which diverges from
+    //    `issue_date.year()` for back-dated invoices and would have
+    //    silently sent a wrong `<annulmentReference>` to NAV the
+    //    moment a tenant adopted a year-bearing numbering template.
     let seller_toml_path = crate::setup_seller_info::seller_toml_path_for_tenant(&args.tenant)
         .context("resolve seller.toml path for numbering template")?;
     let template = crate::numbering::read_numbering_template(&seller_toml_path)
         .context("read [seller.numbering] template from seller.toml")?;
+    let base_issue_year = load_base_invoice_issue_year(&args.db, &args.references)?;
     let precondition = {
         let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
             .context("open audit ledger for annulment precondition check")?;
-        check_base_is_annullable(&ledger, &args.references, &template)?
+        check_base_is_annullable(&ledger, &args.references, &template, base_issue_year)?
     };
     tracing::info!(
         prior_transaction_id = %precondition.prior_transaction_id,
@@ -280,11 +294,13 @@ struct AnnulmentPrecondition {
     /// or `TEST-INV-default/00007` on a dev build, or a custom
     /// template's render such as `ABERP-2026/00007`). Reconstructed
     /// from the `InvoiceSequenceReserved` entry on the audit ledger
-    /// (which carries `seq` + the wall-clock year) rendered through
-    /// the operator-configured [`crate::numbering::NumberingTemplate`].
-    /// The base invoice billing row is NOT loaded here — the annulment
-    /// is not an invoice operation and the billing row is not in the
-    /// transactional path.
+    /// (which carries `seq`) plus the base invoice's
+    /// `issue_date.year()` (loaded outside the precondition walk via
+    /// [`load_base_invoice_issue_year`]), rendered through the
+    /// operator-configured [`crate::numbering::NumberingTemplate`].
+    /// S183 — the base invoice's billing row IS now read (year only)
+    /// so cross-year annulments cite the base by its original year;
+    /// the row is still not loaded inside the audit-tx path.
     base_invoice_number: String,
     /// The base's NAV-facing sequence number (for the operator-
     /// visible summary; not part of the audit payload).
@@ -323,6 +339,7 @@ fn check_base_is_annullable(
     ledger: &Ledger,
     base_invoice_id: &str,
     template: &crate::numbering::NumberingTemplate,
+    base_issue_year: i32,
 ) -> Result<AnnulmentPrecondition> {
     let entries = ledger
         .entries()
@@ -334,13 +351,6 @@ fn check_base_is_annullable(
     // at end-of-loop the stored values are the most-recent ones.
     let mut latest_transaction_id: Option<String> = None;
     let mut latest_sequence_number: Option<u64> = None;
-    // S173 — year captured from the same `InvoiceSequenceReserved`
-    // entry that minted the base's sequence number. Used to render
-    // the base_invoice_number against a year-bearing template
-    // (`Segment::Year{Two|Four}`). For the default template (which
-    // has no Year segment) this year is ignored by the renderer, so
-    // pre-S173 callers keep producing the same string.
-    let mut latest_sequence_year: Option<i32> = None;
     let mut has_prior_annulment = false;
 
     for entry in &entries {
@@ -356,7 +366,6 @@ fn check_base_is_annullable(
                     })?;
                 if payload.invoice_id == base_invoice_id {
                     latest_sequence_number = Some(payload.seq);
-                    latest_sequence_year = Some(entry.time_wall.year());
                 }
             }
             EventKind::InvoiceSubmissionResponse => {
@@ -414,15 +423,15 @@ fn check_base_is_annullable(
             base_invoice_id
         )
     })?;
-    // `latest_sequence_year` is `Some(_)` whenever
-    // `latest_sequence_number` is — they are set on the same line
-    // of the walk above. The `expect` documents that invariant.
-    let base_sequence_year = latest_sequence_year.expect(
-        "latest_sequence_year is set on the same walk line as latest_sequence_number; \
-         reaching here with Some(seq) but None(year) is a programmer error",
-    );
 
-    let base_invoice_number = template.render_for_build(base_sequence_year, base_sequence_number);
+    // S183 — year sourced from the base invoice's `issue_date.year()`
+    // (loaded by [`load_base_invoice_issue_year`] in `run`), NOT from
+    // any `time_wall.year()` on the audit entries. The two diverge for
+    // back-dated invoices; matching the posture every other
+    // base-reference render uses (`issue_storno`, `issue_modification`,
+    // `observe_receiver_confirmation`) closes the silent NAV-side
+    // mismatch named in the PR-182 review.
+    let base_invoice_number = template.render_for_build(base_issue_year, base_sequence_number);
     Ok(AnnulmentPrecondition {
         base_invoice_number,
         base_sequence_number,
@@ -505,6 +514,36 @@ fn local_name(qualified: &[u8]) -> String {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// S183 — load the base invoice's `issue_date.year()` from the billing
+// row so a cross-year annulment cites the base by its ORIGINAL year.
+// Mirrors `observe_receiver_confirmation::load_base_nav_invoice_number`'s
+// posture (billing-row read outside any audit tx). Returns only the
+// year — the rest of the row is discarded.
+// ──────────────────────────────────────────────────────────────────────
+
+fn load_base_invoice_issue_year(db_path: &Path, invoice_id: &str) -> Result<i32> {
+    let store = DuckDbBillingStore::open(db_path)
+        .with_context(|| format!("open billing DuckDB at {}", db_path.display()))?;
+    let mut conn = store.into_connection();
+    let tx = conn
+        .transaction()
+        .context("begin read tx for base invoice issue-year lookup")?;
+    let (invoice, _idem) = billing::load_ready_invoice_by_id(&tx, invoice_id)
+        .context("billing::load_ready_invoice_by_id (request-technical-annulment base)")?
+        .ok_or_else(|| {
+            anyhow!(
+                "no invoice with id {} in this tenant DB — \
+                 request-technical-annulment requires the base invoice's billing row \
+                 to source `issue_date.year()` for the rendered <annulmentReference>",
+                invoice_id
+            )
+        })?;
+    tx.commit()
+        .context("commit read tx for base invoice issue-year lookup")?;
+    Ok(invoice.issue_date.year())
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — precondition walker (accept/reject discipline) + the
 // minimum-children XML guardrail.
 // ──────────────────────────────────────────────────────────────────────
@@ -580,7 +619,10 @@ mod tests {
         ];
         let ledger = ledger_with_entries(entries);
         let template = crate::numbering::default_template();
-        let pre = check_base_is_annullable(&ledger, "inv_A", &template)
+        // S183 — caller supplies the base invoice's `issue_date.year()`;
+        // the default template has no Year segment so the value is unused
+        // by the render, but the parameter is now required.
+        let pre = check_base_is_annullable(&ledger, "inv_A", &template, 2026)
             .expect("submitted base must be annullable");
         assert_eq!(pre.prior_transaction_id, "TXID-7");
         assert_eq!(pre.base_sequence_number, 7);
@@ -595,16 +637,24 @@ mod tests {
         assert_eq!(pre.base_invoice_number, expected);
     }
 
-    /// S173 — when the operator-configured template carries a
+    /// S183 — when the operator-configured template carries a
     /// `Segment::Year` segment, the rendered base_invoice_number must
-    /// use the year captured on the matching `InvoiceSequenceReserved`
-    /// audit entry (the `Entry.time_wall.year()`), NOT the year of
-    /// the current annulment run. This is what makes a cross-year
-    /// annulment cite the base by its original year — the same
-    /// posture `issue_storno` / `issue_modification` already use for
-    /// the base reference (`base_issue_year`).
+    /// use the base invoice's ORIGINAL `issue_date.year()` (passed
+    /// into the walker by [`run`] via [`load_base_invoice_issue_year`]),
+    /// NOT any wall-clock year captured on the audit entries. This is
+    /// what makes a cross-year annulment cite the base by its original
+    /// year — the same posture `issue_storno` / `issue_modification` /
+    /// `observe_receiver_confirmation` already use for the base reference.
+    ///
+    /// Pre-S183 the walker captured year from the
+    /// `InvoiceSequenceReserved` entry's `Entry.time_wall.year()` —
+    /// which silently diverges from `issue_date.year()` for back-dated
+    /// invoices (a common HU end-of-year-bookkeeping case) and would
+    /// have produced a wrong `<annulmentReference>` the moment a
+    /// tenant adopted a year-bearing template. The PR-182 review
+    /// flagged this latent bug; PR-183 closes it.
     #[test]
-    fn check_base_is_annullable_renders_year_from_sequence_reserved_entry() {
+    fn check_base_is_annullable_renders_year_from_base_issue_date_param() {
         use crate::numbering::{NumberingTemplate, ResetPolicy, Segment, YearDigits};
         let entries = vec![
             (
@@ -631,26 +681,75 @@ mod tests {
             reset_policy: ResetPolicy::OnYearChange,
             start_value: 1,
         };
-        let pre = check_base_is_annullable(&ledger, "inv_A", &template)
+        // CLAUDE.md rule 9 — the assertion targets the load-bearing
+        // year-source contract. The in-memory ledger's entries are
+        // stamped with the test-run wall clock (some year N+); we pass
+        // an explicit year 2025 (the base's original `issue_date.year()`)
+        // and assert the render uses 2025 verbatim, NOT the wall clock.
+        // A regression that re-captures year from `time_wall` would fail
+        // this test loudly because 2025 != test-run wall clock year.
+        let pre = check_base_is_annullable(&ledger, "inv_A", &template, 2025)
             .expect("submitted base must be annullable");
-        // The in-memory ledger's `time_wall` for the
-        // `InvoiceSequenceReserved` entry was stamped at append() time
-        // (i.e. the test-run wall clock). We assert the rendered shape
-        // pattern + the captured-year-end-to-end discipline rather than
-        // a hardcoded year string — the year segment must equal
-        // `time::OffsetDateTime::now_utc().year()` ± 1 day (in case
-        // the test crosses midnight UTC, defence-in-depth).
-        let now_year = time::OffsetDateTime::now_utc().year();
-        let valid_years = [now_year - 1, now_year, now_year + 1];
         let prefix = crate::build_profile::INVOICE_NUMBER_TEST_PREFIX;
-        let matched = valid_years
-            .iter()
-            .any(|y| pre.base_invoice_number == format!("{prefix}ABERP-{y:04}/00007"));
-        assert!(
-            matched,
-            "base_invoice_number must render with the year captured on the \
-             InvoiceSequenceReserved audit entry; got {}",
-            pre.base_invoice_number
+        assert_eq!(
+            pre.base_invoice_number,
+            format!("{prefix}ABERP-2025/00007"),
+            "base_invoice_number must render with the year passed in by the caller \
+             (the base invoice's original issue_date.year()), NOT any audit-entry \
+             wall-clock year"
+        );
+    }
+
+    /// S183 — defence-in-depth: explicitly pin that a cross-year
+    /// annulment renders the base reference with the base's ORIGINAL
+    /// year, not the wall-clock year of the annulment run. Same shape
+    /// as the test above but the assertion names the cross-year intent
+    /// loudly so a future contributor reading the test list sees
+    /// "cross-year correctness is locked in." Mirrors the equivalent
+    /// pin in `issue_storno` / `issue_modification` tests.
+    #[test]
+    fn check_base_is_annullable_cross_year_cites_base_original_year() {
+        use crate::numbering::{NumberingTemplate, ResetPolicy, Segment, YearDigits};
+        let entries = vec![
+            (
+                EventKind::InvoiceSequenceReserved,
+                seq_reserved_payload("inv_A", 17),
+                None,
+            ),
+            (
+                EventKind::InvoiceSubmissionResponse,
+                submission_response_payload("inv_A", "TXID-17"),
+                None,
+            ),
+        ];
+        let ledger = ledger_with_entries(entries);
+        let template = NumberingTemplate {
+            segments: vec![
+                Segment::Literal("ABERP-".to_string()),
+                Segment::Year {
+                    digits: YearDigits::Four,
+                },
+                Segment::Literal("/".to_string()),
+                Segment::Counter { pad_width: 5 },
+            ],
+            reset_policy: ResetPolicy::OnYearChange,
+            start_value: 1,
+        };
+        // Base was issued in 2025 (the back-dated case); annulment is
+        // initiated in 2026. The render MUST cite the base as
+        // `ABERP-2025/00017` — not `ABERP-2026/00017`.
+        let pre = check_base_is_annullable(&ledger, "inv_A", &template, 2025)
+            .expect("submitted base must be annullable");
+        let prefix = crate::build_profile::INVOICE_NUMBER_TEST_PREFIX;
+        assert_eq!(
+            pre.base_invoice_number,
+            format!("{prefix}ABERP-2025/00017"),
+            "cross-year annulment must cite the base by its original issue year"
+        );
+        assert_ne!(
+            pre.base_invoice_number,
+            format!("{prefix}ABERP-2026/00017"),
+            "cross-year annulment must NOT cite the base by the annulment-run year"
         );
     }
 
@@ -667,7 +766,7 @@ mod tests {
         )];
         let ledger = ledger_with_entries(entries);
         let template = crate::numbering::default_template();
-        let err = check_base_is_annullable(&ledger, "inv_A", &template).unwrap_err();
+        let err = check_base_is_annullable(&ledger, "inv_A", &template, 2026).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("no NAV submission response"),
@@ -707,7 +806,7 @@ mod tests {
         ];
         let ledger = ledger_with_entries(entries);
         let template = crate::numbering::default_template();
-        let err = check_base_is_annullable(&ledger, "inv_A", &template).unwrap_err();
+        let err = check_base_is_annullable(&ledger, "inv_A", &template, 2026).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("double-annulment"),
@@ -756,7 +855,7 @@ mod tests {
         ];
         let ledger = ledger_with_entries(entries);
         let template = crate::numbering::default_template();
-        check_base_is_annullable(&ledger, "inv_A", &template)
+        check_base_is_annullable(&ledger, "inv_A", &template, 2026)
             .expect("a stornoed base must remain annullable (ADR-0025 §6)");
     }
 
@@ -780,7 +879,7 @@ mod tests {
         ];
         let ledger = ledger_with_entries(entries);
         let template = crate::numbering::default_template();
-        let err = check_base_is_annullable(&ledger, "inv_A", &template).unwrap_err();
+        let err = check_base_is_annullable(&ledger, "inv_A", &template, 2026).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("no NAV submission response"),

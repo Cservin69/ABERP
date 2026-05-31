@@ -40,6 +40,20 @@ template configured — confirm none does and it stays 🟡.
   `base_issue_year` from the `InvoiceDraftCreated` payload's `issue_date` field
   (it's already serialized there per the storno chain), or open the billing DB
   read-side during annulment.
+  > **ADDRESSED-BY-PR-183.** `request_technical_annulment.rs` now opens the
+  > billing store and reads `base_invoice.issue_date.year()` via the new
+  > `load_base_invoice_issue_year` helper (mirroring
+  > `observe_receiver_confirmation::load_base_nav_invoice_number`'s posture),
+  > then passes that year into `check_base_is_annullable` for the
+  > `template.render_for_build` call. The walker's old
+  > `Entry.time_wall.year()` capture is deleted. Tests
+  > `check_base_is_annullable_renders_year_from_base_issue_date_param` and
+  > `check_base_is_annullable_cross_year_cites_base_original_year` pin the
+  > new contract. (Aside on the original recommendation: the
+  > `InvoiceDraftCreatedPayload` does NOT actually carry an `issue_date`
+  > field — only `IncomingInvoiceIngestedPayload` and
+  > `InvoiceRestoredFromNavPayload` do. The billing-row read matches the
+  > posture every other base-reference render uses.)
 
 - **S176 — PNG decoder has no explicit decompression-bomb cap.** 
   `crates/invoice-pdf/src/logo.rs:74` does `vec![0u8; reader.output_buffer_size()]`.
@@ -131,6 +145,17 @@ template configured — confirm none does and it stays 🟡.
   digests. Mild surprise, not a bug. The SPA's `validateYearInput` at
   `restore-wizard.ts:43` passes `currentYear` from `new Date().getFullYear()`
   (local time) so SPA and backend can disagree on NYE. Worth one comment.
+  > **ADDRESSED-BY-PR-183.** `validate_year` now computes `current_year`
+  > via a fixed UTC+1 offset (Europe/Budapest in winter — the only window
+  > with a year-flip, since DST runs late March to late October), aligning
+  > the backend with the SPA's local-time `getFullYear()`. New test
+  > `validate_year_nye_budapest_accepts_local_year` pins that at
+  > 23:30 UTC on Dec 31 of year N (= 00:30 CET on Jan 1 of N+1) the
+  > operator can type N+1 without being rejected as "future".
+  > `month_window_december_covers_nye_budapest_invoice` adds a defence
+  > pin that `month_window(YYYY, 12)` returns `YYYY-12-31` as the upper
+  > bound (NAV's `<invoiceIssueDate>` is date-only, so the existing
+  > calendar-arithmetic path already covered the invoice-loss concern).
 
 - **Auth-order smell across the new AP routes (and pre-existing pattern).**
   `apps/aberp/src/serve.rs:6504-6517`: `handle_mark_incoming_irrelevant` uses

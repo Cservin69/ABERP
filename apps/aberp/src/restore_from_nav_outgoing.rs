@@ -289,8 +289,20 @@ pub struct RestoreSummary {
 /// Validate the operator-supplied year. Same loud-fail posture as
 /// `incoming_invoices::validate_ingestion_input` — closed bounds,
 /// no silent clamp.
+///
+/// S183 — `current_year` is computed in **Europe/Budapest local time**,
+/// not UTC. The only year-flip happens on Jan 1 (which falls in CET,
+/// UTC+1, every year — DST runs late March to late October so summer's
+/// CEST never straddles a year boundary). The fixed +1h offset
+/// suffices for the year-bounds check: at any moment of any year, the
+/// Hungarian calendar-year computed via `(now_utc + 1h).year()`
+/// matches the wall clock the operator sees. Pre-S183 the validator
+/// read `now_utc.date().year()`, so between 00:00–00:59 CET on Jan 1
+/// the operator's correct entry (typing N+1) was rejected as "future"
+/// because UTC was still Dec 31 of year N. PR-182 review §S180 named
+/// this; PR-183 closes it.
 pub fn validate_year(year: i32, now_utc: OffsetDateTime) -> Result<(), String> {
-    let current_year = now_utc.date().year();
+    let current_year = budapest_calendar_year(now_utc);
     if year < MIN_RESTORE_YEAR {
         return Err(format!(
             "year must be >= {MIN_RESTORE_YEAR} (NAV Online Számla went live in 2018; \
@@ -304,6 +316,15 @@ pub fn validate_year(year: i32, now_utc: OffsetDateTime) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// S183 — Europe/Budapest calendar year from a UTC instant. See the
+/// docstring of [`validate_year`] for why a fixed +1h offset is
+/// sufficient (the only year-flip is in winter, when Hungary is CET).
+fn budapest_calendar_year(now_utc: OffsetDateTime) -> i32 {
+    let budapest_offset = time::UtcOffset::from_hms(1, 0, 0)
+        .expect("UTC+1 is a valid offset; const construction cannot fail at runtime");
+    now_utc.to_offset(budapest_offset).date().year()
 }
 
 /// Run one operator-triggered restore wizard cycle. Walks the year
@@ -774,6 +795,57 @@ mod tests {
         validate_year(2026, now).expect("current year ok");
         validate_year(2018, now).expect("floor year ok");
         validate_year(2025, now).expect("recent past ok");
+    }
+
+    /// S183 — NYE-Europe-Budapest-vs-UTC skew. At 23:30 UTC on
+    /// Dec 31 of year N, the Hungarian wall clock reads 00:30 CET on
+    /// Jan 1 of year N+1. The operator (in Hungary) sees year N+1
+    /// and typing N+1 must be accepted as the current calendar year.
+    /// Pre-S183 the validator used `now_utc.date().year()` and would
+    /// have rejected N+1 as "future" — silently surfacing as a
+    /// "year must be <= ..." error during the first hour of every
+    /// new year in Hungary. PR-182 review §S180 named this skew;
+    /// PR-183 closes it via the Europe/Budapest fixed-+1h-offset path.
+    ///
+    /// CLAUDE.md rule 9 — the assertion targets the load-bearing
+    /// timezone-source contract. A regression that reverts to
+    /// `now_utc.date().year()` would fail this test loudly.
+    #[test]
+    fn validate_year_nye_budapest_accepts_local_year() {
+        // 2026-12-31 23:30:00 UTC == 2027-01-01 00:30:00 CET (UTC+1).
+        let nye_post_midnight_in_budapest = datetime!(2026-12-31 23:30:00 UTC);
+        validate_year(2027, nye_post_midnight_in_budapest)
+            .expect("post-midnight Hungarian-local Jan 1 must accept the new local year");
+        // Pre-midnight UTC on Jan 1 stays year N for both UTC and CET —
+        // sanity-check the validator still accepts year N at the
+        // boundary going the other direction.
+        let nye_pre_midnight_in_budapest = datetime!(2026-12-31 22:30:00 UTC);
+        validate_year(2026, nye_pre_midnight_in_budapest)
+            .expect("pre-midnight Hungarian-local Dec 31 must accept the still-current year");
+    }
+
+    /// S183 — defence pin: `month_window(YYYY, 12)` returns a date
+    /// range that COVERS an invoice issued at 23:59:59 Europe/Budapest
+    /// on Dec 31 of `YYYY`. Such an invoice's NAV
+    /// `<invoiceIssueDate>` element is `YYYY-12-31` (NAV stores
+    /// date-only — no time-of-day), so the upper bound
+    /// `dateTo=YYYY-12-31` matches it. PR-182 review's S180 worry
+    /// about year-boundary invoice loss does not bite at the
+    /// `month_window` layer because the function is pure calendar
+    /// arithmetic — no UTC vs CET conversion involved. This test
+    /// pins that invariant against a future refactor that might
+    /// accidentally derive month bounds from UTC instants.
+    #[test]
+    fn month_window_december_covers_nye_budapest_invoice() {
+        let (from, to) = month_window(2026, 12).unwrap();
+        assert_eq!(from, "2026-12-01");
+        assert_eq!(
+            to, "2026-12-31",
+            "Dec upper bound must be 2026-12-31 so an invoice with \
+             <invoiceIssueDate>2026-12-31</invoiceIssueDate> (issued at \
+             23:59:59 Europe/Budapest on Dec 31) is INCLUDED in the \
+             query window"
+        );
     }
 
     #[test]
