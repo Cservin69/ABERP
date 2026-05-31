@@ -145,6 +145,28 @@ template configured — confirm none does and it stays 🟡.
   sees a confusing 500. Recommended future PR: catch the UNIQUE constraint
   violation inside the INSERT arm and re-look-up the existing id, returning
   `AlreadyExists`.
+  > **ADDRESSED-BY-PR-186.** Investigation surfaced two deeper
+  > realities the original review missed: (1) DuckDB does NOT
+  > enforce `UNIQUE` across two `Connection::open` handles in the
+  > same process — each handle opens its own `Database` instance
+  > with no cross-handle index coordination, so both inserts
+  > succeed and leave duplicate rows; (2) the audit-ledger's
+  > chain-hashing assumes serial writers — concurrent writers
+  > produce `tamper detected at seq=N` mismatches on the next
+  > `verify_chain`. Both failure modes are now pinned by
+  > `duckdb_unique_constraint_does_not_fire_across_two_connections_documented_quirk`
+  > and `concurrent_ingest_holds_no_error_one_row_id_consistent`.
+  > The fix is a process-wide `INGEST_SERIALIZER: Mutex<()>` held
+  > for the full critical section (find-or-insert + audit-append +
+  > chain-verify + mirror-sync). Single-tenant-per-process today
+  > makes process-wide equivalent to per-tenant. Defence-in-depth:
+  > the INSERT arm still catches `is_duplicate_key_violation`,
+  > cleans up the orphan NAV-XML artifact, and returns
+  > `AlreadyExists` — covering the cross-process bypass (e.g., a
+  > `aberp ingest` CLI running alongside `aberp serve` — that
+  > path would race on the OS file lock, not the in-process
+  > mutex). The original brief's "catch UNIQUE and recover"
+  > became the second line of defence, not the primary fix.
 
 - **S178 — synchronous DuckDB + chain-verify on the tokio runtime.**
   `apps/aberp/src/ap_sync.rs:281-305`: `ingest_incoming_invoice` is sync DuckDB
@@ -170,6 +192,27 @@ template configured — confirm none does and it stays 🟡.
   future PR: pre-load the set of already-restored `source_nav_invoice_number`s
   into a `HashSet<String>` ONCE at the top of `run`, and pass `&conn` through
   the loop instead of re-opening per digest.
+  > **ADDRESSED-BY-PR-186.** The recommended pre-load landed: a new
+  > `load_already_restored_cache` helper opens the `Ledger` ONCE
+  > and walks `entries()` ONCE into a `HashSet<String>` of
+  > `source_nav_invoice_number`s scoped to the current tenant.
+  > `run` builds this cache before the month-walk loop and threads
+  > a `&mut AlreadyRestoredCache` through `walk_month` and
+  > `process_digest`. Each digest's idempotency check is now O(1)
+  > `contains` instead of a fresh per-call `Ledger::open` + full
+  > `entries()` walk + per-entry payload decode. The cache is
+  > mutated in place as new restores succeed so within-cycle
+  > duplicates (NAV would not emit them but the defence is cheap)
+  > stay skipped. The old `already_restored` helper is removed per
+  > CLAUDE.md rule 13 ("delete before optimize") — it was a `pub`
+  > entry-point used only by its own test. Tenant-scoping pinned
+  > by `load_already_restored_cache_is_tenant_scoped`;
+  > cross-cycle hydration pinned by
+  > `load_already_restored_cache_hydrates_from_prior_ledger_entries`.
+  > The per-digest 3-connection-open pattern inside
+  > `process_digest` (insert tx + post-commit Ledger::open +
+  > mirror-sync) is unchanged — the per-cycle dominant cost was
+  > the pre-S186 ledger walk, not the per-row connection opens.
 
 - **S180 — backend has no equivalent of the SPA's "type RESTORE" ceremony.**
   `apps/aberp/src/serve.rs:6713-6738`: the route gates on `require_ready` +
@@ -182,6 +225,25 @@ template configured — confirm none does and it stays 🟡.
   "operator-discipline" — name it as SPA-side-only in the route's doc-comment
   if that's intentional, or add a `confirmation_token: String` field to the
   request body checked against `"RESTORE"` server-side.
+  > **ADDRESSED-BY-PR-186.** The ceremony moved server-side per
+  > the second alternative in the original recommendation.
+  > `RestoreFromNavOutgoingRequest` now carries a REQUIRED
+  > `confirm_token: String` field (serde-required — missing
+  > field is a 400 from axum's `Json<T>` extractor); the handler
+  > equality-checks against a new
+  > `RESTORE_CONFIRMATION_TOKEN: &str = "RESTORE"` constant
+  > (uppercase, exact-match, no whitespace-trim — mirrors the
+  > SPA's `isRestoreConfirmed` exactly). A mismatch returns 400
+  > BEFORE the year-validation gate fires, so a tokenless request
+  > never reaches the NAV pipeline. The SPA wizard's
+  > `restoreFromNavOutgoing(year)` API became
+  > `restoreFromNavOutgoing(year, confirmToken)` and now
+  > forwards the operator-typed token verbatim (the wizard's
+  > `canSubmit` gate guarantees it equals `"RESTORE"` by the time
+  > the fetch fires). Pinned by `restore_request_serde_requires_confirm_token`
+  > and `restore_confirm_token_literal_is_exact_match_uppercase_restore`.
+  > The existing SPA wizard tests (`restore-wizard.test.ts`) stay
+  > green — the helper surface they pin is unchanged.
 
 - **S180 — `validate_year` uses UTC-derived "current year".**
   `apps/aberp/src/restore_from_nav_outgoing.rs:292-307` reads

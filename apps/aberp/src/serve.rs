@@ -6917,9 +6917,24 @@ fn ap_artifacts_dir(tenant: &str) -> Result<PathBuf> {
 
 // ── S180 / PR-180 — NAV-as-DR restore wizard ─────────────────────────
 
+/// S186 — server-side equivalent of the SPA's "type RESTORE"
+/// ceremony. PR-182 review §S180 named the asymmetry: the wizard's
+/// confirmation gate lived ONLY in
+/// `apps/aberp-ui/ui/src/lib/restore-wizard.ts`, so a buggy SPA
+/// build, a malicious extension, or a curl-with-bearer could POST
+/// the restore endpoint with no token. The literal value MUST stay
+/// `"RESTORE"` so the SPA and backend agree.
+const RESTORE_CONFIRMATION_TOKEN: &str = "RESTORE";
+
 #[derive(Debug, Deserialize)]
 struct RestoreFromNavOutgoingRequest {
     year: i32,
+    /// S186 — operator-discipline ceremony token. Must equal the
+    /// literal `RESTORE` (exact-match, case-sensitive, no
+    /// surrounding whitespace) — same posture as
+    /// `restore-wizard.ts::isRestoreConfirmed`. Missing or
+    /// mismatched → 400.
+    confirm_token: String,
 }
 
 async fn handle_restore_from_nav_outgoing(
@@ -6933,6 +6948,19 @@ async fn handle_restore_from_nav_outgoing(
     };
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
+    }
+    // S186 — confirm-token gate. Reject BEFORE year-validation so a
+    // missing-token request never reaches the NAV pipeline.
+    if body.confirm_token != RESTORE_CONFIRMATION_TOKEN {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body(format!(
+                "restore requires `confirm_token` field equal to the literal \
+                 `{RESTORE_CONFIRMATION_TOKEN}` (case-sensitive, no surrounding \
+                 whitespace) — operator-discipline ceremony"
+            ))),
+        )
+            .into_response();
     }
     // Early year-validation so a 2017 request 400s before the NAV
     // pipeline boots.
@@ -12616,5 +12644,57 @@ mod tests {
         assert_eq!(tax_number, "98765432-2-13");
 
         let _keep = test_dir;
+    }
+
+    // ── S186 / PR-186 — restore-wizard confirm-token gate ─────────────
+    //
+    // PR-182 review §S180 named the asymmetry: the SPA gated the
+    // submit on the literal `RESTORE` token but the backend route
+    // accepted any well-shaped POST. PR-186 closes the gap by
+    // making `confirm_token` REQUIRED on the request body.
+
+    /// The request body MUST carry a `confirm_token` field — serde
+    /// rejects a missing one at deserialization time, surfacing as a
+    /// 400 from axum's `Json<T>` extractor before the handler runs.
+    #[test]
+    fn restore_request_serde_requires_confirm_token() {
+        // Missing field → serde error.
+        let err = serde_json::from_str::<RestoreFromNavOutgoingRequest>(r#"{"year":2026}"#)
+            .expect_err("RestoreFromNavOutgoingRequest must reject a body without confirm_token");
+        assert!(
+            format!("{err}").contains("confirm_token"),
+            "serde error must name the missing field: got {err}"
+        );
+
+        // Present field → deserializes (handler then equality-checks
+        // the value).
+        let ok: RestoreFromNavOutgoingRequest =
+            serde_json::from_str(r#"{"year":2026,"confirm_token":"RESTORE"}"#)
+                .expect("well-shaped body must deserialize");
+        assert_eq!(ok.year, 2026);
+        assert_eq!(ok.confirm_token, "RESTORE");
+    }
+
+    /// The handler's equality check is case-sensitive on the literal
+    /// `RESTORE`. Lowercase, mixed-case, surrounding whitespace, or
+    /// any other token MUST fail — matching the SPA's
+    /// `isRestoreConfirmed` posture so SPA and backend agree on
+    /// what counts as a confirmed ceremony.
+    #[test]
+    fn restore_confirm_token_literal_is_exact_match_uppercase_restore() {
+        assert_eq!(
+            RESTORE_CONFIRMATION_TOKEN, "RESTORE",
+            "the literal token must stay `RESTORE` so SPA + backend agree"
+        );
+        // Document the rejected shapes by encoding the equality
+        // check the handler uses; future refactors that swap to a
+        // case-insensitive / whitespace-trimming comparison would
+        // weaken the ceremony and would fail this pin.
+        for bad in ["restore", "Restore", " RESTORE", "RESTORE ", "REST", ""] {
+            assert!(
+                bad != RESTORE_CONFIRMATION_TOKEN,
+                "the handler's `!=` check must reject `{bad}`"
+            );
+        }
     }
 }

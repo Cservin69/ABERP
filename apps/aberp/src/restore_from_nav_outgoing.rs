@@ -74,6 +74,18 @@
 //!     UNIQUE constraint on `(tenant_id, source_nav_invoice_number)`
 //!     so a code-path-level idempotency-check gap surfaces as a
 //!     DuckDB constraint violation rather than a silent duplicate.
+//!   - S186 / PR-186 performance fix: the set of already-restored
+//!     `source_nav_invoice_number`s is loaded ONCE at the top of
+//!     [`run`] via a SINGLE [`Ledger::open`] + [`Ledger::entries`]
+//!     walk, into a [`HashSet<String>`]. Each digest then does an
+//!     O(1) `contains` check instead of opening a fresh `Ledger` +
+//!     walking the entire chain backward (pre-S186 was O(N×K) for
+//!     `N` digests × `K` prior entries — a 1000-invoice year on a
+//!     tenant with 10K prior audit entries was 10M JSON decodes).
+//!     The cache is mutated in place as new restores succeed so a
+//!     within-the-same-cycle re-encounter of the same NAV invoice
+//!     number (impossible from NAV's API but cheap to defend
+//!     against) still skips.
 //!
 //! Re-running the wizard 10 times produces an identical
 //! `restored_invoice` state.
@@ -88,6 +100,7 @@
 //!     operator-paced; the {restored, skipped, errored} counts ride
 //!     the HTTP response body, not the audit chain.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, BinaryHash, EventKind, Ledger, TenantId};
@@ -274,6 +287,56 @@ impl<'a> DigestContext<'a> {
     }
 }
 
+/// S186 / PR-186 — in-memory cache of `source_nav_invoice_number`s
+/// already present in the tenant's audit ledger as
+/// `InvoiceRestoredFromNav` entries. Built ONCE per wizard run by
+/// [`load_already_restored_cache`] before the month-walk loop starts;
+/// every digest then checks membership in O(1) instead of the
+/// pre-S186 O(N) per-digest ledger walk. The cache is mutated in
+/// place as new restores succeed so within-cycle duplicates (NAV
+/// would not emit them, but the defence is cheap) stay skipped.
+type AlreadyRestoredCache = HashSet<String>;
+
+/// S186 — build the already-restored cache for the tenant: ONE
+/// `Ledger::open` + ONE `entries()` walk, payload-decoding only the
+/// `InvoiceRestoredFromNav` entries scoped to `tenant`. Memory cost
+/// is ~`prior_restored_count` × (~30 bytes per NAV invoice number
+/// string + HashSet overhead) — fine for tenants with tens of
+/// thousands of restored rows.
+fn load_already_restored_cache(
+    db_path: &Path,
+    tenant: TenantId,
+    binary_hash: BinaryHash,
+) -> Result<AlreadyRestoredCache> {
+    let ledger = Ledger::open(db_path, tenant.clone(), binary_hash)
+        .context("open audit ledger to pre-load already-restored cache")?;
+    let entries = ledger
+        .entries()
+        .context("read audit ledger entries for already-restored cache")?;
+    let mut set: AlreadyRestoredCache = HashSet::new();
+    for entry in entries.iter() {
+        if entry.kind != EventKind::InvoiceRestoredFromNav {
+            continue;
+        }
+        // Cross-tenant defensive scoping — same posture
+        // [`already_restored`] takes (storage is multi-tenant by row
+        // column, not by table).
+        if entry.tenant_id.as_str() != tenant.as_str() {
+            continue;
+        }
+        let payload: InvoiceRestoredFromNavPayload = serde_json::from_slice(&entry.payload)
+            .map_err(|e| {
+                anyhow!(
+                    "InvoiceRestoredFromNav payload (seq {:?}) failed typed decode \
+                     while pre-loading already-restored cache: {e}",
+                    entry.seq
+                )
+            })?;
+        set.insert(payload.source_nav_invoice_number);
+    }
+    Ok(set)
+}
+
 /// One wizard run's summary. Returned to the HTTP route which echoes
 /// the body verbatim to the SPA.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -332,6 +395,14 @@ fn budapest_calendar_year(now_utc: OffsetDateTime) -> i32 {
 /// `restored_invoice`, returns the {restored, skipped, errored}
 /// counts. Idempotent: a re-run returns `restored=0` for already-
 /// seen NAV invoice numbers.
+///
+/// S186 — the already-restored set is loaded ONCE here (one
+/// `Ledger::open` + one `entries()` walk into a `HashSet<String>`)
+/// and passed by mutable reference through the month-walk loop;
+/// each digest checks membership in O(1) and inserts on successful
+/// restore. Pre-S186 this was an O(N) per-digest ledger walk with a
+/// fresh `Ledger::open` per call — 1000 digests × 10K prior entries
+/// = 10M JSON decodes worst-case. PR-182 review §S180 named the cost.
 pub async fn run(inputs: RestoreInputs) -> Result<RestoreSummary> {
     let started = std::time::Instant::now();
     validate_year(inputs.year, OffsetDateTime::now_utc())
@@ -340,6 +411,13 @@ pub async fn run(inputs: RestoreInputs) -> Result<RestoreSummary> {
     let transport = NavTransport::new(inputs.endpoint)
         .context("build NAV transport for restore-from-nav wizard")?;
 
+    // S186 — single ledger walk before the month-loop; cache passed
+    // by &mut into walk_month / process_digest, mutated as new
+    // restores succeed.
+    let mut already_restored_cache =
+        load_already_restored_cache(&inputs.db_path, inputs.tenant.clone(), inputs.binary_hash)
+            .context("pre-load already-restored cache for restore wizard")?;
+
     let mut total_restored: u64 = 0;
     let mut total_skipped: u64 = 0;
     let mut total_errored: u64 = 0;
@@ -347,8 +425,14 @@ pub async fn run(inputs: RestoreInputs) -> Result<RestoreSummary> {
 
     for month in 1u8..=12 {
         let (date_from, date_to) = month_window(inputs.year, month)?;
-        let (restored, skipped, errored, pages) =
-            walk_month(&inputs, &transport, &date_from, &date_to).await?;
+        let (restored, skipped, errored, pages) = walk_month(
+            &inputs,
+            &transport,
+            &date_from,
+            &date_to,
+            &mut already_restored_cache,
+        )
+        .await?;
         total_restored += restored;
         total_skipped += skipped;
         total_errored += errored;
@@ -371,6 +455,7 @@ async fn walk_month(
     transport: &NavTransport,
     date_from: &str,
     date_to: &str,
+    already_restored_cache: &mut AlreadyRestoredCache,
 ) -> Result<(u64, u64, u64, u32)> {
     let ctx = DigestContext::from_inputs(inputs);
     let mut restored: u64 = 0;
@@ -419,7 +504,7 @@ async fn walk_month(
 
         let available_page = page_result.available_page;
         for digest in &page_result.digests {
-            match process_digest(&ctx, digest) {
+            match process_digest(&ctx, digest, already_restored_cache) {
                 Ok(ProcessOutcome::Restored) => restored += 1,
                 Ok(ProcessOutcome::Skipped) => skipped += 1,
                 Err(e) => {
@@ -446,17 +531,22 @@ enum ProcessOutcome {
     Skipped,
 }
 
-/// Process one digest: idempotency check via audit-ledger walk, then
+/// Process one digest: O(1) cache-membership idempotency check, then
 /// INSERT + audit-write under one tx, then chain-verify + mirror-sync.
-/// Returns `Skipped` when the audit-ledger walk finds a prior
-/// `InvoiceRestoredFromNav` entry for the same `source_nav_invoice_number`.
-fn process_digest(ctx: &DigestContext<'_>, digest: &InvoiceDigest) -> Result<ProcessOutcome> {
-    if already_restored(
-        ctx.db_path,
-        ctx.tenant.clone(),
-        ctx.binary_hash,
-        &digest.invoice_number,
-    )? {
+/// Returns `Skipped` when the cache already contains the digest's
+/// `source_nav_invoice_number` (the pre-S186 path opened a fresh
+/// `Ledger` and walked the chain backward per call).
+///
+/// On successful restore the cache is mutated in place so a
+/// subsequent digest in the SAME cycle that names the same NAV
+/// invoice number (NAV would not emit a duplicate, but the defence
+/// is cheap) stays skipped.
+fn process_digest(
+    ctx: &DigestContext<'_>,
+    digest: &InvoiceDigest,
+    already_restored_cache: &mut AlreadyRestoredCache,
+) -> Result<ProcessOutcome> {
+    if already_restored_cache.contains(&digest.invoice_number) {
         return Ok(ProcessOutcome::Skipped);
     }
 
@@ -575,52 +665,13 @@ fn process_digest(ctx: &DigestContext<'_>, digest: &InvoiceDigest) -> Result<Pro
         .sync_mirror(&mirror_path)
         .context("sync audit-ledger mirror file after restore insert")?;
 
-    Ok(ProcessOutcome::Restored)
-}
+    // S186 — mark this NAV invoice number as already-restored so a
+    // subsequent digest in the SAME cycle that re-names it (NAV
+    // would not emit duplicates, but the defence is cheap) skips
+    // via the O(1) path.
+    already_restored_cache.insert(digest.invoice_number.clone());
 
-/// Walk the audit ledger backward for the most-recent
-/// `InvoiceRestoredFromNav` entry whose payload's
-/// `source_nav_invoice_number` matches AND whose entry tenant_id
-/// matches `tenant`.
-///
-/// `Ledger::entries()` returns every row in the underlying DuckDB
-/// audit-ledger table regardless of tenant (the storage is a shared
-/// per-DB table, multi-tenant by row column not by table). Tenant
-/// scoping happens HERE at the consumer — same posture the rest of
-/// `audit_query.rs`'s helpers take. Without this filter, a tenant-A
-/// restore would mark tenant B's same NAV invoice number as
-/// already-restored — the cross-tenant contamination failure mode
-/// CLAUDE.md rule 12 names.
-pub fn already_restored(
-    db_path: &Path,
-    tenant: TenantId,
-    binary_hash: BinaryHash,
-    source_nav_invoice_number: &str,
-) -> Result<bool> {
-    let ledger = Ledger::open(db_path, tenant.clone(), binary_hash)
-        .context("open audit ledger for already_restored lookup")?;
-    let entries = ledger
-        .entries()
-        .context("read audit ledger entries for already_restored lookup")?;
-    for entry in entries.iter().rev() {
-        if entry.kind != EventKind::InvoiceRestoredFromNav {
-            continue;
-        }
-        if entry.tenant_id.as_str() != tenant.as_str() {
-            continue;
-        }
-        let payload: InvoiceRestoredFromNavPayload = serde_json::from_slice(&entry.payload)
-            .map_err(|e| {
-                anyhow!(
-                    "InvoiceRestoredFromNav payload (seq {:?}) failed typed decode: {e}",
-                    entry.seq
-                )
-            })?;
-        if payload.source_nav_invoice_number == source_nav_invoice_number {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(ProcessOutcome::Restored)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -911,20 +962,33 @@ mod tests {
     }
 
     /// End-to-end happy path: process one digest, then process the
-    /// SAME digest again. First call inserts + emits an audit entry;
-    /// second call short-circuits via the audit-ledger idempotency
-    /// walk and returns `Skipped`.
+    /// SAME digest again with the SAME in-memory cache. First call
+    /// inserts + emits an audit entry + mutates the cache; second
+    /// call short-circuits via the cache and returns `Skipped`.
+    ///
+    /// S186 — pre-PR-186 this test relied on a per-call ledger walk
+    /// for idempotency; the new path uses the `AlreadyRestoredCache`
+    /// passed through walk_month/process_digest. The contract
+    /// (within-cycle re-processing of the same NAV invoice number
+    /// returns `Skipped` and does NOT write a duplicate audit
+    /// entry) is unchanged.
     #[test]
-    fn process_digest_is_idempotent_via_audit_ledger() {
+    fn process_digest_is_idempotent_within_cycle_via_cache() {
         let tmp = ScopedTempDir::new("test");
         let db_path = tmp.path().join("aberp.duckdb");
         let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+        let mut cache: AlreadyRestoredCache = HashSet::new();
 
         let d = fixture_digest("INV-default/00042", "2026-04-15");
-        let outcome1 = process_digest(&ctx, &d).expect("first call inserts");
+        let outcome1 = process_digest(&ctx, &d, &mut cache).expect("first call inserts");
         assert!(matches!(outcome1, ProcessOutcome::Restored));
+        assert!(
+            cache.contains("INV-default/00042"),
+            "cache must contain the just-restored NAV invoice number"
+        );
 
-        let outcome2 = process_digest(&ctx, &d).expect("second call short-circuits");
+        let outcome2 =
+            process_digest(&ctx, &d, &mut cache).expect("second call short-circuits via cache");
         assert!(matches!(outcome2, ProcessOutcome::Skipped));
 
         let list = list_restored(&db_path, "t1").expect("list");
@@ -958,10 +1022,11 @@ mod tests {
         let tmp = ScopedTempDir::new("test");
         let db_path = tmp.path().join("aberp.duckdb");
         let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+        let mut cache: AlreadyRestoredCache = HashSet::new();
 
         let mut d = fixture_digest("INV-default/00099", "2026-05-01");
         d.currency = Some("USD".to_string());
-        let err = process_digest(&ctx, &d).expect_err("USD outside closed vocab");
+        let err = process_digest(&ctx, &d, &mut cache).expect_err("USD outside closed vocab");
         assert!(format!("{err:#}").contains("USD"), "{err:#}");
     }
 
@@ -971,44 +1036,111 @@ mod tests {
         let tmp = ScopedTempDir::new("test");
         let db_path = tmp.path().join("aberp.duckdb");
         let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+        let mut cache: AlreadyRestoredCache = HashSet::new();
 
         let mut d = fixture_digest("INV-default/00100", "2026-05-01");
         d.issue_date = None;
-        let err = process_digest(&ctx, &d).expect_err("missing issue_date");
+        let err = process_digest(&ctx, &d, &mut cache).expect_err("missing issue_date");
         assert!(format!("{err:#}").contains("invoiceIssueDate"));
     }
 
-    /// `already_restored` MUST be tenant-scoped. A future refactor
-    /// that loosens the scoping surfaces immediately via this pin.
+    /// S186 — `load_already_restored_cache` MUST be tenant-scoped.
+    /// Without the scoping filter, a tenant-A restore would mark
+    /// tenant B's same NAV invoice number as already-restored
+    /// (cross-tenant contamination — the failure mode CLAUDE.md
+    /// rule 12 names). This pin replaces the pre-S186
+    /// `already_restored_is_tenant_scoped_by_ledger_open` test
+    /// (the per-call lookup it pinned is gone; the cache-loader
+    /// inherits the responsibility).
     #[test]
-    fn already_restored_is_tenant_scoped_by_ledger_open() {
+    fn load_already_restored_cache_is_tenant_scoped() {
         let tmp = ScopedTempDir::new("test");
         let db_path = tmp.path().join("aberp.duckdb");
         let ctx_a = fixture_context(&db_path, "t1", "test-user", 2026);
+        let mut cache_a: AlreadyRestoredCache = HashSet::new();
 
         let d = fixture_digest("INV-default/00050", "2026-03-10");
-        process_digest(&ctx_a, &d).expect("tenant A restores");
+        process_digest(&ctx_a, &d, &mut cache_a).expect("tenant A restores");
 
-        let seen_b = already_restored(
+        // Tenant B's cache must NOT contain tenant A's restored
+        // NAV invoice number.
+        let cache_b = load_already_restored_cache(
             &db_path,
             TenantId::new("t2".to_string()).unwrap(),
             ctx_a.binary_hash,
-            "INV-default/00050",
         )
-        .expect("ledger lookup t2");
+        .expect("load cache t2");
         assert!(
-            !seen_b,
-            "tenant B must not see tenant A's restored entry as already-restored"
+            !cache_b.contains("INV-default/00050"),
+            "tenant B's cache must not include tenant A's restored entry"
         );
 
-        let seen_a = already_restored(
-            &db_path,
-            ctx_a.tenant.clone(),
-            ctx_a.binary_hash,
-            "INV-default/00050",
+        // Tenant A's freshly-loaded cache MUST contain it.
+        let cache_a_reloaded =
+            load_already_restored_cache(&db_path, ctx_a.tenant.clone(), ctx_a.binary_hash)
+                .expect("load cache t1");
+        assert!(
+            cache_a_reloaded.contains("INV-default/00050"),
+            "tenant A's cache must include its own restored entry"
+        );
+    }
+
+    /// S186 — pre-cycle cache loader hydrates from prior-cycle
+    /// audit entries. Pins the cross-cycle dedup contract: a second
+    /// wizard run (fresh cache) on the same year as a prior run
+    /// still skips already-restored NAV invoice numbers because
+    /// [`load_already_restored_cache`] reads them back from the
+    /// audit ledger. Pre-S186 the per-call ledger walk did this
+    /// implicitly on every digest; post-S186 the one-shot loader
+    /// is the single integration point.
+    #[test]
+    fn load_already_restored_cache_hydrates_from_prior_ledger_entries() {
+        let tmp = ScopedTempDir::new("test");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+
+        // Cycle 1 — fresh cache, restore one digest.
+        {
+            let mut cache_one: AlreadyRestoredCache = HashSet::new();
+            process_digest(
+                &ctx,
+                &fixture_digest("INV-default/77777", "2026-06-01"),
+                &mut cache_one,
+            )
+            .expect("cycle 1 restores");
+        }
+
+        // Cycle 2 — a freshly-loaded cache must already contain
+        // the NAV invoice number from cycle 1, so a re-encounter
+        // skips and writes NO duplicate audit entry.
+        let mut cache_two =
+            load_already_restored_cache(&db_path, ctx.tenant.clone(), ctx.binary_hash)
+                .expect("load cache cycle 2");
+        assert!(
+            cache_two.contains("INV-default/77777"),
+            "cycle-2 cache must hydrate the prior-cycle restored entry"
+        );
+        let outcome = process_digest(
+            &ctx,
+            &fixture_digest("INV-default/77777", "2026-06-01"),
+            &mut cache_two,
         )
-        .expect("ledger lookup t1");
-        assert!(seen_a, "tenant A must see its own restored entry");
+        .expect("cycle 2 short-circuits via hydrated cache");
+        assert!(matches!(outcome, ProcessOutcome::Skipped));
+
+        // Exactly ONE audit entry — the hydrated cache prevented
+        // a duplicate insert.
+        let ledger =
+            Ledger::open(&db_path, ctx.tenant.clone(), ctx.binary_hash).expect("open ledger");
+        let entries = ledger.entries().expect("read entries");
+        let restored_count = entries
+            .iter()
+            .filter(|e| e.kind == EventKind::InvoiceRestoredFromNav)
+            .count();
+        assert_eq!(
+            restored_count, 1,
+            "exactly one audit entry across both cycles"
+        );
     }
 
     /// Two distinct digests both process cleanly; the listing
@@ -1018,11 +1150,20 @@ mod tests {
         let tmp = ScopedTempDir::new("test");
         let db_path = tmp.path().join("aberp.duckdb");
         let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+        let mut cache: AlreadyRestoredCache = HashSet::new();
 
-        process_digest(&ctx, &fixture_digest("INV-default/00010", "2026-01-15"))
-            .expect("first row");
-        process_digest(&ctx, &fixture_digest("INV-default/00011", "2026-02-15"))
-            .expect("second row");
+        process_digest(
+            &ctx,
+            &fixture_digest("INV-default/00010", "2026-01-15"),
+            &mut cache,
+        )
+        .expect("first row");
+        process_digest(
+            &ctx,
+            &fixture_digest("INV-default/00011", "2026-02-15"),
+            &mut cache,
+        )
+        .expect("second row");
 
         let list = list_restored(&db_path, "t1").expect("list");
         assert_eq!(list.len(), 2);

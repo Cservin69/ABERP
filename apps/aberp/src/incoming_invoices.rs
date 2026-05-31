@@ -51,6 +51,30 @@
 //!     so the caller can echo it. Matches the operator-twin's mental
 //!     model: NAV will re-emit the same digest on every poll; the
 //!     daemon must not multiply rows.
+//!   - **Race-safe under concurrent ingest (S186 / PR-186).** Two
+//!     concurrent callers (the daemon racing a manual `/sync-now`,
+//!     two boot-tick paths overlapping, etc.) hitting
+//!     [`ingest_incoming_invoice`] are serialized via a process-wide
+//!     [`std::sync::Mutex<()>`][`INGEST_SERIALIZER`]. PR-182 review
+//!     §S177 flagged the find-then-insert race as a UNIQUE-violation
+//!     → 500. Investigation under PR-186 surfaced the deeper
+//!     reality: DuckDB's UNIQUE constraint does NOT fire across two
+//!     `Connection::open` handles in the same process (each handle
+//!     opens its own `Database` instance with no cross-handle index
+//!     coordination), AND the audit-ledger's chain-hashing assumes
+//!     serial writers (concurrent writers produce
+//!     `tamper detected at seq=1` mismatches). Both failure modes
+//!     are pinned by tests below
+//!     ([`duckdb_unique_constraint_does_not_fire_across_two_connections_documented_quirk`],
+//!     [`concurrent_ingest_holds_no_error_one_row_id_consistent`]).
+//!     The serializer eliminates BOTH races (UNIQUE + audit-chain)
+//!     at the source: only one ingest at a time, regardless of
+//!     caller. Defence-in-depth: the INSERT arm still catches a
+//!     duplicate-key error and recovers gracefully, in case the
+//!     serializer is bypassed by a future code path (e.g., a CLI
+//!     invocation running in a SEPARATE process from `aberp serve`
+//!     — that path would race across the file lock and the
+//!     in-process mutex would not see it).
 //!
 //! # Deferred-work flags
 //!
@@ -386,6 +410,17 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         .context("ensure ap_invoice schema")
 }
 
+/// S186 / PR-186 — process-wide serializer around
+/// [`ingest_incoming_invoice`]. See the module docs' "Race-safe under
+/// concurrent ingest" bullet for the why; this static holds the
+/// `Mutex<()>` two callers contend for. A single-tenant-per-process
+/// `aberp serve` (the current model) makes process-wide equivalent
+/// to per-tenant; a multi-tenant binary would need keyed-by-tenant
+/// storage. Granularity-of-one is conservative: the daemon ingests
+/// digests sequentially anyway, and the manual `/sync-now` path is
+/// operator-paced.
+static INGEST_SERIALIZER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ──────────────────────────────────────────────────────────────────────
 // Ingestion.
 // ──────────────────────────────────────────────────────────────────────
@@ -414,6 +449,23 @@ pub fn ingest_incoming_invoice(
     input: IngestionInput,
 ) -> std::result::Result<IngestOutcome, IngestError> {
     validate_ingestion_input(&input)?;
+
+    // S186 — process-wide serialization. See [`INGEST_SERIALIZER`]'s
+    // doc-comment for the rationale: DuckDB does not enforce UNIQUE
+    // across two `Connection::open` handles in the same process, and
+    // the audit-ledger's chain hashing assumes serial writers. The
+    // mutex is held for the ENTIRE critical section (find-or-insert
+    // + audit-append + chain-verify + mirror-sync) — granularity-of-
+    // one is conservative; the daemon ingests serially anyway and
+    // the manual route is operator-paced.
+    //
+    // `lock()` only returns `Err` on a poisoned mutex (a prior
+    // panic mid-critical-section). Such a panic would already be a
+    // bug worth surfacing; we propagate it as `IngestError::Other`
+    // rather than swallow.
+    let _guard = INGEST_SERIALIZER
+        .lock()
+        .map_err(|_| anyhow!("ingest serializer mutex poisoned by a prior panic"))?;
 
     let mut conn = Connection::open(db_path).with_context(|| {
         format!(
@@ -472,10 +524,18 @@ pub fn ingest_incoming_invoice(
     // neither a row without an audit entry nor an audit entry without
     // a row. Mirrors the outgoing-invoice billing+audit posture per
     // ADR-0008 / ADR-0009 §3 step 6.
+    //
+    // S186 — the INSERT arm catches the UNIQUE-violation race
+    // window: two concurrent callers can both pass the upfront
+    // `find_existing_id` check, both reach this INSERT, and one
+    // trips `(tenant_id, supplier_tax_number, nav_invoice_number)`'s
+    // UNIQUE constraint. Pre-S186 that surfaced as a 500 to the
+    // caller; now it falls back to a re-lookup + `AlreadyExists`,
+    // matching the idempotency contract the daemon depends on.
     let tx = conn
         .transaction()
         .context("begin DuckDB transaction (ap_invoice ingest)")?;
-    tx.execute(
+    let insert_result = tx.execute(
         "INSERT INTO ap_invoice (
             id, tenant_id, supplier_tax_number, supplier_name, supplier_address,
             nav_invoice_number, issue_date, delivery_date, payment_deadline,
@@ -500,8 +560,40 @@ pub fn ingest_incoming_invoice(
             &now,
             &now,
         ],
-    )
-    .context("INSERT into ap_invoice")?;
+    );
+    if let Err(e) = insert_result {
+        if is_duplicate_key_violation(&e) {
+            // Race lost — another concurrent caller inserted the
+            // same `(tenant, supplier_tax, nav_invoice_number)`
+            // between our upfront `find_existing_id` and this
+            // INSERT. Roll back, clean up the orphan artifact file
+            // we just wrote (the winning row points to ITS own
+            // freshly-minted id; ours would dangle), look up the
+            // surviving row's id, return `AlreadyExists`.
+            drop(tx);
+            if let Some(path) = nav_xml_path.as_deref() {
+                let _ = std::fs::remove_file(path);
+            }
+            return match find_existing_id(
+                &conn,
+                tenant.as_str(),
+                &input.supplier_tax_number,
+                &input.nav_invoice_number,
+            )? {
+                Some(existing) => Ok(IngestOutcome::AlreadyExists { id: existing }),
+                None => Err(IngestError::Other(anyhow!(
+                    "ap_invoice INSERT raised a UNIQUE violation but \
+                     no existing row was found for tenant={} \
+                     supplier_tax={} nav_invoice_number={} — schema or \
+                     constraint drift?",
+                    tenant.as_str(),
+                    input.supplier_tax_number,
+                    input.nav_invoice_number,
+                ))),
+            };
+        }
+        return Err(IngestError::Other(anyhow!("INSERT into ap_invoice: {e}")));
+    }
 
     let payload = IncomingInvoiceIngestedPayload {
         ap_invoice_id: id.clone(),
@@ -591,6 +683,26 @@ fn validate_ingestion_input(input: &IngestionInput) -> std::result::Result<(), I
         }
     }
     Ok(())
+}
+
+/// S186 — true when `e` is a DuckDB UNIQUE / PRIMARY KEY constraint
+/// violation. The duckdb-rs crate stores DuckDB's typed error message
+/// in `Error::DuckDBFailure(_, Some(msg))`; the `ErrorCode` field is
+/// always `Unknown` (the crate does not translate DuckDB's typed
+/// errors back into rusqlite-style codes), so message-matching is the
+/// only available discriminator. DuckDB's wording is stable
+/// (`Constraint Error: Duplicate key ... violates unique constraint`)
+/// — covered by the test
+/// `is_duplicate_key_violation_matches_duckdb_unique_message` below.
+fn is_duplicate_key_violation(e: &duckdb::Error) -> bool {
+    if let duckdb::Error::DuckDBFailure(_, Some(msg)) = e {
+        let lower = msg.to_ascii_lowercase();
+        lower.contains("duplicate key")
+            || lower.contains("violates unique constraint")
+            || lower.contains("violates primary key constraint")
+    } else {
+        false
+    }
 }
 
 fn find_existing_id(
@@ -1425,6 +1537,207 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM ap_invoice", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// S186 — the message-pattern discriminator catches the actual
+    /// wording DuckDB emits for a UNIQUE-constraint violation, and
+    /// does NOT match unrelated errors. Pinning the contract here so
+    /// a future duckdb-rs upgrade that re-words the message surfaces
+    /// at test time, not as a silent regression to "500 on every
+    /// race-loser" production behaviour.
+    #[test]
+    fn is_duplicate_key_violation_matches_duckdb_unique_message() {
+        let dir = ScopedTempDir::new("dup-key");
+        let db_path = dir.path().join("tenant.duckdb");
+        let conn = Connection::open(&db_path).unwrap();
+        ensure_schema(&conn).unwrap();
+        // First insert succeeds.
+        conn.execute(
+            "INSERT INTO ap_invoice (
+                id, tenant_id, supplier_tax_number, supplier_name, supplier_address,
+                nav_invoice_number, issue_date, delivery_date, payment_deadline,
+                total_net_minor, total_vat_minor, total_gross_minor, currency,
+                local_status, irrelevant_reason, nav_xml_path, created_at, updated_at
+             ) VALUES ('apinv_x', 't1', '12345678', 'S', NULL, 'N',
+                       '2026-05-30', NULL, NULL,
+                       0, 0, 0, 'HUF',
+                       'Outstanding', NULL, NULL, '2026-05-30T00:00:00Z',
+                       '2026-05-30T00:00:00Z');",
+            [],
+        )
+        .unwrap();
+        // Second insert with same (tenant, supplier_tax, invoice_number)
+        // (but different id) MUST trip the UNIQUE constraint.
+        let err = conn
+            .execute(
+                "INSERT INTO ap_invoice (
+                id, tenant_id, supplier_tax_number, supplier_name, supplier_address,
+                nav_invoice_number, issue_date, delivery_date, payment_deadline,
+                total_net_minor, total_vat_minor, total_gross_minor, currency,
+                local_status, irrelevant_reason, nav_xml_path, created_at, updated_at
+             ) VALUES ('apinv_y', 't1', '12345678', 'S', NULL, 'N',
+                       '2026-05-30', NULL, NULL,
+                       0, 0, 0, 'HUF',
+                       'Outstanding', NULL, NULL, '2026-05-30T00:00:00Z',
+                       '2026-05-30T00:00:00Z');",
+                [],
+            )
+            .expect_err("second insert must violate UNIQUE");
+        assert!(
+            is_duplicate_key_violation(&err),
+            "duckdb UNIQUE-violation message must match the helper: got {err:?}"
+        );
+
+        // Negative: a non-constraint error (e.g., syntax error) must
+        // NOT match. Using a malformed SQL fragment so the failure
+        // mode is unambiguous.
+        let other = conn
+            .execute("THIS IS NOT VALID SQL", [])
+            .expect_err("syntax error");
+        assert!(
+            !is_duplicate_key_violation(&other),
+            "non-constraint error must NOT match the helper: got {other:?}"
+        );
+    }
+
+    /// S186 — document a DuckDB quirk this PR works around:
+    /// `Connection::open(path)` × 2 within ONE process do NOT
+    /// coordinate on the table's `UNIQUE` constraint. Two
+    /// independent inserts of the SAME
+    /// `(tenant, supplier_tax, nav_invoice_number)` triple from
+    /// separate handles both succeed and leave TWO rows in the
+    /// table. PR-182 review §S177 assumed UNIQUE would fire and
+    /// proposed catching the violation; the investigation that
+    /// surfaced this quirk drove the actual fix to a process-wide
+    /// [`INGEST_SERIALIZER`] mutex.
+    ///
+    /// The pin is preserved as a defence: a future duckdb-rs /
+    /// bundled-DuckDB upgrade that DOES enforce UNIQUE across
+    /// in-process connections would flip this test, prompting a
+    /// reconsideration of whether the mutex is still load-bearing.
+    /// A reviewer hitting that diff should also re-evaluate the
+    /// `is_duplicate_key_violation` helper's role.
+    #[test]
+    fn duckdb_unique_constraint_does_not_fire_across_two_connections_documented_quirk() {
+        let dir = ScopedTempDir::new("dup-key-cross-conn");
+        let db_path = dir.path().join("tenant.duckdb");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            ensure_schema(&conn).unwrap();
+        }
+        let conn1 = Connection::open(&db_path).unwrap();
+        let conn2 = Connection::open(&db_path).unwrap();
+        let insert_sql = "INSERT INTO ap_invoice (
+                id, tenant_id, supplier_tax_number, supplier_name, supplier_address,
+                nav_invoice_number, issue_date, delivery_date, payment_deadline,
+                total_net_minor, total_vat_minor, total_gross_minor, currency,
+                local_status, irrelevant_reason, nav_xml_path, created_at, updated_at
+             ) VALUES (?, 't1', '12345678', 'S', NULL, 'N',
+                       '2026-05-30', NULL, NULL,
+                       0, 0, 0, 'HUF',
+                       'Outstanding', NULL, NULL, '2026-05-30T00:00:00Z',
+                       '2026-05-30T00:00:00Z');";
+        // First insert succeeds (any DuckDB, expected).
+        conn1
+            .execute(insert_sql, duckdb::params!["apinv_first"])
+            .expect("first insert (conn 1) must succeed");
+        // Second insert with the same key from a SEPARATE connection
+        // — also succeeds today, surfacing the quirk this PR's
+        // mutex defends against. If a future DuckDB upgrade flips
+        // this to a UNIQUE violation, the assertion below will
+        // fail loudly and the mutex's rationale can be revisited.
+        let second_result =
+            conn2.execute(insert_sql, duckdb::params!["apinv_second"]);
+        assert!(
+            second_result.is_ok(),
+            "QUIRK: same-process cross-connection INSERT with the same UNIQUE \
+             key currently succeeds in DuckDB {}; if this assertion flips, \
+             revisit `INGEST_SERIALIZER`'s rationale",
+            second_result.err().map(|e| format!("{e:?}")).unwrap_or_default(),
+        );
+    }
+
+    /// S186 — `ingest_incoming_invoice` is robust under concurrent
+    /// calls with the SAME `(tenant, supplier_tax, nav_invoice_number)`
+    /// triple. The [`INGEST_SERIALIZER`] mutex serializes the
+    /// critical section across threads in the process; the contract
+    /// pinned here is the operator-visible outcome:
+    ///
+    ///   - Contract A: no caller errors (pre-S186 a concurrent
+    ///     second caller hit an audit-chain "tamper detected"
+    ///     verification error from racing audit-ledger writers,
+    ///     surfacing as 500).
+    ///   - Contract B: exactly ONE row exists in the table — the
+    ///     serializer turns concurrent ingests into a winner +
+    ///     `AlreadyExists` echoes.
+    ///   - Contract C: every caller's returned id equals the
+    ///     surviving row's id — no caller ever points an operator
+    ///     at a row that does not exist.
+    #[test]
+    fn concurrent_ingest_holds_no_error_one_row_id_consistent() {
+        let dir = ScopedTempDir::new("concurrent-ingest");
+        let db_path = dir.path().join("tenant.duckdb");
+        let artifacts_dir = dir.path().join("ap-artifacts");
+        let tenant = fixture_tenant();
+        let bh = fixture_binary_hash();
+
+        // Pre-create schema so the threads don't race on
+        // CREATE TABLE / boot-time setup (which would mask the
+        // race-of-interest with a different race).
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            ensure_schema(&conn).unwrap();
+            audit_ledger::ensure_schema(&conn).unwrap();
+        }
+
+        // Four threads to up the race-trigger probability across
+        // schedulings.
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let db = db_path.clone();
+            let art = artifacts_dir.clone();
+            let t = tenant.clone();
+            let operator = format!("operator-{i}");
+            handles.push(std::thread::spawn(move || {
+                ingest_incoming_invoice(&db, t, bh, &operator, &art, fixture_input())
+            }));
+        }
+        let outcomes: Vec<std::result::Result<IngestOutcome, IngestError>> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked"))
+            .collect();
+
+        // Contract A: no caller errors.
+        for (i, r) in outcomes.iter().enumerate() {
+            assert!(
+                r.is_ok(),
+                "thread {i} must not error under concurrent ingest: {:?}",
+                r.as_ref().err()
+            );
+        }
+
+        // Contract B: exactly one row exists.
+        let rows = list_incoming(&db_path, tenant.as_str(), None, 100, 0).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one ap_invoice row must exist after concurrent ingest \
+             (race-recovery + UNIQUE constraint)"
+        );
+        let canonical_id = rows[0].id.clone();
+
+        // Contract C: every caller's returned id matches the
+        // surviving row.
+        for (i, r) in outcomes.iter().enumerate() {
+            let id = match r.as_ref().unwrap() {
+                IngestOutcome::Created { id } => id,
+                IngestOutcome::AlreadyExists { id } => id,
+            };
+            assert_eq!(
+                id, &canonical_id,
+                "thread {i}'s outcome id must equal the surviving row id"
+            );
+        }
     }
 
     /// list_incoming filters by status.

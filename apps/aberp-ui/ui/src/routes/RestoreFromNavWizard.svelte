@@ -88,7 +88,12 @@
     errorMessage = null;
     summary = null;
     try {
-      const result = await restoreFromNavOutgoing(parsed.year);
+      // S186 — forward the confirmation token to the backend so the
+      // server-side gate (mirror of `isRestoreConfirmed`) passes. By
+      // the time this fires the operator has typed the literal
+      // `RESTORE` (the `canSubmit` gate enforces it); sending the
+      // raw value preserves the discipline ceremony on the wire.
+      const result = await restoreFromNavOutgoing(parsed.year, confirmRaw);
       summary = result;
       // Refresh the already-restored panel so the new rows appear
       // without a manual reload.

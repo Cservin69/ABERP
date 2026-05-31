@@ -1797,9 +1797,18 @@ export interface RestoredInvoice {
   created_at: string;
 }
 
-export async function restoreFromNavOutgoing(year: number): Promise<RestoreSummary> {
+/** S186 / PR-186 — the backend now REQUIRES a `confirm_token` field
+ * equal to the literal `"RESTORE"`. The wizard already gates submit
+ * on `isRestoreConfirmed`, so by the time this call fires the
+ * operator has typed the token; we forward it verbatim so the
+ * backend's equality check (mirroring `isRestoreConfirmed`) passes.
+ * Missing or mismatched → 400 from the backend. */
+export async function restoreFromNavOutgoing(
+  year: number,
+  confirmToken: string,
+): Promise<RestoreSummary> {
   return invoke<RestoreSummary>("restore_from_nav_outgoing", {
-    body: { year },
+    body: { year, confirm_token: confirmToken },
   });
 }
 
