@@ -71,7 +71,7 @@ if ! bash -n "$0" 2>/dev/null; then
   exit 2
 fi
 
-readonly VERSION_RE='^PROD_v[0-9]+\.[0-9]+$'
+readonly VERSION_RE='^PROD_v[0-9]+\.[0-9]+(\.[0-9]+)?$'
 readonly DEV_SENTINEL_PATH_SUBSTR="/Documents/Claude/Projects/"
 
 # ---------- colour helpers (no-op when stdout is not a terminal) ------------
@@ -122,14 +122,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$version" ]]; then
-  echo "usage: $(basename "$0") <PROD_vMAJOR.MINOR> [tenant]" >&2
+  echo "usage: $(basename "$0") <PROD_vMAJOR.MINOR[.PATCH]> [tenant]" >&2
   echo "       $(basename "$0") --help" >&2
   exit 2
 fi
 
 if [[ ! "$version" =~ $VERSION_RE ]]; then
-  die "version '$version' does not match $VERSION_RE — expected e.g. PROD_v1.5
-HU: A '$version' nem felel meg a $VERSION_RE mintának — pl. PROD_v1.5"
+  die "version '$version' does not match $VERSION_RE — expected e.g. PROD_v1.5 or PROD_v1.5.1
+HU: A '$version' nem felel meg a $VERSION_RE mintának — pl. PROD_v1.5 vagy PROD_v1.5.1"
 fi
 
 # Resolve script + repo paths.
