@@ -3066,9 +3066,15 @@ async fn handle_list_invoices(headers: HeaderMap, State(state): State<AppState>)
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match list_invoices(&state) {
-        Ok(items) => Json(items).into_response(),
-        Err(e) => internal_error("list_invoices", e),
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || list_invoices(&state_for_task)).await;
+    match result {
+        Ok(Ok(items)) => Json(items).into_response(),
+        Ok(Err(e)) => internal_error("list_invoices", e),
+        Err(join_err) => internal_error(
+            "list_invoices:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
     }
 }
 
@@ -3083,14 +3089,24 @@ async fn handle_get_invoice(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match get_invoice_detail(&state, &invoice_id) {
-        Ok(Some(detail)) => Json(detail).into_response(),
-        Ok(None) => (
+    let state_for_task = state.clone();
+    let invoice_id_for_task = invoice_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        get_invoice_detail(&state_for_task, &invoice_id_for_task)
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(detail))) => Json(detail).into_response(),
+        Ok(Ok(None)) => (
             StatusCode::NOT_FOUND,
             Json(error_body(format!("no invoice found with id {invoice_id}"))),
         )
             .into_response(),
-        Err(e) => internal_error("get_invoice_detail", e),
+        Ok(Err(e)) => internal_error("get_invoice_detail", e),
+        Err(join_err) => internal_error(
+            "get_invoice_detail:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
     }
 }
 
@@ -3105,16 +3121,26 @@ async fn handle_get_audit(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match get_audit_for_invoice(&state, &invoice_id) {
-        Ok(entries) if entries.is_empty() => (
+    let state_for_task = state.clone();
+    let invoice_id_for_task = invoice_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        get_audit_for_invoice(&state_for_task, &invoice_id_for_task)
+    })
+    .await;
+    match result {
+        Ok(Ok(entries)) if entries.is_empty() => (
             StatusCode::NOT_FOUND,
             Json(error_body(format!(
                 "no audit ledger entries for invoice id {invoice_id}"
             ))),
         )
             .into_response(),
-        Ok(entries) => Json(entries).into_response(),
-        Err(e) => internal_error("get_audit_for_invoice", e),
+        Ok(Ok(entries)) => Json(entries).into_response(),
+        Ok(Err(e)) => internal_error("get_audit_for_invoice", e),
+        Err(join_err) => internal_error(
+            "get_audit_for_invoice:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
     }
 }
 
@@ -3151,8 +3177,14 @@ async fn handle_get_invoice_pdf(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match get_invoice_pdf(&state, &invoice_id, None) {
-        Ok(Some(rendered)) => {
+    let state_for_task = state.clone();
+    let invoice_id_for_task = invoice_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        get_invoice_pdf(&state_for_task, &invoice_id_for_task, None)
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(rendered))) => {
             let filename = pdf_filename_for_invoice(&rendered.invoice_number);
             let disposition = format!("attachment; filename=\"{filename}\"");
             (
@@ -3167,14 +3199,18 @@ async fn handle_get_invoice_pdf(
             )
                 .into_response()
         }
-        Ok(None) => (
+        Ok(Ok(None)) => (
             StatusCode::NOT_FOUND,
             Json(error_body(format!(
                 "no InvoiceDraftCreated audit entry for invoice id {invoice_id}"
             ))),
         )
             .into_response(),
-        Err(e) => internal_error("get_invoice_pdf", e),
+        Ok(Err(e)) => internal_error("get_invoice_pdf", e),
+        Err(join_err) => internal_error(
+            "get_invoice_pdf:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
     }
 }
 
@@ -5542,9 +5578,15 @@ async fn handle_get_issuance_input(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match get_issuance_input(&state, &invoice_id) {
-        Ok(Some(input)) => Json(input).into_response(),
-        Ok(None) => (
+    let state_for_task = state.clone();
+    let invoice_id_for_task = invoice_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        get_issuance_input(&state_for_task, &invoice_id_for_task)
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(input))) => Json(input).into_response(),
+        Ok(Ok(None)) => (
             StatusCode::NOT_FOUND,
             Json(error_body(format!(
                 "no side-stored issuance input for invoice {invoice_id} \
@@ -5553,7 +5595,11 @@ async fn handle_get_issuance_input(
             ))),
         )
             .into_response(),
-        Err(e) => internal_error("get_issuance_input", e),
+        Ok(Err(e)) => internal_error("get_issuance_input", e),
+        Err(join_err) => internal_error(
+            "get_issuance_input:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
     }
 }
 
@@ -5716,7 +5762,22 @@ async fn handle_mark_invoice_paid(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match mark_paid_request(&state, &invoice_id, body) {
+    let state_for_task = state.clone();
+    let invoice_id_for_task = invoice_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        mark_paid_request(&state_for_task, &invoice_id_for_task, body)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "mark_paid_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
         Ok(outcome) => Json(MarkPaidResponse {
             invoice_id,
             payment: outcome.payment.into(),
@@ -6023,7 +6084,22 @@ async fn handle_list_partners(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match list_partners_request(&state, query.search.as_deref()) {
+    let state_for_task = state.clone();
+    let search = query.search;
+    let result = tokio::task::spawn_blocking(move || {
+        list_partners_request(&state_for_task, search.as_deref())
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "list_partners_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
         Ok(partners) => Json(partners).into_response(),
         Err(PartnerRouteError::Other(e)) => internal_error("list_partners_request", e),
         Err(PartnerRouteError::Validation(_)) | Err(PartnerRouteError::NotFound) => {
@@ -6101,7 +6177,19 @@ async fn handle_create_partner(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match create_partner_request(&state, &inputs) {
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || create_partner_request(&state_for_task, &inputs)).await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "create_partner_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
         Ok(partner) => (StatusCode::CREATED, Json(partner)).into_response(),
         Err(PartnerRouteError::Validation(errors)) => partner_validation_response(errors),
         Err(PartnerRouteError::Other(e)) => internal_error("create_partner_request", e),
@@ -6139,7 +6227,20 @@ async fn handle_update_partner(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match update_partner_request(&state, &id, &inputs) {
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || update_partner_request(&state_for_task, &id, &inputs))
+            .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "update_partner_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
         Ok(partner) => Json(partner).into_response(),
         Err(PartnerRouteError::Validation(errors)) => partner_validation_response(errors),
         Err(PartnerRouteError::NotFound) => partner_not_found_response(),
@@ -6176,7 +6277,19 @@ async fn handle_delete_partner(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match delete_partner_request(&state, &id) {
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || delete_partner_request(&state_for_task, &id)).await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "delete_partner_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(PartnerRouteError::NotFound) => partner_not_found_response(),
         Err(PartnerRouteError::Other(e)) => internal_error("delete_partner_request", e),
@@ -6248,9 +6361,18 @@ async fn handle_get_notes_history(
         }
     };
     let limit = query.limit.unwrap_or(crate::notes_history::DEFAULT_LIMIT);
-    match list_notes_history_request(&state, scope, limit) {
-        Ok(notes) => Json(notes).into_response(),
-        Err(e) => internal_error("list_notes_history_request", e),
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        list_notes_history_request(&state_for_task, scope, limit)
+    })
+    .await;
+    match result {
+        Ok(Ok(notes)) => Json(notes).into_response(),
+        Ok(Err(e)) => internal_error("list_notes_history_request", e),
+        Err(join_err) => internal_error(
+            "list_notes_history_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
     }
 }
 
@@ -6340,7 +6462,22 @@ async fn handle_list_products(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match list_products_request(&state, query.search.as_deref()) {
+    let state_for_task = state.clone();
+    let search = query.search;
+    let result = tokio::task::spawn_blocking(move || {
+        list_products_request(&state_for_task, search.as_deref())
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "list_products_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
         Ok(items) => Json(items).into_response(),
         Err(ProductRouteError::Other(e)) => internal_error("list_products_request", e),
         Err(ProductRouteError::Validation(_)) | Err(ProductRouteError::NotFound) => internal_error(
@@ -6409,7 +6546,19 @@ async fn handle_create_product(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match create_product_request(&state, &inputs) {
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || create_product_request(&state_for_task, &inputs)).await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "create_product_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
         Ok(p) => (StatusCode::CREATED, Json(p)).into_response(),
         Err(ProductRouteError::Validation(errors)) => product_validation_response(errors),
         Err(ProductRouteError::Other(e)) => internal_error("create_product_request", e),
@@ -6447,7 +6596,20 @@ async fn handle_update_product(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match update_product_request(&state, &id, &inputs) {
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || update_product_request(&state_for_task, &id, &inputs))
+            .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "update_product_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
         Ok(p) => Json(p).into_response(),
         Err(ProductRouteError::Validation(errors)) => product_validation_response(errors),
         Err(ProductRouteError::NotFound) => product_not_found_response(),
@@ -6484,7 +6646,19 @@ async fn handle_delete_product(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match delete_product_request(&state, &id) {
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || delete_product_request(&state_for_task, &id)).await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "delete_product_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(ProductRouteError::NotFound) => product_not_found_response(),
         Err(ProductRouteError::Other(e)) => internal_error("delete_product_request", e),
@@ -6575,15 +6749,19 @@ async fn handle_list_incoming_invoices(
         .unwrap_or(DEFAULT_INCOMING_LIST_LIMIT)
         .min(MAX_INCOMING_LIST_LIMIT);
     let offset = query.offset.unwrap_or(0);
-    match incoming_invoices::list_incoming(
-        &state.db_path,
-        state.tenant.as_str(),
-        status_filter,
-        limit,
-        offset,
-    ) {
-        Ok(rows) => Json(rows).into_response(),
-        Err(e) => internal_error("list_incoming_invoices", e),
+    let db_path = state.db_path.clone();
+    let tenant = state.tenant.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        incoming_invoices::list_incoming(&db_path, tenant.as_str(), status_filter, limit, offset)
+    })
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(rows).into_response(),
+        Ok(Err(e)) => internal_error("list_incoming_invoices", e),
+        Err(join_err) => internal_error(
+            "list_incoming_invoices:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
     }
 }
 
@@ -6598,14 +6776,25 @@ async fn handle_get_incoming_invoice(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match incoming_invoices::get_incoming(&state.db_path, state.tenant.as_str(), &id) {
-        Ok(Some(row)) => Json(row).into_response(),
-        Ok(None) => (
+    let db_path = state.db_path.clone();
+    let tenant = state.tenant.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        incoming_invoices::get_incoming(&db_path, tenant.as_str(), &id_for_task)
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(row))) => Json(row).into_response(),
+        Ok(Ok(None)) => (
             StatusCode::NOT_FOUND,
             Json(error_body(format!("incoming invoice {id} not found"))),
         )
             .into_response(),
-        Err(e) => internal_error("get_incoming_invoice", e),
+        Ok(Err(e)) => internal_error("get_incoming_invoice", e),
+        Err(join_err) => internal_error(
+            "get_incoming_invoice:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
     }
 }
 
@@ -6639,30 +6828,40 @@ async fn handle_ingest_incoming_invoice(
         Ok(p) => p,
         Err(e) => return internal_error("ingest_incoming_invoice:artifacts_dir", e),
     };
-    match incoming_invoices::ingest_incoming_invoice(
-        &state.db_path,
-        state.tenant.clone(),
-        binary_hash,
-        &operator_login,
-        &artifacts_dir,
-        input,
-    ) {
-        Ok(incoming_invoices::IngestOutcome::Created { id }) => (
+    let db_path = state.db_path.clone();
+    let tenant = state.tenant.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        incoming_invoices::ingest_incoming_invoice(
+            &db_path,
+            tenant,
+            binary_hash,
+            &operator_login,
+            &artifacts_dir,
+            input,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(incoming_invoices::IngestOutcome::Created { id })) => (
             StatusCode::CREATED,
             Json(IngestIncomingInvoiceResponse { id, created: true }),
         )
             .into_response(),
-        Ok(incoming_invoices::IngestOutcome::AlreadyExists { id }) => (
+        Ok(Ok(incoming_invoices::IngestOutcome::AlreadyExists { id })) => (
             StatusCode::OK,
             Json(IngestIncomingInvoiceResponse { id, created: false }),
         )
             .into_response(),
-        Err(incoming_invoices::IngestError::InvalidInput(msg)) => {
+        Ok(Err(incoming_invoices::IngestError::InvalidInput(msg))) => {
             (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response()
         }
-        Err(incoming_invoices::IngestError::Other(e)) => {
+        Ok(Err(incoming_invoices::IngestError::Other(e))) => {
             internal_error("ingest_incoming_invoice", e)
         }
+        Err(join_err) => internal_error(
+            "ingest_incoming_invoice:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
     }
 }
 
@@ -6693,10 +6892,11 @@ async fn handle_mark_incoming_paid(
     mark_incoming_status_inner(
         state,
         headers,
-        &id,
+        id,
         incoming_invoices::IncomingInvoiceStatus::Paid,
         None,
     )
+    .await
 }
 
 async fn handle_mark_incoming_outstanding(
@@ -6707,10 +6907,11 @@ async fn handle_mark_incoming_outstanding(
     mark_incoming_status_inner(
         state,
         headers,
-        &id,
+        id,
         incoming_invoices::IncomingInvoiceStatus::Outstanding,
         None,
     )
+    .await
 }
 
 async fn handle_mark_incoming_irrelevant(
@@ -6722,16 +6923,17 @@ async fn handle_mark_incoming_irrelevant(
     mark_incoming_status_inner(
         state,
         headers,
-        &id,
+        id,
         incoming_invoices::IncomingInvoiceStatus::Irrelevant,
         Some(body.reason),
     )
+    .await
 }
 
-fn mark_incoming_status_inner(
+async fn mark_incoming_status_inner(
     state: AppState,
     headers: HeaderMap,
-    id: &str,
+    id: String,
     to_status: incoming_invoices::IncomingInvoiceStatus,
     reason: Option<String>,
 ) -> Response {
@@ -6746,16 +6948,23 @@ fn mark_incoming_status_inner(
         Ok(h) => h,
         Err(e) => return internal_error("mark_incoming_status:binary_hash", anyhow!(e)),
     };
-    match incoming_invoices::change_status(
-        &state.db_path,
-        state.tenant.clone(),
-        binary_hash,
-        &operator_login,
-        id,
-        to_status,
-        reason,
-    ) {
-        Ok(outcome) => Json(MarkIncomingStatusResponse {
+    let db_path = state.db_path.clone();
+    let tenant = state.tenant.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        incoming_invoices::change_status(
+            &db_path,
+            tenant,
+            binary_hash,
+            &operator_login,
+            &id_for_task,
+            to_status,
+            reason,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(outcome)) => Json(MarkIncomingStatusResponse {
             id: outcome.id,
             from_status: outcome.from_status,
             to_status: outcome.to_status,
@@ -6763,12 +6972,12 @@ fn mark_incoming_status_inner(
             entries_verified: outcome.entries_verified,
         })
         .into_response(),
-        Err(incoming_invoices::StatusChangeError::NotFound) => (
+        Ok(Err(incoming_invoices::StatusChangeError::NotFound)) => (
             StatusCode::NOT_FOUND,
             Json(error_body(format!("incoming invoice {id} not found"))),
         )
             .into_response(),
-        Err(incoming_invoices::StatusChangeError::InvalidTransition { from, to }) => (
+        Ok(Err(incoming_invoices::StatusChangeError::InvalidTransition { from, to })) => (
             StatusCode::BAD_REQUEST,
             Json(error_body(format!(
                 "transition `{from}` → `{to}` is not allowed; \
@@ -6776,16 +6985,20 @@ fn mark_incoming_status_inner(
             ))),
         )
             .into_response(),
-        Err(incoming_invoices::StatusChangeError::ReasonRequiredForIrrelevant) => (
+        Ok(Err(incoming_invoices::StatusChangeError::ReasonRequiredForIrrelevant)) => (
             StatusCode::BAD_REQUEST,
             Json(error_body(
                 "marking incoming invoice as Irrelevant requires a non-empty `reason`".into(),
             )),
         )
             .into_response(),
-        Err(incoming_invoices::StatusChangeError::Other(e)) => {
+        Ok(Err(incoming_invoices::StatusChangeError::Other(e))) => {
             internal_error("mark_incoming_status", e)
         }
+        Err(join_err) => internal_error(
+            "mark_incoming_status:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
     }
 }
 
@@ -6987,9 +7200,19 @@ async fn handle_list_restored_invoices(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match restore_outgoing::list_restored(&state.db_path, state.tenant.as_str()) {
-        Ok(rows) => Json(rows).into_response(),
-        Err(e) => internal_error("list_restored_invoices", e),
+    let db_path = state.db_path.clone();
+    let tenant = state.tenant.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        restore_outgoing::list_restored(&db_path, tenant.as_str())
+    })
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(rows).into_response(),
+        Ok(Err(e)) => internal_error("list_restored_invoices", e),
+        Err(join_err) => internal_error(
+            "list_restored_invoices:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
     }
 }
 

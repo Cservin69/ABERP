@@ -275,18 +275,6 @@ struct DigestContext<'a> {
     year: i32,
 }
 
-impl<'a> DigestContext<'a> {
-    fn from_inputs(inputs: &'a RestoreInputs) -> Self {
-        Self {
-            db_path: &inputs.db_path,
-            tenant: inputs.tenant.clone(),
-            binary_hash: inputs.binary_hash,
-            operator_login: &inputs.operator_login,
-            year: inputs.year,
-        }
-    }
-}
-
 /// S186 / PR-186 — in-memory cache of `source_nav_invoice_number`s
 /// already present in the tenant's audit ledger as
 /// `InvoiceRestoredFromNav` entries. Built ONCE per wizard run by
@@ -414,9 +402,20 @@ pub async fn run(inputs: RestoreInputs) -> Result<RestoreSummary> {
     // S186 — single ledger walk before the month-loop; cache passed
     // by &mut into walk_month / process_digest, mutated as new
     // restores succeed.
-    let mut already_restored_cache =
-        load_already_restored_cache(&inputs.db_path, inputs.tenant.clone(), inputs.binary_hash)
-            .context("pre-load already-restored cache for restore wizard")?;
+    //
+    // S191 — the ledger walk is fully synchronous DuckDB / typed
+    // JSON-decode work over potentially tens of thousands of
+    // entries; fence it inside `spawn_blocking` so the tokio worker
+    // is not held until it returns.
+    let cache_db = inputs.db_path.clone();
+    let cache_tenant = inputs.tenant.clone();
+    let cache_binary_hash = inputs.binary_hash;
+    let mut already_restored_cache = tokio::task::spawn_blocking(move || {
+        load_already_restored_cache(&cache_db, cache_tenant, cache_binary_hash)
+    })
+    .await
+    .map_err(|join_err| anyhow!("restore wizard cache-load task panicked: {join_err}"))?
+    .context("pre-load already-restored cache for restore wizard")?;
 
     let mut total_restored: u64 = 0;
     let mut total_skipped: u64 = 0;
@@ -457,7 +456,6 @@ async fn walk_month(
     date_to: &str,
     already_restored_cache: &mut AlreadyRestoredCache,
 ) -> Result<(u64, u64, u64, u32)> {
-    let ctx = DigestContext::from_inputs(inputs);
     let mut restored: u64 = 0;
     let mut skipped: u64 = 0;
     let mut errored: u64 = 0;
@@ -503,20 +501,55 @@ async fn walk_month(
         };
 
         let available_page = page_result.available_page;
-        for digest in &page_result.digests {
-            match process_digest(&ctx, digest, already_restored_cache) {
-                Ok(ProcessOutcome::Restored) => restored += 1,
-                Ok(ProcessOutcome::Skipped) => skipped += 1,
-                Err(e) => {
-                    tracing::warn!(
-                        invoice_number = %digest.invoice_number,
-                        error = ?e,
-                        "restore-from-nav: digest processing failed; continuing"
-                    );
-                    errored += 1;
+        // S191 — process the page's digests on the blocking pool so
+        // the tokio worker is not held across N synchronous DuckDB
+        // INSERT + chain-verify + mirror-sync calls. One
+        // `spawn_blocking` per page keeps the boundary-cross count at
+        // O(pages) instead of O(digests). The cache is `mem::take`n
+        // into the closure and threaded back out so the mutation
+        // posture (one cache for the whole month-walk) is preserved.
+        let digests = page_result.digests;
+        let db_path = inputs.db_path.clone();
+        let tenant = inputs.tenant.clone();
+        let binary_hash = inputs.binary_hash;
+        let operator_login = inputs.operator_login.clone();
+        let year = inputs.year;
+        let cache_taken = std::mem::take(already_restored_cache);
+        let (cache_returned, page_restored, page_skipped, page_errored) =
+            tokio::task::spawn_blocking(move || {
+                let ctx = DigestContext {
+                    db_path: &db_path,
+                    tenant,
+                    binary_hash,
+                    operator_login: &operator_login,
+                    year,
+                };
+                let mut cache = cache_taken;
+                let mut r: u64 = 0;
+                let mut s: u64 = 0;
+                let mut er: u64 = 0;
+                for digest in &digests {
+                    match process_digest(&ctx, digest, &mut cache) {
+                        Ok(ProcessOutcome::Restored) => r += 1,
+                        Ok(ProcessOutcome::Skipped) => s += 1,
+                        Err(e) => {
+                            tracing::warn!(
+                                invoice_number = %digest.invoice_number,
+                                error = ?e,
+                                "restore-from-nav: digest processing failed; continuing"
+                            );
+                            er += 1;
+                        }
+                    }
                 }
-            }
-        }
+                (cache, r, s, er)
+            })
+            .await
+            .map_err(|join_err| anyhow!("restore wizard per-page task panicked: {join_err}"))?;
+        *already_restored_cache = cache_returned;
+        restored += page_restored;
+        skipped += page_skipped;
+        errored += page_errored;
 
         if page >= available_page {
             return Ok((restored, skipped, errored, page));

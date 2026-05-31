@@ -179,6 +179,19 @@ template configured — confirm none does and it stays 🟡.
   real one for the boot tick on a tenant with a 30-day backlog or for the first
   S180 restore of a heavy year. Recommended future PR: wrap the per-digest
   body in `tokio::task::spawn_blocking`.
+  - **ADDRESSED-BY-PR-191 / S191.** AP sync's per-page digest batch and
+    `write_cycle_audit_entry` now run on `spawn_blocking`; restore-from-nav's
+    `load_already_restored_cache` and per-page `process_digest` batch also.
+    All async HTTP handlers doing non-trivial DuckDB work (outgoing list /
+    detail / audit / PDF / mark-paid / get-issuance-input / partners CRUD /
+    products CRUD / notes-history / incoming list / detail / ingest / mark-*
+    / restored list) wrap their sync helper in `spawn_blocking` at the
+    handler boundary. Single-row GET-by-id reads stay inline per the brief
+    (under ~1ms; tokio's blocking-detector does not flag them). Chain
+    handlers (issue / storno / modification / submit / poll) remain
+    unchanged — their DB work interleaves with async NAV / MNB calls inside
+    `*_request` helpers; refactoring them is outside this PR's surgical
+    scope.
 
 - **S180 — `already_restored` is O(N) per digest with a full audit-ledger walk + a
   fresh Ledger handle each call.** `apps/aberp/src/restore_from_nav_outgoing.rs:573-603`:

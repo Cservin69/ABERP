@@ -225,12 +225,36 @@ pub async fn run_one_cycle(inputs: CycleInputs, trigger: CycleTrigger) -> Result
     };
 
     // Best-effort audit-entry write. A write-failure here logs loud
-    // but does NOT mask the caller's original error.
-    if let Err(audit_err) = write_cycle_audit_entry(&inputs, &summary) {
-        tracing::warn!(
+    // but does NOT mask the caller's original error. S191 — the
+    // sync DuckDB write is fenced inside `spawn_blocking` so the
+    // tokio worker pool is not blocked for the duration of the
+    // INSERT + chain-verify + mirror-sync. `JoinError` is unified
+    // into the existing warn! surface.
+    let audit_inputs_db = inputs.db_path.clone();
+    let audit_inputs_tenant = inputs.tenant.clone();
+    let audit_inputs_binary_hash = inputs.binary_hash;
+    let audit_inputs_login = inputs.operator_login.clone();
+    let audit_summary = summary.clone();
+    let audit_outcome = tokio::task::spawn_blocking(move || {
+        write_cycle_audit_entry_inner(
+            &audit_inputs_db,
+            audit_inputs_tenant,
+            audit_inputs_binary_hash,
+            &audit_inputs_login,
+            &audit_summary,
+        )
+    })
+    .await;
+    match audit_outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(audit_err)) => tracing::warn!(
             error = %format!("{audit_err:#}"),
             "failed to write IncomingInvoiceSyncCycleCompleted audit entry"
-        );
+        ),
+        Err(join_err) => tracing::warn!(
+            error = %format!("{join_err}"),
+            "IncomingInvoiceSyncCycleCompleted audit-write task panicked"
+        ),
     }
 
     match result {
@@ -275,46 +299,66 @@ async fn run_cycle_inner(
 
         let available_page = page_result.available_page;
 
-        for digest in page_result.digests {
-            match digest_to_ingestion_input(&digest) {
-                Ok(input) => {
-                    match incoming_invoices::ingest_incoming_invoice(
-                        &inputs.db_path,
-                        inputs.tenant.clone(),
-                        inputs.binary_hash,
-                        &inputs.operator_login,
-                        &inputs.ap_artifacts_dir,
-                        input,
-                    ) {
-                        Ok(IngestOutcome::Created { .. }) => ingested_count += 1,
-                        Ok(IngestOutcome::AlreadyExists { .. }) => skipped_count += 1,
-                        Err(e) => {
-                            // A single-digest ingest failure must NOT
-                            // abort the whole cycle — the digest is
-                            // logged loud and the daemon continues.
-                            // Otherwise one malformed row from NAV
-                            // would block every subsequent row.
-                            tracing::warn!(
-                                invoice_number = %digest.invoice_number,
-                                supplier_tax = %digest.supplier_tax_number,
-                                error = ?e,
-                                "ingest_incoming_invoice failed for digest; continuing cycle"
-                            );
-                            skipped_count += 1;
+        // S191 — process the whole page's digests on the blocking
+        // pool so the tokio worker is not held across N synchronous
+        // DuckDB INSERT + chain-verify + mirror-sync calls. One
+        // `spawn_blocking` per page keeps the boundary-cross count at
+        // O(pages) instead of O(digests).
+        let digests = page_result.digests;
+        let db_path = inputs.db_path.clone();
+        let tenant = inputs.tenant.clone();
+        let binary_hash = inputs.binary_hash;
+        let operator_login = inputs.operator_login.clone();
+        let ap_artifacts_dir = inputs.ap_artifacts_dir.clone();
+        let (page_ingested, page_skipped) = tokio::task::spawn_blocking(move || {
+            let mut ingested: u64 = 0;
+            let mut skipped: u64 = 0;
+            for digest in digests {
+                match digest_to_ingestion_input(&digest) {
+                    Ok(input) => {
+                        match incoming_invoices::ingest_incoming_invoice(
+                            &db_path,
+                            tenant.clone(),
+                            binary_hash,
+                            &operator_login,
+                            &ap_artifacts_dir,
+                            input,
+                        ) {
+                            Ok(IngestOutcome::Created { .. }) => ingested += 1,
+                            Ok(IngestOutcome::AlreadyExists { .. }) => skipped += 1,
+                            Err(e) => {
+                                // A single-digest ingest failure must NOT
+                                // abort the whole cycle — the digest is
+                                // logged loud and the daemon continues.
+                                // Otherwise one malformed row from NAV
+                                // would block every subsequent row.
+                                tracing::warn!(
+                                    invoice_number = %digest.invoice_number,
+                                    supplier_tax = %digest.supplier_tax_number,
+                                    error = ?e,
+                                    "ingest_incoming_invoice failed for digest; continuing cycle"
+                                );
+                                skipped += 1;
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        invoice_number = %digest.invoice_number,
-                        supplier_tax = %digest.supplier_tax_number,
-                        error = ?e,
-                        "digest → IngestionInput conversion failed; skipping"
-                    );
-                    skipped_count += 1;
+                    Err(e) => {
+                        tracing::warn!(
+                            invoice_number = %digest.invoice_number,
+                            supplier_tax = %digest.supplier_tax_number,
+                            error = ?e,
+                            "digest → IngestionInput conversion failed; skipping"
+                        );
+                        skipped += 1;
+                    }
                 }
             }
-        }
+            (ingested, skipped)
+        })
+        .await
+        .map_err(|join_err| anyhow!("AP sync per-page ingest task panicked: {join_err}"))?;
+        ingested_count += page_ingested;
+        skipped_count += page_skipped;
 
         if page >= available_page {
             return Ok((ingested_count, skipped_count, page));
@@ -439,7 +483,18 @@ fn compute_date_window(now_utc: OffsetDateTime) -> Result<(String, String)> {
     Ok((from.format(&ISO_DATE)?, today.format(&ISO_DATE)?))
 }
 
-fn write_cycle_audit_entry(inputs: &CycleInputs, summary: &CycleSummary) -> Result<()> {
+/// S191 — owned-arg variant called from inside `spawn_blocking`. The
+/// pre-S191 `write_cycle_audit_entry(&CycleInputs, &CycleSummary)`
+/// borrowed `inputs`, which the move-closure boundary forbids;
+/// splitting the owned fields out keeps the move ergonomics clean
+/// without a wrapping `Arc<CycleInputs>` clone.
+fn write_cycle_audit_entry_inner(
+    db_path: &std::path::Path,
+    tenant: TenantId,
+    binary_hash: BinaryHash,
+    operator_login: &str,
+    summary: &CycleSummary,
+) -> Result<()> {
     let payload = IncomingInvoiceSyncCycleCompletedPayload {
         idempotency_key: IdempotencyKey::new().to_canonical_string(),
         trigger: summary.trigger.as_audit_str().to_string(),
@@ -452,13 +507,13 @@ fn write_cycle_audit_entry(inputs: &CycleInputs, summary: &CycleSummary) -> Resu
         error: summary.error.clone(),
     };
     let session_id = Ulid::new().to_string();
-    let actor = Actor::from_local_cli(session_id, &inputs.operator_login);
-    let ledger_meta = audit_ledger::LedgerMeta::new(inputs.tenant.clone(), inputs.binary_hash);
+    let actor = Actor::from_local_cli(session_id, operator_login);
+    let ledger_meta = audit_ledger::LedgerMeta::new(tenant.clone(), binary_hash);
 
-    let mut conn = duckdb::Connection::open(&inputs.db_path).with_context(|| {
+    let mut conn = duckdb::Connection::open(db_path).with_context(|| {
         format!(
             "open tenant DuckDB at {} for AP sync cycle audit entry",
-            inputs.db_path.display()
+            db_path.display()
         )
     })?;
     audit_ledger::ensure_schema(&conn)
@@ -479,12 +534,12 @@ fn write_cycle_audit_entry(inputs: &CycleInputs, summary: &CycleSummary) -> Resu
         .context("commit DuckDB transaction (AP sync cycle audit entry)")?;
     drop(conn);
 
-    let ledger = Ledger::open(&inputs.db_path, inputs.tenant.clone(), inputs.binary_hash)
+    let ledger = Ledger::open(db_path, tenant, binary_hash)
         .context("open audit ledger to verify chain after AP sync cycle entry")?;
     ledger
         .verify_chain()
         .context("audit-ledger chain verification failed AFTER AP sync cycle entry")?;
-    let mirror_path = audit_ledger::mirror_path_for(&inputs.db_path);
+    let mirror_path = audit_ledger::mirror_path_for(db_path);
     ledger
         .sync_mirror(&mirror_path)
         .context("sync audit-ledger mirror file after AP sync cycle entry")?;
