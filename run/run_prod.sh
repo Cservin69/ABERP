@@ -119,6 +119,61 @@ echo "${c_red}  seller.toml:  ${PROD_SELLER_TOML}${c_rst}" >&2
 echo "${c_red}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c_rst}" >&2
 echo >&2
 
+# ---------- pre-flight: Frankenstein-build refusal (S200 / PR-200) ----------
+# Refuses to compile-and-launch from a tree the operator has hand-edited
+# (uncommitted changes) OR a HEAD that doesn't match any origin/PROD_v*
+# release branch. Both checks together prevent the failure mode where
+# Ervin's recovery dance (cp'ing files to "fix" a prior cutover failure)
+# leaves the tree dirty AND no longer pointed at a known release ref —
+# the resulting binary is a one-off Frankenstein with no provenance.
+#
+# Opt-out: ABERP_SKIP_GIT_CHECK=1 (for dev workflows that intentionally
+# launch from main or a feature branch — never for real prod).
+if [[ "${ABERP_SKIP_GIT_CHECK:-0}" != "1" ]]; then
+  if [[ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]]; then
+    echo "${c_red}❌ Working tree has uncommitted changes — refusing to launch a Frankenstein build.${c_rst}" >&2
+    echo "${c_red}   A munkakönyvtár nincs tiszta — Frankenstein-bináris indítása megtagadva.${c_rst}" >&2
+    echo >&2
+    echo "   Recommended: ./run/upgrade_prod.sh <PROD_vX.Y>  (single-command clean upgrade)" >&2
+    echo "   Manual:      git status, then git reset --hard origin/<your-branch> + git clean -fd" >&2
+    echo "   Bypass:      ABERP_SKIP_GIT_CHECK=1 ./run/run_prod.sh  (dev workflows only)" >&2
+    echo >&2
+    exit 1
+  fi
+
+  # Confirm HEAD matches some origin/PROD_v* branch tip. A detached HEAD
+  # or a feature branch reaching here means the operator launched
+  # something other than a published release — refuse.
+  local_head="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)"
+  matched_branch=""
+  while IFS= read -r remote_branch; do
+    [[ -z "$remote_branch" ]] && continue
+    remote_head="$(git -C "$REPO_ROOT" rev-parse "$remote_branch" 2>/dev/null || true)"
+    if [[ -n "$remote_head" && "$local_head" == "$remote_head" ]]; then
+      matched_branch="$remote_branch"
+      break
+    fi
+  done < <(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' refs/remotes/origin/PROD_v* 2>/dev/null || true)
+
+  if [[ -z "$matched_branch" ]]; then
+    echo "${c_red}❌ HEAD doesn't match any origin/PROD_v* branch — refusing to launch.${c_rst}" >&2
+    echo "${c_red}   A HEAD nem egyezik egyik origin/PROD_v* branch-csel sem — indítás megtagadva.${c_rst}" >&2
+    echo >&2
+    echo "   HEAD is at: $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo '?')" >&2
+    echo >&2
+    echo "   Recommended: ./run/upgrade_prod.sh <PROD_vX.Y>  (single-command clean upgrade)" >&2
+    echo "   Bypass:      ABERP_SKIP_GIT_CHECK=1 ./run/run_prod.sh  (dev workflows only)" >&2
+    echo >&2
+    exit 1
+  fi
+  echo "${c_grn}✓ HEAD matches ${matched_branch} — safe to launch.${c_rst}" >&2
+  echo >&2
+else
+  echo "${c_yel}[bypass] ABERP_SKIP_GIT_CHECK=1 — skipping Frankenstein-build refusal.${c_rst}" >&2
+  echo "${c_yel}[bypass] ABERP_SKIP_GIT_CHECK=1 — Frankenstein-ellenőrzés kikapcsolva.${c_rst}" >&2
+  echo >&2
+fi
+
 # ---------- pre-flight: free port 5173 (stale-Vite cleanup) ----------------
 # Defense-in-depth: the S169 release binary embeds the SPA via
 # tauri/custom-protocol and does NOT touch :5173 at runtime. But Ervin

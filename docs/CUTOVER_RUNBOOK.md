@@ -1,11 +1,12 @@
 # ABERP production cutover runbook
 
-**Last updated:** 2026-05-31 — Session 198 / PR-198 (troubleshooting
+**Last updated:** 2026-05-31 — Session 200 / PR-200 (`upgrade_prod.sh`
+one-command hülye-biztos upgrade + `run_prod.sh` Frankenstein-build
+refusal — see Step 9 rewrite).
+**Prior update:** 2026-05-31 — Session 198 / PR-198 (troubleshooting
 entries for the PROD_v1.1→v1.3 cutover wrinkles + Appendix A inventory
 extended per ADR-0055 to name `ap-artifacts/`, `ap_invoice`, and
 `restored_invoice`).
-**Prior update:** 2026-05-30 — Session 170 / PR-170 (identity-write
-preserves SMTP + numbering, snapshot-prod.sh, real Áben logo).
 **Audience:** Ervin (sole operator).
 **Language:** EN-primary; HU clarifications inline where they help at the
 machine.
@@ -477,57 +478,104 @@ fix it by reverting code.
 ## Step 9 — Ongoing update workflow
 
 Routine: dev work continues to land on `main`. When you want a fix or
-feature to reach prod:
-
-> **⚠️ BEFORE, not after.** The snapshot below MUST run BEFORE you run
-> `git checkout PROD_vX.Y` or `./run/run_prod.sh` against the new
-> release. A snapshot taken AFTER the upgrade captures post-upgrade
-> state — it is useless as a rollback handle for the upgrade itself.
-> This is the PROD_v1.1→v1.3 lesson (2026-05-31): the operator who
-> snapshots after upgrade thinks they are protected and is not. If
-> you forgot, see Troubleshooting → "Forgot to snapshot before
-> upgrade" below.
+feature to reach prod, **one command** does the whole upgrade on the
+prod side. S200 / PR-200 introduced `./run/upgrade_prod.sh` after Ervin
+hit the bare-`git checkout`-on-dirty-tree failure three times across
+PROD_v1.0 → v1.4 cutovers; the script enforces the BEFORE-snapshot
+ordering, refuses to swap a running binary, and does the full clean
+git switch (`fetch` → `reset --hard` → `clean -fd` → `checkout -B`)
+that the operator was doing piecewise (and getting wrong).
 
 ```bash
-# 1. *** REQUIRED — RUN THIS FIRST, BEFORE ANY git checkout *** 
-#    Snapshot current prod state BEFORE switching release branches.
-#    This is the recovery handle if the new release has a bug that
-#    costs operator state (the S170 prod-update pilot lost SMTP +
-#    numbering this way; PR-170 fixed the write path but we still
-#    snapshot every upgrade defense-in-depth).
-#
-#    The snapshot captures the full ~/.aberp/prod/ tenant directory
-#    (seller.toml + DuckDB + side-store invoices + audit log + first-
-#    launch touchfile) AND the per-tenant macOS keychain entries
-#    (NAV credentials blob + SMTP password) into a password-protected
-#    zip. Snapshots land in ~/aberp-snapshots/. It ALSO drops a small
-#    contract file at ~/.aberp/prod/.upgrade-snapshot.toml carrying
-#    the [seller.smtp] + [seller.numbering] sections — the next boot
-#    of the new binary compares it against the post-upgrade
-#    seller.toml and REFUSES to start if either section drifted
-#    (S171). You don't need to manually verify SMTP + numbering
-#    after the upgrade; the binary catches it.
-./tools/snapshot-prod.sh
-# (will prompt twice for an encryption password — pick one you can
-#  remember; you need it to restore.)
-
-# 2. From the DEV clone: publish a new release branch.
+# 1. From the DEV clone: publish a new release branch.
 cd ~/Documents/Claude/Projects/ABERP
 git checkout main
 git pull --ff-only origin main
-./run/release.sh PROD_v1.1     # bump the minor
+./run/release.sh PROD_v1.5         # bump the minor
 
-# 3. On the PROD clone: pull the new release branch.
+# 2. On the PROD clone: Ctrl-C the running prod app in its terminal
+#    (do NOT skip this — upgrade_prod.sh refuses to swap a running
+#    binary by design).
+
+# 3. On the PROD clone: ONE command runs the whole upgrade.
+cd ~/ABERP-prod
+./run/upgrade_prod.sh PROD_v1.5
+# (will prompt twice for the snapshot's encryption password — pick
+#  one you can remember; you need it to restore from this snapshot.)
+
+# 4. Smoke-test on a low-stakes path before bulk-issuing.
+```
+
+What `upgrade_prod.sh` does, in order (all failures loud-fail with
+bilingual error + recovery hint):
+
+1. Validates the version arg matches `PROD_v<MAJOR>.<MINOR>`.
+2. Refuses if invoked from the dev workspace (path-substring sentinel,
+   same as `release.sh`). Opt-out: `ABERP_ALLOW_DEV_WORKSPACE=1`.
+3. Verifies `origin` works + the release branch exists on it
+   (`git ls-remote --exit-code --heads origin <branch>`).
+4. Verifies `~/.aberp/<tenant>/seller.toml` exists (refuses an upgrade
+   against a tenant that was never set up — that's the cutover path,
+   not the upgrade path).
+5. Refuses if `aberp-ui` or `aberp` is still running. The operator
+   must Ctrl-C the run_prod.sh terminal first; don't hot-swap a
+   running binary.
+6. **Snapshots BEFORE switching** — runs `./tools/snapshot-prod.sh
+   <tenant>` (captures the full tenant dir + the per-tenant macOS
+   keychain entries to a password-protected zip under
+   `~/aberp-snapshots/`, plus the `[seller.smtp]` + `[seller.numbering]`
+   contract at `~/.aberp/<tenant>/.upgrade-snapshot.toml` that S171's
+   boot-time drift check reads). Operator can't forget the
+   BEFORE-not-after ordering: the script does it.
+7. Full clean git switch: `git fetch` → `git reset --hard HEAD`
+   → `git clean -fd` → `git checkout -B <branch> origin/<branch>`
+   → `git reset --hard origin/<branch>` (belt-and-suspenders).
+8. Prunes stale local `PROD_v*` branches (everything except the
+   target). Local `main` is left alone (operator may want it).
+9. Verifies clean tree + `HEAD == origin/<branch>` before launching.
+10. `exec ./run/run_prod.sh` — transfers control; one terminal, one
+    continuous output stream. Ctrl-C in this terminal exits the
+    relaunched app.
+
+When the binary boots after the swap, `run_prod.sh` also re-checks
+the working tree is clean and HEAD matches an `origin/PROD_v*` branch
+(S200 / PR-200 Frankenstein-build refusal). If the operator somehow
+got into a state where the tree drifted between `upgrade_prod.sh`
+finishing and `run_prod.sh` starting, the launcher refuses. Opt-out:
+`ABERP_SKIP_GIT_CHECK=1` (dev workflows only).
+
+### Manual escape hatch
+
+If `upgrade_prod.sh` itself errors and you need to force the upgrade
+manually (very first cutover from a pre-S200 clone; script not yet
+present on disk; or a corrupted `tools/snapshot-prod.sh` you need to
+work around), here's the equivalent raw sequence:
+
+```bash
+# 1. Snapshot first — BEFORE, not after.
+./tools/snapshot-prod.sh prod
+
+# 2. Stop the running app (Ctrl-C in the run_prod.sh terminal).
+
+# 3. Full clean switch.
 cd ~/ABERP-prod
 git fetch origin
-git checkout PROD_v1.1
+git reset --hard HEAD                            # drop tracked mods
+git clean -fd                                    # drop untracked
+git checkout -B PROD_v1.5 origin/PROD_v1.5       # create/reset + switch
+git reset --hard origin/PROD_v1.5                # belt-and-suspenders
 
-# 4. Stop the running app (Ctrl-C in the run_prod.sh terminal),
-#    then relaunch:
+# 4. Verify.
+git status              # must be clean
+git rev-parse HEAD      # must match origin/PROD_v1.5
+
+# 5. Launch.
 ./run/run_prod.sh
-
-# 5. Smoke-test on a low-stakes path before bulk-issuing.
 ```
+
+The `upgrade_prod.sh` script automates this sequence and adds the
+checks (running-binary, branch-exists, dev-sentinel) — prefer the
+script whenever it's available.
 
 ### Restoring from a snapshot
 
@@ -889,6 +937,7 @@ the reason the runbook bangs the snapshot-the-DB drum at every step.
 |------------|---------|
 | Publish a release branch (from dev) | `./run/release.sh PROD_vX.Y` |
 | Clone a release on the prod machine | `git clone --branch PROD_vX.Y <origin-url> ABERP-prod` |
+| Upgrade an existing prod install to a new release | `./run/upgrade_prod.sh PROD_vX.Y` |
 | Launch the prod app | `./run/run_prod.sh` |
 | Set up / rotate NAV creds | SPA NAV credentials wizard (boot route, S133) |
 | Set up / rotate SMTP creds | SPA → Tenant Settings → SMTP → Test Connection → Save |
