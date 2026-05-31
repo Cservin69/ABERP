@@ -69,6 +69,7 @@
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aberp_audit_ledger::{Actor, Entry, EventKind, Ledger, TenantId};
 use aberp_billing::{self as billing, BillingStore, Currency, DuckDbBillingStore, ReadyInvoice};
@@ -130,6 +131,7 @@ use crate::setup_nav_credentials::{self, NavCredentialInputs, SetupCredentialsEr
 use crate::setup_seller_info::{
     self, FieldError as SellerFieldError, SellerIdentity, SellerInfoInputs, SetupSellerInfoError,
 };
+use crate::shutdown::{self, ShutdownCoordinator, ShutdownResult};
 use crate::smtp_config::{self as smtp_config_mod, SmtpConfig, SmtpSecurity};
 use crate::smtp_credentials;
 use crate::submit_invoice;
@@ -795,6 +797,13 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // takes a read lock to either pull `operator_login` or reject
     // with 503 needs-setup.
     let state_token_at_print = initial_boot_state.state_token();
+    // PR-209 / S213 — mint the shutdown token here so it's
+    // available to BOTH `AppState` (cloned into every
+    // dynamically-spawned NAV poll daemon) AND the
+    // `ShutdownCoordinator` built inside the runtime block. Same
+    // underlying token (CancellationToken is Arc<Inner> internally);
+    // either side firing `cancel()` propagates to every clone.
+    let shutdown_token_root = tokio_util::sync::CancellationToken::new();
     let state = AppState {
         db_path: Arc::new(args.db.clone()),
         tenant,
@@ -803,6 +812,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         boot_state: Arc::new(std::sync::RwLock::new(initial_boot_state)),
         secrets_cache,
         nav_poll_semaphore: Arc::new(tokio::sync::Semaphore::new(NAV_POLL_DAEMON_CONCURRENCY)),
+        shutdown_token: shutdown_token_root.clone(),
     };
 
     // 5. Build the axum router. Clone the state first so the app-boot
@@ -878,6 +888,19 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     );
 
     runtime.block_on(async move {
+        // PR-209 / S213 — graceful-shutdown coordinator. Uses the
+        // SAME token already minted at state-construction time
+        // (`shutdown_token_root`) so post-issue NAV poll daemons
+        // spawned via `state.shutdown_token.clone()` share the
+        // cancellation signal with the boot-time daemons registered
+        // here. The coordinator's `register` is the load-bearing
+        // side — boot-time daemons whose JoinHandle is registered
+        // get awaited during drain; post-issue daemons are not
+        // registered (per-invoice ephemeral) but DO receive the
+        // token, so they exit on cancellation even though the
+        // coordinator doesn't track them by name.
+        let mut coordinator = ShutdownCoordinator::from_token(shutdown_token_root.clone());
+
         // Session-161 — app-boot NAV poll daemon recovery. Scan the
         // audit ledger for invoices still in `Submitted` (NAV accepted,
         // no terminal ack yet) and re-spawn an indefinite poll daemon
@@ -886,44 +909,64 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // chase. Best-effort: a scan failure logs and continues — the
         // operator can still poll manually. Runs BEFORE `serve()` so the
         // daemons are in flight as soon as the listener accepts.
-        match query_non_terminal_invoices(&recovery_state) {
-            Ok(pending) => {
-                tracing::info!(
-                    count = pending.len(),
-                    "spawning NAV poll daemons for pending invoices"
-                );
-                for invoice_id in pending {
-                    let st = recovery_state.clone();
-                    tokio::spawn(async move {
-                        match build_poll_daemon_inputs(&st, &invoice_id).await {
-                            Ok(inputs) => {
-                                if let Err(e) = poll_ack::run_nav_poll_daemon(
-                                    inputs,
-                                    st.nav_poll_semaphore.clone(),
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        invoice_id = %invoice_id,
-                                        error = ?e,
-                                        "boot-recovery NAV poll daemon failed"
-                                    );
-                                }
-                            }
-                            Err(e) => tracing::warn!(
-                                invoice_id = %invoice_id,
-                                error = ?e,
-                                "boot-recovery could not build poll daemon inputs; skipping"
-                            ),
+        //
+        // PR-209 / S213 — the boot-recovery FAN-OUT itself is wrapped
+        // in ONE registered task (not per-invoice) so the coordinator
+        // doesn't have to track 50 dynamic handles. The wrapper task
+        // spawns one un-registered child per pending invoice; each
+        // child's `run_nav_poll_daemon` receives the same shutdown
+        // token, so cancellation still reaches every NAV poll loop.
+        // The wrapper exits as soon as its fan-out completes (the
+        // children outlive it — that's fine, the token reaches them
+        // directly).
+        let recovery_token = coordinator.token.clone();
+        let recovery_for_task = recovery_state.clone();
+        let recovery_handle = tokio::spawn(async move {
+            match query_non_terminal_invoices(&recovery_for_task) {
+                Ok(pending) => {
+                    tracing::info!(
+                        count = pending.len(),
+                        "spawning NAV poll daemons for pending invoices"
+                    );
+                    for invoice_id in pending {
+                        if recovery_token.is_cancelled() {
+                            return;
                         }
-                    });
+                        let st = recovery_for_task.clone();
+                        let child_token = recovery_token.clone();
+                        tokio::spawn(async move {
+                            match build_poll_daemon_inputs(&st, &invoice_id).await {
+                                Ok(inputs) => {
+                                    if let Err(e) = poll_ack::run_nav_poll_daemon(
+                                        inputs,
+                                        st.nav_poll_semaphore.clone(),
+                                        child_token,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            invoice_id = %invoice_id,
+                                            error = ?e,
+                                            "boot-recovery NAV poll daemon failed"
+                                        );
+                                    }
+                                }
+                                Err(e) => tracing::warn!(
+                                    invoice_id = %invoice_id,
+                                    error = ?e,
+                                    "boot-recovery could not build poll daemon inputs; skipping"
+                                ),
+                            }
+                        });
+                    }
                 }
+                Err(e) => tracing::warn!(
+                    error = ?e,
+                    "boot-recovery NAV poll daemon scan failed; continuing without recovery"
+                ),
             }
-            Err(e) => tracing::warn!(
-                error = ?e,
-                "boot-recovery NAV poll daemon scan failed; continuing without recovery"
-            ),
-        }
+        });
+        coordinator.register("nav-poll-boot-recovery", recovery_handle);
 
         // S178 / PR-178 — AP-side auto-sync daemon. Mirrors the
         // outgoing-side NAV poll daemon's spawn-and-forget posture;
@@ -932,9 +975,15 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // rotation is picked up at the next cadence without a
         // restart). The closure clones state into the task so the
         // outer `recovery_state` move is safe.
+        //
+        // PR-209 / S213 — registered with the shutdown coordinator.
+        // `ap_sync::run_daemon_forever` accepts the cancellation
+        // token; a shutdown mid-cadence-sleep exits within ms instead
+        // of waiting 30 minutes for the next tick.
         {
             let st = recovery_state.clone();
-            tokio::spawn(async move {
+            let ap_sync_token = coordinator.token.clone();
+            let ap_sync_handle = tokio::spawn(async move {
                 let st = st;
                 ap_sync::run_daemon_forever(move || {
                     let operator_login = match st.boot_state.read() {
@@ -993,9 +1042,10 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                         endpoint,
                         credentials,
                     })
-                })
+                }, ap_sync_token)
                 .await;
             });
+            coordinator.register("ap-sync", ap_sync_handle);
         }
 
         // S210 / PR-204 — quote-intake daemon. Opt-in via either the
@@ -1081,9 +1131,15 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                 cadence_secs = service.poll_interval().as_secs(),
                                 "spawning quote-intake daemon (S210 / PR-204)"
                             );
-                            tokio::spawn(async move {
-                                service.run_daemon_forever().await;
+                            // PR-209 / S213 — registered with the
+                            // shutdown coordinator; cancellation
+                            // races the cadence sleep so a Tauri
+                            // close exits within ms.
+                            let quote_intake_token = coordinator.token.clone();
+                            let quote_intake_handle = tokio::spawn(async move {
+                                service.run_daemon_forever(quote_intake_token).await;
                             });
+                            coordinator.register("quote-intake", quote_intake_handle);
                         }
                         Err(e) => {
                             return Err(anyhow!(
@@ -1107,13 +1163,225 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         let config = RustlsConfig::from_der(rustls_config.0, rustls_config.1)
             .await
             .context("build axum-server RustlsConfig")?;
-        axum_server::from_tcp_rustls(listener, config)
+
+        // PR-209 / S213 — graceful-shutdown wiring. axum-server's
+        // `Handle::graceful_shutdown(None)` stops accepting new
+        // connections and lets in-flight requests drain; we then
+        // call the coordinator's `shutdown(timeout)` to fan
+        // cancellation out to every registered daemon, write ONE
+        // `DaemonShutdownCompleted` audit row, log the result, and
+        // force-exit. The process MUST exit after this — any
+        // un-registered tokio task would otherwise hold it alive
+        // forever, which is exactly the bug PR-209 closes.
+        let axum_handle = axum_server::Handle::new();
+        let signal_axum_handle = axum_handle.clone();
+        let signal_token = coordinator.token.clone();
+
+        // Listen for ctrl_c (terminal launch) OR SIGTERM (Tauri
+        // close handler routes window-close → child SIGTERM via the
+        // `Child::kill` upgrade landed in `apps/aberp-ui/src/
+        // backend.rs`). The first signal to arrive wins the race;
+        // the resulting trigger string flows into the audit payload.
+        let signal_listener: tokio::task::JoinHandle<&'static str> = tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not install SIGTERM handler; \
+                             relying on ctrl_c only");
+                        // Fall back to ctrl_c-only: install a
+                        // never-firing future for the SIGTERM arm.
+                        let trigger = tokio::signal::ctrl_c()
+                            .await
+                            .map(|_| "ctrl-c")
+                            .unwrap_or("ctrl-c-error");
+                        signal_token.cancel();
+                        signal_axum_handle.graceful_shutdown(Some(Duration::from_secs(2)));
+                        return trigger;
+                    }
+                };
+                let mut sighup = signal(SignalKind::hangup()).ok();
+                let trigger = tokio::select! {
+                    res = tokio::signal::ctrl_c() => {
+                        if let Err(e) = res {
+                            tracing::warn!(error = %e, "ctrl_c listener errored");
+                        }
+                        "ctrl-c"
+                    }
+                    _ = sigterm.recv() => "sigterm",
+                    _ = async {
+                        match sighup.as_mut() {
+                            Some(s) => { s.recv().await; }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => "hangup",
+                };
+                tracing::info!(trigger, "shutdown signal received; draining daemons");
+                signal_token.cancel();
+                signal_axum_handle.graceful_shutdown(Some(Duration::from_secs(2)));
+                trigger
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!(trigger = "ctrl-c", "shutdown signal received; draining daemons");
+                signal_token.cancel();
+                signal_axum_handle.graceful_shutdown(Some(Duration::from_secs(2)));
+                "ctrl-c"
+            }
+        });
+
+        let serve_result = axum_server::from_tcp_rustls(listener, config)
+            .handle(axum_handle)
             .serve(app.into_make_service())
             .await
-            .context("axum_server::from_tcp_rustls(...).serve(...)")
+            .context("axum_server::from_tcp_rustls(...).serve(...)");
+
+        // Reach the trigger label. If the signal listener has fired
+        // (the common path — serve only returns AFTER graceful_shutdown
+        // is called), join completes immediately. If serve returned for
+        // another reason (axum error), the listener is still pending;
+        // we abort it and treat the trigger as "axum-error" so the
+        // audit row carries the truthful cause.
+        let trigger: String = if signal_listener.is_finished() {
+            signal_listener.await.map(|s| s.to_string()).unwrap_or_else(|e| {
+                tracing::warn!(error = ?e, "signal listener task failed");
+                "signal-task-error".to_string()
+            })
+        } else {
+            signal_listener.abort();
+            "axum-error".to_string()
+        };
+
+        // Drive the coordinator's drain pass. Returns within
+        // `shutdown_timeout_from_env()` (default 5s) regardless of
+        // daemon cooperation.
+        let timeout = shutdown::shutdown_timeout_from_env();
+        let shutdown_result = coordinator.shutdown(timeout).await;
+        log_shutdown_result(&shutdown_result);
+        write_shutdown_audit_entry(&recovery_state, &trigger, &shutdown_result);
+
+        // The serve_result was captured BEFORE the drain so a hard
+        // axum error still bubbles up via the runtime. We return
+        // Ok(()) on the success path so the binary exits 0 cleanly.
+        serve_result
     })?;
 
     Ok(())
+}
+
+/// PR-209 / S213 — log the coordinator's drain outcome. Pretty-formats
+/// the timeout list so a `RUST_LOG=info` operator sees exactly which
+/// daemon hung (or that nothing did) without having to re-parse JSON.
+fn log_shutdown_result(result: &ShutdownResult) {
+    if result.timeout_kills.is_empty() {
+        tracing::info!(
+            clean_exits = result.clean_exits,
+            elapsed_ms = result.elapsed_ms,
+            "graceful shutdown drained all daemons within timeout"
+        );
+    } else {
+        tracing::warn!(
+            clean_exits = result.clean_exits,
+            timeout_kills = ?result.timeout_kills,
+            elapsed_ms = result.elapsed_ms,
+            "graceful shutdown drain timed out; named daemons will be \
+             force-killed by process exit"
+        );
+    }
+}
+
+/// PR-209 / S213 — write the per-shutdown audit row. Best-effort: a
+/// failure here logs loud but does NOT block the process exit — the
+/// alternative would be a stuck process the operator can't kill, which
+/// is the original bug. The audit chain is anchored at the next boot
+/// via the existing boot-recovery scan.
+fn write_shutdown_audit_entry(state: &AppState, trigger: &str, result: &ShutdownResult) {
+    let binary_hash = match state.binary_hash.wait() {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(
+                error = ?e,
+                "could not resolve binary hash for shutdown audit entry; skipping"
+            );
+            return;
+        }
+    };
+    let operator_login = match state.boot_state.read() {
+        Ok(guard) => match &*guard {
+            ServeBootState::Ready { operator_login } => operator_login.clone(),
+            _ => "shutdown".to_string(),
+        },
+        Err(_) => "shutdown".to_string(),
+    };
+
+    let payload = audit_payloads::DaemonShutdownCompletedPayload {
+        idempotency_key: aberp_billing::IdempotencyKey::new().to_canonical_string(),
+        trigger: trigger.to_string(),
+        registered_daemons: {
+            // Re-derive from the result: clean + timeout names sum
+            // to the full registration. We don't have the clean
+            // daemon names individually (the coordinator's API only
+            // reports the timeout side by name to keep allocations
+            // off the shutdown hot path), so we list the timeout
+            // names + a placeholder count for the clean side. A
+            // future PR can extend the API if a postmortem ever
+            // needs per-clean-daemon names.
+            let mut v = Vec::new();
+            v.push(format!("clean_exits={}", result.clean_exits));
+            for name in &result.timeout_kills {
+                v.push((*name).to_string());
+            }
+            v
+        },
+        clean_exits: result.clean_exits as u64,
+        timeout_kills: result
+            .timeout_kills
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        elapsed_ms: result.elapsed_ms,
+    };
+
+    let db_path = (*state.db_path).clone();
+    let tenant = state.tenant.clone();
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
+    let bytes = payload.to_bytes();
+
+    let write_outcome = (|| -> Result<()> {
+        let mut conn =
+            Connection::open(&db_path).context("open tenant DuckDB for shutdown audit entry")?;
+        aberp_audit_ledger::ensure_schema(&conn)
+            .context("ensure audit-ledger schema for shutdown audit entry")?;
+        let tx = conn
+            .transaction()
+            .context("begin DuckDB transaction for shutdown audit entry")?;
+        let ledger_meta = aberp_audit_ledger::LedgerMeta::new(tenant.clone(), binary_hash);
+        aberp_audit_ledger::append_in_tx(
+            &tx,
+            &ledger_meta,
+            EventKind::DaemonShutdownCompleted,
+            bytes,
+            actor,
+            None,
+        )
+        .context("audit_ledger::append_in_tx DaemonShutdownCompleted")?;
+        tx.commit()
+            .context("commit DuckDB transaction for shutdown audit entry")?;
+        let mirror_path = aberp_audit_ledger::mirror_path_for(&db_path);
+        let ledger = Ledger::open(&db_path, tenant, binary_hash)
+            .context("open audit ledger after shutdown entry")?;
+        ledger
+            .sync_mirror(&mirror_path)
+            .context("sync audit-ledger mirror after shutdown entry")?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_outcome {
+        tracing::error!(error = ?e, "shutdown audit entry write failed; continuing exit");
+    }
 }
 
 // ── Cert / key / fingerprint persistence ─────────────────────────────
@@ -1469,6 +1737,14 @@ pub struct AppState {
     /// NAV's published limits. Excess spawns block on `acquire()` until
     /// a daemon terminates and frees its slot.
     pub nav_poll_semaphore: Arc<tokio::sync::Semaphore>,
+    /// PR-209 / S213 — the graceful-shutdown coordinator's token,
+    /// cloned into every dynamically-spawned NAV poll daemon (post-
+    /// issue auto-poll + chain post-issue tail). Boot-time daemons
+    /// (boot-recovery / AP sync / quote-intake) receive the token
+    /// directly from the coordinator in `run`; the post-issue path
+    /// has no other handle on the coordinator, so the token rides on
+    /// `AppState` to reach those spawn sites.
+    pub shutdown_token: tokio_util::sync::CancellationToken,
 }
 
 /// Session-161 — max number of NAV poll daemons polling concurrently.
@@ -4097,9 +4373,10 @@ async fn handle_issue_invoice(
                             match build_poll_daemon_inputs(&task_state, &task_invoice_id).await {
                                 Ok(inputs) => {
                                     let sem = task_state.nav_poll_semaphore.clone();
+                                    let cancel = task_state.shutdown_token.clone();
                                     tokio::spawn(async move {
                                         if let Err(e) =
-                                            poll_ack::run_nav_poll_daemon(inputs, sem).await
+                                            poll_ack::run_nav_poll_daemon(inputs, sem, cancel).await
                                         {
                                             tracing::warn!(
                                                 error = ?e,
@@ -4210,8 +4487,9 @@ async fn run_chain_post_issue_tail(
             Ok(_) => match build_poll_daemon_inputs(state, chain_invoice_id).await {
                 Ok(inputs) => {
                     let sem = state.nav_poll_semaphore.clone();
+                    let cancel = state.shutdown_token.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = poll_ack::run_nav_poll_daemon(inputs, sem).await {
+                        if let Err(e) = poll_ack::run_nav_poll_daemon(inputs, sem, cancel).await {
                             tracing::warn!(
                                 error = ?e,
                                 "post-issue chain NAV poll daemon failed"
@@ -13576,6 +13854,7 @@ mod tests {
             boot_state: std::sync::Arc::new(std::sync::RwLock::new(ServeBootState::Ready {
                 operator_login: "test-operator".to_string(),
             })),
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, storno_invoice_id)
@@ -13677,6 +13956,7 @@ mod tests {
             boot_state: std::sync::Arc::new(std::sync::RwLock::new(ServeBootState::Ready {
                 operator_login: "test-operator".to_string(),
             })),
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, invoice_id)

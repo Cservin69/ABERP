@@ -279,6 +279,7 @@ fn rotation_preserves_other_three_fields() {
         nav_poll_semaphore: Arc::new(tokio::sync::Semaphore::new(
             aberp::serve::NAV_POLL_DAEMON_CONCURRENCY,
         )),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
     };
 
     // Rotate password only.

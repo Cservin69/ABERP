@@ -81,12 +81,14 @@ pub struct BackendHandle {
     pub session_token: String,
     pub client: reqwest::Client,
     pub tenant: String,
-    #[allow(dead_code)]
     // Kept alive for the lifetime of the Tauri shell so the child is
     // killed when the shell exits. `tokio::process::Child::drop`
-    // already kills by default; the Arc<Mutex<_>> shape lets a
-    // future PR add a graceful-shutdown command without re-plumbing.
-    child: Arc<Mutex<Child>>,
+    // already kills by default; PR-209 / S213 surfaced this field
+    // as `pub` so the close-event handler in `lib.rs` can read the
+    // child PID and send SIGTERM for graceful shutdown BEFORE the
+    // Child is dropped (the drop's SIGKILL is the fallback, not the
+    // primary exit path).
+    pub child: Arc<Mutex<Child>>,
 }
 
 impl BackendHandle {

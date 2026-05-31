@@ -65,6 +65,7 @@ pub mod seller_toml_backup;
 pub mod serve;
 pub mod setup_nav_credentials;
 pub mod setup_seller_info;
+pub mod shutdown;
 pub mod smtp_config;
 pub mod smtp_credentials;
 pub mod submission_queue;

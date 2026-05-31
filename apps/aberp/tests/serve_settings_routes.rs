@@ -159,6 +159,7 @@ fn build_state_for(tenant: &str, db_path: PathBuf) -> AppState {
         boot_state: Arc::new(std::sync::RwLock::new(ServeBootState::Ready {
             operator_login: "old-login".to_string(),
         })),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
     }
 }
 

@@ -59,6 +59,7 @@ fn build_state(boot_state: ServeBootState, tenant: &str) -> AppState {
         nav_poll_semaphore: Arc::new(tokio::sync::Semaphore::new(
             aberp::serve::NAV_POLL_DAEMON_CONCURRENCY,
         )),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
     }
 }
 

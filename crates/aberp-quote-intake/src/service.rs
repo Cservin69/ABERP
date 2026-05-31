@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use time::OffsetDateTime;
 use tokio::task::spawn_blocking;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use aberp_audit_ledger::{Actor, BinaryHash, LedgerMeta, TenantId};
@@ -376,11 +377,31 @@ impl QuoteIntakeService {
         self.config.poll_interval
     }
 
-    pub async fn run_daemon_forever(self) {
+    /// Run the quote-intake daemon until the process exits OR
+    /// `cancel` fires.
+    ///
+    /// PR-209 / S213 — the boot-delay sleep + steady-cadence sleep
+    /// both race against `cancel.cancelled()` so a Tauri-window
+    /// close or a Ctrl-C in `run_prod.sh` actually stops the daemon
+    /// instead of waiting out the cadence (the cadence is often
+    /// minutes, so pre-PR-209 shutdown left the daemon spinning).
+    /// Mid-cycle cancellation is observed at the NEXT iteration —
+    /// the in-flight `poll_once` finishes its current HTTP call
+    /// (reqwest's connect timeout caps it) before the loop checks
+    /// the token again. The shutdown timeout (5s default) is sized
+    /// for this; a daemon that times out shows up by name in the
+    /// `DaemonShutdownCompleted` audit row.
+    pub async fn run_daemon_forever(self, cancel: CancellationToken) {
         let cadence = self.config.poll_interval;
         let service = Arc::new(self);
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+        }
         loop {
+            if cancel.is_cancelled() {
+                return;
+            }
             let s = service.clone();
             let summary = s.poll_once(PollTrigger::Daemon).await;
             tracing::info!(
@@ -394,7 +415,10 @@ impl QuoteIntakeService {
                 error = ?summary.error,
                 "quote-intake cycle complete"
             );
-            tokio::time::sleep(cadence).await;
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(cadence) => {}
+            }
         }
     }
 }

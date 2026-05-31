@@ -200,6 +200,7 @@ fn build_state(wired: &WiredInvoice) -> AppState {
                 operator_login: "test-operator".to_string(),
             },
         )),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
     }
 }
 

@@ -183,6 +183,7 @@ fn build_state(boot_state: ServeBootState, tenant: &str) -> AppState {
             aberp::serve::NAV_POLL_DAEMON_CONCURRENCY,
         )),
         boot_state: Arc::new(std::sync::RwLock::new(boot_state)),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
     }
 }
 

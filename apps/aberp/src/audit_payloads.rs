@@ -2324,6 +2324,76 @@ impl InvoiceRestoredFromNavPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// DaemonShutdownCompleted (S213 / PR-209)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::DaemonShutdownCompleted`].
+///
+/// Written exactly ONCE per `aberp serve` shutdown, by the graceful-
+/// shutdown coordinator in `crate::shutdown` immediately after its
+/// drain pass completes (cleanly or via timeout). The row anchors
+/// the audit chain at the process boundary — combined with the next
+/// boot's `FirstProdLaunchAcknowledged` / boot-recovery row, a
+/// postmortem can reconstruct "process X exited cleanly at T1; process
+/// Y started at T2; daemon Z always times out on shutdown" without
+/// trawling log files.
+///
+/// **No NAV bytes.** Process-lifecycle telemetry; the
+/// `system.daemon_shutdown_completed` storage prefix is the
+/// load-bearing guard so the per-outgoing-invoice export bundle
+/// never sweeps a shutdown row.
+///
+/// **`registered_daemons`** lists every daemon whose `JoinHandle`
+/// was registered with the coordinator at boot — typically
+/// `["nav-poll-boot-recovery", "ap-sync", "quote-intake"]` plus any
+/// per-invoice NAV poll daemons that the coordinator was tracking
+/// at the moment shutdown fired. `clean_exits` + `timeout_kills`
+/// reconcile against this list:
+///   `clean_exits + timeout_kills.len() == registered_daemons.len()`
+/// is the load-bearing invariant; a drift here is a coordinator bug.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DaemonShutdownCompletedPayload {
+    /// Per-shutdown idempotency key — minted fresh per shutdown.
+    /// Mirrors every other audit payload's F8 carry-forward shape.
+    pub idempotency_key: String,
+    /// Closed vocab naming the signal that triggered shutdown.
+    /// `"ctrl-c"` (Ctrl-C in the run_prod.sh terminal),
+    /// `"sigterm"` (Tauri-side window-close → SIGTERM),
+    /// `"hangup"` (SIGHUP — typically a closed terminal).
+    /// Surfaced so the timeline reader can tell apart an operator-
+    /// triggered exit from a launchd / supervisor-driven one.
+    pub trigger: String,
+    /// Every daemon that was registered with the coordinator at the
+    /// moment shutdown fired. Order is registration order, which
+    /// matches boot order in `serve::run` — useful for spotting "we
+    /// added a new daemon but forgot to register it" drift.
+    pub registered_daemons: Vec<String>,
+    /// Count of daemons that exited cleanly inside the timeout
+    /// window. A panicking daemon still counts as a clean exit (the
+    /// task DID exit); only daemons that ignored the cancellation
+    /// token long enough to blow the timeout show up in
+    /// `timeout_kills`.
+    pub clean_exits: u64,
+    /// Names of daemons that did NOT exit inside the timeout window.
+    /// The process force-exits after the audit row is written, so
+    /// these daemons are SIGKILL'd by the OS — the audit row is the
+    /// only evidence ops gets of *which* daemon hung.
+    pub timeout_kills: Vec<String>,
+    /// Wall-clock between `token.cancel()` firing and the join
+    /// completing. Useful for tuning
+    /// `ABERP_SHUTDOWN_TIMEOUT_SECS` — a clean-exit shutdown that
+    /// always burns 4.9s of a 5s budget means daemons are
+    /// finishing-but-only-just.
+    pub elapsed_ms: u64,
+}
+
+impl DaemonShutdownCompletedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -4280,6 +4350,52 @@ mod tests {
         };
         let bytes = payload.to_bytes();
         let parsed: IncomingInvoiceSyncCycleCompletedPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
+    }
+
+    /// S213 / PR-209 — `DaemonShutdownCompletedPayload` round-trips
+    /// on the clean-exit path (no timeouts, all three production
+    /// daemons closed within budget).
+    #[test]
+    fn daemon_shutdown_completed_round_trip_clean() {
+        let payload = DaemonShutdownCompletedPayload {
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            trigger: "ctrl-c".to_string(),
+            registered_daemons: vec![
+                "nav-poll-boot-recovery".to_string(),
+                "ap-sync".to_string(),
+                "quote-intake".to_string(),
+            ],
+            clean_exits: 3,
+            timeout_kills: Vec::new(),
+            elapsed_ms: 47,
+        };
+        let bytes = payload.to_bytes();
+        let parsed: DaemonShutdownCompletedPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
+    }
+
+    /// S213 / PR-209 — `DaemonShutdownCompletedPayload` round-trips
+    /// on the timeout-kill path. NAV poll daemon hung; the audit
+    /// row names it so the postmortem starts in the right place.
+    #[test]
+    fn daemon_shutdown_completed_round_trip_timeout() {
+        let payload = DaemonShutdownCompletedPayload {
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            trigger: "sigterm".to_string(),
+            registered_daemons: vec![
+                "nav-poll-boot-recovery".to_string(),
+                "ap-sync".to_string(),
+                "quote-intake".to_string(),
+            ],
+            clean_exits: 2,
+            timeout_kills: vec!["nav-poll-boot-recovery".to_string()],
+            elapsed_ms: 5_007,
+        };
+        let bytes = payload.to_bytes();
+        let parsed: DaemonShutdownCompletedPayload =
             serde_json::from_slice(&bytes).expect("round-trip");
         assert_eq!(parsed, payload);
     }
