@@ -1938,4 +1938,60 @@ mod tests {
         .expect_err("must loud-fail on unknown id");
         assert!(format!("{err:#}").contains("matched 0 rows"));
     }
+
+    /// PR-214 / S216 — `list_incoming` MUST return rows whose
+    /// `nav_xml_path` column is NULL. The S197 daemon writes that
+    /// column lazily (one queryInvoiceData fetch per row); a digest-
+    /// only row is the lifecycle-natural state for every freshly-
+    /// ingested entry. Pins against a future contributor who adds a
+    /// `WHERE nav_xml_path IS NOT NULL` gate (which would silently
+    /// hide every row until its XML fetch completes — a class of
+    /// regression that hit prod's PR-214 / S216 brief). This is the
+    /// non-bug pin for what the PR-214 brief termed "Symptom A".
+    #[test]
+    fn list_incoming_returns_rows_with_null_nav_xml_path() {
+        let dir = ScopedTempDir::new("null-xml-path");
+        let db_path = dir.path().join("tenant.duckdb");
+        let artifacts_dir = dir.path().join("ap-artifacts");
+        let tenant = fixture_tenant();
+        let bh = fixture_binary_hash();
+
+        // Ingest two rows: neither carries nav_xml (so nav_xml_path
+        // stays NULL on both).
+        let mut input_a = fixture_input();
+        input_a.nav_invoice_number = "SUP-2026/A".into();
+        ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            input_a,
+        )
+        .expect("ingest A");
+        let mut input_b = fixture_input();
+        input_b.nav_invoice_number = "SUP-2026/B".into();
+        ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            input_b,
+        )
+        .expect("ingest B");
+
+        // The list must return BOTH rows even though their
+        // nav_xml_path is NULL — the SPA's IncomingInvoiceList renders
+        // them with an "XML pending" affordance, NOT a hidden gate.
+        let rows = list_incoming(&db_path, tenant.as_str(), None, 100, 0).unwrap();
+        assert_eq!(rows.len(), 2, "both NULL-xml-path rows must surface");
+        for row in &rows {
+            assert!(
+                row.nav_xml_path.is_none(),
+                "fixture row must keep NULL nav_xml_path; got: {:?}",
+                row.nav_xml_path
+            );
+        }
+    }
 }

@@ -609,13 +609,30 @@ fn persist_xml_for_row(
     ap_invoice_id: &str,
     invoice_number: &str,
 ) -> Result<()> {
-    let inner = restore_from_nav_extract::extract_inner_invoice_data_xml(response_xml)
-        .with_context(|| {
-            format!(
-                "base64-decode <invoiceData> for {} (ap_invoice_id={})",
-                invoice_number, ap_invoice_id
-            )
-        })?;
+    let inner = match restore_from_nav_extract::extract_inner_invoice_data_xml(response_xml) {
+        Ok(bytes) => bytes,
+        Err(extract_err) => {
+            // PR-214 / S216 — diagnostic capture for the opaque
+            // queryInvoiceData INBOUND failure mode where NAV returns
+            // HTTP 200 + funcCode OK but WITHOUT an `<invoiceData>`
+            // element. Save the raw response to
+            // `<ap_artifacts_dir>/.failed/<ap_invoice_id>.xml` so the
+            // operator can share the bytes for next-session triage,
+            // and emit a tax-ID-redacted 500-byte preview in the warn!
+            // log line so the cycle log itself carries diagnostic
+            // value. Defence-in-depth: every capture side-effect is
+            // best-effort — the original `extract_err` is the
+            // contract-bearing return value and must NOT be masked by
+            // a filesystem failure during capture.
+            capture_failing_response(ap_artifacts_dir, ap_invoice_id, response_xml);
+            return Err(extract_err).with_context(|| {
+                format!(
+                    "base64-decode <invoiceData> for {} (ap_invoice_id={})",
+                    invoice_number, ap_invoice_id
+                )
+            });
+        }
+    };
     std::fs::create_dir_all(ap_artifacts_dir).with_context(|| {
         format!(
             "create AP artifacts directory at {}",
@@ -638,6 +655,159 @@ fn persist_xml_for_row(
         )
     })?;
     Ok(())
+}
+
+/// PR-214 / S216 — best-effort diagnostic capture for a failing
+/// `queryInvoiceData INBOUND` response. Saves the raw response bytes
+/// to `<ap_artifacts_dir>/.failed/<ap_invoice_id>.xml` (overwrites any
+/// prior capture for the same row — only the latest matters for
+/// next-session triage) and logs a 500-byte preview with HU tax IDs
+/// redacted. Every failure inside this helper is swallowed via
+/// `tracing::warn!` — the caller's original extraction error is the
+/// contract-bearing surface and must NOT be masked by a filesystem
+/// failure during diagnostic capture.
+///
+/// Supplier names are NOT redacted: they're already surfaced in the
+/// per-row warn! lines the daemon emits during the cycle and they're
+/// what the operator needs to correlate the captured files with the
+/// observed failure.
+fn capture_failing_response(
+    ap_artifacts_dir: &std::path::Path,
+    ap_invoice_id: &str,
+    response_xml: &[u8],
+) {
+    let failed_dir = ap_artifacts_dir.join(".failed");
+    if let Err(e) = std::fs::create_dir_all(&failed_dir) {
+        tracing::warn!(
+            ap_invoice_id = %ap_invoice_id,
+            error = %format!("{e:#}"),
+            "diagnostic capture: failed to create .failed/ directory"
+        );
+        // Fall through — the preview log line below still gives the
+        // operator something to read from, even without the file save.
+    } else {
+        let file_path = failed_dir.join(format!("{}.xml", ap_invoice_id));
+        match std::fs::write(&file_path, response_xml) {
+            Ok(()) => tracing::warn!(
+                ap_invoice_id = %ap_invoice_id,
+                path = %file_path.display(),
+                bytes = response_xml.len(),
+                "diagnostic capture: saved failing queryInvoiceData response — \
+                 share with next-session triage to identify NAV-side shape change"
+            ),
+            Err(e) => tracing::warn!(
+                ap_invoice_id = %ap_invoice_id,
+                path = %file_path.display(),
+                error = %format!("{e:#}"),
+                "diagnostic capture: failed to write capture file"
+            ),
+        }
+    }
+    let preview = sanitise_response_preview(response_xml, 500);
+    tracing::warn!(
+        ap_invoice_id = %ap_invoice_id,
+        preview = %preview,
+        "diagnostic capture: queryInvoiceData response preview (first 500 bytes, HU tax IDs redacted)"
+    );
+}
+
+/// PR-214 / S216 — produce a tax-ID-redacted preview of a NAV
+/// response body suitable for a `tracing::warn!` field. Truncates to
+/// at most `max_bytes` UTF-8 bytes (boundary-aware — never splits a
+/// multi-byte code point) and then redacts any HU tax-ID pattern via
+/// [`redact_hu_tax_ids`]. The truncation marker `…` is appended when
+/// the input exceeds `max_bytes`.
+fn sanitise_response_preview(response_xml: &[u8], max_bytes: usize) -> String {
+    let s = String::from_utf8_lossy(response_xml);
+    let truncated: String = if s.len() <= max_bytes {
+        s.into_owned()
+    } else {
+        let mut idx = max_bytes;
+        while idx > 0 && !s.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        format!("{}…", &s[..idx])
+    };
+    redact_hu_tax_ids(&truncated)
+}
+
+/// PR-214 / S216 — strip HU tax-ID patterns from a string for safe
+/// log emission. Two patterns are redacted:
+///
+///   1. Full HU community tax number: `NNNNNNNN-N-NN` (8 digits + `-`
+///      + 1 digit + `-` + 2 digits). Replaced with `[REDACTED-TAX]`.
+///   2. Bare 8-digit taxpayer ID (the first segment alone, which NAV
+///      embeds inside `<taxpayerId>` elements). Replaced with
+///      `[REDACTED-ID]`.
+///
+/// The two patterns share their first 8 digits — pattern (1) is
+/// matched FIRST so a full tax number isn't redacted to
+/// `[REDACTED-ID]-1-23`. Match-positions are computed by a single
+/// left-to-right scan; no regex dependency is pulled in.
+///
+/// Supplier names, dates, currency codes, and the XML element
+/// structure stay verbatim — the operator needs them to correlate
+/// the redacted preview with the observed failure.
+fn redact_hu_tax_ids(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Find the start of any 8-digit run anchored at byte `i`.
+        if bytes[i].is_ascii_digit() {
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            let digits_len = j - i;
+            // Require exactly 8 digits AND the preceding char (if any)
+            // not be a digit, so we don't redact the first 8 digits of
+            // a longer numeric token like `123456789012` (NAV invoice
+            // numbers can carry long digit runs).
+            let preceding_is_digit = i > 0 && bytes[i - 1].is_ascii_digit();
+            if digits_len == 8 && !preceding_is_digit {
+                // Look for `-N-NN` continuation for pattern (1).
+                let tail_len = if j + 5 <= bytes.len()
+                    && bytes[j] == b'-'
+                    && bytes[j + 1].is_ascii_digit()
+                    && bytes[j + 2] == b'-'
+                    && bytes[j + 3].is_ascii_digit()
+                    && bytes[j + 4].is_ascii_digit()
+                    // The 13th byte must NOT be a digit (else we'd be
+                    // mid-way through `NNNNNNNN-N-NNN` which isn't a
+                    // HU tax ID; leave it alone).
+                    && (j + 5 == bytes.len() || !bytes[j + 5].is_ascii_digit())
+                {
+                    Some(5usize)
+                } else {
+                    None
+                };
+                match tail_len {
+                    Some(t) => {
+                        out.push_str("[REDACTED-TAX]");
+                        i = j + t;
+                        continue;
+                    }
+                    None => {
+                        out.push_str("[REDACTED-ID]");
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            // Otherwise emit the digit run verbatim and resume.
+            out.push_str(&s[i..j]);
+            i = j;
+            continue;
+        }
+        // Non-digit: emit a single UTF-8 char boundary slice.
+        let next_boundary = (i + 1..=s.len())
+            .find(|k| s.is_char_boundary(*k))
+            .unwrap_or(s.len());
+        out.push_str(&s[i..next_boundary]);
+        i = next_boundary;
+    }
+    out
 }
 
 /// Convert a NAV digest row into an [`IngestionInput`] suitable for
@@ -1434,5 +1604,223 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// PR-214 / S216 — when `extract_inner_invoice_data_xml` fails the
+    /// caller writes the raw response_xml to
+    /// `<ap_artifacts_dir>/.failed/<ap_invoice_id>.xml` so the operator
+    /// can share the bytes for next-session triage. Pins that the
+    /// capture (a) actually lands on disk, (b) carries the original
+    /// bytes verbatim, and (c) does NOT mask the loud-fail error
+    /// message — the diagnostic is additive, not a swallow.
+    #[test]
+    fn persist_xml_for_row_writes_diagnostic_capture_on_extract_failure() {
+        let tmp = std::env::temp_dir().join(format!(
+            "aberp-s216-capture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db_path = tmp.join("tenant.duckdb");
+        let artifacts_dir = tmp.join("ap-artifacts");
+        let id = "apinv_01HRQXYZABCDEFGHJKMNPQRST";
+        // funcCode=OK without <invoiceData> — the exact prod failure
+        // shape Ervin observed in the 2026-06-01 cycle log.
+        let response_xml = b"<QueryInvoiceDataResponse>\
+            <result><funcCode>OK</funcCode></result>\
+            <invoiceDataResult/>\
+        </QueryInvoiceDataResponse>";
+        let err = persist_xml_for_row(
+            response_xml,
+            &db_path,
+            "t1",
+            &artifacts_dir,
+            id,
+            "SUP-2026/000001",
+        )
+        .expect_err("missing <invoiceData> must still loud-fail");
+        assert!(
+            format!("{err:#}").contains("missing <invoiceData>"),
+            "loud-fail message must NOT be masked by diagnostic capture; got: {err:#}"
+        );
+        let capture_path = artifacts_dir.join(".failed").join(format!("{}.xml", id));
+        let captured = std::fs::read(&capture_path).expect("capture file must exist");
+        assert_eq!(
+            captured, response_xml,
+            "capture must carry the original response bytes verbatim"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// PR-214 / S216 — `extract_inner_invoice_data_xml` success path
+    /// must NOT trigger diagnostic capture. Pins that a healthy
+    /// response keeps the `.failed/` directory absent (the operator
+    /// would mis-read its existence as "the daemon hit the failure
+    /// mode again" otherwise).
+    #[test]
+    fn persist_xml_for_row_does_not_capture_on_success() {
+        use base64::Engine;
+        use incoming_invoices::IngestOutcome;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "aberp-s216-no-capture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db_path = tmp.join("tenant.duckdb");
+        let artifacts_dir = tmp.join("ap-artifacts");
+
+        let tenant = aberp_audit_ledger::TenantId::new("t1".to_string()).expect("fixture tenant");
+        let binary_hash = aberp_audit_ledger::BinaryHash::from_bytes([0u8; 32]);
+        let input = IngestionInput {
+            supplier_tax_number: "12345678".into(),
+            supplier_name: "Supplier Kft.".into(),
+            supplier_address: None,
+            nav_invoice_number: "SUP-2026/000001".into(),
+            issue_date: "2026-05-30".into(),
+            delivery_date: None,
+            payment_deadline: None,
+            total_net_minor: 100_000,
+            total_vat_minor: 27_000,
+            total_gross_minor: 127_000,
+            currency: "HUF".into(),
+            nav_xml: None,
+        };
+        let outcome = incoming_invoices::ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            binary_hash,
+            "operator",
+            &artifacts_dir,
+            input,
+        )
+        .expect("fixture ingest");
+        let id = match outcome {
+            IngestOutcome::Created { id } => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let inner = b"<InvoiceData><supplierInfo/></InvoiceData>";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(inner);
+        let response_xml = format!(
+            "<QueryInvoiceDataResponse><invoiceDataResult><invoiceData>{b64}</invoiceData></invoiceDataResult></QueryInvoiceDataResponse>"
+        );
+        persist_xml_for_row(
+            response_xml.as_bytes(),
+            &db_path,
+            tenant.as_str(),
+            &artifacts_dir,
+            &id,
+            "SUP-2026/000001",
+        )
+        .expect("persist must succeed");
+
+        let capture_path = artifacts_dir.join(".failed").join(format!("{}.xml", id));
+        assert!(
+            !capture_path.exists(),
+            "success path must NOT create a .failed/ capture; found {}",
+            capture_path.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// PR-214 / S216 — full HU community tax number (`NNNNNNNN-N-NN`)
+    /// is redacted with the `[REDACTED-TAX]` marker; a bare 8-digit
+    /// taxpayer ID with no continuation is redacted with
+    /// `[REDACTED-ID]`. Surrounding XML structure and supplier names
+    /// stay verbatim — the operator needs them to correlate the
+    /// preview with the observed failure.
+    #[test]
+    fn redact_hu_tax_ids_strips_both_patterns_and_keeps_context() {
+        let input = "<supplierTaxNumber>12345678-1-23</supplierTaxNumber>\
+                     <customerName>Áben Bt.</customerName>\
+                     <taxpayerId>87654321</taxpayerId>\
+                     <invoiceNumber>SUP-2026/000001</invoiceNumber>";
+        let got = redact_hu_tax_ids(input);
+        assert!(
+            got.contains("[REDACTED-TAX]"),
+            "full HU tax ID must be marked as TAX; got: {got}"
+        );
+        assert!(
+            got.contains("[REDACTED-ID]"),
+            "bare 8-digit taxpayer ID must be marked as ID; got: {got}"
+        );
+        assert!(
+            !got.contains("12345678-1-23"),
+            "raw full tax ID must not leak; got: {got}"
+        );
+        assert!(
+            !got.contains(">87654321<"),
+            "raw bare taxpayer ID must not leak; got: {got}"
+        );
+        assert!(
+            got.contains("Áben Bt."),
+            "supplier name must NOT be redacted (operator needs it for correlation); got: {got}"
+        );
+        assert!(
+            got.contains("SUP-2026/000001"),
+            "invoice number must NOT be redacted (NAV-issued, not a tax ID); got: {got}"
+        );
+    }
+
+    /// PR-214 / S216 — the redactor must not redact arbitrary 8-digit
+    /// runs that are part of a longer numeric token (NAV invoice
+    /// numbers like `100351218526` carry long digit runs). The
+    /// preceding-digit check is what defends against that drift.
+    #[test]
+    fn redact_hu_tax_ids_skips_digit_runs_inside_longer_tokens() {
+        // `100351218526` is a real Yettel-Magyarország invoice number
+        // shape from the prod DB; the first 8 digits form a "100..."
+        // run that must NOT be mistaken for a taxpayer ID.
+        let input = "<invoiceNumber>100351218526</invoiceNumber>";
+        let got = redact_hu_tax_ids(input);
+        assert_eq!(
+            got, input,
+            "12-digit invoice number must pass through unmodified; got: {got}"
+        );
+    }
+
+    /// PR-214 / S216 — preview truncation is byte-bounded with a UTF-8
+    /// boundary safeguard so a multi-byte HU character (e.g., `é`,
+    /// `Ü`) split across `max_bytes` does not panic the format step.
+    #[test]
+    fn sanitise_response_preview_truncates_on_utf8_boundary() {
+        // Pad with leading ASCII so the multi-byte char straddles the
+        // 10-byte cap regardless of code-point width.
+        let s = "abcdefghi".to_string() + "éééééééé";
+        let bytes = s.as_bytes();
+        let preview = sanitise_response_preview(bytes, 10);
+        // The preview must NOT contain a half-character or panic.
+        // We don't pin the exact length (it depends on where the
+        // boundary lands) — just that it's <= the truncation
+        // threshold + the `…` marker and ends cleanly.
+        assert!(
+            preview.ends_with('…'),
+            "truncated preview must end with the truncation marker; got: {preview}"
+        );
+        // The leading ASCII prefix must survive.
+        assert!(
+            preview.starts_with("abcdefghi"),
+            "leading ASCII prefix must survive; got: {preview}"
+        );
+    }
+
+    /// PR-214 / S216 — preview pass-through when the input fits within
+    /// `max_bytes` — no truncation marker, no length change.
+    #[test]
+    fn sanitise_response_preview_passes_short_input_unchanged() {
+        let input = b"<r>OK</r>";
+        let preview = sanitise_response_preview(input, 500);
+        assert_eq!(preview, "<r>OK</r>");
+        assert!(!preview.contains('…'));
     }
 }
