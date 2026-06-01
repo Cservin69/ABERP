@@ -181,3 +181,114 @@ that ignore those principles will be sent back.
    order, later ones assume earlier ones.
 3. [`docs/CUTOVER_RUNBOOK.md`](docs/CUTOVER_RUNBOOK.md) — the prod
    cutover + update procedure.
+
+## Operator runbook — hülye-biztos cookbook
+
+Field-tested commands. Copy whichever recipe you need. Replace `<VERSION>` with the release name (e.g., `PROD_v2.0`, `PROD_v2.1`, `PROD_v2.0.1`).
+
+### 1. Upgrade prod to a new release (Frissítés új verzióra)
+
+The canonical "go from current to `<VERSION>`" command. Kills running aberp, syncs to release branch, snapshots, swaps binary, launches.
+
+```bash
+cd ~/ABERP && \
+pgrep -f aberp | xargs -r kill 2>/dev/null; sleep 2; \
+pgrep -f aberp | xargs -r kill -9 2>/dev/null; \
+git fetch origin && git reset --hard origin/<VERSION> && \
+./run/upgrade_prod.sh <VERSION>
+```
+
+### 2. Just relaunch (Újraindítás verzióváltás nélkül)
+
+After a Ctrl-C or shutdown, when nothing changed and you want prod back up.
+
+```bash
+cd ~/ABERP && \
+pgrep -f aberp | xargs -r kill 2>/dev/null; sleep 2; \
+pgrep -f aberp | xargs -r kill -9 2>/dev/null; \
+./run/run_prod.sh
+```
+
+### 3. Kill stuck aberp processes (Lefagyott aberp folyamatok kilövése)
+
+When graceful shutdown didn't drain everything (rare post-PR-209 / S213).
+
+```bash
+pgrep -f aberp | xargs -r kill 2>/dev/null; sleep 2; \
+pgrep -f aberp | xargs -r kill -9 2>/dev/null
+```
+
+### 4. Emergency bypass — launch with dirty tree (Vészhelyzeti megkerülés)
+
+For dev workflows or when you've verified state by hand and know the git check is a false positive. NEVER for casual prod use.
+
+```bash
+cd ~/ABERP && ABERP_SKIP_GIT_CHECK=1 ./run/run_prod.sh
+```
+
+### 5. Verify remote branch + tag SHAs before resetting (Távoli állapot ellenőrzése)
+
+Sanity-check before any `git reset --hard origin/<VERSION>`.
+
+```bash
+git ls-remote https://github.com/Cservin69/ABERP.git \
+  refs/heads/main refs/heads/PROD_v2.0 refs/heads/PROD_v1.4.1 \
+  refs/tags/PROD_v2.0
+```
+
+### 6. Restore tenant from snapshot (Visszaállítás biztonsági mentésből)
+
+If an upgrade went sideways. The snapshot was taken at the start of every `upgrade_prod.sh` run; tarball + keychain-zip live in `~/aberp-snapshots/`.
+
+```bash
+# Stop the app first
+pgrep -f aberp | xargs -r kill -9 2>/dev/null
+# Pick the snapshot to restore
+ls -lt ~/aberp-snapshots/prod-*.tgz | head -3
+# Replace TIMESTAMP with the chosen file
+tar -C "$HOME/.aberp" -xzf "$HOME/aberp-snapshots/prod-TIMESTAMP.tgz"
+unzip "$HOME/aberp-snapshots/prod-TIMESTAMP-keychain.zip" -d /tmp/
+# Re-import keychain entries
+for line in $(jq -r '.[] | @base64' /tmp/keychain-prod.json); do echo "$line" | base64 -d | jq -r '"security add-generic-password -s \"" + .service + "\" -a \"" + .account + "\" -w \"" + .password + "\""'; done
+# (paste each printed command back into the shell)
+# Relaunch
+cd ~/ABERP && ./run/run_prod.sh
+```
+
+### 7. Wipe leftover worktrees in DEV that poison prod check (Dev worktree takarítás)
+
+Pre-PR-C only relevant. Post-PR-C, run_prod.sh uses its own checkout's path and dev's worktrees don't affect prod. Still useful for dev cleanup.
+
+```bash
+cd ~/Documents/Claude/Projects/ABERP && \
+git worktree list && \
+git worktree list --porcelain | grep '^worktree' | awk '{print $2}' | grep -v "^$(pwd)$" | xargs -r -I{} git worktree remove --force {} 2>/dev/null; \
+git worktree prune && \
+rm -rf .claude && git status
+```
+
+### 8. Verify a release binary's provenance (Build provenance ellenőrzés)
+
+Confirms the binary was built from the same audit-ledger state it claims.
+
+```bash
+cargo run -p aberp-verify -- --tenant prod
+```
+
+### 9. Setup NAV creds + SMTP password on a fresh box (Új gépen alapbeállítás)
+
+After cloning the repo on a new machine and before the first prod launch.
+
+```bash
+cd ~/ABERP && ./run/setup_nav_creds.sh
+# Then in Tenant Settings → SMTP → enter the SMTP password
+# Then in Tenant Settings → Quote Intake (if enabled) → bearer token
+```
+
+### Forensics
+
+- Snapshot tarballs: `~/aberp-snapshots/prod-*.tgz` (encrypted keychain dump beside each)
+- Audit ledger: `~/.aberp/prod/audit-ledger.duckdb` + mirror at `~/.aberp/prod/audit-ledger.jsonl`
+- DuckDB: `~/.aberp/prod/aberp.duckdb`
+- Seller config: `~/.aberp/prod/seller.toml`
+- Logs (Tauri): `~/Library/Logs/aberp/`
