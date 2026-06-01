@@ -775,8 +775,29 @@ async fn extract_catalog_for_invoice(
     // Synchronous XML parse + DB upserts on the blocking pool so the
     // tokio worker is not held across the per-candidate DuckDB writes.
     let join_result = tokio::task::spawn_blocking(move || {
+        // PR-215 / S217 — `extract_inner_invoice_data_xml` now returns
+        // `Result<Option<Vec<u8>>>`. For OUTBOUND (the seller's own
+        // invoice) NAV is expected to always carry `<invoiceData>` —
+        // the seller's entitlement to their own submission is
+        // unconditional. So `Ok(None)` here is anomalous and gets the
+        // same `warn!` + skip treatment as a hard decode failure (it
+        // would indicate NAV-side data loss or a wire-shape regression
+        // we want surfaced loud).
         let inner = match restore_from_nav_extract::extract_inner_invoice_data_xml(&response_xml) {
-            Ok(v) => v,
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                tracing::warn!(
+                    invoice_number = invoice_number_owned.as_str(),
+                    "S196: queryInvoiceData OUTBOUND returned funcCode=OK without \
+                     <invoiceData> for the seller's own invoice — anomalous (the \
+                     seller is unconditionally entitled to their own submission); \
+                     catalog extraction skipped"
+                );
+                return ExtractionDelta {
+                    invoice_extraction_errored: 1,
+                    ..Default::default()
+                };
+            }
             Err(e) => {
                 tracing::warn!(
                     invoice_number = invoice_number_owned.as_str(),

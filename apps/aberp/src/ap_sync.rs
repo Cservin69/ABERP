@@ -601,6 +601,22 @@ async fn fetch_and_persist_xml_for_row(
 /// `<QueryInvoiceDataResponse>` envelope NAV returned; the helper
 /// base64-decodes the inner `<invoiceData>` blob and persists those
 /// bytes (the supplier's original `<InvoiceData>` XML root).
+///
+/// PR-215 / S217 — three outcomes:
+///   - `<invoiceData>` present + decodes  → write XML file + UPDATE
+///                                          `nav_xml_path`, return `Ok(())`
+///   - `<invoiceData>` ABSENT             → `info!` + return `Ok(())`,
+///                                          leave `nav_xml_path` NULL,
+///                                          NO `.failed/` capture (this is
+///                                          the legitimate NAV "supplier
+///                                          has not exposed XML to buyer"
+///                                          case — every one of the 13/13
+///                                          2026-06-01 prod cycle failures
+///                                          falls under this branch).
+///   - `<invoiceData>` present + malformed → `capture_failing_response()`
+///                                           + return `Err(...)` (this is
+///                                           a genuine contract violation
+///                                           worth surfacing for triage).
 fn persist_xml_for_row(
     response_xml: &[u8],
     db_path: &std::path::Path,
@@ -610,17 +626,44 @@ fn persist_xml_for_row(
     invoice_number: &str,
 ) -> Result<()> {
     let inner = match restore_from_nav_extract::extract_inner_invoice_data_xml(response_xml) {
-        Ok(bytes) => bytes,
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            // PR-215 / S217 — per the NAV OSA 3.0 XSD,
+            // `QueryInvoiceDataResponseType.invoiceDataResult` is
+            // `minOccurs=0`; NAV legitimately returns funcCode=OK
+            // without it whenever the supplier has not exposed the
+            // original XML payload to the buyer (paper invoices,
+            // partial-data submissions, supplier opted out of XML
+            // republication). The buyer's entitlement ends at the
+            // digest in those cases. Leave nav_xml_path NULL — the SPA
+            // already hides the XML download button when null — and
+            // do NOT write to `.failed/` (would mis-signal a real
+            // failure to the next-session operator). The row stays
+            // digest-only forever, which is the intended steady-state
+            // for invoices the supplier has chosen not to expose.
+            tracing::info!(
+                ap_invoice_id = %ap_invoice_id,
+                invoice_number = %invoice_number,
+                "queryInvoiceData INBOUND: NAV returned funcCode=OK without \
+                 <invoiceData> (supplier has not exposed the XML payload to \
+                 the buyer — paper invoice, partial-data submission, or \
+                 supplier opted out of republication). Row stays digest-only; \
+                 nav_xml_path remains NULL."
+            );
+            return Ok(());
+        }
         Err(extract_err) => {
-            // PR-214 / S216 — diagnostic capture for the opaque
-            // queryInvoiceData INBOUND failure mode where NAV returns
-            // HTTP 200 + funcCode OK but WITHOUT an `<invoiceData>`
-            // element. Save the raw response to
-            // `<ap_artifacts_dir>/.failed/<ap_invoice_id>.xml` so the
-            // operator can share the bytes for next-session triage,
-            // and emit a tax-ID-redacted 500-byte preview in the warn!
-            // log line so the cycle log itself carries diagnostic
-            // value. Defence-in-depth: every capture side-effect is
+            // PR-214 / S216 — diagnostic capture for genuinely
+            // malformed `<invoiceData>` payloads (present but empty
+            // text, base64 garbage, structurally malformed XML around
+            // it). Pre-PR-215 the loud-fail also fired on the absent
+            // case, which produced the 13/13 false-positive captures
+            // on the 2026-06-01 prod cycle. Post-PR-215 the absent
+            // case is handled in the `Ok(None)` arm above and this
+            // arm only fires on genuine contract violations worth
+            // surfacing for triage.
+            //
+            // Defence-in-depth: every capture side-effect is
             // best-effort — the original `extract_err` is the
             // contract-bearing return value and must NOT be masked by
             // a filesystem failure during capture.
@@ -1566,16 +1609,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// S197 — malformed NAV envelope (missing `<invoiceData>` element)
-    /// loud-fails per CLAUDE.md rule 12. The caller (the cycle loop)
-    /// turns this into a `warn!` and continues; the test pins that the
-    /// failure surface stays loud at the helper layer rather than
-    /// silently leaving `nav_xml_path` as the empty string or some
-    /// other coerced value.
+    /// PR-215 / S217 — RENAMED + FLIPPED from S197's
+    /// `persist_xml_for_row_loud_fails_on_missing_invoice_data_element`.
+    /// Per the NAV OSA 3.0 XSD `invoiceDataResult` is `minOccurs=0` and
+    /// NAV legitimately returns `funcCode=OK` without `<invoiceData>`
+    /// whenever the supplier has not exposed XML to the buyer. That is
+    /// the EXACT shape Ervin observed on 13/13 INBOUND rows in the
+    /// 2026-06-01 prod cycle — they are NOT failures and must NOT
+    /// loud-fail. The S197 test was contract-wrong; this is the
+    /// replacement.
+    ///
+    /// Pinned shape — `<invoiceData>` absent, anything else present:
+    ///   - persist_xml_for_row returns `Ok(())`
+    ///   - `nav_xml_path` stays NULL (no UPDATE)
+    ///   - NO `.failed/` capture is written (would mis-signal a real
+    ///     failure to the next-session operator)
     #[test]
-    fn persist_xml_for_row_loud_fails_on_missing_invoice_data_element() {
+    fn persist_xml_for_row_treats_absent_invoice_data_as_no_op_per_pr215() {
         let tmp = std::env::temp_dir().join(format!(
-            "aberp-s197-persist-bad-{}-{}",
+            "aberp-pr215-no-op-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1586,10 +1638,12 @@ mod tests {
         let db_path = tmp.join("tenant.duckdb");
         let artifacts_dir = tmp.join("ap-artifacts");
 
-        // No ingest — `extract_inner_invoice_data_xml` fails BEFORE the
-        // UPDATE leg, so the row's absence is irrelevant to the assertion.
-        let response_xml = b"<QueryInvoiceDataResponse></QueryInvoiceDataResponse>";
-        let err = persist_xml_for_row(
+        // No row ingest needed — the `Ok(None)` branch returns BEFORE
+        // touching the UPDATE leg, so the row's absence is irrelevant.
+        let response_xml = b"<QueryInvoiceDataResponse>\
+            <result><funcCode>OK</funcCode></result>\
+        </QueryInvoiceDataResponse>";
+        persist_xml_for_row(
             response_xml,
             &db_path,
             "t1",
@@ -1597,26 +1651,33 @@ mod tests {
             "apinv_01HRQXYZABCDEFGHJKMNPQRST",
             "SUP-2026/000001",
         )
-        .expect_err("missing <invoiceData> must loud-fail");
+        .expect("absent <invoiceData> must NOT loud-fail per PR-215");
+
+        let capture_path = artifacts_dir
+            .join(".failed")
+            .join("apinv_01HRQXYZABCDEFGHJKMNPQRST.xml");
         assert!(
-            format!("{err:#}").contains("missing <invoiceData>"),
-            "loud-fail message must name the missing element; got: {err:#}"
+            !capture_path.exists(),
+            "absent <invoiceData> is expected NAV behavior; .failed/ MUST stay empty \
+             so a real failure stands out; found {}",
+            capture_path.display()
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// PR-214 / S216 — when `extract_inner_invoice_data_xml` fails the
-    /// caller writes the raw response_xml to
-    /// `<ap_artifacts_dir>/.failed/<ap_invoice_id>.xml` so the operator
-    /// can share the bytes for next-session triage. Pins that the
-    /// capture (a) actually lands on disk, (b) carries the original
-    /// bytes verbatim, and (c) does NOT mask the loud-fail error
-    /// message — the diagnostic is additive, not a swallow.
+    /// PR-215 / S217 — same as the prior test but with the
+    /// `<invoiceDataResult/>` self-closing wrapper present and no
+    /// `<invoiceData>` inside. NAV's published XSD allows
+    /// `invoiceDataResult` to be present-but-empty in principle (the
+    /// real wire shape we've observed omits it entirely; this guards
+    /// against a future NAV-side shape change adding the wrapper while
+    /// still withholding the data). Same contract: `Ok(())`, no
+    /// `.failed/` capture.
     #[test]
-    fn persist_xml_for_row_writes_diagnostic_capture_on_extract_failure() {
+    fn persist_xml_for_row_treats_empty_invoice_data_result_as_no_op_per_pr215() {
         let tmp = std::env::temp_dir().join(format!(
-            "aberp-s216-capture-{}-{}",
+            "aberp-pr215-empty-result-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1627,11 +1688,131 @@ mod tests {
         let db_path = tmp.join("tenant.duckdb");
         let artifacts_dir = tmp.join("ap-artifacts");
         let id = "apinv_01HRQXYZABCDEFGHJKMNPQRST";
-        // funcCode=OK without <invoiceData> — the exact prod failure
-        // shape Ervin observed in the 2026-06-01 cycle log.
+
         let response_xml = b"<QueryInvoiceDataResponse>\
             <result><funcCode>OK</funcCode></result>\
             <invoiceDataResult/>\
+        </QueryInvoiceDataResponse>";
+        persist_xml_for_row(response_xml, &db_path, "t1", &artifacts_dir, id, "SUP-2026/000001")
+            .expect("empty <invoiceDataResult/> must NOT loud-fail per PR-215");
+
+        let capture_path = artifacts_dir.join(".failed").join(format!("{}.xml", id));
+        assert!(
+            !capture_path.exists(),
+            "empty <invoiceDataResult/> is expected NAV behavior; .failed/ must stay empty"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// PR-215 / S217 — golden fixture for NAV response Shape A
+    /// (`xmlns="…/NTCA/…/common", xmlns:ns2="…/OSA/3.0/api"`). Redacted
+    /// from a real 2026-06-01 prod fixture — supplier-side request and
+    /// timestamps preserved verbatim because they're already public NAV
+    /// transaction surface, but everything that could carry PII is
+    /// constant. Pins the parser tolerance against the majority shape
+    /// (10/13 of the prod cycle).
+    #[test]
+    fn persist_xml_for_row_tolerates_shape_a_ntca_default_ns_per_pr215() {
+        let tmp = std::env::temp_dir().join(format!(
+            "aberp-pr215-shape-a-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db_path = tmp.join("tenant.duckdb");
+        let artifacts_dir = tmp.join("ap-artifacts");
+        let id = "apinv_01HRQXYZABCDEFGHJKMNPQRST";
+
+        // Verbatim 2026-06-01 prod Shape A response, with the requestId
+        // and timestamp masked. Note: the response is funcCode=OK with
+        // NO <invoiceDataResult> and NO <invoiceData>. Real NAV bytes.
+        let response_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><ns2:QueryInvoiceDataResponse xmlns="http://schemas.nav.gov.hu/NTCA/1.0/common" xmlns:ns2="http://schemas.nav.gov.hu/OSA/3.0/api" xmlns:ns3="http://schemas.nav.gov.hu/OSA/3.0/base" xmlns:ns4="http://schemas.nav.gov.hu/OSA/3.0/data"><header><requestId>REQ00000000000000000000000000</requestId><timestamp>2026-06-01T00:00:00Z</timestamp><requestVersion>3.0</requestVersion><headerVersion>1.0</headerVersion></header><result><funcCode>OK</funcCode></result><ns2:software><ns2:softwareId>ABERP-000000000001</ns2:softwareId><ns2:softwareName>ABERP</ns2:softwareName><ns2:softwareOperation>LOCAL_SOFTWARE</ns2:softwareOperation><ns2:softwareMainVersion>0.0.0</ns2:softwareMainVersion><ns2:softwareDevName>Ervin Aben</ns2:softwareDevName><ns2:softwareDevContact>ervin@aben.ch</ns2:softwareDevContact></ns2:software></ns2:QueryInvoiceDataResponse>"#;
+
+        persist_xml_for_row(response_xml, &db_path, "t1", &artifacts_dir, id, "SUP-2026/000001")
+            .expect("Shape A (NTCA-default) with no <invoiceData> must NOT loud-fail per PR-215");
+
+        let capture_path = artifacts_dir.join(".failed").join(format!("{}.xml", id));
+        assert!(!capture_path.exists(), "no .failed/ capture for Shape A no-data response");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// PR-215 / S217 — golden fixture for NAV response Shape B
+    /// (`xmlns="…/OSA/3.0/api", xmlns:ns2="…/NTCA/…/common"`). The
+    /// SAME 2026-06-01 prod cycle returned this shape on the minority
+    /// of rows (3/13). NAV swaps which namespace URI is bound to the
+    /// default vs the `ns2` prefix per response — perfectly legal XML.
+    /// Pins that the namespace-blind `find_first_text` tolerates both
+    /// shapes uniformly. (Brief hypothesised the parser was prefix-
+    /// matching `ns2:invoiceData` literally; it was always
+    /// namespace-blind via local_name_matches — the brief
+    /// misdiagnosed; see PR body.)
+    #[test]
+    fn persist_xml_for_row_tolerates_shape_b_osa_api_default_ns_per_pr215() {
+        let tmp = std::env::temp_dir().join(format!(
+            "aberp-pr215-shape-b-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db_path = tmp.join("tenant.duckdb");
+        let artifacts_dir = tmp.join("ap-artifacts");
+        let id = "apinv_01HRQXYZABCDEFGHJKMNPQRST";
+
+        // Verbatim 2026-06-01 prod Shape B response, requestId +
+        // timestamp masked. Default ns is OSA/api this time; the NTCA
+        // namespace gets the ns2 prefix. Header + result + software
+        // ALL carry the `ns2:` prefix here (whereas Shape A bound the
+        // prefix to OSA so they were unprefixed there).
+        let response_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><QueryInvoiceDataResponse xmlns="http://schemas.nav.gov.hu/OSA/3.0/api" xmlns:ns2="http://schemas.nav.gov.hu/NTCA/1.0/common" xmlns:ns3="http://schemas.nav.gov.hu/OSA/3.0/base" xmlns:ns4="http://schemas.nav.gov.hu/OSA/3.0/data"><ns2:header><ns2:requestId>REQ00000000000000000000000000</ns2:requestId><ns2:timestamp>2026-06-01T00:00:00Z</ns2:timestamp><ns2:requestVersion>3.0</ns2:requestVersion><ns2:headerVersion>1.0</ns2:headerVersion></ns2:header><ns2:result><ns2:funcCode>OK</ns2:funcCode></ns2:result><software><softwareId>ABERP-000000000001</softwareId><softwareName>ABERP</softwareName><softwareOperation>LOCAL_SOFTWARE</softwareOperation><softwareMainVersion>0.0.0</softwareMainVersion><softwareDevName>Ervin Aben</softwareDevName><softwareDevContact>ervin@aben.ch</softwareDevContact></software></QueryInvoiceDataResponse>"#;
+
+        persist_xml_for_row(response_xml, &db_path, "t1", &artifacts_dir, id, "SUP-2026/000001")
+            .expect("Shape B (OSA/api-default) with no <invoiceData> must NOT loud-fail per PR-215");
+
+        let capture_path = artifacts_dir.join(".failed").join(format!("{}.xml", id));
+        assert!(!capture_path.exists(), "no .failed/ capture for Shape B no-data response");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// PR-214 / S216 (REFINED by PR-215) — `.failed/` diagnostic
+    /// capture survives, but the trigger surface is narrower now. Only
+    /// GENUINELY malformed `<invoiceData>` payloads (present but
+    /// non-base64 / empty text / structurally malformed surrounding
+    /// XML) still capture. Absent `<invoiceData>` does NOT capture
+    /// post-PR-215 (covered by the `treats_absent_..._as_no_op` tests
+    /// above).
+    ///
+    /// This fixture has `<invoiceData>` PRESENT but carrying garbage
+    /// (not valid base64), so the parser's loud-fail leg fires and the
+    /// capture lands.
+    #[test]
+    fn persist_xml_for_row_writes_diagnostic_capture_on_genuine_malformed_invoice_data() {
+        let tmp = std::env::temp_dir().join(format!(
+            "aberp-pr215-capture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db_path = tmp.join("tenant.duckdb");
+        let artifacts_dir = tmp.join("ap-artifacts");
+        let id = "apinv_01HRQXYZABCDEFGHJKMNPQRST";
+        // <invoiceData> PRESENT but carries clearly-invalid base64
+        // characters (`!!!` is not in the base64 alphabet). Per the
+        // PR-215 contract this stays a loud-fail and captures.
+        let response_xml = b"<QueryInvoiceDataResponse>\
+            <result><funcCode>OK</funcCode></result>\
+            <invoiceDataResult><invoiceData>!!!not-base64!!!</invoiceData></invoiceDataResult>\
         </QueryInvoiceDataResponse>";
         let err = persist_xml_for_row(
             response_xml,
@@ -1641,10 +1822,10 @@ mod tests {
             id,
             "SUP-2026/000001",
         )
-        .expect_err("missing <invoiceData> must still loud-fail");
+        .expect_err("genuinely malformed <invoiceData> must loud-fail");
         assert!(
-            format!("{err:#}").contains("missing <invoiceData>"),
-            "loud-fail message must NOT be masked by diagnostic capture; got: {err:#}"
+            format!("{err:#}").contains("base64-decode <invoiceData>"),
+            "loud-fail must name the base64 decode failure; got: {err:#}"
         );
         let capture_path = artifacts_dir.join(".failed").join(format!("{}.xml", id));
         let captured = std::fs::read(&capture_path).expect("capture file must exist");

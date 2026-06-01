@@ -195,6 +195,68 @@ pub fn run() {
                     };
                 }
             });
+
+            // PR-215 / S217 — terminal-Ctrl-C graceful shutdown
+            // listener. Closes the regression Ervin hit on 2026-06-01
+            // PROD_v2.1.1 (kimentő "still not working"). Pre-PR-215
+            // PR-209 wired graceful shutdown ONLY into the Tauri
+            // window-close path (`handle_window_event` → SIGTERM →
+            // backend's serve.rs ctrl_c handler). Terminal Ctrl-C
+            // however delivers SIGINT to the FOREGROUND process group,
+            // which means it hits the aberp-ui Tauri shell as well as
+            // the aberp serve child. The Tauri shell had no SIGINT
+            // handler, so it died on the kernel's default action; on
+            // exit, `Child::drop` with `kill_on_drop(true)` (see
+            // `backend.rs::spawn`) SIGKILLed the backend before its
+            // 5s drain budget elapsed → daemons cut mid-cycle, no
+            // `DaemonShutdownCompleted` audit row, and ZOMBIE
+            // backends sometimes held the loopback port across the
+            // next launch.
+            //
+            // The fix: install a SIGINT listener (plus SIGTERM /
+            // SIGHUP for systemd / `kill` parity with serve.rs)
+            // BEFORE Tauri starts the event loop. On signal, drive
+            // the SAME `drain_backend_then_exit` flow as
+            // `WindowEvent::CloseRequested` — that already sends
+            // SIGTERM to the backend (triggering its serve.rs
+            // graceful-shutdown coordinator) and exits the shell
+            // cleanly after the drain budget.
+            //
+            // Conservative choices, flagged for the operator:
+            //   - One-shot listener: after a signal fires we drive
+            //     the drain and exit. A second Ctrl-C during the 6s
+            //     drain window will NOT be caught by us (Tauri may
+            //     swallow it; the worst case is the operator hits
+            //     Ctrl-C again and Tauri's runtime exits hard,
+            //     which is no worse than pre-PR-215 behavior).
+            //   - We do NOT spawn this on a separate runtime: it
+            //     lives on the Tauri-owned tokio runtime alongside
+            //     `boot_backend`, so when the runtime shuts down on
+            //     `app_handle.exit(0)` the listener task naturally
+            //     drops.
+            //   - We do NOT race the signal arrival against
+            //     anything else here — the drain function itself
+            //     bounds wall time (5s `ABERP_SHUTDOWN_TIMEOUT_SECS`
+            //     + 1s slack inside `drain_backend_then_exit`).
+            //   - Test coverage is deliberately field-only: a
+            //     `cargo test` that sends real SIGINT would race
+            //     against cargo's own signal handler and either
+            //     hang the runner or kill it. Pre-flight is "shell
+            //     compiles + boot_backend keeps working", post-
+            //     flight is "Ervin Ctrl-Cs the prod run and confirms
+            //     `pgrep -f aberp` shows 0 within the drain budget"
+            //     — mirrors the [[aberp-graceful-shutdown-s213]]
+            //     post-merge verification posture.
+            let signal_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let trigger = await_terminal_shutdown_signal().await;
+                tracing::info!(
+                    trigger = %trigger,
+                    "Tauri shell: terminal shutdown signal received; routing through \
+                     drain_backend_then_exit (same path as WindowEvent::CloseRequested)"
+                );
+                drain_backend_then_exit(signal_handle).await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -371,6 +433,57 @@ async fn drain_backend_then_exit(app_handle: tauri::AppHandle) {
 
     tracing::info!("Tauri close: drain budget elapsed; exiting shell");
     app_handle.exit(0);
+}
+
+/// PR-215 / S217 — wait for any of {SIGINT, SIGTERM, SIGHUP} on Unix
+/// (only SIGINT on non-Unix). Returns a short string naming which
+/// signal fired so the calling `tracing::info!` can attribute the
+/// shutdown in the operator log. Shape mirrors
+/// `apps/aberp/src/serve.rs`'s signal-race block — same vocabulary,
+/// same fallback behaviour when SIGTERM install fails. Kept narrow:
+/// no token, no coordinator, no return-on-channel — the calling task
+/// is one-shot and re-await-able only by spawning a fresh task.
+async fn await_terminal_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Tauri shell: could not install SIGTERM handler; relying on ctrl_c only"
+                );
+                None
+            }
+        };
+        let mut sighup = signal(SignalKind::hangup()).ok();
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => {
+                if let Err(e) = res {
+                    tracing::warn!(error = %e, "Tauri shell: ctrl_c listener errored");
+                }
+                "ctrl-c"
+            }
+            _ = async {
+                match sigterm.as_mut() {
+                    Some(s) => { s.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => "sigterm",
+            _ = async {
+                match sighup.as_mut() {
+                    Some(s) => { s.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => "hangup",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "ctrl-c"
+    }
 }
 
 /// Read the tenant identifier from `ABERP_TENANT`, defaulting to

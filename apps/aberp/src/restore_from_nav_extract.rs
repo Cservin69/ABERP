@@ -199,11 +199,40 @@ pub struct LineCandidate {
 /// Extract + base64-decode the inner `<invoiceData>` blob from a
 /// verbatim `<QueryInvoiceDataResponse>` body. The decoded bytes are
 /// the full `<InvoiceData>` XML root the supplier originally submitted
-/// via `manageInvoice`. Loud-fails on absent / empty / malformed
-/// base64 per CLAUDE.md rule 12.
-pub fn extract_inner_invoice_data_xml(response_xml: &[u8]) -> Result<Vec<u8>> {
-    let b64 = find_first_text(response_xml, "invoiceData")?
-        .ok_or_else(|| anyhow!("queryInvoiceData response missing <invoiceData> element"))?;
+/// via `manageInvoice`.
+///
+/// Return-shape contract — three outcomes, per PR-215 / S217:
+///
+///   - `Ok(Some(bytes))` — `<invoiceData>` element present, base64 decoded.
+///   - `Ok(None)`        — `<invoiceData>` element ABSENT. Per the official
+///                         NAV OSA 3.0 XSD,
+///                         `QueryInvoiceDataResponseType.invoiceDataResult`
+///                         is `minOccurs=0`; for `queryInvoiceData INBOUND`
+///                         NAV legitimately returns `funcCode=OK` without
+///                         it when the supplier has not exposed the
+///                         original XML payload to the buyer (paper
+///                         invoices, partial-data submissions, supplier
+///                         opted out of XML republication). The buyer's
+///                         entitlement ends at the digest in those cases.
+///                         NOT a bug — observed on 13/13 of the 2026-06-01
+///                         production cycle's INBOUND rows. Callers MUST
+///                         distinguish this from `Err(...)`.
+///   - `Err(...)`        — `<invoiceData>` present but empty / base64
+///                         garbage. Stays loud per CLAUDE.md rule 12.
+///
+/// Pre-PR-215 this returned `Result<Vec<u8>>` and loud-failed on the
+/// absent case. The OUTBOUND caller is unaffected (a missing
+/// `<invoiceData>` for the seller's own invoice is still anomalous —
+/// `restore_from_nav_outgoing.rs::extract_catalog_for_invoice` continues
+/// to `warn!` + skip on `Ok(None)`). The INBOUND caller in
+/// `ap_sync.rs::persist_xml_for_row` treats `Ok(None)` as expected NAV
+/// behavior: `info!` + leave `nav_xml_path` NULL + skip `.failed/`
+/// diagnostic capture.
+pub fn extract_inner_invoice_data_xml(response_xml: &[u8]) -> Result<Option<Vec<u8>>> {
+    let b64 = match find_first_text(response_xml, "invoiceData")? {
+        Some(text) => text,
+        None => return Ok(None),
+    };
     let trimmed = b64.trim();
     if trimmed.is_empty() {
         return Err(anyhow!(
@@ -211,9 +240,10 @@ pub fn extract_inner_invoice_data_xml(response_xml: &[u8]) -> Result<Vec<u8>> {
              defence-in-depth loud-fail per CLAUDE.md rule 12"
         ));
     }
-    base64::engine::general_purpose::STANDARD
+    let bytes = base64::engine::general_purpose::STANDARD
         .decode(trimmed)
-        .map_err(|e| anyhow!("base64-decode <invoiceData> blob: {e}"))
+        .map_err(|e| anyhow!("base64-decode <invoiceData> blob: {e}"))?;
+    Ok(Some(bytes))
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1023,15 +1053,74 @@ mod tests {
               </invoiceDataResult>
             </QueryInvoiceDataResponse>"#
         );
-        let decoded = extract_inner_invoice_data_xml(envelope.as_bytes()).expect("decodes");
+        let decoded = extract_inner_invoice_data_xml(envelope.as_bytes())
+            .expect("decodes")
+            .expect("Some(bytes) on present + valid base64");
         assert_eq!(decoded, inner);
     }
 
+    /// PR-215 / S217 — RENAMED + FLIPPED. The pre-PR-215
+    /// `_loud_fails_on_missing` pin was contract-wrong: per the NAV
+    /// OSA 3.0 XSD `invoiceDataResult` is `minOccurs=0`, so funcCode=OK
+    /// without `<invoiceData>` is a legitimate NAV response (observed
+    /// on 13/13 INBOUND rows on 2026-06-01 prod). The parser MUST
+    /// distinguish "absent" (Ok(None)) from "present but malformed"
+    /// (Err) so the INBOUND caller can treat the former as expected
+    /// and the latter as a contract violation. See the parser's
+    /// doc-comment for the full return-shape contract.
     #[test]
-    fn extract_inner_invoice_data_xml_loud_fails_on_missing() {
+    fn extract_inner_invoice_data_xml_returns_none_on_absent_per_pr215() {
         let envelope = b"<QueryInvoiceDataResponse></QueryInvoiceDataResponse>";
-        let err = extract_inner_invoice_data_xml(envelope).expect_err("missing must fail");
-        assert!(format!("{err:#}").contains("missing <invoiceData>"));
+        let got = extract_inner_invoice_data_xml(envelope).expect("absent must not error");
+        assert!(got.is_none(), "absent <invoiceData> must yield Ok(None); got {got:?}");
+    }
+
+    /// PR-215 / S217 — same as above with the `<invoiceDataResult/>`
+    /// self-closing wrapper present. Both `<invoiceDataResult>` absent
+    /// AND empty must yield `Ok(None)` — the parser keys on
+    /// `<invoiceData>` (the only element that carries the payload),
+    /// not on the wrapper.
+    #[test]
+    fn extract_inner_invoice_data_xml_returns_none_on_empty_wrapper_per_pr215() {
+        let envelope = b"<QueryInvoiceDataResponse>\
+            <result><funcCode>OK</funcCode></result>\
+            <invoiceDataResult/>\
+        </QueryInvoiceDataResponse>";
+        let got = extract_inner_invoice_data_xml(envelope).expect("empty wrapper must not error");
+        assert!(got.is_none(), "empty <invoiceDataResult/> must yield Ok(None); got {got:?}");
+    }
+
+    /// PR-215 / S217 — preserved loud-fail surface: `<invoiceData>`
+    /// PRESENT with non-base64 content remains a contract violation
+    /// per CLAUDE.md rule 12. The INBOUND caller will write the raw
+    /// response to `.failed/` for triage.
+    #[test]
+    fn extract_inner_invoice_data_xml_loud_fails_on_invalid_base64_per_pr215() {
+        let envelope = b"<QueryInvoiceDataResponse>\
+            <invoiceDataResult><invoiceData>!!!not-base64!!!</invoiceData></invoiceDataResult>\
+        </QueryInvoiceDataResponse>";
+        let err = extract_inner_invoice_data_xml(envelope)
+            .expect_err("invalid base64 must loud-fail");
+        assert!(
+            format!("{err:#}").contains("base64-decode <invoiceData>"),
+            "loud-fail must name the base64 decode failure; got: {err:#}"
+        );
+    }
+
+    /// PR-215 / S217 — preserved loud-fail surface: `<invoiceData>`
+    /// PRESENT with an empty / whitespace-only text node is a contract
+    /// violation. Distinct from absence (which is Ok(None)).
+    #[test]
+    fn extract_inner_invoice_data_xml_loud_fails_on_empty_text_per_pr215() {
+        let envelope = b"<QueryInvoiceDataResponse>\
+            <invoiceDataResult><invoiceData>   </invoiceData></invoiceDataResult>\
+        </QueryInvoiceDataResponse>";
+        let err = extract_inner_invoice_data_xml(envelope)
+            .expect_err("present-but-empty must loud-fail");
+        assert!(
+            format!("{err:#}").contains("empty <invoiceData>"),
+            "loud-fail must name the empty-blob case; got: {err:#}"
+        );
     }
 
     // ── apply_candidates — dedup pins ─────────────────────────────
