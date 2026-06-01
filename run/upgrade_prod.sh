@@ -302,7 +302,16 @@ $(git status --short)
 HU: A munkafa nem tiszta a váltás után — valami baj van." 5
 fi
 
-current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || current_branch="UNKNOWN"
+# NB: `git rev-parse --abbrev-ref HEAD` AND `git symbolic-ref --short HEAD`
+# BOTH emit `heads/<name>` when a tag of the same name exists (release.sh
+# pushes both `refs/heads/PROD_vX.Y` AND `refs/tags/PROD_vX.Y` since S212,
+# so this collision is the steady state for every release branch).
+# `git branch --show-current` (git 2.22+) is the only form that returns the
+# unprefixed branch name in that ambiguous state. See S214 / PR-212.
+current_branch="$(git branch --show-current 2>/dev/null)" || current_branch="UNKNOWN"
+if [[ -z "$current_branch" ]]; then
+  current_branch="UNKNOWN"
+fi
 if [[ "$current_branch" != "$version" ]]; then
   die "current branch is '$current_branch' but expected '$version'" 5
 fi
