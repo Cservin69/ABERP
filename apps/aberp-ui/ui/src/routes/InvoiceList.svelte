@@ -92,6 +92,12 @@
     parseHotkey,
   } from "../lib/keyboard-nav";
   import { navigateTo } from "../lib/router";
+  // PR-223 / S227 — URL-driven filter init from the StatisticsPage's
+  // hygiene click-through. Read once on mount + on any subsequent
+  // hashchange that carries init params; strip the params off the
+  // URL after consumption so a refresh / browser-back does not
+  // reapply a stale init on top of the operator's interactive edits.
+  import { parseInvoicesUrl } from "../lib/hygiene-clickthrough";
   import InvoiceDetail from "./InvoiceDetail.svelte";
   import ModificationInvoice from "./ModificationInvoice.svelte";
   // S220 / PR-217 — operator-paced partner picker for ExtNav rows.
@@ -259,6 +265,13 @@
   }
 
   onMount(() => {
+    // PR-223 / S227 — consume any URL-driven filter init the
+    // StatisticsPage click-through deposited before the rest of
+    // mount runs, so the first paint already shows the filtered
+    // view (no flicker of saved-prefs rows being narrowed a beat
+    // later).
+    applyUrlInitIfPresent();
+    window.addEventListener("hashchange", onHashChange);
     void refresh();
     window.addEventListener("keydown", handleKeydown);
     // PR-87 / session-112 — read the just-issued stash left by the
@@ -282,7 +295,53 @@
 
   onDestroy(() => {
     window.removeEventListener("keydown", handleKeydown);
+    window.removeEventListener("hashchange", onHashChange);
   });
+
+  // PR-223 / S227 — URL → filter consumer. Reads the current
+  // `window.location.hash`, parses recognised params, and overrides
+  // the relevant facets on the live `filter` object. After consuming
+  // the URL we strip the query portion via `history.replaceState` so
+  // a later refresh does not reapply the same init on top of the
+  // operator's clicks; the persisted prefs (PR-175) then drive the
+  // saved view on next mount as usual.
+  //
+  // The init is one-way: it OVERRIDES the operator's saved facets
+  // for the axes named in the URL, but does NOT touch any facet the
+  // URL did not mention. So a click-through to "Rejected by NAV"
+  // sets `state = "Rejected"` but leaves the operator's saved
+  // currency / kind / needle untouched. The "Clear filters" button
+  // resets to `EMPTY_FILTER` (which has no `hygiene` field) so the
+  // operator can wipe the URL-induced narrowing with one click.
+  function applyUrlInitIfPresent() {
+    if (typeof window === "undefined") return;
+    const init = parseInvoicesUrl(window.location.hash);
+    if (!init.hasInit) return;
+    const o = init.outgoing;
+    const next: InvoiceFilterSpec = { ...filter };
+    if (o.state !== undefined) next.state = o.state;
+    if (o.row_kind !== undefined) next.row_kind = o.row_kind;
+    if (o.hygiene !== undefined) next.hygiene = o.hygiene;
+    filter = next;
+    // Strip the consumed query string so a refresh / back-button does
+    // not reapply the init. Keeps `#/invoices` clean for bookmarking.
+    try {
+      const baseHash = "#/invoices";
+      const newUrl = window.location.pathname + window.location.search + baseHash;
+      window.history.replaceState(window.history.state, "", newUrl);
+    } catch (_e) {
+      // history API can throw in restricted sandboxes; the init has
+      // already taken effect on the live filter, so this is best-
+      // effort cleanup.
+    }
+  }
+
+  function onHashChange() {
+    // Hashchange fires for in-app navigations + browser back/forward.
+    // We only act when the new hash carries init params; otherwise we
+    // leave the operator's interactive edits alone.
+    applyUrlInitIfPresent();
+  }
 
   function handleKeydown(event: KeyboardEvent) {
     // The detail modal and modification modal mount inside this

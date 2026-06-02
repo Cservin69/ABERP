@@ -12,6 +12,10 @@
 import type { DetailActionButton } from "./invoice-actions";
 import { buttonsForState } from "./invoice-actions";
 import type { Currency, InvoiceState, RowKind } from "./api";
+import {
+  PENDING_STATES,
+  type OutgoingHygieneFacet,
+} from "./hygiene-clickthrough";
 import { lifecycleIndex } from "./labels";
 import { filterInvoicesByNeedle, type InvoiceSearchRow } from "./keyboard-nav";
 
@@ -401,10 +405,27 @@ export interface InvoiceFilterSpec {
    * invoices; `"ExtNav"` restricts to NAV-mirror rows from
    * `restored_invoice`. */
   row_kind: "All" | RowKind;
+  /** PR-223 / S227 — synthetic hygiene predicate driven by the
+   * StatisticsPage click-through (no UI chip; URL-only init).
+   * Optional (absent === open gate) so every pre-S227 call site
+   * (`InvoiceList.svelte` chip-driven filter, persistence test
+   * literals) continues to type-check without an explicit
+   * `hygiene: null`. Closed-vocab when present:
+   *   - `"pending"` — row.state ∈ [`PENDING_STATES`]; mirrors the
+   *     dashboard's `outgoing_pending_count` (`reports::
+   *     CountedKind::PendingDraft`).
+   *   - `"no_partner"` — row.buyer_name is null / whitespace-only;
+   *     combined with `row_kind = "ExtNav"` matches the dashboard's
+   *     `restored_no_partner_count`. */
+  hygiene?: OutgoingHygieneFacet | null;
 }
 
 /** PR-94 / session-114 — empty filter (every facet open). The
- * "Clear filters" button on the empty-state resets to this. */
+ * "Clear filters" button on the empty-state resets to this. Field
+ * `hygiene` is intentionally OMITTED (not `hygiene: null`) so a
+ * persistence round-trip on a pre-S227 blob deep-equals
+ * `EMPTY_FILTER` — the validator never has to invent a field a
+ * fresh install does not yet write. */
 export const EMPTY_FILTER: InvoiceFilterSpec = {
   needle: "",
   state: "All",
@@ -420,8 +441,31 @@ export function isFilterEmpty(spec: InvoiceFilterSpec): boolean {
     spec.needle.trim().length === 0 &&
     spec.state === "All" &&
     spec.currency === "All" &&
-    spec.row_kind === "All"
+    spec.row_kind === "All" &&
+    // PR-223 / S227 — absent (undefined) and explicit-null both read
+    // as "open gate". A typo in a URL param that the parser fell back
+    // to null-on-unknown MUST still register as empty here so the
+    // "Clear filters" button keeps its empty-state meaning.
+    (spec.hygiene ?? null) === null
   );
+}
+
+/** PR-223 / S227 — pure predicate for the synthetic outgoing-hygiene
+ * gate. Pure on the same `InvoiceSortRow` shape `filterInvoices`
+ * already accepts; pinned by `hygiene-clickthrough.test.ts`. */
+function passesOutgoingHygiene<R extends InvoiceSortRow>(
+  row: R,
+  hygiene: OutgoingHygieneFacet,
+): boolean {
+  switch (hygiene) {
+    case "pending":
+      return (PENDING_STATES as readonly string[]).includes(row.state);
+    case "no_partner": {
+      const name = row.buyer_name;
+      if (name === null) return true;
+      return name.trim().length === 0;
+    }
+  }
 }
 
 /** PR-94 / session-114 — facet + needle filter. Composes with
@@ -442,10 +486,12 @@ export function filterInvoices<R extends InvoiceSortRow & InvoiceSearchRow>(
   const stateGate = spec.state === "All";
   const currencyGate = spec.currency === "All";
   const rowKindGate = spec.row_kind === "All";
+  const hygiene = spec.hygiene ?? null;
   const faceted = rows.filter((r) => {
     if (!stateGate && r.state !== spec.state) return false;
     if (!currencyGate && r.currency !== spec.currency) return false;
     if (!rowKindGate && r.row_kind !== spec.row_kind) return false;
+    if (hygiene !== null && !passesOutgoingHygiene(r, hygiene)) return false;
     return true;
   });
   return filterInvoicesByNeedle(faceted, spec.needle);

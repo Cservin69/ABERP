@@ -8,6 +8,7 @@
 // vocab is DISCARDED, never coerced (CLAUDE.md rule 7).
 
 import type { Currency } from "./api";
+import type { IncomingHygieneFacet } from "./hygiene-clickthrough";
 
 export type IncomingSortKey =
   | "supplier_name"
@@ -27,6 +28,14 @@ export interface IncomingFilterSpec {
   needle: string;
   status: IncomingStatusFacet;
   currency: IncomingCurrencyFacet;
+  /** PR-223 / S227 — synthetic hygiene predicate driven by the
+   * StatisticsPage click-through (no UI chip; URL-only init).
+   * Optional — absent === open gate. Today's only variant
+   * `"past_deadline"` matches the dashboard's
+   * `payable_past_deadline_count`: unpaid + payment_deadline <
+   * today. Both inputs live on the row already (PR-179 wire shape:
+   * `local_status` and `payment_deadline`), so no backend change. */
+  hygiene?: IncomingHygieneFacet | null;
 }
 
 export interface IncomingListPrefs {
@@ -66,6 +75,8 @@ const LEGAL_STATUSES: readonly IncomingStatusFacet[] = [
 ];
 
 const LEGAL_CURRENCIES: readonly IncomingCurrencyFacet[] = ["All", "HUF", "EUR"];
+
+const LEGAL_HYGIENE_FACETS: readonly IncomingHygieneFacet[] = ["past_deadline"];
 
 export function loadIncomingListPrefs(
   storage: Pick<Storage, "getItem"> | null = localStorageOrNull(),
@@ -141,7 +152,20 @@ function validateFilter(raw: unknown): IncomingFilterSpec {
   const currency = LEGAL_CURRENCIES.includes(obj.currency as IncomingCurrencyFacet)
     ? (obj.currency as IncomingCurrencyFacet)
     : "All";
-  return { needle, status, currency };
+  const out: IncomingFilterSpec = { needle, status, currency };
+  // PR-223 / S227 — hygiene field is optional. Only set explicitly
+  // when input carries a recognised value or an explicit `null`
+  // (operator cleared via URL-init); otherwise omit so the round-
+  // trip of a pre-S227 blob deep-equals `EMPTY_INCOMING_FILTER`.
+  if (obj.hygiene === null) {
+    out.hygiene = null;
+  } else if (
+    typeof obj.hygiene === "string" &&
+    LEGAL_HYGIENE_FACETS.includes(obj.hygiene as IncomingHygieneFacet)
+  ) {
+    out.hygiene = obj.hygiene as IncomingHygieneFacet;
+  }
+  return out;
 }
 
 function localStorageOrNull(): Storage | null {

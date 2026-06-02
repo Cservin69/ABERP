@@ -87,6 +87,12 @@
     saveInvoiceTab,
     type InvoiceTab,
   } from "./lib/invoice-tab-persistence";
+  // PR-223 / S227 — StatisticsPage hygiene click-through can carry a
+  // `?tab=outgoing|incoming` query param into the `#/invoices` route;
+  // this reader flips the segmented control so the operator lands on
+  // the right tab without an extra click. Quotes is intentionally
+  // out of vocab here (no hygiene flag maps to it).
+  import { parseInvoicesUrl } from "./lib/hygiene-clickthrough";
 
   // PR-87 / session-112 — sessionStorage key the IssueInvoice route
   // uses to hand the just-issued invoice id back to InvoiceList on
@@ -199,8 +205,30 @@
     bootPollTimer = setInterval(() => void pollBoot(), 300);
     unsubscribeRoute = subscribeRoute((r) => {
       route = r;
+      // PR-223 / S227 — when a hash-change lands on the `invoices`
+      // route AND carries a `?tab=` init, flip the segmented control
+      // to match. The list components themselves consume the rest of
+      // the query string on their own onMount / hashchange paths.
+      if (r === "invoices") applyTabFromUrl();
     });
+    // First paint: also honour an `?tab=` param if the operator
+    // deep-linked into the SPA via a hygiene-clickthrough URL.
+    if (route === "invoices") applyTabFromUrl();
   });
+
+  /** PR-223 / S227 — read `?tab=` off the live `window.location.hash`
+   * and override `invoicesTab` if a recognised value is present.
+   * Persists the override via `saveInvoiceTab` so a later reload
+   * keeps the operator on the tab they were just sent to (mirrors
+   * how the segmented control's own click handler persists). */
+  function applyTabFromUrl() {
+    if (typeof window === "undefined") return;
+    const init = parseInvoicesUrl(window.location.hash);
+    if (init.tab !== null && init.tab !== invoicesTab) {
+      invoicesTab = init.tab;
+      saveInvoiceTab(invoicesTab);
+    }
+  }
 
   onDestroy(() => {
     if (bootPollTimer !== null) clearInterval(bootPollTimer);

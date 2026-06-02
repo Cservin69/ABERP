@@ -20,6 +20,7 @@
 // first sort click overwrites it cleanly.
 
 import type { Currency, InvoiceState, RowKind } from "./api";
+import type { OutgoingHygieneFacet } from "./hygiene-clickthrough";
 import { LIFECYCLE_ORDER } from "./labels";
 import { EMPTY_FILTER, type InvoiceFilterSpec, type SortDir, type SortKey } from "./invoice-list";
 
@@ -48,6 +49,13 @@ const LEGAL_SORT_DIRS: readonly SortDir[] = ["asc", "desc"];
 const LEGAL_CURRENCIES: readonly Currency[] = ["HUF", "EUR"];
 
 const LEGAL_ROW_KINDS: readonly RowKind[] = ["Own", "ExtNav"];
+
+/** PR-223 / S227 — legal vocab for the persisted hygiene facet.
+ * Mirrors `OutgoingHygieneFacet` in `hygiene-clickthrough.ts`. */
+const LEGAL_HYGIENE_FACETS: readonly OutgoingHygieneFacet[] = [
+  "pending",
+  "no_partner",
+];
 
 /** Persisted shape. `sort.key === null` is the lifecycle-natural
  * fallback the Svelte component already documents as the default;
@@ -168,7 +176,15 @@ function validateFilter(raw: unknown): InvoiceFilterSpec {
   const state = validateStateFacet(obj.state);
   const currency = validateCurrencyFacet(obj.currency);
   const row_kind = validateRowKindFacet(obj.row_kind);
-  return { needle, state, currency, row_kind };
+  // PR-223 / S227 — `hygiene` is optional. Omit the field entirely
+  // when absent / unknown so a fresh install's persisted blob
+  // deep-equals `EMPTY_FILTER` (no invented `hygiene: null` key
+  // showing up in the JSON the next save reads). When a recognised
+  // value is present, set it explicitly.
+  const hygiene = validateHygieneFacet(obj.hygiene);
+  const out: InvoiceFilterSpec = { needle, state, currency, row_kind };
+  if (hygiene !== undefined) out.hygiene = hygiene;
+  return out;
 }
 
 function validateStateFacet(raw: unknown): InvoiceFilterSpec["state"] {
@@ -193,6 +209,29 @@ function validateRowKindFacet(raw: unknown): InvoiceFilterSpec["row_kind"] {
     return raw as RowKind;
   }
   return "All";
+}
+
+/** Returns `undefined` when absent / unknown so the caller can omit
+ * the field on the persisted shape; returns `null` only when input
+ * explicitly stored `null` (operator's last save was URL-init that
+ * cleared the hygiene gate but kept the field key); returns the
+ * recognised vocab value otherwise. */
+function validateHygieneFacet(
+  raw: unknown,
+): OutgoingHygieneFacet | null | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return null;
+  if (
+    typeof raw === "string" &&
+    LEGAL_HYGIENE_FACETS.includes(raw as OutgoingHygieneFacet)
+  ) {
+    return raw as OutgoingHygieneFacet;
+  }
+  // Unknown vocab → undefined (omit the field). Persisting an unknown
+  // value would silently constrain the operator's view on the next
+  // reload; the closed-vocab discard keeps the saved-prefs path
+  // honest.
+  return undefined;
 }
 
 function localStorageOrNull(): Storage | null {

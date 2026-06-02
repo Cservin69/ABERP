@@ -29,6 +29,13 @@
     isAggregateEmpty,
     type DateBasis,
   } from "../lib/statistics";
+  // PR-223 / S227 — hygiene-row click-through ([[hulye-biztos]] —
+  // a non-zero count must give the operator a one-click path to the
+  // rows behind it, not a number they hand-translate into filters).
+  import {
+    clickTargetForFlag,
+    type HygieneFlag,
+  } from "../lib/hygiene-clickthrough";
 
   type LoadState = "idle" | "loading" | "ready" | "error";
 
@@ -69,6 +76,74 @@
     if (next === dateBasis) return;
     dateBasis = next;
     void load();
+  }
+
+  // PR-223 / S227 — click-through navigation for a hygiene row.
+  // Mutates `window.location.hash` so the SPA's hash router fires its
+  // existing `hashchange` listener (App.svelte's `subscribeRoute`),
+  // re-rendering into InvoiceList / IncomingInvoiceList with the
+  // URL-driven filter init that the list reads on mount. A `null`
+  // target keeps the row static (today: AR-side past-deadline — see
+  // `clickTargetForFlag` for why).
+  function onHygieneClick(flag: HygieneFlag) {
+    const target = clickTargetForFlag(flag);
+    if (target === null) return;
+    window.location.hash = target.hash;
+  }
+
+  /** Per-flag display label (Hungarian + English) sourced verbatim from
+   * the pre-S227 markup; lifted into a typed helper so the renderer
+   * stays a single `{#each HYGIENE_ROWS}` loop and the click-vs-static
+   * branch reads as one CSS-classed `<li>` instead of eight near-
+   * duplicate blocks. */
+  interface HygieneRow {
+    flag: HygieneFlag;
+    label: string;
+  }
+  // PR-223 / S227 — closed-vocab table; mirrors `HygienePanel` fields
+  // in `api.ts`. Re-order = re-order on screen.
+  const HYGIENE_ROWS: readonly HygieneRow[] = [
+    { flag: "outgoing_pending", label: "Pending drafts (outgoing)" },
+    { flag: "outgoing_rejected", label: "Rejected by NAV" },
+    { flag: "outgoing_abandoned", label: "Abandoned" },
+    {
+      flag: "restored_no_partner",
+      label: "Restored rows with no partner link",
+    },
+    {
+      flag: "outstanding_past_deadline",
+      label: "Outstanding receivables past deadline",
+    },
+    {
+      flag: "payable_past_deadline",
+      label: "Outstanding payables past deadline",
+    },
+    { flag: "storno_chain", label: "Storno chain entries in period" },
+    {
+      flag: "modification_chain",
+      label: "Modification chain entries in period",
+    },
+  ];
+
+  function countForFlag(report: FinancialReport, flag: HygieneFlag): number {
+    switch (flag) {
+      case "outgoing_pending":
+        return report.hygiene.outgoing_pending_count;
+      case "outgoing_rejected":
+        return report.hygiene.outgoing_rejected_count;
+      case "outgoing_abandoned":
+        return report.hygiene.outgoing_abandoned_count;
+      case "restored_no_partner":
+        return report.hygiene.restored_no_partner_count;
+      case "outstanding_past_deadline":
+        return report.hygiene.outstanding_past_deadline_count;
+      case "payable_past_deadline":
+        return report.hygiene.payable_past_deadline_count;
+      case "storno_chain":
+        return report.hygiene.storno_chain_count;
+      case "modification_chain":
+        return report.hygiene.modification_chain_count;
+    }
   }
 </script>
 
@@ -355,18 +430,42 @@
       </article>
     </section>
 
-    <!-- Row 5: Hygiene flags -->
+    <!-- Row 5: Hygiene flags. PR-223 / S227 — each non-zero row is a
+         click target into InvoiceList / IncomingInvoiceList, pre-
+         filtered to the rows behind the count. Zero-count rows stay
+         static (no chevron, no hover). The two AR-side past-deadline
+         flags currently have no exact row-level filter (the wire
+         shape `InvoiceListItem` does not carry `payment_deadline`,
+         and adding it is out of S227 scope) — those rows stay static
+         even when non-zero. -->
     <section class="stats__hygiene" aria-label="Hygiene flags">
       <h3>Hygiene</h3>
       <ul>
-        <li class:flag-nonzero={r.hygiene.outgoing_pending_count > 0}>Pending drafts (outgoing): <strong>{r.hygiene.outgoing_pending_count}</strong></li>
-        <li class:flag-nonzero={r.hygiene.outgoing_rejected_count > 0}>Rejected by NAV: <strong>{r.hygiene.outgoing_rejected_count}</strong></li>
-        <li class:flag-nonzero={r.hygiene.outgoing_abandoned_count > 0}>Abandoned: <strong>{r.hygiene.outgoing_abandoned_count}</strong></li>
-        <li class:flag-nonzero={r.hygiene.restored_no_partner_count > 0}>Restored rows with no partner link: <strong>{r.hygiene.restored_no_partner_count}</strong></li>
-        <li class:flag-nonzero={r.hygiene.outstanding_past_deadline_count > 0}>Outstanding receivables past deadline: <strong>{r.hygiene.outstanding_past_deadline_count}</strong></li>
-        <li class:flag-nonzero={r.hygiene.payable_past_deadline_count > 0}>Outstanding payables past deadline: <strong>{r.hygiene.payable_past_deadline_count}</strong></li>
-        <li class:flag-nonzero={r.hygiene.storno_chain_count > 0}>Storno chain entries in period: <strong>{r.hygiene.storno_chain_count}</strong></li>
-        <li class:flag-nonzero={r.hygiene.modification_chain_count > 0}>Modification chain entries in period: <strong>{r.hygiene.modification_chain_count}</strong></li>
+        {#each HYGIENE_ROWS as row (row.flag)}
+          {@const count = countForFlag(r, row.flag)}
+          {@const target = clickTargetForFlag(row.flag)}
+          {@const clickable = count > 0 && target !== null}
+          {#if clickable && target !== null}
+            <li class="flag-nonzero clickable">
+              <button
+                type="button"
+                class="hygiene-row-btn"
+                onclick={() => onHygieneClick(row.flag)}
+                aria-label={`${row.label}: ${count}. Open list filtered to these rows.`}
+                title={`${row.label} — kattints a szűrt listához. / Click to open the filtered list.`}
+              >
+                <span class="hygiene-label">{row.label}:</span>
+                <strong>{count}</strong>
+                <span class="hygiene-chevron" aria-hidden="true">›</span>
+              </button>
+            </li>
+          {:else}
+            <li class:flag-nonzero={count > 0}>
+              <span class="hygiene-label">{row.label}:</span>
+              <strong>{count}</strong>
+            </li>
+          {/if}
+        {/each}
       </ul>
     </section>
 
@@ -691,6 +790,58 @@
   }
   .stats__hygiene li.flag-nonzero strong {
     color: var(--color-signal-warning);
+  }
+
+  /* PR-223 / S227 — clickable hygiene row chrome. The button strips
+   * its native background + border so the row reads visually
+   * identical to the static span path; the chevron + hover state
+   * carry the only affordance signal (ADR-0017 §1-2 quiet chrome).
+   * `display: contents` is intentional — the inner button must
+   * inherit the parent `<li>`'s flex layout (the leading dot,
+   * label, count, chevron all sit on the same row), not introduce
+   * its own block box. */
+  .stats__hygiene .hygiene-row-btn {
+    display: contents;
+    background: none;
+    border: 0;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+    text-align: inherit;
+  }
+  .stats__hygiene li.clickable {
+    cursor: pointer;
+    transition: color var(--motion-fade-in);
+  }
+  .stats__hygiene li.clickable:hover .hygiene-label {
+    color: var(--color-text-strong);
+  }
+  .stats__hygiene li.clickable:hover strong {
+    color: var(--color-text-strong);
+  }
+  .stats__hygiene li.clickable.flag-nonzero:hover strong {
+    /* When the count is in the warning colour AND we're hovering,
+     * keep the warning colour so the eye doesn't see a colour
+     * change that suggests "this is now safe". */
+    color: var(--color-signal-warning);
+    filter: brightness(1.2);
+  }
+  .stats__hygiene .hygiene-chevron {
+    color: var(--color-text-muted);
+    font-size: var(--type-size-md);
+    line-height: 1;
+    margin-left: var(--space-1);
+    transition: transform var(--motion-fade-in);
+  }
+  .stats__hygiene li.clickable:hover .hygiene-chevron {
+    color: var(--color-text-strong);
+    transform: translateX(2px);
+  }
+  .stats__hygiene .hygiene-row-btn:focus-visible {
+    outline: 2px solid var(--color-text-strong);
+    outline-offset: 2px;
   }
 
   .stats__deferred {

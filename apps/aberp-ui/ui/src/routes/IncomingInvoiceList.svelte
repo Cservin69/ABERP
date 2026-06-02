@@ -26,7 +26,7 @@
   // queryInvoiceData fetch wrote the bytes to disk); hidden otherwise
   // (digest-only fallback row, next sync cycle will re-attempt).
 
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import {
     listIncomingInvoices,
     markIncomingPaid,
@@ -38,6 +38,9 @@
     type SyncIncomingNowResponse,
     type Currency,
   } from "../lib/api";
+  // PR-223 / S227 — URL-driven filter init from the StatisticsPage's
+  // hygiene click-through.
+  import { parseInvoicesUrl } from "../lib/hygiene-clickthrough";
   import { formatTotal, formatInvoiceDate } from "../lib/format";
   import {
     actionsForStatus,
@@ -90,8 +93,37 @@
   let irrelevantSubmitting = $state(false);
 
   onMount(() => {
+    // PR-223 / S227 — consume any URL-driven filter init from the
+    // StatisticsPage click-through before the first paint.
+    applyUrlInitIfPresent();
+    window.addEventListener("hashchange", onHashChange);
     void refresh();
   });
+
+  onDestroy(() => {
+    window.removeEventListener("hashchange", onHashChange);
+  });
+
+  function applyUrlInitIfPresent() {
+    if (typeof window === "undefined") return;
+    const init = parseInvoicesUrl(window.location.hash);
+    if (!init.hasInit) return;
+    if (init.incoming.hygiene !== undefined) {
+      filter = { ...filter, hygiene: init.incoming.hygiene };
+    }
+    // Strip the consumed query string so a refresh does not reapply.
+    try {
+      const baseHash = "#/invoices";
+      const newUrl = window.location.pathname + window.location.search + baseHash;
+      window.history.replaceState(window.history.state, "", newUrl);
+    } catch (_e) {
+      // best-effort cleanup
+    }
+  }
+
+  function onHashChange() {
+    applyUrlInitIfPresent();
+  }
 
   $effect(() => {
     // Persist on every mutation. Cheap synchronous JSON write; the
@@ -158,12 +190,35 @@
 
   // ── Filtering ──────────────────────────────────────────────────────
 
+  /** PR-223 / S227 — today's date in ISO `YYYY-MM-DD` form for the
+   * `past_deadline` hygiene predicate. Captured once per `$derived`
+   * pass via the same `Date` the browser uses for "today" everywhere
+   * else; ISO compares lexicographically vs `payment_deadline`
+   * which the wire shape already stores as `YYYY-MM-DD`. */
+  function todayIso(): string {
+    const d = new Date();
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
   function matchesFilter(inv: IncomingInvoice): boolean {
     if (filter.status !== "All" && inv.local_status !== filter.status) {
       return false;
     }
     if (filter.currency !== "All" && inv.currency !== filter.currency) {
       return false;
+    }
+    // PR-223 / S227 — synthetic hygiene gate. Today: only
+    // `past_deadline` is in the closed-vocab. Mirrors the dashboard's
+    // `payable_past_deadline_count`: unpaid (local_status ===
+    // Outstanding) AND payment_deadline strictly before today.
+    const hygiene = filter.hygiene ?? null;
+    if (hygiene === "past_deadline") {
+      if (inv.local_status !== "Outstanding") return false;
+      if (inv.payment_deadline === null) return false;
+      if (inv.payment_deadline >= todayIso()) return false;
     }
     const needle = filter.needle.trim().toLowerCase();
     if (needle === "") return true;
