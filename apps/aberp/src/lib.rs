@@ -55,6 +55,7 @@ pub mod quote_intake_config;
 pub mod quote_intake_credentials;
 pub mod quote_intake_query;
 pub mod recover_from_nav;
+pub mod reports;
 pub mod request_technical_annulment;
 pub mod restore_from_nav_extract;
 pub mod restore_from_nav_outgoing;

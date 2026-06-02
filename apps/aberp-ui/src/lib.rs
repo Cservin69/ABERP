@@ -327,6 +327,8 @@ pub fn run() {
             commands::put_quote_intake_config,
             commands::test_quote_intake_connection,
             commands::list_quote_intake,
+            // S225 / PR-221 — financial-statistics dashboard endpoint.
+            commands::get_financial_report,
         ])
         .on_window_event(handle_window_event)
         .run(tauri::generate_context!())

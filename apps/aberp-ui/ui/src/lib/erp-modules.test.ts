@@ -47,11 +47,13 @@ import type { AppRoute } from "./router";
 const ALL_APP_ROUTES: AppRoute[] = [
   "invoices",
   "invoices-new",
+  "statistics",
   "partners",
   "products",
   "tenant",
   "nav-credentials",
   "maintenance",
+  "restore-from-nav",
 ];
 
 // PR-79 / session 102 — closed set of AREA-landing routes. These are
@@ -73,6 +75,8 @@ const AREA_LANDING_ROUTE_SET: Set<AppRoute> = new Set<AppRoute>([
 const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   invoices: "invoicing",
   "invoices-new": "invoicing",
+  // S225 / PR-221 — financial-statistics dashboard.
+  statistics: "statistics",
   partners: "master-data",
   products: "master-data",
   tenant: "settings",
@@ -89,6 +93,8 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
 const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   invoices: "operational",
   "invoices-new": "operational",
+  // S225 / PR-221 — operational area (visibility, daily-driver).
+  statistics: "operational",
   partners: "maintenance",
   products: "maintenance",
   tenant: "maintenance",
@@ -267,7 +273,7 @@ describe("modulesInArea + defaultRouteForArea", () => {
   it("modulesInArea preserves registry order within each area", () => {
     const op = modulesInArea("operational");
     const mt = modulesInArea("maintenance");
-    expect(op.map((m) => m.id)).toEqual(["invoicing"]);
+    expect(op.map((m) => m.id)).toEqual(["invoicing", "statistics"]);
     expect(mt.map((m) => m.id)).toEqual(["master-data", "settings"]);
   });
 

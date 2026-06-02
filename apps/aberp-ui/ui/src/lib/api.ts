@@ -1992,3 +1992,145 @@ export interface QuoteIntakeRow {
 export async function listQuoteIntake(): Promise<QuoteIntakeRow[]> {
   return invoke<QuoteIntakeRow[]>("list_quote_intake");
 }
+
+// ── S225 / PR-221 — Financial statistics dashboard ──────────────────
+
+/** One per-currency aggregate (HUF cents-equivalent, EUR cents).
+ * Mirrors `aberp::reports::AmountAggregate`. Minor-unit semantics
+ * inherit the closed-vocab Currency rule: HUF = whole forints,
+ * EUR = cents. */
+export interface AmountAggregate {
+  gross_minor: number;
+  net_minor: number;
+  vat_minor: number;
+  count: number;
+}
+
+/** Parallel HUF + EUR aggregates. The dashboard renders the two side-
+ * by-side; either may be zero. */
+export interface CurrencyAggregate {
+  huf: AmountAggregate;
+  eur: AmountAggregate;
+}
+
+/** Parallel HUF + EUR amounts (no count/net/vat split). */
+export interface CurrencyPair {
+  huf_minor: number;
+  eur_minor: number;
+}
+
+/** AR / AP aging buckets in days-overdue. `current` = not yet due. */
+export interface AgingPanel {
+  current: AmountAggregate;
+  days_1_30: AmountAggregate;
+  days_31_60: AmountAggregate;
+  days_61_90: AmountAggregate;
+  days_90_plus: AmountAggregate;
+}
+
+/** Days Sales Outstanding (DSO) — avg(paid - issued). `null` when
+ * sample size is zero. */
+export interface DsoPanel {
+  huf_days: number | null;
+  eur_days: number | null;
+  huf_sample_size: number;
+  eur_sample_size: number;
+}
+
+/** Forward cashflow projection — gross of not-yet-overdue receivables
+ * due within the next N days. */
+export interface CashflowPanel {
+  next_30: CurrencyPair;
+  next_60: CurrencyPair;
+  next_90: CurrencyPair;
+}
+
+export interface VatRateBreakdownEntry {
+  rate_basis_points: number;
+  currency: string;
+  net_minor: number;
+  vat_minor: number;
+}
+
+export interface TopEntry {
+  label: string;
+  currency: string;
+  gross_minor: number;
+  count: number;
+}
+
+export interface HygienePanel {
+  outgoing_rejected_count: number;
+  outgoing_abandoned_count: number;
+  outgoing_pending_count: number;
+  restored_no_partner_count: number;
+  outstanding_past_deadline_count: number;
+  payable_past_deadline_count: number;
+  storno_chain_count: number;
+  modification_chain_count: number;
+}
+
+export interface DeltaSet {
+  period_label: string;
+  revenue: CurrencyAggregate;
+  expenses: CurrencyAggregate;
+  revenue_pct_huf: number | null;
+  revenue_pct_eur: number | null;
+  expenses_pct_huf: number | null;
+  expenses_pct_eur: number | null;
+}
+
+export interface PeriodDeltas {
+  mom: DeltaSet | null;
+  yoy: DeltaSet | null;
+}
+
+export interface AnnualRunningPanel {
+  year: number;
+  revenue: CurrencyAggregate;
+}
+
+export interface PeriodMeta {
+  kind: string;
+  label: string;
+  from: string | null;
+  to: string | null;
+  date_basis: string;
+  today: string;
+}
+
+export interface FinancialReport {
+  period: PeriodMeta;
+  revenue: CurrencyAggregate;
+  expenses: CurrencyAggregate;
+  gross_profit: CurrencyPair;
+  vat_collected: CurrencyAggregate;
+  vat_paid: CurrencyAggregate;
+  vat_to_pay: CurrencyPair;
+  receivables: CurrencyAggregate;
+  payables: CurrencyAggregate;
+  receivables_aging: AgingPanel;
+  payables_aging: AgingPanel;
+  dso_days: DsoPanel;
+  cashflow_forward: CashflowPanel;
+  vat_breakdown_outgoing: VatRateBreakdownEntry[];
+  top_customers: TopEntry[];
+  top_vendors: TopEntry[];
+  hygiene: HygienePanel;
+  deltas: PeriodDeltas;
+  annual_running: AnnualRunningPanel;
+  deferred_notes: string[];
+}
+
+/** Fetch the financial-statistics snapshot for the given period +
+ * date basis. Both args optional — backend defaults to current month +
+ * `teljesites` (delivery-date) basis when either is empty. */
+export async function getFinancialReport(
+  period?: string,
+  dateBasis?: string,
+): Promise<FinancialReport> {
+  return invoke<FinancialReport>("get_financial_report", {
+    period: period ?? null,
+    dateBasis: dateBasis ?? null,
+  });
+}

@@ -124,6 +124,7 @@ use crate::products::{self, Product, ProductInputs, ValidationError as ProductVa
 use crate::quote_intake_config as quote_intake_config_mod;
 use crate::quote_intake_credentials as quote_intake_credentials_mod;
 use crate::quote_intake_query as quote_intake_query_mod;
+use crate::reports;
 use crate::restore_from_nav_outgoing as restore_outgoing;
 use crate::secrets_cache::SecretsCache;
 use crate::seller_banks::{self, SellerBankEntry, SellerBanks, SellerBanksError};
@@ -2025,6 +2026,14 @@ fn build_router(state: AppState) -> Router {
             post(handle_restore_from_nav_outgoing),
         )
         .route("/api/restored-invoices", get(handle_list_restored_invoices))
+        // S225 / PR-221 — financial-statistics dashboard endpoint.
+        // Read-only aggregation over invoice + restored_invoice +
+        // ap_invoice (digest-only sources combined with audit-ledger-
+        // derived state). Query params: `period` (default current
+        // month), `date_basis` (default `teljesites`). No audit-ledger
+        // writes — reports are pure views per the no-silent-write
+        // posture (CLAUDE.md rule 12).
+        .route("/api/reports/financial", get(handle_financial_report))
         // PR-72 / session-94 — multi-bank-account CRUD (PR-B of the
         // multi-bank initiative; ADR-0040 §addendum). Five routes
         // (list + create on the collection; update + delete + flip-
@@ -8255,6 +8264,87 @@ async fn handle_list_restored_invoices(
         Ok(Err(e)) => internal_error("list_restored_invoices", e),
         Err(join_err) => internal_error(
             "list_restored_invoices:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ── S225 / PR-221 — financial-statistics dashboard endpoint ────────────
+
+/// Query string for `GET /api/reports/financial`. Both fields are
+/// optional. `period` defaults to the current month (matches the HU
+/// monthly bevallás cadence); `date_basis` defaults to `teljesites`
+/// (delivery date — the regulatory anchor for VAT-month assignment).
+#[derive(Deserialize, Debug)]
+struct FinancialReportQuery {
+    period: Option<String>,
+    date_basis: Option<String>,
+}
+
+async fn handle_financial_report(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(q): Query<FinancialReportQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let today = reports::today_local();
+    let period_str = q.period.as_deref().unwrap_or("");
+    let period = if period_str.is_empty() {
+        reports::PeriodKind::Month(today.year(), u8::from(today.month()))
+    } else {
+        match reports::parse_period(period_str) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body(format!("invalid period parameter: {e}"))),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let date_basis = match q.date_basis.as_deref() {
+        None | Some("") => reports::DateBasis::Teljesites,
+        Some(s) => match reports::DateBasis::parse(s) {
+            Some(b) => b,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body(format!(
+                        "invalid date_basis `{s}` (must be `teljesites` or `issued`)"
+                    ))),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let binary_hash = match state.binary_hash.wait() {
+        Ok(h) => h,
+        Err(e) => {
+            return internal_error("financial_report:binary_hash", e);
+        }
+    };
+    let db_path = state.db_path.clone();
+    let tenant = state.tenant.clone();
+    let req = reports::ReportRequest {
+        period,
+        date_basis,
+        today,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        reports::compute_financial_report(&db_path, tenant, binary_hash, req)
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(e)) => internal_error("financial_report:compute", e),
+        Err(join_err) => internal_error(
+            "financial_report:join",
             anyhow!("blocking task panicked: {join_err}"),
         ),
     }

@@ -37,7 +37,11 @@ export type ErpArea = "operational" | "maintenance";
  * mirrors the SPA chrome's grouping. CLAUDE.md rule 7 — deny-default:
  * a new module is an explicit one-line widening here, not a silent
  * fall-through. */
-export type ErpModuleId = "invoicing" | "master-data" | "settings";
+export type ErpModuleId =
+  | "invoicing"
+  | "statistics"
+  | "master-data"
+  | "settings";
 
 /** A route reference inside a module. `id` is the typed `AppRoute`
  * slug (the router's closed vocab); `label` is the chrome's display
@@ -111,6 +115,18 @@ export const MODULES: ErpModule[] = [
       { id: "invoices", label: "Invoices" },
       { id: "invoices-new", label: "New invoice", hidden: true },
     ],
+  },
+  // S225 / PR-221 — financial-statistics dashboard. Operational area
+  // (daily-driver visibility into revenue / VAT / receivables /
+  // payables); separate module from Invoicing so the sidebar reads as
+  // "what to do" (Invoicing) vs "what's happened" (Statistics).
+  {
+    id: "statistics",
+    area: "operational",
+    label_hu: "Statisztika",
+    label_en: "Statistics",
+    glyph: "∑",
+    routes: [{ id: "statistics", label: "Financial dashboard" }],
   },
   {
     id: "master-data",

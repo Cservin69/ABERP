@@ -785,6 +785,36 @@ pub async fn list_restored_invoices(state: State<'_, AppState>) -> Result<Value,
     forward_get(&state, "/api/restored-invoices", true).await
 }
 
+/// S225 / PR-221 — financial-statistics dashboard. Forwards to the
+/// backend's `GET /api/reports/financial` aggregator. Both query params
+/// are optional; the backend defaults to current month + `teljesites`
+/// date basis when either is empty.
+#[tauri::command]
+pub async fn get_financial_report(
+    state: State<'_, AppState>,
+    period: Option<String>,
+    date_basis: Option<String>,
+) -> Result<Value, String> {
+    let mut path = String::from("/api/reports/financial");
+    let mut sep = '?';
+    if let Some(p) = &period {
+        if !p.is_empty() {
+            path.push(sep);
+            path.push_str("period=");
+            path.push_str(&urlencode(p));
+            sep = '&';
+        }
+    }
+    if let Some(b) = &date_basis {
+        if !b.is_empty() {
+            path.push(sep);
+            path.push_str("date_basis=");
+            path.push_str(&urlencode(b));
+        }
+    }
+    forward_get(&state, &path, true).await
+}
+
 /// S220 / PR-217 — operator-paced manual partner link on a restored
 /// ExtNav row. Per [[aberp-extnav-partner-nav-gap]] NAV does not expose
 /// buyer info for invoices submitted via other software; this command

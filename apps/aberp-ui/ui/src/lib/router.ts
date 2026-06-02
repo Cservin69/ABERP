@@ -27,6 +27,7 @@
 export type AppRoute =
   | "invoices"
   | "invoices-new"
+  | "statistics"
   | "tenant"
   | "nav-credentials"
   | "partners"
@@ -68,6 +69,8 @@ export function parseRoute(hash: string): AppRoute {
       return "invoices";
     case "invoices-new":
       return "invoices-new";
+    case "statistics":
+      return "statistics";
     case "tenant":
       return "tenant";
     case "nav-credentials":

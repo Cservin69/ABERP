@@ -75,6 +75,8 @@
   import RestoreFromNavWizard from "./routes/RestoreFromNavWizard.svelte";
   import SellerConfigWizard from "./routes/SellerConfigWizard.svelte";
   import SetupWizard from "./routes/SetupWizard.svelte";
+  // S225 / PR-221 — financial-statistics dashboard.
+  import StatisticsPage from "./routes/StatisticsPage.svelte";
   import TenantSettings from "./routes/TenantSettings.svelte";
   // PR-179 / session-179 — Outgoing / Incoming tab persistence on the
   // Invoices page. The tab is a top-level segmented control inside the
@@ -484,6 +486,8 @@
           <PartnersList />
         {:else if route === "products"}
           <ProductsList />
+        {:else if route === "statistics"}
+          <StatisticsPage />
         {:else if route === "maintenance"}
           <MaintenanceDashboard />
         {:else if route === "restore-from-nav"}
