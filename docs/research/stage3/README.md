@@ -26,6 +26,68 @@ Read it before any Phase β work — the trait shape, the canonical vocabulary,
 and the audit-ledger prefix family are now load-bearing contracts, not
 research starting points.
 
+## Phase β landed (2026-06-03)
+
+PR-225 / S229 shipped the first real adapter: `BarcodeScannerAdapter`
+(see ADR-0060 §"Phase β picks the first real adapter"). The scanner is
+the cheapest useful integration — works before any CNC arrives — and
+proves the trait shape against a real device.
+
+## Phase γ — workflow rails (2026-06-03, this PR-226 / S230)
+
+**The smart sequencing decision** (Ervin, 2026-06-03): build the
+workflow software **before** any further hardware adapters. Phases α
+and β gave us canonical event types and a single adapter; the gap
+they leave is "ABERP has no entities that own the state machines
+those events drive." A `CanonicalEvent::WorkOrderStateChanged`
+arriving from a scanner today has nowhere to be applied — there is
+no `work_orders` table, no state machine, no SPA surface.
+
+Phase γ fills that gap with four ADRs, sequenced so each consumes
+the prior:
+
+1. **[ADR-0061 — Inventory module v1](../../../adr/0061-inventory.md)** — `stock_movements` append-only ledger + denormalized `stock_qty` cache on `products` + virtual low-stock view + closed-vocab `MovementReason` × `MovementRefKind`. The foundation everything else writes into.
+2. **[ADR-0062 — Work Orders + 1-level BOM + linear Routing](../../../adr/0062-work-orders.md)** — `work_orders` entity owns the `WorkOrderStateChanged` lifecycle from ADR-0060 §1; `boms` is a per-product property (snapshot at Release); `routings` is per-WO. On Release the handler emits N `BomConsumption` movements; on Complete one `WoCompletion` movement.
+3. **[ADR-0063 — QA queue v1](../../../adr/0063-qa-queue.md)** — `qa_inspections` auto-created on routing-op Completed; manual Pass/Fail/Rework/Dispose buttons. WO Completed gated on all-pass. Future `CanonicalEvent::QualityResultReceived` from Renishaw flips state via the SAME handler with `actor: Adapter(name)`; operator override supersedes adapter forensically.
+4. **[ADR-0064 — Dispatch + invoice auto-spawn](../../../adr/0064-dispatch.md)** — `dispatches` entity; Mark-Shipped emits a `Dispatch` movement, spawns a Stage 1 invoice **draft** (not a NAV submission), and closes the Stage 3 → Stage 1 loop. Operator's Issue click is the only NAV trigger.
+
+**Hardware adapters become triggers; the rails work without them.**
+The Phase γ posture is that every entity-state mutation has a manual
+SPA button as its first-class trigger. When the Renishaw lands
+(Phase ζ) it calls into the SAME handler that the operator's Pass
+button calls today. No parallel code paths. The mock-friendly handler
+shape (`actor: ActorKind` parameter captured into audit) is the
+Phase γ cross-cutting decision that makes this work.
+
+**Audit-kind budget**: Phase γ adds 8 new `EventKind` variants under
+the `mes.*` prefix family ADR-0060 §4 established: 1 (ADR-0061
+`StockMovementRecorded`) + 3 (ADR-0062 `WorkOrderCreated`,
+`WorkOrderStateChanged`, `RoutingOpStateChanged`) + 2 (ADR-0063
+`QaInspectionCreated`, `QaInspectionDecided`) + 2 (ADR-0064
+`DispatchCreated`, `DispatchShipped`). F12 four-edit ritual fires
+eight times across the four implementation sessions S231–S234.
+
+**Stage 1 changes: zero.** The auto-spawned invoice draft enters the
+existing Stage 1 outgoing-invoice pipeline unchanged. Same posture
+as ADR-0057's quote-intake staging-not-burning: the regulated
+surface (`invoice` table → NAV submission) stays operator-adopted.
+
+**Sequenced as S231 → S232 → S233 → S234.** Each session implements
+one of the four ADRs as a single PR. The ADRs land together in this
+PR-226 / S230 doc-only commit so future sessions code against
+locked contracts. After Phase γ the workflow runs end-to-end with
+manual buttons; further hardware adapter phases (ε CNC, ζ Renishaw,
+η robotics) plug into the existing handlers.
+
+## Phase δ onward — hardware adapter strands (deferred)
+
+Phases δ through η are the per-vendor adapter sessions named in
+ADR-0060 §1's variant-mapping table. They are NOT sequenced before
+Phase γ because the canonical-vocabulary endpoint they emit into
+(the WorkOrder / QA / Dispatch handlers) does not exist until
+Phase γ ships. Once Phase γ ships, the order of δ–η is opportunistic
+— driven by which hardware Ervin buys first.
+
 ## Why this exists
 
 ABERP today is invoicing (Stage 1) plus a beginning of the customer-facing storefront strand (Stage 2). Stage 3 is the multi-year vision: when 3-4 DMG-Mori CNCs, a laser, robot transport, and a Renishaw quality gate land in Áben's shop, ABERP becomes the orchestration brain — the work-order dispatch, the audit ledger, the status board, the operations dashboard.
