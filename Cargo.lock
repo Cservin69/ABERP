@@ -9,6 +9,7 @@ dependencies = [
  "aberp-audit-ledger",
  "aberp-billing",
  "aberp-invoice-pdf",
+ "aberp-mes",
  "aberp-mnb-rates",
  "aberp-nav-transport",
  "aberp-nav-xsd-validator",
@@ -104,6 +105,8 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "tokio",
+ "tokio-util",
+ "tracing",
  "ulid",
 ]
 

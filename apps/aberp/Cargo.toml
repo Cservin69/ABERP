@@ -70,6 +70,14 @@ aberp-invoice-pdf = { path = "../../crates/invoice-pdf" }
 # is dormant. Per [[aberp-versioning-policy]] this is the first
 # Stage 2 module landing.
 aberp-quote-intake = { path = "../../crates/aberp-quote-intake" }
+# S229 / PR-225 — Stage 3 manufacturing-execution adapter framework
+# (ADR-0060 Phase β). The binary owns the boot-time `AdapterRegistry`
+# + per-adapter ledger-writer spawn. The first real adapter shipped
+# is `BarcodeScannerAdapter` (TCP socket listener); opt-in via the
+# `ABERP_BARCODE_SCANNER_ENABLED=true` env var (no seller.toml slot
+# touched in PR-225 — that's filed for a follow-up PR per the
+# [[seller-toml-write-invariant]] family preservation discipline).
+aberp-mes = { path = "../../crates/aberp-mes" }
 # PR-44γ — decimal arithmetic for the EUR→HUF round-half-even
 # conversion at the CLI boundary (the `aberp-billing` module is the
 # arithmetic owner; the binary needs the type for the

@@ -1,0 +1,16 @@
+//! Concrete adapter implementations bundled with the framework.
+//!
+//! Phase β (S229 / PR-225) ships the first real adapter:
+//! [`barcode_scanner::BarcodeScannerAdapter`] — a TCP socket listener
+//! suitable for the well-known industrial pattern where a Cognex /
+//! Datalogic / Honeywell scanner emits decoded payloads as
+//! line-delimited UTF-8 over plain TCP. Future phases add MTConnect /
+//! OPC-UA / Renishaw / robot adapters; each lives either inside this
+//! module (when the protocol code is small and self-contained) or in a
+//! per-vendor crate (when it pulls vendor SDKs).
+//!
+//! Per ADR-0060 §"The next adapter author's first hour" — adapters
+//! speak vendor-specific protocols on one side and emit
+//! [`CanonicalEvent`](crate::CanonicalEvent)s on the other.
+
+pub mod barcode_scanner;

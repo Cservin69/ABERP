@@ -21,7 +21,11 @@ async-trait = { workspace = true }
 
 # Async runtime — broadcast channel for per-adapter event fan-out per
 # ADR-0006 §"Event bus" Phase 1 + ADR-0060 §"Why broadcast over mpsc".
-tokio = { workspace = true }
+# PR-225 / S229 extends with `io-util` for `BufReader` + `AsyncReadExt`
+# inside the barcode-scanner adapter's per-connection reader loop;
+# `rt` for `spawn_blocking` used by the ledger writer's per-event
+# DuckDB-append surface.
+tokio = { workspace = true, features = ["io-util", "rt"] }
 
 # Error machinery — same crate every other ABERP crate uses.
 thiserror = { workspace = true }
@@ -41,12 +45,29 @@ aberp-audit-ledger = { path = "../audit-ledger" }
 # posture as `aberp-quote-intake::audit::write_poll_audit_entry`.
 duckdb = { workspace = true }
 
+# PR-225 / S229 (Phase β) — `CancellationToken` for the
+# `BarcodeScannerAdapter`'s listener-task lifecycle + the
+# `spawn_ledger_writer` runtime task. Same posture as quote-intake /
+# AP sync / NAV poll daemons — child token races a recv / accept
+# future via tokio::select.
+tokio-util = { workspace = true }
+
+# PR-225 / S229 — `time::OffsetDateTime::now_utc().format(&Rfc3339)`
+# stamps the `at_iso8601` field on the BarcodeScannerAdapter's
+# emitted ScanReceived events. Workspace pin (no chrono).
+time = { workspace = true }
+
+# PR-225 / S229 — `Ulid::new()` for the operator-decision idempotency
+# key minted per ledger-writer ScanReceived emission.
+ulid = { workspace = true }
+
+# PR-225 / S229 — `tracing::{warn,error,info}` for adapter lifecycle +
+# loud logs on RecvError::Lagged / bind failures / oversize-payload
+# drops. Same posture as every other ABERP daemon.
+tracing = { workspace = true }
+
 [dev-dependencies]
 # tokio test utilities — turn-on the test-util feature to drive paused
-# clocks in lifecycle tests.
+# clocks in lifecycle tests, plus net/sync/io for the TCP listener
+# integration tests.
 tokio = { workspace = true, features = ["test-util"] }
-
-# time / ulid — needed by the audit-ledger integration test that
-# constructs an Entry through the same surface aberp-quote-intake uses.
-time = { workspace = true }
-ulid = { workspace = true }

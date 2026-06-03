@@ -72,13 +72,24 @@ pub enum CanonicalEvent {
         at_iso8601: String,
     },
 
-    /// A barcode / QR code was scanned at a station. The `code` is the
-    /// verbatim payload the scanner emitted; downstream consumers parse
-    /// vendor-specific encodings.
+    /// A barcode / QR code was scanned at a station. `payload` is the
+    /// verbatim decoded string the scanner emitted (AIM ID prefix
+    /// stripped — when present, the prefix's symbology surfaces as
+    /// `symbology`). `source_addr` carries the peer address of the
+    /// originating TCP / network connection when available, for
+    /// debugging only — MUST NOT carry credential bytes.
+    ///
+    /// Extended in S229 / PR-225 (Phase β) with `symbology` +
+    /// `source_addr`. `code` was renamed to `payload` and `station_id`
+    /// was dropped — the station identity is encoded inside
+    /// `scanner_id` (e.g. `"barcode-scanner-receiving-dock"`) per the
+    /// barcode-scanner adapter config. No prod data existed for the
+    /// Phase α shape — safe to evolve before the variant ever shipped.
     ScanReceived {
         scanner_id: String,
-        station_id: String,
-        code: String,
+        payload: String,
+        symbology: Option<String>,
+        source_addr: Option<String>,
         at_iso8601: String,
     },
 
@@ -197,9 +208,10 @@ mod tests {
 
     fn sample_scan_received() -> CanonicalEvent {
         CanonicalEvent::ScanReceived {
-            scanner_id: "honeywell-1900-station-A".to_string(),
-            station_id: "packaging-1".to_string(),
-            code: "QR:wo_01H/op-3".to_string(),
+            scanner_id: "barcode-scanner-packaging-1".to_string(),
+            payload: "QR:wo_01H/op-3".to_string(),
+            symbology: Some("QR".to_string()),
+            source_addr: Some("10.0.0.42:51234".to_string()),
             at_iso8601: "2026-06-03T08:32:00Z".to_string(),
         }
     }
@@ -384,5 +396,24 @@ mod tests {
         let json = serde_json::to_string(&with_some).unwrap();
         let back: CanonicalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, with_some);
+    }
+
+    /// `ScanReceived`'s two Optional fields (`symbology`, `source_addr`)
+    /// MUST round-trip cleanly through None — a scan whose payload had
+    /// no recognized AIM ID prefix, or whose source connection had no
+    /// peer address (HID wedge mode future Phase β.2 has no
+    /// `source_addr`), still produces a valid event. S229 / PR-225.
+    #[test]
+    fn scan_received_optional_fields_round_trip_through_none() {
+        let with_none = CanonicalEvent::ScanReceived {
+            scanner_id: "barcode-scanner-receiving-dock".into(),
+            payload: "ORDER-12345".into(),
+            symbology: None,
+            source_addr: None,
+            at_iso8601: "2026-06-03T08:32:00Z".into(),
+        };
+        let json = serde_json::to_string(&with_none).unwrap();
+        let back: CanonicalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with_none);
     }
 }

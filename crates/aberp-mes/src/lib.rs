@@ -46,15 +46,23 @@
 #![warn(missing_debug_implementations)]
 
 mod adapter;
+pub mod adapters;
 mod audit;
 mod error;
 mod events;
+mod ledger_writer;
 mod noop;
 mod registry;
 
 pub use adapter::{Adapter, AdapterHealth};
+pub use adapters::barcode_scanner::{
+    aim_id_to_symbology, split_aim_prefix, BarcodeScannerAdapter, BarcodeScannerConfig,
+    DEFAULT_CHANNEL_CAPACITY, DEFAULT_LISTEN_PORT, DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+    DEFAULT_MAX_PAYLOAD_LEN,
+};
 pub use audit::{audit_kind_string, write_mes_adapter_event, MesAdapterEventPayload};
 pub use error::{AdapterError, RegistryError};
 pub use events::{CanonicalEvent, MachineState, QualityOutcome, WorkOrderState};
+pub use ledger_writer::{spawn_ledger_writer, LedgerWriterActor, LedgerWriterDeps};
 pub use noop::NoopAdapter;
 pub use registry::AdapterRegistry;

@@ -41,6 +41,10 @@ pub mod issue_preflight;
 pub mod issue_storno;
 pub mod mark_abandoned;
 pub mod mark_invoice_paid;
+// S229 / PR-225 — Stage 3 manufacturing-adapter framework boot wiring.
+// Reads `ABERP_BARCODE_SCANNER_*` env vars and spawns the barcode
+// scanner adapter + per-adapter ledger-writer task. Default-off.
+pub mod mes_boot;
 pub mod mnb_rates_provider;
 pub mod nav_xml;
 pub mod notes_history;

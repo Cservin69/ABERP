@@ -1254,6 +1254,54 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             }
         }
 
+        // S229 / PR-225 — Stage 3 manufacturing-adapter framework
+        // boot (ADR-0060 Phase β). The barcode scanner adapter binds
+        // a TCP listener and emits `CanonicalEvent::ScanReceived`
+        // events into the audit ledger via the per-adapter
+        // ledger-writer task. Opt-in via the
+        // `ABERP_BARCODE_SCANNER_ENABLED=true` env var; same posture
+        // as quote-intake S210 — keychain / seller.toml integration
+        // is deferred to a follow-up PR per the
+        // [[seller-toml-write-invariant]] family preservation
+        // discipline.
+        //
+        // DoS bounds (`max_payload_len`, `max_concurrent_connections`)
+        // stay at compiled defaults per [[trust-code-not-operator]] —
+        // env-var knobs are scanner_id + host + port only.
+        {
+            let operator_login = match recovery_state.boot_state.read() {
+                Ok(guard) => match &*guard {
+                    ServeBootState::Ready { operator_login } => operator_login.clone(),
+                    _ => "boot".to_string(),
+                },
+                Err(_) => "boot".to_string(),
+            };
+            let binary_hash = recovery_state
+                .binary_hash
+                .wait()
+                .context("await background binary hash for MES barcode-scanner boot")?;
+            let mes_deps = crate::mes_boot::MesBootDeps {
+                db_path: (*recovery_state.db_path).clone(),
+                tenant: recovery_state.tenant.clone(),
+                binary_hash,
+                operator_login,
+                session_id: Ulid::new().to_string(),
+            };
+            match crate::mes_boot::boot_mes_adapters(mes_deps, coordinator.token.clone())
+                .await
+            {
+                Ok(Some(spawned)) => {
+                    for (label, handle) in spawned.handles {
+                        coordinator.register(label, handle);
+                    }
+                }
+                Ok(None) => {} // disabled — already logged inside boot_mes_adapters
+                Err(e) => {
+                    return Err(anyhow!("MES adapter boot failed: {e:#}"));
+                }
+            }
+        }
+
         let config = RustlsConfig::from_der(rustls_config.0, rustls_config.1)
             .await
             .context("build axum-server RustlsConfig")?;
