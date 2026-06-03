@@ -17,7 +17,11 @@
   import {
     createStockMovement,
     getProduct,
+    getProductBom,
+    listProducts,
     listStockMovements,
+    putProductBom,
+    type BomLine,
     type Product,
     type StockMovement,
   } from "../lib/api";
@@ -29,6 +33,17 @@
     reasonLabel,
   } from "../lib/stock-movements";
   import type { StockMovementReason } from "../lib/api";
+  import {
+    addBomRow,
+    componentName,
+    composeBomBody,
+    emptyBomForm,
+    formFromBomLines,
+    isBomFormSubmittable,
+    removeBomRow,
+    updateBomRow,
+    type BomFormState,
+  } from "../lib/bom-form";
   import { formatTotal } from "../lib/format";
 
   type Props = {
@@ -41,6 +56,30 @@
   let movements: StockMovement[] = $state([]);
   let loadState: "loading" | "loaded" | "error" = $state("loading");
   let loadError: string | null = $state(null);
+
+  // S232 — tab segmented control. "stock" is the default (Inventory v1
+  // is the operator's daily driver — adding a recipe is a per-product
+  // setup task). The active tab is local SPA state; the modal closing
+  // resets to default on the next open via this var's declaration.
+  let activeTab: "stock" | "bom" = $state("stock");
+
+  // S232 — BOM authoring tab state.
+  // - `bomLines` mirrors the GET /api/products/:id/bom response (the
+  //   current active BOM). Used for the read-side table above the
+  //   editor.
+  // - `bomForm` is the operator-edited draft; folded from `bomLines`
+  //   on every (re)load so the operator sees the current recipe
+  //   pre-filled rather than typing it from scratch each time.
+  // - `componentCatalog` is the full products list, used by the row's
+  //   <select> to pick a component AND by the read-side table to
+  //   resolve `component_id` → name.
+  let bomLines: BomLine[] = $state([]);
+  let bomForm: BomFormState = $state(emptyBomForm());
+  let componentCatalog: Product[] = $state([]);
+  let bomLoadState: "loading" | "loaded" | "error" = $state("loading");
+  let bomLoadError: string | null = $state(null);
+  let bomSaveState: "idle" | "saving" | "error" = $state("idle");
+  let bomSaveError: string | null = $state(null);
 
   // Manual adjustment form state. `reason` defaults to Adjustment —
   // the only reason that accepts any sign per ADR-0061 §5, so the
@@ -90,6 +129,60 @@
       loadError = err instanceof Error ? err.message : String(err);
     }
   }
+
+  // S232 — lazy-load the BOM data the first time the operator opens
+  // the BOM tab (and on every subsequent open so a concurrent edit
+  // somewhere else re-syncs). The component catalog rides in the same
+  // fetch because the row picker + the read-side table both need it
+  // to resolve `component_id` → name. `listProducts()` returns the
+  // current product TOO (the row picker filters self-loops in the
+  // template).
+  async function loadBom(id: string) {
+    bomLoadState = "loading";
+    bomLoadError = null;
+    try {
+      const [lines, catalog] = await Promise.all([
+        getProductBom(id),
+        listProducts(),
+      ]);
+      bomLines = lines;
+      bomForm = formFromBomLines(lines);
+      componentCatalog = catalog;
+      bomLoadState = "loaded";
+    } catch (err: unknown) {
+      bomLoadState = "error";
+      bomLoadError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  // S232 — POST the operator-edited BOM. Backend semantics are full-
+  // replace: every prior active row is soft-retired; the supplied list
+  // becomes the new active set. On success, the response IS the new
+  // active list — fold it back into the form so the operator sees the
+  // saved state without a second round-trip.
+  async function saveBom() {
+    if (productId === null) return;
+    bomSaveState = "saving";
+    bomSaveError = null;
+    try {
+      const result = await putProductBom(productId, composeBomBody(bomForm));
+      bomLines = result;
+      bomForm = formFromBomLines(result);
+      bomSaveState = "idle";
+    } catch (err: unknown) {
+      bomSaveState = "error";
+      bomSaveError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  // S232 — auto-load BOM on tab open. `$effect` re-fires when either
+  // `activeTab` or `productId` changes; the guard skips the initial
+  // "stock" tab and the null-productId boot frame.
+  $effect(() => {
+    if (activeTab === "bom" && productId !== null) {
+      void loadBom(productId);
+    }
+  });
 
   async function submit() {
     if (productId === null) return;
@@ -169,6 +262,38 @@
       </dl>
     </section>
 
+    <!-- S232 / PR-228 follow-up — tab segmented control. "Stock"
+         keeps the daily-driver inventory ledger; "BOM" surfaces the
+         per-product recipe authoring tab. The bilingual labels match
+         the App.svelte Invoices tab pattern (HU on top, EN sub-label
+         below). -->
+    <div class="product-detail__tabs" role="tablist" aria-label="Product detail tabs">
+      <button
+        type="button"
+        role="tab"
+        class="product-detail__tab"
+        class:product-detail__tab--active={activeTab === "stock"}
+        aria-selected={activeTab === "stock"}
+        onclick={() => (activeTab = "stock")}
+      >
+        <span class="product-detail__tab-label">Készlet</span>
+        <span class="product-detail__tab-sub">Stock</span>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        class="product-detail__tab"
+        class:product-detail__tab--active={activeTab === "bom"}
+        aria-selected={activeTab === "bom"}
+        onclick={() => (activeTab = "bom")}
+        data-testid="product-detail-tab-bom"
+      >
+        <span class="product-detail__tab-label">Receptúra</span>
+        <span class="product-detail__tab-sub">BOM</span>
+      </button>
+    </div>
+
+    {#if activeTab === "stock"}
     <section class="product-detail__form" aria-labelledby="pd-form-title">
       <h3 id="pd-form-title">Post a stock movement</h3>
       <p class="product-detail__muted small">
@@ -256,6 +381,137 @@
         </table>
       {/if}
     </section>
+    {/if}
+
+    {#if activeTab === "bom"}
+      <!-- S232 / PR-228 follow-up — BOM authoring tab. Reads the
+           current active BOM via GET /api/products/:id/bom and
+           POSTs a new full-replace list on Save. Backend semantics:
+           every prior active row is soft-retired in the same
+           transaction so the next GET returns only the just-saved
+           rows. -->
+      <section class="product-detail__bom" aria-labelledby="pd-bom-title">
+        <h3 id="pd-bom-title">Receptúra / Bill of materials</h3>
+        <p class="product-detail__muted small">
+          A komponensek és a darabonkénti mennyiségek mentésekor a
+          korábbi receptúra automatikusan archiválódik. / Saving
+          replaces the entire active recipe (prior rows are
+          soft-retired).
+        </p>
+
+        {#if bomLoadState === "loading"}
+          <p class="product-detail__muted">Betöltés… / Loading…</p>
+        {:else if bomLoadState === "error"}
+          <p class="product-detail__error" role="alert">
+            <strong>Could not load BOM.</strong>
+            <span>{bomLoadError ?? ""}</span>
+          </p>
+        {:else}
+          {#if bomLines.length === 0}
+            <p class="product-detail__muted">
+              Még nincs aktív receptúra. / No active BOM yet.
+            </p>
+          {:else}
+            <table class="ledger-table" aria-label="Active BOM">
+              <thead>
+                <tr>
+                  <th scope="col">Komponens / Component</th>
+                  <th scope="col" class="num">Mennyiség / Qty per unit</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each bomLines as line (line.bom_line_id)}
+                  <tr>
+                    <td>{componentName(line.component_id, componentCatalog)}</td>
+                    <td class="num mono">{formatQty(line.qty_per_unit)}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          {/if}
+
+          <form
+            class="bom-form"
+            onsubmit={(e) => {
+              e.preventDefault();
+              void saveBom();
+            }}
+          >
+            <h4 class="bom-form__title">Szerkesztés / Edit</h4>
+            {#each bomForm.rows as row, idx (idx)}
+              <div class="bom-form__row">
+                <label class="bom-form__field bom-form__field--grow">
+                  <span>Komponens / Component</span>
+                  <select
+                    value={row.component_id}
+                    onchange={(e) => {
+                      bomForm = updateBomRow(bomForm, idx, {
+                        component_id: (e.currentTarget as HTMLSelectElement).value,
+                      });
+                    }}
+                    required
+                  >
+                    <option value="" disabled>— válassz / pick —</option>
+                    {#each componentCatalog as p (p.id)}
+                      {#if p.id !== productId}
+                        <option value={p.id}>{p.name}</option>
+                      {/if}
+                    {/each}
+                  </select>
+                </label>
+                <label class="bom-form__field">
+                  <span>Mennyiség / Qty per unit</span>
+                  <input
+                    type="text"
+                    inputmode="decimal"
+                    value={row.qty_per_unit_input}
+                    oninput={(e) => {
+                      bomForm = updateBomRow(bomForm, idx, {
+                        qty_per_unit_input: (e.currentTarget as HTMLInputElement)
+                          .value,
+                      });
+                    }}
+                    placeholder="e.g. 4 or 1.5"
+                    required
+                  />
+                </label>
+                <button
+                  type="button"
+                  class="quiet-button bom-form__remove"
+                  onclick={() => (bomForm = removeBomRow(bomForm, idx))}
+                  aria-label="Sor törlése / Remove row"
+                >
+                  ×
+                </button>
+              </div>
+            {/each}
+
+            <div class="bom-form__actions">
+              <button
+                type="button"
+                class="quiet-button"
+                onclick={() => (bomForm = addBomRow(bomForm))}
+              >
+                + Komponens hozzáadása / Add component
+              </button>
+              <button
+                type="submit"
+                class="page__primary"
+                disabled={bomSaveState === "saving" || !isBomFormSubmittable(bomForm)}
+              >
+                {bomSaveState === "saving"
+                  ? "Mentés… / Saving…"
+                  : "Mentés / Save"}
+              </button>
+            </div>
+
+            {#if bomSaveError !== null}
+              <p class="product-detail__error" role="alert">{bomSaveError}</p>
+            {/if}
+          </form>
+        {/if}
+      </section>
+    {/if}
   {/if}
 </dialog>
 
@@ -405,5 +661,89 @@
     border: 1px solid var(--color-border, #ccc);
     border-radius: 4px;
     cursor: pointer;
+  }
+
+  /* S232 / PR-228 follow-up — tab segmented control. Same visual
+     posture as the App.svelte invoices tabs but scoped to the modal. */
+  .product-detail__tabs {
+    display: flex;
+    gap: 4px;
+    margin: var(--space-3) 0 var(--space-3) 0;
+    border-bottom: 1px solid var(--color-border, #ccc);
+  }
+  .product-detail__tab {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 6px 12px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    color: var(--color-text-secondary, #666);
+  }
+  .product-detail__tab--active {
+    border-bottom-color: var(--color-primary, #1769aa);
+    color: var(--color-text-strong, #111);
+  }
+  .product-detail__tab-label {
+    font-weight: 600;
+  }
+  .product-detail__tab-sub {
+    font-size: 0.75rem;
+    color: var(--color-text-secondary, #666);
+  }
+
+  /* S232 — BOM editor form layout. */
+  .product-detail__bom {
+    margin-top: var(--space-3);
+  }
+  .bom-form {
+    margin-top: var(--space-3);
+    padding: var(--space-3);
+    background: var(--color-surface-raised, #f6f6f6);
+    border-radius: var(--radius-sm, 4px);
+  }
+  .bom-form__title {
+    margin: 0 0 var(--space-2) 0;
+    font-size: 0.95rem;
+    font-weight: 600;
+  }
+  .bom-form__row {
+    display: flex;
+    gap: var(--space-2);
+    align-items: flex-end;
+    margin-bottom: var(--space-2);
+  }
+  .bom-form__field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .bom-form__field--grow {
+    flex: 1;
+  }
+  .bom-form__field span {
+    font-size: 0.85rem;
+    color: var(--color-text-secondary, #666);
+  }
+  .bom-form__field input,
+  .bom-form__field select {
+    padding: 6px 8px;
+    border: 1px solid var(--color-border, #ccc);
+    border-radius: 4px;
+    background: var(--color-surface, white);
+    color: var(--color-text-strong, #111);
+  }
+  .bom-form__remove {
+    align-self: flex-end;
+    padding: 4px 10px;
+    font-weight: bold;
+  }
+  .bom-form__actions {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
   }
 </style>
