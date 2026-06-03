@@ -53,9 +53,10 @@ mod types;
 pub use audit::{QaInspectionCreatedPayload, QaInspectionDecidedPayload};
 pub use error::QaError;
 pub use repository::{
-    all_live_inspections_passed_for_wo, auto_create_inspection_for_op_completion, decide_qa,
-    ensure_schema, get_qa_inspection, list_live_inspections_for_wo, list_qa_inspections,
-    AutoCreateInspectionInputs, DecideQaInputs, QaDecisionOutcome, QaInspection, QaWriteContext,
+    all_live_inspections_passed_for_wo, auto_create_inspection_for_op_completion,
+    count_qa_inspections_by_state, decide_qa, ensure_schema, get_qa_inspection,
+    list_live_inspections_for_wo, list_qa_inspections, AutoCreateInspectionInputs, DecideQaInputs,
+    QaDecisionOutcome, QaInspection, QaStateCounts, QaWriteContext,
 };
 pub use state::{next_qa_state, QaStateError};
 pub use types::{QaDecision, QaState};

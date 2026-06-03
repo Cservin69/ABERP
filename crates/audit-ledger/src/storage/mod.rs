@@ -157,6 +157,15 @@ impl Ledger {
         Ok(out)
     }
 
+    /// Read the most-recent `limit` entries in DESC seq order. Thin
+    /// wrapper around the free [`recent_entries`] function so callers
+    /// that already own a [`Ledger`] don't have to reach for the
+    /// connection. Added in S235 / PR-231 for the operator dashboard
+    /// tile.
+    pub fn recent(&self, limit: u32) -> Result<Vec<Entry>, AppendError> {
+        recent_entries(&self.conn, limit)
+    }
+
     /// Verify the full chain against the tenant genesis. See
     /// [`crate::chain::verify_chain`] for the exact contract.
     pub fn verify_chain(&self) -> Result<u64, LedgerVerifyError> {
@@ -201,6 +210,21 @@ impl Ledger {
 pub fn ensure_schema(conn: &Connection) -> Result<(), AppendError> {
     conn.execute_batch(schema::CREATE_TABLE)?;
     Ok(())
+}
+
+/// Read the most-recent `limit` entries in descending seq order
+/// (newest first). Used by the operator dashboard's recent-activity
+/// tile (PR-231 / S235) and any future "tail" surface. Per-tenant
+/// scoping comes from the tenant DuckDB file (ADR-0002); this is
+/// NOT a multi-tenant query.
+pub fn recent_entries(conn: &Connection, limit: u32) -> Result<Vec<Entry>, AppendError> {
+    let mut stmt = conn.prepare(schema::SELECT_RECENT)?;
+    let rows = stmt.query_map(params![limit as i64], row_to_entry)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 /// Append a new entry inside a caller-owned transaction. The caller is

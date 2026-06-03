@@ -603,6 +603,52 @@ pub fn list_qa_inspections(
     Ok(out)
 }
 
+/// Counts of QA inspections by state for the tenant. Returns a fully-
+/// populated [`QaStateCounts`] (every state always present, zero-
+/// defaulted) so the dashboard SPA renders a fixed row.
+///
+/// Single `SELECT state, COUNT(*) ... GROUP BY state` — used by the
+/// operator dashboard tile (PR-231 / S235).
+pub fn count_qa_inspections_by_state(
+    conn: &Connection,
+    tenant: &str,
+) -> anyhow::Result<QaStateCounts> {
+    let mut stmt = conn.prepare(
+        "SELECT state, COUNT(*) FROM qa_inspections WHERE tenant_id = ? GROUP BY state;",
+    )?;
+    let rows = stmt.query_map(params![tenant], |row| {
+        let state_str: String = row.get(0)?;
+        let count: i64 = row.get(1)?;
+        Ok((state_str, count))
+    })?;
+    let mut counts = QaStateCounts::default();
+    for r in rows {
+        let (state_str, count) = r?;
+        let state =
+            QaState::from_storage_str(&state_str).map_err(|e| anyhow!("{e}: {state_str:?}"))?;
+        let bucket = match state {
+            QaState::Pending => &mut counts.pending,
+            QaState::Passed => &mut counts.passed,
+            QaState::Failed => &mut counts.failed,
+            QaState::Reworking => &mut counts.reworking,
+            QaState::Disposed => &mut counts.disposed,
+        };
+        *bucket = u32::try_from(count.max(0)).unwrap_or(u32::MAX);
+    }
+    Ok(counts)
+}
+
+/// Tenant-scoped count of QA inspections grouped by [`QaState`]. All
+/// five fields are always present (zero-defaulted).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QaStateCounts {
+    pub pending: u32,
+    pub passed: u32,
+    pub failed: u32,
+    pub reworking: u32,
+    pub disposed: u32,
+}
+
 /// Read a single QA inspection row by id, scoped to the tenant.
 /// `None` for unknown ids.
 pub fn get_qa_inspection(

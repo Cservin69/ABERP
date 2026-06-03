@@ -21,10 +21,11 @@ use aberp_audit_ledger::{
     ensure_schema as ensure_audit_schema, Actor, BinaryHash, LedgerMeta, TenantId,
 };
 use aberp_dispatch::{
-    cancel_dispatch, create_dispatch, ensure_schema as ensure_dispatch_schema, get_dispatch,
-    list_dispatches, list_eligible_work_orders, mark_shipped, CarrierKind, CreateDispatchInputs,
-    Dispatch, DispatchError, DispatchState, DispatchWriteContext, InvoiceSpawner,
-    MarkShippedInputs, NoopInvoiceSpawner,
+    cancel_dispatch, count_dispatches_by_state, count_dispatches_shipped_today,
+    count_eligible_work_orders, create_dispatch, ensure_schema as ensure_dispatch_schema,
+    get_dispatch, list_dispatches, list_eligible_work_orders, mark_shipped, CarrierKind,
+    CreateDispatchInputs, Dispatch, DispatchError, DispatchState, DispatchWriteContext,
+    InvoiceSpawner, MarkShippedInputs, NoopInvoiceSpawner,
 };
 use aberp_inventory::{
     current_stock, ensure_schema as ensure_inventory_schema, record_movement, ActorKind,
@@ -1247,4 +1248,193 @@ fn wo_in_active_state_is_not_eligible() {
 #[allow(dead_code)]
 fn _force_wo_state_use() -> WorkOrderState {
     WorkOrderState::Completed
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// S235 / PR-231 — Workshop dashboard count helpers: dispatch by state,
+// eligible-WO count, shipped-today count.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Pin the state-grouping helper against three dispatches in three
+/// distinct states (Drafted, Shipped, Cancelled).
+#[test]
+fn count_dispatches_by_state_groups_correctly() {
+    let mut conn = setup_db();
+    let meta = meta();
+
+    // Zero before any data.
+    let zero = count_dispatches_by_state(&conn, TEST_TENANT).unwrap();
+    assert_eq!(zero.drafted, 0);
+    assert_eq!(zero.shipped, 0);
+    assert_eq!(zero.cancelled, 0);
+
+    // Build three completed WOs (one per dispatch we want).
+    let wo_d = create_completed_wo(&mut conn, &meta, "WO-CNT-D");
+    let wo_s = create_completed_wo(&mut conn, &meta, "WO-CNT-S");
+    let wo_c = create_completed_wo(&mut conn, &meta, "WO-CNT-C");
+
+    // Draft three dispatches.
+    let tx = conn.transaction().unwrap();
+    let d = create_dispatch(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        CreateDispatchInputs {
+            wo_id: wo_d,
+            partner_id: "ptr_acme".to_string(),
+            notes: None,
+            idempotency_key: "cnt-d".to_string(),
+        },
+    )
+    .unwrap();
+    let s = create_dispatch(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        CreateDispatchInputs {
+            wo_id: wo_s,
+            partner_id: "ptr_acme".to_string(),
+            notes: None,
+            idempotency_key: "cnt-s".to_string(),
+        },
+    )
+    .unwrap();
+    let c = create_dispatch(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        CreateDispatchInputs {
+            wo_id: wo_c,
+            partner_id: "ptr_acme".to_string(),
+            notes: None,
+            idempotency_key: "cnt-c".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let _ = d;
+
+    // Ship one, cancel one — first survivor stays Drafted.
+    let tx = conn.transaction().unwrap();
+    mark_shipped(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        &s.dsp_id,
+        MarkShippedInputs {
+            carrier_kind: CarrierKind::MagyarPosta,
+            tracking_number: None,
+            shipped_at: None,
+            idempotency_key: "cnt-s-ship".to_string(),
+        },
+        &NoopInvoiceSpawner,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let tx = conn.transaction().unwrap();
+    cancel_dispatch(&tx, &dispatch_ctx_for(&meta, "ervin"), &c.dsp_id).unwrap();
+    tx.commit().unwrap();
+
+    let counts = count_dispatches_by_state(&conn, TEST_TENANT).unwrap();
+    assert_eq!(counts.drafted, 1);
+    assert_eq!(counts.shipped, 1);
+    assert_eq!(counts.cancelled, 1);
+}
+
+/// Pin the eligible-WO count against the list helper: when there are
+/// zero completed-undispatched WOs the count is zero; when one shows
+/// up the count rises to one; once it's been dispatched the count
+/// drops back to zero.
+#[test]
+fn count_eligible_work_orders_tracks_list_helper() {
+    let mut conn = setup_db();
+    let meta = meta();
+    assert_eq!(
+        count_eligible_work_orders(&conn, TEST_TENANT).unwrap(),
+        0,
+        "empty tenant has zero eligible WOs"
+    );
+
+    let wo = create_completed_wo(&mut conn, &meta, "WO-ELG-001");
+
+    let live = list_eligible_work_orders(&conn, TEST_TENANT, 50).unwrap();
+    assert_eq!(live.len(), 1, "completed WO surfaces as eligible");
+    assert_eq!(
+        count_eligible_work_orders(&conn, TEST_TENANT).unwrap(),
+        1,
+        "count matches list len"
+    );
+
+    // Draft a dispatch — eligibility drops.
+    let tx = conn.transaction().unwrap();
+    let _d = create_dispatch(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        CreateDispatchInputs {
+            wo_id: wo,
+            partner_id: "ptr_acme".to_string(),
+            notes: None,
+            idempotency_key: "elg-d".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        count_eligible_work_orders(&conn, TEST_TENANT).unwrap(),
+        0,
+        "dispatched WO drops out of the eligible pool"
+    );
+}
+
+/// Pin shipped-today: ship one dispatch today, query with today's
+/// `shipped_at` 10-char prefix → 1; query with a different date → 0.
+#[test]
+fn count_dispatches_shipped_today_matches_iso_date_prefix() {
+    let mut conn = setup_db();
+    let meta = meta();
+    let wo = create_completed_wo(&mut conn, &meta, "WO-SHIP-TODAY-001");
+
+    let tx = conn.transaction().unwrap();
+    let dsp = create_dispatch(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        CreateDispatchInputs {
+            wo_id: wo,
+            partner_id: "ptr_acme".to_string(),
+            notes: None,
+            idempotency_key: "ship-today-d".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    // Stamp a deterministic shipped_at so the date-prefix match is
+    // pinable — UTC midnight of a fixed day.
+    let stamped_at = "2026-06-03T12:34:56Z".to_string();
+    let tx = conn.transaction().unwrap();
+    mark_shipped(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        &dsp.dsp_id,
+        MarkShippedInputs {
+            carrier_kind: CarrierKind::MagyarPosta,
+            tracking_number: None,
+            shipped_at: Some(stamped_at.clone()),
+            idempotency_key: "ship-today-mark".to_string(),
+        },
+        &NoopInvoiceSpawner,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(
+        count_dispatches_shipped_today(&conn, TEST_TENANT, "2026-06-03").unwrap(),
+        1
+    );
+    assert_eq!(
+        count_dispatches_shipped_today(&conn, TEST_TENANT, "2026-06-04").unwrap(),
+        0,
+        "wrong date matches nothing"
+    );
+    assert_eq!(
+        count_dispatches_shipped_today(&conn, "ten_other", "2026-06-03").unwrap(),
+        0,
+        "tenant-scoped: other tenant sees zero"
+    );
 }

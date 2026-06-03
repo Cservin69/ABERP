@@ -572,6 +572,23 @@ pub fn low_stock_products(conn: &Connection, tenant: &str) -> anyhow::Result<Vec
     Ok(out)
 }
 
+/// COUNT-only sibling of [`low_stock_products`] — same predicate, just
+/// the headline number. Used by the operator dashboard tile
+/// (PR-231 / S235) which renders one integer and links the operator
+/// over to the full filtered list on click.
+pub fn count_low_stock_products(conn: &Connection, tenant: &str) -> anyhow::Result<u32> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM products
+         WHERE tenant_id = ?
+           AND deleted_at IS NULL
+           AND COALESCE(stock_qty, 0) < COALESCE(min_stock, 0);",
+        params![tenant],
+        |row| row.get(0),
+    )?;
+    Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+}
+
 /// Walk every product in the tenant and re-compute its `stock_qty`
 /// from `SUM(stock_movements.qty_delta)`. Returns the count of rows
 /// touched (every product, even if its computed SUM already matched

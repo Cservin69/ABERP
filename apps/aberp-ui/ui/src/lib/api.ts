@@ -2641,3 +2641,84 @@ export async function getFinancialReport(
     dateBasis: dateBasis ?? null,
   });
 }
+
+// ── S235 / PR-231 — Workshop / Műhely operator dashboard ───────────────
+//
+// One endpoint returns every count tile in one bundle. The SPA polls
+// it every ~10s; each tile is a slice of the response. See
+// `Workshop.svelte` for the render.
+
+export interface WorkOrderStateCounts {
+  created: number;
+  released: number;
+  in_progress: number;
+  completed: number;
+  on_hold: number;
+  cancelled: number;
+}
+
+export interface QaStateCounts {
+  pending: number;
+  passed: number;
+  failed: number;
+  reworking: number;
+  disposed: number;
+}
+
+export interface DispatchStateCounts {
+  drafted: number;
+  shipped: number;
+  cancelled: number;
+}
+
+export interface DispatchPanel {
+  by_state: DispatchStateCounts;
+  eligible_work_orders: number;
+  shipped_today: number;
+}
+
+export interface LowStockCount {
+  count: number;
+}
+
+export interface TodayPanel {
+  date: string;
+  issued_count_huf: number;
+  issued_count_eur: number;
+  gross_revenue_huf_minor: number;
+  gross_revenue_eur_minor: number;
+}
+
+export interface RecentActivityEntry {
+  id: string;
+  kind: string;
+  at_iso8601: string;
+  seq: number;
+}
+
+export interface AdapterStatusSnapshot {
+  name: string;
+  status: "enabled" | "disabled";
+  kind: string;
+  host: string;
+  port: number;
+}
+
+export interface WorkshopDashboard {
+  work_orders: WorkOrderStateCounts;
+  low_stock_products: LowStockCount;
+  qa: QaStateCounts;
+  dispatch: DispatchPanel;
+  today: TodayPanel;
+  recent_activity: RecentActivityEntry[];
+  adapters: AdapterStatusSnapshot[];
+  snapshot_at_iso8601: string;
+}
+
+/** Fetch the Workshop dashboard bundle. No params — the whole tile
+ * grid renders off one response. The SPA polls this on a 10s default
+ * cadence (overridable via the `VITE_WORKSHOP_POLL_MS` env var, read
+ * inside `Workshop.svelte`). */
+export async function getWorkshopDashboard(): Promise<WorkshopDashboard> {
+  return invoke<WorkshopDashboard>("get_workshop_dashboard");
+}

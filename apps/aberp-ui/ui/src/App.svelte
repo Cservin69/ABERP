@@ -74,6 +74,10 @@
   import WorkOrdersList from "./routes/WorkOrdersList.svelte";
   // S233 / PR-229 / ADR-0063 — Stage 3 Phase γ QA queue v1 SPA tab.
   import QaList from "./routes/QaList.svelte";
+  // S235 / PR-231 — Workshop / Műhely wall-TV operator dashboard. One
+  // grid of count tiles polled every ~10s; click a number to drill into
+  // the underlying list (WorkOrders / Products / QA / Dispatch).
+  import Workshop from "./routes/Workshop.svelte";
   // S234 / PR-230 / ADR-0064 — Stage 3 Phase γ Dispatch board v1 SPA
   // tab. Closes the Stage 3 → Stage 1 loop.
   import DispatchList from "./routes/DispatchList.svelte";
@@ -527,6 +531,8 @@
           <QaList />
         {:else if route === "dispatch"}
           <DispatchList />
+        {:else if route === "workshop"}
+          <Workshop />
         {:else if route === "statistics"}
           <StatisticsPage />
         {:else if route === "maintenance"}

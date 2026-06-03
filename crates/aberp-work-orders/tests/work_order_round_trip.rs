@@ -19,11 +19,11 @@ use aberp_inventory::{
     MovementReason, MovementRefKind, RecordMovementContext, RecordMovementInputs,
 };
 use aberp_work_orders::{
-    create_work_order, ensure_schema as ensure_wo_schema, list_active_bom_for_product,
-    list_routing_ops_for_wo, read_work_order, replace_bom_for_product, transition_routing_op,
-    transition_work_order, BomLineInput, CreateWorkOrderInputs, RoutingOpAction, RoutingOpInput,
-    RoutingOpTransitionInputs, TransitionInputs, WoAction, WoWriteContext, WorkOrderError,
-    WorkOrderState,
+    count_work_orders_by_state, create_work_order, ensure_schema as ensure_wo_schema,
+    list_active_bom_for_product, list_routing_ops_for_wo, read_work_order, replace_bom_for_product,
+    transition_routing_op, transition_work_order, BomLineInput, CreateWorkOrderInputs,
+    RoutingOpAction, RoutingOpInput, RoutingOpTransitionInputs, TransitionInputs, WoAction,
+    WoWriteContext, WorkOrderError, WorkOrderState,
 };
 use duckdb::Connection;
 
@@ -889,4 +889,212 @@ fn count_kind(conn: &Connection, kind: &str) -> i64 {
         |row| row.get::<_, i64>(0),
     )
     .unwrap()
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// S235 / PR-231 — count_work_orders_by_state pins for the Workshop
+// operator dashboard tile.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Sweep WOs across multiple states and verify the count helper
+/// returns the right per-state breakdown.
+#[test]
+fn count_work_orders_by_state_groups_correctly() {
+    let mut conn = setup_db();
+    insert_product(&conn, "prd_widget", "Widget");
+    insert_product(&conn, "prd_bar", "Raw bar");
+    let meta = meta();
+    seed_component_stock(&mut conn, &meta, "prd_bar", "100");
+
+    // Author a 1:1 BOM so each WO Release is cheap.
+    {
+        let tx = conn.transaction().unwrap();
+        replace_bom_for_product(
+            &tx,
+            TEST_TENANT,
+            "prd_widget",
+            &[BomLineInput {
+                component_id: "prd_bar".to_string(),
+                qty_per_unit: Decimal::from_str("1").unwrap(),
+            }],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Empty tenant — every bucket is zero.
+    let zero = count_work_orders_by_state(&conn, TEST_TENANT).unwrap();
+    assert_eq!(zero.created, 0);
+    assert_eq!(zero.released, 0);
+    assert_eq!(zero.in_progress, 0);
+    assert_eq!(zero.completed, 0);
+    assert_eq!(zero.on_hold, 0);
+    assert_eq!(zero.cancelled, 0);
+
+    // Create three WOs in distinct states: created / released / cancelled.
+    // We use the public `create_work_order` + `transition_work_order`
+    // entry points so the state-machine invariants stay covered.
+
+    // WO #1 — stays Created.
+    {
+        let tx = conn.transaction().unwrap();
+        create_work_order(
+            &tx,
+            &ctx_for(&meta, "ervin"),
+            CreateWorkOrderInputs {
+                wo_number: "WO-CNT-1".to_string(),
+                product_id: "prd_widget".to_string(),
+                qty_target: Decimal::from_str("1").unwrap(),
+                notes: None,
+                routing_ops: vec![RoutingOpInput {
+                    op_name: "step".to_string(),
+                    est_time_min: None,
+                    est_cost_huf: None,
+                }],
+                idempotency_key: "cnt-1".to_string(),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // WO #2 — Released (Create → Release).
+    let wo_2_id = {
+        let tx = conn.transaction().unwrap();
+        let (wo, _) = create_work_order(
+            &tx,
+            &ctx_for(&meta, "ervin"),
+            CreateWorkOrderInputs {
+                wo_number: "WO-CNT-2".to_string(),
+                product_id: "prd_widget".to_string(),
+                qty_target: Decimal::from_str("1").unwrap(),
+                notes: None,
+                routing_ops: vec![RoutingOpInput {
+                    op_name: "step".to_string(),
+                    est_time_min: None,
+                    est_cost_huf: None,
+                }],
+                idempotency_key: "cnt-2".to_string(),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        wo.wo_id
+    };
+    {
+        let tx = conn.transaction().unwrap();
+        transition_work_order(
+            &tx,
+            &ctx_for(&meta, "ervin"),
+            &wo_2_id,
+            TransitionInputs {
+                action: WoAction::Release,
+                reason: None,
+                source_event_id: None,
+                idempotency_key: "rel-2".to_string(),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // WO #3 — Cancelled (Create → Cancel).
+    let wo_3_id = {
+        let tx = conn.transaction().unwrap();
+        let (wo, _) = create_work_order(
+            &tx,
+            &ctx_for(&meta, "ervin"),
+            CreateWorkOrderInputs {
+                wo_number: "WO-CNT-3".to_string(),
+                product_id: "prd_widget".to_string(),
+                qty_target: Decimal::from_str("1").unwrap(),
+                notes: None,
+                routing_ops: vec![RoutingOpInput {
+                    op_name: "step".to_string(),
+                    est_time_min: None,
+                    est_cost_huf: None,
+                }],
+                idempotency_key: "cnt-3".to_string(),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        wo.wo_id
+    };
+    {
+        let tx = conn.transaction().unwrap();
+        transition_work_order(
+            &tx,
+            &ctx_for(&meta, "ervin"),
+            &wo_3_id,
+            TransitionInputs {
+                action: WoAction::Cancel,
+                reason: Some("test-cancel".to_string()),
+                source_event_id: None,
+                idempotency_key: "cancel-3".to_string(),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let counts = count_work_orders_by_state(&conn, TEST_TENANT).unwrap();
+    assert_eq!(counts.created, 1, "WO-CNT-1 in Created");
+    assert_eq!(counts.released, 1, "WO-CNT-2 in Released");
+    assert_eq!(counts.in_progress, 0);
+    assert_eq!(counts.completed, 0);
+    assert_eq!(counts.on_hold, 0);
+    assert_eq!(counts.cancelled, 1, "WO-CNT-3 in Cancelled");
+}
+
+/// Multi-tenant: the helper is tenant-scoped, so a different tenant's
+/// WOs MUST NOT contribute to the home tenant's counts.
+#[test]
+fn count_work_orders_by_state_is_tenant_scoped() {
+    let mut conn = setup_db();
+    insert_product(&conn, "prd_widget", "Widget");
+    insert_product(&conn, "prd_bar", "Raw bar");
+    let meta = meta();
+    seed_component_stock(&mut conn, &meta, "prd_bar", "100");
+
+    {
+        let tx = conn.transaction().unwrap();
+        replace_bom_for_product(
+            &tx,
+            TEST_TENANT,
+            "prd_widget",
+            &[BomLineInput {
+                component_id: "prd_bar".to_string(),
+                qty_per_unit: Decimal::from_str("1").unwrap(),
+            }],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let tx = conn.transaction().unwrap();
+    create_work_order(
+        &tx,
+        &ctx_for(&meta, "ervin"),
+        CreateWorkOrderInputs {
+            wo_number: "WO-OWN-1".to_string(),
+            product_id: "prd_widget".to_string(),
+            qty_target: Decimal::from_str("1").unwrap(),
+            notes: None,
+            routing_ops: vec![RoutingOpInput {
+                op_name: "step".to_string(),
+                est_time_min: None,
+                est_cost_huf: None,
+            }],
+            idempotency_key: "own-1".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let other = count_work_orders_by_state(&conn, "ten_other").unwrap();
+    assert_eq!(other.created, 0, "other tenant sees zero");
+
+    let own = count_work_orders_by_state(&conn, TEST_TENANT).unwrap();
+    assert_eq!(own.created, 1);
 }

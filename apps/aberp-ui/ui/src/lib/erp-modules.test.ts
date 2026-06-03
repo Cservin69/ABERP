@@ -87,6 +87,10 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   // S234 / PR-230 / ADR-0064 — Dispatch board lives in the same module
   // (closes the Stage 3 → Stage 1 loop).
   dispatch: "production",
+  // S235 / PR-231 — Workshop / Műhely wall-TV operator dashboard.
+  // Sits at the top of Production so the shop-floor station lands on
+  // the at-a-glance view by default.
+  workshop: "production",
   tenant: "settings",
   "nav-credentials": "settings",
   // S180 / PR-180 — NAV-as-DR restore wizard, settings-grouped.
@@ -111,6 +115,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   qa: "operational",
   // S234 / PR-230 / ADR-0064 — Dispatch board (operational).
   dispatch: "operational",
+  // S235 / PR-231 — Workshop operator dashboard (operational).
+  workshop: "operational",
   tenant: "maintenance",
   "nav-credentials": "maintenance",
   maintenance: "maintenance",

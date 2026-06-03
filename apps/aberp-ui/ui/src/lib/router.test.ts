@@ -25,6 +25,8 @@ describe("parseRoute", () => {
       { hash: "#/products", expected: "products" },
       // S232 / PR-228 — Stage 3 Phase γ Work Orders top-level route.
       { hash: "#/work-orders", expected: "work-orders" },
+      // S235 / PR-231 — Workshop / Műhely wall-TV dashboard route.
+      { hash: "#/workshop", expected: "workshop" },
       { hash: "#/maintenance", expected: "maintenance" },
     ];
     for (const { hash, expected } of cases) {

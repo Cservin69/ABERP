@@ -142,7 +142,13 @@ export const MODULES: ErpModule[] = [
     label_hu: "Gyártás",
     label_en: "Production",
     glyph: "⚙",
+    // S235 / PR-231 — Workshop is the wall-TV operator dashboard. It
+    // sits at the TOP of the Production module so the shop-floor
+    // station that parks on this URL lands on the at-a-glance view by
+    // default; the operational sub-screens (Work orders / QA / Dispatch)
+    // remain reachable below.
     routes: [
+      { id: "workshop", label: "Műhely / Workshop" },
       { id: "work-orders", label: "Work orders" },
       { id: "qa", label: "QA queue" },
       { id: "dispatch", label: "Dispatch" },

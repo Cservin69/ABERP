@@ -146,6 +146,57 @@ fn barcode_scanner_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// One adapter's intent-snapshot for the operator dashboard tile
+/// (PR-231 / S235). Reflects env-var configuration: what the boot
+/// path INTENDED to start, not a live registry probe. Live health
+/// is a separate refactor (the [`AdapterRegistry`] currently lives
+/// in [`boot_mes_adapters`]'s scope, not on `AppState`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdapterStatusSnapshot {
+    /// Stable identifier (matches the registry key when the adapter
+    /// boots — `barcode_scanner_id` env-var or its default).
+    pub name: String,
+    /// `"enabled"` when the adapter's `..._ENABLED=true` env var is set,
+    /// otherwise `"disabled"`. Closed vocab.
+    pub status: &'static str,
+    /// Kind label for the SPA — `"barcode-scanner"` etc. Lets the
+    /// dashboard group / icon by family if more adapters land.
+    pub kind: &'static str,
+    /// Listen host (configured via env). Surfaced so the operator can
+    /// confirm the bind address from the dashboard without opening a
+    /// terminal.
+    pub host: String,
+    /// Listen port (configured via env).
+    pub port: u16,
+}
+
+/// Snapshot every configurable MES adapter's env-var posture for the
+/// operator dashboard. Always returns at least one row per
+/// adapter-family we ship (currently barcode-scanner — S229); families
+/// the operator hasn't enabled show `status: "disabled"` so the tile
+/// surfaces them as "configured but off" rather than hiding them.
+pub fn snapshot_mes_adapter_config() -> Vec<AdapterStatusSnapshot> {
+    let scanner_id =
+        std::env::var(ENV_BARCODE_ID).unwrap_or_else(|_| DEFAULT_SCANNER_ID.to_string());
+    let host = std::env::var(ENV_BARCODE_HOST).unwrap_or_else(|_| DEFAULT_HOST.to_string());
+    let port = std::env::var(ENV_BARCODE_PORT)
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(aberp_mes::DEFAULT_LISTEN_PORT);
+    let status = if barcode_scanner_enabled() {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    vec![AdapterStatusSnapshot {
+        name: scanner_id,
+        status,
+        kind: "barcode-scanner",
+        host,
+        port,
+    }]
+}
+
 fn read_barcode_scanner_config_from_env() -> Result<BarcodeScannerConfig> {
     let scanner_id =
         std::env::var(ENV_BARCODE_ID).unwrap_or_else(|_| DEFAULT_SCANNER_ID.to_string());

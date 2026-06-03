@@ -111,6 +111,7 @@ use crate::issue_preflight::{
 };
 use crate::issue_storno;
 use crate::mark_invoice_paid::{self, MarkPaidError, MarkPaidInput};
+use crate::mes_boot::{snapshot_mes_adapter_config, AdapterStatusSnapshot};
 use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
 use crate::nav_xml::{self, SupplierConfigError, SupplierInfo};
 use crate::numbering::{
@@ -2234,6 +2235,15 @@ fn build_router(state: AppState) -> Router {
         // writes — reports are pure views per the no-silent-write
         // posture (CLAUDE.md rule 12).
         .route("/api/reports/financial", get(handle_financial_report))
+        // S235 / PR-231 — Workshop / Műhely operator dashboard. ONE
+        // endpoint that returns every count tile in one bundle: WO by
+        // state, low-stock count, QA by state, dispatch by state +
+        // eligible + shipped-today, today's invoice headline,
+        // recent-activity tail, MES adapter env snapshot. The SPA
+        // wall-TV polls this every 10s; one DuckDB tx beats six round-
+        // trips. No writes — pure aggregation; same no-silent-write
+        // posture as the financial-statistics route.
+        .route("/api/workshop/dashboard", get(handle_workshop_dashboard))
         // PR-72 / session-94 — multi-bank-account CRUD (PR-B of the
         // multi-bank initiative; ADR-0040 §addendum). Five routes
         // (list + create on the collection; update + delete + flip-
@@ -10511,6 +10521,203 @@ async fn handle_financial_report(
             anyhow!("blocking task panicked: {join_err}"),
         ),
     }
+}
+
+// ── S235 / PR-231 — Workshop / Műhely operator dashboard endpoint ─────
+//
+// ONE endpoint that bundles every count tile the wall-TV SPA renders:
+//
+//   - WO by state (created / released / in_progress / completed /
+//     on_hold / cancelled)
+//   - Low-stock product count
+//   - QA by state (pending / passed / failed / reworking / disposed)
+//   - Dispatch by state + eligible-WO count + shipped-today count
+//   - Today's invoice headline (issued count + gross revenue in HUF
+//     and EUR) — reuses `reports::compute_financial_report` over a
+//     1-day Custom period; same SQL the financial dashboard uses
+//   - Recent activity (last N audit-ledger entries)
+//   - MES adapter env-config snapshot (env-var posture, not live
+//     registry health — see `snapshot_mes_adapter_config` docs)
+//
+// One DuckDB tx beats six round-trips when the SPA polls every 10s.
+// The whole bundle is pure aggregation — no audit-ledger writes. The
+// SPA's per-tile refresh button re-fetches the bundle (the tile that
+// matters renders fresh; the others are cheap to re-render).
+
+const DASHBOARD_RECENT_ACTIVITY_LIMIT: u32 = 10;
+
+/// Closed-vocab response for `GET /api/workshop/dashboard`. Every
+/// nested object is fully populated even when the underlying counts
+/// are zero so the SPA renders a fixed-shape tile grid.
+#[derive(Debug, Serialize)]
+struct WorkshopDashboard {
+    work_orders: aberp_work_orders::WorkOrderStateCounts,
+    low_stock_products: LowStockCount,
+    qa: aberp_qa::QaStateCounts,
+    dispatch: DispatchPanel,
+    today: TodayPanel,
+    recent_activity: Vec<RecentActivityEntry>,
+    adapters: Vec<AdapterStatusSnapshot>,
+    /// RFC3339 UTC instant the dashboard bundle was assembled. SPA
+    /// uses it as the "last refreshed" marker.
+    snapshot_at_iso8601: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LowStockCount {
+    count: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct DispatchPanel {
+    /// Counts grouped by state — drafted / shipped / cancelled.
+    by_state: aberp_dispatch::DispatchStateCounts,
+    /// WOs ready to dispatch (Completed state with no dispatch row).
+    eligible_work_orders: u32,
+    /// Dispatches transitioned into `Shipped` today (UTC date match
+    /// against `shipped_at`).
+    shipped_today: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct TodayPanel {
+    /// ISO date the "today" window resolved to (UTC anchor — same as
+    /// `reports::today_local()`).
+    date: String,
+    /// Count of HUF revenue invoices issued today.
+    issued_count_huf: u64,
+    /// Count of EUR revenue invoices issued today.
+    issued_count_eur: u64,
+    /// Today's gross HUF revenue (HUF cents → forint string).
+    gross_revenue_huf_minor: i64,
+    /// Today's gross EUR revenue (EUR cents).
+    gross_revenue_eur_minor: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct RecentActivityEntry {
+    /// `aud_<ULID>` audit-ledger entry id.
+    id: String,
+    /// `EventKind` discriminant (string form — closed vocab).
+    kind: String,
+    /// RFC3339 wall-clock timestamp.
+    at_iso8601: String,
+    /// Monotone chain sequence — newest first.
+    seq: u64,
+}
+
+async fn handle_workshop_dashboard(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let today = reports::today_local();
+    let binary_hash = match state.binary_hash.wait() {
+        Ok(h) => h,
+        Err(e) => return internal_error("workshop_dashboard:binary_hash", e),
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        compute_workshop_dashboard(&state_for_task, today, binary_hash)
+    })
+    .await;
+    match result {
+        Ok(Ok(payload)) => Json(payload).into_response(),
+        Ok(Err(e)) => internal_error("workshop_dashboard:compute", e),
+        Err(join_err) => internal_error(
+            "workshop_dashboard:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+fn compute_workshop_dashboard(
+    state: &AppState,
+    today: time::Date,
+    binary_hash: aberp_audit_ledger::BinaryHash,
+) -> anyhow::Result<WorkshopDashboard> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tenant_str = state.tenant.as_str();
+    // ISO 8601 date `YYYY-MM-DD`. `time::Date`'s default Display is
+    // already this shape; explicit formatter avoids any future Display
+    // surprise and matches the column-storage representation that
+    // `count_dispatches_shipped_today` matches against.
+    let today_iso = today
+        .format(&time::macros::format_description!("[year]-[month]-[day]"))
+        .unwrap_or_else(|_| today.to_string());
+
+    let work_orders = aberp_work_orders::count_work_orders_by_state(&conn, tenant_str)
+        .context("count work_orders by state")?;
+    let low_stock_count = aberp_inventory::count_low_stock_products(&conn, tenant_str)
+        .context("count low-stock products")?;
+    let qa = aberp_qa::count_qa_inspections_by_state(&conn, tenant_str)
+        .context("count qa_inspections by state")?;
+    let dispatch_by_state = aberp_dispatch::count_dispatches_by_state(&conn, tenant_str)
+        .context("count dispatches by state")?;
+    let eligible_wo = aberp_dispatch::count_eligible_work_orders(&conn, tenant_str)
+        .context("count eligible work orders")?;
+    let shipped_today =
+        aberp_dispatch::count_dispatches_shipped_today(&conn, tenant_str, &today_iso)
+            .context("count dispatches shipped today")?;
+    let recent = aberp_audit_ledger::recent_entries(&conn, DASHBOARD_RECENT_ACTIVITY_LIMIT)
+        .context("read recent audit-ledger entries")?;
+
+    // Today's invoice headline rides on `reports::compute_financial_report`
+    // with a 1-day Custom window — one source of truth for revenue
+    // grouping. `compute_financial_report` opens its own Connection; the
+    // brief one-day window keeps it cheap.
+    let req = reports::ReportRequest {
+        period: reports::PeriodKind::Custom {
+            from: today,
+            to: today,
+        },
+        date_basis: reports::DateBasis::Teljesites,
+        today,
+    };
+    let today_report =
+        reports::compute_financial_report(&state.db_path, state.tenant.clone(), binary_hash, req)
+            .context("compute today's financial snapshot for dashboard tile")?;
+
+    let snapshot_at_iso8601 = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+
+    Ok(WorkshopDashboard {
+        work_orders,
+        low_stock_products: LowStockCount {
+            count: low_stock_count,
+        },
+        qa,
+        dispatch: DispatchPanel {
+            by_state: dispatch_by_state,
+            eligible_work_orders: eligible_wo,
+            shipped_today,
+        },
+        today: TodayPanel {
+            date: today_iso,
+            issued_count_huf: today_report.revenue.huf.count,
+            issued_count_eur: today_report.revenue.eur.count,
+            gross_revenue_huf_minor: today_report.revenue.huf.gross_minor,
+            gross_revenue_eur_minor: today_report.revenue.eur.gross_minor,
+        },
+        recent_activity: recent
+            .into_iter()
+            .map(|e| RecentActivityEntry {
+                id: e.id.to_prefixed_string(),
+                kind: e.kind.as_str().to_string(),
+                at_iso8601: e
+                    .time_wall
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+                seq: e.seq.as_u64(),
+            })
+            .collect(),
+        adapters: snapshot_mes_adapter_config(),
+        snapshot_at_iso8601,
+    })
 }
 
 /// Build the `RestoreInputs` for the wizard. Loads NAV credentials

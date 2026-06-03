@@ -981,6 +981,55 @@ pub fn list_work_orders(
     Ok(rows_iter)
 }
 
+/// Counts of work orders by state for the tenant. Returns a fully-
+/// populated [`WorkOrderStateCounts`] (every state always present,
+/// zero-defaulted) so the dashboard SPA can render the row without
+/// branching on missing keys.
+///
+/// Single `SELECT state, COUNT(*) ... GROUP BY state` — used by the
+/// operator dashboard tile (PR-231 / S235).
+pub fn count_work_orders_by_state(
+    conn: &Connection,
+    tenant: &str,
+) -> anyhow::Result<WorkOrderStateCounts> {
+    let mut stmt = conn
+        .prepare("SELECT state, COUNT(*) FROM work_orders WHERE tenant_id = ? GROUP BY state;")?;
+    let rows = stmt.query_map(params![tenant], |row| {
+        let state_str: String = row.get(0)?;
+        let count: i64 = row.get(1)?;
+        Ok((state_str, count))
+    })?;
+    let mut counts = WorkOrderStateCounts::default();
+    for r in rows {
+        let (state_str, count) = r?;
+        let state = WorkOrderState::from_storage_str(&state_str)
+            .map_err(|e| anyhow!("{e}: {state_str:?}"))?;
+        let bucket = match state {
+            WorkOrderState::Created => &mut counts.created,
+            WorkOrderState::Released => &mut counts.released,
+            WorkOrderState::InProgress => &mut counts.in_progress,
+            WorkOrderState::Completed => &mut counts.completed,
+            WorkOrderState::OnHold => &mut counts.on_hold,
+            WorkOrderState::Cancelled => &mut counts.cancelled,
+        };
+        *bucket = u32::try_from(count.max(0)).unwrap_or(u32::MAX);
+    }
+    Ok(counts)
+}
+
+/// Tenant-scoped count of WOs grouped by [`WorkOrderState`]. All six
+/// fields are always present (zero-defaulted) so the SPA dashboard
+/// tile renders a fixed row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkOrderStateCounts {
+    pub created: u32,
+    pub released: u32,
+    pub in_progress: u32,
+    pub completed: u32,
+    pub on_hold: u32,
+    pub cancelled: u32,
+}
+
 #[allow(clippy::type_complexity)]
 fn row_to_wo(row: &duckdb::Row<'_>) -> duckdb::Result<anyhow::Result<WorkOrder>> {
     let wo_id: String = row.get(0)?;

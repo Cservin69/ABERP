@@ -35,6 +35,7 @@ export type AppRoute =
   | "work-orders"
   | "qa"
   | "dispatch"
+  | "workshop"
   | "maintenance"
   | "restore-from-nav";
 
@@ -88,6 +89,8 @@ export function parseRoute(hash: string): AppRoute {
       return "qa";
     case "dispatch":
       return "dispatch";
+    case "workshop":
+      return "workshop";
     case "maintenance":
       return "maintenance";
     case "restore-from-nav":

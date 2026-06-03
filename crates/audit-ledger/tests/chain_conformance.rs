@@ -80,6 +80,40 @@ fn three_entries_verify_cleanly() {
     assert_eq!(count, 3, "verifier should report 3 entries verified");
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// S235 / PR-231 — recent_entries pins for the Workshop dashboard tile.
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn recent_returns_newest_first_and_caps_at_limit() {
+    let mut ledger = fresh_ledger();
+    append_n(&mut ledger, 7);
+
+    // limit=3 should return entries with seq 7, 6, 5 (newest first).
+    let tail = ledger.recent(3).expect("recent returns ok");
+    assert_eq!(tail.len(), 3);
+    assert_eq!(tail[0].seq.as_u64(), 7);
+    assert_eq!(tail[1].seq.as_u64(), 6);
+    assert_eq!(tail[2].seq.as_u64(), 5);
+}
+
+#[test]
+fn recent_against_empty_ledger_returns_empty() {
+    let ledger = fresh_ledger();
+    let tail = ledger.recent(10).expect("recent on empty ok");
+    assert!(tail.is_empty(), "empty ledger yields zero recent entries");
+}
+
+#[test]
+fn recent_limit_exceeds_count_returns_all() {
+    let mut ledger = fresh_ledger();
+    append_n(&mut ledger, 2);
+    let tail = ledger.recent(50).expect("recent ok");
+    assert_eq!(tail.len(), 2, "limit beyond count yields full ledger");
+    assert_eq!(tail[0].seq.as_u64(), 2);
+    assert_eq!(tail[1].seq.as_u64(), 1);
+}
+
 #[test]
 fn round_trip_preserves_all_fields() {
     let mut ledger = fresh_ledger();

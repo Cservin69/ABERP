@@ -1062,6 +1062,15 @@ pub async fn list_restored_invoices(state: State<'_, AppState>) -> Result<Value,
     forward_get(&state, "/api/restored-invoices", true).await
 }
 
+/// S235 / PR-231 — Workshop / Műhely operator dashboard. Forwards to
+/// the backend's `GET /api/workshop/dashboard` aggregator. No params:
+/// the backend always returns the full bundle (WO + low-stock + QA +
+/// dispatch + today + recent activity + adapter snapshot).
+#[tauri::command]
+pub async fn get_workshop_dashboard(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/workshop/dashboard", true).await
+}
+
 /// S225 / PR-221 — financial-statistics dashboard. Forwards to the
 /// backend's `GET /api/reports/financial` aggregator. Both query params
 /// are optional; the backend defaults to current month + `teljesites`

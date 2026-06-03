@@ -353,6 +353,8 @@ pub fn run() {
             commands::list_quote_intake,
             // S225 / PR-221 — financial-statistics dashboard endpoint.
             commands::get_financial_report,
+            // S235 / PR-231 — Workshop / Műhely operator dashboard.
+            commands::get_workshop_dashboard,
         ])
         .on_window_event(handle_window_event)
         .run(tauri::generate_context!())

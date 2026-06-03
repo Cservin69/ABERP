@@ -63,3 +63,15 @@ FROM audit_ledger
 ORDER BY seq DESC
 LIMIT 1;
 ";
+
+/// SQL to read the most-recent `N` entries (highest seq first). One
+/// parameter: `LIMIT`. Powers the operator dashboard's recent-activity
+/// tile (PR-231 / S235) — no offset, no tenant filter (the per-tenant
+/// DuckDB file IS the tenant scope per ADR-0002).
+pub const SELECT_RECENT: &str = "
+SELECT id, seq, prev_hash, time_wall, time_mono, actor,
+       binary_hash, tenant_id, kind, payload, idempotency_key, entry_hash
+FROM audit_ledger
+ORDER BY seq DESC
+LIMIT ?;
+";

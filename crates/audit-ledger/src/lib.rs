@@ -47,7 +47,9 @@ pub use mirror::{
     ensure_consistent_with_db, mirror_path_for, read_mirror_entries, sync_mirror, MirrorEntry,
     RecoveryAction,
 };
-pub use storage::{append_in_tx, ensure_schema, Ledger, LedgerMeta, LedgerVerifyError};
+pub use storage::{
+    append_in_tx, ensure_schema, recent_entries, Ledger, LedgerMeta, LedgerVerifyError,
+};
 
 // PR-22 / ADR-0035 §8 — additive `pub use` re-exports of the chain
 // primitives that `aberp-verify` needs to re-verify a per-invoice

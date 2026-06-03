@@ -17,10 +17,10 @@ use aberp_audit_ledger::{
     ensure_schema as ensure_audit_schema, Actor, BinaryHash, LedgerMeta, TenantId,
 };
 use aberp_inventory::{
-    current_stock, ensure_schema as ensure_inventory_schema, list_movements_for_product,
-    low_stock_products, rebuild_stock_cache_for_tenant, record_movement, validate_reason_sign,
-    ActorKind, InventoryError, MovementReason, MovementRefKind, RecordMovementContext,
-    RecordMovementInputs, RequiredSign,
+    count_low_stock_products, current_stock, ensure_schema as ensure_inventory_schema,
+    list_movements_for_product, low_stock_products, rebuild_stock_cache_for_tenant,
+    record_movement, validate_reason_sign, ActorKind, InventoryError, MovementReason,
+    MovementRefKind, RecordMovementContext, RecordMovementInputs, RequiredSign,
 };
 use duckdb::Connection;
 
@@ -342,6 +342,22 @@ fn low_stock_products_surfaces_only_below_min() {
     assert_eq!(names, vec!["Below B", "Below A"]); // by deficit ASC
     assert_eq!(low[0].stock_qty, Decimal::from_str("5.000000").unwrap());
     assert_eq!(low[0].min_stock, Decimal::from_str("20.000000").unwrap());
+
+    // S235 / PR-231 — count helper mirrors the list len (Workshop tile).
+    let count = count_low_stock_products(&conn, TEST_TENANT).unwrap();
+    assert_eq!(count as usize, low.len());
+    assert_eq!(count, 2, "two products are below their min");
+
+    // Tenant-scoped: another tenant sees zero.
+    let other = count_low_stock_products(&conn, "ten_other").unwrap();
+    assert_eq!(other, 0);
+}
+
+#[test]
+fn count_low_stock_products_empty_tenant_is_zero() {
+    let conn = setup_db();
+    let n = count_low_stock_products(&conn, TEST_TENANT).unwrap();
+    assert_eq!(n, 0);
 }
 
 // ──────────────────────────────────────────────────────────────────────

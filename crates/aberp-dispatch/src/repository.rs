@@ -708,6 +708,86 @@ pub fn list_eligible_work_orders(
     Ok(out)
 }
 
+/// Counts of dispatches by state for the tenant. Returns a fully-
+/// populated [`DispatchStateCounts`] (every state always present,
+/// zero-defaulted). Powers the operator dashboard tile (PR-231 / S235).
+pub fn count_dispatches_by_state(
+    conn: &Connection,
+    tenant: &str,
+) -> anyhow::Result<DispatchStateCounts> {
+    let mut stmt =
+        conn.prepare("SELECT state, COUNT(*) FROM dispatches WHERE tenant_id = ? GROUP BY state;")?;
+    let rows = stmt.query_map(params![tenant], |row| {
+        let state_str: String = row.get(0)?;
+        let count: i64 = row.get(1)?;
+        Ok((state_str, count))
+    })?;
+    let mut counts = DispatchStateCounts::default();
+    for r in rows {
+        let (state_str, count) = r?;
+        let state = DispatchState::from_storage_str(&state_str)
+            .map_err(|e| anyhow!("{e}: {state_str:?}"))?;
+        let bucket = match state {
+            DispatchState::Drafted => &mut counts.drafted,
+            DispatchState::Shipped => &mut counts.shipped,
+            DispatchState::Cancelled => &mut counts.cancelled,
+        };
+        *bucket = u32::try_from(count.max(0)).unwrap_or(u32::MAX);
+    }
+    Ok(counts)
+}
+
+/// Count of WOs eligible for dispatch (same predicate as
+/// [`list_eligible_work_orders`] but COUNT-only). The dashboard tile
+/// only needs the headline number; the full list lives behind a
+/// click-through to the Dispatch board.
+pub fn count_eligible_work_orders(conn: &Connection, tenant: &str) -> anyhow::Result<u32> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM work_orders wo
+         WHERE wo.tenant_id = ?
+           AND wo.state = 'completed'
+           AND NOT EXISTS (
+                SELECT 1 FROM dispatches d
+                WHERE d.tenant_id = wo.tenant_id AND d.wo_id = wo.wo_id
+           );",
+        params![tenant],
+        |row| row.get(0),
+    )?;
+    Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+}
+
+/// Count of dispatches shipped (transitioned into `Shipped`) on a
+/// given local-calendar date. `today_iso` is the `YYYY-MM-DD` date
+/// string the caller has already resolved against its local TZ — we
+/// match against the `shipped_at` column's leading 10 chars.
+pub fn count_dispatches_shipped_today(
+    conn: &Connection,
+    tenant: &str,
+    today_iso: &str,
+) -> anyhow::Result<u32> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM dispatches
+         WHERE tenant_id = ?
+           AND state = 'shipped'
+           AND shipped_at IS NOT NULL
+           AND substr(shipped_at, 1, 10) = ?;",
+        params![tenant, today_iso],
+        |row| row.get(0),
+    )?;
+    Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+}
+
+/// Tenant-scoped count of dispatches grouped by [`DispatchState`]. All
+/// three fields are always present (zero-defaulted).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchStateCounts {
+    pub drafted: u32,
+    pub shipped: u32,
+    pub cancelled: u32,
+}
+
 // ── Internals ──────────────────────────────────────────────────────
 
 fn read_dispatch_in_tx(
