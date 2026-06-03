@@ -543,6 +543,92 @@ pub async fn list_low_stock_products(state: State<'_, AppState>) -> Result<Value
     forward_get(&state, "/api/products/low-stock", true).await
 }
 
+// ── S232 / PR-228 / ADR-0062 — Work Orders v1 SPA bridge ────────────
+
+/// S232 — `GET /api/work-orders[?state=&limit=&offset=]`. The
+/// WorkOrderList screen reads here; state filter is a closed-vocab
+/// `WorkOrderState` storage string (created/released/in_progress/
+/// completed/cancelled/on_hold).
+#[tauri::command]
+pub async fn list_work_orders(
+    state: State<'_, AppState>,
+    state_filter: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Value, String> {
+    let mut path = String::from("/api/work-orders?");
+    if let Some(s) = state_filter {
+        path.push_str(&format!("state={s}&"));
+    }
+    if let Some(n) = limit {
+        path.push_str(&format!("limit={n}&"));
+    }
+    if let Some(n) = offset {
+        path.push_str(&format!("offset={n}"));
+    }
+    forward_get(&state, &path, true).await
+}
+
+/// S232 — `POST /api/work-orders`. The "+ New work order" form on the
+/// WorkOrderList submits here. Body shape mirrors the backend
+/// `CreateWorkOrderBody`.
+#[tauri::command]
+pub async fn create_work_order(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/work-orders", body).await
+}
+
+/// S232 — `GET /api/work-orders/:id`. The WorkOrderDetail screen reads
+/// here; response carries the WO + routing-ops + active BOM snapshot.
+#[tauri::command]
+pub async fn get_work_order(state: State<'_, AppState>, wo_id: String) -> Result<Value, String> {
+    validate_wo_id(&wo_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/work-orders/{wo_id}");
+    forward_get(&state, &path, true).await
+}
+
+/// S232 — `POST /api/work-orders/:id/transitions`. The state-aware
+/// action buttons (Release / Start / Complete / Cancel / Hold /
+/// Resume) on WorkOrderDetail POST here. Body shape:
+/// `{ action, reason?, idempotency_key }`. The SPA NEVER supplies
+/// `source_event_id` — only adapter event handlers (future) may, per
+/// ADR-0062 invariant 7.
+#[tauri::command]
+pub async fn transition_work_order(
+    state: State<'_, AppState>,
+    wo_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_wo_id(&wo_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/work-orders/{wo_id}/transitions");
+    forward_post(&state, &path, body).await
+}
+
+/// S232 — `GET /api/products/:id/bom`. Read the active BOM lines for
+/// a product. The Product detail page's BOM tab reads here.
+#[tauri::command]
+pub async fn get_product_bom(
+    state: State<'_, AppState>,
+    product_id: String,
+) -> Result<Value, String> {
+    validate_product_id(&product_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/products/{product_id}/bom");
+    forward_get(&state, &path, true).await
+}
+
+/// S232 — `POST /api/products/:id/bom`. Replace the active BOM lines
+/// (soft-retires the prior set per ADR-0062 §6). Body shape:
+/// `{ lines: [{ component_id, qty_per_unit }, ...] }`.
+#[tauri::command]
+pub async fn put_product_bom(
+    state: State<'_, AppState>,
+    product_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_product_id(&product_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/products/{product_id}/bom");
+    forward_post(&state, &path, body).await
+}
+
 /// PR-72 / session-94 — `GET /api/seller/banks`. Used by the SPA's
 /// Tenant Settings page (bank-accounts subsection) + the
 /// SellerConfigWizard's multi-row block to render the current
@@ -1280,6 +1366,25 @@ fn validate_product_id(s: &str) -> anyhow::Result<()> {
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
         anyhow::bail!("product_id `{s}` contains characters outside [A-Za-z0-9_-]");
+    }
+    Ok(())
+}
+
+/// S232 / PR-228 — defence-in-depth validator for the `:id` segment on
+/// work-order routes (`wo_<26-char-ULID>` — 30 chars total). Mirrors
+/// `validate_product_id`.
+fn validate_wo_id(s: &str) -> anyhow::Result<()> {
+    if s.is_empty() {
+        anyhow::bail!("wo_id is empty");
+    }
+    if s.len() > 64 {
+        anyhow::bail!("wo_id length {} exceeds 64", s.len());
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        anyhow::bail!("wo_id `{s}` contains characters outside [A-Za-z0-9_-]");
     }
     Ok(())
 }

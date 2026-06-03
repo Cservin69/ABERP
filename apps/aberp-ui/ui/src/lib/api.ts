@@ -1610,6 +1610,177 @@ export async function listLowStockProducts(): Promise<LowStockRow[]> {
   return invoke<LowStockRow[]>("list_low_stock_products", {});
 }
 
+// ── S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Work Orders v1 ────────
+
+/** S232 — closed-vocab WO state per ADR-0062 §2. Snake_case storage
+ * strings match `aberp_work_orders::WorkOrderState::as_str`. */
+export type WorkOrderState =
+  | "created"
+  | "released"
+  | "in_progress"
+  | "completed"
+  | "cancelled"
+  | "on_hold";
+
+/** S232 — closed-vocab WO action per ADR-0062 §3. The action a SPA
+ * button (or future adapter event) submits to the transitions
+ * endpoint. */
+export type WoAction =
+  | "release"
+  | "start"
+  | "complete"
+  | "cancel"
+  | "hold"
+  | "resume";
+
+/** S232 — closed-vocab per-operation state per ADR-0062 §2. */
+export type RoutingOpState = "pending" | "active" | "completed" | "skipped";
+
+/** S232 — one row from `work_orders`. Snake_case JSON mirror of
+ * `aberp_work_orders::WorkOrder`. Decimal-as-string per
+ * [[decimal-quantity-s157]]. */
+export interface WorkOrder {
+  wo_id: string;
+  wo_number: string;
+  product_id: string;
+  qty_target: string;
+  state: WorkOrderState;
+  created_at: string;
+  released_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  cancelled_at: string | null;
+  hold_reason: string | null;
+  notes: string | null;
+}
+
+/** S232 — one routing operation. */
+export interface RoutingOp {
+  routing_op_id: string;
+  wo_id: string;
+  sequence: number;
+  op_name: string;
+  est_time_min: number | null;
+  est_cost_huf: string | null;
+  state: RoutingOpState;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+/** S232 — one BOM line. */
+export interface BomLine {
+  bom_line_id: string;
+  product_id: string;
+  component_id: string;
+  qty_per_unit: string;
+  created_at: string;
+  retired_at: string | null;
+}
+
+/** S232 — POST /api/work-orders body. */
+export interface CreateWorkOrderBody {
+  wo_number: string;
+  product_id: string;
+  qty_target: string;
+  notes?: string | null;
+  routing_ops: CreateRoutingOpBody[];
+  idempotency_key: string;
+}
+
+export interface CreateRoutingOpBody {
+  op_name: string;
+  est_time_min?: number | null;
+  est_cost_huf?: string | null;
+}
+
+/** S232 — POST /api/work-orders response. */
+export interface CreateWorkOrderResponse {
+  work_order: WorkOrder;
+  routing_ops: RoutingOp[];
+}
+
+/** S232 — GET /api/work-orders/:id response shape (WO + ops + active
+ * BOM snapshot). */
+export interface WorkOrderDetailResponse {
+  work_order: WorkOrder;
+  routing_ops: RoutingOp[];
+  bom: BomLine[];
+}
+
+/** S232 — POST /api/work-orders/:id/transitions body. */
+export interface TransitionWorkOrderBody {
+  action: WoAction;
+  reason?: string | null;
+  idempotency_key: string;
+}
+
+/** S232 — POST /api/work-orders/:id/transitions response. */
+export interface TransitionWorkOrderResponse {
+  work_order: WorkOrder;
+  warnings?: string[];
+}
+
+/** S232 — PUT BOM body: full-replace the active BOM rows. */
+export interface PutProductBomBody {
+  lines: PutProductBomLine[];
+}
+
+export interface PutProductBomLine {
+  component_id: string;
+  qty_per_unit: string;
+}
+
+/** S232 — `GET /api/work-orders[?state=&limit=&offset=]`. */
+export async function listWorkOrders(
+  stateFilter?: WorkOrderState | null,
+  limit?: number,
+  offset?: number,
+): Promise<WorkOrder[]> {
+  return invoke<WorkOrder[]>("list_work_orders", {
+    stateFilter: stateFilter ?? null,
+    limit: limit ?? null,
+    offset: offset ?? null,
+  });
+}
+
+/** S232 — `POST /api/work-orders`. */
+export async function createWorkOrder(
+  body: CreateWorkOrderBody,
+): Promise<CreateWorkOrderResponse> {
+  return invoke<CreateWorkOrderResponse>("create_work_order", { body });
+}
+
+/** S232 — `GET /api/work-orders/:id`. */
+export async function getWorkOrder(
+  woId: string,
+): Promise<WorkOrderDetailResponse> {
+  return invoke<WorkOrderDetailResponse>("get_work_order", { woId });
+}
+
+/** S232 — `POST /api/work-orders/:id/transitions`. */
+export async function transitionWorkOrder(
+  woId: string,
+  body: TransitionWorkOrderBody,
+): Promise<TransitionWorkOrderResponse> {
+  return invoke<TransitionWorkOrderResponse>("transition_work_order", {
+    woId,
+    body,
+  });
+}
+
+/** S232 — `GET /api/products/:id/bom`. */
+export async function getProductBom(productId: string): Promise<BomLine[]> {
+  return invoke<BomLine[]>("get_product_bom", { productId });
+}
+
+/** S232 — `POST /api/products/:id/bom`. Replace active BOM lines. */
+export async function putProductBom(
+  productId: string,
+  body: PutProductBomBody,
+): Promise<BomLine[]> {
+  return invoke<BomLine[]>("put_product_bom", { productId, body });
+}
+
 // ── PR-72 / session-94 — multi-bank-account routes (PR-B) ─────────────
 
 /** PR-72 / session-94 — closed-vocab currency on a bank-account row.

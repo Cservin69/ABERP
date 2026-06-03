@@ -13,6 +13,16 @@
 #                              `mes.stock_movement_recorded`; ships
 #                              `rebuild-stock-cache` binary as the recovery
 #                              path when cache drifts from ledger.
+#   crates/aberp-work-orders - Stage 3 Phase γ Work Orders module v1 (S232 /
+#                              PR-228, ADR-0062). `work_orders` regulated
+#                              entity + 1-level `boms` + linear `routings`;
+#                              SPA-button OR future-adapter call the SAME
+#                              `transition_work_order` handler (actor captured
+#                              into the audit entry). Three new audit kinds
+#                              (`mes.work_order_created` / `*_state_changed`
+#                              / `mes.routing_op_state_changed`); transactional
+#                              inventory coupling consumes BOM on Release +
+#                              produces finished good on Complete.
 #   crates/audit-ledger      - tamper-evident hash-chained audit ledger (ADR-0008).
 #   crates/aberp-verify      - bundle verifier CLI (ADR-0035, PR-22) — re-verifies
 #                              a per-invoice export bundle from its own bytes alone;
@@ -59,6 +69,7 @@ members = [
     "crates/aberp-quote-intake",
     "crates/aberp-mes",
     "crates/aberp-inventory",
+    "crates/aberp-work-orders",
     "crates/invoice-pdf",
     "crates/mnb-rates",
     "crates/nav-transport",

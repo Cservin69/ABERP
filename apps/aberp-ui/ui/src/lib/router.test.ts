@@ -15,7 +15,7 @@ import {
 } from "./router";
 
 describe("parseRoute", () => {
-  it("maps the seven canonical slugs verbatim", () => {
+  it("maps the eight canonical slugs verbatim", () => {
     const cases: { hash: string; expected: AppRoute }[] = [
       { hash: "#/invoices", expected: "invoices" },
       { hash: "#/invoices-new", expected: "invoices-new" },
@@ -23,6 +23,8 @@ describe("parseRoute", () => {
       { hash: "#/nav-credentials", expected: "nav-credentials" },
       { hash: "#/partners", expected: "partners" },
       { hash: "#/products", expected: "products" },
+      // S232 / PR-228 — Stage 3 Phase γ Work Orders top-level route.
+      { hash: "#/work-orders", expected: "work-orders" },
       { hash: "#/maintenance", expected: "maintenance" },
     ];
     for (const { hash, expected } of cases) {
@@ -58,6 +60,7 @@ describe("routeHash", () => {
     expect(routeHash("nav-credentials")).toBe(`${HASH_PREFIX}nav-credentials`);
     expect(routeHash("partners")).toBe(`${HASH_PREFIX}partners`);
     expect(routeHash("products")).toBe(`${HASH_PREFIX}products`);
+    expect(routeHash("work-orders")).toBe(`${HASH_PREFIX}work-orders`);
     expect(routeHash("maintenance")).toBe(`${HASH_PREFIX}maintenance`);
   });
 
@@ -71,6 +74,7 @@ describe("routeHash", () => {
       "nav-credentials",
       "partners",
       "products",
+      "work-orders",
       "maintenance",
     ];
     for (const r of all) {

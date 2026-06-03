@@ -32,6 +32,7 @@ export type AppRoute =
   | "nav-credentials"
   | "partners"
   | "products"
+  | "work-orders"
   | "maintenance"
   | "restore-from-nav";
 
@@ -79,6 +80,8 @@ export function parseRoute(hash: string): AppRoute {
       return "partners";
     case "products":
       return "products";
+    case "work-orders":
+      return "work-orders";
     case "maintenance":
       return "maintenance";
     case "restore-from-nav":

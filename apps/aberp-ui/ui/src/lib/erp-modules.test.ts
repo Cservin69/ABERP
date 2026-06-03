@@ -50,6 +50,7 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "statistics",
   "partners",
   "products",
+  "work-orders",
   "tenant",
   "nav-credentials",
   "maintenance",
@@ -79,6 +80,8 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   statistics: "statistics",
   partners: "master-data",
   products: "master-data",
+  // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Production module.
+  "work-orders": "production",
   tenant: "settings",
   "nav-credentials": "settings",
   // S180 / PR-180 — NAV-as-DR restore wizard, settings-grouped.
@@ -97,6 +100,9 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   statistics: "operational",
   partners: "maintenance",
   products: "maintenance",
+  // S232 / PR-228 / ADR-0062 — Production is operational (daily-driver
+  // shop-floor workflow). Future QA/Dispatch routes extend.
+  "work-orders": "operational",
   tenant: "maintenance",
   "nav-credentials": "maintenance",
   maintenance: "maintenance",
@@ -273,7 +279,9 @@ describe("modulesInArea + defaultRouteForArea", () => {
   it("modulesInArea preserves registry order within each area", () => {
     const op = modulesInArea("operational");
     const mt = modulesInArea("maintenance");
-    expect(op.map((m) => m.id)).toEqual(["invoicing", "statistics"]);
+    // S232 / PR-228 — "production" (Stage 3 Phase γ Work Orders) joins
+    // the operational area after statistics per the registry order.
+    expect(op.map((m) => m.id)).toEqual(["invoicing", "statistics", "production"]);
     expect(mt.map((m) => m.id)).toEqual(["master-data", "settings"]);
   });
 

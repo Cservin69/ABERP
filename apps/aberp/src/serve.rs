@@ -716,6 +716,23 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         aberp_inventory::ensure_schema(&conn).context("ensure inventory schema at serve boot")?;
     }
 
+    // S232 / PR-228 / ADR-0062 — pin the work-orders schema at boot
+    // (creates work_orders + boms + routings tables). Same idempotent
+    // CREATE TABLE IF NOT EXISTS posture as the inventory migration
+    // above. MUST run AFTER the products migration (BOM rows reference
+    // products by id even though no FK is declared per [[no-sql-specific]]).
+    {
+        let _s = tracing::info_span!("serve.ensure_work_orders_schema").entered();
+        let conn = Connection::open(&args.db).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for work-orders boot migration",
+                args.db.display()
+            )
+        })?;
+        aberp_work_orders::ensure_schema(&conn)
+            .context("ensure work-orders schema at serve boot")?;
+    }
+
     // S177 / PR-177 — pin the ap_invoice (incoming AP-side mirror)
     // schema at boot, same posture as products + partners. The route
     // layer also calls `ensure_schema` defensively so a fresh DB +
@@ -2046,6 +2063,31 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/products/low-stock",
             get(handle_list_low_stock_products),
+        )
+        // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Work Orders v1.
+        // GET lists tenant WOs (optional `?state=` filter +
+        // pagination); POST creates a new WO with product_id +
+        // qty_target + routing-op rows. The detail GET expands the
+        // routing operations + active BOM snapshot. The transitions
+        // POST is the SAME handler future adapter events call per
+        // ADR-0062 §3 — actor captured into the audit entry only.
+        // BOM author GET / POST under `/api/products/:id/bom`.
+        // All require_ready + bearer auth. DoS bounds per
+        // [[trust-code-not-operator]]: axum's default Json size cap +
+        // explicit per-WO routing-op cap (200) + per-BOM line cap
+        // (200) inside the repository.
+        .route(
+            "/api/work-orders",
+            get(handle_list_work_orders).post(handle_create_work_order),
+        )
+        .route("/api/work-orders/:id", get(handle_get_work_order_detail))
+        .route(
+            "/api/work-orders/:id/transitions",
+            post(handle_transition_work_order),
+        )
+        .route(
+            "/api/products/:id/bom",
+            get(handle_get_product_bom).post(handle_put_product_bom),
         )
         // S177 / PR-177 — AP module v1 BACKEND. Incoming-invoice list +
         // detail + manual ingestion + three closed-vocab status
@@ -8129,6 +8171,636 @@ pub fn list_low_stock_products_request(
     let conn = Connection::open(&*state.db_path)
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     aberp_inventory::low_stock_products(&conn, state.tenant.as_str())
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Work Orders v1 routes.
+// ──────────────────────────────────────────────────────────────────────
+//
+// Four routes (one collection, three on a `:id`):
+//
+//   - `GET  /api/work-orders[?state=&limit=&offset=]` — list.
+//   - `POST /api/work-orders` — create WO + routing operations.
+//   - `GET  /api/work-orders/:id` — detail (WO + routing-ops + active
+//     BOM snapshot).
+//   - `POST /api/work-orders/:id/transitions` — state transition body
+//     `{ action, reason?, source_event_id?, idempotency_key }`; SAME
+//     handler future adapter events call per ADR-0062 §3.
+//   - `GET  /api/products/:id/bom` — active BOM for a product.
+//   - `POST /api/products/:id/bom` — replace BOM (soft-retires prior).
+//
+// All require_ready + bearer auth. DoS bounds: axum-default Json body
+// cap + explicit per-WO routing-op cap + per-BOM line cap inside the
+// repository per [[trust-code-not-operator]].
+
+/// Query string for `GET /api/work-orders`.
+#[derive(Debug, Deserialize)]
+pub struct ListWorkOrdersQuery {
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+const WO_LIST_DEFAULT_LIMIT: u32 = 100;
+const WO_LIST_MAX_LIMIT: u32 = 500;
+
+#[derive(Debug)]
+pub enum WorkOrderRouteError {
+    BadInput(String),
+    NotFound,
+    Conflict(String),
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for WorkOrderRouteError {
+    fn from(e: anyhow::Error) -> Self {
+        WorkOrderRouteError::Other(e)
+    }
+}
+
+fn map_wo_err(e: aberp_work_orders::WorkOrderError) -> WorkOrderRouteError {
+    use aberp_work_orders::WorkOrderError as WE;
+    match e {
+        WE::IllegalTransition(msg) => WorkOrderRouteError::BadInput(msg),
+        WE::StateRaced { expected, actual } => WorkOrderRouteError::Conflict(format!(
+            "state raced: expected from={:?}, found={:?} — refresh and retry",
+            expected, actual
+        )),
+        WE::NoActiveBomForProduct(p) => {
+            WorkOrderRouteError::BadInput(format!("cannot release: product {p} has no active BOM"))
+        }
+        WE::WorkOrderNotFound(_) => WorkOrderRouteError::NotFound,
+        WE::ProductNotFound(p) => WorkOrderRouteError::BadInput(format!("product {p} not found")),
+        WE::DuplicateIdempotencyKey(k) => {
+            WorkOrderRouteError::Conflict(format!("duplicate idempotency_key {k}"))
+        }
+        WE::Validation(msg) => WorkOrderRouteError::BadInput(msg),
+        WE::Storage(e) => WorkOrderRouteError::Other(e),
+    }
+}
+
+fn wo_route_error_response(err: WorkOrderRouteError) -> Response {
+    match err {
+        WorkOrderRouteError::BadInput(msg) => {
+            (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response()
+        }
+        WorkOrderRouteError::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(error_body("work order not found".to_string())),
+        )
+            .into_response(),
+        WorkOrderRouteError::Conflict(msg) => {
+            (StatusCode::CONFLICT, Json(error_body(msg))).into_response()
+        }
+        WorkOrderRouteError::Other(e) => internal_error("work_order_route", e),
+    }
+}
+
+async fn handle_list_work_orders(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<ListWorkOrdersQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_filter = match query.state.as_deref() {
+        None => None,
+        Some(s) => match aberp_work_orders::WorkOrderState::from_storage_str(s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body(format!("invalid `state`: {e}"))),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let limit = query
+        .limit
+        .unwrap_or(WO_LIST_DEFAULT_LIMIT)
+        .min(WO_LIST_MAX_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        list_work_orders_request(&state_for_task, state_filter, limit, offset)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "list_work_orders_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => internal_error("list_work_orders_request", e),
+    }
+}
+
+pub fn list_work_orders_request(
+    state: &AppState,
+    state_filter: Option<aberp_work_orders::WorkOrderState>,
+    limit: u32,
+    offset: u32,
+) -> anyhow::Result<Vec<aberp_work_orders::WorkOrder>> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    aberp_work_orders::list_work_orders(&conn, state.tenant.as_str(), state_filter, limit, offset)
+}
+
+/// POST body for creating a WO.
+#[derive(Debug, Deserialize)]
+pub struct CreateWorkOrderBody {
+    pub wo_number: String,
+    pub product_id: String,
+    pub qty_target: String, // Decimal-as-string per [[decimal-quantity-s157]].
+    #[serde(default)]
+    pub notes: Option<String>,
+    pub routing_ops: Vec<CreateRoutingOpBody>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateRoutingOpBody {
+    pub op_name: String,
+    #[serde(default)]
+    pub est_time_min: Option<i32>,
+    #[serde(default)]
+    pub est_cost_huf: Option<String>,
+}
+
+/// POST /api/work-orders response.
+#[derive(Debug, Serialize)]
+pub struct CreateWorkOrderResponse {
+    pub work_order: aberp_work_orders::WorkOrder,
+    pub routing_ops: Vec<aberp_work_orders::RoutingOp>,
+}
+
+async fn handle_create_work_order(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<CreateWorkOrderBody>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        create_work_order_request(&state_for_task, &operator_login, body)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "create_work_order_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
+        Err(e) => wo_route_error_response(e),
+    }
+}
+
+pub fn create_work_order_request(
+    state: &AppState,
+    operator_login: &str,
+    body: CreateWorkOrderBody,
+) -> std::result::Result<CreateWorkOrderResponse, WorkOrderRouteError> {
+    use std::str::FromStr;
+
+    let qty_target = rust_decimal::Decimal::from_str(body.qty_target.trim()).map_err(|_| {
+        WorkOrderRouteError::BadInput(format!(
+            "qty_target must be a decimal, got {:?}",
+            body.qty_target
+        ))
+    })?;
+
+    let routing_ops: Vec<aberp_work_orders::RoutingOpInput> = body
+        .routing_ops
+        .iter()
+        .map(|op| -> std::result::Result<_, WorkOrderRouteError> {
+            let est_cost_huf = match op.est_cost_huf.as_deref() {
+                None => None,
+                Some(s) if s.trim().is_empty() => None,
+                Some(s) => Some(rust_decimal::Decimal::from_str(s.trim()).map_err(|_| {
+                    WorkOrderRouteError::BadInput(format!("est_cost_huf must be decimal: {s:?}"))
+                })?),
+            };
+            Ok(aberp_work_orders::RoutingOpInput {
+                op_name: op.op_name.clone(),
+                est_time_min: op.est_time_min,
+                est_cost_huf,
+            })
+        })
+        .collect::<std::result::Result<_, _>>()?;
+
+    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!(
+            "open tenant DuckDB at {}: {e}",
+            state.db_path.display()
+        ))
+    })?;
+
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+
+    let tx = conn
+        .transaction()
+        .context("begin work-order create transaction")?;
+    let ctx = aberp_work_orders::WoWriteContext {
+        tenant: state.tenant.as_str(),
+        actor: aberp_inventory::ActorKind::SpaOperator {
+            operator_login: operator_login.to_string(),
+        },
+        ledger_meta: &ledger_meta,
+        ledger_actor,
+    };
+    let inputs = aberp_work_orders::CreateWorkOrderInputs {
+        wo_number: body.wo_number,
+        product_id: body.product_id,
+        qty_target,
+        notes: body.notes,
+        routing_ops,
+        idempotency_key: body.idempotency_key,
+    };
+    let (wo, routing_ops) =
+        aberp_work_orders::create_work_order(&tx, &ctx, inputs).map_err(map_wo_err)?;
+    tx.commit()
+        .context("commit work-order create transaction")?;
+
+    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+
+    Ok(CreateWorkOrderResponse {
+        work_order: wo,
+        routing_ops,
+    })
+}
+
+/// GET /api/work-orders/:id response — composed shape with the routing
+/// ops + active BOM expansion.
+#[derive(Debug, Serialize)]
+pub struct WorkOrderDetailResponse {
+    pub work_order: aberp_work_orders::WorkOrder,
+    pub routing_ops: Vec<aberp_work_orders::RoutingOp>,
+    pub bom: Vec<aberp_work_orders::BomLine>,
+}
+
+async fn handle_get_work_order_detail(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        get_work_order_detail_request(&state_for_task, &id_for_task)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "get_work_order_detail_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(Some(resp)) => Json(resp).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!("work order {id} not found"))),
+        )
+            .into_response(),
+        Err(e) => internal_error("get_work_order_detail_request", e),
+    }
+}
+
+pub fn get_work_order_detail_request(
+    state: &AppState,
+    wo_id: &str,
+) -> anyhow::Result<Option<WorkOrderDetailResponse>> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let wo = aberp_work_orders::read_work_order(&conn, state.tenant.as_str(), wo_id)
+        .map_err(|e| anyhow!("read work order: {e}"))?;
+    let wo = match wo {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let routing_ops =
+        aberp_work_orders::list_routing_ops_for_wo(&conn, state.tenant.as_str(), wo_id)?;
+    let bom = aberp_work_orders::list_active_bom_for_product(
+        &conn,
+        state.tenant.as_str(),
+        &wo.product_id,
+    )?;
+    Ok(Some(WorkOrderDetailResponse {
+        work_order: wo,
+        routing_ops,
+        bom,
+    }))
+}
+
+/// POST body for `/api/work-orders/:id/transitions`. The route layer
+/// resolves the actor (SpaOperator from the bearer session) and calls
+/// the SAME repository handler future adapter events will call per
+/// ADR-0062 §3 — `source_event_id` is explicit so the handler signature
+/// invariant holds (ADR-0062 invariant 7).
+#[derive(Debug, Deserialize)]
+pub struct TransitionWorkOrderBody {
+    pub action: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// MUST be supplied explicitly per ADR-0062 invariant 7. SPA
+    /// routes pass `None` (operator clicked a button); adapter event
+    /// handlers pass `Some(ULID)` of the upstream adapter event.
+    #[serde(default)]
+    pub source_event_id: Option<String>,
+    pub idempotency_key: String,
+}
+
+/// Response for a successful transition.
+#[derive(Debug, Serialize)]
+pub struct TransitionWorkOrderResponse {
+    pub work_order: aberp_work_orders::WorkOrder,
+    /// Per ADR-0062 §5 + ADR-0061 negative-stock policy — when a
+    /// Release lands an active BOM line whose component goes negative,
+    /// the route still succeeds but a warning surfaces here.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+async fn handle_transition_work_order(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<TransitionWorkOrderBody>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        transition_work_order_request(&state_for_task, &id_for_task, &operator_login, body)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "transition_work_order_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => wo_route_error_response(e),
+    }
+}
+
+pub fn transition_work_order_request(
+    state: &AppState,
+    wo_id: &str,
+    operator_login: &str,
+    body: TransitionWorkOrderBody,
+) -> std::result::Result<TransitionWorkOrderResponse, WorkOrderRouteError> {
+    let action = aberp_work_orders::WoAction::from_storage_str(body.action.trim())
+        .map_err(|e| WorkOrderRouteError::BadInput(format!("{e}: {:?}", body.action)))?;
+
+    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!(
+            "open tenant DuckDB at {}: {e}",
+            state.db_path.display()
+        ))
+    })?;
+
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+
+    let tx = conn
+        .transaction()
+        .context("begin work-order transition transaction")?;
+    let ctx = aberp_work_orders::WoWriteContext {
+        tenant: state.tenant.as_str(),
+        actor: aberp_inventory::ActorKind::SpaOperator {
+            operator_login: operator_login.to_string(),
+        },
+        ledger_meta: &ledger_meta,
+        ledger_actor,
+    };
+    let inputs = aberp_work_orders::TransitionInputs {
+        action,
+        reason: body.reason,
+        // Per ADR-0062 invariant 7 the SPA route ALWAYS passes None
+        // explicitly. A non-None body field is rejected to defend the
+        // invariant — only adapter event handlers (future) can supply
+        // a source_event_id.
+        source_event_id: None,
+        idempotency_key: body.idempotency_key,
+    };
+    if body.source_event_id.is_some() {
+        return Err(WorkOrderRouteError::BadInput(
+            "source_event_id is not accepted from the SPA route — adapter event handlers only \
+             (ADR-0062 invariant 7)"
+                .to_string(),
+        ));
+    }
+    let outcome =
+        aberp_work_orders::transition_work_order(&tx, &ctx, wo_id, inputs).map_err(map_wo_err)?;
+    tx.commit()
+        .context("commit work-order transition transaction")?;
+    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    Ok(TransitionWorkOrderResponse {
+        work_order: outcome.wo,
+        warnings: outcome.warnings,
+    })
+}
+
+/// GET /api/products/:id/bom — list active BOM rows.
+async fn handle_get_product_bom(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let id_for_task = id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || get_product_bom_request(&state_for_task, &id_for_task))
+            .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "get_product_bom_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => internal_error("get_product_bom_request", e),
+    }
+}
+
+pub fn get_product_bom_request(
+    state: &AppState,
+    product_id: &str,
+) -> anyhow::Result<Vec<aberp_work_orders::BomLine>> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    aberp_work_orders::list_active_bom_for_product(&conn, state.tenant.as_str(), product_id)
+}
+
+/// POST body for `/api/products/:id/bom` — full-replace the active
+/// BOM. The repository soft-retires the prior active rows.
+#[derive(Debug, Deserialize)]
+pub struct PutProductBomBody {
+    pub lines: Vec<PutProductBomLine>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PutProductBomLine {
+    pub component_id: String,
+    pub qty_per_unit: String,
+}
+
+async fn handle_put_product_bom(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<PutProductBomBody>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        put_product_bom_request(&state_for_task, &id_for_task, body)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "put_product_bom_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => wo_route_error_response(e),
+    }
+}
+
+pub fn put_product_bom_request(
+    state: &AppState,
+    product_id: &str,
+    body: PutProductBomBody,
+) -> std::result::Result<Vec<aberp_work_orders::BomLine>, WorkOrderRouteError> {
+    use std::str::FromStr;
+
+    let lines: Vec<aberp_work_orders::BomLineInput> = body
+        .lines
+        .iter()
+        .map(|l| -> std::result::Result<_, WorkOrderRouteError> {
+            let qty = rust_decimal::Decimal::from_str(l.qty_per_unit.trim()).map_err(|_| {
+                WorkOrderRouteError::BadInput(format!(
+                    "qty_per_unit must be a decimal, got {:?}",
+                    l.qty_per_unit
+                ))
+            })?;
+            Ok(aberp_work_orders::BomLineInput {
+                component_id: l.component_id.clone(),
+                qty_per_unit: qty,
+            })
+        })
+        .collect::<std::result::Result<_, _>>()?;
+
+    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!(
+            "open tenant DuckDB at {}: {e}",
+            state.db_path.display()
+        ))
+    })?;
+    let tx = conn
+        .transaction()
+        .context("begin BOM replace transaction")?;
+    let out =
+        aberp_work_orders::replace_bom_for_product(&tx, state.tenant.as_str(), product_id, &lines)
+            .map_err(map_wo_err)?;
+    tx.commit().context("commit BOM replace transaction")?;
+    Ok(out)
+}
+
+/// Best-effort audit-mirror sync after a successful write transaction.
+/// Mirrors the inventory route's posture: the canonical row already
+/// landed in the DB tx; a mirror failure should not poison the
+/// operator's response, and the next write (or boot) will heal per
+/// ADR-0030 §6's bootstrap-from-DB posture.
+fn sync_audit_mirror_best_effort(
+    db_path: &std::path::Path,
+    tenant: aberp_audit_ledger::TenantId,
+    binary_hash: aberp_audit_ledger::BinaryHash,
+) {
+    let mirror_path = aberp_audit_ledger::mirror_path_for(db_path);
+    if let Ok(ledger) = Ledger::open(db_path, tenant, binary_hash) {
+        if let Err(e) = ledger.sync_mirror(&mirror_path) {
+            tracing::warn!(
+                error = ?e,
+                "work-order mirror sync failed; will heal on next write"
+            );
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────

@@ -1,0 +1,61 @@
+[package]
+name = "aberp-work-orders"
+description = "ABERP Stage 3 Phase γ Work Orders module v1 (S232 / PR-228 / ADR-0062) — work_orders + 1-level BOM (boms) + linear routings + per-state-transition audit + transactional inventory coupling (consume on Release, produce on Complete)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_work_orders"
+path = "src/lib.rs"
+
+[dependencies]
+# Audit-ledger F8 cross-crate writer per ADR-0062 §4: every state
+# transition + create + per-routing-op transition emits one audit
+# entry inside the caller-owned transaction. Same posture
+# aberp-inventory uses.
+aberp-audit-ledger = { path = "../audit-ledger" }
+
+# ADR-0062 §5 — Released emits one stock_movement per BOM line via
+# the inventory module's existing `record_movement` surface; Completed
+# emits one positive movement for the finished good. The work-orders
+# crate consumes the public re-exports (ActorKind / MovementReason /
+# MovementRefKind / record_movement / RecordMovementContext /
+# RecordMovementInputs).
+aberp-inventory = { path = "../aberp-inventory" }
+
+# DuckDB Transaction is the type signature of every write path; same
+# posture aberp-inventory uses.
+duckdb = { workspace = true }
+
+# Decimal qty_target + qty_per_unit per ADR-0062 §1 — matches
+# [[decimal-quantity-s157]]'s invoice-line precedent and the inventory
+# crate's `stock_movements.qty_delta` typing.
+rust_decimal = { workspace = true }
+
+# Serde for the audit payloads (WorkOrderCreatedPayload /
+# WorkOrderStateChangedPayload / RoutingOpStateChangedPayload) + the
+# closed-vocab enum (WorkOrderState / RoutingOpState / WoAction)
+# round-trip. Same posture as every other `mes.*` payload.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Typed errors at the crate boundary; binary boundary uses anyhow.
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# RFC3339 stamps for created_at / released_at / etc. Workspace pin
+# (no chrono).
+time = { workspace = true }
+
+# ULID for wo_id (`wo_<ULID>`), bml_id (`bml_<ULID>`), rop_id
+# (`rop_<ULID>`) per ADR-0062 §1 and for the audit-ledger F8
+# idempotency key.
+ulid = { workspace = true }
+
+# Diagnostic logging at the route layer.
+tracing = { workspace = true }

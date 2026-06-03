@@ -695,7 +695,15 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // belong to products + work orders + dispatches, never to an
         // outgoing invoice. The bundle's `invoice.*` glob excludes
         // them anyway; this arm exists for exhaustiveness only.
-        | EventKind::StockMovementRecorded => None,
+        | EventKind::StockMovementRecorded
+        // S232 / PR-228 / ADR-0062 — Work Order lifecycle events.
+        // `mes.*` family per ADR-0062 §4; WO lifecycle belongs to
+        // products + routings + dispatches, never to an outgoing
+        // invoice. The bundle's `invoice.*` glob excludes them
+        // anyway; these arms exist for exhaustiveness only.
+        | EventKind::WorkOrderCreated
+        | EventKind::WorkOrderStateChanged
+        | EventKind::RoutingOpStateChanged => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

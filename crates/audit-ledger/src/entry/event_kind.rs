@@ -870,6 +870,52 @@ pub enum EventKind {
     ///
     /// F12 four-edit ritual fires once.
     StockMovementRecorded,
+
+    /// S232 / PR-228 / ADR-0062 — a Work Order was created. ONE entry
+    /// per WO at Create time; carries the full snapshot (product_id,
+    /// qty_target, routing_op_ids, actor, idempotency_key) so the
+    /// future operations-dashboard projection can glob `mes.work_order_*`
+    /// without sweeping inventory or QA traffic.
+    ///
+    /// Per ADR-0062 §4 the create-vs-transition split mirrors the
+    /// Stage 1 `InvoiceDraftCreated` vs `InvoiceState*` pattern: create
+    /// emits the full snapshot once, transitions are deltas.
+    ///
+    /// `mes.` prefix — Stage 3 modules (Inventory, Work Orders, QA,
+    /// Dispatch) share the family.
+    ///
+    /// F12 four-edit ritual fires once.
+    WorkOrderCreated,
+
+    /// S232 / PR-228 / ADR-0062 — a Work Order transitioned between
+    /// states per the closed-vocab `WorkOrderState` lifecycle
+    /// (Created → Released → InProgress → Completed | Cancelled | OnHold).
+    /// Carries `from_state`, `to_state`, optional `reason`, `actor`,
+    /// and `source_event_id` (`Some(ULID)` when an adapter event drove
+    /// the transition, `None` for SPA button presses per ADR-0062 §4 +
+    /// §"Invariant 7").
+    ///
+    /// `source_event_id` is **load-bearing** — it cross-references the
+    /// adapter event's ULID so an operator looking at the timeline can
+    /// trace "the state change at 12:34 was triggered by adapter X's
+    /// scan at 12:33."
+    ///
+    /// `mes.` prefix per ADR-0062 §4.
+    ///
+    /// F12 four-edit ritual fires once.
+    WorkOrderStateChanged,
+
+    /// S232 / PR-228 / ADR-0062 — a Routing Operation transitioned
+    /// between states per the narrower `RoutingOpState` vocab
+    /// (Pending → Active → Completed | Skipped). Per-op events are a
+    /// separate kind from `WorkOrderStateChanged` so a future
+    /// operations-dashboard projection can glob `mes.routing_op_*`
+    /// without sweeping WO-level events (ADR-0062 §4).
+    ///
+    /// `mes.` prefix per ADR-0062 §4.
+    ///
+    /// F12 four-edit ritual fires once.
+    RoutingOpStateChanged,
 }
 
 impl EventKind {
@@ -919,6 +965,9 @@ impl EventKind {
             EventKind::ExtNavPartnerManualLink => "system.extnav_partner_manual_link",
             EventKind::MesAdapterEvent => "mes.adapter_event",
             EventKind::StockMovementRecorded => "mes.stock_movement_recorded",
+            EventKind::WorkOrderCreated => "mes.work_order_created",
+            EventKind::WorkOrderStateChanged => "mes.work_order_state_changed",
+            EventKind::RoutingOpStateChanged => "mes.routing_op_state_changed",
         }
     }
 
@@ -979,6 +1028,9 @@ impl EventKind {
             "system.extnav_partner_manual_link" => Ok(EventKind::ExtNavPartnerManualLink),
             "mes.adapter_event" => Ok(EventKind::MesAdapterEvent),
             "mes.stock_movement_recorded" => Ok(EventKind::StockMovementRecorded),
+            "mes.work_order_created" => Ok(EventKind::WorkOrderCreated),
+            "mes.work_order_state_changed" => Ok(EventKind::WorkOrderStateChanged),
+            "mes.routing_op_state_changed" => Ok(EventKind::RoutingOpStateChanged),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1031,6 +1083,9 @@ mod tests {
             EventKind::ExtNavPartnerManualLink,
             EventKind::MesAdapterEvent,
             EventKind::StockMovementRecorded,
+            EventKind::WorkOrderCreated,
+            EventKind::WorkOrderStateChanged,
+            EventKind::RoutingOpStateChanged,
         ];
         for v in variants {
             let s = v.as_str();
@@ -1802,6 +1857,66 @@ mod tests {
             EventKind::StockMovementRecorded.as_str(),
             EventKind::InvoicePaymentRecorded.as_str()
         );
+    }
+
+    /// S232 / PR-228 / ADR-0062 — the three Work Order kinds use the
+    /// `mes.*` prefix family alongside `MesAdapterEvent` /
+    /// `StockMovementRecorded`. Stage 3 modules (Inventory, Work
+    /// Orders, QA, Dispatch) share the family so the
+    /// per-OUTGOING-invoice export bundle's `invoice.*` glob never
+    /// sweeps Stage 3 traffic and `system.*` consumers stay narrow.
+    /// MUST NOT start with `invoice.` or `system.`.
+    #[test]
+    fn s232_work_order_kinds_use_mes_prefix() {
+        for k in [
+            EventKind::WorkOrderCreated,
+            EventKind::WorkOrderStateChanged,
+            EventKind::RoutingOpStateChanged,
+        ] {
+            let s = k.as_str();
+            assert!(s.starts_with("mes."), "{s} must start with mes.");
+            assert!(
+                !s.starts_with("invoice."),
+                "{s} must not start with invoice."
+            );
+            assert!(!s.starts_with("system."), "{s} must not start with system.");
+        }
+        // Exact storage strings per ADR-0062 §4 table.
+        assert_eq!(
+            EventKind::WorkOrderCreated.as_str(),
+            "mes.work_order_created"
+        );
+        assert_eq!(
+            EventKind::WorkOrderStateChanged.as_str(),
+            "mes.work_order_state_changed"
+        );
+        assert_eq!(
+            EventKind::RoutingOpStateChanged.as_str(),
+            "mes.routing_op_state_changed"
+        );
+    }
+
+    /// S232 / PR-228 / ADR-0062 — the three Work Order kinds are
+    /// distinct from each other and from the prior `mes.*` kinds
+    /// (`MesAdapterEvent` / `StockMovementRecorded`). Catches a future
+    /// refactor accidentally collapsing two `mes.*` kinds onto one
+    /// storage string.
+    #[test]
+    fn s232_work_order_kinds_are_distinct() {
+        let new_kinds = [
+            EventKind::WorkOrderCreated.as_str(),
+            EventKind::WorkOrderStateChanged.as_str(),
+            EventKind::RoutingOpStateChanged.as_str(),
+        ];
+        // Pairwise-distinct among themselves.
+        assert_ne!(new_kinds[0], new_kinds[1]);
+        assert_ne!(new_kinds[0], new_kinds[2]);
+        assert_ne!(new_kinds[1], new_kinds[2]);
+        // Distinct from the prior `mes.*` kinds.
+        for new_k in new_kinds {
+            assert_ne!(new_k, EventKind::MesAdapterEvent.as_str());
+            assert_ne!(new_k, EventKind::StockMovementRecorded.as_str());
+        }
     }
 
     /// S220 / PR-217 — the two new kinds must be distinct from every

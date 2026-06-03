@@ -70,6 +70,8 @@
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
   import PartnersList from "./routes/PartnersList.svelte";
   import ProductsList from "./routes/ProductsList.svelte";
+  // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Work Orders v1.
+  import WorkOrdersList from "./routes/WorkOrdersList.svelte";
   // S180 / PR-180 — NAV-as-DR restore wizard, mounted at
   // `#/restore-from-nav` under the maintenance area.
   import RestoreFromNavWizard from "./routes/RestoreFromNavWizard.svelte";
@@ -514,6 +516,8 @@
           <PartnersList />
         {:else if route === "products"}
           <ProductsList />
+        {:else if route === "work-orders"}
+          <WorkOrdersList />
         {:else if route === "statistics"}
           <StatisticsPage />
         {:else if route === "maintenance"}

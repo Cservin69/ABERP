@@ -295,6 +295,13 @@ pub fn run() {
             commands::list_stock_movements,
             commands::create_stock_movement,
             commands::list_low_stock_products,
+            // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Work Orders v1.
+            commands::list_work_orders,
+            commands::create_work_order,
+            commands::get_work_order,
+            commands::transition_work_order,
+            commands::get_product_bom,
+            commands::put_product_bom,
             commands::list_seller_banks,
             commands::create_seller_bank,
             commands::update_seller_bank,

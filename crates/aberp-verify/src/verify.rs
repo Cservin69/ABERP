@@ -815,7 +815,17 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // typed inventory deltas, no NAV bytes. Excluded from the
         // per-OUTGOING-invoice bundle by the `invoice.*` glob; this
         // arm exists for exhaustiveness only.
-        | EventKind::StockMovementRecorded => (None, ""),
+        | EventKind::StockMovementRecorded
+        // S232 / PR-228 / ADR-0062 — Work Order create + state-change
+        // + per-op state-change events. `mes.*` family per ADR-0062 §4
+        // — shop-floor lifecycle, never an outgoing-invoice surface.
+        // Payloads carry typed lifecycle deltas (wo_id, from_state,
+        // to_state, routing_op_ids, actor); no NAV bytes. Excluded
+        // from the per-OUTGOING-invoice bundle by the `invoice.*` glob;
+        // this arm exists for exhaustiveness only.
+        | EventKind::WorkOrderCreated
+        | EventKind::WorkOrderStateChanged
+        | EventKind::RoutingOpStateChanged => (None, ""),
     };
 
     Ok(NavExtraction {
