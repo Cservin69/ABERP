@@ -60,3 +60,7 @@ tracing = { workspace = true }
 aberp-work-orders = { path = "../aberp-work-orders" }
 aberp-qa = { path = "../aberp-qa" }
 aberp-audit-ledger = { path = "../audit-ledger", features = ["test-support"] }
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

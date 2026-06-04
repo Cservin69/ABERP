@@ -77,7 +77,6 @@ fn format_huf_forints(forints: i64) -> String {
 pub fn rate_for_display(canonical_decimal: &str) -> String {
     let (whole, frac) = canonical_decimal
         .split_once('.')
-        .map(|(w, f)| (w, f))
         .unwrap_or((canonical_decimal, ""));
     let frac_two = if frac.len() >= 2 {
         &frac[..2]

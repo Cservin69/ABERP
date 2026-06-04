@@ -277,7 +277,7 @@ async fn issue_route_huf_happy_path_writes_audit_pair_and_xml() {
 
     // Walk the audit ledger and prove the two-event pair landed.
     let ledger = Ledger::open(
-        &dir.join("aberp.duckdb"),
+        dir.join("aberp.duckdb"),
         TenantId::new(TEST_TENANT.to_string()).unwrap(),
         BinaryHash::from_bytes([0u8; 32]),
     )
@@ -355,7 +355,7 @@ async fn issue_route_eur_happy_path_stamps_rate_metadata_on_draft() {
     // Walk the ledger; find the matching draft entry; assert the
     // rate-metadata fields are populated per ADR-0037 §1.a.
     let ledger = Ledger::open(
-        &dir.join("aberp.duckdb"),
+        dir.join("aberp.duckdb"),
         TenantId::new(TEST_TENANT.to_string()).unwrap(),
         BinaryHash::from_bytes([0u8; 32]),
     )

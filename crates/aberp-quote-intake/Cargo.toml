@@ -35,3 +35,7 @@ rust_decimal = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 zeroize = { workspace = true }
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

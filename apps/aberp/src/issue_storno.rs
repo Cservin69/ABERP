@@ -566,25 +566,27 @@ fn check_base_is_finalized(ledger: &Ledger, base_invoice_id: &str) -> Result<()>
 
     for entry in &entries {
         match entry.kind {
-            EventKind::InvoiceMarkedAbandoned => {
+            EventKind::InvoiceMarkedAbandoned
                 if payload_invoice_id_matches::<audit_payloads::InvoiceMarkedAbandonedPayload>(
                     &entry.payload,
                     base_invoice_id,
                     "InvoiceMarkedAbandoned",
                     entry.seq.as_u64(),
-                )? {
-                    has_marked_abandoned = true;
-                }
+                )? =>
+            {
+                has_marked_abandoned = true;
             }
-            EventKind::InvoiceSubmissionResponse => {
-                if payload_invoice_id_matches::<audit_payloads::InvoiceSubmissionResponsePayload>(
+            EventKind::InvoiceSubmissionResponse
+                if payload_invoice_id_matches::<
+                    audit_payloads::InvoiceSubmissionResponsePayload,
+                >(
                     &entry.payload,
                     base_invoice_id,
                     "InvoiceSubmissionResponse",
                     entry.seq.as_u64(),
-                )? {
-                    has_submission_response = true;
-                }
+                )? =>
+            {
+                has_submission_response = true;
             }
             EventKind::InvoiceAckStatus => {
                 // Decode + filter; only update the latest if it matches.

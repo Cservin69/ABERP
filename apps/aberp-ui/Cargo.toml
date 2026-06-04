@@ -108,3 +108,7 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 # The integration test `tests/handshake_parse.rs` only needs the
 # library face; no test-support feature gate is required for PR-9-2.
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

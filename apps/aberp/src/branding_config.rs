@@ -108,10 +108,8 @@ pub fn parse_branding_section(body: &str) -> Result<Option<BrandingConfig>> {
         let key = k.trim();
         let value = strip_quotes(v.trim()).to_string();
         match key {
-            "primary_color" => {
-                if !value.is_empty() {
-                    primary_color = Some(value);
-                }
+            "primary_color" if !value.is_empty() => {
+                primary_color = Some(value);
             }
             _ => {
                 // Silently ignore unknown keys — forward-compat with a

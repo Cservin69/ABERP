@@ -73,3 +73,7 @@ tracing = { workspace = true }
 # (`tests/work_order_round_trip.rs`) call `aberp_qa::ensure_schema` +
 # the cascade-triggered QA inspection flow needs aberp-qa types
 # transitively; the existing dep is sufficient — no dev-dep needed.
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

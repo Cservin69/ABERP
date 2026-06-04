@@ -23,3 +23,7 @@ thiserror = { workspace = true }
 # read-side use (the existing workspace pin already includes
 # `serialize` because the SOAP envelope writer needs it).
 quick-xml = { workspace = true }
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

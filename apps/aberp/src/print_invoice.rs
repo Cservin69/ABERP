@@ -609,7 +609,7 @@ pub fn parse_nav_invoice_xml(bytes: &[u8]) -> Result<ParsedNavInvoice> {
                     &mut cur_line,
                     address_in,
                     &mut address_buf,
-                    &date_fmt,
+                    date_fmt,
                 )?;
             }
             Ok(_) => {}
@@ -735,10 +735,10 @@ fn handle_text(
     // ── Supplier address: collect every text under <supplierAddress> ──
     if address_in.is_some() {
         match last {
-            "countryCode" | "postalCode" | "city" | "additionalAddressDetail" => {
-                if !value.is_empty() {
-                    address_buf.push(value.to_string());
-                }
+            "countryCode" | "postalCode" | "city" | "additionalAddressDetail"
+                if !value.is_empty() =>
+            {
+                address_buf.push(value.to_string());
             }
             _ => {}
         }

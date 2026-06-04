@@ -1023,8 +1023,7 @@ mod tests {
 
     #[test]
     fn parse_invoice_lines_handles_nav_and_own_units() {
-        let xml = format!(
-            r#"<InvoiceData xmlns="http://schemas.nav.gov.hu/OSA/3.0/data">
+        let xml = r#"<InvoiceData xmlns="http://schemas.nav.gov.hu/OSA/3.0/data">
   <invoiceMain><invoice><invoiceLines>
     <line><lineNumber>1</lineNumber>
       <lineDescription>Tanácsadás</lineDescription>
@@ -1038,7 +1037,7 @@ mod tests {
       <unitOfMeasureOwn>liter@15C</unitOfMeasureOwn>
       <unitPrice>650</unitPrice></line>
   </invoiceLines></invoice></invoiceMain></InvoiceData>"#
-        );
+            .to_string();
         let lines = parse_invoice_lines(xml.as_bytes(), Currency::Huf).expect("parses");
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].description, "Tanácsadás");

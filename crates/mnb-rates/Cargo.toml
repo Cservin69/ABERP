@@ -46,3 +46,7 @@ aberp-billing = { path = "../../modules/billing" }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

@@ -1068,7 +1068,7 @@ mod tests {
     #[test]
     fn storno_chain_link_matches_both_base_and_storno_bundles() {
         let payload =
-            format!(r#"{{"storno_invoice_id":"inv_STORNO","base_invoice_id":"inv_BASE"}}"#);
+            r#"{"storno_invoice_id":"inv_STORNO","base_invoice_id":"inv_BASE"}"#.to_string();
         let probe: BundleMembershipProbe = serde_json::from_str(&payload).unwrap();
         assert!(probe.matches("inv_BASE"));
         assert!(probe.matches("inv_STORNO"));
@@ -1081,7 +1081,7 @@ mod tests {
     #[test]
     fn modification_chain_link_matches_both_base_and_modification_bundles() {
         let payload =
-            format!(r#"{{"modification_invoice_id":"inv_MOD","base_invoice_id":"inv_BASE"}}"#);
+            r#"{"modification_invoice_id":"inv_MOD","base_invoice_id":"inv_BASE"}"#.to_string();
         let probe: BundleMembershipProbe = serde_json::from_str(&payload).unwrap();
         assert!(probe.matches("inv_BASE"));
         assert!(probe.matches("inv_MOD"));

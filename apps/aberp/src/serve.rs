@@ -13164,10 +13164,7 @@ async fn handle_put_quote_intake_config(
             }
         }
     }
-    let has_token = match quote_intake_credentials_mod::read_token(state.tenant.as_str()) {
-        Ok(_) => true,
-        Err(_) => false,
-    };
+    let has_token = quote_intake_credentials_mod::read_token(state.tenant.as_str()).is_ok();
     let last_poll = latest_quote_intake_poll(&state).ok().flatten();
     let body = QuoteIntakeConfigResponse {
         enabled: cfg.enabled,

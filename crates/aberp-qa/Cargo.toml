@@ -54,3 +54,7 @@ tracing = { workspace = true }
 # own [dependencies], so this dev-dep is one-way (no Cargo cycle —
 # dev-deps don't propagate). Used ONLY in `tests/qa_round_trip.rs`.
 aberp-work-orders = { path = "../aberp-work-orders" }
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

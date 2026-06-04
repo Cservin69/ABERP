@@ -1220,7 +1220,7 @@ mod tests {
         // polls 0,1,2 retryable-error; 3 intermediate (resets counter);
         // 4 SAVED.
         let (poll, _log) = scripted(|n| match n {
-            0 | 1 | 2 => Err(AttemptError::Retryable(format!("blip {n}"))),
+            0..=2 => Err(AttemptError::Retryable(format!("blip {n}"))),
             3 => Ok(ok_outcome(ProcessingStatus::Processing)),
             _ => Ok(ok_outcome(ProcessingStatus::Saved)),
         });

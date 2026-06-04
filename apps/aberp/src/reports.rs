@@ -1026,20 +1026,14 @@ fn aggregate_outgoing(
     agg.pending_count = 0;
     for (id, trace) in traces {
         match trace.classify() {
-            CountedKind::Rejected => {
-                if seen_rejected.insert(id.clone()) {
-                    agg.rejected_count += 1;
-                }
+            CountedKind::Rejected if seen_rejected.insert(id.clone()) => {
+                agg.rejected_count += 1;
             }
-            CountedKind::Abandoned => {
-                if seen_abandoned.insert(id.clone()) {
-                    agg.abandoned_count += 1;
-                }
+            CountedKind::Abandoned if seen_abandoned.insert(id.clone()) => {
+                agg.abandoned_count += 1;
             }
-            CountedKind::PendingDraft => {
-                if seen_pending.insert(id.clone()) {
-                    agg.pending_count += 1;
-                }
+            CountedKind::PendingDraft if seen_pending.insert(id.clone()) => {
+                agg.pending_count += 1;
             }
             _ => {}
         }
@@ -1349,19 +1343,14 @@ pub fn compute_financial_report(
         }
     }
 
-    let mut deferred_notes: Vec<String> = Vec::new();
-    deferred_notes
-        .push("FX-aggregated (all-currencies-in-HUF-at-MNB-rate) total deferred to v2.2.1.".into());
-    deferred_notes
-        .push("HIPA base + KATA/KIVA threshold logic deferred to v2.3 (separate ADR).".into());
-    deferred_notes.push(
+    let deferred_notes: Vec<String> = vec![
+        "FX-aggregated (all-currencies-in-HUF-at-MNB-rate) total deferred to v2.2.1.".into(),
+        "HIPA base + KATA/KIVA threshold logic deferred to v2.3 (separate ADR).".into(),
         "AAM / reverse-charge / EU-0 VAT sub-buckets deferred — schema does not tag them today."
             .into(),
-    );
-    deferred_notes.push(
         "Per-VAT-rate breakdown for incoming + restored deferred (digest-only ingestion in v1)."
             .into(),
-    );
+    ];
 
     // Period-over-period deltas — re-run the aggregates over the prior
     // comparable window. Custom + All periods get None.

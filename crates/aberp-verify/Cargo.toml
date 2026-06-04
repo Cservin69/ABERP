@@ -74,3 +74,7 @@ tracing-subscriber = { workspace = true }
 # pattern (apps/aberp's Cargo.toml uses the same idiom for
 # rollback_conformance.rs).
 aberp-audit-ledger = { path = "../audit-ledger", features = ["test-support"] }
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

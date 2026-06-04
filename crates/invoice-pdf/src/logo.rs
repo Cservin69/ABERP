@@ -358,7 +358,7 @@ mod tests {
         assert_eq!(logo.height, 1024);
         assert_eq!(
             logo.rgb_bytes.len(),
-            1 * 1024 * 3,
+            1024 * 3,
             "1×1024 grayscale must expand to 3 bytes per pixel"
         );
         // Pixel sanity — every byte is the source grayscale value
@@ -375,7 +375,7 @@ mod tests {
         let logo_h = TenantLogo::from_png_bytes(&png_h).expect("decode 1024×1 strip");
         assert_eq!(logo_h.width, 1024);
         assert_eq!(logo_h.height, 1);
-        assert_eq!(logo_h.rgb_bytes.len(), 1024 * 1 * 3);
+        assert_eq!(logo_h.rgb_bytes.len(), 1024 * 3);
     }
 
     #[test]

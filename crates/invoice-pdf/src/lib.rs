@@ -1317,7 +1317,7 @@ mod tests {
         let tall = TenantLogo {
             width: 1,
             height: 1024,
-            rgb_bytes: vec![0u8; 1 * 1024 * 3],
+            rgb_bytes: vec![0u8; 1024 * 3],
         };
         let (draw_w, draw_h) = draw_dims(&tall);
         assert!(
@@ -1349,7 +1349,7 @@ mod tests {
         let wide = TenantLogo {
             width: 1024,
             height: 1,
-            rgb_bytes: vec![0u8; 1024 * 1 * 3],
+            rgb_bytes: vec![0u8; 1024 * 3],
         };
         let (draw_w_h, draw_h_h) = draw_dims(&wide);
         assert!(

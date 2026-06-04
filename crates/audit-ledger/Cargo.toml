@@ -41,3 +41,7 @@ fs2 = { workspace = true }
 
 [dev-dependencies]
 # Conformance test only. Kept minimal: no extra crates required.
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

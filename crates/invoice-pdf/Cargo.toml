@@ -49,3 +49,7 @@ png = { workspace = true }
 # §1.a field is present. Dev-dep only — production renderer does not
 # parse the bytes it emits.
 pdf-extract = { workspace = true }
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

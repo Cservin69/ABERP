@@ -29,3 +29,7 @@ ulid = { workspace = true }
 # the dev-only `serde_json` use in `apps/aberp/src/serve.rs`'s
 # `ack_status_wire_shape_pins_uppercase_strings`.
 serde_json = { workspace = true }
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

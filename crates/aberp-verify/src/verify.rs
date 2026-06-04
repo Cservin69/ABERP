@@ -918,7 +918,7 @@ fn check_root_element(
     };
 
     let actual = first_element_local_name(bytes)
-        .ok_or_else(|| format!("could not find an opening XML tag in the bytes"))?;
+        .ok_or_else(|| "could not find an opening XML tag in the bytes".to_string())?;
     if expected.iter().any(|e| *e == actual) {
         Ok(())
     } else {
@@ -957,7 +957,7 @@ fn first_element_local_name(bytes: &[u8]) -> Option<String> {
     let rest = cursor.strip_prefix('<')?;
     // Read the element name up to the first non-name character.
     let end = rest
-        .find(|c: char| c == '>' || c == ' ' || c == '\t' || c == '/' || c == '\n' || c == '\r')
+        .find(['>', ' ', '\t', '/', '\n', '\r'])
         .unwrap_or(rest.len());
     let qualified = &rest[..end];
     // Strip a namespace prefix `ns:` if present.

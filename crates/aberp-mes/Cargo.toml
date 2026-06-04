@@ -71,3 +71,7 @@ tracing = { workspace = true }
 # clocks in lifecycle tests, plus net/sync/io for the TCP listener
 # integration tests.
 tokio = { workspace = true, features = ["test-util"] }
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

@@ -102,3 +102,7 @@ aberp-nav-transport = { path = ".", features = ["test-support"] }
 # that the production trust store does NOT trust certs rooted elsewhere.
 # Build-time only; never linked into the release binary.
 tokio = { workspace = true }
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

@@ -63,7 +63,7 @@ use super::{is_non_retryable, parse_result_block, NavResultBlock};
 /// fields later is additive — a future contributor extending
 /// this struct only needs to add a parse arm in
 /// [`parse_digest_page`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InvoiceDigest {
     /// `<invoiceNumber>` — the supplier's invoice number, used
     /// as half of the dedup key against the `ap_invoice` table.
@@ -371,21 +371,6 @@ pub(crate) fn parse_digest_page(xml: &[u8]) -> Result<QueryInvoiceDigestPage, Na
         available_line,
         digests,
     })
-}
-
-impl Default for InvoiceDigest {
-    fn default() -> Self {
-        Self {
-            invoice_number: String::new(),
-            supplier_tax_number: String::new(),
-            supplier_name: None,
-            issue_date: None,
-            transaction_id: None,
-            currency: None,
-            invoice_net_amount: None,
-            invoice_vat_amount: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]

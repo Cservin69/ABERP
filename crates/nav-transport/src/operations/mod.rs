@@ -359,19 +359,18 @@ pub fn find_all_technical_validations(
                     }
                 }
             }
-            Ok(Event::Empty(e)) => {
+            Ok(Event::Empty(e))
                 // Self-closing element like `<ns2:tag/>` — record an
                 // empty-string value into the matching field so the
                 // operator sees the element WAS present (vs. NAV omitting
                 // it entirely, which leaves the field `None`).
-                if block_depth == 1 {
+                if block_depth == 1 => {
                     let qualified = e.name();
                     let qualified = qualified.as_ref();
                     if let Some(field) = sub_field_for(qualified) {
                         assign_sub_field(&mut current, field, String::new());
                     }
                 }
-            }
             Ok(Event::Text(t)) if block_depth == 2 && active_sub.is_some() => {
                 let unescaped = t
                     .unescape()

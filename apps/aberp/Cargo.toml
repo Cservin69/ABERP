@@ -244,3 +244,7 @@ png = { workspace = true }
 # Reading A and lives outside the operator binary's trust
 # boundary).
 aberp-verify = { path = "../../crates/aberp-verify" }
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

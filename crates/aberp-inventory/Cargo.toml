@@ -59,3 +59,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 # No extra dev-deps yet; the in-process DuckDB driving uses the
 # `duckdb` crate already in [dependencies] above.
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

@@ -116,6 +116,7 @@ mod tests {
 
     #[cfg(not(feature = "production"))]
     #[test]
+    #[allow(clippy::assertions_on_constants)] // pinning the compile-time gate is the test's purpose.
     fn dev_build_targets_test_endpoint_and_prefixes() {
         assert!(!IS_PRODUCTION_BUILD);
         assert_eq!(nav_endpoint(), NavEndpoint::Test);
@@ -129,6 +130,7 @@ mod tests {
 
     #[cfg(feature = "production")]
     #[test]
+    #[allow(clippy::assertions_on_constants)] // pinning the compile-time gate is the test's purpose.
     fn production_build_targets_prod_endpoint_and_no_prefix() {
         assert!(IS_PRODUCTION_BUILD);
         assert_eq!(nav_endpoint(), NavEndpoint::Production);
