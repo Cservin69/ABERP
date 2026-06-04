@@ -13,6 +13,9 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+import { isDemoMode } from "./workshop-demo-mode";
+import { getMockDashboard } from "./workshop-mock-data";
+
 /** PR-44ε / session-53 — typed wire mirror for the `aberp_billing::Currency`
  * enum per ADR-0037 §3. Two variants today (HUF + EUR); third-currency
  * widening is named-deferred per ADR-0037 §5 (operator-signs-a-customer
@@ -2751,7 +2754,19 @@ export interface WorkshopDashboard {
 /** Fetch the Workshop dashboard bundle. No params — the whole tile
  * grid renders off one response. The SPA polls this on a 10s default
  * cadence (overridable via the `VITE_WORKSHOP_POLL_MS` env var, read
- * inside `Workshop.svelte`). */
+ * inside `Workshop.svelte`).
+ *
+ * S238 / PR-232 — when the Workshop demo-mode flag is on (5-tap
+ * gesture on the page H2 sets it via `workshop-demo-mode`), short-
+ * circuit to mock data instead of the real Tauri command. The
+ * component never sees the branch; tile rendering is identical.
+ * The check is per-call so a mid-poll toggle takes effect at the
+ * next 10s tick. Both modules are statically imported because
+ * `Workshop.svelte` consumes them too (scan/spotlight constants)
+ * — they would land in the same chunk regardless. */
 export async function getWorkshopDashboard(): Promise<WorkshopDashboard> {
+  if (isDemoMode()) {
+    return getMockDashboard();
+  }
   return invoke<WorkshopDashboard>("get_workshop_dashboard");
 }

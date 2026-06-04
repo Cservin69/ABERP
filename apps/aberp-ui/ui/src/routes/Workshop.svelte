@@ -14,6 +14,20 @@
   // Dark-theme tokens only per [[spa-dark-theme-default]]. Canonical
   // references: DispatchList.svelte (S234) + QaList.svelte (S233) +
   // StatisticsPage.svelte (S225 / PR-221).
+  //
+  // S238 / PR-232 — two changes ship together:
+  //   1. Layout reorganised onto explicit `grid-template-areas`:
+  //      Recent Activity becomes a full-height right rail; the
+  //      Adapters + Low Stock + Today trio collapses to a bottom
+  //      horizontal row of equal-width tiles. Same layout serves
+  //      real + demo — only the data source swaps.
+  //   2. Hidden demo-mode toggle: 5 clicks on the page H2 within 2s
+  //      flips a localStorage flag; `api.ts.getWorkshopDashboard`
+  //      then short-circuits to mock data. In demo mode, three
+  //      kinetic effects bring the page alive — activity stream
+  //      auto-scroll, spotlight rotation across tiles, scan-message
+  //      ticker on the barcode-scanner adapter row. Real mode stays
+  //      utilitarian (no animations).
 
   import { onMount, onDestroy } from "svelte";
   import {
@@ -29,6 +43,15 @@
     fmtMinor,
     resolvePollInterval,
   } from "../lib/workshop-format";
+  import {
+    createTapDetector,
+    isDemoMode,
+    setDemoMode,
+  } from "../lib/workshop-demo-mode";
+  import {
+    MOCK_SCAN_MESSAGES,
+    MOCK_SPOTLIGHT_TILES,
+  } from "../lib/workshop-mock-data";
 
   type LoadState = "idle" | "loading" | "ready" | "error";
 
@@ -45,15 +68,53 @@
   // Debounce — Refresh button bursts get coalesced into one fetch.
   const REFRESH_DEBOUNCE_MS = 500;
 
+  // Demo-mode kinetic intervals. Chosen for "feels alive without
+  // distracting": scan ticker faster than spotlight, both fast
+  // enough to register inside a 10-15s tile glance.
+  const DEMO_SCAN_TICK_MS = 3_500;
+  const DEMO_SPOTLIGHT_TICK_MS = 8_000;
+  const DEMO_AUTO_SCROLL_TICK_MS = 6_000;
+
   let loadState: LoadState = $state("idle");
   let errorMessage = $state<string | null>(null);
   let bundle: WorkshopDashboard | null = $state(null);
   // Locale flip — match the bilingual chrome of QaList / DispatchList.
   let lang: "hu" | "en" = $state("hu");
 
+  // ── Demo mode ────────────────────────────────────────────────────
+  // Initial value pulled from localStorage so a mid-tour reload
+  // preserves the operator's choice. Subsequent flips go via
+  // `flipDemoMode()` which writes back to storage AND triggers an
+  // immediate refresh so the tile values swap without waiting for
+  // the next 10s poll tick.
+  let demoMode = $state(isDemoMode());
+  let scanTickIdx = $state(0);
+  let spotlightIdx = $state(0);
+
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let scanTimer: ReturnType<typeof setInterval> | null = null;
+  let spotlightTimer: ReturnType<typeof setInterval> | null = null;
+  let autoScrollTimer: ReturnType<typeof setInterval> | null = null;
+  let activityList: HTMLOListElement | null = $state(null);
   let lastRefreshAt = 0;
   let inFlight = $state(false);
+
+  // 5-tap-within-2s gesture on the page H2. The handler is invisible
+  // — no hover state, no tooltip, no "you've tapped N times" hint —
+  // per [[trust-code-not-operator]] so a guest can't reverse-engineer
+  // the gesture from chrome cues.
+  const tapDetector = createTapDetector(() => {
+    flipDemoMode();
+  });
+
+  function flipDemoMode(): void {
+    const next = !demoMode;
+    demoMode = next;
+    setDemoMode(next);
+    // Immediate refresh so the operator sees the value swap on the
+    // tap, not 10s later.
+    void refresh();
+  }
 
   onMount(() => {
     void refresh();
@@ -66,6 +127,59 @@
     if (pollTimer !== null) {
       clearInterval(pollTimer);
       pollTimer = null;
+    }
+    stopDemoTimers();
+  });
+
+  function startDemoTimers(): void {
+    stopDemoTimers();
+    scanTimer = setInterval(() => {
+      scanTickIdx = (scanTickIdx + 1) % MOCK_SCAN_MESSAGES.length;
+    }, DEMO_SCAN_TICK_MS);
+    spotlightTimer = setInterval(() => {
+      spotlightIdx = (spotlightIdx + 1) % MOCK_SPOTLIGHT_TILES.length;
+    }, DEMO_SPOTLIGHT_TICK_MS);
+    autoScrollTimer = setInterval(() => {
+      const el = activityList;
+      if (el === null) return;
+      // Smooth nudge so the tail of the list keeps moving into
+      // view; once the bottom is reached, jump back to the top so
+      // the cycle continues — operator-tour theater, not honest
+      // pagination.
+      const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 4;
+      if (atBottom) {
+        el.scrollTo({ top: 0, behavior: "smooth" });
+      } else {
+        el.scrollBy({ top: 48, behavior: "smooth" });
+      }
+    }, DEMO_AUTO_SCROLL_TICK_MS);
+  }
+
+  function stopDemoTimers(): void {
+    if (scanTimer !== null) {
+      clearInterval(scanTimer);
+      scanTimer = null;
+    }
+    if (spotlightTimer !== null) {
+      clearInterval(spotlightTimer);
+      spotlightTimer = null;
+    }
+    if (autoScrollTimer !== null) {
+      clearInterval(autoScrollTimer);
+      autoScrollTimer = null;
+    }
+  }
+
+  // React to demoMode flips: start / stop the theater timers
+  // accordingly. `$effect` cleans up on demoMode→false automatically
+  // because we explicitly call stopDemoTimers in the off branch.
+  $effect(() => {
+    if (demoMode) {
+      startDemoTimers();
+    } else {
+      stopDemoTimers();
+      scanTickIdx = 0;
+      spotlightIdx = 0;
     }
   });
 
@@ -180,16 +294,41 @@
   function fmtMinorWithLang(minor: number, currency: "HUF" | "EUR"): string {
     return fmtMinor(minor, currency, lang);
   }
+
+  // Helper — `data-spotlight="true"` on the currently-highlighted
+  // tile when demo mode is on. Off otherwise. The CSS rule for the
+  // attribute does the actual border-glow animation.
+  function spotlightFor(testid: string): "true" | "false" {
+    if (!demoMode) return "false";
+    return MOCK_SPOTLIGHT_TILES[spotlightIdx] === testid ? "true" : "false";
+  }
 </script>
 
 <section
   class="ws-page"
   aria-labelledby="ws-page-title"
   data-testid="workshop-page"
+  data-demo-mode={demoMode ? "on" : "off"}
 >
   <header class="ws-head">
     <div class="ws-head__titles">
-      <h2 id="ws-page-title">
+      <!-- The H2 doubles as the hidden demo-mode handle. A normal
+           click does nothing visible — the tap detector counts;
+           five inside 2s flip the mode. Per the brief there is no
+           hover state change, no tooltip, no progress hint — guest-
+           invisible by design. The H2 stays a heading for AT (we
+           attach onclick directly rather than wrapping in a button
+           so the heading semantics are preserved). The gesture is
+           mouse/touch-only by design — keyboard activation would
+           expose the affordance via focus ring + tabindex, so we
+           suppress the matching a11y rule rather than satisfy it. -->
+      <!-- svelte-ignore a11y_click_events_have_key_events -->
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <h2
+        id="ws-page-title"
+        class="ws-head__title-tap"
+        onclick={() => tapDetector.tap()}
+      >
         {lang === "hu" ? "Műhely" : "Workshop"}
       </h2>
       <p class="ws-head__sub">
@@ -222,6 +361,16 @@
         </span>
       {/if}
     </div>
+    {#if demoMode}
+      <!-- Operator-only indicator — tour-invisible by virtue of size
+           + opacity. Marks the corner so the operator knows demo is
+           on without giving the gesture away to a guest. -->
+      <span
+        class="ws-head__demo-dot"
+        aria-label="demo mode"
+        data-testid="workshop-demo-indicator"
+      ></span>
+    {/if}
   </header>
 
   {#if loadState === "loading" && bundle === null}
@@ -242,11 +391,13 @@
   {#if bundle !== null}
     {@const b = bundle}
     <div class="ws-grid" role="region" aria-label="dashboard tiles">
-      <!-- Work Orders by state -->
+      <!-- Work Orders by state — top of the left side, spans the
+           three left columns. -->
       <article
-        class="ws-tile ws-tile--wide"
+        class="ws-tile ws-tile--wo"
         aria-labelledby="tile-wo-title"
         data-testid="tile-work-orders"
+        data-spotlight={spotlightFor("tile-work-orders")}
       >
         <header class="ws-tile__head">
           <h3 id="tile-wo-title">
@@ -277,42 +428,12 @@
         </ul>
       </article>
 
-      <!-- Low stock -->
+      <!-- QA backlog — middle-row left, narrower. -->
       <article
-        class="ws-tile"
-        aria-labelledby="tile-low-stock-title"
-        data-testid="tile-low-stock"
-      >
-        <header class="ws-tile__head">
-          <h3 id="tile-low-stock-title">
-            {lang === "hu" ? "Készlethiány" : "Low stock"}
-          </h3>
-          <button
-            type="button"
-            class="ws-tile__link"
-            onclick={gotoProducts}>{lang === "hu" ? "Termékek →" : "Open →"}</button
-          >
-        </header>
-        <button
-          type="button"
-          class={`ws-bignum ${b.low_stock_products.count > 0 ? "ws-bignum--warn" : ""}`}
-          onclick={gotoProducts}
-          data-testid="low-stock-count"
-        >
-          <span class="ws-bignum__value">{b.low_stock_products.count}</span>
-          <span class="ws-bignum__label">
-            {lang === "hu"
-              ? "minimum alatti termék"
-              : "products below minimum"}
-          </span>
-        </button>
-      </article>
-
-      <!-- QA backlog -->
-      <article
-        class="ws-tile"
+        class="ws-tile ws-tile--qa"
         aria-labelledby="tile-qa-title"
         data-testid="tile-qa"
+        data-spotlight={spotlightFor("tile-qa")}
       >
         <header class="ws-tile__head">
           <h3 id="tile-qa-title">
@@ -358,11 +479,13 @@
         </p>
       </article>
 
-      <!-- Dispatch board -->
+      <!-- Dispatch board — middle-row right, takes the remaining
+           two columns. -->
       <article
-        class="ws-tile"
+        class="ws-tile ws-tile--dispatch"
         aria-labelledby="tile-dispatch-title"
         data-testid="tile-dispatch"
+        data-spotlight={spotlightFor("tile-dispatch")}
       >
         <header class="ws-tile__head">
           <h3 id="tile-dispatch-title">
@@ -421,11 +544,105 @@
         </ul>
       </article>
 
-      <!-- Today snapshot -->
+      <!-- Bottom-row trio — Adapters, Low Stock, Today. Three equal-
+           width tiles per [[aberp-workshop-demo-mode]] layout brief. -->
       <article
-        class="ws-tile"
+        class="ws-tile ws-tile--adapters"
+        aria-labelledby="tile-adapters-title"
+        data-testid="tile-adapters"
+        data-spotlight={spotlightFor("tile-adapters")}
+      >
+        <header class="ws-tile__head">
+          <h3 id="tile-adapters-title">
+            {lang === "hu" ? "Adapterek" : "Adapters"}
+          </h3>
+        </header>
+        {#if b.adapters.length === 0}
+          <p class="ws-empty">
+            {lang === "hu" ? "Nincs konfigurálva" : "None configured"}
+          </p>
+        {:else}
+          <ul class="ws-adapter-list">
+            {#each b.adapters as adapter}
+              <li
+                class="ws-adapter"
+                data-testid={`adapter-${adapter.name}`}
+              >
+                <span
+                  class={`ws-dot ${adapterDotClass(adapter.status)}`}
+                  aria-hidden="true"
+                ></span>
+                <div class="ws-adapter__body">
+                  <span class="ws-adapter__name">{adapter.name}</span>
+                  <span class="ws-adapter__meta">
+                    {adapter.kind} · {adapter.host}:{adapter.port}
+                  </span>
+                  {#if demoMode && adapter.kind === "barcode"}
+                    <!-- Demo-mode polish: a rolling "last scan"
+                         line on the barcode-scanner adapter row,
+                         cycling MOCK_SCAN_MESSAGES every ~3.5s. -->
+                    <span
+                      class="ws-adapter__scan"
+                      data-testid="adapter-scan-message"
+                    >
+                      {lang === "hu" ? "Beolvasva" : "Scanned"}:
+                      {MOCK_SCAN_MESSAGES[scanTickIdx]}
+                    </span>
+                  {/if}
+                </div>
+                <span class={`ws-pill ws-pill--${adapter.status}`}>
+                  {adapter.status === "enabled"
+                    ? lang === "hu"
+                      ? "Aktív"
+                      : "Enabled"
+                    : lang === "hu"
+                      ? "Kikapcsolva"
+                      : "Disabled"}
+                </span>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </article>
+
+      <!-- Low stock — bottom row middle. -->
+      <article
+        class="ws-tile ws-tile--lowstock"
+        aria-labelledby="tile-low-stock-title"
+        data-testid="tile-low-stock"
+        data-spotlight={spotlightFor("tile-low-stock")}
+      >
+        <header class="ws-tile__head">
+          <h3 id="tile-low-stock-title">
+            {lang === "hu" ? "Készlethiány" : "Low stock"}
+          </h3>
+          <button
+            type="button"
+            class="ws-tile__link"
+            onclick={gotoProducts}>{lang === "hu" ? "Termékek →" : "Open →"}</button
+          >
+        </header>
+        <button
+          type="button"
+          class={`ws-bignum ${b.low_stock_products.count > 0 ? "ws-bignum--warn" : ""}`}
+          onclick={gotoProducts}
+          data-testid="low-stock-count"
+        >
+          <span class="ws-bignum__value">{b.low_stock_products.count}</span>
+          <span class="ws-bignum__label">
+            {lang === "hu"
+              ? "minimum alatti termék"
+              : "products below minimum"}
+          </span>
+        </button>
+      </article>
+
+      <!-- Today snapshot — bottom row right. -->
+      <article
+        class="ws-tile ws-tile--today"
         aria-labelledby="tile-today-title"
         data-testid="tile-today"
+        data-spotlight={spotlightFor("tile-today")}
       >
         <header class="ws-tile__head">
           <h3 id="tile-today-title">
@@ -469,58 +686,12 @@
         </ul>
       </article>
 
-      <!-- Adapter status -->
+      <!-- Recent activity — full-height right rail. -->
       <article
-        class="ws-tile"
-        aria-labelledby="tile-adapters-title"
-        data-testid="tile-adapters"
-      >
-        <header class="ws-tile__head">
-          <h3 id="tile-adapters-title">
-            {lang === "hu" ? "Adapterek" : "Adapters"}
-          </h3>
-        </header>
-        {#if b.adapters.length === 0}
-          <p class="ws-empty">
-            {lang === "hu" ? "Nincs konfigurálva" : "None configured"}
-          </p>
-        {:else}
-          <ul class="ws-adapter-list">
-            {#each b.adapters as adapter}
-              <li
-                class="ws-adapter"
-                data-testid={`adapter-${adapter.name}`}
-              >
-                <span
-                  class={`ws-dot ${adapterDotClass(adapter.status)}`}
-                  aria-hidden="true"
-                ></span>
-                <div class="ws-adapter__body">
-                  <span class="ws-adapter__name">{adapter.name}</span>
-                  <span class="ws-adapter__meta">
-                    {adapter.kind} · {adapter.host}:{adapter.port}
-                  </span>
-                </div>
-                <span class={`ws-pill ws-pill--${adapter.status}`}>
-                  {adapter.status === "enabled"
-                    ? lang === "hu"
-                      ? "Aktív"
-                      : "Enabled"
-                    : lang === "hu"
-                      ? "Kikapcsolva"
-                      : "Disabled"}
-                </span>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-      </article>
-
-      <!-- Recent activity -->
-      <article
-        class="ws-tile ws-tile--tall"
+        class="ws-tile ws-tile--recent"
         aria-labelledby="tile-recent-title"
         data-testid="tile-recent-activity"
+        data-spotlight={spotlightFor("tile-recent-activity")}
       >
         <header class="ws-tile__head">
           <h3 id="tile-recent-title">
@@ -532,7 +703,10 @@
             {lang === "hu" ? "Még nincs esemény" : "Nothing yet"}
           </p>
         {:else}
-          <ol class="ws-activity">
+          <ol
+            class={`ws-activity ${demoMode ? "ws-activity--demo" : ""}`}
+            bind:this={activityList}
+          >
             {#each b.recent_activity as entry (entry.id)}
               <li class="ws-activity__row">
                 <span class="ws-activity__kind">{fmtEventKind(entry.kind)}</span>
@@ -556,7 +730,14 @@
   /* S235 / PR-231 — Workshop dashboard dark-theme styles. Tokens only;
      no hardcoded hex. Canonical references per
      [[spa-dark-theme-default]]: DispatchList.svelte (S234) + QaList.svelte
-     (S233) + StatisticsPage.svelte (S225). */
+     (S233) + StatisticsPage.svelte (S225).
+
+     S238 / PR-232 — layout rewritten onto `grid-template-areas` so
+     Recent Activity is a tall right rail and the
+     Adapters / Low Stock / Today trio forms an equal-width bottom
+     row. The CSS-grid template makes the layout intent explicit
+     so a future refactor can't accidentally hide a tile by tweaking
+     a column count. Demo-mode kinetic styles append at the bottom. */
 
   .ws-page {
     padding: var(--space-4);
@@ -571,6 +752,7 @@
     justify-content: space-between;
     gap: var(--space-3);
     margin-bottom: var(--space-4);
+    position: relative;
   }
 
   .ws-head__titles h2 {
@@ -578,6 +760,15 @@
     font-size: var(--type-size-xxl);
     font-weight: 500;
     color: var(--color-text-strong);
+  }
+
+  /* H2 doubles as the demo-mode tap target. We keep the heading
+     looking exactly like a heading (no underline, no hand cursor)
+     so the gesture stays invisible to guests; the operator's
+     muscle memory does the work. */
+  .ws-head__title-tap {
+    cursor: default;
+    user-select: none;
   }
 
   .ws-head__sub {
@@ -618,6 +809,21 @@
     font-family: var(--type-family-mono);
   }
 
+  /* Operator-only demo-mode dot. 6px square, 30% opacity, pinned to
+     the absolute corner of the header. Visible if you know to
+     look for it; invisible to a guest scanning the tile values. */
+  .ws-head__demo-dot {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--color-signal-positive);
+    opacity: 0.3;
+    pointer-events: none;
+  }
+
   .ws-status {
     padding: var(--space-3);
     color: var(--color-text-secondary);
@@ -628,12 +834,22 @@
     color: var(--color-signal-negative);
   }
 
-  /* Auto-fit grid: 320px min tile keeps the 13" laptop honest;
-     the wide WO tile spans 2 cols on a wider screen. On a 1920x1080
-     wall TV with the sidebar present this yields ~4 columns. */
+  /* Explicit grid: four columns (3 left + 1 right rail), three
+     rows. Named areas make the layout intent obvious AND the
+     responsive collapse below trivial.
+
+     Row sizing: WO tile is content-tall (six WO state buckets in a
+     3×2 inner grid); QA + Dispatch row is content-tall; bottom
+     trio is content-tall. The right rail spans all three rows,
+     so its tile height equals the sum of the left rows' heights. */
   .ws-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    grid-template-columns: 1fr 1fr 1fr minmax(280px, 1fr);
+    grid-template-rows: auto auto auto;
+    grid-template-areas:
+      "wo wo wo recent"
+      "qa dispatch dispatch recent"
+      "adapters lowstock today recent";
     gap: var(--space-3);
   }
 
@@ -645,14 +861,32 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
+    min-width: 0;
   }
 
-  .ws-tile--wide {
-    grid-column: span 2;
+  .ws-tile--wo {
+    grid-area: wo;
   }
-
-  .ws-tile--tall {
-    grid-row: span 2;
+  .ws-tile--qa {
+    grid-area: qa;
+  }
+  .ws-tile--dispatch {
+    grid-area: dispatch;
+  }
+  .ws-tile--adapters {
+    grid-area: adapters;
+  }
+  .ws-tile--lowstock {
+    grid-area: lowstock;
+  }
+  .ws-tile--today {
+    grid-area: today;
+  }
+  .ws-tile--recent {
+    grid-area: recent;
+    /* Tall right-rail flex column so the activity list inside
+       can claim the leftover vertical space. */
+    min-height: 0;
   }
 
   .ws-tile__head {
@@ -857,6 +1091,16 @@
     font-size: var(--type-size-xs);
   }
 
+  /* Demo-mode "last scan" line. Subtle italic so it reads as a
+     transient note rather than configured chrome. */
+  .ws-adapter__scan {
+    color: var(--color-signal-positive);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    font-style: italic;
+    margin-top: 2px;
+  }
+
   .ws-dot {
     width: 10px;
     height: 10px;
@@ -890,6 +1134,9 @@
     color: var(--color-text-muted);
   }
 
+  /* Activity list — tall right rail. `min-height: 0` on the
+     wrapper tile lets the flex column shrink so this `flex: 1`
+     panel claims the leftover vertical space. */
   .ws-activity {
     list-style: none;
     padding: 0;
@@ -897,8 +1144,16 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
-    max-height: 320px;
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
+  }
+
+  /* Demo-mode adds a smooth scroll behaviour so the auto-scroll
+     timer's `scrollBy` calls glide rather than jump. Real mode
+     keeps the default (operator scrubs the bar manually). */
+  .ws-activity--demo {
+    scroll-behavior: smooth;
   }
 
   .ws-activity__row {
@@ -920,14 +1175,88 @@
     color: var(--color-text-muted);
   }
 
-  /* Wall-TV bias: collapse the WO span on narrower screens so the
-     tile reads as one column rather than spilling. */
+  /* Demo-mode spotlight — one tile at a time gets a soft border-
+     glow that fades in. Animation is the OUTER cycle (8s) divided
+     into a ~2s fade in / 4s hold / 2s fade out via opacity on a
+     pseudo-element rather than on the tile border itself — that
+     way the glow has no layout effect and the real border colour
+     stays untouched. */
+  .ws-tile {
+    position: relative;
+  }
+
+  .ws-tile[data-spotlight="true"]::after {
+    content: "";
+    position: absolute;
+    inset: -2px;
+    border-radius: 8px;
+    pointer-events: none;
+    border: 1px solid var(--color-signal-positive);
+    box-shadow: 0 0 12px var(--color-signal-positive);
+    opacity: 0;
+    animation: ws-spotlight-pulse 8s ease-in-out;
+  }
+
+  @keyframes ws-spotlight-pulse {
+    0% {
+      opacity: 0;
+    }
+    25% {
+      opacity: 0.45;
+    }
+    75% {
+      opacity: 0.45;
+    }
+    100% {
+      opacity: 0;
+    }
+  }
+
+  /* ── Responsive collapse ───────────────────────────────────────
+     Wide TV (≥1600px): the default layout as drawn — 4 cols,
+       Recent Activity tall right rail.
+     Laptop (1280-1600px): same shape; the columns just narrow.
+     Narrow laptop / tablet (<1280px): drop the right rail under
+       everything else; left side reflows to 2 cols on the trio.
+     Phone (<720px): single-column stack of every tile in source
+       order. */
+  @media (max-width: 1280px) {
+    .ws-grid {
+      grid-template-columns: 1fr 1fr 1fr;
+      grid-template-areas:
+        "wo wo wo"
+        "qa dispatch dispatch"
+        "adapters lowstock today"
+        "recent recent recent";
+    }
+  }
+
   @media (max-width: 960px) {
-    .ws-tile--wide {
-      grid-column: span 1;
+    .ws-grid {
+      grid-template-columns: 1fr 1fr;
+      grid-template-areas:
+        "wo wo"
+        "qa dispatch"
+        "adapters lowstock"
+        "today today"
+        "recent recent";
     }
     .ws-grid-inner {
       grid-template-columns: repeat(2, 1fr);
+    }
+  }
+
+  @media (max-width: 720px) {
+    .ws-grid {
+      grid-template-columns: 1fr;
+      grid-template-areas:
+        "wo"
+        "qa"
+        "dispatch"
+        "adapters"
+        "lowstock"
+        "today"
+        "recent";
     }
   }
 </style>
