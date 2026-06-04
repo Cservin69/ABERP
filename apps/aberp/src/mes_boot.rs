@@ -26,7 +26,7 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::task::JoinHandle;
@@ -34,8 +34,8 @@ use tokio_util::sync::CancellationToken;
 
 use aberp_audit_ledger::{BinaryHash, TenantId};
 use aberp_mes::{
-    spawn_ledger_writer, Adapter, BarcodeScannerAdapter, BarcodeScannerConfig, LedgerWriterActor,
-    LedgerWriterDeps, DEFAULT_LISTEN_PORT,
+    spawn_ledger_writer, Adapter, AdapterRegistry, BarcodeScannerAdapter, BarcodeScannerConfig,
+    LedgerWriterActor, LedgerWriterDeps, DEFAULT_LISTEN_PORT,
 };
 
 const ENV_BARCODE_ENABLED: &str = "ABERP_BARCODE_SCANNER_ENABLED";
@@ -69,14 +69,19 @@ pub struct SpawnedMesTasks {
 }
 
 /// Boot the MES adapter set as configured by env vars. Returns
-/// `Ok(None)` when no adapter is enabled — boot proceeds silently.
+/// `Ok(None)` when no adapter is enabled — boot proceeds silently and
+/// `registry` is left empty.
 ///
 /// On success the registered tasks fan out from `cancel`: every
 /// spawned task respects `cancel.cancelled()` so a Tauri-window close
-/// or a Ctrl-C exits within ms.
+/// or a Ctrl-C exits within ms. The same started adapter is also
+/// registered into `registry` so the Workshop dashboard route can
+/// probe live health (S240 / PR-234) instead of the prior env-var
+/// snapshot.
 pub async fn boot_mes_adapters(
     deps: MesBootDeps,
     cancel: CancellationToken,
+    registry: Arc<RwLock<AdapterRegistry>>,
 ) -> Result<Option<SpawnedMesTasks>> {
     if !barcode_scanner_enabled() {
         tracing::info!(
@@ -102,6 +107,20 @@ pub async fn boot_mes_adapters(
         .start()
         .await
         .with_context(|| format!("barcode scanner adapter '{scanner_id}' start failed"))?;
+
+    // Register the started adapter so the Workshop dashboard live-
+    // health snapshot can see it (S240 / PR-234). Done AFTER `start()`
+    // succeeds — a failed-to-start adapter must not appear in the
+    // dashboard list, per [[trust-code-not-operator]].
+    {
+        let mut guard = registry
+            .write()
+            .map_err(|_| anyhow!("adapter registry rwlock poisoned during boot"))?;
+        let adapter_for_registry: Arc<dyn Adapter> = adapter.clone();
+        guard
+            .register(adapter_for_registry)
+            .with_context(|| format!("register adapter '{scanner_id}' into runtime registry"))?;
+    }
 
     let adapter_for_writer: Arc<dyn Adapter> = adapter.clone();
     let writer_deps = LedgerWriterDeps {
@@ -144,57 +163,6 @@ fn barcode_scanner_enabled() -> bool {
     std::env::var(ENV_BARCODE_ENABLED)
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
-}
-
-/// One adapter's intent-snapshot for the operator dashboard tile
-/// (PR-231 / S235). Reflects env-var configuration: what the boot
-/// path INTENDED to start, not a live registry probe. Live health
-/// is a separate refactor (the [`AdapterRegistry`] currently lives
-/// in [`boot_mes_adapters`]'s scope, not on `AppState`).
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AdapterStatusSnapshot {
-    /// Stable identifier (matches the registry key when the adapter
-    /// boots — `barcode_scanner_id` env-var or its default).
-    pub name: String,
-    /// `"enabled"` when the adapter's `..._ENABLED=true` env var is set,
-    /// otherwise `"disabled"`. Closed vocab.
-    pub status: &'static str,
-    /// Kind label for the SPA — `"barcode-scanner"` etc. Lets the
-    /// dashboard group / icon by family if more adapters land.
-    pub kind: &'static str,
-    /// Listen host (configured via env). Surfaced so the operator can
-    /// confirm the bind address from the dashboard without opening a
-    /// terminal.
-    pub host: String,
-    /// Listen port (configured via env).
-    pub port: u16,
-}
-
-/// Snapshot every configurable MES adapter's env-var posture for the
-/// operator dashboard. Always returns at least one row per
-/// adapter-family we ship (currently barcode-scanner — S229); families
-/// the operator hasn't enabled show `status: "disabled"` so the tile
-/// surfaces them as "configured but off" rather than hiding them.
-pub fn snapshot_mes_adapter_config() -> Vec<AdapterStatusSnapshot> {
-    let scanner_id =
-        std::env::var(ENV_BARCODE_ID).unwrap_or_else(|_| DEFAULT_SCANNER_ID.to_string());
-    let host = std::env::var(ENV_BARCODE_HOST).unwrap_or_else(|_| DEFAULT_HOST.to_string());
-    let port = std::env::var(ENV_BARCODE_PORT)
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(aberp_mes::DEFAULT_LISTEN_PORT);
-    let status = if barcode_scanner_enabled() {
-        "enabled"
-    } else {
-        "disabled"
-    };
-    vec![AdapterStatusSnapshot {
-        name: scanner_id,
-        status,
-        kind: "barcode-scanner",
-        host,
-        port,
-    }]
 }
 
 fn read_barcode_scanner_config_from_env() -> Result<BarcodeScannerConfig> {
@@ -308,6 +276,37 @@ mod tests {
         let err = read_barcode_scanner_config_from_env().unwrap_err();
         assert!(err.to_string().contains(ENV_BARCODE_PORT));
         clear_env();
+    }
+
+    /// S240 / PR-234 — when the adapter is disabled the boot path
+    /// leaves the shared registry empty. The dashboard handler then
+    /// renders the "no adapters configured" empty state — honest
+    /// replacement for the prior env-snapshot's "disabled" pill.
+    ///
+    /// Synchronous test driving the future with `block_on` so the
+    /// `ENV_LOCK` std-Mutex guard doesn't cross an `.await` point
+    /// (clippy `await_holding_lock`).
+    #[test]
+    fn boot_with_adapter_disabled_leaves_registry_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let registry = Arc::new(RwLock::new(AdapterRegistry::new()));
+        let deps = MesBootDeps {
+            db_path: PathBuf::from("/tmp/unused-by-disabled-path.duckdb"),
+            tenant: TenantId::new("tenant-test").unwrap(),
+            binary_hash: BinaryHash::from_bytes([0u8; 32]),
+            operator_login: "op".to_string(),
+            session_id: "sess".to_string(),
+        };
+        let cancel = CancellationToken::new();
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(boot_mes_adapters(deps, cancel, registry.clone()))
+            .unwrap();
+        assert!(outcome.is_none());
+        assert!(registry.read().unwrap().is_empty());
     }
 
     #[test]

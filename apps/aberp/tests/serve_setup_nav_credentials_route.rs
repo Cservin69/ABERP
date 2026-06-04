@@ -184,6 +184,7 @@ fn build_state(boot_state: ServeBootState, tenant: &str) -> AppState {
         )),
         boot_state: Arc::new(std::sync::RwLock::new(boot_state)),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
+        adapter_registry: Arc::new(std::sync::RwLock::new(aberp_mes::AdapterRegistry::new())),
     }
 }
 

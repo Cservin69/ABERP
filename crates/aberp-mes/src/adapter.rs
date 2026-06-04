@@ -37,6 +37,27 @@ pub trait Adapter: Send + Sync + std::fmt::Debug {
     /// the registry key; MUST be unique across registered adapters.
     fn name(&self) -> &str;
 
+    /// Family label — `"barcode-scanner"`, future `"mtconnect"`,
+    /// `"label-printer"`, etc. Lets the operator dashboard group/icon
+    /// rows by family. Default `"unknown"` so adapters that have not
+    /// yet declared a kind do not silently masquerade as another.
+    fn kind(&self) -> &'static str {
+        "unknown"
+    }
+
+    /// Optional listen / endpoint host string for display in the
+    /// operator dashboard. `None` when the adapter does not bind a
+    /// TCP port (e.g. a polled HTTP client).
+    fn endpoint_host(&self) -> Option<String> {
+        None
+    }
+
+    /// Optional listen / endpoint port for display in the operator
+    /// dashboard. `None` when the adapter does not bind a TCP port.
+    fn endpoint_port(&self) -> Option<u16> {
+        None
+    }
+
     /// Boot background tasks. Returns once the adapter is up; does NOT
     /// block until cancellation. Idempotent.
     async fn start(&self) -> Result<(), AdapterError>;

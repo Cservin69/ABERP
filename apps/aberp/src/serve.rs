@@ -112,7 +112,6 @@ use crate::issue_preflight::{
 };
 use crate::issue_storno;
 use crate::mark_invoice_paid::{self, MarkPaidError, MarkPaidInput};
-use crate::mes_boot::{snapshot_mes_adapter_config, AdapterStatusSnapshot};
 use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
 use crate::nav_xml::{self, SupplierConfigError, SupplierInfo};
 use crate::numbering::{
@@ -139,6 +138,7 @@ use crate::smtp_config::{self as smtp_config_mod, SmtpConfig, SmtpSecurity};
 use crate::smtp_credentials;
 use crate::submit_invoice;
 use crate::upgrade_snapshot;
+use aberp_mes::{AdapterHealth, AdapterRegistry};
 use aberp_quote_intake::{
     service::QuoteIntakeDeps, QuoteIntakeConfig, QuoteIntakeError, QuoteIntakeService,
 };
@@ -894,6 +894,10 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // underlying token (CancellationToken is Arc<Inner> internally);
     // either side firing `cancel()` propagates to every clone.
     let shutdown_token_root = tokio_util::sync::CancellationToken::new();
+    // S240 / PR-234 — empty registry created here so it can be cloned
+    // into both `AppState` (for the dashboard handler) and the MES boot
+    // path (which registers adapters into it after `start()` succeeds).
+    let adapter_registry = Arc::new(std::sync::RwLock::new(AdapterRegistry::new()));
     let state = AppState {
         db_path: Arc::new(args.db.clone()),
         tenant,
@@ -903,6 +907,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         secrets_cache,
         nav_poll_semaphore: Arc::new(tokio::sync::Semaphore::new(NAV_POLL_DAEMON_CONCURRENCY)),
         shutdown_token: shutdown_token_root.clone(),
+        adapter_registry: adapter_registry.clone(),
     };
 
     // 5. Build the axum router. Clone the state first so the app-boot
@@ -1376,8 +1381,12 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 operator_login,
                 session_id: Ulid::new().to_string(),
             };
-            match crate::mes_boot::boot_mes_adapters(mes_deps, coordinator.token.clone())
-                .await
+            match crate::mes_boot::boot_mes_adapters(
+                mes_deps,
+                coordinator.token.clone(),
+                recovery_state.adapter_registry.clone(),
+            )
+            .await
             {
                 Ok(Some(spawned)) => {
                     for (label, handle) in spawned.handles {
@@ -1976,6 +1985,13 @@ pub struct AppState {
     /// has no other handle on the coordinator, so the token rides on
     /// `AppState` to reach those spawn sites.
     pub shutdown_token: tokio_util::sync::CancellationToken,
+    /// S240 / PR-234 — shared handle to the MES adapter registry.
+    /// Created empty at boot, populated by `mes_boot::boot_mes_adapters`
+    /// after each adapter's `start()` succeeds. The Workshop dashboard
+    /// handler takes a read lock to call `health_snapshot()`, replacing
+    /// the prior `snapshot_mes_adapter_config()` env-var read with a
+    /// live registry probe per [[trust-code-not-operator]].
+    pub adapter_registry: Arc<std::sync::RwLock<AdapterRegistry>>,
 }
 
 /// Session-161 — max number of NAV poll daemons polling concurrently.
@@ -10749,8 +10765,9 @@ async fn handle_financial_report(
 //     and EUR) — reuses `reports::compute_financial_report` over a
 //     1-day Custom period; same SQL the financial dashboard uses
 //   - Recent activity (last N audit-ledger entries)
-//   - MES adapter env-config snapshot (env-var posture, not live
-//     registry health — see `snapshot_mes_adapter_config` docs)
+//   - MES adapter live registry probe (S240 / PR-234 —
+//     `snapshot_adapter_registry` reads `AppState.adapter_registry`'s
+//     `health_snapshot()`; empty list when no adapter is registered)
 //
 // One DuckDB tx beats six round-trips when the SPA polls every 10s.
 // The whole bundle is pure aggregation — no audit-ledger writes. The
@@ -10774,6 +10791,39 @@ struct WorkshopDashboard {
     /// RFC3339 UTC instant the dashboard bundle was assembled. SPA
     /// uses it as the "last refreshed" marker.
     snapshot_at_iso8601: String,
+}
+
+/// One adapter's live snapshot for the Workshop dashboard tile
+/// (S240 / PR-234). Replaces the prior `mes_boot::AdapterStatusSnapshot`
+/// which read env vars; this struct is populated from a live
+/// `AdapterRegistry::health_snapshot()` so a `started-but-now-down`
+/// adapter surfaces as `unhealthy` rather than masquerading as
+/// `enabled`. Wire-shape decision: `status` keeps `&'static str` for
+/// no-allocation serialization; `host` becomes an empty string + `port`
+/// becomes 0 when the adapter declines an endpoint (e.g. polled HTTP).
+#[derive(Debug, Clone, Serialize)]
+struct AdapterStatusSnapshot {
+    name: String,
+    /// Closed vocab: `"healthy" | "degraded" | "unhealthy" | "starting" | "stopped"`.
+    /// Mapped from [`AdapterHealth`] by [`adapter_health_status`].
+    status: &'static str,
+    kind: &'static str,
+    host: String,
+    port: u16,
+}
+
+/// Map [`AdapterHealth`] onto the closed wire-vocab string the SPA
+/// chip mapping in `workshop-format.ts::adapterDotClass` matches on.
+/// Centralised so a future variant addition (e.g. `Maintenance`)
+/// surfaces as one diff site on both sides.
+fn adapter_health_status(h: &AdapterHealth) -> &'static str {
+    match h {
+        AdapterHealth::Healthy => "healthy",
+        AdapterHealth::Degraded { .. } => "degraded",
+        AdapterHealth::Unhealthy { .. } => "unhealthy",
+        AdapterHealth::Starting => "starting",
+        AdapterHealth::Stopped => "stopped",
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -10928,9 +10978,42 @@ fn compute_workshop_dashboard(
                 seq: e.seq.as_u64(),
             })
             .collect(),
-        adapters: snapshot_mes_adapter_config(),
+        adapters: snapshot_adapter_registry(&state.adapter_registry),
         snapshot_at_iso8601,
     })
+}
+
+/// S240 / PR-234 — live registry probe for the Workshop dashboard.
+/// Read-lock is held only across the snapshot walk; the registry's
+/// `health_snapshot()` is a cheap iteration over `Arc<dyn Adapter>` map
+/// entries calling each adapter's sync `health()` accessor (no
+/// upstream I/O). Empty list when no adapters are registered — the SPA
+/// renders the "no adapters" empty-state tile per S240.
+fn snapshot_adapter_registry(
+    registry: &Arc<std::sync::RwLock<AdapterRegistry>>,
+) -> Vec<AdapterStatusSnapshot> {
+    let guard = match registry.read() {
+        Ok(g) => g,
+        Err(_) => {
+            // RwLock poisoning is unrecoverable for the registry — surface
+            // an empty list so the dashboard tile shows the empty state
+            // rather than serving stale data. The poisoning itself logs
+            // wherever the panic that produced it landed.
+            tracing::warn!("adapter registry rwlock poisoned at dashboard read");
+            return Vec::new();
+        }
+    };
+    guard
+        .health_snapshot()
+        .into_iter()
+        .map(|e| AdapterStatusSnapshot {
+            name: e.name,
+            status: adapter_health_status(&e.health),
+            kind: e.kind,
+            host: e.host.unwrap_or_default(),
+            port: e.port.unwrap_or(0),
+        })
+        .collect()
 }
 
 /// Build the `RestoreInputs` for the wizard. Loads NAV credentials
@@ -17070,6 +17153,9 @@ mod tests {
                 operator_login: "test-operator".to_string(),
             })),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
+            adapter_registry: std::sync::Arc::new(std::sync::RwLock::new(
+                aberp_mes::AdapterRegistry::new(),
+            )),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, storno_invoice_id)
@@ -17172,6 +17258,9 @@ mod tests {
                 operator_login: "test-operator".to_string(),
             })),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
+            adapter_registry: std::sync::Arc::new(std::sync::RwLock::new(
+                aberp_mes::AdapterRegistry::new(),
+            )),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, invoice_id)
@@ -17550,5 +17639,74 @@ mod tests {
 
         // Clean up scratch — best-effort.
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // S240 / PR-234 — Workshop dashboard live adapter registry probe
+    // ──────────────────────────────────────────────────────────────
+
+    /// `adapter_health_status` maps every [`AdapterHealth`] variant
+    /// onto the closed wire vocab the SPA chip mapping in
+    /// `workshop-format.ts::adapterDotClass` matches on. A future
+    /// variant addition (e.g. `Maintenance`) must extend this map AND
+    /// the SPA mapping in lockstep — the closed-vocab match in the
+    /// helper would fail to compile here first.
+    #[test]
+    fn adapter_health_status_maps_every_variant() {
+        assert_eq!(adapter_health_status(&AdapterHealth::Healthy), "healthy");
+        assert_eq!(
+            adapter_health_status(&AdapterHealth::Degraded {
+                reason: "slow upstream".to_string(),
+            }),
+            "degraded"
+        );
+        assert_eq!(
+            adapter_health_status(&AdapterHealth::Unhealthy {
+                reason: "tcp listener gone".to_string(),
+            }),
+            "unhealthy"
+        );
+        assert_eq!(adapter_health_status(&AdapterHealth::Starting), "starting");
+        assert_eq!(adapter_health_status(&AdapterHealth::Stopped), "stopped");
+    }
+
+    /// `snapshot_adapter_registry` returns an empty `Vec` when no
+    /// adapters are registered. This is the honest replacement for
+    /// the prior "disabled" pill — the SPA renders the empty-state
+    /// tile ("Nincs adapter regisztrálva" / "No adapters registered").
+    #[test]
+    fn snapshot_adapter_registry_empty_for_unset_registry() {
+        let registry = std::sync::Arc::new(std::sync::RwLock::new(AdapterRegistry::new()));
+        let snap = snapshot_adapter_registry(&registry);
+        assert!(snap.is_empty());
+    }
+
+    /// `snapshot_adapter_registry` returns one row per registered
+    /// adapter, populated from the live `health()` accessor. Uses
+    /// `NoopAdapter` (which declines an endpoint) so the wire-shape
+    /// host/port fallback (empty string + 0) is covered.
+    #[tokio::test]
+    async fn snapshot_adapter_registry_walks_live_health() {
+        let mut r = AdapterRegistry::new();
+        let a: std::sync::Arc<dyn aberp_mes::Adapter> =
+            std::sync::Arc::new(aberp_mes::NoopAdapter::new("noop-a"));
+        let b: std::sync::Arc<dyn aberp_mes::Adapter> =
+            std::sync::Arc::new(aberp_mes::NoopAdapter::new("noop-b"));
+        r.register(a).unwrap();
+        r.register(b).unwrap();
+        let _ = r.start_all().await; // flip to Healthy
+        let registry = std::sync::Arc::new(std::sync::RwLock::new(r));
+        let snap = snapshot_adapter_registry(&registry);
+        assert_eq!(snap.len(), 2);
+        // Sorted by name (per `AdapterRegistry::names`).
+        assert_eq!(snap[0].name, "noop-a");
+        assert_eq!(snap[1].name, "noop-b");
+        // NoopAdapter uses trait defaults — no endpoint, kind "unknown".
+        for row in &snap {
+            assert_eq!(row.kind, "unknown");
+            assert_eq!(row.host, "");
+            assert_eq!(row.port, 0);
+            assert_eq!(row.status, "healthy");
+        }
     }
 }

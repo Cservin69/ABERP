@@ -65,4 +65,4 @@ pub use error::{AdapterError, RegistryError};
 pub use events::{CanonicalEvent, MachineState, QualityOutcome, WorkOrderState};
 pub use ledger_writer::{spawn_ledger_writer, LedgerWriterActor, LedgerWriterDeps};
 pub use noop::NoopAdapter;
-pub use registry::AdapterRegistry;
+pub use registry::{AdapterHealthEntry, AdapterRegistry};

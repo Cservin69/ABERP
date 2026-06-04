@@ -39,6 +39,7 @@
   import { navigateTo } from "../lib/router";
   import {
     adapterDotClass,
+    adapterStatusLabel,
     fmtEventKind,
     fmtMinor,
     resolvePollInterval,
@@ -559,7 +560,9 @@
         </header>
         {#if b.adapters.length === 0}
           <p class="ws-empty">
-            {lang === "hu" ? "Nincs konfigurálva" : "None configured"}
+            {lang === "hu"
+              ? "Nincs adapter regisztrálva"
+              : "No adapters registered"}
           </p>
         {:else}
           <ul class="ws-adapter-list">
@@ -575,9 +578,11 @@
                 <div class="ws-adapter__body">
                   <span class="ws-adapter__name">{adapter.name}</span>
                   <span class="ws-adapter__meta">
-                    {adapter.kind} · {adapter.host}:{adapter.port}
+                    {adapter.kind}{adapter.port > 0
+                      ? ` · ${adapter.host}:${adapter.port}`
+                      : ""}
                   </span>
-                  {#if demoMode && adapter.kind === "barcode"}
+                  {#if demoMode && adapter.kind === "barcode-scanner"}
                     <!-- Demo-mode polish: a rolling "last scan"
                          line on the barcode-scanner adapter row,
                          cycling MOCK_SCAN_MESSAGES every ~3.5s. -->
@@ -591,13 +596,7 @@
                   {/if}
                 </div>
                 <span class={`ws-pill ws-pill--${adapter.status}`}>
-                  {adapter.status === "enabled"
-                    ? lang === "hu"
-                      ? "Aktív"
-                      : "Enabled"
-                    : lang === "hu"
-                      ? "Kikapcsolva"
-                      : "Disabled"}
+                  {adapterStatusLabel(adapter.status, lang)}
                 </span>
               </li>
             {/each}
@@ -1113,6 +1112,14 @@
     background: var(--color-signal-positive);
   }
 
+  .ws-dot--warning {
+    background: var(--color-signal-warning);
+  }
+
+  .ws-dot--negative {
+    background: var(--color-signal-negative);
+  }
+
   .ws-dot--muted {
     background: var(--color-text-muted);
   }
@@ -1122,15 +1129,26 @@
     padding: 2px var(--space-2);
     border-radius: 999px;
     border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-base);
   }
 
-  .ws-pill--enabled {
-    background: var(--color-surface-base);
+  /* S240 / PR-234 — chip variants for the live-registry adapter vocab.
+     Colours come from the existing signal tokens so dark-theme
+     contrast is inherited per [[spa-dark-theme-default]]. */
+  .ws-pill--healthy {
     color: var(--color-signal-positive);
   }
 
-  .ws-pill--disabled {
-    background: var(--color-surface-base);
+  .ws-pill--degraded,
+  .ws-pill--starting {
+    color: var(--color-signal-warning);
+  }
+
+  .ws-pill--unhealthy {
+    color: var(--color-signal-negative);
+  }
+
+  .ws-pill--stopped {
     color: var(--color-text-muted);
   }
 

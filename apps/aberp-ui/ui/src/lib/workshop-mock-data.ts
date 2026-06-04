@@ -118,8 +118,9 @@ function buildRecentActivity(now: Date): RecentActivityEntry[] {
 
 // ── Adapters ────────────────────────────────────────────────────
 
-/** Three MES adapters — all `enabled`. The barcode scanner is the
- *  one whose rotating "Last scan" messages feed the demo-mode
+/** Three MES adapters — all `healthy` (S240 / PR-234 vocab —
+ *  was `enabled` pre-live-registry). The barcode scanner is the one
+ *  whose rotating "Last scan" messages feed the demo-mode
  *  Workshop.svelte ticker. The rotation itself lives in
  *  `Workshop.svelte` because it needs a Svelte effect; this list
  *  just supplies the static adapter metadata. */
@@ -127,21 +128,21 @@ function buildAdapters(): AdapterStatusSnapshot[] {
   return [
     {
       name: "barcode-scanner-01",
-      status: "enabled",
-      kind: "barcode",
+      status: "healthy",
+      kind: "barcode-scanner",
       host: "192.168.42.21",
       port: 4001,
     },
     {
       name: "mes-printer-bay-A",
-      status: "enabled",
+      status: "healthy",
       kind: "label_printer",
       host: "192.168.42.22",
       port: 9100,
     },
     {
       name: "scale-shipping-01",
-      status: "enabled",
+      status: "healthy",
       kind: "weight_scale",
       host: "192.168.42.23",
       port: 4003,

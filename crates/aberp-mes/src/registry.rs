@@ -23,6 +23,23 @@ pub struct AdapterRegistry {
     adapters: HashMap<String, Arc<dyn Adapter>>,
 }
 
+/// One row of [`AdapterRegistry::health_snapshot`]. Carries the
+/// metadata + live health the Workshop dashboard tile (S240 / PR-234)
+/// renders per registered adapter.
+#[derive(Debug, Clone)]
+pub struct AdapterHealthEntry {
+    /// Registered name (`Adapter::name()` at registration).
+    pub name: String,
+    /// Family label (`Adapter::kind()`), e.g. `"barcode-scanner"`.
+    pub kind: &'static str,
+    /// Endpoint host string if the adapter binds a TCP port.
+    pub host: Option<String>,
+    /// Endpoint port if the adapter binds a TCP port.
+    pub port: Option<u16>,
+    /// Current live health.
+    pub health: AdapterHealth,
+}
+
 impl AdapterRegistry {
     /// Construct an empty registry.
     pub fn new() -> Self {
@@ -77,6 +94,27 @@ impl AdapterRegistry {
         self.adapters
             .iter()
             .map(|(name, adapter)| (name.clone(), adapter.health()))
+            .collect()
+    }
+
+    /// Richer snapshot: every adapter's `name` + `kind` + endpoint
+    /// metadata + current health, in registration-name-sorted order.
+    /// Powers the Workshop dashboard adapter tile (S240 / PR-234) —
+    /// replaces the prior env-var-only "configured?" snapshot with a
+    /// live registry probe.
+    pub fn health_snapshot(&self) -> Vec<AdapterHealthEntry> {
+        self.names()
+            .into_iter()
+            .map(|name| {
+                let adapter = self.adapters.get(&name).expect("present per names()");
+                AdapterHealthEntry {
+                    name,
+                    kind: adapter.kind(),
+                    host: adapter.endpoint_host(),
+                    port: adapter.endpoint_port(),
+                    health: adapter.health(),
+                }
+            })
             .collect()
     }
 
@@ -193,6 +231,32 @@ mod tests {
         let h = r.health();
         assert_eq!(h.get("a"), Some(&AdapterHealth::Stopped));
         assert_eq!(h.get("b"), Some(&AdapterHealth::Stopped));
+    }
+
+    /// `health_snapshot` returns adapters in sorted name order with
+    /// metadata + health. NoopAdapter declines a host/port so those
+    /// fields are `None` — the dashboard renders this as the empty
+    /// host:port column slot.
+    #[tokio::test]
+    async fn health_snapshot_returns_rich_sorted_entries() {
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(NoopAdapter::new("zebra"))).unwrap();
+        r.register(Arc::new(NoopAdapter::new("alpha"))).unwrap();
+        let snap = r.health_snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].name, "alpha");
+        assert_eq!(snap[1].name, "zebra");
+        // NoopAdapter uses trait defaults — no endpoint, kind "unknown".
+        assert_eq!(snap[0].kind, "unknown");
+        assert!(snap[0].host.is_none());
+        assert!(snap[0].port.is_none());
+        assert_eq!(snap[0].health, AdapterHealth::Stopped);
+
+        // After start, health flips to Healthy.
+        let _ = r.start_all().await;
+        let snap = r.health_snapshot();
+        assert_eq!(snap[0].health, AdapterHealth::Healthy);
+        assert_eq!(snap[1].health, AdapterHealth::Healthy);
     }
 
     /// The registry's start/stop iterate in sorted order. Pin so a

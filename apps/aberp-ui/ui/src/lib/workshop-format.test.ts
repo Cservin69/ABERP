@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   adapterDotClass,
+  adapterStatusLabel,
   fmtEventKind,
   fmtMinor,
   resolvePollInterval,
@@ -30,12 +31,39 @@ describe("fmtEventKind", () => {
   });
 });
 
-describe("adapterDotClass", () => {
-  it("maps 'enabled' onto the positive token slot", () => {
-    expect(adapterDotClass("enabled")).toBe("ws-dot--positive");
+describe("adapterDotClass — S240 live-registry vocab", () => {
+  it("maps 'healthy' onto the positive token slot", () => {
+    expect(adapterDotClass("healthy")).toBe("ws-dot--positive");
   });
-  it("maps 'disabled' onto the muted token slot", () => {
-    expect(adapterDotClass("disabled")).toBe("ws-dot--muted");
+  it("maps 'degraded' onto the warning token slot", () => {
+    expect(adapterDotClass("degraded")).toBe("ws-dot--warning");
+  });
+  it("maps 'starting' onto the warning token slot", () => {
+    expect(adapterDotClass("starting")).toBe("ws-dot--warning");
+  });
+  it("maps 'unhealthy' onto the negative token slot", () => {
+    expect(adapterDotClass("unhealthy")).toBe("ws-dot--negative");
+  });
+  it("maps 'stopped' onto the muted token slot", () => {
+    expect(adapterDotClass("stopped")).toBe("ws-dot--muted");
+  });
+});
+
+describe("adapterStatusLabel — bilingual closed-vocab table", () => {
+  it("returns Hungarian labels for every variant", () => {
+    expect(adapterStatusLabel("healthy", "hu")).toBe("Fut");
+    expect(adapterStatusLabel("degraded", "hu")).toBe("Lassú");
+    expect(adapterStatusLabel("unhealthy", "hu")).toBe("Leállt");
+    expect(adapterStatusLabel("starting", "hu")).toBe("Induló");
+    expect(adapterStatusLabel("stopped", "hu")).toBe("Leállítva");
+  });
+
+  it("returns English labels for every variant", () => {
+    expect(adapterStatusLabel("healthy", "en")).toBe("Running");
+    expect(adapterStatusLabel("degraded", "en")).toBe("Degraded");
+    expect(adapterStatusLabel("unhealthy", "en")).toBe("Down");
+    expect(adapterStatusLabel("starting", "en")).toBe("Starting");
+    expect(adapterStatusLabel("stopped", "en")).toBe("Stopped");
   });
 });
 

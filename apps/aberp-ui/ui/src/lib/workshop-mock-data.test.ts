@@ -69,11 +69,11 @@ describe("workshop-mock-data — shape pin", () => {
     expect(b.today.gross_revenue_eur_minor).toBe(1_245_000); // 12,450 EUR
   });
 
-  it("all adapters are enabled — shop floor 'green' demo state", () => {
+  it("all adapters are healthy — shop floor 'green' demo state (S240 vocab)", () => {
     const b = getMockDashboard();
     expect(b.adapters.length).toBeGreaterThan(0);
     for (const a of b.adapters) {
-      expect(a.status).toBe("enabled");
+      expect(a.status).toBe("healthy");
     }
   });
 

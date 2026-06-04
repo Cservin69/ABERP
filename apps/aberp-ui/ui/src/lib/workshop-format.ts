@@ -6,7 +6,7 @@
 // existing tests stay pure-module per the router.test.ts / format.test.ts
 // patterns).
 
-import type { AdapterStatusSnapshot } from "./api";
+import type { AdapterStatus } from "./api";
 
 /** Compact label for an audit-ledger EventKind shown in the recent-
  * activity stream. Strips a leading namespace (`"system.foo"` →
@@ -20,14 +20,56 @@ export function fmtEventKind(kind: string): string {
   return kind.slice(dotIdx + 1);
 }
 
-/** CSS-class suffix for an adapter status dot. Closed-vocab match:
- * `"enabled"` → positive; everything else → muted. A future
- * `"degraded"` / `"unhealthy"` widening would be a one-line addition
- * here. */
+/** S240 / PR-234 — CSS-class suffix for an adapter status dot.
+ * Closed-vocab match against the live-registry `AdapterStatus`. Maps:
+ *
+ * - `healthy`   → positive (green)   `--color-signal-positive`
+ * - `degraded`  → warning  (amber)   `--color-signal-warning`
+ * - `starting`  → warning  (amber)   `--color-signal-warning`
+ * - `unhealthy` → negative (red)     `--color-signal-negative`
+ * - `stopped`   → muted    (gray)    `--color-text-muted`
+ *
+ * Pure switch — no fallthrough default so TypeScript catches a new
+ * variant addition at compile time (CLAUDE.md rule 7: surface drift,
+ * don't blend it). */
 export function adapterDotClass(
-  status: AdapterStatusSnapshot["status"],
-): "ws-dot--positive" | "ws-dot--muted" {
-  return status === "enabled" ? "ws-dot--positive" : "ws-dot--muted";
+  status: AdapterStatus,
+):
+  | "ws-dot--positive"
+  | "ws-dot--warning"
+  | "ws-dot--negative"
+  | "ws-dot--muted" {
+  switch (status) {
+    case "healthy":
+      return "ws-dot--positive";
+    case "degraded":
+    case "starting":
+      return "ws-dot--warning";
+    case "unhealthy":
+      return "ws-dot--negative";
+    case "stopped":
+      return "ws-dot--muted";
+  }
+}
+
+/** S240 / PR-234 — bilingual chip label for an adapter status. Pure
+ *  table; same closed-vocab discipline as `adapterDotClass`. */
+export function adapterStatusLabel(
+  status: AdapterStatus,
+  lang: "hu" | "en",
+): string {
+  switch (status) {
+    case "healthy":
+      return lang === "hu" ? "Fut" : "Running";
+    case "degraded":
+      return lang === "hu" ? "Lassú" : "Degraded";
+    case "unhealthy":
+      return lang === "hu" ? "Leállt" : "Down";
+    case "starting":
+      return lang === "hu" ? "Induló" : "Starting";
+    case "stopped":
+      return lang === "hu" ? "Leállítva" : "Stopped";
+  }
 }
 
 /** Format a minor-unit amount as a major-unit currency string for

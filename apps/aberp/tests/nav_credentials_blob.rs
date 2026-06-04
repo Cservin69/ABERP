@@ -280,6 +280,7 @@ fn rotation_preserves_other_three_fields() {
             aberp::serve::NAV_POLL_DAEMON_CONCURRENCY,
         )),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
+        adapter_registry: Arc::new(std::sync::RwLock::new(aberp_mes::AdapterRegistry::new())),
     };
 
     // Rotate password only.

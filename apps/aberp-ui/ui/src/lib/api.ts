@@ -2732,11 +2732,28 @@ export interface RecentActivityEntry {
   seq: number;
 }
 
+/** Closed-vocab adapter health, mirrored from the Rust
+ *  `AdapterHealth` enum via `serve::adapter_health_status`. Drives
+ *  `adapterDotClass` + chip rendering in `Workshop.svelte`. A future
+ *  variant (e.g. `"maintenance"`) needs widening here AND in the
+ *  Rust mapper at the same time — the helper signature catches drift
+ *  at TS compile time. */
+export type AdapterStatus =
+  | "healthy"
+  | "degraded"
+  | "unhealthy"
+  | "starting"
+  | "stopped";
+
 export interface AdapterStatusSnapshot {
   name: string;
-  status: "enabled" | "disabled";
+  status: AdapterStatus;
   kind: string;
+  /** Empty string when the adapter declines a TCP endpoint (e.g. a
+   *  polled HTTP client). The SPA suppresses the `host:port` line in
+   *  that case. */
   host: string;
+  /** 0 when the adapter declines a TCP endpoint. */
   port: number;
 }
 

@@ -201,6 +201,18 @@ impl Adapter for BarcodeScannerAdapter {
         &self.config.scanner_id
     }
 
+    fn kind(&self) -> &'static str {
+        "barcode-scanner"
+    }
+
+    fn endpoint_host(&self) -> Option<String> {
+        Some(self.config.listen_addr.to_string())
+    }
+
+    fn endpoint_port(&self) -> Option<u16> {
+        Some(self.config.listen_port)
+    }
+
     async fn start(&self) -> Result<(), AdapterError> {
         // Idempotent: Stopped/Unhealthy → Starting → Healthy.
         // Healthy/Starting stays put.
