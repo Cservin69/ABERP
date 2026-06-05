@@ -2479,6 +2479,46 @@ export interface RestoreSummary {
   errored: number;
   pages_walked: number;
   elapsed_ms: number;
+  /** S196 — partner/product catalog-extraction counters (additive). */
+  partners_restored?: number;
+  products_restored?: number;
+  /** S261 / PR-250 — SHA-256 of the sorted NAV invoice-number list +
+   * the distinct NAV-invoice count the checksum covers. Stamped on the
+   * `RestoreFromNavRun` audit entry; shown on the wizard's Done step. */
+  checksum?: string;
+  nav_invoice_count?: number;
+}
+
+/** S261 / PR-250 — one missing-serial anomaly in NAV's returned set.
+ * Mirror of `restore_from_nav_outgoing::GapWarning`. */
+export interface GapWarning {
+  series_prefix: string;
+  missing_number: string;
+}
+
+/** S261 / PR-250 — mirror of `restore_from_nav_outgoing::RestorePreview`.
+ * The read-only dry-run answer: WHAT a confirm would import. */
+export interface RestorePreview {
+  year: number;
+  nav_invoice_count: number;
+  new_invoice_count: number;
+  already_present_count: number;
+  new_partner_count: number;
+  new_product_count: number;
+  gaps: GapWarning[];
+  gaps_truncated: boolean;
+  checksum: string;
+  pages_walked: number;
+  extraction_errored: number;
+  sample_new_numbers: string[];
+  elapsed_ms: number;
+}
+
+/** S261 / PR-250 — mirror of `restore_from_nav_outgoing::RestoreLock`. */
+export interface RestoreLock {
+  acquired_at: string;
+  operator: string;
+  year: number;
 }
 
 /** Mirror of `restore_from_nav_outgoing::RestoredInvoice` — one
@@ -2513,6 +2553,29 @@ export async function restoreFromNavOutgoing(
 
 export async function listRestoredInvoices(): Promise<RestoredInvoice[]> {
   return invoke<RestoredInvoice[]>("list_restored_invoices");
+}
+
+/** S261 / PR-250 — read-only Preview (dry-run). Walks NAV, computes
+ * would-import counts + gap warnings + checksum, writes NOTHING. No
+ * confirm token (it does not mutate). */
+export async function restoreFromNavPreview(year: number): Promise<RestorePreview> {
+  return invoke<RestorePreview>("restore_from_nav_preview", { body: { year } });
+}
+
+/** S261 / PR-250 — restore-in-progress lock status. `null` when no
+ * restore is running (the steady state). Drives the global "Restore in
+ * progress" banner + the boot-crash-recovery surface. */
+export async function restoreLockStatus(): Promise<RestoreLock | null> {
+  const res = await invoke<{ lock: RestoreLock | null }>("restore_lock_status");
+  return res.lock;
+}
+
+/** S261 / PR-250 — abandon a held restore lock (crash recovery). Gated
+ * on the same typed RESTORE ceremony token as a confirm. */
+export async function restoreLockAbandon(confirmToken: string): Promise<void> {
+  await invoke<{ abandoned: boolean }>("restore_lock_abandon", {
+    body: { confirm_token: confirmToken },
+  });
 }
 
 /** S220 / PR-217 — `POST /api/restored-invoices/:id/partner`.

@@ -2324,6 +2324,79 @@ impl InvoiceRestoredFromNavPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// RestoreFromNavRun (S261 / PR-250)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::RestoreFromNavRun`].
+///
+/// S261 / PR-250 — the AGGREGATE batch-summary entry, written exactly
+/// ONCE per operator-confirmed restore wizard run, distinct from the
+/// per-row [`InvoiceRestoredFromNavPayload`] entries the same run also
+/// emits (one per freshly-restored invoice). The per-row entries are
+/// the idempotency source-of-truth + per-invoice lineage; this entry
+/// is the human-facing "the operator ran a disaster-recovery restore
+/// for year N and these are the totals" landmark — the thing a
+/// postmortem greps for to answer "was this DB rebuilt from NAV, and
+/// when?".
+///
+/// **`checksum`** is the SHA-256 (lowercase hex) of the sorted-and-
+/// deduplicated list of NAV `<invoiceNumber>`s the run encountered for
+/// the year, joined by `\n`. Two runs against the same NAV state for
+/// the same year produce the identical checksum regardless of how many
+/// rows were freshly restored vs already-present-and-skipped — it
+/// pins WHAT NAV held, not what the local DB happened to be missing.
+/// An operator (or an auditor) can recompute it independently from a
+/// NAV digest dump to prove the local restored set matches NAV.
+///
+/// `system.`-prefixed: a restored batch is a recovery operation, not a
+/// per-OUTGOING-invoice lifecycle event, so the per-invoice export
+/// bundle's `invoice.*` glob MUST NEVER sweep it — same posture as
+/// `InvoiceRestoredFromNav` and the other `system.` restore kinds.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RestoreFromNavRunPayload {
+    /// Operator-decision idempotency key. Mirrors every other audit
+    /// payload's F8 carry-forward shape; minted fresh per confirmed
+    /// run. A re-run is itself idempotent at the per-row layer (already-
+    /// restored invoices are skipped), but this batch-summary entry is
+    /// written once per CONFIRMED run regardless — re-running the
+    /// wizard against the same year legitimately appends a second
+    /// `RestoreFromNavRun` with `invoice_count` unchanged and (almost
+    /// always) zero fresh partners/products, which is the audit trail
+    /// of "the operator ran restore twice".
+    pub idempotency_key: String,
+    /// The calendar year the wizard was invoked for (e.g. `2026`).
+    pub year: i32,
+    /// Count of distinct NAV `<invoiceNumber>`s encountered for the
+    /// year (restored-this-run + already-present-and-skipped). This is
+    /// the cardinality of the set the `checksum` is computed over — NOT
+    /// the count of rows freshly written this run (that is the per-row
+    /// `InvoiceRestoredFromNav` entry count).
+    pub invoice_count: u64,
+    /// Partners freshly inserted into the local `partners` master from
+    /// this run's `<customerInfo>` extraction (S196 path). Zero on a
+    /// pure re-run.
+    pub partner_count: u64,
+    /// Products freshly inserted into the local `products` master from
+    /// this run's `<invoiceLines>` extraction (S196 path). Zero on a
+    /// pure re-run.
+    pub product_count: u64,
+    /// SHA-256 (lowercase hex) of the sorted + deduplicated NAV
+    /// invoice-number list, joined by `\n`. See the struct docstring
+    /// for the recompute-independently invariant.
+    pub checksum: String,
+    /// Wall-clock instant the run completed, RFC 3339 UTC. Surfaced so
+    /// a postmortem can place the restore on the timeline without
+    /// reading the entry's chain-position metadata.
+    pub ts: String,
+}
+
+impl RestoreFromNavRunPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // DaemonShutdownCompleted (S213 / PR-209)
 // ──────────────────────────────────────────────────────────────────────
 

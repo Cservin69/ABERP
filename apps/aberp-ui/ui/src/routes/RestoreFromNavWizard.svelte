@@ -20,20 +20,36 @@
   // notes, storno reason — see [[dev-db-disposable]]) so the operator
   // is not surprised post-run.
 
+  // S261 / PR-250 — the wizard is now a linear dry-run-first flow:
+  //   year → Preview (read-only, computes would-import N/M/K + gap
+  //   warnings + checksum) → Confirm (type RESTORE) → Done. Nothing
+  //   writes until the operator confirms (acceptance #4 dry-run). A
+  //   held restore lock (DB row, survives a crash) shows a blocking
+  //   "Restore in progress" banner + disables Preview/Confirm per
+  //   [[trust-code-not-operator]].
   import { onMount } from "svelte";
 
   import {
     listRestoredInvoices,
     restoreFromNavOutgoing,
+    restoreFromNavPreview,
+    restoreLockAbandon,
+    restoreLockStatus,
+    type RestoreLock,
+    type RestorePreview,
     type RestoreSummary,
     type RestoredInvoice,
   } from "../lib/api";
   import {
-    canSubmit,
+    formatPreviewHeadline,
     formatRestoreSummary,
+    hasGapWarnings,
+    isPreviewNoOp,
+    isRestoreConfirmed,
     MIN_RESTORE_YEAR,
     RESTORE_CONFIRMATION_TOKEN,
     validateYearInput,
+    type WizardStep,
   } from "../lib/restore-wizard";
 
   // currentYear from the browser clock. The backend re-validates
@@ -41,11 +57,17 @@
   // smuggle a future year past the API.
   const currentYear = new Date().getUTCFullYear();
 
+  let step: WizardStep = $state("year");
   let yearRaw: string = $state(String(currentYear));
   let confirmRaw: string = $state("");
   let busy: boolean = $state(false);
   let errorMessage: string | null = $state(null);
+  let preview: RestorePreview | null = $state(null);
   let summary: RestoreSummary | null = $state(null);
+
+  // Restore-lock banner — a held lock blocks Preview + Confirm.
+  let lock: RestoreLock | null = $state(null);
+  let abandonToken: string = $state("");
 
   // Already-restored panel — fire-once load to show the operator
   // what's already in the local mirror table.
@@ -57,6 +79,7 @@
 
   onMount(() => {
     void loadRestored();
+    void refreshLock();
   });
 
   async function loadRestored() {
@@ -72,35 +95,87 @@
     }
   }
 
-  // Derived: gate states.
-  const yearStatus = $derived(validateYearInput(yearRaw, currentYear));
-  const submitEnabled = $derived(
-    !busy && canSubmit(yearRaw, confirmRaw, currentYear),
-  );
+  async function refreshLock() {
+    try {
+      lock = await restoreLockStatus();
+    } catch {
+      // A status read failure must not wedge the wizard — the backend
+      // route gates are the hard guarantee; leave the banner as-is.
+    }
+  }
 
-  async function onSubmit(event: SubmitEvent) {
+  // Derived gate states.
+  const yearStatus = $derived(validateYearInput(yearRaw, currentYear));
+  const locked = $derived(lock !== null);
+  const previewEnabled = $derived(
+    !busy && !locked && yearStatus.kind === "ok",
+  );
+  const confirmEnabled = $derived(
+    !busy && !locked && isRestoreConfirmed(confirmRaw),
+  );
+  const abandonEnabled = $derived(!busy && isRestoreConfirmed(abandonToken));
+
+  function resetToYear() {
+    step = "year";
+    preview = null;
+    summary = null;
+    confirmRaw = "";
+    errorMessage = null;
+  }
+
+  async function onPreview(event: SubmitEvent) {
     event.preventDefault();
-    if (!submitEnabled) return;
-    // Both gates already passed; coerce year to number.
+    if (!previewEnabled) return;
     const parsed = validateYearInput(yearRaw, currentYear);
     if (parsed.kind !== "ok") return;
     busy = true;
     errorMessage = null;
+    preview = null;
     summary = null;
     try {
-      // S186 — forward the confirmation token to the backend so the
-      // server-side gate (mirror of `isRestoreConfirmed`) passes. By
-      // the time this fires the operator has typed the literal
-      // `RESTORE` (the `canSubmit` gate enforces it); sending the
-      // raw value preserves the discipline ceremony on the wire.
-      const result = await restoreFromNavOutgoing(parsed.year, confirmRaw);
-      summary = result;
-      // Refresh the already-restored panel so the new rows appear
-      // without a manual reload.
-      await loadRestored();
-      // Clear the confirmation token so a second restore requires
-      // re-typing RESTORE — every restore is its own ceremony.
+      // Read-only dry run — writes NOTHING. Computes would-import
+      // counts + gap warnings + checksum against live NAV + local DB.
+      preview = await restoreFromNavPreview(parsed.year);
+      step = "preview";
+    } catch (e: unknown) {
+      errorMessage = e instanceof Error ? e.message : String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function onConfirm(event: SubmitEvent) {
+    event.preventDefault();
+    if (!confirmEnabled) return;
+    const parsed = validateYearInput(yearRaw, currentYear);
+    if (parsed.kind !== "ok") return;
+    busy = true;
+    errorMessage = null;
+    try {
+      // The token reached the backend verbatim so the server-side
+      // gate (mirror of `isRestoreConfirmed`) passes; this is the
+      // first write of the whole flow.
+      summary = await restoreFromNavOutgoing(parsed.year, confirmRaw);
+      step = "done";
       confirmRaw = "";
+      await loadRestored();
+      await refreshLock();
+    } catch (e: unknown) {
+      errorMessage = e instanceof Error ? e.message : String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function onAbandon(event: SubmitEvent) {
+    event.preventDefault();
+    if (!abandonEnabled) return;
+    busy = true;
+    errorMessage = null;
+    try {
+      await restoreLockAbandon(abandonToken);
+      abandonToken = "";
+      await refreshLock();
     } catch (e: unknown) {
       errorMessage = e instanceof Error ? e.message : String(e);
     } finally {
@@ -141,75 +216,201 @@
     </p>
   </section>
 
-  <form class="wizard__form" onsubmit={onSubmit}>
-    <label class="wizard__field">
-      <span class="wizard__label">Year to restore</span>
-      <input
-        type="text"
-        inputmode="numeric"
-        bind:value={yearRaw}
-        disabled={busy}
-        aria-invalid={yearStatus.kind !== "ok"}
-        aria-describedby={yearStatus.kind !== "ok" ? "year-error" : undefined}
-      />
-      {#if yearStatus.kind === "below_floor"}
-        <p id="year-error" class="wizard__field-error">
-          Year must be {MIN_RESTORE_YEAR} or later — NAV Online Számla
-          went live in 2018; pre-2018 invoices were never submitted.
-        </p>
-      {:else if yearStatus.kind === "above_ceiling"}
-        <p id="year-error" class="wizard__field-error">
-          Year must be {yearStatus.ceiling} or earlier — NAV cannot
-          hold invoices issued in the future.
-        </p>
-      {:else if yearStatus.kind === "not_integer"}
-        <p id="year-error" class="wizard__field-error">
-          Enter a 4-digit year (e.g. {currentYear}).
-        </p>
-      {/if}
-    </label>
-
-    <label class="wizard__field">
-      <span class="wizard__label">
-        Type <code>{RESTORE_CONFIRMATION_TOKEN}</code> to confirm
-      </span>
-      <input
-        type="text"
-        bind:value={confirmRaw}
-        disabled={busy}
-        autocomplete="off"
-        spellcheck={false}
-        aria-describedby="restore-help"
-      />
-      <p id="restore-help" class="wizard__field-help">
-        Operator-discipline ceremony — pasting will not work, the token
-        must be typed exactly as shown (uppercase, no surrounding
-        whitespace).
+  {#if locked && lock !== null}
+    <section class="wizard__lock" role="alert" aria-live="assertive">
+      <h3>⚠ Restore in progress</h3>
+      <p>
+        A restore from NAV is in progress (started {lock.acquired_at} by
+        {lock.operator} for year {lock.year}). Issuing invoices and AP
+        sync are blocked until it completes. If a previous run crashed
+        mid-restore, abandon the lock below — a fresh run is idempotent
+        and will simply re-pull what is missing.
       </p>
-    </label>
-
-    <button type="submit" disabled={!submitEnabled}>
-      {#if busy}Restoring from NAV…{:else}Run restore{/if}
-    </button>
-  </form>
+      <form class="wizard__abandon" onsubmit={onAbandon}>
+        <label class="wizard__field">
+          <span class="wizard__label">
+            Type <code>{RESTORE_CONFIRMATION_TOKEN}</code> to abandon the
+            held lock
+          </span>
+          <input
+            type="text"
+            bind:value={abandonToken}
+            disabled={busy}
+            autocomplete="off"
+            spellcheck={false}
+          />
+        </label>
+        <button type="submit" disabled={!abandonEnabled}>
+          {#if busy}Working…{:else}Abandon restore lock{/if}
+        </button>
+      </form>
+    </section>
+  {/if}
 
   {#if errorMessage !== null}
     <section class="wizard__error" role="alert">
-      <strong>Restore failed.</strong>
+      <strong>Something went wrong.</strong>
       <pre>{errorMessage}</pre>
     </section>
   {/if}
 
-  {#if summary !== null}
+  {#if step === "year"}
+    <form class="wizard__form" onsubmit={onPreview}>
+      <label class="wizard__field">
+        <span class="wizard__label">Year to restore</span>
+        <input
+          type="text"
+          inputmode="numeric"
+          bind:value={yearRaw}
+          disabled={busy || locked}
+          aria-invalid={yearStatus.kind !== "ok"}
+          aria-describedby={yearStatus.kind !== "ok" ? "year-error" : undefined}
+        />
+        {#if yearStatus.kind === "below_floor"}
+          <p id="year-error" class="wizard__field-error">
+            Year must be {MIN_RESTORE_YEAR} or later — NAV Online Számla
+            went live in 2018; pre-2018 invoices were never submitted.
+          </p>
+        {:else if yearStatus.kind === "above_ceiling"}
+          <p id="year-error" class="wizard__field-error">
+            Year must be {yearStatus.ceiling} or earlier — NAV cannot
+            hold invoices issued in the future.
+          </p>
+        {:else if yearStatus.kind === "not_integer"}
+          <p id="year-error" class="wizard__field-error">
+            Enter a 4-digit year (e.g. {currentYear}).
+          </p>
+        {/if}
+      </label>
+      <button type="submit" disabled={!previewEnabled}>
+        {#if busy}Checking NAV…{:else}Preview restore{/if}
+      </button>
+      <p class="wizard__field-help">
+        Preview is a read-only dry run — it walks NAV and tells you what
+        a restore WOULD import. Nothing is written until you confirm.
+      </p>
+    </form>
+  {/if}
+
+  {#if step === "preview" && preview !== null}
+    <section class="wizard__preview" aria-live="polite">
+      <h3>Preview — year {preview.year}</h3>
+      <p class="wizard__preview-headline">{formatPreviewHeadline(preview)}</p>
+      <dl class="wizard__stats">
+        <div><dt>NAV invoices for year</dt><dd>{preview.nav_invoice_count}</dd></div>
+        <div><dt>New (would import)</dt><dd>{preview.new_invoice_count}</dd></div>
+        <div><dt>Already present (skip)</dt><dd>{preview.already_present_count}</dd></div>
+        <div><dt>New partners</dt><dd>{preview.new_partner_count}</dd></div>
+        <div><dt>New products</dt><dd>{preview.new_product_count}</dd></div>
+        <div><dt>Checksum (NAV set)</dt><dd class="mono">{preview.checksum}</dd></div>
+      </dl>
+
+      {#if preview.extraction_errored > 0}
+        <p class="wizard__field-error">
+          {preview.extraction_errored} invoice(s) could not be sampled
+          for partner/product counts (NAV queryInvoiceData failed) — the
+          invoice + checksum counts are unaffected, but the partner /
+          product preview may understate the real import.
+        </p>
+      {/if}
+
+      {#if hasGapWarnings(preview)}
+        <section class="wizard__gaps" role="note">
+          <h4>⚠ Gap warning — NAV is missing invoice numbers</h4>
+          <p class="wizard__note">
+            NAV's returned set has missing serial numbers the sequence
+            implies should exist. This may be legitimate (voided numbers,
+            multi-tool numbering) or a sign NAV is itself missing an
+            invoice. Review before continuing.
+          </p>
+          <ul class="wizard__gap-list">
+            {#each preview.gaps as g (g.series_prefix + g.missing_number)}
+              <li class="mono">{g.series_prefix}{g.missing_number}</li>
+            {/each}
+          </ul>
+          {#if preview.gaps_truncated}
+            <p class="wizard__field-error">
+              Gap list truncated — more missing numbers exist than shown.
+            </p>
+          {/if}
+        </section>
+      {/if}
+
+      <div class="wizard__actions">
+        <button type="button" class="secondary" onclick={resetToYear}>
+          Back
+        </button>
+        {#if isPreviewNoOp(preview)}
+          <p class="wizard__note">
+            Nothing to import — the local database already holds every
+            NAV invoice for this year. Re-running is safe but would be a
+            no-op.
+          </p>
+        {:else}
+          <button
+            type="button"
+            disabled={busy || locked}
+            onclick={() => (step = "confirm")}
+          >
+            Continue to confirm
+          </button>
+        {/if}
+      </div>
+    </section>
+  {/if}
+
+  {#if step === "confirm" && preview !== null}
+    <form class="wizard__form" onsubmit={onConfirm}>
+      <p class="wizard__preview-headline">{formatPreviewHeadline(preview)}</p>
+      <label class="wizard__field">
+        <span class="wizard__label">
+          Type <code>{RESTORE_CONFIRMATION_TOKEN}</code> to confirm and
+          write
+        </span>
+        <input
+          type="text"
+          bind:value={confirmRaw}
+          disabled={busy || locked}
+          autocomplete="off"
+          spellcheck={false}
+          aria-describedby="restore-help"
+        />
+        <p id="restore-help" class="wizard__field-help">
+          Operator-discipline ceremony — the token must be typed exactly
+          as shown (uppercase, no surrounding whitespace). This is the
+          first step that writes to your database.
+        </p>
+      </label>
+      <div class="wizard__actions">
+        <button type="button" class="secondary" onclick={() => (step = "preview")}>
+          Back
+        </button>
+        <button type="submit" disabled={!confirmEnabled}>
+          {#if busy}Restoring from NAV…{:else}Run restore{/if}
+        </button>
+      </div>
+    </form>
+  {/if}
+
+  {#if step === "done" && summary !== null}
     <section class="wizard__result" aria-live="polite">
-      <h3>Last run</h3>
+      <h3>Restore complete</h3>
       <p>{formatRestoreSummary(summary)}</p>
+      {#if summary.checksum}
+        <p class="wizard__note">
+          NAV invoice-number checksum:
+          <span class="mono">{summary.checksum}</span>
+          — recorded on the audit ledger (RestoreFromNavRun). Keep it to
+          prove the restored set matches NAV.
+        </p>
+      {/if}
       {#if summary.errored > 0}
         <p class="wizard__field-error">
           {summary.errored} digest(s) failed to process — check the
           audit log for the verbatim NAV diagnostic per row.
         </p>
       {/if}
+      <button type="button" onclick={resetToYear}>Start another</button>
     </section>
   {/if}
 
@@ -418,5 +619,134 @@
     text-align: right;
     font-variant-numeric: tabular-nums;
     font-family: var(--type-family-mono);
+  }
+
+  /* S261 / PR-250 — lock banner, preview panel, gap warnings. */
+  .wizard__lock {
+    margin: var(--space-3) 0;
+    padding: var(--space-3);
+    background: var(--color-surface-raised);
+    border: 2px solid var(--color-signal-negative);
+    border-radius: 6px;
+  }
+  .wizard__lock h3 {
+    margin: 0 0 var(--space-2) 0;
+    color: var(--color-signal-negative);
+    font-size: var(--type-size-sm);
+    font-family: var(--type-family-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .wizard__lock p {
+    margin: 0 0 var(--space-2) 0;
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-sm);
+    line-height: 1.5;
+  }
+  .wizard__abandon {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .wizard__abandon button,
+  .wizard__actions button,
+  .wizard__result button {
+    align-self: flex-start;
+    padding: var(--space-2) var(--space-4);
+    background: var(--color-text-strong);
+    color: var(--color-surface-raised);
+    border: none;
+    border-radius: 4px;
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+  }
+  .wizard__abandon button:disabled,
+  .wizard__actions button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .wizard__actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    margin-top: var(--space-3);
+    flex-wrap: wrap;
+  }
+  .wizard__actions button.secondary,
+  .wizard__form button.secondary {
+    background: transparent;
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-surface-divider);
+  }
+  .wizard__preview,
+  .wizard__result {
+    margin: var(--space-3) 0;
+    padding: var(--space-3);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+  }
+  .wizard__preview h3 {
+    margin: 0 0 var(--space-2) 0;
+    font-size: var(--type-size-sm);
+    font-family: var(--type-family-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--color-text-muted);
+  }
+  .wizard__preview-headline {
+    margin: 0 0 var(--space-3) 0;
+    color: var(--color-text-strong);
+    font-size: var(--type-size-md);
+    line-height: 1.5;
+  }
+  .wizard__stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: var(--space-2);
+    margin: 0 0 var(--space-3) 0;
+  }
+  .wizard__stats div {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .wizard__stats dt {
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .wizard__stats dd {
+    margin: 0;
+    color: var(--color-text-strong);
+    font-size: var(--type-size-md);
+    font-variant-numeric: tabular-nums;
+  }
+  .mono {
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    word-break: break-all;
+  }
+  .wizard__gaps {
+    margin: var(--space-3) 0;
+    padding: var(--space-3);
+    border: 1px solid var(--color-signal-negative);
+    border-radius: 4px;
+  }
+  .wizard__gaps h4 {
+    margin: 0 0 var(--space-2) 0;
+    color: var(--color-signal-negative);
+    font-size: var(--type-size-sm);
+  }
+  .wizard__gap-list {
+    margin: var(--space-2) 0 0 var(--space-4);
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-sm);
+    max-height: 200px;
+    overflow-y: auto;
   }
 </style>

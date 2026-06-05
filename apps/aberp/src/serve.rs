@@ -817,6 +817,24 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         })?;
         restore_outgoing::ensure_schema(&conn)
             .context("ensure restored_invoice schema at serve boot")?;
+        // S261 / PR-250 — crashed-restore detection. The restore lock is
+        // a DB row (survives a crash); if one is held at boot, a prior
+        // `aberp serve` died mid-restore. Surface it LOUD per CLAUDE.md
+        // rule 12 — the Issue + AP-sync routes will refuse to proceed
+        // (restore_lock_block) and the SPA banner will prompt the
+        // operator to abandon or re-run until the lock is cleared.
+        match restore_outgoing::read_restore_lock(&conn, args.tenant.as_str()) {
+            Ok(Some(lock)) => tracing::warn!(
+                acquired_at = %lock.acquired_at,
+                operator = %lock.operator,
+                year = lock.year,
+                "S261: a restore-from-NAV lock is HELD at boot — a prior process likely \
+                 crashed mid-restore. Issue + AP-sync are blocked until the operator \
+                 abandons the restore (Settings → Restore from NAV) or completes it via re-run."
+            ),
+            Ok(None) => {}
+            Err(e) => tracing::error!(error = ?e, "S261: boot restore-lock probe failed"),
+        }
     }
 
     // Session 152b — reconcile the audit-ledger mirror against the DB
@@ -2325,6 +2343,22 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/restore-from-nav-outgoing",
             post(handle_restore_from_nav_outgoing),
+        )
+        // S261 / PR-250 — read-only Preview (dry-run) step. POST { year }
+        // returns would-import counts + gap warnings + checksum without
+        // writing. No confirm token, no lock (it does not mutate).
+        .route(
+            "/api/restore-from-nav-preview",
+            post(handle_restore_from_nav_preview),
+        )
+        // S261 / PR-250 — restore-in-progress lock surface. GET reports
+        // the held lock (drives the "Restore in progress" banner + the
+        // boot-crash-recovery surface); POST /abandon (RESTORE token)
+        // clears a crashed lock so operations can resume.
+        .route("/api/restore-lock", get(handle_restore_lock_status))
+        .route(
+            "/api/restore-lock/abandon",
+            post(handle_restore_lock_abandon),
         )
         .route("/api/restored-invoices", get(handle_list_restored_invoices))
         // S225 / PR-221 — financial-statistics dashboard endpoint.
@@ -4699,6 +4733,13 @@ async fn handle_issue_invoice(
         Err(resp) => return resp,
     };
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    // S261 / PR-250 — refuse to issue while a restore from NAV is in
+    // progress (or a crashed restore lock is still held). Per
+    // [[trust-code-not-operator]] the code blocks the parallel write
+    // rather than relying on the disabled SPA button alone.
+    if let Some(resp) = restore_lock_block(&state).await {
         return resp;
     }
     // PR-69 / session-91 — pre-issuance preflight validator (ADR-0038)
@@ -10735,6 +10776,13 @@ async fn handle_sync_incoming_now(headers: HeaderMap, State(state): State<AppSta
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
+    // S261 / PR-250 — refuse a manual AP sync while a restore from NAV
+    // is in progress (or a crashed lock is held): a parallel NAV walk
+    // against the same tenant DB is exactly the contention the restore
+    // lock exists to prevent per [[trust-code-not-operator]].
+    if let Some(resp) = restore_lock_block(&state).await {
+        return resp;
+    }
     let inputs = match build_ap_sync_inputs(&state, operator_login).await {
         Ok(v) => v,
         Err(e) => return internal_error("sync_incoming_now:build_inputs", e),
@@ -11002,13 +11050,282 @@ async fn handle_restore_from_nav_outgoing(
     if let Err(msg) = restore_outgoing::validate_year(body.year, time::OffsetDateTime::now_utc()) {
         return (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response();
     }
+
+    // S261 — acquire the restore lock BEFORE the pipeline boots. The
+    // lock is a DB row (survives a crash); a held lock means a restore
+    // is already running (or crashed mid-restore and was never
+    // abandoned), so a second confirm is refused with 409 per
+    // [[trust-code-not-operator]] — the operator is made physically
+    // unable to start a parallel restore.
+    let acquired_at = match time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+    {
+        Ok(s) => s,
+        Err(e) => return internal_error("restore_from_nav_outgoing:ts", anyhow!("{e}")),
+    };
+    {
+        let db_path = (*state.db_path).clone();
+        let tenant = state.tenant.clone();
+        let op = operator_login.clone();
+        let year = body.year;
+        let at = acquired_at.clone();
+        let acquired = tokio::task::spawn_blocking(move || {
+            restore_outgoing::acquire_restore_lock_at(&db_path, tenant.as_str(), &op, year, &at)
+        })
+        .await;
+        match acquired {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(error_body(
+                        "a restore is already in progress (or a crashed restore lock is still \
+                         held); abandon it from Settings → Restore from NAV before starting \
+                         another"
+                            .to_string(),
+                    )),
+                )
+                    .into_response();
+            }
+            Ok(Err(e)) => return internal_error("restore_from_nav_outgoing:lock", e),
+            Err(e) => return internal_error("restore_from_nav_outgoing:lock_join", anyhow!("{e}")),
+        }
+    }
+
+    let inputs = match build_restore_inputs(&state, operator_login.clone(), body.year).await {
+        Ok(v) => v,
+        Err(e) => {
+            release_restore_lock_best_effort(&state).await;
+            return internal_error("restore_from_nav_outgoing:build_inputs", e);
+        }
+    };
+    let run_result = restore_outgoing::run(inputs).await;
+    // Release the lock regardless of the run's outcome — a failed run
+    // leaves the per-row idempotency intact, so the safe recovery is a
+    // re-run, which needs the lock free.
+    release_restore_lock_best_effort(&state).await;
+
+    match run_result {
+        Ok(summary) => {
+            // S261 — stamp the ONE aggregate RestoreFromNavRun audit
+            // entry for this confirmed run (distinct from the per-row
+            // InvoiceRestoredFromNav entries run() already wrote). Audit
+            // failure must NOT mask a successful restore: log loud +
+            // still return the summary (the restored rows + per-row
+            // entries are the regulated record; this batch landmark is
+            // a convenience the operator can re-derive).
+            if let Err(e) =
+                record_restore_from_nav_run_audit(&state, &operator_login, &summary, &acquired_at)
+                    .await
+            {
+                tracing::error!(error = ?e,
+                    "S261: restore succeeded but RestoreFromNavRun audit append failed");
+            }
+            Json(summary).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(error_body(format!("{e:#}")))).into_response(),
+    }
+}
+
+/// S261 — release the restore lock, swallowing errors into a loud log.
+/// Used on the confirm path's cleanup where a failed release must not
+/// itself fail the response (the lock can always be abandoned from the
+/// UI), but the failure must surface per CLAUDE.md rule 12.
+async fn release_restore_lock_best_effort(state: &AppState) {
+    let db_path = (*state.db_path).clone();
+    let tenant = state.tenant.clone();
+    let released = tokio::task::spawn_blocking(move || {
+        restore_outgoing::release_restore_lock_at(&db_path, tenant.as_str())
+    })
+    .await;
+    match released {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(error = ?e, "S261: restore lock release failed"),
+        Err(e) => tracing::error!(error = ?e, "S261: restore lock release task panicked"),
+    }
+}
+
+/// S261 — append the aggregate `RestoreFromNavRun` audit entry for one
+/// confirmed wizard run. The checksum + invoice count ride the
+/// `RestoreSummary` (computed inside `run`), so no NAV re-walk here.
+async fn record_restore_from_nav_run_audit(
+    state: &AppState,
+    operator_login: &str,
+    summary: &restore_outgoing::RestoreSummary,
+    ts: &str,
+) -> Result<()> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await binary hash for RestoreFromNavRun audit")?;
+    let db_path = (*state.db_path).clone();
+    let tenant = state.tenant.clone();
+    let operator = operator_login.to_string();
+    let payload = audit_payloads::RestoreFromNavRunPayload {
+        idempotency_key: Ulid::new().to_string(),
+        year: summary.year,
+        invoice_count: summary.nav_invoice_count,
+        partner_count: summary.partners_restored,
+        product_count: summary.products_restored,
+        checksum: summary.checksum.clone(),
+        ts: ts.to_string(),
+    };
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut ledger = Ledger::open(&db_path, tenant, binary_hash)
+            .context("open audit ledger to record RestoreFromNavRun")?;
+        let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator);
+        ledger
+            .append(
+                EventKind::RestoreFromNavRun,
+                payload.to_bytes(),
+                actor,
+                None,
+            )
+            .context("append RestoreFromNavRun audit entry")?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow!("RestoreFromNavRun audit task panicked: {e}"))?
+}
+
+#[derive(Debug, Deserialize)]
+struct RestoreFromNavPreviewRequest {
+    year: i32,
+}
+
+/// S261 / PR-250 — the read-only Preview (dry-run) step. Walks NAV's
+/// `queryInvoiceDigest OUTBOUND` for the year, partitions against the
+/// local restored set, samples `queryInvoiceData` for the NEW invoices
+/// to count would-be partner/product inserts, computes gap warnings +
+/// the checksum, and writes NOTHING. No confirm token (it is a dry
+/// run); no lock (it does not mutate). The SPA renders the result on
+/// the Preview step before the operator confirms.
+async fn handle_restore_from_nav_preview(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<RestoreFromNavPreviewRequest>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if let Err(msg) = restore_outgoing::validate_year(body.year, time::OffsetDateTime::now_utc()) {
+        return (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response();
+    }
     let inputs = match build_restore_inputs(&state, operator_login, body.year).await {
         Ok(v) => v,
-        Err(e) => return internal_error("restore_from_nav_outgoing:build_inputs", e),
+        Err(e) => return internal_error("restore_from_nav_preview:build_inputs", e),
     };
-    match restore_outgoing::run(inputs).await {
-        Ok(summary) => Json(summary).into_response(),
+    match restore_outgoing::preview(inputs).await {
+        Ok(preview) => Json(preview).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(error_body(format!("{e:#}")))).into_response(),
+    }
+}
+
+/// S261 / PR-250 — restore-lock status. Drives the SPA "Restore in
+/// progress" banner + the boot-crash-recovery surface. Returns
+/// `{ "lock": null }` when no restore is in progress, or
+/// `{ "lock": { acquired_at, operator, year } }` when one is held.
+async fn handle_restore_lock_status(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let db_path = (*state.db_path).clone();
+    let tenant = state.tenant.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        restore_outgoing::read_restore_lock_at(&db_path, tenant.as_str())
+    })
+    .await;
+    match result {
+        Ok(Ok(lock)) => Json(serde_json::json!({ "lock": lock })).into_response(),
+        Ok(Err(e)) => internal_error("restore_lock_status", e),
+        Err(e) => internal_error("restore_lock_status:join", anyhow!("{e}")),
+    }
+}
+
+/// S261 / PR-250 — abandon a held restore lock. The crash-recovery
+/// escape hatch: if `aberp serve` died mid-restore, the lock row
+/// survives and blocks all operations; the operator clicks Abandon to
+/// clear it (a subsequent re-run is idempotent at the per-row layer).
+/// Requires the same typed `RESTORE` ceremony token as a confirm so an
+/// abandon is a deliberate operator decision, not a stray click.
+async fn handle_restore_lock_abandon(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<RestoreFromNavOutgoingRequest>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if body.confirm_token != RESTORE_CONFIRMATION_TOKEN {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body(format!(
+                "abandoning a restore requires `confirm_token` equal to the literal \
+                 `{RESTORE_CONFIRMATION_TOKEN}` — operator-discipline ceremony"
+            ))),
+        )
+            .into_response();
+    }
+    let db_path = (*state.db_path).clone();
+    let tenant = state.tenant.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        restore_outgoing::release_restore_lock_at(&db_path, tenant.as_str())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Json(serde_json::json!({ "abandoned": true })).into_response(),
+        Ok(Err(e)) => internal_error("restore_lock_abandon", e),
+        Err(e) => internal_error("restore_lock_abandon:join", anyhow!("{e}")),
+    }
+}
+
+/// S261 / PR-250 — gate guard shared by the Issue + AP-sync routes.
+/// Returns `Some(409)` when a restore lock is held so neither a new
+/// invoice issuance nor an AP sync can run concurrently with (or after
+/// a crash during) a restore — per [[trust-code-not-operator]] the code
+/// refuses the parallel operation rather than trusting the operator to
+/// not click. `None` when no restore is in progress (the steady state).
+/// A read error fails OPEN with a loud log: a transient DB read hiccup
+/// must not wedge invoicing, and the per-row idempotency + the confirm-
+/// side acquire remain the hard guarantees.
+async fn restore_lock_block(state: &AppState) -> Option<Response> {
+    let db_path = (*state.db_path).clone();
+    let tenant = state.tenant.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        restore_outgoing::read_restore_lock_at(&db_path, tenant.as_str())
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(lock))) => Some(
+            (
+                StatusCode::CONFLICT,
+                Json(error_body(format!(
+                    "a restore from NAV is in progress (started {} by {} for year {}); \
+                     this operation is blocked until the restore completes or is abandoned",
+                    lock.acquired_at, lock.operator, lock.year
+                ))),
+            )
+                .into_response(),
+        ),
+        Ok(Ok(None)) => None,
+        Ok(Err(e)) => {
+            tracing::error!(error = ?e, "S261: restore-lock gate read failed; failing open");
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "S261: restore-lock gate task panicked; failing open");
+            None
+        }
     }
 }
 

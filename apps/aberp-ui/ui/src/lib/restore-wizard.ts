@@ -97,3 +97,64 @@ export interface RestoreSummary {
 export function formatRestoreSummary(s: RestoreSummary): string {
   return `Year ${s.year}: ${s.restored} restored, ${s.skipped} already present (skipped), ${s.errored} errored. Walked ${s.pages_walked} NAV pages in ${s.elapsed_ms} ms.`;
 }
+
+// ── S261 / PR-250 — Preview (dry-run) step helpers ───────────────────
+
+/** Mirror of `restore_from_nav_outgoing::GapWarning`. */
+export interface GapWarning {
+  series_prefix: string;
+  missing_number: string;
+}
+
+/** Mirror of `restore_from_nav_outgoing::RestorePreview` — the subset
+ * the wizard renders + the pins exercise. */
+export interface RestorePreview {
+  year: number;
+  nav_invoice_count: number;
+  new_invoice_count: number;
+  already_present_count: number;
+  new_partner_count: number;
+  new_product_count: number;
+  gaps: GapWarning[];
+  gaps_truncated: boolean;
+  checksum: string;
+  elapsed_ms: number;
+}
+
+/** The wizard's linear step machine. `fetch` and `preview` are folded
+ * into one operator action (the Preview button fires the dry-run and
+ * renders its result), so the visible steps are: pick year → review the
+ * preview → confirm → done. */
+export type WizardStep = "year" | "preview" | "confirm" | "done";
+
+/** Format the preview into the "would import N / M / K" headline the
+ * Preview step renders. Pinned so a refactor that drops a count (which
+ * would understate what a confirm writes) is caught — silent omission
+ * per CLAUDE.md rule 12. */
+export function formatPreviewHeadline(p: RestorePreview): string {
+  return `Would import ${p.new_invoice_count} invoice(s), ${p.new_partner_count} partner(s), ${p.new_product_count} product(s). ${p.already_present_count} already present (would skip).`;
+}
+
+/** Is this a no-op preview — nothing new to import? The Done/idempotency
+ * surface keys on this so a re-run renders "already up to date" rather
+ * than a misleading "ready to import 0". */
+export function isPreviewNoOp(p: RestorePreview): boolean {
+  return (
+    p.new_invoice_count === 0 &&
+    p.new_partner_count === 0 &&
+    p.new_product_count === 0
+  );
+}
+
+/** One-line operator-readable description of a gap-warning row. */
+export function describeGap(g: GapWarning): string {
+  return `${g.series_prefix}${g.missing_number}`;
+}
+
+/** Should the wizard surface a blocking gap warning before letting the
+ * operator confirm? True iff NAV's returned set has missing serials.
+ * The operator can still proceed (gaps may be legitimate — voided
+ * numbers, multi-tool numbering), but the warning must be acknowledged. */
+export function hasGapWarnings(p: RestorePreview): boolean {
+  return p.gaps.length > 0 || p.gaps_truncated;
+}

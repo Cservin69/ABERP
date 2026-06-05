@@ -1169,6 +1169,37 @@ pub async fn restore_from_nav_outgoing(
     forward_post(&state, "/api/restore-from-nav-outgoing", body).await
 }
 
+/// S261 / PR-250 — read-only Preview (dry-run) step. `POST
+/// /api/restore-from-nav-preview { year }`. Walks NAV, computes
+/// would-import counts + gap warnings + checksum, writes NOTHING.
+/// Returns `RestorePreview` for the wizard's Preview step.
+#[tauri::command]
+pub async fn restore_from_nav_preview(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/restore-from-nav-preview", body).await
+}
+
+/// S261 / PR-250 — restore-in-progress lock status. `GET
+/// /api/restore-lock`. Drives the "Restore in progress" banner + the
+/// boot-crash-recovery surface. Returns `{ lock: RestoreLock | null }`.
+#[tauri::command]
+pub async fn restore_lock_status(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/restore-lock", true).await
+}
+
+/// S261 / PR-250 — abandon a held restore lock (crash-recovery escape
+/// hatch). `POST /api/restore-lock/abandon { confirm_token }`. The SPA
+/// gates the click on the typed RESTORE ceremony token.
+#[tauri::command]
+pub async fn restore_lock_abandon(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/restore-lock/abandon", body).await
+}
+
 /// S180 / PR-180 — list every restored invoice for the tenant. Used
 /// by the wizard's "already-restored" panel + the upcoming
 /// restored-invoice list view.

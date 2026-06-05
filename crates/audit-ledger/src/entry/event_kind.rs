@@ -804,6 +804,31 @@ pub enum EventKind {
     /// as `InvoiceRestoredFromNav`). F12 four-edit ritual fires once.
     ExtNavPartnerManualLink,
 
+    /// S261 / PR-250 — the AGGREGATE batch-summary entry for ONE
+    /// operator-confirmed restore-from-NAV wizard run. Distinct from
+    /// the per-row `InvoiceRestoredFromNav` entries the same run emits:
+    /// those are the idempotency source-of-truth + per-invoice lineage
+    /// (one per freshly-restored invoice); THIS is the human-facing
+    /// "the operator rebuilt this DB from NAV for year N, here are the
+    /// totals + checksum" landmark — exactly one per confirmed run.
+    ///
+    /// Payload (`aberp::audit_payloads::RestoreFromNavRunPayload`)
+    /// carries the F8 idempotency key, the `year`, the `invoice_count`
+    /// (distinct NAV invoice numbers seen for the year), the freshly-
+    /// inserted `partner_count` / `product_count`, the run completion
+    /// `ts`, and the `checksum` — SHA-256 of the sorted + deduplicated
+    /// NAV invoice-number list. The checksum pins WHAT NAV held (not
+    /// what the local DB was missing) so two runs against the same NAV
+    /// state yield the identical value, recomputable independently from
+    /// a NAV digest dump.
+    ///
+    /// `system.`-prefixed: a recovery batch is NOT a per-OUTGOING-
+    /// invoice lifecycle event, so the per-invoice export bundle's
+    /// `invoice.*` glob MUST NEVER sweep it — same posture as
+    /// `InvoiceRestoredFromNav` and the other `system.` restore kinds.
+    /// F12 four-edit ritual fires once.
+    RestoreFromNavRun,
+
     /// S228 / PR-224 / ADR-0060 — a `CanonicalEvent` emitted by a
     /// registered Stage 3 adapter (manufacturing execution: CNC /
     /// robot / Renishaw / barcode / laser) was recorded into the
@@ -1228,6 +1253,7 @@ impl EventKind {
             EventKind::RestoreBuyerBackfillCycleCompleted => {
                 "system.restore_buyer_backfill_cycle_completed"
             }
+            EventKind::RestoreFromNavRun => "system.restore_from_nav_run",
             EventKind::ExtNavPartnerManualLink => "system.extnav_partner_manual_link",
             EventKind::MesAdapterEvent => "mes.adapter_event",
             EventKind::StockMovementRecorded => "mes.stock_movement_recorded",
@@ -1305,6 +1331,7 @@ impl EventKind {
             "system.restore_buyer_backfill_cycle_completed" => {
                 Ok(EventKind::RestoreBuyerBackfillCycleCompleted)
             }
+            "system.restore_from_nav_run" => Ok(EventKind::RestoreFromNavRun),
             "system.extnav_partner_manual_link" => Ok(EventKind::ExtNavPartnerManualLink),
             "mes.adapter_event" => Ok(EventKind::MesAdapterEvent),
             "mes.stock_movement_recorded" => Ok(EventKind::StockMovementRecorded),
@@ -1375,6 +1402,7 @@ mod tests {
             EventKind::DaemonShutdownCompleted,
             EventKind::RestoreBuyerBackfillCycleCompleted,
             EventKind::ExtNavPartnerManualLink,
+            EventKind::RestoreFromNavRun,
             EventKind::MesAdapterEvent,
             EventKind::StockMovementRecorded,
             EventKind::WorkOrderCreated,
@@ -2041,6 +2069,48 @@ mod tests {
         assert!(!EventKind::ExtNavPartnerManualLink
             .as_str()
             .starts_with("invoice."));
+    }
+
+    /// S261 / PR-250 — the aggregate restore-batch-summary kind is a
+    /// recovery operation, NOT a per-OUTGOING-invoice lifecycle event.
+    /// Same `system.` prefix posture as `InvoiceRestoredFromNav`. MUST
+    /// NOT carry an `invoice.` prefix or the per-OUTGOING-invoice export
+    /// bundle's `invoice.*` glob would sweep a DR batch-summary entry
+    /// into an evidence bundle that is supposed to carry per-invoice
+    /// regulated entries only.
+    #[test]
+    fn s261_restore_from_nav_run_uses_system_prefix() {
+        assert_eq!(
+            EventKind::RestoreFromNavRun.as_str(),
+            "system.restore_from_nav_run"
+        );
+        assert!(EventKind::RestoreFromNavRun.as_str().starts_with("system."));
+        assert!(!EventKind::RestoreFromNavRun
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// S261 / PR-250 — the aggregate restore-batch kind is a DISTINCT
+    /// discriminator from the per-row `InvoiceRestoredFromNav` kind (the
+    /// two are emitted by the same run but answer different questions:
+    /// per-invoice lineage vs batch summary) and from the AP-side kinds.
+    /// Same fork-discipline posture as the other `*_is_distinct_from`
+    /// pins — collapsing them would corrupt the "how many invoices did
+    /// run K restore" count by conflating per-row and per-batch entries.
+    #[test]
+    fn s261_restore_from_nav_run_is_distinct() {
+        assert_ne!(
+            EventKind::RestoreFromNavRun.as_str(),
+            EventKind::InvoiceRestoredFromNav.as_str()
+        );
+        assert_ne!(
+            EventKind::RestoreFromNavRun.as_str(),
+            EventKind::RestoreBuyerBackfillCycleCompleted.as_str()
+        );
+        assert_ne!(
+            EventKind::RestoreFromNavRun.as_str(),
+            EventKind::IncomingInvoiceSyncCycleCompleted.as_str()
+        );
     }
 
     /// S228 / PR-224 / ADR-0060 — the Stage 3 manufacturing-execution

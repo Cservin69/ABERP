@@ -347,6 +347,11 @@ pub fn run() {
             // already-restored rows.
             commands::restore_from_nav_outgoing,
             commands::list_restored_invoices,
+            // S261 / PR-250 — dry-run Preview step + restore-lock
+            // status / abandon (crashed-restore recovery).
+            commands::restore_from_nav_preview,
+            commands::restore_lock_status,
+            commands::restore_lock_abandon,
             // S220 / PR-217 — operator-paced manual partner link on
             // a restored ExtNav row (NAV doesn't expose buyer info
             // for invoices submitted via other software).

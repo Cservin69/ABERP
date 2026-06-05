@@ -681,6 +681,11 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // `restored_invoice` (not `invoice`); annotations against
         // it never belong in a per-OUTGOING-invoice export bundle.
         | EventKind::ExtNavPartnerManualLink
+        // S261 / PR-250 — aggregate restore-batch-summary event. A
+        // recovery-batch landmark against `restored_invoice`, not a
+        // per-OUTGOING-invoice surface; the `system.` prefix keeps the
+        // bundle's `invoice.*` glob from sweeping it. Exhaustive arm.
+        | EventKind::RestoreFromNavRun
         // S228 / PR-224 / ADR-0060 — Stage 3 manufacturing-execution
         // adapter event. `mes.`-prefixed (a third prefix family
         // alongside `invoice.*` and `system.*`); shop-floor events

@@ -96,9 +96,28 @@
 //!     digest seen — skipped digests do not emit an audit entry, so
 //!     re-running the wizard does not pollute the ledger with N×K
 //!     duplicate entries).
-//!   - No per-cycle summary audit kind. The wizard is
-//!     operator-paced; the {restored, skipped, errored} counts ride
-//!     the HTTP response body, not the audit chain.
+//!   - S261 / PR-250 — ONE aggregate `RestoreFromNavRun` entry per
+//!     operator-CONFIRMED run, written by the HTTP handler (NOT this
+//!     module — the handler owns the ledger append so the engine stays
+//!     transport-pure + unit-testable without a `Ledger`). It carries
+//!     `{year, invoice_count, partner_count, product_count, checksum,
+//!     ts}` where `checksum` is the SHA-256 of the sorted NAV
+//!     invoice-number list ([`restore_checksum`]). [`run`] surfaces the
+//!     checksum on [`RestoreSummary`] so the handler can stamp the
+//!     audit entry without re-walking NAV.
+//!
+//! # S261 / PR-250 — preview (dry-run) + restore lock
+//!
+//!   - [`preview`] is a READ-ONLY dry run: it walks the same NAV digest
+//!     view + fans out `queryInvoiceData` for the NEW invoices to count
+//!     would-be partner/product inserts, computes the gap-warning rows
+//!     + the checksum, and writes NOTHING. The wizard's Preview step
+//!     calls it; nothing mutates until the operator confirms.
+//!   - The `restore_lock` table ([`acquire_restore_lock`] /
+//!     [`release_restore_lock`] / [`read_restore_lock`]) is a DB ROW
+//!     (not in-memory), so a crash mid-restore leaves the lock held;
+//!     boot + the Issue/sync routes refuse to proceed until the
+//!     operator abandons or completes it (per [[trust-code-not-operator]]).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -117,6 +136,7 @@ use duckdb::{params, Connection};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::{format_description::FormatItem, macros, OffsetDateTime};
 use ulid::Ulid;
 
@@ -227,6 +247,30 @@ ALTER TABLE restored_invoice
     ADD COLUMN IF NOT EXISTS partner_id          VARCHAR;
 ";
 
+/// S261 / PR-250 — the restore-in-progress lock table. Per
+/// [[trust-code-not-operator]] the lock is a DB ROW, NOT an in-memory
+/// `AppState` flag: if `aberp serve` crashes (or is killed) mid-restore,
+/// the row survives the restart, so the boot path + the Issue / AP-sync
+/// routes can refuse to proceed until the operator explicitly abandons
+/// the abandoned restore (`POST /api/restore-lock/abandon` → DELETE) or
+/// completes it (a re-run is idempotent at the per-row layer, so the
+/// safe recovery is "abandon, then re-run").
+///
+/// `tenant_id` is the PRIMARY KEY → at most ONE held lock per tenant.
+/// `acquire` is an INSERT that fails on the PK collision, which is how
+/// a second concurrent restore (or a parallel Issue) is made
+/// PHYSICALLY impossible rather than merely discouraged. No CHECK
+/// constraint — the closed-vocab invariants ride application code per
+/// the [[no-sql-specific]] discipline.
+const RESTORE_LOCK_SCHEMA_SQL: &str = "
+CREATE TABLE IF NOT EXISTS restore_lock (
+    tenant_id    VARCHAR NOT NULL PRIMARY KEY,
+    acquired_at  VARCHAR NOT NULL,
+    operator     VARCHAR NOT NULL,
+    year         INTEGER NOT NULL
+);
+";
+
 /// Idempotent `CREATE TABLE IF NOT EXISTS` + PR-216 + PR-217 additive
 /// migrations. Same boot-time posture as
 /// `incoming_invoices::ensure_schema` / `partners::ensure_schema`.
@@ -237,7 +281,285 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         .context("apply PR-216 restored_invoice migration (customer_name/tax_number/vat_status)")?;
     conn.execute_batch(RESTORED_INVOICE_PR217_MIGRATION_SQL)
         .context("apply PR-217 restored_invoice migration (partner_id)")?;
+    conn.execute_batch(RESTORE_LOCK_SCHEMA_SQL)
+        .context("ensure restore_lock schema (S261 / PR-250)")?;
     Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S261 / PR-250 — restore-in-progress lock (DB row, survives a crash).
+// ──────────────────────────────────────────────────────────────────────
+
+/// The held restore lock, as the status route surfaces it to the SPA
+/// banner. `None` from [`read_restore_lock`] means no restore is in
+/// progress (the normal steady state).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestoreLock {
+    /// RFC 3339 UTC instant the lock was acquired (restore started).
+    pub acquired_at: String,
+    /// Operator login that started the restore — surfaced so the
+    /// "Restore in progress" banner can name WHO, and so a stale-lock
+    /// abandon decision has the context.
+    pub operator: String,
+    /// The year the in-progress restore targets.
+    pub year: i32,
+}
+
+/// Acquire the per-tenant restore lock. Returns `Ok(true)` when the
+/// lock was freshly taken, `Ok(false)` when a lock is ALREADY held
+/// (the PK INSERT collided) — the caller maps `false` onto a 409 so a
+/// second concurrent restore is refused. Any non-collision DuckDB error
+/// loud-fails as `Err` per CLAUDE.md rule 12 (never swallow).
+pub fn acquire_restore_lock(
+    conn: &Connection,
+    tenant: &str,
+    operator: &str,
+    year: i32,
+    acquired_at: &str,
+) -> Result<bool> {
+    let affected = match conn.execute(
+        "INSERT INTO restore_lock (tenant_id, acquired_at, operator, year)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (tenant_id) DO NOTHING;",
+        params![tenant, acquired_at, operator, year],
+    ) {
+        Ok(n) => n,
+        Err(e) => return Err(anyhow!("acquire restore_lock for tenant `{tenant}`: {e}")),
+    };
+    // ON CONFLICT DO NOTHING → 0 rows affected means a lock was already
+    // held; 1 means we took it.
+    Ok(affected == 1)
+}
+
+/// Release the per-tenant restore lock. Idempotent: deleting an
+/// already-absent lock is a no-op (the abandon route + the run's
+/// success/error cleanup can both fire without ordering hazard).
+pub fn release_restore_lock(conn: &Connection, tenant: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM restore_lock WHERE tenant_id = ?;",
+        params![tenant],
+    )
+    .with_context(|| format!("release restore_lock for tenant `{tenant}`"))?;
+    Ok(())
+}
+
+/// Read the per-tenant restore lock, if held. Drives the boot-time
+/// crashed-restore check, the Issue / AP-sync route gates, and the
+/// SPA "Restore in progress" banner.
+pub fn read_restore_lock(conn: &Connection, tenant: &str) -> Result<Option<RestoreLock>> {
+    let mut stmt =
+        conn.prepare("SELECT acquired_at, operator, year FROM restore_lock WHERE tenant_id = ?;")?;
+    let mut rows = stmt.query(params![tenant])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(RestoreLock {
+            acquired_at: row.get(0)?,
+            operator: row.get(1)?,
+            year: row.get(2)?,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// S261 — open, ensure schema, acquire. Path-taking wrapper for the
+/// confirm handler. Returns `Ok(true)` when freshly taken, `Ok(false)`
+/// when a lock is already held.
+pub fn acquire_restore_lock_at(
+    db_path: &Path,
+    tenant: &str,
+    operator: &str,
+    year: i32,
+    acquired_at: &str,
+) -> Result<bool> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+    ensure_schema(&conn)?;
+    acquire_restore_lock(&conn, tenant, operator, year, acquired_at)
+}
+
+/// S261 — open the tenant DuckDB, ensure schema, read the lock. The
+/// path-taking convenience wrapper the HTTP handlers + boot check use
+/// (they have a `db_path`, not an open `Connection`).
+pub fn read_restore_lock_at(db_path: &Path, tenant: &str) -> Result<Option<RestoreLock>> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+    ensure_schema(&conn)?;
+    read_restore_lock(&conn, tenant)
+}
+
+/// S261 — open, ensure schema, DELETE the lock. The abandon route's
+/// path-taking wrapper.
+pub fn release_restore_lock_at(db_path: &Path, tenant: &str) -> Result<()> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+    ensure_schema(&conn)?;
+    release_restore_lock(&conn, tenant)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S261 / PR-250 — checksum + gap detection (pure; offline-testable).
+// ──────────────────────────────────────────────────────────────────────
+
+/// SHA-256 (lowercase hex) of the sorted + deduplicated NAV
+/// invoice-number list, joined by `\n`. The canonical fingerprint of
+/// "what NAV held for the year" — stamped on the `RestoreFromNavRun`
+/// audit entry + surfaced in the preview so the operator/auditor can
+/// recompute it independently from a NAV digest dump. Sorting +
+/// deduplicating BEFORE hashing makes the value order-independent and
+/// idempotent: two runs over the same NAV set yield the identical
+/// checksum regardless of digest pagination order or how many rows were
+/// already-present-and-skipped vs freshly restored.
+pub fn restore_checksum(invoice_numbers: &[String]) -> String {
+    let mut sorted: Vec<&str> = invoice_numbers.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut hasher = Sha256::new();
+    for (i, n) in sorted.iter().enumerate() {
+        if i > 0 {
+            hasher.update(b"\n");
+        }
+        hasher.update(n.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// One gap-warning row in the preview: a serial number the contiguous
+/// sequence implies should exist but which NAV did NOT return for the
+/// year. A genuine anomaly the operator should see BEFORE confirming —
+/// either NAV is itself missing an invoice (a regulatory red flag) or
+/// the series prefix the heuristic split on is noisier than expected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GapWarning {
+    /// The series prefix the gap belongs to (everything up to the
+    /// trailing run of digits, e.g. `"INV-default/"`).
+    pub series_prefix: String,
+    /// The missing serial as it would have been formatted (zero-padded
+    /// to the observed width, e.g. `"00042"`).
+    pub missing_number: String,
+}
+
+/// Cap on the number of gap-warning rows surfaced — a pathological
+/// series (e.g. one stray number 9 orders of magnitude above the rest)
+/// could otherwise generate millions of "missing" rows. Beyond the cap
+/// the preview sets `gaps_truncated = true` so the omission surfaces
+/// LOUD per CLAUDE.md rule 12 (never silently drop).
+pub const MAX_GAP_WARNINGS: usize = 200;
+
+/// Split a NAV invoice number into `(series_prefix, serial_value,
+/// serial_width)` on the trailing run of ASCII digits. Returns `None`
+/// when the number has no trailing digits (no sequence to gap-detect).
+fn split_invoice_serial(number: &str) -> Option<(&str, u64, usize)> {
+    let last_non_digit = number.rfind(|c: char| !c.is_ascii_digit());
+    let digit_start = match last_non_digit {
+        Some(idx) => idx + 1,
+        None => 0, // entire string is digits
+    };
+    let digits = &number[digit_start..];
+    if digits.is_empty() {
+        return None;
+    }
+    // A serial wider than 18 digits overflows u64; such a "number" is
+    // not a real NAV serial — skip it rather than panic.
+    let value: u64 = digits.parse().ok()?;
+    Some((&number[..digit_start], value, digits.len()))
+}
+
+/// Detect missing serials in the NAV invoice-number set, grouped by
+/// series prefix. PURE (no DB, no NAV) so the headline gap-detection
+/// test runs offline. For each prefix with ≥2 numbers, the contiguous
+/// integer range `[min..=max]` is scanned and every value absent from
+/// the observed set becomes a `GapWarning`. Returns the warnings (capped
+/// at [`MAX_GAP_WARNINGS`]) + whether the cap truncated.
+pub fn detect_gaps(invoice_numbers: &[String]) -> (Vec<GapWarning>, bool) {
+    use std::collections::BTreeMap;
+    // prefix → (set of observed serials, observed width)
+    let mut by_prefix: BTreeMap<&str, (HashSet<u64>, usize)> = BTreeMap::new();
+    for n in invoice_numbers {
+        if let Some((prefix, value, width)) = split_invoice_serial(n) {
+            let entry = by_prefix
+                .entry(prefix)
+                .or_insert_with(|| (HashSet::new(), width));
+            entry.0.insert(value);
+            // Track the widest serial seen so zero-padding the missing
+            // number matches the operator's expectation.
+            entry.1 = entry.1.max(width);
+        }
+    }
+    let mut gaps = Vec::new();
+    let mut truncated = false;
+    for (prefix, (serials, width)) in by_prefix {
+        if serials.len() < 2 {
+            continue;
+        }
+        let min = *serials.iter().min().expect("non-empty by len check");
+        let max = *serials.iter().max().expect("non-empty by len check");
+        for v in min..=max {
+            if serials.contains(&v) {
+                continue;
+            }
+            if gaps.len() >= MAX_GAP_WARNINGS {
+                truncated = true;
+                break;
+            }
+            gaps.push(GapWarning {
+                series_prefix: prefix.to_string(),
+                missing_number: format!("{v:0width$}", width = width),
+            });
+        }
+        if truncated {
+            break;
+        }
+    }
+    (gaps, truncated)
+}
+
+/// S261 — the result of partitioning the NAV digest set against the
+/// already-restored set. PURE (no DB / no NAV) so the headline
+/// idempotency test runs offline: feed the same NAV set twice, applying
+/// the first run's `new` to the `already` set in between, and the
+/// second run's `new_count` MUST be 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvoiceDelta {
+    /// NAV invoice numbers NOT present in the already-restored set —
+    /// the ones a confirm would freshly restore.
+    pub new_numbers: Vec<String>,
+    /// Count of NAV numbers already present locally (would be skipped).
+    pub already_present_count: u64,
+}
+
+/// Partition the NAV invoice-number set against the already-restored
+/// set. The new-numbers vec is sorted for determinism (so the preview's
+/// "first N would import" sample is stable across pagination order).
+pub fn compute_invoice_delta(
+    nav_numbers: &[String],
+    already_restored: &HashSet<String>,
+) -> InvoiceDelta {
+    let mut new_numbers: Vec<String> = Vec::new();
+    let mut already_present_count: u64 = 0;
+    // Dedup NAV side first (NAV would not emit dupes, but the preview's
+    // counts must not double-count if it ever did).
+    let mut seen_this_pass: HashSet<&str> = HashSet::new();
+    for n in nav_numbers {
+        if !seen_this_pass.insert(n.as_str()) {
+            continue;
+        }
+        if already_restored.contains(n) {
+            already_present_count += 1;
+        } else {
+            new_numbers.push(n.clone());
+        }
+    }
+    new_numbers.sort_unstable();
+    InvoiceDelta {
+        new_numbers,
+        already_present_count,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -705,6 +1027,21 @@ pub struct RestoreSummary {
     /// extraction for it was lost.
     #[serde(default)]
     pub invoice_extraction_errored: u64,
+    /// S261 / PR-250 — SHA-256 (lowercase hex) of the sorted +
+    /// deduplicated NAV invoice-number list seen this run (see
+    /// [`restore_checksum`]). The HTTP handler stamps this onto the
+    /// `RestoreFromNavRun` audit entry without re-walking NAV; the SPA
+    /// surfaces it on the Done step so the operator can record it.
+    #[serde(default)]
+    pub checksum: String,
+    /// S261 / PR-250 — count of DISTINCT NAV invoice numbers seen this
+    /// run (the cardinality the `checksum` is computed over). Equals
+    /// `restored + skipped` in the common case but is derived from the
+    /// deduplicated set so it stays correct if a number recurs across
+    /// pages. Stamped onto the `RestoreFromNavRun` audit entry's
+    /// `invoice_count`.
+    #[serde(default)]
+    pub nav_invoice_count: u64,
 }
 
 /// Validate the operator-supplied year. Same loud-fail posture as
@@ -792,6 +1129,9 @@ pub async fn run(inputs: RestoreInputs) -> Result<RestoreSummary> {
     let mut total_errored: u64 = 0;
     let mut total_pages: u32 = 0;
     let mut total_extraction = ExtractionDelta::default();
+    // S261 — accumulate every NAV invoice number seen across the 12
+    // months for the run-level checksum.
+    let mut all_numbers: Vec<String> = Vec::new();
 
     for month in 1u8..=12 {
         let (date_from, date_to) = month_window(inputs.year, month)?;
@@ -808,7 +1148,18 @@ pub async fn run(inputs: RestoreInputs) -> Result<RestoreSummary> {
         total_errored += outcome.errored;
         total_pages += outcome.pages;
         total_extraction.add(outcome.extraction);
+        all_numbers.extend(outcome.numbers);
     }
+
+    // S261 — distinct-count + checksum over the full year's NAV set.
+    let checksum = restore_checksum(&all_numbers);
+    let nav_invoice_count = {
+        let mut distinct: HashSet<&str> = HashSet::with_capacity(all_numbers.len());
+        all_numbers
+            .iter()
+            .filter(|n| distinct.insert(n.as_str()))
+            .count() as u64
+    };
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(RestoreSummary {
@@ -826,7 +1177,399 @@ pub async fn run(inputs: RestoreInputs) -> Result<RestoreSummary> {
         products_errored: total_extraction.products_errored,
         products_price_varies: total_extraction.products_price_varies,
         invoice_extraction_errored: total_extraction.invoice_extraction_errored,
+        checksum,
+        nav_invoice_count,
     })
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S261 / PR-250 — preview (read-only dry run).
+// ──────────────────────────────────────────────────────────────────────
+
+/// The Preview step's answer: WHAT a confirm would import, computed
+/// against the live NAV digest view + the local DB, writing NOTHING.
+/// The wizard renders `new_invoice_count` / `new_partner_count` /
+/// `new_product_count` ("would import N / M / K"), the gap-warning
+/// rows, and the checksum the operator can record. On a re-run against
+/// an already-restored year the three `new_*` counts are 0 — the
+/// idempotency headline surfaced BEFORE any write.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RestorePreview {
+    pub year: i32,
+    /// Distinct NAV invoice numbers found for the year.
+    pub nav_invoice_count: u64,
+    /// NAV invoices NOT yet in the local `restored_invoice` set — a
+    /// confirm would freshly restore these.
+    pub new_invoice_count: u64,
+    /// NAV invoices already present locally — a confirm would skip these.
+    pub already_present_count: u64,
+    /// Distinct partners the new invoices would freshly insert into the
+    /// local `partners` master (computed via `queryInvoiceData` on the
+    /// NEW invoices only — zero queryInvoiceData calls on a pure re-run).
+    pub new_partner_count: u64,
+    /// Distinct products the new invoices would freshly insert.
+    pub new_product_count: u64,
+    /// Missing-serial anomalies in NAV's returned set (see [`detect_gaps`]).
+    pub gaps: Vec<GapWarning>,
+    /// True when [`MAX_GAP_WARNINGS`] capped the gap list — surfaces the
+    /// truncation LOUD rather than silently dropping rows.
+    pub gaps_truncated: bool,
+    /// SHA-256 of the sorted NAV invoice-number list (see [`restore_checksum`]).
+    pub checksum: String,
+    /// NAV digest pages walked across the 12 months.
+    pub pages_walked: u32,
+    /// `queryInvoiceData` fetch/parse failures encountered while
+    /// sampling the NEW invoices for the partner/product preview. The
+    /// invoice + gap + checksum numbers are unaffected (those derive
+    /// from the digest walk); this only caps the partner/product
+    /// preview's precision, so it surfaces as its own counter per
+    /// CLAUDE.md rule 12.
+    pub extraction_errored: u64,
+    /// First handful of new invoice numbers (sorted) for the wizard to
+    /// show as a sample without dumping the whole list.
+    pub sample_new_numbers: Vec<String>,
+    pub elapsed_ms: u64,
+}
+
+/// How many new invoice numbers to surface as a display sample.
+const PREVIEW_SAMPLE_CAP: usize = 25;
+
+/// Run the read-only Preview (dry-run) for `inputs.year`. Walks the
+/// NAV digest view, partitions against the already-restored set,
+/// samples `queryInvoiceData` for the NEW invoices to count would-be
+/// partner/product inserts, computes gap warnings + the checksum, and
+/// writes NOTHING. The wizard's Preview step calls this; the operator
+/// then confirms (or aborts on a gap warning) before [`run`] mutates.
+pub async fn preview(inputs: RestoreInputs) -> Result<RestorePreview> {
+    let started = std::time::Instant::now();
+    validate_year(inputs.year, OffsetDateTime::now_utc())
+        .map_err(|m| anyhow!("invalid year {}: {m}", inputs.year))?;
+
+    let transport = NavTransport::new(inputs.endpoint)
+        .context("build NAV transport for restore-from-nav preview")?;
+
+    // Digest walk — collect every digest for the year (read-only).
+    let mut digests: Vec<InvoiceDigest> = Vec::new();
+    let mut pages_walked: u32 = 0;
+    for month in 1u8..=12 {
+        let (date_from, date_to) = month_window(inputs.year, month)?;
+        let mut page: u32 = 1;
+        loop {
+            if page > MAX_PAGES_PER_MONTH {
+                tracing::warn!(
+                    cap = MAX_PAGES_PER_MONTH,
+                    date_from = %date_from,
+                    "restore-from-nav preview: month-window page cap hit; truncating"
+                );
+                break;
+            }
+            let page_result = match query_invoice_digest::call(
+                &transport,
+                &inputs.credentials,
+                &inputs.tax_number_8,
+                page,
+                InvoiceDirection::Outbound,
+                &date_from,
+                &date_to,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        date_from = %date_from,
+                        page,
+                        error = ?e,
+                        "restore-from-nav preview: queryInvoiceDigest failed; \
+                         continuing to next month"
+                    );
+                    break;
+                }
+            };
+            pages_walked += 1;
+            let available_page = page_result.available_page;
+            digests.extend(page_result.digests);
+            if page >= available_page {
+                break;
+            }
+            page += 1;
+        }
+    }
+
+    // Numbers + checksum + gap detection (pure, over the full set).
+    let all_numbers: Vec<String> = digests.iter().map(|d| d.invoice_number.clone()).collect();
+    let checksum = restore_checksum(&all_numbers);
+    let (gaps, gaps_truncated) = detect_gaps(&all_numbers);
+
+    // Partition against the already-restored set (one ledger walk).
+    let cache_db = inputs.db_path.clone();
+    let cache_tenant = inputs.tenant.clone();
+    let cache_binary_hash = inputs.binary_hash;
+    let already_restored = tokio::task::spawn_blocking(move || {
+        load_already_restored_cache(&cache_db, cache_tenant, cache_binary_hash)
+    })
+    .await
+    .map_err(|join_err| anyhow!("restore preview cache-load task panicked: {join_err}"))?
+    .context("pre-load already-restored cache for restore preview")?;
+    let delta = compute_invoice_delta(&all_numbers, &already_restored);
+
+    let nav_invoice_count = delta.new_numbers.len() as u64 + delta.already_present_count;
+    let new_invoice_count = delta.new_numbers.len() as u64;
+    let sample_new_numbers: Vec<String> = delta
+        .new_numbers
+        .iter()
+        .take(PREVIEW_SAMPLE_CAP)
+        .cloned()
+        .collect();
+
+    // Network phase — fetch queryInvoiceData for the NEW invoices only.
+    // On a pure re-run `delta.new_numbers` is empty, so zero NAV calls
+    // here and the partner/product counts fall out as 0 (the headline
+    // idempotency behaviour, surfaced pre-write).
+    let by_number: std::collections::HashMap<&str, &InvoiceDigest> = digests
+        .iter()
+        .map(|d| (d.invoice_number.as_str(), d))
+        .collect();
+    let mut samples: Vec<(Currency, Vec<u8>)> = Vec::new();
+    let mut extraction_errored: u64 = 0;
+    for number in &delta.new_numbers {
+        let Some(digest) = by_number.get(number.as_str()) else {
+            continue;
+        };
+        let currency = match parse_digest_currency(digest) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(invoice_number = %number, error = ?e,
+                    "restore preview: digest currency parse failed; skipping catalog sample");
+                extraction_errored += 1;
+                continue;
+            }
+        };
+        match query_invoice_data::call(
+            &transport,
+            &inputs.credentials,
+            &inputs.tax_number_8,
+            number,
+            InvoiceDirection::Outbound,
+        )
+        .await
+        {
+            Ok(outcome) => samples.push((currency, outcome.response_xml)),
+            Err(e) => {
+                tracing::warn!(invoice_number = %number,
+                    error = %nav_transport_error_message(&e),
+                    "restore preview: queryInvoiceData failed; partner/product sample skipped");
+                extraction_errored += 1;
+            }
+        }
+    }
+
+    // Counting phase — parse + local-existence dedup on the blocking
+    // pool (synchronous XML parse + DuckDB reads).
+    let db_path = inputs.db_path.clone();
+    let tenant = inputs.tenant.clone();
+    let (new_partner_count, new_product_count, parse_errored) =
+        tokio::task::spawn_blocking(move || count_new_catalog(&db_path, tenant.as_str(), samples))
+            .await
+            .map_err(|join_err| anyhow!("restore preview count task panicked: {join_err}"))??;
+    extraction_errored += parse_errored;
+
+    Ok(RestorePreview {
+        year: inputs.year,
+        nav_invoice_count,
+        new_invoice_count,
+        already_present_count: delta.already_present_count,
+        new_partner_count,
+        new_product_count,
+        gaps,
+        gaps_truncated,
+        checksum,
+        pages_walked,
+        extraction_errored,
+        sample_new_numbers,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+/// Count the DISTINCT partners + products the sampled NEW invoices
+/// would freshly insert. A candidate is "new" iff it is absent from
+/// BOTH the local master (`find_*` lookup) AND the within-preview
+/// seen-set (so two new invoices for the same new partner count once).
+/// Returns `(new_partners, new_products, parse_errored)`; parse
+/// failures are CONTAINED (warn + counter) so one malformed XML body
+/// does not abort the whole preview.
+fn count_new_catalog(
+    db_path: &Path,
+    tenant: &str,
+    samples: Vec<(Currency, Vec<u8>)>,
+) -> Result<(u64, u64, u64)> {
+    use crate::restore_from_nav_extract::{
+        extract_inner_invoice_data_xml, parse_customer_info, parse_invoice_lines,
+    };
+    let conn = restore_from_nav_extract::open_for_extract(db_path)
+        .context("open DuckDB for restore-preview catalog count")?;
+    let mut seen_partner_keys: HashSet<String> = HashSet::new();
+    let mut seen_product_keys: HashSet<String> = HashSet::new();
+    let mut new_partners: u64 = 0;
+    let mut new_products: u64 = 0;
+    let mut parse_errored: u64 = 0;
+
+    for (currency, response_xml) in samples {
+        let inner = match extract_inner_invoice_data_xml(&response_xml) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                // Anomalous for OUTBOUND (the seller's own invoice);
+                // no candidates to count, not a parse error.
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e,
+                    "restore preview: inner invoiceData unwrap failed; sample skipped");
+                parse_errored += 1;
+                continue;
+            }
+        };
+        match parse_customer_info(&inner) {
+            Ok(customer) => {
+                if let Some(key) = preview_partner_key(&customer) {
+                    if !seen_partner_keys.contains(&key)
+                        && partner_absent_locally(&conn, tenant, &customer)?
+                    {
+                        new_partners += 1;
+                    }
+                    // Insert AFTER the count so the first sighting counts
+                    // and subsequent ones dedup, regardless of local hit.
+                    seen_partner_keys.insert(key);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e,
+                    "restore preview: customer parse failed; partner sample skipped");
+                parse_errored += 1;
+            }
+        }
+        match parse_invoice_lines(&inner, currency) {
+            Ok(lines) => {
+                for line in lines {
+                    let key = format!("{}|{:?}", line.description.trim().to_lowercase(), line.unit);
+                    if !seen_product_keys.contains(&key)
+                        && crate::products::find_product_by_name_and_unit(
+                            &conn,
+                            tenant,
+                            &line.description,
+                            &line.unit,
+                        )?
+                        .is_none()
+                    {
+                        new_products += 1;
+                    }
+                    seen_product_keys.insert(key);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e,
+                    "restore preview: invoice-lines parse failed; product sample skipped");
+                parse_errored += 1;
+            }
+        }
+    }
+    Ok((new_partners, new_products, parse_errored))
+}
+
+/// Within-preview dedup key for a partner candidate, mirroring
+/// [`restore_from_nav_extract`]'s upsert dedup keys (DOMESTIC →
+/// tax_number; PRIVATE_PERSON → name+address). `None` for an OTHER
+/// candidate (named-deferred per ADR-0048 §7 — the extractor would
+/// error on it, so it counts as neither new nor existing here) or a
+/// PRIVATE_PERSON with no usable name.
+fn preview_partner_key(
+    customer: &crate::restore_from_nav_extract::CustomerCandidate,
+) -> Option<String> {
+    use crate::nav_xml::CustomerVatStatus;
+    match customer.vat_status {
+        CustomerVatStatus::Domestic => customer
+            .tax_number
+            .as_deref()
+            .map(|t| format!("tax:{}", t.trim().to_lowercase())),
+        CustomerVatStatus::PrivatePerson => {
+            let name = customer
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            Some(format!(
+                "pp:{}|{}|{}|{}|{}",
+                name.to_lowercase(),
+                customer
+                    .address_country
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase(),
+                customer
+                    .address_postal_code
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase(),
+                customer
+                    .address_city
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase(),
+                customer
+                    .address_street
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase(),
+            ))
+        }
+        CustomerVatStatus::Other => None,
+    }
+}
+
+/// Local-existence check for a partner candidate via the same `find_*`
+/// keys `restore_from_nav_extract::upsert_partner` uses. An OTHER
+/// candidate (no preview key) is treated as "present" (returns false /
+/// not-absent) so it never inflates the new-partner count — the actual
+/// confirm would error on it, not insert it.
+fn partner_absent_locally(
+    conn: &Connection,
+    tenant: &str,
+    customer: &crate::restore_from_nav_extract::CustomerCandidate,
+) -> Result<bool> {
+    use crate::nav_xml::CustomerVatStatus;
+    match customer.vat_status {
+        CustomerVatStatus::Domestic => {
+            let Some(tax_number) = customer.tax_number.as_deref() else {
+                return Ok(false);
+            };
+            Ok(crate::partners::find_partner_by_tax_number(conn, tenant, tax_number)?.is_none())
+        }
+        CustomerVatStatus::PrivatePerson => {
+            let Some(name) = customer
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Ok(false);
+            };
+            Ok(crate::partners::find_partner_by_name_and_address(
+                conn,
+                tenant,
+                name,
+                customer.address_country.as_deref(),
+                customer.address_postal_code.as_deref(),
+                customer.address_city.as_deref(),
+                customer.address_street.as_deref(),
+            )?
+            .is_none())
+        }
+        CustomerVatStatus::Other => Ok(false),
+    }
 }
 
 /// S196 — one month-walk's outputs. Pre-S196 returned a 4-tuple;
@@ -838,6 +1581,12 @@ struct MonthOutcome {
     errored: u64,
     pages: u32,
     extraction: ExtractionDelta,
+    /// S261 — every NAV `<invoiceNumber>` seen this month (restored +
+    /// skipped + errored alike). [`run`] concatenates these across the
+    /// 12 months and feeds them to [`restore_checksum`] so the
+    /// `RestoreFromNavRun` audit entry pins WHAT NAV held, independent
+    /// of how many rows were freshly written.
+    numbers: Vec<String>,
 }
 
 async fn walk_month(
@@ -852,6 +1601,9 @@ async fn walk_month(
     let mut errored: u64 = 0;
     let mut page: u32 = 1;
     let mut month_extraction = ExtractionDelta::default();
+    // S261 — accumulate every NAV invoice number seen this month for
+    // the run-level checksum.
+    let mut month_numbers: Vec<String> = Vec::new();
 
     loop {
         if page > MAX_PAGES_PER_MONTH {
@@ -869,6 +1621,7 @@ async fn walk_month(
                 errored,
                 pages: page - 1,
                 extraction: month_extraction,
+                numbers: month_numbers,
             });
         }
 
@@ -900,6 +1653,7 @@ async fn walk_month(
                     errored,
                     pages: page.saturating_sub(1),
                     extraction: month_extraction,
+                    numbers: month_numbers,
                 });
             }
         };
@@ -922,6 +1676,10 @@ async fn walk_month(
         // for the XML parse + partner/product DB inserts so the worker
         // is not held across the synchronous DB work.
         let digests = page_result.digests;
+        // S261 — capture this page's NAV invoice numbers for the
+        // run-level checksum BEFORE `digests` moves into the blocking
+        // closure below.
+        month_numbers.extend(digests.iter().map(|d| d.invoice_number.clone()));
         let db_path = inputs.db_path.clone();
         let tenant = inputs.tenant.clone();
         let binary_hash = inputs.binary_hash;
@@ -1010,6 +1768,7 @@ async fn walk_month(
                 errored,
                 pages: page,
                 extraction: month_extraction,
+                numbers: month_numbers,
             });
         }
         page += 1;
@@ -2861,5 +3620,202 @@ mod tests {
 
         let list = list_restored(&db_path, "t1").expect("list");
         assert_eq!(list[0].partner_id.as_deref(), Some("prt_TEST"));
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // S261 / PR-250 — checksum, gap detection, idempotency delta, lock.
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn checksum_is_order_and_duplicate_independent() {
+        // The checksum pins the SET of NAV numbers, not their order or
+        // multiplicity — so two runs over the same NAV state agree
+        // regardless of pagination order or a repeated digest.
+        let a = checksum_of(&["INV/0002", "INV/0001", "INV/0003"]);
+        let b = checksum_of(&["INV/0001", "INV/0002", "INV/0003", "INV/0002"]);
+        assert_eq!(a, b, "sort+dedup must make the checksum set-stable");
+        // Different set → different checksum (sanity that it is not a
+        // constant).
+        let c = checksum_of(&["INV/0001", "INV/0002"]);
+        assert_ne!(a, c);
+        // Known-answer: SHA-256 is 64 lowercase hex chars.
+        assert_eq!(a.len(), 64);
+        assert!(a
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_uppercase()));
+    }
+
+    fn checksum_of(nums: &[&str]) -> String {
+        restore_checksum(&nums.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn empty_checksum_is_sha256_of_empty_input() {
+        // The empty year (no NAV invoices) must still produce a stable,
+        // well-defined checksum, not panic — SHA-256 of zero bytes.
+        let empty = restore_checksum(&[]);
+        assert_eq!(
+            empty,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// HEADLINE — the idempotency invariant that justifies the feature.
+    /// Run the delta computation twice against the SAME NAV set; after
+    /// applying the first run's new invoices to the local set, the
+    /// second run reports ZERO new invoices. This is exactly what the
+    /// wizard's Preview step renders ("0 new invoices") on a re-run —
+    /// surfaced BEFORE any write.
+    #[test]
+    fn idempotency_second_preview_reports_zero_new() {
+        let nav: Vec<String> = ["INV/0001", "INV/0002", "INV/0003"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // First run: nothing restored locally yet → all 3 are new.
+        let mut already: HashSet<String> = HashSet::new();
+        let first = compute_invoice_delta(&nav, &already);
+        assert_eq!(first.new_numbers.len(), 3, "first run sees all 3 as new");
+        assert_eq!(first.already_present_count, 0);
+
+        // Simulate the confirm: every freshly-restored invoice joins the
+        // already-restored set (this is what the per-row
+        // InvoiceRestoredFromNav ledger entries record).
+        for n in &first.new_numbers {
+            already.insert(n.clone());
+        }
+
+        // Second run against the same NAV state → ZERO new, all skipped.
+        let second = compute_invoice_delta(&nav, &already);
+        assert_eq!(
+            second.new_numbers.len(),
+            0,
+            "re-run must create no duplicates"
+        );
+        assert_eq!(second.already_present_count, 3, "all 3 already present");
+
+        // And the checksum is identical across both runs — it pins the
+        // NAV set, not the local delta.
+        assert_eq!(restore_checksum(&nav), restore_checksum(&nav));
+    }
+
+    #[test]
+    fn delta_dedups_repeated_nav_number() {
+        let nav: Vec<String> = ["INV/0001", "INV/0001", "INV/0002"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let already: HashSet<String> = HashSet::new();
+        let delta = compute_invoice_delta(&nav, &already);
+        assert_eq!(delta.new_numbers, vec!["INV/0001", "INV/0002"]);
+    }
+
+    #[test]
+    fn detect_gaps_flags_missing_serial_in_sequence() {
+        // NAV returned 1, 2, 4 for one series — 3 is the gap the operator
+        // must see before confirming (NAV is itself missing an invoice
+        // the sequence implies should exist).
+        let nums: Vec<String> = [
+            "INV-default/00001",
+            "INV-default/00002",
+            "INV-default/00004",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (gaps, truncated) = detect_gaps(&nums);
+        assert!(!truncated);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].series_prefix, "INV-default/");
+        assert_eq!(
+            gaps[0].missing_number, "00003",
+            "zero-padded to observed width"
+        );
+    }
+
+    #[test]
+    fn detect_gaps_is_quiet_on_contiguous_and_single() {
+        // Contiguous → no gaps. Two distinct series, each contiguous →
+        // still no gaps. A lone number in a series → no gaps (no range).
+        let contiguous: Vec<String> = ["A/1", "A/2", "A/3", "B/10", "B/11"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (gaps, _) = detect_gaps(&contiguous);
+        assert!(
+            gaps.is_empty(),
+            "contiguous series produce no gap warnings: {gaps:?}"
+        );
+
+        let single: Vec<String> = vec!["A/5".to_string()];
+        let (gaps, _) = detect_gaps(&single);
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn detect_gaps_groups_by_series_prefix() {
+        // A gap in one series must NOT leak across to another series'
+        // numbering — the prefix split keeps them independent.
+        let nums: Vec<String> = ["X/1", "X/3", "Y/1", "Y/2"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (gaps, _) = detect_gaps(&nums);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].series_prefix, "X/");
+        assert_eq!(gaps[0].missing_number, "2");
+    }
+
+    #[test]
+    fn restore_lock_lifecycle_on_real_duckdb() {
+        let tmp = ScopedTempDir::new("s261-lock");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let conn = Connection::open(&db_path).expect("open db");
+        ensure_schema(&conn).expect("schema");
+
+        // Initially unlocked.
+        assert!(read_restore_lock(&conn, "t1").expect("read").is_none());
+
+        // Acquire → true (freshly taken).
+        assert!(
+            acquire_restore_lock(&conn, "t1", "alice", 2026, "2026-06-05T10:00:00Z").expect("acq"),
+            "first acquire takes the lock"
+        );
+        let held = read_restore_lock(&conn, "t1").expect("read").expect("held");
+        assert_eq!(held.operator, "alice");
+        assert_eq!(held.year, 2026);
+
+        // Second acquire on the SAME tenant → false (already held). This
+        // is the gate that makes a parallel restore physically refused.
+        assert!(
+            !acquire_restore_lock(&conn, "t1", "bob", 2025, "2026-06-05T10:01:00Z").expect("acq2"),
+            "a held lock refuses a second acquire"
+        );
+        // The original holder is unchanged (DO NOTHING did not overwrite).
+        let still = read_restore_lock(&conn, "t1").expect("read").expect("held");
+        assert_eq!(still.operator, "alice");
+
+        // A DIFFERENT tenant is independent (per-tenant PK).
+        assert!(
+            acquire_restore_lock(&conn, "t2", "carol", 2024, "2026-06-05T10:02:00Z")
+                .expect("acq t2")
+        );
+
+        // Release t1 → gone; release is idempotent.
+        release_restore_lock(&conn, "t1").expect("release");
+        assert!(read_restore_lock(&conn, "t1").expect("read").is_none());
+        release_restore_lock(&conn, "t1").expect("release-again is a no-op");
+
+        // t2 still held (release was tenant-scoped).
+        assert!(read_restore_lock(&conn, "t2").expect("read").is_some());
+    }
+
+    #[test]
+    fn split_invoice_serial_handles_edge_shapes() {
+        assert_eq!(split_invoice_serial("INV/00042"), Some(("INV/", 42, 5)));
+        assert_eq!(split_invoice_serial("00042"), Some(("", 42, 5)));
+        assert_eq!(split_invoice_serial("NO-DIGITS"), None);
+        assert_eq!(split_invoice_serial(""), None);
     }
 }

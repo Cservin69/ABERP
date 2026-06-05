@@ -800,6 +800,12 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // restored row. `system.`-scoped; the payload is an
         // operator-decision record, no NAV bytes.
         | EventKind::ExtNavPartnerManualLink
+        // S261 / PR-250 — aggregate restore-batch-summary event. One
+        // per confirmed wizard run; `system.`-scoped. Payload carries
+        // batch counters + the NAV invoice-number-list checksum, NOT
+        // NAV XML bytes (the per-row `InvoiceRestoredFromNav` entries
+        // carry the per-invoice lineage). Same no-bytes posture.
+        | EventKind::RestoreFromNavRun
         // S228 / PR-224 / ADR-0060 — Stage 3 manufacturing-execution
         // adapter event. `mes.`-prefixed (not invoice / not system —
         // a third prefix family); the payload carries the canonical

@@ -9,12 +9,33 @@ import { describe, expect, it } from "vitest";
 
 import {
   canSubmit,
+  describeGap,
+  formatPreviewHeadline,
   formatRestoreSummary,
+  hasGapWarnings,
+  isPreviewNoOp,
   isRestoreConfirmed,
   MIN_RESTORE_YEAR,
   RESTORE_CONFIRMATION_TOKEN,
   validateYearInput,
+  type RestorePreview,
 } from "./restore-wizard";
+
+function previewFixture(over: Partial<RestorePreview> = {}): RestorePreview {
+  return {
+    year: 2026,
+    nav_invoice_count: 50,
+    new_invoice_count: 3,
+    already_present_count: 47,
+    new_partner_count: 1,
+    new_product_count: 2,
+    gaps: [],
+    gaps_truncated: false,
+    checksum: "abc123",
+    elapsed_ms: 100,
+    ...over,
+  };
+}
 
 describe("RESTORE confirmation gate", () => {
   it("accepts the exact uppercase token", () => {
@@ -109,5 +130,54 @@ describe("formatRestoreSummary", () => {
     expect(s).toContain("2 errored");
     expect(s).toContain("14");
     expect(s).toContain("1234 ms");
+  });
+});
+
+// ── S261 / PR-250 — preview (dry-run) + gap helpers ──────────────────
+
+describe("formatPreviewHeadline", () => {
+  it("names all three would-import counts + the skip count", () => {
+    const h = formatPreviewHeadline(previewFixture());
+    expect(h).toContain("3 invoice");
+    expect(h).toContain("1 partner");
+    expect(h).toContain("2 product");
+    expect(h).toContain("47 already present");
+  });
+});
+
+describe("isPreviewNoOp — the idempotency surface", () => {
+  it("is true only when all three new counts are zero", () => {
+    // HEADLINE: a re-run against an already-restored year reports 0/0/0,
+    // which the wizard renders as 'already up to date' instead of an
+    // import prompt — the idempotency guarantee surfaced before any write.
+    expect(
+      isPreviewNoOp(
+        previewFixture({
+          new_invoice_count: 0,
+          new_partner_count: 0,
+          new_product_count: 0,
+        }),
+      ),
+    ).toBe(true);
+  });
+  it("is false when anything new would be imported", () => {
+    expect(isPreviewNoOp(previewFixture({ new_invoice_count: 1, new_partner_count: 0, new_product_count: 0 }))).toBe(false);
+    expect(isPreviewNoOp(previewFixture({ new_invoice_count: 0, new_partner_count: 1, new_product_count: 0 }))).toBe(false);
+    expect(isPreviewNoOp(previewFixture({ new_invoice_count: 0, new_partner_count: 0, new_product_count: 1 }))).toBe(false);
+  });
+});
+
+describe("gap warnings", () => {
+  it("hasGapWarnings is true when gaps exist or the list truncated", () => {
+    expect(hasGapWarnings(previewFixture())).toBe(false);
+    expect(
+      hasGapWarnings(previewFixture({ gaps: [{ series_prefix: "INV/", missing_number: "00042" }] })),
+    ).toBe(true);
+    expect(hasGapWarnings(previewFixture({ gaps_truncated: true }))).toBe(true);
+  });
+  it("describeGap renders the missing invoice number", () => {
+    expect(describeGap({ series_prefix: "INV-default/", missing_number: "00042" })).toBe(
+      "INV-default/00042",
+    );
   });
 });
