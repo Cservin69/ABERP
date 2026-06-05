@@ -2915,6 +2915,21 @@ export type AdapterStatus =
   | "starting"
   | "stopped";
 
+/** S258 / PR-247 — one adapter health transition from the audit ledger,
+ *  surfaced to the wall-TV SPA so it can drive the alert chime: the
+ *  `seq` is the boot-grace high-water-mark, `at_iso8601` the flapping
+ *  debounce clock. The red pulse itself reads live `AdapterStatusSnapshot
+ *  .status`, not this — a page reload recovers alert state from here. */
+export interface AdapterTransitionEntry {
+  adapter_id: string;
+  /** Closed-vocab health string the adapter left. */
+  from_state: string;
+  /** Closed-vocab health string the adapter entered. */
+  to_state: string;
+  at_iso8601: string;
+  seq: number;
+}
+
 export interface AdapterStatusSnapshot {
   name: string;
   status: AdapterStatus;
@@ -3009,6 +3024,10 @@ export interface WorkshopDashboard {
   today: TodayPanel;
   recent_activity: RecentActivityEntry[];
   adapters: AdapterStatusSnapshot[];
+  /** S258 / PR-247 — recent adapter health transitions, newest-first.
+   *  Optional on the wire: a mid-upgrade backend (pre-v2.15.1) omits it;
+   *  `getWorkshopDashboard` normalises a missing/non-array value to `[]`. */
+  adapter_transitions?: AdapterTransitionEntry[];
   snapshot_at_iso8601: string;
   // S246 / PR-239 — density rows below each aggregate tile.
   // PR-242 / S250 finding 5 — every new field is OPTIONAL on the wire
@@ -3060,6 +3079,7 @@ export async function getWorkshopDashboard(): Promise<WorkshopDashboard> {
 function normalizeWorkshopDashboard(p: WorkshopDashboard): WorkshopDashboard {
   return {
     ...p,
+    adapter_transitions: Array.isArray(p.adapter_transitions) ? p.adapter_transitions : [],
     work_order_rows: Array.isArray(p.work_order_rows) ? p.work_order_rows : [],
     low_stock_rows: Array.isArray(p.low_stock_rows) ? p.low_stock_rows : [],
     pending_qa_rows: Array.isArray(p.pending_qa_rows) ? p.pending_qa_rows : [],

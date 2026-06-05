@@ -55,6 +55,15 @@
     MOCK_SCAN_MESSAGES,
     MOCK_SPOTLIGHT_TILES,
   } from "../lib/workshop-mock-data";
+  import type { AdapterStatus } from "../lib/api";
+  import {
+    isAlertingState,
+    computeAdapterAlerts,
+    initialAdapterAlertState,
+    type AdapterAlertState,
+  } from "../lib/adapter-format";
+  import { playAdapterAlert } from "../lib/quote-chime";
+  import { loadNotificationPrefs } from "../lib/notification-prefs";
 
   type LoadState = "idle" | "loading" | "ready" | "error";
 
@@ -100,6 +109,37 @@
   let demoMode = $state(isDemoMode());
   let scanTickIdx = $state(0);
   let spotlightIdx = $state(0);
+
+  // S258 / PR-247 — wall-TV adapter-health alerting.
+  //
+  // The red border + slow pulse on a degraded/unhealthy tile is driven
+  // PURELY by reactive state (`displayStatus` → `isAlertingState`), CSS-
+  // only — no JS interval drives the animation (that would fight Svelte's
+  // diffing and re-trigger the keyframes on every poll).
+  //
+  // The optional chime is gated three ways, all owned here per the
+  // [[aberp-workshop-demo-mode]] convention: the Settings→Notifications
+  // `adapterSoundEnabled` pref, demo mode (suppressed), and the
+  // boot-grace + flapping-debounce logic inside `computeAdapterAlerts`
+  // (which reads the audit-ledger transitions off the dashboard payload).
+  // `adapterAlertState` is a plain `let` (not `$state`) — it's poll
+  // bookkeeping, never rendered. It lives for the component's lifetime, so
+  // a page reload / route re-entry reseeds the high-water-mark = boot
+  // grace, and nothing replays.
+  let adapterAlertState: AdapterAlertState = initialAdapterAlertState();
+
+  /** In demo mode every adapter RENDERS healthy (green dot, "Running"
+   *  chip, no pulse) regardless of the mock payload — the tour wall never
+   *  flares red. Real mode shows the live status. */
+  function displayStatus(status: AdapterStatus): AdapterStatus {
+    return demoMode ? "healthy" : status;
+  }
+
+  /** Should this adapter tile pulse red? Never in demo mode (forced
+   *  healthy). */
+  function adapterAlerting(status: AdapterStatus): boolean {
+    return isAlertingState(displayStatus(status));
+  }
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let scanTimer: ReturnType<typeof setInterval> | null = null;
@@ -213,12 +253,28 @@
       bundle = next;
       loadState = "ready";
       errorMessage = null;
+      maybeChimeAdapterAlerts(next);
     } catch (e) {
       errorMessage = e instanceof Error ? e.message : String(e);
       loadState = "error";
     } finally {
       inFlight = false;
     }
+  }
+
+  // S258 / PR-247 — advance the alert high-water-mark each poll and play
+  // ONE coalesced tone when a fresh non-alerting→alerting transition is
+  // seen. Always advances `adapterAlertState` (even when muted/demo) so
+  // the boot-grace seed + debounce clock stay correct; only the actual
+  // `playAdapterAlert()` is gated by the pref + demo mode.
+  function maybeChimeAdapterAlerts(next: WorkshopDashboard): void {
+    const transitions = next.adapter_transitions ?? [];
+    const result = computeAdapterAlerts(transitions, adapterAlertState);
+    adapterAlertState = result.next;
+    if (result.chimeCount <= 0) return;
+    if (demoMode) return;
+    if (!loadNotificationPrefs().adapterSoundEnabled) return;
+    playAdapterAlert();
   }
 
   function toggleLang(): void {
@@ -702,11 +758,12 @@
           <ul class="ws-adapter-list">
             {#each b.adapters as adapter}
               <li
-                class="ws-adapter"
+                class={`ws-adapter ${adapterAlerting(adapter.status) ? "ws-adapter--alert" : ""}`}
                 data-testid={`adapter-${adapter.name}`}
+                data-alerting={adapterAlerting(adapter.status) ? "true" : "false"}
               >
                 <span
-                  class={`ws-dot ${adapterDotClass(adapter.status)}`}
+                  class={`ws-dot ${adapterDotClass(displayStatus(adapter.status))}`}
                   aria-hidden="true"
                 ></span>
                 <div class="ws-adapter__body">
@@ -729,8 +786,8 @@
                     </span>
                   {/if}
                 </div>
-                <span class={`ws-pill ws-pill--${adapter.status}`}>
-                  {adapterStatusLabel(adapter.status, lang)}
+                <span class={`ws-pill ws-pill--${displayStatus(adapter.status)}`}>
+                  {adapterStatusLabel(displayStatus(adapter.status), lang)}
                 </span>
               </li>
             {/each}
@@ -1405,6 +1462,38 @@
     border: 1px solid var(--color-surface-divider);
     border-radius: 4px;
     padding: var(--space-2);
+  }
+
+  /* S258 / PR-247 — degraded/unhealthy adapter alert. A red border plus a
+     slow 1 Hz glow pulse, glanceable from across the shop floor. CSS-only
+     so it's driven by the reactive `ws-adapter--alert` class, not a JS
+     interval (which would re-trigger the keyframes on every poll). The
+     pulse animates box-shadow ONLY — no transform / size change — so it
+     never shifts layout or jitters the row, and the steady border stays
+     red even at the trough of the glow. */
+  .ws-adapter--alert {
+    border-color: var(--color-signal-negative);
+    animation: ws-adapter-alert-pulse 1s ease-in-out infinite;
+  }
+
+  @keyframes ws-adapter-alert-pulse {
+    0%,
+    100% {
+      box-shadow: 0 0 0 1px var(--color-signal-negative);
+    }
+    50% {
+      box-shadow: 0 0 10px 2px var(--color-signal-negative);
+    }
+  }
+
+  /* Accessibility / motion-sensitivity: drop the animation but KEEP the
+     red border + a static glow so the alert signal is never lost — only
+     the motion is. */
+  @media (prefers-reduced-motion: reduce) {
+    .ws-adapter--alert {
+      animation: none;
+      box-shadow: 0 0 0 1px var(--color-signal-negative);
+    }
   }
 
   .ws-adapter__body {

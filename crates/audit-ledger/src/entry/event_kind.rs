@@ -1161,6 +1161,27 @@ pub enum EventKind {
     /// Payload: `AdapterConfigAuditPayload` (aberp binary `mes_manager`).
     /// F12 four-edit ritual fires once.
     AdapterRemoved,
+
+    /// S258 / PR-247 — a registered MES adapter changed health state
+    /// (e.g. `healthy → unhealthy` when a CNC's MTConnect agent stops
+    /// responding). Detected at the Workshop dashboard's poll cadence by
+    /// diffing the live `AdapterRegistry` health against an in-memory
+    /// per-adapter baseline; the FIRST sight of an adapter after process
+    /// boot seeds the baseline silently (boot-grace — a restart never
+    /// re-emits an already-degraded adapter), so every entry here records
+    /// a genuine in-session transition. The durable record lets the wall-
+    /// TV SPA recover "when did this adapter start alerting" across page
+    /// reloads (the chime's high-water-mark) rather than from in-memory
+    /// JS state. `mes.` prefix — manufacturing-domain runtime telemetry,
+    /// the namespace neighbour of [`EventKind::MesAdapterEvent`]; never
+    /// sweeps a per-OUTGOING-invoice export bundle.
+    ///
+    /// Payload: `AdapterHealthTransitionPayload` (aberp binary `serve`) —
+    /// `{ adapter_id, from_state, to_state, ts }` where the states are the
+    /// closed wire-vocab health strings (`healthy`/`degraded`/`unhealthy`/
+    /// `starting`/`stopped`).
+    /// F12 four-edit ritual fires once.
+    AdapterHealthTransitioned,
 }
 
 impl EventKind {
@@ -1226,6 +1247,7 @@ impl EventKind {
             EventKind::AdapterAdded => "mes.adapter_added",
             EventKind::AdapterUpdated => "mes.adapter_updated",
             EventKind::AdapterRemoved => "mes.adapter_removed",
+            EventKind::AdapterHealthTransitioned => "mes.adapter_health_transitioned",
         }
     }
 
@@ -1302,6 +1324,7 @@ impl EventKind {
             "mes.adapter_added" => Ok(EventKind::AdapterAdded),
             "mes.adapter_updated" => Ok(EventKind::AdapterUpdated),
             "mes.adapter_removed" => Ok(EventKind::AdapterRemoved),
+            "mes.adapter_health_transitioned" => Ok(EventKind::AdapterHealthTransitioned),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1370,6 +1393,7 @@ mod tests {
             EventKind::AdapterAdded,
             EventKind::AdapterUpdated,
             EventKind::AdapterRemoved,
+            EventKind::AdapterHealthTransitioned,
         ];
         for v in variants {
             let s = v.as_str();
@@ -2498,6 +2522,36 @@ mod tests {
         assert_eq!(EventKind::AdapterAdded.as_str(), "mes.adapter_added");
         assert_eq!(EventKind::AdapterUpdated.as_str(), "mes.adapter_updated");
         assert_eq!(EventKind::AdapterRemoved.as_str(), "mes.adapter_removed");
+    }
+
+    /// S258 / PR-247 — the adapter-health-transition kind uses the `mes.`
+    /// prefix (manufacturing-domain runtime telemetry, namespace
+    /// neighbour of `mes.adapter_event`), NOT `system.` or `invoice.`.
+    /// Same prefix-pin posture as the S257 adapter-config kinds.
+    #[test]
+    fn s258_adapter_health_transitioned_uses_mes_prefix() {
+        let s = EventKind::AdapterHealthTransitioned.as_str();
+        assert_eq!(s, "mes.adapter_health_transitioned");
+        assert!(s.starts_with("mes."), "{s} must start with mes.");
+        assert!(
+            !s.starts_with("invoice."),
+            "{s} must not start with invoice."
+        );
+        assert!(!s.starts_with("system."), "{s} must not start with system.");
+    }
+
+    /// S258 / PR-247 — the health-transition kind is distinct from the
+    /// adapter-config CRUD kinds (S257) AND from the runtime
+    /// `mes.adapter_event` telemetry kind whose storage string it
+    /// neighbours. A collision would mis-route a health transition into
+    /// the config-CRUD or per-event bucket on parse.
+    #[test]
+    fn s258_adapter_health_transitioned_is_distinct() {
+        let k = EventKind::AdapterHealthTransitioned.as_str();
+        assert_ne!(k, EventKind::AdapterAdded.as_str());
+        assert_ne!(k, EventKind::AdapterUpdated.as_str());
+        assert_ne!(k, EventKind::AdapterRemoved.as_str());
+        assert_ne!(k, EventKind::MesAdapterEvent.as_str());
     }
 
     /// S257 / PR-246 — the three adapter-config kinds are pairwise-

@@ -138,12 +138,15 @@ function buildRecentActivity(now: Date): RecentActivityEntry[] {
 
 // ── Adapters ────────────────────────────────────────────────────
 
-/** Three MES adapters — all `healthy` (S240 / PR-234 vocab —
- *  was `enabled` pre-live-registry). The barcode scanner is the one
- *  whose rotating "Last scan" messages feed the demo-mode
- *  Workshop.svelte ticker. The rotation itself lives in
- *  `Workshop.svelte` because it needs a Svelte effect; this list
- *  just supplies the static adapter metadata. */
+/** Four MES adapters. The barcode scanner is the one whose rotating
+ *  "Last scan" messages feed the demo-mode Workshop.svelte ticker.
+ *
+ *  S258 / PR-247 — `mtconnect-mill-03` is deliberately `unhealthy` in the
+ *  RAW mock so the demo-mode suppression is exercised end-to-end: demo
+ *  mode forces every adapter to RENDER healthy (no red border, no pulse,
+ *  no chime), so a degraded adapter in the payload proves the override
+ *  rather than flaring red on the tour wall. In real (non-demo) mode this
+ *  branch is never taken — the payload comes from the live registry. */
 function buildAdapters(): AdapterStatusSnapshot[] {
   return [
     {
@@ -166,6 +169,13 @@ function buildAdapters(): AdapterStatusSnapshot[] {
       kind: "weight_scale",
       host: "192.168.42.23",
       port: 4003,
+    },
+    {
+      name: "mtconnect-mill-03",
+      status: "unhealthy",
+      kind: "cnc-machine",
+      host: "192.168.42.24",
+      port: 7878,
     },
   ];
 }

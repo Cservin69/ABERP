@@ -249,6 +249,13 @@
     notifyPrefs = { ...notifyPrefs, soundEnabled: next };
     saveNotificationPrefs(notifyPrefs);
   }
+
+  // S258 / PR-247 — alert tone when a Workshop adapter goes degraded /
+  // unhealthy. Same per-machine localStorage pref family; OFF by default.
+  function onToggleAdapterSound(next: boolean) {
+    notifyPrefs = { ...notifyPrefs, adapterSoundEnabled: next };
+    saveNotificationPrefs(notifyPrefs);
+  }
   let numberingLiteralDraft = $state("");
   let numberingValidation = $derived(validateTemplate(numbering));
   let numberingPreview = $derived.by(() => {
@@ -1736,6 +1743,22 @@
         />
         <span class="field__label">
           Halk hangjelzés / Subtle chime
+        </span>
+      </label>
+
+      <!-- S258 / PR-247 — Workshop adapter-health alert tone. Plays once
+           when a CNC / printer / robot adapter on the wall-TV dashboard
+           transitions into a degraded/unhealthy state. OFF by default;
+           suppressed in demo mode + during the post-restart catch-up. -->
+      <label class="field field--checkbox">
+        <input
+          type="checkbox"
+          checked={notifyPrefs.adapterSoundEnabled}
+          onchange={(e) => onToggleAdapterSound(e.currentTarget.checked)}
+          data-testid="notify-adapter-sound-toggle"
+        />
+        <span class="field__label">
+          Adapter riasztó hang / Adapter alert tone
         </span>
       </label>
     </section>

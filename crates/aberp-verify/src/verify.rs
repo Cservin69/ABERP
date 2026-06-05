@@ -875,7 +875,12 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // bundle.
         | EventKind::AdapterAdded
         | EventKind::AdapterUpdated
-        | EventKind::AdapterRemoved => (None, ""),
+        | EventKind::AdapterRemoved
+        // S258 / PR-247 — adapter health-transition telemetry. `mes.`-
+        // scoped runtime observation (adapter_id / from_state / to_state
+        // / ts); never carries NAV XML bytes, never sweeps a per-
+        // OUTGOING-invoice bundle.
+        | EventKind::AdapterHealthTransitioned => (None, ""),
     };
 
     Ok(NavExtraction {

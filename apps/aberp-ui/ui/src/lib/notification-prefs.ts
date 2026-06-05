@@ -17,13 +17,18 @@ const PREFS_KEY = "aberp:notifications:prefs";
 export interface NotificationPrefs {
   /** Fire a native OS notification (survives backgrounding) on arrival. */
   nativeEnabled: boolean;
-  /** Play a single subtle chime on arrival (suppressed in demo mode). */
+  /** Play a single subtle chime on quote arrival (suppressed in demo mode). */
   soundEnabled: boolean;
+  /** S258 / PR-247 — play a single alert tone when a Workshop adapter
+   *  transitions into a degraded/unhealthy state (suppressed in demo
+   *  mode + during the boot-grace catch-up, like the arrival chime). */
+  adapterSoundEnabled: boolean;
 }
 
 export const DEFAULT_NOTIFICATION_PREFS: NotificationPrefs = {
   nativeEnabled: false,
   soundEnabled: false,
+  adapterSoundEnabled: false,
 };
 
 function defaultStorage(): StorageLike | null {
@@ -54,6 +59,7 @@ export function loadNotificationPrefs(
     return {
       nativeEnabled: coerceBool(obj.nativeEnabled),
       soundEnabled: coerceBool(obj.soundEnabled),
+      adapterSoundEnabled: coerceBool(obj.adapterSoundEnabled),
     };
   } catch {
     return { ...DEFAULT_NOTIFICATION_PREFS };
@@ -71,6 +77,7 @@ export function saveNotificationPrefs(
     const clean: NotificationPrefs = {
       nativeEnabled: prefs.nativeEnabled === true,
       soundEnabled: prefs.soundEnabled === true,
+      adapterSoundEnabled: prefs.adapterSoundEnabled === true,
     };
     storage.setItem(PREFS_KEY, JSON.stringify(clean));
   } catch {

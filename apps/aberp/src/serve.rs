@@ -918,6 +918,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         shutdown_token: shutdown_token_root.clone(),
         adapter_registry: adapter_registry.clone(),
         adapter_manager: adapter_manager.clone(),
+        adapter_health_baseline: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     // 5. Build the axum router. Clone the state first so the app-boot
@@ -2021,6 +2022,17 @@ pub struct AppState {
     /// `adapter_registry` above. Backs the Settings → Adapters CRUD
     /// routes; persists to the `[[mes.adapters]]` seller.toml slot.
     pub adapter_manager: Arc<crate::mes_manager::AdapterManager>,
+    /// S258 / PR-247 — per-adapter last-observed health status, keyed by
+    /// adapter name, the diff baseline for `AdapterHealthTransitioned`
+    /// emission. Seeds silently on first sight after process boot
+    /// (boot-grace: a restart never re-emits an already-degraded
+    /// adapter), so each ledger entry records a genuine in-session
+    /// transition. The dashboard poll (`compute_workshop_dashboard`) is
+    /// the detection site — health is pull-only, so there is no separate
+    /// health-watcher daemon. The `Mutex` serialises concurrent polls so
+    /// two SPA sessions can't double-emit the same transition.
+    pub adapter_health_baseline:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, &'static str>>>,
 }
 
 /// Session-161 — max number of NAV poll daemons polling concurrently.
@@ -11149,6 +11161,13 @@ struct WorkshopDashboard {
     today: TodayPanel,
     recent_activity: Vec<RecentActivityEntry>,
     adapters: Vec<AdapterStatusSnapshot>,
+    /// S258 / PR-247 — recent adapter health transitions (newest-first,
+    /// capped). The wall-TV SPA drives the alert chime off these (boot-
+    /// grace high-water-mark by `seq`, flapping debounce by `at_iso8601`)
+    /// so a page reload recovers the alert state from the ledger, not
+    /// from in-memory JS. The red pulse itself is driven purely by the
+    /// live `adapters[].status` above — independent of this field.
+    adapter_transitions: Vec<AdapterTransitionEntry>,
     /// RFC3339 UTC instant the dashboard bundle was assembled. SPA
     /// uses it as the "last refreshed" marker.
     snapshot_at_iso8601: String,
@@ -11210,6 +11229,162 @@ fn adapter_health_status(h: &AdapterHealth) -> &'static str {
         AdapterHealth::Stopped => "stopped",
     }
 }
+
+/// S258 / PR-247 — durable audit payload for `AdapterHealthTransitioned`.
+/// `from_state` / `to_state` are the closed wire-vocab health strings;
+/// `ts` is the RFC3339 UTC instant the transition was observed (carried
+/// explicitly per the brief so the wall-TV chime's debounce clock
+/// survives a page reload without re-deriving it from the entry header).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AdapterHealthTransitionPayload {
+    adapter_id: String,
+    from_state: String,
+    to_state: String,
+    ts: String,
+}
+
+/// S258 / PR-247 — one health transition surfaced to the Workshop SPA so
+/// it can drive the chime (high-water-mark by `seq`, debounce by `ts`).
+/// Walked from the audit ledger each poll, NOT from in-memory — a page
+/// reload recovers the alert state from here.
+#[derive(Debug, Clone, Serialize)]
+struct AdapterTransitionEntry {
+    adapter_id: String,
+    from_state: String,
+    to_state: String,
+    at_iso8601: String,
+    seq: u64,
+}
+
+/// S258 / PR-247 — a detected in-session health change, ready to emit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdapterHealthTransition {
+    adapter_id: String,
+    from_state: &'static str,
+    to_state: &'static str,
+}
+
+/// S258 / PR-247 — PURE transition detection. Diffs the current adapter
+/// snapshot against the per-adapter `baseline` and returns the
+/// transitions to record, MUTATING `baseline` to the current state.
+///
+/// First-sight adapters (absent from `baseline`) seed silently with NO
+/// transition — this is the backend boot-grace: after a process restart
+/// the baseline is empty, so an adapter that was already `unhealthy`
+/// before boot does not generate a spurious catch-up transition. Only a
+/// genuine state change between two observations is returned.
+///
+/// Caller holds the `AppState` baseline mutex across this call so two
+/// concurrent dashboard polls can't both observe the same change and
+/// double-emit (the second poll sees the already-mutated baseline).
+fn diff_adapter_health(
+    baseline: &mut std::collections::HashMap<String, &'static str>,
+    adapters: &[AdapterStatusSnapshot],
+) -> Vec<AdapterHealthTransition> {
+    let mut out = Vec::new();
+    for a in adapters {
+        let to = a.status;
+        match baseline.get(a.name.as_str()).copied() {
+            None => {
+                baseline.insert(a.name.clone(), to);
+            }
+            Some(from) if from == to => {}
+            Some(from) => {
+                out.push(AdapterHealthTransition {
+                    adapter_id: a.name.clone(),
+                    from_state: from,
+                    to_state: to,
+                });
+                baseline.insert(a.name.clone(), to);
+            }
+        }
+    }
+    out
+}
+
+/// S258 / PR-247 — append one `AdapterHealthTransitioned` entry. Opens
+/// its own short-lived Connection (mirrors `mes_manager::audit`) so it
+/// composes with the dashboard's read Connection without a borrow
+/// conflict. The actor is a system identity — this is a daemon-style
+/// observation, not an operator action.
+fn emit_adapter_health_transition(
+    db_path: &std::path::Path,
+    tenant: &aberp_audit_ledger::TenantId,
+    binary_hash: aberp_audit_ledger::BinaryHash,
+    t: &AdapterHealthTransition,
+) -> anyhow::Result<()> {
+    let payload = AdapterHealthTransitionPayload {
+        adapter_id: t.adapter_id.clone(),
+        from_state: t.from_state.to_string(),
+        to_state: t.to_state.to_string(),
+        ts: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+    };
+    let bytes = serde_json::to_vec(&payload).context("serialize adapter health transition")?;
+    let actor = aberp_audit_ledger::Actor::from_local_cli(
+        ulid::Ulid::new().to_string(),
+        "system:adapter-health",
+    );
+    let mut conn =
+        Connection::open(db_path).context("open DuckDB for adapter health transition audit")?;
+    aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
+    let tx = conn.transaction().context("begin transition audit tx")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(tenant.clone(), binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        EventKind::AdapterHealthTransitioned,
+        bytes,
+        actor,
+        None,
+    )
+    .context("append AdapterHealthTransitioned")?;
+    tx.commit().context("commit transition audit tx")?;
+    Ok(())
+}
+
+/// S258 / PR-247 — walk recent audit entries for the latest health
+/// transitions to hand the SPA. Filters a wide window down to the
+/// `AdapterHealthTransitioned` kind, parses each payload, and returns the
+/// most-recent `ADAPTER_TRANSITION_LIMIT` newest-first. Malformed
+/// payloads are skipped (fail-soft on a single bad row; the pulse is
+/// state-driven and unaffected). The wide fetch tolerates a busy floor
+/// interleaving other events between transitions; a transition that ages
+/// out of the window only costs the chime, not the visual alarm.
+fn build_adapter_transitions(conn: &Connection) -> anyhow::Result<Vec<AdapterTransitionEntry>> {
+    let entries = aberp_audit_ledger::recent_entries(conn, ADAPTER_TRANSITION_SCAN_WINDOW)
+        .context("read recent audit-ledger entries for adapter transitions")?;
+    let mut out = Vec::new();
+    for e in entries {
+        if e.kind != EventKind::AdapterHealthTransitioned {
+            continue;
+        }
+        let Ok(p) = serde_json::from_slice::<AdapterHealthTransitionPayload>(&e.payload) else {
+            continue;
+        };
+        out.push(AdapterTransitionEntry {
+            adapter_id: p.adapter_id,
+            from_state: p.from_state,
+            to_state: p.to_state,
+            at_iso8601: e
+                .time_wall
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            seq: e.seq.as_u64(),
+        });
+        if out.len() >= ADAPTER_TRANSITION_LIMIT as usize {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Wide scan window for `build_adapter_transitions` — transitions are
+/// rare relative to shop-floor events, so we over-fetch then filter.
+const ADAPTER_TRANSITION_SCAN_WINDOW: u32 = 200;
+/// Cap on transitions handed to the SPA per poll (newest-first).
+const ADAPTER_TRANSITION_LIMIT: u32 = 20;
 
 #[derive(Debug, Serialize)]
 struct LowStockCount {
@@ -11486,6 +11661,38 @@ fn compute_workshop_dashboard(
     let (today_invoice_rows, today_invoice_total) = build_today_invoice_rows(state, &today_iso)
         .context("read today invoices for dashboard tile")?;
 
+    // S258 / PR-247 — detect adapter health transitions and record them
+    // to the ledger. Health is pull-only, so the dashboard poll is the
+    // detection site. The baseline mutex is held only across the pure
+    // diff (which mutates it to the current state) so concurrent polls
+    // can't double-emit; the DB appends happen after the lock is
+    // released. An append failure is logged loudly but does NOT fail the
+    // dashboard render — the operator's window stays up; the pulse (which
+    // reads live status, not the ledger) is unaffected.
+    let adapters = snapshot_adapter_registry(&state.adapter_registry);
+    let transitions_to_emit = {
+        let mut guard = state
+            .adapter_health_baseline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        diff_adapter_health(&mut guard, &adapters)
+    };
+    for t in &transitions_to_emit {
+        if let Err(e) =
+            emit_adapter_health_transition(&state.db_path, &state.tenant, binary_hash, t)
+        {
+            tracing::error!(
+                adapter_id = %t.adapter_id,
+                from = t.from_state,
+                to = t.to_state,
+                error = %e,
+                "failed to record AdapterHealthTransitioned audit entry",
+            );
+        }
+    }
+    let adapter_transitions = build_adapter_transitions(&conn)
+        .context("read recent adapter health transitions for dashboard")?;
+
     let snapshot_at_iso8601 = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
@@ -11520,7 +11727,8 @@ fn compute_workshop_dashboard(
                 seq: e.seq.as_u64(),
             })
             .collect(),
-        adapters: snapshot_adapter_registry(&state.adapter_registry),
+        adapters,
+        adapter_transitions,
         snapshot_at_iso8601,
         work_order_rows,
         low_stock_rows,
@@ -18408,6 +18616,9 @@ mod tests {
                 std::sync::Arc::new(std::sync::RwLock::new(aberp_mes::AdapterRegistry::new())),
                 tokio_util::sync::CancellationToken::new(),
             )),
+            adapter_health_baseline: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, storno_invoice_id)
@@ -18516,6 +18727,9 @@ mod tests {
             adapter_manager: std::sync::Arc::new(crate::mes_manager::AdapterManager::new(
                 std::sync::Arc::new(std::sync::RwLock::new(aberp_mes::AdapterRegistry::new())),
                 tokio_util::sync::CancellationToken::new(),
+            )),
+            adapter_health_baseline: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
             )),
         };
 
@@ -19032,6 +19246,74 @@ mod tests {
             assert_eq!(row.port, 0);
             assert_eq!(row.status, "healthy");
         }
+    }
+
+    fn snap(name: &str, status: &'static str) -> AdapterStatusSnapshot {
+        AdapterStatusSnapshot {
+            name: name.to_string(),
+            status,
+            kind: "cnc-machine",
+            host: String::new(),
+            port: 0,
+        }
+    }
+
+    /// S258 / PR-247 — first sight of an adapter SEEDS the baseline with
+    /// NO transition emitted. This is the backend boot-grace: after a
+    /// process restart the baseline is empty, so an adapter that was
+    /// already `unhealthy` before boot must not generate a spurious
+    /// catch-up transition (which would chime on the wall TV for a fault
+    /// that predates the restart).
+    #[test]
+    fn diff_adapter_health_first_sight_seeds_silently() {
+        let mut baseline = std::collections::HashMap::new();
+        let got = diff_adapter_health(
+            &mut baseline,
+            &[snap("cnc-01", "unhealthy"), snap("cnc-02", "healthy")],
+        );
+        assert!(got.is_empty(), "first sight must not emit a transition");
+        assert_eq!(baseline.get("cnc-01").copied(), Some("unhealthy"));
+        assert_eq!(baseline.get("cnc-02").copied(), Some("healthy"));
+    }
+
+    /// S258 / PR-247 — an unchanged status between two observations emits
+    /// nothing (no per-poll spam), and a genuine change emits exactly one
+    /// transition carrying the correct from/to and mutates the baseline.
+    #[test]
+    fn diff_adapter_health_emits_only_on_change() {
+        let mut baseline = std::collections::HashMap::new();
+        // Seed.
+        let _ = diff_adapter_health(&mut baseline, &[snap("cnc-01", "healthy")]);
+        // Unchanged → nothing.
+        let unchanged = diff_adapter_health(&mut baseline, &[snap("cnc-01", "healthy")]);
+        assert!(unchanged.is_empty());
+        // Change healthy → unhealthy → exactly one transition.
+        let changed = diff_adapter_health(&mut baseline, &[snap("cnc-01", "unhealthy")]);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].adapter_id, "cnc-01");
+        assert_eq!(changed[0].from_state, "healthy");
+        assert_eq!(changed[0].to_state, "unhealthy");
+        assert_eq!(baseline.get("cnc-01").copied(), Some("unhealthy"));
+    }
+
+    /// S258 / PR-247 — concurrent-poll dedup: because `diff_adapter_health`
+    /// mutates the baseline in place, a SECOND diff over the same changed
+    /// snapshot (the racing poll that grabbed the mutex right after the
+    /// first) sees the already-updated baseline and emits nothing. This is
+    /// why the caller holds the baseline mutex across the diff — the DB
+    /// append can then happen outside the lock without risking a double
+    /// `AdapterHealthTransitioned` row for one real change.
+    #[test]
+    fn diff_adapter_health_second_diff_after_change_is_idempotent() {
+        let mut baseline = std::collections::HashMap::new();
+        let _ = diff_adapter_health(&mut baseline, &[snap("cnc-01", "healthy")]);
+        let first = diff_adapter_health(&mut baseline, &[snap("cnc-01", "degraded")]);
+        assert_eq!(first.len(), 1);
+        let second = diff_adapter_health(&mut baseline, &[snap("cnc-01", "degraded")]);
+        assert!(
+            second.is_empty(),
+            "the racing poll must not re-emit the same transition"
+        );
     }
 
     /// S246 / PR-239 — `wo_touched_at` picks the most recent non-NULL

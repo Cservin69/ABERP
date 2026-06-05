@@ -48,3 +48,41 @@ export function playArrivalChime(): void {
     // No audio device / autoplay-blocked / jsdom — chime is optional.
   }
 }
+
+/** S258 / PR-247 — single alert tone for a Workshop adapter going
+ * degraded/unhealthy. Deliberately distinct from `playArrivalChime`: two
+ * DESCENDING notes (a "something dropped" cue) rather than the arrival's
+ * upward lift, and a touch louder. Still ONE short burst, never
+ * continuous — the CALLER owns the demo-mode + boot-grace + debounce
+ * gating; this just plays once when asked. Best-effort: silently no-ops
+ * when WebAudio is unavailable (vitest jsdom) or construction throws. */
+export function playAdapterAlert(): void {
+  const Ctor = audioCtor();
+  if (Ctor === null) return;
+  try {
+    const ctx = new Ctor();
+    const now = ctx.currentTime;
+    const gain = ctx.createGain();
+    gain.connect(ctx.destination);
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.12, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.5);
+
+    const osc = ctx.createOscillator();
+    osc.type = "triangle";
+    osc.frequency.setValueAtTime(660, now); // E5
+    osc.frequency.setValueAtTime(440, now + 0.14); // A4 — a downward drop
+    osc.connect(gain);
+    osc.start(now);
+    osc.stop(now + 0.51);
+    osc.onended = () => {
+      try {
+        void ctx.close();
+      } catch {
+        // ignore
+      }
+    };
+  } catch {
+    // No audio device / autoplay-blocked / jsdom — alert is optional.
+  }
+}

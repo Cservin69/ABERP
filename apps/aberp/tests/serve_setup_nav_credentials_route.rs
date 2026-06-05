@@ -189,6 +189,7 @@ fn build_state(boot_state: ServeBootState, tenant: &str) -> AppState {
             Arc::new(std::sync::RwLock::new(aberp_mes::AdapterRegistry::new())),
             tokio_util::sync::CancellationToken::new(),
         )),
+        adapter_health_baseline: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     }
 }
 

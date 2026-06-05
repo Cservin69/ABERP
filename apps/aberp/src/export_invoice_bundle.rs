@@ -756,7 +756,11 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // OUTGOING-invoice bundle.
         | EventKind::AdapterAdded
         | EventKind::AdapterUpdated
-        | EventKind::AdapterRemoved => None,
+        | EventKind::AdapterRemoved
+        // S258 / PR-247 — adapter health-transition telemetry. `mes.`-
+        // scoped runtime observation; no NAV bytes, never sweeps a per-
+        // OUTGOING-invoice bundle.
+        | EventKind::AdapterHealthTransitioned => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

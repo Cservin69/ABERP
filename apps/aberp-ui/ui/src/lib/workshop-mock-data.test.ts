@@ -69,12 +69,18 @@ describe("workshop-mock-data — shape pin", () => {
     expect(b.today.gross_revenue_eur_minor).toBe(1_245_000); // 12,450 EUR
   });
 
-  it("all adapters are healthy — shop floor 'green' demo state (S240 vocab)", () => {
+  it("includes a deliberately-unhealthy adapter — exercises demo-mode suppression (S258)", () => {
     const b = getMockDashboard();
     expect(b.adapters.length).toBeGreaterThan(0);
-    for (const a of b.adapters) {
-      expect(a.status).toBe("healthy");
-    }
+    // S258 / PR-247 — the RAW mock now carries one `unhealthy` adapter on
+    // purpose. The "all green on the demo wall" guarantee moved to the
+    // RENDER layer (Workshop.svelte forces `displayStatus` → healthy in
+    // demo mode); this fixture proves that suppression has something to
+    // suppress. The remaining adapters stay healthy so the tile isn't a
+    // sea of red.
+    const statuses = b.adapters.map((a) => a.status);
+    expect(statuses).toContain("unhealthy");
+    expect(statuses).toContain("healthy");
   });
 
   it("recent activity has 15-20 entries spanning the last 90 minutes", () => {
