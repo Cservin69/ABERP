@@ -40,6 +40,14 @@ pub struct QuoteIntakeRow {
     /// the "→ Draft" link instead of the pickup button when set.
     /// `None` for never-picked-up quotes.
     pub picked_up_drf_id: Option<String>,
+    /// S256 / PR-245 — closed-vocab intake state: `staged` (pickable),
+    /// `error` (malformed — surfaced with `intake_error` + retry/dismiss
+    /// actions), or `irrelevant` (operator-dismissed). Defaults to
+    /// `staged` for pre-S256 rows.
+    pub intake_state: String,
+    /// S256 / PR-245 — operator-readable mapping-failure message on an
+    /// `error`-state row; `None` otherwise.
+    pub intake_error: Option<String>,
 }
 
 /// List staged quote-intake rows for a tenant, ordered by intake time
@@ -57,10 +65,14 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Vec<
     // (or a pre-S255 boot followed by SPA load) gets the column
     // lazily.
     conn.execute_batch(S255_MIGRATION_BACKSTOP)?;
+    // S256 / PR-245 — additive `intake_state` + `intake_error` columns.
+    // Same lazy-backstop posture as S255 for a fresh tenant DB.
+    conn.execute_batch(S256_MIGRATION_BACKSTOP)?;
     let mut stmt = conn.prepare(
         "SELECT quote_id, invoice_id, received_at, intake_at,
                 status_writeback_at, raw_payload, prepared_draft,
-                picked_up_drf_id
+                picked_up_drf_id,
+                COALESCE(intake_state, 'staged'), intake_error
            FROM quote_intake_log
           WHERE tenant_id = ?1
           ORDER BY intake_at DESC
@@ -77,6 +89,10 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Vec<
         let raw_payload: String = row.get(5).unwrap_or_default();
         let prepared_draft: String = row.get(6).unwrap_or_default();
         let picked_up_drf_id: Option<String> = row.get(7).ok().flatten();
+        let intake_state: String = row
+            .get::<_, String>(8)
+            .unwrap_or_else(|_| "staged".to_string());
+        let intake_error: Option<String> = row.get(9).ok().flatten();
 
         let summary = extract_row_summary(&raw_payload, &prepared_draft);
         out.push(QuoteIntakeRow {
@@ -92,6 +108,8 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Vec<
             quantity: summary.quantity,
             notes: summary.notes,
             picked_up_drf_id,
+            intake_state,
+            intake_error,
         });
     }
     Ok(out)
@@ -120,6 +138,18 @@ CREATE TABLE IF NOT EXISTS quote_intake_log (
 const S255_MIGRATION_BACKSTOP: &str = "
 ALTER TABLE quote_intake_log
     ADD COLUMN IF NOT EXISTS picked_up_drf_id VARCHAR;
+";
+
+/// S256 / PR-245 — additive `intake_state` + `intake_error` columns.
+/// Mirrors the daemon-write side's `log_table::S256_MIGRATION_SQL`; run
+/// lazily on every list call so a fresh tenant whose daemon never
+/// spawned still gets the columns. `DEFAULT 'staged'` backfills pre-S256
+/// rows.
+const S256_MIGRATION_BACKSTOP: &str = "
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS intake_state VARCHAR DEFAULT 'staged';
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS intake_error VARCHAR;
 ";
 
 #[derive(Debug, Default)]

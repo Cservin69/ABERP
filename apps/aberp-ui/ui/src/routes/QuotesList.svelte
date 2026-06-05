@@ -21,7 +21,9 @@
   import { onMount } from "svelte";
   import {
     listQuoteIntake,
+    markQuoteIntakeIrrelevant,
     pickupQuoteAsDraft,
+    retryParseQuoteIntake,
     type QuoteIntakeRow,
   } from "../lib/api";
   import { formatInvoiceDate } from "../lib/format";
@@ -36,6 +38,9 @@
   // list doesn't leave a spinner visible after a refresh.
   let pickupBusyQuoteId = $state<string | null>(null);
   let pickupError = $state<string | null>(null);
+  // S256 / PR-245 — per-row recovery state for error (dead-letter) rows.
+  let recoverBusyQuoteId = $state<string | null>(null);
+  let recoverError = $state<string | null>(null);
 
   onMount(() => {
     void refresh();
@@ -90,6 +95,36 @@
         e instanceof Error ? e.message : String(e);
     } finally {
       pickupBusyQuoteId = null;
+    }
+  }
+
+  // S256 / PR-245 (brief §A.4) — dead-letter recovery on an error row.
+  // Retry re-parses the stored payload server-side; on success the row
+  // flips to `staged` and we refresh so the pickup button appears.
+  async function retryParse(row: QuoteIntakeRow): Promise<void> {
+    recoverBusyQuoteId = row.quote_id;
+    recoverError = null;
+    try {
+      await retryParseQuoteIntake(row.quote_id);
+      await refresh();
+    } catch (e) {
+      recoverError = e instanceof Error ? e.message : String(e);
+    } finally {
+      recoverBusyQuoteId = null;
+    }
+  }
+
+  // Dismiss a row (mark irrelevant). Drops it from the badge + queue.
+  async function dismissRow(row: QuoteIntakeRow): Promise<void> {
+    recoverBusyQuoteId = row.quote_id;
+    recoverError = null;
+    try {
+      await markQuoteIntakeIrrelevant(row.quote_id);
+      await refresh();
+    } catch (e) {
+      recoverError = e instanceof Error ? e.message : String(e);
+    } finally {
+      recoverBusyQuoteId = null;
     }
   }
 
@@ -156,6 +191,13 @@
     </div>
   {/if}
 
+  {#if recoverError !== null}
+    <div class="quotes-page__error" role="alert" data-testid="quotes-recover-error">
+      <strong>A művelet nem sikerült / Recovery action failed.</strong>
+      <p class="quotes-page__error-detail">{recoverError}</p>
+    </div>
+  {/if}
+
   {#if loadState === "loading" && rows.length === 0}
     <p class="quotes-page__muted">Betöltés… / Loading quotes…</p>
   {:else if loadState === "error"}
@@ -193,7 +235,12 @@
       <tbody>
         {#each rows as row (row.quote_id)}
           {@const wb = writebackLabel(row.status_writeback_at)}
-          <tr data-testid="quotes-row" data-quote-id={row.quote_id}>
+          <tr
+            data-testid="quotes-row"
+            data-quote-id={row.quote_id}
+            data-state={row.intake_state}
+            class:quotes-row--error={row.intake_state === "error"}
+          >
             <td>{fmt(row.received_at)}</td>
             <td>{fmt(row.intake_at)}</td>
             <td>
@@ -240,7 +287,48 @@
               >{wb.hu}</span>
             </td>
             <td>
-              {#if row.picked_up_drf_id}
+              {#if row.intake_state === "error"}
+                <!-- S256 / PR-245 — dead-letter row: a malformed quote
+                     the daemon staged instead of dropping. Show the
+                     reason + recovery actions. -->
+                <div
+                  class="quotes-row__error-msg"
+                  data-testid="quotes-row-error-msg"
+                  title={row.intake_error ?? undefined}
+                >
+                  ⚠ {row.intake_error ?? "Hibás ajánlat / Malformed quote"}
+                </div>
+                <div class="quotes-row__error-actions">
+                  <button
+                    type="button"
+                    class="quotes-row__pickup"
+                    data-testid="quotes-row-retry-btn"
+                    disabled={recoverBusyQuoteId === row.quote_id}
+                    onclick={() => void retryParse(row)}
+                    title="Re-parse the stored payload (S256)"
+                  >
+                    {recoverBusyQuoteId === row.quote_id
+                      ? "…"
+                      : "Újrapróbálás / Retry parse"}
+                  </button>
+                  <button
+                    type="button"
+                    class="quotes-row__dismiss"
+                    data-testid="quotes-row-dismiss-btn"
+                    disabled={recoverBusyQuoteId === row.quote_id}
+                    onclick={() => void dismissRow(row)}
+                    title="Mark this quote irrelevant (S256)"
+                  >
+                    Elvetés / Dismiss
+                  </button>
+                </div>
+              {:else if row.intake_state === "irrelevant"}
+                <span
+                  class="quotes-chip"
+                  data-testid="quotes-row-dismissed"
+                  title="Marked irrelevant by an operator"
+                >Elvetve / Dismissed</span>
+              {:else if row.picked_up_drf_id}
                 <button
                   type="button"
                   class="quotes-row__draft-link"
@@ -522,5 +610,47 @@
   .quotes-row__draft-link:hover {
     color: var(--color-text-strong);
     border-color: var(--color-text-strong);
+  }
+
+  /* S256 / PR-245 — dead-letter (error-state) row affordances. A left
+   * hairline in the warning signal colour marks the row; the message is
+   * quiet (it's recoverable, not a hard failure). */
+  .quotes-row--error td:first-child {
+    border-left: 3px solid var(--color-signal-warning);
+  }
+
+  .quotes-row__error-msg {
+    color: var(--color-signal-warning);
+    font-size: var(--type-size-xs);
+    max-width: 18rem;
+    margin-bottom: var(--space-1);
+  }
+
+  .quotes-row__error-actions {
+    display: flex;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+  }
+
+  .quotes-row__dismiss {
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    transition: color var(--motion-fade-in);
+  }
+
+  .quotes-row__dismiss:hover:not(:disabled) {
+    color: var(--color-signal-negative);
+    border-color: var(--color-signal-negative);
+  }
+
+  .quotes-row__dismiss:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 </style>

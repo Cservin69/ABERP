@@ -860,7 +860,15 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // S255 / PR-244 — quote-pickup event. Same `drf_<ULID>` keying
         // (the payload references the staged draft); bundle excludes
         // by the standard `inv_<ULID>` id-filter. No NAV bytes.
-        | EventKind::InvoicePickedUpFromQuote => (None, ""),
+        | EventKind::InvoicePickedUpFromQuote
+        // S256 / PR-245 — quote-intake hardening kinds. `system.`-scoped
+        // sister-service staging telemetry (per-cycle heartbeat, per-row
+        // arrival, structured failure); poll counters + quote_ids, never
+        // NAV XML bytes. Same no-bytes posture as
+        // `QuoteIntakePollCompleted` (which these supersede / accompany).
+        | EventKind::QuoteIntakePollAttempted
+        | EventKind::QuoteIntakeRowAdded
+        | EventKind::QuoteIntakePollFailed => (None, ""),
     };
 
     Ok(NavExtraction {

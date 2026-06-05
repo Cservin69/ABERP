@@ -41,6 +41,7 @@
   import {
     adapterDotClass,
     adapterStatusLabel,
+    eventKindGlyph,
     fmtEventKind,
     fmtMinor,
     resolvePollInterval,
@@ -896,8 +897,14 @@
             bind:this={activityList}
           >
             {#each b.recent_activity as entry (entry.id)}
-              <li class="ws-activity__row">
-                <span class="ws-activity__kind">{fmtEventKind(entry.kind)}</span>
+              {@const glyph = eventKindGlyph(entry.kind)}
+              <li class="ws-activity__row" data-kind={entry.kind}>
+                <span class="ws-activity__kind">
+                  {#if glyph !== ""}<span
+                      class="ws-activity__glyph"
+                      aria-hidden="true">{glyph}</span
+                    >{/if}{fmtEventKind(entry.kind)}</span
+                >
                 <time
                   class="ws-activity__time"
                   datetime={entry.at_iso8601}
@@ -1516,6 +1523,13 @@
   .ws-activity__kind {
     color: var(--color-text-strong);
     font-family: var(--type-family-mono);
+  }
+
+  /* S256 / PR-245 — quote-arrival glyph (📨); a hair of right-margin so
+   * it doesn't crowd the label. */
+  .ws-activity__glyph {
+    margin-right: var(--space-1);
+    font-family: var(--type-family-body);
   }
 
   .ws-activity__time {

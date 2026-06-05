@@ -15,9 +15,22 @@ import type { AdapterStatus } from "./api";
  * surfaced honestly per CLAUDE.md rule 12 — no silent hiding). */
 export function fmtEventKind(kind: string): string {
   if (kind === "") return "";
+  // S256 / PR-245 — friendly label for quote arrivals so the Workshop
+  // recent-activity tile reads "New quote" rather than the raw
+  // `quote_intake_row_added`.
+  if (kind === "system.quote_intake_row_added") return "Új ajánlat / New quote";
   const dotIdx = kind.indexOf(".");
   if (dotIdx === -1) return kind;
   return kind.slice(dotIdx + 1);
+}
+
+/** S256 / PR-245 — leading glyph for a recent-activity row. Quote
+ * arrivals get a 📨 so they're visually distinct from the WO / QA /
+ * dispatch shop-floor events they're interleaved with (brief §B.9).
+ * Empty string for every other kind (no glyph). */
+export function eventKindGlyph(kind: string): string {
+  if (kind === "system.quote_intake_row_added") return "📨";
+  return "";
 }
 
 /** S240 / PR-234 — CSS-class suffix for an adapter status dot.

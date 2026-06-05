@@ -743,7 +743,14 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // per-OUTGOING-invoice bundle never matches because there is
         // no `inv_<ULID>` until the operator's Issue click promotes
         // the draft. No NAV bytes.
-        | EventKind::InvoicePickedUpFromQuote => None,
+        | EventKind::InvoicePickedUpFromQuote
+        // S256 / PR-245 — quote-intake hardening kinds. `system.`-scoped
+        // sister-service staging telemetry (per-cycle heartbeat, per-row
+        // arrival, structured failure). Carry poll counters + quote_ids,
+        // never NAV bytes; never sweep a per-OUTGOING-invoice bundle.
+        | EventKind::QuoteIntakePollAttempted
+        | EventKind::QuoteIntakeRowAdded
+        | EventKind::QuoteIntakePollFailed => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

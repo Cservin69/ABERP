@@ -1072,6 +1072,61 @@ pub enum EventKind {
     ///
     /// F12 four-edit ritual fires once.
     InvoicePickedUpFromQuote,
+
+    /// S256 / PR-245 — the quote-intake daemon completed one poll cycle
+    /// AND wrote an audit entry for it **regardless of outcome**. This
+    /// is the v2 per-cycle heartbeat kind: it supersedes the
+    /// conditional [`EventKind::QuoteIntakePollCompleted`] (S210), which
+    /// only fired when `fetched > 0 || failure || error` and so left the
+    /// Settings → Quote Intake panel reading "No daemon cycle has
+    /// emitted an audit entry yet" on a healthy-but-idle daemon. Per the
+    /// module-header convention ("bumping a payload schema renames the
+    /// kind; the old kind remains valid for historical entries") this is
+    /// a clean schema-version bump — `QuoteIntakePollCompleted` is
+    /// retained for parsing pre-S256 rows but no longer emitted.
+    ///
+    /// Payload (`aberp_quote_intake::QuoteIntakePollPayload`, unchanged)
+    /// carries the idempotency key, cycle trigger, counts, `elapsed_ms`,
+    /// and an optional `error`. `system.` prefix — never sweeps a
+    /// per-OUTGOING-invoice export bundle.
+    ///
+    /// F12 four-edit ritual fires once.
+    QuoteIntakePollAttempted,
+
+    /// S256 / PR-245 — one approved quote was freshly staged into
+    /// `quote_intake_log` during a poll cycle. ONE entry per quote
+    /// ingested (NOT per cycle). Carries the customer's source-of-truth
+    /// `quote_id` (the reference UUID from the storefront `metadata`) so
+    /// an arrival is traceable end-to-end, plus the minted `invoice_id`
+    /// and the `intake_at` timestamp. This is the read-side signal the
+    /// SPA badge + arrival toast key on: the un-picked-up count
+    /// increments when one of these lands.
+    ///
+    /// Payload (`aberp_quote_intake::QuoteIntakeRowAddedPayload`).
+    /// `system.` prefix — a staging event for a sister-service quote,
+    /// not a regulated invoice-lifecycle entry; never sweeps a
+    /// per-OUTGOING-invoice export bundle.
+    ///
+    /// F12 four-edit ritual fires once.
+    QuoteIntakeRowAdded,
+
+    /// S256 / PR-245 — a poll cycle aborted because the storefront HTTP
+    /// call failed (transport error / non-2xx). Distinct from
+    /// [`EventKind::QuoteIntakePollAttempted`] (which still fires for the
+    /// same cycle, carrying the free-text `error`): THIS entry carries a
+    /// **structured, closed-vocab** `reason`
+    /// (`aberp_quote_intake::PollFailureReason`) so the failure can be
+    /// dashboarded by class later without parsing free text. A 401
+    /// `unauthorized` reason additionally tells the operator-facing
+    /// Settings panel to surface the "re-paste bearer" prompt (the
+    /// daemon pauses rather than hammering a rotated bearer).
+    ///
+    /// Payload (`aberp_quote_intake::QuoteIntakePollFailedPayload`).
+    /// `system.` prefix — never sweeps a per-OUTGOING-invoice export
+    /// bundle.
+    ///
+    /// F12 four-edit ritual fires once.
+    QuoteIntakePollFailed,
 }
 
 impl EventKind {
@@ -1131,6 +1186,9 @@ impl EventKind {
             EventKind::InvoiceStaged => "invoice.staged",
             EventKind::InvoiceDraftDeleted => "invoice.draft_deleted",
             EventKind::InvoicePickedUpFromQuote => "invoice.picked_up_from_quote",
+            EventKind::QuoteIntakePollAttempted => "system.quote_intake_poll_attempted",
+            EventKind::QuoteIntakeRowAdded => "system.quote_intake_row_added",
+            EventKind::QuoteIntakePollFailed => "system.quote_intake_poll_failed",
         }
     }
 
@@ -1201,6 +1259,9 @@ impl EventKind {
             "invoice.staged" => Ok(EventKind::InvoiceStaged),
             "invoice.draft_deleted" => Ok(EventKind::InvoiceDraftDeleted),
             "invoice.picked_up_from_quote" => Ok(EventKind::InvoicePickedUpFromQuote),
+            "system.quote_intake_poll_attempted" => Ok(EventKind::QuoteIntakePollAttempted),
+            "system.quote_intake_row_added" => Ok(EventKind::QuoteIntakeRowAdded),
+            "system.quote_intake_poll_failed" => Ok(EventKind::QuoteIntakePollFailed),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1263,6 +1324,9 @@ mod tests {
             EventKind::InvoiceStaged,
             EventKind::InvoiceDraftDeleted,
             EventKind::InvoicePickedUpFromQuote,
+            EventKind::QuoteIntakePollAttempted,
+            EventKind::QuoteIntakeRowAdded,
+            EventKind::QuoteIntakePollFailed,
         ];
         for v in variants {
             let s = v.as_str();
@@ -2312,5 +2376,60 @@ mod tests {
             EventKind::ExtNavPartnerManualLink.as_str(),
             EventKind::InvoiceRestoredFromNav.as_str()
         );
+    }
+
+    /// S256 / PR-245 — the three new quote-intake hardening kinds all
+    /// use the `system.` prefix (sister-service staging traffic, never
+    /// a per-OUTGOING-invoice surface). Same prefix-pin posture as
+    /// `s210_quote_intake_poll_completed_uses_system_prefix`.
+    #[test]
+    fn s256_quote_intake_kinds_use_system_prefix() {
+        for k in [
+            EventKind::QuoteIntakePollAttempted,
+            EventKind::QuoteIntakeRowAdded,
+            EventKind::QuoteIntakePollFailed,
+        ] {
+            let s = k.as_str();
+            assert!(s.starts_with("system."), "{s} must start with system.");
+            assert!(
+                !s.starts_with("invoice."),
+                "{s} must not start with invoice."
+            );
+            assert!(!s.starts_with("mes."), "{s} must not start with mes.");
+        }
+        assert_eq!(
+            EventKind::QuoteIntakePollAttempted.as_str(),
+            "system.quote_intake_poll_attempted"
+        );
+        assert_eq!(
+            EventKind::QuoteIntakeRowAdded.as_str(),
+            "system.quote_intake_row_added"
+        );
+        assert_eq!(
+            EventKind::QuoteIntakePollFailed.as_str(),
+            "system.quote_intake_poll_failed"
+        );
+    }
+
+    /// S256 / PR-245 — the three new kinds are pairwise-distinct AND
+    /// distinct from the superseded `QuoteIntakePollCompleted` (S210)
+    /// and the S255 pickup kind. `QuoteIntakePollAttempted` is the v2
+    /// rename of the cycle kind — it MUST NOT collide with the v1
+    /// storage string or historical-row parsing would mis-route.
+    #[test]
+    fn s256_quote_intake_kinds_are_distinct() {
+        let new = [
+            EventKind::QuoteIntakePollAttempted.as_str(),
+            EventKind::QuoteIntakeRowAdded.as_str(),
+            EventKind::QuoteIntakePollFailed.as_str(),
+        ];
+        assert_ne!(new[0], new[1]);
+        assert_ne!(new[0], new[2]);
+        assert_ne!(new[1], new[2]);
+        for k in new {
+            assert_ne!(k, EventKind::QuoteIntakePollCompleted.as_str());
+            assert_ne!(k, EventKind::InvoicePickedUpFromQuote.as_str());
+            assert_ne!(k, EventKind::IncomingInvoiceSyncCycleCompleted.as_str());
+        }
     }
 }

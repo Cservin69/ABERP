@@ -71,6 +71,21 @@
     type NumberingSegment,
     type NumberingTemplate,
   } from "../lib/invoice-numbering";
+  // S256 / PR-245 — per-machine notification preferences (native OS
+  // notification + chime on quote arrival). localStorage-backed, not
+  // seller.toml ([[seller-toml-write-invariant]]).
+  import {
+    DEFAULT_NOTIFICATION_PREFS,
+    loadNotificationPrefs,
+    saveNotificationPrefs,
+    type NotificationPrefs,
+  } from "../lib/notification-prefs";
+  import {
+    ensureNativePermission,
+    nativeNotificationsSupported,
+    nativePermission,
+    type NativePermission,
+  } from "../lib/native-notify";
   import { formFromSellerInfo } from "../lib/tenant-settings";
 
   // S165 — `isProductionBuild` comes from `GET /health` (threaded down
@@ -181,6 +196,9 @@
   let quoteIntakeHasToken = $state(false);
   let quoteIntakeEnvOverride = $state(false);
   let quoteIntakeLastPoll: QuoteIntakeConfigResponse["last_poll"] = $state(null);
+  // S256 / PR-245 — daemon paused on a 401 (bearer rotated). Drives the
+  // "re-paste bearer" prompt in the Quote Intake panel.
+  let quoteIntakeAuthPaused = $state(false);
   let quoteIntakeSubmitting = $state(false);
   let quoteIntakeSubmitError: string | null = $state(null);
   let quoteIntakeSaved = $state(false);
@@ -196,6 +214,41 @@
   let quoteIntakeTesting = $state(false);
   let quoteIntakeTestOutcome: QuoteIntakeTestOutcome | null = $state(null);
   let quoteIntakeTestError: string | null = $state(null);
+
+  // S256 / PR-245 — per-machine notification prefs (native OS
+  // notification + chime on quote arrival). Loaded from localStorage on
+  // mount; both default OFF. `notifyNativeSupported` / `notifyPermission`
+  // gate the native toggle (a denied OS permission disables it).
+  let notifyPrefs: NotificationPrefs = $state({ ...DEFAULT_NOTIFICATION_PREFS });
+  let notifyNativeSupported = $state(false);
+  let notifyPermission: NativePermission = $state("unsupported");
+
+  function loadNotifyPrefsFromStorage() {
+    notifyPrefs = loadNotificationPrefs();
+    notifyNativeSupported = nativeNotificationsSupported();
+    notifyPermission = nativePermission();
+  }
+
+  // Enabling native notifications prompts for OS permission on first
+  // enable (§B.10). If the operator denies it, we revert the toggle and
+  // leave the prompt-state recorded by the browser (we never re-prompt).
+  async function onToggleNativeNotifications(next: boolean) {
+    if (!next) {
+      notifyPrefs = { ...notifyPrefs, nativeEnabled: false };
+      saveNotificationPrefs(notifyPrefs);
+      return;
+    }
+    const perm = await ensureNativePermission();
+    notifyPermission = perm;
+    const granted = perm === "granted";
+    notifyPrefs = { ...notifyPrefs, nativeEnabled: granted };
+    saveNotificationPrefs(notifyPrefs);
+  }
+
+  function onToggleSound(next: boolean) {
+    notifyPrefs = { ...notifyPrefs, soundEnabled: next };
+    saveNotificationPrefs(notifyPrefs);
+  }
   let numberingLiteralDraft = $state("");
   let numberingValidation = $derived(validateTemplate(numbering));
   let numberingPreview = $derived.by(() => {
@@ -229,6 +282,7 @@
     void loadNumbering();
     void loadSmtpConfig();
     void loadQuoteIntakeConfig();
+    loadNotifyPrefsFromStorage();
   });
 
   async function loadSellerInfo() {
@@ -572,6 +626,7 @@
       quoteIntakeHasToken = response.has_token;
       quoteIntakeEnvOverride = response.env_override_active;
       quoteIntakeLastPoll = response.last_poll ?? null;
+      quoteIntakeAuthPaused = response.auth_paused;
       quoteIntakeLastKnownEnabled = response.enabled;
       quoteIntakeLastKnownBaseUrl = response.base_url ?? "";
       quoteIntakeLastKnownInterval = response.poll_interval_secs;
@@ -1402,6 +1457,25 @@
           </div>
         {/if}
 
+        {#if quoteIntakeAuthPaused}
+          <div
+            class="page__error"
+            role="alert"
+            data-testid="quote-intake-auth-paused"
+          >
+            <strong>⏸ A daemon szünetel — 401 Unauthorized.</strong>
+            <p class="page__error-detail">
+              Az ABERP-site elutasította a bearer tokent (rotálva lett?).
+              A daemon leállt, hogy ne hívja folyamatosan egy rossz
+              tokennel. Illeszd be újra a tokent lentebb, mentsd el, és
+              indítsd újra az ABERP-et. / The storefront rejected the
+              bearer token (rotated?). The daemon paused rather than
+              hammer a bad credential. Re-paste the token below, save,
+              and restart ABERP to resume.
+            </p>
+          </div>
+        {/if}
+
         <form
           onsubmit={onSaveQuoteIntake}
           class="page__form"
@@ -1595,6 +1669,75 @@
           </fieldset>
         </form>
       {/if}
+    </section>
+
+    <!-- S256 / PR-245 — arrival notifications (brief §B.10/§B.11). These
+         are PER-MACHINE desktop prefs in localStorage (not seller.toml),
+         both default OFF. The in-app toast + sidebar badge always work;
+         these add an optional native OS notification + a chime. -->
+    <section
+      class="page__banks"
+      aria-labelledby="notifications-title"
+      data-testid="notifications-section"
+    >
+      <header class="page__banks-head">
+        <h3 id="notifications-title" class="page__section">
+          Értesítések / Notifications
+          <span class="page__section-hint">
+            új ajánlat érkezésekor · S256 · ezen a gépen
+          </span>
+        </h3>
+      </header>
+
+      <p class="page__muted" style="margin-bottom: var(--space-3);">
+        Új ajánlat érkezésekor mindig megjelenik egy buborék + a Quotes
+        fül jelvénye. Opcionálisan kérhetsz rendszerszintű értesítést
+        (akkor is látszik, ha az ABERP a háttérben van) és egy halk
+        hangjelzést. Ezek a beállítások csak ezen a gépen érvényesek. /
+        A new quote always shows an in-app toast + the Quotes badge.
+        Optionally also get a native OS notification (survives ABERP
+        being in the background) and a subtle chime. These are
+        per-machine.
+      </p>
+
+      <label class="field field--checkbox">
+        <input
+          type="checkbox"
+          checked={notifyPrefs.nativeEnabled}
+          disabled={!notifyNativeSupported || notifyPermission === "denied"}
+          onchange={(e) =>
+            void onToggleNativeNotifications(e.currentTarget.checked)}
+          data-testid="notify-native-toggle"
+        />
+        <span class="field__label">
+          Rendszerszintű értesítés / Native OS notification
+        </span>
+      </label>
+      {#if !notifyNativeSupported}
+        <p class="page__muted" data-testid="notify-native-unsupported">
+          A rendszerszintű értesítés ezen a build-en nem érhető el. /
+          Native notifications aren't available in this build.
+        </p>
+      {:else if notifyPermission === "denied"}
+        <p class="page__muted" data-testid="notify-native-denied">
+          Az értesítési engedély meg lett tagadva. Engedélyezd a macOS
+          rendszerbeállításokban, majd indítsd újra az ABERP-et. /
+          OS notification permission was denied — grant it in macOS
+          System Settings, then restart ABERP.
+        </p>
+      {/if}
+
+      <label class="field field--checkbox">
+        <input
+          type="checkbox"
+          checked={notifyPrefs.soundEnabled}
+          onchange={(e) => onToggleSound(e.currentTarget.checked)}
+          data-testid="notify-sound-toggle"
+        />
+        <span class="field__label">
+          Halk hangjelzés / Subtle chime
+        </span>
+      </label>
     </section>
 
     {#if bankModalOpen}

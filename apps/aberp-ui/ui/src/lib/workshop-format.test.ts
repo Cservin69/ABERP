@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   adapterDotClass,
   adapterStatusLabel,
+  eventKindGlyph,
   fmtEventKind,
   fmtMinor,
   resolvePollInterval,
@@ -28,6 +29,25 @@ describe("fmtEventKind", () => {
 
   it("handles empty input without throwing", () => {
     expect(fmtEventKind("")).toBe("");
+  });
+
+  it("S256 — gives quote arrivals a friendly bilingual label", () => {
+    expect(fmtEventKind("system.quote_intake_row_added")).toBe(
+      "Új ajánlat / New quote",
+    );
+  });
+});
+
+describe("eventKindGlyph — S256 quote-arrival glyph", () => {
+  it("returns the 📨 glyph for a quote arrival", () => {
+    expect(eventKindGlyph("system.quote_intake_row_added")).toBe("📨");
+  });
+
+  it("returns no glyph for shop-floor / other kinds", () => {
+    expect(eventKindGlyph("mes.dispatch_shipped")).toBe("");
+    expect(eventKindGlyph("InvoiceIssued")).toBe("");
+    expect(eventKindGlyph("system.quote_intake_poll_attempted")).toBe("");
+    expect(eventKindGlyph("")).toBe("");
   });
 });
 

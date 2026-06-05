@@ -1089,6 +1089,38 @@ pub async fn pickup_quote_as_draft(
     forward_post(&state, &path, Value::Null).await
 }
 
+/// S256 / PR-245 — one polled endpoint feeding the sidebar badge +
+/// arrival toast + 401 prompt. `GET /api/quote-intake/notifications`
+/// returns `{ unpicked_count, errored_count, live_ready, live_arrivals,
+/// auth_paused }`. Polled by App.svelte on a timer.
+#[tauri::command]
+pub async fn quote_intake_notifications(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quote-intake/notifications", true).await
+}
+
+/// S256 / PR-245 — dead-letter recovery: re-parse the stored payload of
+/// an `error`-state quote. `POST /api/quote-intake/{quote_id}/retry-parse`.
+/// 200 on success (row flips to `staged`); 422 if still malformed.
+#[tauri::command]
+pub async fn quote_intake_retry_parse(
+    state: State<'_, AppState>,
+    quote_id: String,
+) -> Result<Value, String> {
+    let path = format!("/api/quote-intake/{quote_id}/retry-parse");
+    forward_post(&state, &path, Value::Null).await
+}
+
+/// S256 / PR-245 — dismiss a quote (typically a dead-letter error row).
+/// `POST /api/quote-intake/{quote_id}/mark-irrelevant`.
+#[tauri::command]
+pub async fn quote_intake_mark_irrelevant(
+    state: State<'_, AppState>,
+    quote_id: String,
+) -> Result<Value, String> {
+    let path = format!("/api/quote-intake/{quote_id}/mark-irrelevant");
+    forward_post(&state, &path, Value::Null).await
+}
+
 /// S180 / PR-180 — operator-clicked NAV-as-DR restore wizard.
 /// `POST /api/restore-from-nav-outgoing { year }`. Synchronous (walks
 /// 12 months × pagination against NAV); the SPA gates the click on

@@ -2489,6 +2489,10 @@ export interface QuoteIntakeConfigResponse {
   has_token: boolean;
   env_override_active: boolean;
   last_poll?: QuoteIntakeLastPoll | null;
+  /** S256 / PR-245 — `true` when the daemon paused on a 401 (bearer
+   * rotated). The Quote Intake settings panel surfaces the "re-paste
+   * bearer" prompt when set. */
+  auth_paused: boolean;
 }
 
 /** PUT body — `token` is optional; an empty / absent value leaves the
@@ -2547,10 +2551,54 @@ export interface QuoteIntakeRow {
    * renders the pickup button when null and the "→ Draft" link when
    * populated. */
   picked_up_drf_id: string | null;
+  /** S256 / PR-245 — closed-vocab intake state. `staged` rows are
+   * pickable; `error` rows are malformed (show `intake_error` + the
+   * retry/dismiss actions); `irrelevant` rows were operator-dismissed. */
+  intake_state: "staged" | "error" | "irrelevant";
+  /** S256 / PR-245 — mapping-failure message on an `error` row. */
+  intake_error: string | null;
 }
 
 export async function listQuoteIntake(): Promise<QuoteIntakeRow[]> {
   return invoke<QuoteIntakeRow[]>("list_quote_intake");
+}
+
+/** S256 / PR-245 — one live arrival (post-catch-up, still un-picked). */
+export interface QuoteArrival {
+  quote_id: string;
+  intake_at: string;
+}
+
+/** S256 / PR-245 — polled notifications bundle feeding the sidebar/tab
+ * badge AND the arrival toast. `unpicked_count` is DB truth (survives an
+ * app restart); `live_arrivals` are the post-catch-up arrivals the toast
+ * coalesces; `auth_paused` mirrors the config flag. */
+export interface QuoteIntakeNotifications {
+  unpicked_count: number;
+  errored_count: number;
+  live_ready: boolean;
+  live_arrivals: QuoteArrival[];
+  auth_paused: boolean;
+}
+
+export async function getQuoteIntakeNotifications(): Promise<QuoteIntakeNotifications> {
+  return invoke<QuoteIntakeNotifications>("quote_intake_notifications");
+}
+
+/** S256 / PR-245 — re-parse an `error`-state quote's stored payload.
+ * Resolves on 200 (flipped to `staged`); rejects with the backend error
+ * text on 404 (not in error state) or 422 (still malformed). */
+export async function retryParseQuoteIntake(
+  quoteId: string,
+): Promise<{ quote_id: string; state: string }> {
+  return invoke("quote_intake_retry_parse", { quoteId });
+}
+
+/** S256 / PR-245 — dismiss a quote (mark `irrelevant`). */
+export async function markQuoteIntakeIrrelevant(
+  quoteId: string,
+): Promise<{ quote_id: string; state: string }> {
+  return invoke("quote_intake_mark_irrelevant", { quoteId });
 }
 
 /** S255 / PR-244 — outcome of POST `/api/quotes/{quote_id}/pickup-as-draft`.

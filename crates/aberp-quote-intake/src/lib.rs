@@ -42,7 +42,11 @@ pub mod payload;
 pub mod service;
 pub mod transport;
 
-pub use audit::{audit_kind_string, write_poll_audit_entry, QuoteIntakePollPayload};
+pub use audit::{
+    audit_kind_string, write_poll_audit_entry, write_poll_failed_entry, write_row_added_entry,
+    PollFailureReason, QuoteIntakePollFailedPayload, QuoteIntakePollPayload,
+    QuoteIntakeRowAddedPayload,
+};
 pub use config::QuoteIntakeConfig;
 pub use error::QuoteIntakeError;
 pub use mapping::{quote_to_draft_invoice, MappingOutcome, PreparedDraft};

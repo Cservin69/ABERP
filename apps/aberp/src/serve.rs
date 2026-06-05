@@ -1251,6 +1251,10 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // spawn a daemon that polls a wrong URL forever. Per
         // [[trust-code-not-operator]] and brief §8.
         {
+            // S256 / PR-245 — stamp the boot wall-time so the
+            // notifications route can tell catch-up arrivals (first
+            // cycle after boot) from live arrivals (operator watching).
+            mark_quote_intake_boot();
             let st = recovery_state.clone();
             let cfg_result: std::result::Result<QuoteIntakeConfig, QuoteIntakeError> =
                 match QuoteIntakeConfig::from_env() {
@@ -2361,6 +2365,23 @@ fn build_router(state: AppState) -> Router {
             post(handle_test_quote_intake_connection),
         )
         .route("/api/quote-intake/quotes", get(handle_list_quote_intake))
+        // S256 / PR-245 — one polled endpoint feeding the sidebar badge
+        // (un-picked count, DB truth) + the arrival toast (live arrivals
+        // past the catch-up boundary) + the 401 re-paste-bearer prompt.
+        .route(
+            "/api/quote-intake/notifications",
+            get(handle_quote_intake_notifications),
+        )
+        // S256 / PR-245 — dead-letter recovery for malformed (error-state)
+        // rows: re-parse the stored payload, or dismiss as irrelevant.
+        .route(
+            "/api/quote-intake/:quote_id/retry-parse",
+            post(handle_quote_intake_retry_parse),
+        )
+        .route(
+            "/api/quote-intake/:quote_id/mark-irrelevant",
+            post(handle_quote_intake_mark_irrelevant),
+        )
         // S255 / PR-244 — operator-clicked pickup. POST mints a Draft
         // referencing the quote; the SPA navigates to the Invoices tab
         // where the new row surfaces under the [[aberp-invoice-draft-state]]
@@ -11157,8 +11178,25 @@ fn compute_workshop_dashboard(
     let shipped_today =
         aberp_dispatch::count_dispatches_shipped_today(&conn, tenant_str, &today_iso)
             .context("count dispatches shipped today")?;
-    let recent = aberp_audit_ledger::recent_entries(&conn, DASHBOARD_RECENT_ACTIVITY_LIMIT)
-        .context("read recent audit-ledger entries")?;
+    // S256 / PR-245 — the quote-intake daemon now emits a
+    // `QuoteIntakePollAttempted` heartbeat EVERY cycle (≈1/min when
+    // enabled). Left unfiltered it would flood this 10-row tile with
+    // "poll attempted" noise and crowd out the genuine activity. Fetch a
+    // wider window, drop the heartbeat (keeping the meaningful
+    // `QuoteIntakeRowAdded` arrivals + `QuoteIntakePollFailed`), then
+    // truncate. Brief §B.9 wants ARRIVALS interleaved, not heartbeats.
+    let recent: Vec<_> = aberp_audit_ledger::recent_entries(
+        &conn,
+        DASHBOARD_RECENT_ACTIVITY_LIMIT.saturating_mul(5),
+    )
+    .context("read recent audit-ledger entries")?
+    .into_iter()
+    .filter(|e| {
+        e.kind != EventKind::QuoteIntakePollAttempted
+            && e.kind != EventKind::QuoteIntakePollCompleted
+    })
+    .take(DASHBOARD_RECENT_ACTIVITY_LIMIT as usize)
+    .collect();
 
     // Today's invoice headline rides on `reports::compute_financial_report`
     // with a 1-day Custom window — one source of truth for revenue
@@ -13461,6 +13499,50 @@ fn parse_supplier_tax_number_from_xml(xml: &[u8]) -> Result<String> {
 
 // ── S211 / PR-210 — Quote-intake config + queue routes ─────────────────
 
+/// S256 / PR-245 — wall-clock unix-seconds boundary distinguishing
+/// "catch-up" quote arrivals (ingested by the daemon's first cycle
+/// after a boot, possibly covering a downtime backlog) from "live"
+/// arrivals (ingested while the operator is actively using the app).
+/// Set once at serve boot (`mark_quote_intake_boot`); `0` means
+/// "not yet booted" → all arrivals are suppressed from the toast.
+///
+/// Brief §B.8's hint was to watermark at *daemon start*; that would let
+/// the first (catch-up) cycle's own brand-new rows fire toasts, which
+/// is exactly the jarring-on-open behaviour §B.8 forbids. We instead
+/// take the boot wall-time + a grace window covering the 30s boot delay
+/// plus the first cycle, so only cycle-2-onward arrivals are "live".
+static QUOTE_INTAKE_BOOT_WALL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Grace window (seconds) after boot during which `QuoteIntakeRowAdded`
+/// entries are treated as catch-up (badge-only, no toast). Comfortably
+/// clears the daemon's fixed 30s boot delay plus a normal first cycle.
+const QUOTE_INTAKE_CATCHUP_GRACE_SECS: i64 = 90;
+
+/// Record the serve-process boot wall-time so the notifications route
+/// can compute the catch-up boundary. Idempotent — only the first call
+/// in the process wins (later calls are no-ops).
+fn mark_quote_intake_boot() {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let _ = QUOTE_INTAKE_BOOT_WALL.compare_exchange(
+        0,
+        now,
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+/// The unix-seconds boundary above which a `QuoteIntakeRowAdded` entry
+/// counts as a live arrival. `i64::MAX` when boot hasn't been marked yet
+/// (suppress everything).
+fn quote_intake_live_boundary() -> i64 {
+    let boot = QUOTE_INTAKE_BOOT_WALL.load(std::sync::atomic::Ordering::SeqCst);
+    if boot == 0 {
+        i64::MAX
+    } else {
+        boot + QUOTE_INTAKE_CATCHUP_GRACE_SECS
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 struct QuoteIntakeLastPoll {
     /// RFC3339 timestamp the cycle finished.
@@ -13489,9 +13571,15 @@ struct QuoteIntakeConfigResponse {
     /// button in that case so a save doesn't silently lose to the env
     /// var on next restart.
     env_override_active: bool,
-    /// Latest `QuoteIntakePollCompleted` audit entry, if any.
+    /// Latest per-cycle audit entry, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_poll: Option<QuoteIntakeLastPoll>,
+    /// S256 / PR-245 — `true` when the daemon paused on a 401 (bearer
+    /// rotated). The SPA surfaces the "re-paste bearer" prompt. Derived
+    /// from the audit ledger: the most-recent `QuoteIntakePollFailed`
+    /// carries `reason = "unauthorized"` and is no older than the most
+    /// recent cycle heartbeat.
+    auth_paused: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -13583,6 +13671,7 @@ async fn handle_get_quote_intake_config(
             None
         }
     };
+    let auth_paused = quote_intake_auth_paused(&state).unwrap_or(false);
     let body = QuoteIntakeConfigResponse {
         enabled: toml.as_ref().map(|c| c.enabled).unwrap_or(false),
         base_url: toml.as_ref().and_then(|c| c.base_url.clone()),
@@ -13593,6 +13682,7 @@ async fn handle_get_quote_intake_config(
         has_token,
         env_override_active: quote_intake_env_override_active(),
         last_poll,
+        auth_paused,
     };
     Json(body).into_response()
 }
@@ -13650,6 +13740,7 @@ async fn handle_put_quote_intake_config(
         has_token,
         env_override_active: quote_intake_env_override_active(),
         last_poll,
+        auth_paused: quote_intake_auth_paused(&state).unwrap_or(false),
     };
     Json(body).into_response()
 }
@@ -13868,10 +13959,16 @@ pub fn pickup_quote_as_draft_request(
     Ok(outcome)
 }
 
-/// Read the most-recent `QuoteIntakePollCompleted` payload from the
-/// audit ledger, decode for the SPA's last-poll status panel. Returns
+/// Read the most-recent per-cycle heartbeat payload from the audit
+/// ledger, decode for the SPA's last-poll status panel. Returns
 /// `Ok(None)` for a freshly-booted tenant whose daemon hasn't yet
-/// emitted (a pure-zero cycle is silent — see crate audit `should_emit`).
+/// emitted a single cycle.
+///
+/// S256 / PR-245 — the daemon now ALWAYS emits a cycle entry, under the
+/// v2 `QuoteIntakePollAttempted` kind. Pre-S256 rows carry the v1
+/// `QuoteIntakePollCompleted` kind; both share the same payload shape,
+/// so this reader accepts EITHER and takes the most recent — old
+/// installs keep their last-poll panel until the next cycle.
 fn latest_quote_intake_poll(state: &AppState) -> Result<Option<QuoteIntakeLastPoll>> {
     let binary_hash = state
         .binary_hash
@@ -13884,7 +13981,9 @@ fn latest_quote_intake_poll(state: &AppState) -> Result<Option<QuoteIntakeLastPo
         .context("read audit ledger entries for quote-intake poll lookup")?;
     let mut latest: Option<(time::OffsetDateTime, Entry)> = None;
     for entry in entries {
-        if entry.kind == EventKind::QuoteIntakePollCompleted {
+        if entry.kind == EventKind::QuoteIntakePollAttempted
+            || entry.kind == EventKind::QuoteIntakePollCompleted
+        {
             let ts = entry.time_wall;
             match latest {
                 Some((cur, _)) if cur >= ts => {}
@@ -13896,8 +13995,7 @@ fn latest_quote_intake_poll(state: &AppState) -> Result<Option<QuoteIntakeLastPo
         return Ok(None);
     };
     let payload: aberp_quote_intake::QuoteIntakePollPayload =
-        serde_json::from_slice(&entry.payload)
-            .context("decode QuoteIntakePollCompleted payload")?;
+        serde_json::from_slice(&entry.payload).context("decode quote-intake poll payload")?;
     let at_str = at
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
@@ -13913,6 +14011,308 @@ fn latest_quote_intake_poll(state: &AppState) -> Result<Option<QuoteIntakeLastPo
         elapsed_ms: payload.elapsed_ms,
         error: payload.error,
     }))
+}
+
+/// S256 / PR-245 — is the daemon paused on a rotated bearer (401)?
+/// `true` iff the most-recent `QuoteIntakePollFailed { reason =
+/// "unauthorized" }` entry is no older than the most-recent cycle
+/// heartbeat. Because the daemon STOPS on 401, the unauthorized failure
+/// remains the newest cycle signal until a restart writes fresh
+/// heartbeats (which then make this `false`).
+fn quote_intake_auth_paused(state: &AppState) -> Result<bool> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await binary hash for quote-intake auth-paused lookup")?;
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
+        .context("open ledger for quote-intake auth-paused lookup")?;
+    let entries = ledger
+        .entries()
+        .context("read entries for quote-intake auth-paused lookup")?;
+    let mut latest_attempt: Option<time::OffsetDateTime> = None;
+    let mut latest_unauth: Option<time::OffsetDateTime> = None;
+    let bump = |slot: &mut Option<time::OffsetDateTime>, ts: time::OffsetDateTime| {
+        *slot = Some(slot.map_or(ts, |cur| cur.max(ts)));
+    };
+    for entry in entries {
+        match entry.kind {
+            EventKind::QuoteIntakePollAttempted | EventKind::QuoteIntakePollCompleted => {
+                bump(&mut latest_attempt, entry.time_wall);
+            }
+            EventKind::QuoteIntakePollFailed => {
+                let is_unauth = serde_json::from_slice::<
+                    aberp_quote_intake::QuoteIntakePollFailedPayload,
+                >(&entry.payload)
+                .map(|p| p.reason == aberp_quote_intake::PollFailureReason::Unauthorized.as_str())
+                .unwrap_or(false);
+                if is_unauth {
+                    bump(&mut latest_unauth, entry.time_wall);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(match (latest_unauth, latest_attempt) {
+        (Some(u), Some(a)) => u >= a,
+        (Some(_), None) => true,
+        _ => false,
+    })
+}
+
+#[derive(Debug, serde::Serialize)]
+struct QuoteArrival {
+    quote_id: String,
+    intake_at: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct QuoteIntakeNotifications {
+    /// Badge count — staged, un-picked-up quotes. DB truth, recomputed
+    /// each call so it survives an app restart.
+    unpicked_count: u64,
+    /// Count of `error`-state (dead-letter) rows awaiting triage.
+    errored_count: u64,
+    /// `true` once the catch-up grace window has elapsed, so the SPA can
+    /// distinguish "still booting" from "genuinely no live arrivals".
+    live_ready: bool,
+    /// Live arrivals (post-catch-up, still un-picked). The SPA coalesces
+    /// these into a single toast and de-dupes against its own seen-set.
+    live_arrivals: Vec<QuoteArrival>,
+    /// Daemon paused on a 401 — surface the "re-paste bearer" prompt.
+    auth_paused: bool,
+}
+
+/// S256 / PR-245 (brief §B.6/§B.7/§B.8) — one polled endpoint feeding the
+/// sidebar badge AND the arrival toast. The SPA polls this on a timer
+/// (and on launch the badge is correct immediately because it is DB
+/// truth, not an in-memory counter).
+async fn handle_quote_intake_notifications(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let boundary = quote_intake_live_boundary();
+    let live_ready = boundary != i64::MAX;
+    let auth_paused = quote_intake_auth_paused(&state).unwrap_or(false);
+
+    let db_path = (*state.db_path).clone();
+    let tenant = state.tenant.as_str().to_string();
+    let binary_hash = match state.binary_hash.wait() {
+        Ok(h) => h,
+        Err(e) => {
+            return internal_error("binary hash for quote-intake notifications", anyhow!("{e}"))
+        }
+    };
+    let tenant_for_ledger = state.tenant.clone();
+    let db_for_ledger = (*state.db_path).clone();
+
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<QuoteIntakeNotifications> {
+            let conn = duckdb::Connection::open(&db_path)
+                .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
+            let unpicked_count = aberp_quote_intake::log_table::count_unpicked(&conn, &tenant)
+                .context("count un-picked quotes")?;
+            let errored_count = aberp_quote_intake::log_table::count_errored(&conn, &tenant)
+                .context("count error-state quotes")?;
+            let unpicked_ids: std::collections::HashSet<String> =
+                aberp_quote_intake::log_table::list_unpicked_quote_ids(&conn, &tenant)
+                    .context("list un-picked quote ids")?
+                    .into_iter()
+                    .collect();
+
+            // Live arrivals: QuoteIntakeRowAdded entries past the catch-up
+            // boundary whose quote is still staged + un-picked.
+            let mut live_arrivals: Vec<QuoteArrival> = Vec::new();
+            if live_ready {
+                let ledger = Ledger::open(&db_for_ledger, tenant_for_ledger, binary_hash)
+                    .context("open ledger for quote-intake arrivals")?;
+                let entries = ledger.entries().context("read entries for arrivals")?;
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for entry in entries {
+                    if entry.kind != EventKind::QuoteIntakeRowAdded {
+                        continue;
+                    }
+                    if entry.time_wall.unix_timestamp() <= boundary {
+                        continue;
+                    }
+                    let Ok(p) = serde_json::from_slice::<
+                        aberp_quote_intake::QuoteIntakeRowAddedPayload,
+                    >(&entry.payload) else {
+                        continue;
+                    };
+                    if !unpicked_ids.contains(&p.quote_id) || !seen.insert(p.quote_id.clone()) {
+                        continue;
+                    }
+                    live_arrivals.push(QuoteArrival {
+                        quote_id: p.quote_id,
+                        intake_at: p.intake_at,
+                    });
+                }
+            }
+            Ok(QuoteIntakeNotifications {
+                unpicked_count,
+                errored_count,
+                live_ready,
+                live_arrivals,
+                auth_paused,
+            })
+        })
+        .await;
+
+    match result {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(e)) => internal_error("quote-intake notifications", e),
+        Err(e) => internal_error("quote-intake notifications join", anyhow!("{e}")),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct QuoteIntakeRecoveryOutcome {
+    quote_id: String,
+    /// New state after the action: `"staged"` | `"irrelevant"`.
+    state: &'static str,
+}
+
+/// S256 / PR-245 (brief §A.4) — re-parse the stored raw payload of an
+/// `error`-state quote. On success, the row flips back to `staged` with
+/// a freshly-mapped prepared draft; on failure (the payload is still
+/// malformed), the row stays `error` with an updated message and we
+/// return 422 so the operator sees the recovery didn't take.
+async fn handle_quote_intake_retry_parse(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(quote_id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let db_path = (*state.db_path).clone();
+    let tenant = state.tenant.as_str().to_string();
+    let quote_id_task = quote_id.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<RetryParseResult> {
+        let conn = duckdb::Connection::open(&db_path)
+            .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
+        let Some((raw, _state)) =
+            aberp_quote_intake::log_table::read_raw_and_state(&conn, &tenant, &quote_id_task)
+                .context("read raw payload for retry-parse")?
+        else {
+            return Ok(RetryParseResult::NotFound);
+        };
+        let quote: aberp_quote_intake::Quote = match serde_json::from_str(&raw) {
+            Ok(q) => q,
+            Err(e) => {
+                return Ok(RetryParseResult::StillMalformed(format!(
+                    "payload parse: {e}"
+                )))
+            }
+        };
+        let now = time::OffsetDateTime::now_utc();
+        match aberp_quote_intake::quote_to_draft_invoice(&quote, now, Currency::Huf) {
+            Ok(outcome) => {
+                let prepared = serde_json::to_string(&outcome.prepared)
+                    .context("serialize re-parsed prepared draft")?;
+                let invoice_id = outcome.invoice_id.to_prefixed_string();
+                let n = aberp_quote_intake::log_table::retry_parse_intake(
+                    &conn,
+                    &tenant,
+                    &quote_id_task,
+                    &invoice_id,
+                    &prepared,
+                )
+                .context("apply retry-parse update")?;
+                if n == 0 {
+                    Ok(RetryParseResult::NotFound)
+                } else {
+                    Ok(RetryParseResult::Ok)
+                }
+            }
+            Err(e) => Ok(RetryParseResult::StillMalformed(e.to_string())),
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(RetryParseResult::Ok)) => (
+            StatusCode::OK,
+            Json(QuoteIntakeRecoveryOutcome {
+                quote_id,
+                state: "staged",
+            }),
+        )
+            .into_response(),
+        Ok(Ok(RetryParseResult::NotFound)) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!(
+                "quote {quote_id} not in an error state"
+            ))),
+        )
+            .into_response(),
+        Ok(Ok(RetryParseResult::StillMalformed(msg))) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(error_body(format!(
+                "quote {quote_id} still malformed: {msg}"
+            ))),
+        )
+            .into_response(),
+        Ok(Err(e)) => internal_error("quote-intake retry-parse", e),
+        Err(e) => internal_error("quote-intake retry-parse join", anyhow!("{e}")),
+    }
+}
+
+enum RetryParseResult {
+    Ok,
+    NotFound,
+    StillMalformed(String),
+}
+
+/// S256 / PR-245 (brief §A.4) — operator dismisses a quote (typically a
+/// dead-letter error row). Flips it to `irrelevant`; it then leaves the
+/// badge count and pickup surface.
+async fn handle_quote_intake_mark_irrelevant(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(quote_id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let db_path = (*state.db_path).clone();
+    let tenant = state.tenant.as_str().to_string();
+    let quote_id_task = quote_id.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<usize> {
+        let conn = duckdb::Connection::open(&db_path)
+            .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
+        aberp_quote_intake::log_table::mark_irrelevant(&conn, &tenant, &quote_id_task)
+            .context("mark quote irrelevant")
+    })
+    .await;
+    match result {
+        Ok(Ok(0)) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!("quote {quote_id} not found"))),
+        )
+            .into_response(),
+        Ok(Ok(_)) => (
+            StatusCode::OK,
+            Json(QuoteIntakeRecoveryOutcome {
+                quote_id,
+                state: "irrelevant",
+            }),
+        )
+            .into_response(),
+        Ok(Err(e)) => internal_error("quote-intake mark-irrelevant", e),
+        Err(e) => internal_error("quote-intake mark-irrelevant join", anyhow!("{e}")),
+    }
 }
 
 // ── Session-161 — NAV poll daemon orchestration ──────────────────────

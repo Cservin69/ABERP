@@ -104,6 +104,21 @@
   // the right tab without an extra click. Quotes is intentionally
   // out of vocab here (no hygiene flag maps to it).
   import { parseInvoicesUrl } from "./lib/hygiene-clickthrough";
+  // S256 / PR-245 — quote-arrival surfacing: sidebar/tab badge (DB-truth
+  // un-picked count) + in-app toast (live arrivals past the catch-up
+  // boundary) + optional native notification + chime.
+  import { getQuoteIntakeNotifications } from "./lib/api";
+  import QuoteArrivalToast from "./lib/QuoteArrivalToast.svelte";
+  import {
+    arrivalToastMessage,
+    freshArrivals,
+    loadSeen,
+    saveSeen,
+  } from "./lib/quote-arrival-notifications";
+  import { loadNotificationPrefs } from "./lib/notification-prefs";
+  import { fireNativeNotification } from "./lib/native-notify";
+  import { playArrivalChime } from "./lib/quote-chime";
+  import { isDemoMode } from "./lib/workshop-demo-mode";
 
   // PR-87 / session-112 — sessionStorage key the IssueInvoice route
   // uses to hand the just-issued invoice id back to InvoiceList on
@@ -208,6 +223,22 @@
   let healthInfo: HealthResponse | null = $state(null);
   let healthError: string | null = $state(null);
 
+  // S256 / PR-245 — quote-arrival surfacing state. `quoteUnpickedCount`
+  // drives the sidebar + tab badge (DB truth, polled — survives
+  // restart). The toast fires only for FRESH live arrivals (deduped via
+  // the persisted seen-set). Both default quiet.
+  let quoteUnpickedCount = $state(0);
+  let quoteToastVisible = $state(false);
+  let quoteToastMessage = $state("");
+  let quoteNotifyTimer: ReturnType<typeof setInterval> | null = null;
+  let quoteToastTimer: ReturnType<typeof setTimeout> | null = null;
+  // Seen-set is loaded once at mount so a reload doesn't replay arrivals.
+  const quoteSeen: Set<string> = loadSeen();
+  // Notification prefs (native OS notification + chime) — re-read each
+  // arrival so a mid-session Settings change takes effect without a
+  // reload.
+  const NOTIFY_POLL_MS = 20_000;
+
   onMount(() => {
     void pollBoot();
     // 300ms cadence: fast enough that the loading-pane log line
@@ -244,6 +275,8 @@
   onDestroy(() => {
     if (bootPollTimer !== null) clearInterval(bootPollTimer);
     if (healthPollTimer !== null) clearInterval(healthPollTimer);
+    if (quoteNotifyTimer !== null) clearInterval(quoteNotifyTimer);
+    if (quoteToastTimer !== null) clearTimeout(quoteToastTimer);
     if (unsubscribeRoute !== null) unsubscribeRoute();
   });
 
@@ -261,6 +294,16 @@
         if (healthPollTimer === null) {
           void probe();
           healthPollTimer = setInterval(() => void probe(), 10_000);
+        }
+        // S256 / PR-245 — start the quote-arrival poll once Ready. The
+        // first call seeds the badge immediately; the toast only fires
+        // for arrivals past the backend's catch-up boundary.
+        if (quoteNotifyTimer === null) {
+          void pollQuoteNotifications();
+          quoteNotifyTimer = setInterval(
+            () => void pollQuoteNotifications(),
+            NOTIFY_POLL_MS,
+          );
         }
       }
     } catch (err: unknown) {
@@ -284,6 +327,66 @@
     } catch (err: unknown) {
       healthState = "error";
       healthError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  // S256 / PR-245 — poll the quote-intake notifications endpoint. The
+  // backend returns the DB-truth un-picked count (badge) + the live
+  // arrivals (already filtered to post-catch-up, still-un-picked rows).
+  // We coalesce the fresh ones into a single toast, optionally chime +
+  // fire a native notification, then mark them seen so the next poll
+  // (or a reload) doesn't replay them.
+  async function pollQuoteNotifications() {
+    let n;
+    try {
+      n = await getQuoteIntakeNotifications();
+    } catch {
+      // A failed poll must never disrupt the operator's UI (the daemon
+      // is opt-in; a tenant without it returns zeros). Stay quiet.
+      return;
+    }
+    quoteUnpickedCount = n.unpicked_count;
+    if (n.live_arrivals.length === 0) return;
+    const fresh = freshArrivals(n.live_arrivals, quoteSeen);
+    if (fresh.length === 0) return;
+    for (const a of fresh) quoteSeen.add(a.quote_id);
+    saveSeen(quoteSeen);
+
+    const msg = arrivalToastMessage(fresh.length);
+    quoteToastMessage = `${msg.en} · ${msg.hu}`;
+    quoteToastVisible = true;
+    if (quoteToastTimer !== null) clearTimeout(quoteToastTimer);
+    // Auto-dismiss after 8s (brief §B.7).
+    quoteToastTimer = setTimeout(() => {
+      quoteToastVisible = false;
+      quoteToastTimer = null;
+    }, 8_000);
+
+    // Optional side-channels, both default-off and re-read each arrival.
+    const prefs = loadNotificationPrefs();
+    if (prefs.soundEnabled && !isDemoMode()) {
+      playArrivalChime();
+    }
+    if (prefs.nativeEnabled) {
+      fireNativeNotification("ABERP", msg.en);
+    }
+  }
+
+  function viewQuotes() {
+    quoteToastVisible = false;
+    if (quoteToastTimer !== null) {
+      clearTimeout(quoteToastTimer);
+      quoteToastTimer = null;
+    }
+    setInvoicesTab("quotes");
+    navigateTo("invoices");
+  }
+
+  function dismissQuoteToast() {
+    quoteToastVisible = false;
+    if (quoteToastTimer !== null) {
+      clearTimeout(quoteToastTimer);
+      quoteToastTimer = null;
     }
   }
 
@@ -495,6 +598,18 @@
                       }}
                     >
                       {r.label}
+                      <!-- S256 / PR-245 — un-picked-quote badge on the
+                           Invoices nav item (Quotes lives as a tab
+                           there). Visible from any operational route so
+                           the operator doesn't have to remember to check
+                           ([[trust-code-not-operator]]). -->
+                      {#if r.id === "invoices" && quoteUnpickedCount > 0}
+                        <span
+                          class="sidenav__badge"
+                          title={`${quoteUnpickedCount} quote(s) awaiting pickup`}
+                          data-testid="quotes-nav-badge"
+                        >{quoteUnpickedCount}</span>
+                      {/if}
                     </a>
                   </li>
                 {/each}
@@ -621,6 +736,12 @@
             >
               <span class="invoices-tab__label">Ajánlatok</span>
               <span class="invoices-tab__sub">Quotes</span>
+              {#if quoteUnpickedCount > 0}
+                <span
+                  class="invoices-tab__badge"
+                  data-testid="quotes-tab-badge"
+                >{quoteUnpickedCount}</span>
+              {/if}
             </button>
           </div>
           {#if invoicesTab === "incoming"}
@@ -633,6 +754,14 @@
         {/if}
       </main>
     </div>
+    <!-- S256 / PR-245 — in-app quote-arrival toast. Fixed-position;
+         clicking it routes to the Quotes tab. -->
+    <QuoteArrivalToast
+      visible={quoteToastVisible}
+      message={quoteToastMessage}
+      onView={viewQuotes}
+      onDismiss={dismissQuoteToast}
+    />
     {/if}
   {:else}
   <main>
@@ -945,12 +1074,31 @@
   }
 
   .sidenav__item {
-    display: block;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
     padding: var(--space-2) var(--space-4) var(--space-2) var(--space-6);
     color: var(--color-text-secondary);
     text-decoration: none;
     font-size: var(--type-size-sm);
     border-left: 3px solid transparent;
+  }
+
+  /* S256 / PR-245 — un-picked-quote count pill. Signal-positive (a
+   * pending opportunity, not an error) on a sunken surface so it reads
+   * as a quiet count, not an alarm ([[spa-dark-theme-default]]). */
+  .sidenav__badge {
+    flex: 0 0 auto;
+    min-width: 1.25rem;
+    padding: 0 var(--space-1);
+    border-radius: 999px;
+    background: var(--color-signal-positive);
+    color: var(--color-surface-base);
+    font-size: var(--type-size-xs);
+    font-weight: 600;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
   }
 
   .sidenav__item:hover {
@@ -1171,6 +1319,7 @@
   }
 
   .invoices-tab {
+    position: relative;
     display: inline-flex;
     flex-direction: column;
     align-items: flex-start;
@@ -1183,6 +1332,24 @@
     color: var(--color-text-secondary);
     cursor: pointer;
     font-family: inherit;
+  }
+
+  /* S256 / PR-245 — un-picked count on the Quotes tab, top-right
+   * corner so it doesn't disturb the two-line label layout. */
+  .invoices-tab__badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    min-width: 1.1rem;
+    padding: 0 4px;
+    border-radius: 999px;
+    background: var(--color-signal-positive);
+    color: var(--color-surface-base);
+    font-size: var(--type-size-xs);
+    font-weight: 600;
+    line-height: 1.1rem;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
   }
 
   .invoices-tab:hover {

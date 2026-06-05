@@ -40,6 +40,8 @@ function row(over: Partial<QuoteIntakeRow> = {}): QuoteIntakeRow {
     quantity: "3",
     notes: null,
     picked_up_drf_id: null,
+    intake_state: "staged",
+    intake_error: null,
     ...over,
   };
 }

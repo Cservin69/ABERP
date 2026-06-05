@@ -106,6 +106,10 @@ function buildRecentActivity(now: Date): RecentActivityEntry[] {
     [54, "system.dispatch_drafted"],
     [49, "system.work_order_in_progress"],
     [44, "InvoiceIssued"],
+    // S256 / PR-245 — a quote arrival interleaved with the shop-floor
+    // events so demo mode exercises the 📨 glyph in the recent-activity
+    // tile (brief §B.9).
+    [40, "system.quote_intake_row_added"],
     [38, "system.qa_check_passed"],
     [33, "system.dispatch_shipped"],
     [28, "system.work_order_completed"],

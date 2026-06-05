@@ -16,7 +16,10 @@ use ulid::Ulid;
 use aberp_audit_ledger::{Actor, BinaryHash, LedgerMeta, TenantId};
 use aberp_billing::Currency;
 
-use crate::audit::{should_emit, write_poll_audit_entry, PollTrigger, QuoteIntakePollPayload};
+use crate::audit::{
+    write_poll_audit_entry, write_poll_failed_entry, write_row_added_entry, PollFailureReason,
+    PollTrigger, QuoteIntakePollFailedPayload, QuoteIntakePollPayload, QuoteIntakeRowAddedPayload,
+};
 use crate::config::QuoteIntakeConfig;
 use crate::error::QuoteIntakeError;
 use crate::log_table;
@@ -32,9 +35,16 @@ pub struct PollSummary {
     pub skipped_duplicate: u32,
     pub writeback_retried: u32,
     pub writeback_failed: u32,
+    /// S256 — quotes that failed mapping and were staged as `error`
+    /// rows (brief §A.4) rather than silently dropped.
+    pub errored: u32,
     pub failed: Vec<(String, String)>,
     pub elapsed_ms: u64,
     pub error: Option<String>,
+    /// S256 — structured class of a cycle-aborting transport failure.
+    /// `Some` ⇒ the cycle emitted a `QuoteIntakePollFailed` entry and
+    /// the daemon loop should back off (or PAUSE on `Unauthorized`).
+    pub error_reason: Option<PollFailureReason>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +60,19 @@ pub struct QuoteIntakeService {
     config: QuoteIntakeConfig,
     transport: QuoteIntakeTransport,
     deps: QuoteIntakeDeps,
+}
+
+/// Best-effort extraction of the HTTP status from an
+/// `UnexpectedStatus` error's Display string ("…unexpected HTTP status
+/// 500"). Returns `None` if no trailing integer is present. Used only
+/// to populate the optional `status` field on `QuoteIntakePollFailed`;
+/// the structured `reason` is the load-bearing field.
+fn parse_status_from_detail(detail: &Option<String>) -> Option<u16> {
+    detail
+        .as_deref()?
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .find(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u16>().ok())
 }
 
 impl std::fmt::Debug for QuoteIntakeService {
@@ -81,17 +104,23 @@ impl QuoteIntakeService {
             skipped_duplicate: 0,
             writeback_retried: 0,
             writeback_failed: 0,
+            errored: 0,
             failed: Vec::new(),
             elapsed_ms: 0,
             error: None,
+            error_reason: None,
         };
 
         let quotes = match self.transport.list_approved_quotes().await {
             Ok(qs) => qs,
             Err(e) => {
                 summary.error = Some(e.to_string());
+                // S256 — classify the failure for the structured
+                // `QuoteIntakePollFailed` entry + the daemon's
+                // backoff/pause decision.
+                summary.error_reason = PollFailureReason::from_error(&e);
                 summary.elapsed_ms = started.elapsed().as_millis() as u64;
-                self.write_audit_if_needed(&summary).await;
+                self.write_cycle_audit(&summary).await;
                 return summary;
             }
         };
@@ -113,7 +142,7 @@ impl QuoteIntakeService {
             .await;
 
         summary.elapsed_ms = started.elapsed().as_millis() as u64;
-        self.write_audit_if_needed(&summary).await;
+        self.write_cycle_audit(&summary).await;
         summary
     }
 
@@ -155,7 +184,45 @@ impl QuoteIntakeService {
         let mapping_outcome = match quote_to_draft_invoice(quote, now, self.deps.default_currency) {
             Ok(m) => m,
             Err(e) => {
-                summary.failed.push((quote.id.clone(), e.to_string()));
+                // S256 / PR-245 (brief §A.4) — a quote whose payload
+                // fails mapping (missing contact email/name, bad status,
+                // date overflow) is no longer silently dropped. Stage it
+                // as an `error`-state row carrying the verbatim payload +
+                // the message, so it surfaces in the Quotes tab and the
+                // operator can retry-parse or mark-irrelevant. The
+                // `quote_id` PRIMARY KEY makes this idempotent across
+                // cycles (the precheck above skips an existing error row).
+                let msg = e.to_string();
+                let raw_payload_json =
+                    serde_json::to_string(quote).unwrap_or_else(|_| "{}".to_string());
+                let tenant_for_err = tenant_id.clone();
+                let quote_id_for_err = quote.id.clone();
+                let received_at_for_err = quote.received_at.clone();
+                let db_for_err = db_path.clone();
+                let msg_for_err = msg.clone();
+                let insert_err = spawn_blocking(move || {
+                    let conn = duckdb::Connection::open(&db_for_err).map_err(|e| {
+                        QuoteIntakeError::Storage(format!("open DB for error-row insert: {e}"))
+                    })?;
+                    log_table::insert_error_intake(
+                        &conn,
+                        &tenant_for_err,
+                        &quote_id_for_err,
+                        &received_at_for_err,
+                        now,
+                        &raw_payload_json,
+                        &msg_for_err,
+                    )
+                })
+                .await;
+                match insert_err {
+                    Ok(Ok(())) => summary.errored += 1,
+                    Ok(Err(e)) => summary.failed.push((quote.id.clone(), e.to_string())),
+                    Err(e) => summary
+                        .failed
+                        .push((quote.id.clone(), format!("error-row insert join: {e}"))),
+                }
+                tracing::warn!(quote_id = %quote.id, error = %msg, "quote failed mapping; staged as error row");
                 return;
             }
         };
@@ -184,6 +251,7 @@ impl QuoteIntakeService {
         let tenant_for_insert = tenant_id.clone();
         let quote_id_for_insert = quote_id.clone();
         let db_for_insert = db_path.clone();
+        let invoice_id_for_insert = invoice_id.clone();
         let insert_outcome = spawn_blocking(move || {
             let conn = duckdb::Connection::open(&db_for_insert).map_err(|e| {
                 QuoteIntakeError::Storage(format!("open tenant DB for insert: {e}"))
@@ -192,7 +260,7 @@ impl QuoteIntakeService {
                 &conn,
                 &tenant_for_insert,
                 &quote_id_for_insert,
-                &invoice_id,
+                &invoice_id_for_insert,
                 &received_at,
                 now,
                 &raw_payload_json,
@@ -215,6 +283,13 @@ impl QuoteIntakeService {
             }
         }
         summary.created += 1;
+
+        // S256 / PR-245 (brief §A.2) — emit a per-row arrival entry
+        // carrying the customer's source `quote_id` so the SPA badge +
+        // arrival toast can key on it and the arrival is traceable
+        // end-to-end. Best-effort: a failure here is logged, not fatal
+        // (the row is already staged; the badge re-derives from DB).
+        self.write_row_added(quote, &invoice_id, now).await;
 
         let writeback_note = format!(
             "ABERP draft invoice {} created at {}",
@@ -325,8 +400,14 @@ impl QuoteIntakeService {
         }
     }
 
-    async fn write_audit_if_needed(&self, summary: &PollSummary) {
-        let payload = QuoteIntakePollPayload {
+    /// S256 / PR-245 — write the per-cycle audit. ALWAYS emits the
+    /// `QuoteIntakePollAttempted` heartbeat (no `should_emit` gate — the
+    /// Settings panel needs a "last cycle" even for idle no-op cycles).
+    /// When the cycle aborted on a transport failure
+    /// (`summary.error_reason.is_some()`) it ALSO emits a structured
+    /// `QuoteIntakePollFailed` entry in the same transaction.
+    async fn write_cycle_audit(&self, summary: &PollSummary) {
+        let attempted = QuoteIntakePollPayload {
             idempotency_key: Ulid::new().to_string(),
             trigger: summary.trigger.as_audit_str().to_string(),
             fetched_count: summary.fetched,
@@ -335,12 +416,24 @@ impl QuoteIntakeService {
             writeback_retried_count: summary.writeback_retried,
             writeback_failed_count: summary.writeback_failed,
             failed_count: summary.failed.len() as u32,
+            errored_count: summary.errored,
             elapsed_ms: summary.elapsed_ms,
             error: summary.error.clone(),
         };
-        if !should_emit(&payload) {
-            return;
-        }
+        let failed = summary.error_reason.map(|reason| {
+            let status = match reason {
+                PollFailureReason::UnexpectedStatus => parse_status_from_detail(&summary.error),
+                _ => None,
+            };
+            QuoteIntakePollFailedPayload {
+                idempotency_key: Ulid::new().to_string(),
+                trigger: summary.trigger.as_audit_str().to_string(),
+                reason: reason.as_str().to_string(),
+                status,
+                detail: summary.error.clone(),
+                elapsed_ms: summary.elapsed_ms,
+            }
+        });
         let db_path = self.deps.db_path.clone();
         let tenant = self.deps.tenant.clone();
         let binary_hash = self.deps.binary_hash;
@@ -356,7 +449,11 @@ impl QuoteIntakeService {
                 .map_err(|e| QuoteIntakeError::Storage(format!("open audit tx: {e}")))?;
             let meta = LedgerMeta::new(tenant.clone(), binary_hash);
             let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
-            write_poll_audit_entry(&tx, &meta, actor, &payload)?;
+            write_poll_audit_entry(&tx, &meta, actor, &attempted)?;
+            if let Some(failed) = failed.as_ref() {
+                let actor2 = Actor::from_local_cli(Ulid::new().to_string(), &login);
+                write_poll_failed_entry(&tx, &meta, actor2, failed)?;
+            }
             tx.commit()
                 .map_err(|e| QuoteIntakeError::Storage(format!("commit audit tx: {e}")))?;
             Ok(())
@@ -365,10 +462,55 @@ impl QuoteIntakeService {
         match outcome {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                tracing::warn!(error = %e, "QuoteIntakePollCompleted audit write failed");
+                tracing::warn!(error = %e, "quote-intake cycle audit write failed");
             }
             Err(e) => {
-                tracing::warn!(error = %e, "QuoteIntakePollCompleted audit task panicked");
+                tracing::warn!(error = %e, "quote-intake cycle audit task panicked");
+            }
+        }
+    }
+
+    /// S256 / PR-245 — emit one `QuoteIntakeRowAdded` entry. Best-effort:
+    /// a failure is logged but never aborts the cycle (the row is already
+    /// staged in `quote_intake_log`; the badge re-derives from DB).
+    async fn write_row_added(&self, quote: &Quote, invoice_id: &str, now: OffsetDateTime) {
+        let payload = QuoteIntakeRowAddedPayload {
+            idempotency_key: format!("quote_intake_row_added:{}", quote.id),
+            quote_id: quote.id.clone(),
+            invoice_id: invoice_id.to_string(),
+            intake_at: now
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string()),
+        };
+        let db_path = self.deps.db_path.clone();
+        let tenant = self.deps.tenant.clone();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+        let outcome = spawn_blocking(move || -> Result<(), QuoteIntakeError> {
+            let mut conn = duckdb::Connection::open(&db_path).map_err(|e| {
+                QuoteIntakeError::Storage(format!("open DB for row-added append: {e}"))
+            })?;
+            aberp_audit_ledger::ensure_schema(&conn).map_err(|e| {
+                QuoteIntakeError::Storage(format!("ensure audit-ledger schema: {e}"))
+            })?;
+            let tx = conn
+                .transaction()
+                .map_err(|e| QuoteIntakeError::Storage(format!("open row-added tx: {e}")))?;
+            let meta = LedgerMeta::new(tenant.clone(), binary_hash);
+            let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+            write_row_added_entry(&tx, &meta, actor, &payload)?;
+            tx.commit()
+                .map_err(|e| QuoteIntakeError::Storage(format!("commit row-added tx: {e}")))?;
+            Ok(())
+        })
+        .await;
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(quote_id = %quote.id, error = %e, "QuoteIntakeRowAdded write failed")
+            }
+            Err(e) => {
+                tracing::warn!(quote_id = %quote.id, error = %e, "QuoteIntakeRowAdded task panicked")
             }
         }
     }
@@ -398,6 +540,11 @@ impl QuoteIntakeService {
             _ = cancel.cancelled() => return,
             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
         }
+        // S256 / PR-245 (brief §A.3) — exponential backoff on a
+        // cycle-aborting transport failure: 5s → 15s → 60s, then settle
+        // at the normal cadence. `backoff_idx` advances on each
+        // consecutive failure and RESETS to 0 on the next success.
+        let mut backoff_idx: usize = 0;
         loop {
             if cancel.is_cancelled() {
                 return;
@@ -410,15 +557,91 @@ impl QuoteIntakeService {
                 skipped = summary.skipped_duplicate,
                 writeback_retried = summary.writeback_retried,
                 writeback_failed = summary.writeback_failed,
+                errored = summary.errored,
                 failed = summary.failed.len(),
                 elapsed_ms = summary.elapsed_ms,
                 error = ?summary.error,
+                reason = ?summary.error_reason,
                 "quote-intake cycle complete"
             );
+
+            // S256 / PR-245 (brief §A.5) — a 401 means the bearer was
+            // rotated. PAUSE rather than hammer a known-bad credential:
+            // stop the daemon loop entirely. The cycle already wrote a
+            // `QuoteIntakePollFailed { reason: unauthorized }` entry,
+            // which the Settings → Quote Intake panel reads to surface
+            // the "re-paste bearer" prompt. Resumption is on the next
+            // `aberp serve` boot after the operator re-pastes the token
+            // (consistent with the existing no-hot-reload posture).
+            if summary.error_reason == Some(PollFailureReason::Unauthorized) {
+                tracing::error!(
+                    "quote-intake daemon PAUSED: storefront returned 401 \
+                     (bearer rotated/invalid). Re-paste the bearer token in \
+                     Settings → Quote Intake and restart ABERP to resume."
+                );
+                return;
+            }
+
+            let sleep_dur = match summary.error_reason {
+                Some(_) => {
+                    let dur = backoff_duration(backoff_idx, cadence);
+                    backoff_idx = backoff_idx.saturating_add(1);
+                    tracing::warn!(
+                        backoff_secs = dur.as_secs(),
+                        "quote-intake cycle failed; backing off before retry"
+                    );
+                    dur
+                }
+                None => {
+                    backoff_idx = 0;
+                    cadence
+                }
+            };
             tokio::select! {
                 _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(cadence) => {}
+                _ = tokio::time::sleep(sleep_dur) => {}
             }
         }
+    }
+}
+
+/// S256 / PR-245 — backoff schedule for consecutive cycle failures:
+/// 5s, 15s, 60s, then the normal cadence for every further consecutive
+/// failure. `idx` is the count of prior consecutive failures.
+fn backoff_duration(idx: usize, cadence: Duration) -> Duration {
+    match idx {
+        0 => Duration::from_secs(5),
+        1 => Duration::from_secs(15),
+        2 => Duration::from_secs(60),
+        _ => cadence,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_follows_5_15_60_then_cadence() {
+        let cadence = Duration::from_secs(60 * 5);
+        assert_eq!(backoff_duration(0, cadence), Duration::from_secs(5));
+        assert_eq!(backoff_duration(1, cadence), Duration::from_secs(15));
+        assert_eq!(backoff_duration(2, cadence), Duration::from_secs(60));
+        // 4th+ consecutive failure settles at the configured cadence.
+        assert_eq!(backoff_duration(3, cadence), cadence);
+        assert_eq!(backoff_duration(99, cadence), cadence);
+    }
+
+    #[test]
+    fn parse_status_extracts_trailing_integer() {
+        assert_eq!(
+            parse_status_from_detail(&Some("quote-intake unexpected HTTP status 500".to_string())),
+            Some(500)
+        );
+        assert_eq!(
+            parse_status_from_detail(&Some("no digits here".to_string())),
+            None
+        );
+        assert_eq!(parse_status_from_detail(&None), None);
     }
 }
