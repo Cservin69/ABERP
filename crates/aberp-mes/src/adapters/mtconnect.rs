@@ -119,10 +119,10 @@ use quick_xml::Reader;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::adapter::{Adapter, AdapterHealth};
+use crate::adapters::common::AdapterLifecycle;
 use crate::error::AdapterError;
 use crate::events::{CanonicalEvent, MachineState};
 
@@ -227,10 +227,11 @@ impl MtconnectAdapterConfig {
 #[derive(Debug)]
 pub struct MtconnectAdapter {
     config: MtconnectAdapterConfig,
-    health: Arc<Mutex<AdapterHealth>>,
+    /// Cancel token, poll-task handle, and cached health — the shared
+    /// task-lifecycle scaffolding (S259 / PR-248). The poll loop holds a
+    /// clone of the health cell via [`AdapterLifecycle::health_slot`].
+    lifecycle: AdapterLifecycle,
     sender: broadcast::Sender<CanonicalEvent>,
-    cancel: Mutex<Option<CancellationToken>>,
-    poll_handle: Mutex<Option<JoinHandle<()>>>,
     /// Most recently observed Execution-derived [`MachineState`].
     /// `None` until the first successful poll establishes a baseline;
     /// the first emitted event always carries
@@ -244,10 +245,8 @@ impl MtconnectAdapter {
         let (sender, _) = broadcast::channel(config.channel_capacity);
         Self {
             config,
-            health: Arc::new(Mutex::new(AdapterHealth::Stopped)),
+            lifecycle: AdapterLifecycle::new(),
             sender,
-            cancel: Mutex::new(None),
-            poll_handle: Mutex::new(None),
             last_state: Arc::new(Mutex::new(None)),
         }
     }
@@ -278,14 +277,10 @@ impl Adapter for MtconnectAdapter {
     }
 
     async fn start(&self) -> Result<(), AdapterError> {
-        // Idempotent: if already running, no-op.
-        {
-            let current = self.health.lock().expect("health mutex poisoned").clone();
-            if !matches!(current, AdapterHealth::Stopped) {
-                return Ok(());
-            }
-            *self.health.lock().expect("health mutex poisoned") = AdapterHealth::Starting;
-        }
+        // Idempotent start guard: None means already running → no-op.
+        let Some(cancel) = self.lifecycle.begin_start() else {
+            return Ok(());
+        };
 
         let client = reqwest::Client::builder()
             .timeout(self.config.request_timeout)
@@ -296,22 +291,20 @@ impl Adapter for MtconnectAdapter {
         let slow_threshold = self.config.slow_threshold;
         let max_response_bytes = self.config.max_response_bytes;
 
+        let health_slot = self.lifecycle.health_slot();
+
         // Initial poll synchronously so the first `health()` read after
         // start sees the real outcome, not the transient Starting.
         let outcome = poll_once(&client, &url, max_response_bytes).await;
         apply_poll_outcome(
             outcome,
-            &self.health,
+            &health_slot,
             &self.last_state,
             &self.sender,
             &self.config.machine_id,
             slow_threshold,
         );
 
-        let cancel = CancellationToken::new();
-        *self.cancel.lock().expect("cancel mutex poisoned") = Some(cancel.clone());
-
-        let health_slot = self.health.clone();
         let last_state_slot = self.last_state.clone();
         let sender = self.sender.clone();
         let machine_id = self.config.machine_id.clone();
@@ -333,41 +326,18 @@ impl Adapter for MtconnectAdapter {
             .await;
         });
 
-        *self.poll_handle.lock().expect("poll_handle mutex poisoned") = Some(handle);
+        self.lifecycle.attach(handle);
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), AdapterError> {
-        // Take handle + cancel under the lock, drop the lock, then
-        // await — matches the zebra/barcode_scanner stop() posture.
-        let cancel_opt = self.cancel.lock().expect("cancel mutex poisoned").take();
-        let handle_opt = self
-            .poll_handle
-            .lock()
-            .expect("poll_handle mutex poisoned")
-            .take();
-
-        if let Some(token) = cancel_opt {
-            token.cancel();
-        }
-        if let Some(handle) = handle_opt {
-            if let Err(e) = handle.await {
-                if e.is_panic() {
-                    tracing::error!(
-                        machine_id = %self.config.machine_id,
-                        "MTConnect poll task panicked during stop: {e}"
-                    );
-                }
-            }
-        }
-
-        *self.health.lock().expect("health mutex poisoned") = AdapterHealth::Stopped;
+        self.lifecycle.stop(&self.config.machine_id).await;
         *self.last_state.lock().expect("last_state mutex poisoned") = None;
         Ok(())
     }
 
     fn health(&self) -> AdapterHealth {
-        self.health.lock().expect("health mutex poisoned").clone()
+        self.lifecycle.health()
     }
 
     fn subscribe(&self) -> broadcast::Receiver<CanonicalEvent> {

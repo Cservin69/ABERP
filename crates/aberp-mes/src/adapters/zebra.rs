@@ -91,10 +91,10 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::adapter::{Adapter, AdapterHealth};
+use crate::adapters::common::AdapterLifecycle;
 use crate::error::AdapterError;
 use crate::events::CanonicalEvent;
 
@@ -211,14 +211,11 @@ impl ZebraAdapterConfig {
 #[derive(Debug)]
 pub struct ZebraAdapter {
     config: ZebraAdapterConfig,
-    /// `Arc<Mutex<…>>` so the probe task can hold its own handle and
-    /// write back without a cycle through `Arc<Self>`. The adapter's
-    /// own `health()` / `start()` / `stop()` / `print_zpl` paths share
-    /// the same Mutex via this Arc.
-    health: Arc<Mutex<AdapterHealth>>,
+    /// Cancel token, probe-task handle, and cached health — the shared
+    /// task-lifecycle scaffolding (S259 / PR-248). The probe loop holds a
+    /// clone of the health cell via [`AdapterLifecycle::health_slot`].
+    lifecycle: AdapterLifecycle,
     sender: broadcast::Sender<CanonicalEvent>,
-    cancel: Mutex<Option<CancellationToken>>,
-    probe_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl ZebraAdapter {
@@ -227,10 +224,8 @@ impl ZebraAdapter {
         let (sender, _) = broadcast::channel(config.channel_capacity);
         Self {
             config,
-            health: Arc::new(Mutex::new(AdapterHealth::Stopped)),
+            lifecycle: AdapterLifecycle::new(),
             sender,
-            cancel: Mutex::new(None),
-            probe_handle: Mutex::new(None),
         }
     }
 
@@ -284,10 +279,9 @@ impl ZebraAdapter {
                             format!("print failed after retry: {first_err} (retry: {retry_err})");
                         // Flip cached health so the dashboard sees the
                         // failure before the next periodic probe runs.
-                        *self.health.lock().expect("health mutex poisoned") =
-                            AdapterHealth::Unhealthy {
-                                reason: format!("print failed: {retry_err}"),
-                            };
+                        self.lifecycle.set_health(AdapterHealth::Unhealthy {
+                            reason: format!("print failed: {retry_err}"),
+                        });
                         tracing::error!(
                             printer_id = %self.config.printer_id,
                             endpoint = %endpoint,
@@ -320,14 +314,10 @@ impl Adapter for ZebraAdapter {
     }
 
     async fn start(&self) -> Result<(), AdapterError> {
-        // Idempotent: if already running, no-op.
-        {
-            let current = self.health.lock().expect("health mutex poisoned").clone();
-            if !matches!(current, AdapterHealth::Stopped) {
-                return Ok(());
-            }
-            *self.health.lock().expect("health mutex poisoned") = AdapterHealth::Starting;
-        }
+        // Idempotent start guard: None means already running → no-op.
+        let Some(cancel) = self.lifecycle.begin_start() else {
+            return Ok(());
+        };
 
         let endpoint = self.config.endpoint();
         let connect_timeout = self.config.connect_timeout;
@@ -336,12 +326,9 @@ impl Adapter for ZebraAdapter {
         // Initial probe runs synchronously so the caller's first
         // health() read sees the real result, not a transient Starting.
         let initial = probe_once(&endpoint, connect_timeout, slow_threshold).await;
-        *self.health.lock().expect("health mutex poisoned") = initial;
+        self.lifecycle.set_health(initial);
 
-        let cancel = CancellationToken::new();
-        *self.cancel.lock().expect("cancel mutex poisoned") = Some(cancel.clone());
-
-        let health_slot = self.health.clone();
+        let health_slot = self.lifecycle.health_slot();
         let printer_id = self.config.printer_id.clone();
         let probe_interval = self.config.probe_interval;
 
@@ -358,43 +345,17 @@ impl Adapter for ZebraAdapter {
             .await;
         });
 
-        *self
-            .probe_handle
-            .lock()
-            .expect("probe_handle mutex poisoned") = Some(handle);
+        self.lifecycle.attach(handle);
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), AdapterError> {
-        // Take handle + cancel under the lock, drop the lock, then
-        // await — matches the barcode_scanner stop() posture.
-        let cancel_opt = self.cancel.lock().expect("cancel mutex poisoned").take();
-        let handle_opt = self
-            .probe_handle
-            .lock()
-            .expect("probe_handle mutex poisoned")
-            .take();
-
-        if let Some(token) = cancel_opt {
-            token.cancel();
-        }
-        if let Some(handle) = handle_opt {
-            if let Err(e) = handle.await {
-                if e.is_panic() {
-                    tracing::error!(
-                        printer_id = %self.config.printer_id,
-                        "probe task panicked during stop: {e}"
-                    );
-                }
-            }
-        }
-
-        *self.health.lock().expect("health mutex poisoned") = AdapterHealth::Stopped;
+        self.lifecycle.stop(&self.config.printer_id).await;
         Ok(())
     }
 
     fn health(&self) -> AdapterHealth {
-        self.health.lock().expect("health mutex poisoned").clone()
+        self.lifecycle.health()
     }
 
     fn subscribe(&self) -> broadcast::Receiver<CanonicalEvent> {

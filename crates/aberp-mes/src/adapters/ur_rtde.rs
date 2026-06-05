@@ -145,10 +145,10 @@ use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::adapter::{Adapter, AdapterHealth};
+use crate::adapters::common::AdapterLifecycle;
 use crate::error::AdapterError;
 use crate::events::{CanonicalEvent, RobotMode, SafetyMode};
 
@@ -321,10 +321,11 @@ impl UrRtdeAdapterConfig {
 #[derive(Debug)]
 pub struct UrRtdeAdapter {
     config: UrRtdeAdapterConfig,
-    health: Arc<Mutex<AdapterHealth>>,
+    /// Cancel token, connect-task handle, and cached health — the shared
+    /// task-lifecycle scaffolding (S259 / PR-248). The connect loop holds
+    /// a clone of the health cell via [`AdapterLifecycle::health_slot`].
+    lifecycle: AdapterLifecycle,
     sender: broadcast::Sender<CanonicalEvent>,
-    cancel: Mutex<Option<CancellationToken>>,
-    connect_handle: Mutex<Option<JoinHandle<()>>>,
     /// Most recently observed `robot_mode` / `safety_mode` pair.
     /// `None` until the first successful data frame establishes a
     /// baseline; the first emitted event always carries
@@ -338,10 +339,8 @@ impl UrRtdeAdapter {
         let (sender, _) = broadcast::channel(config.channel_capacity);
         Self {
             config,
-            health: Arc::new(Mutex::new(AdapterHealth::Stopped)),
+            lifecycle: AdapterLifecycle::new(),
             sender,
-            cancel: Mutex::new(None),
-            connect_handle: Mutex::new(None),
             last_state: Arc::new(Mutex::new(None)),
         }
     }
@@ -378,20 +377,13 @@ impl Adapter for UrRtdeAdapter {
     }
 
     async fn start(&self) -> Result<(), AdapterError> {
-        // Idempotent: if already running, no-op.
-        {
-            let current = self.health.lock().expect("health mutex poisoned").clone();
-            if !matches!(current, AdapterHealth::Stopped) {
-                return Ok(());
-            }
-            *self.health.lock().expect("health mutex poisoned") = AdapterHealth::Starting;
-        }
-
-        let cancel = CancellationToken::new();
-        *self.cancel.lock().expect("cancel mutex poisoned") = Some(cancel.clone());
+        // Idempotent start guard: None means already running → no-op.
+        let Some(cancel) = self.lifecycle.begin_start() else {
+            return Ok(());
+        };
 
         let config = self.config.clone();
-        let health_slot = self.health.clone();
+        let health_slot = self.lifecycle.health_slot();
         let last_state_slot = self.last_state.clone();
         let sender = self.sender.clone();
 
@@ -399,42 +391,18 @@ impl Adapter for UrRtdeAdapter {
             run_connect_loop(config, cancel, health_slot, last_state_slot, sender).await;
         });
 
-        *self
-            .connect_handle
-            .lock()
-            .expect("connect_handle mutex poisoned") = Some(handle);
+        self.lifecycle.attach(handle);
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), AdapterError> {
-        let cancel_opt = self.cancel.lock().expect("cancel mutex poisoned").take();
-        let handle_opt = self
-            .connect_handle
-            .lock()
-            .expect("connect_handle mutex poisoned")
-            .take();
-
-        if let Some(token) = cancel_opt {
-            token.cancel();
-        }
-        if let Some(handle) = handle_opt {
-            if let Err(e) = handle.await {
-                if e.is_panic() {
-                    tracing::error!(
-                        robot_id = %self.config.robot_id,
-                        "RTDE connect task panicked during stop: {e}"
-                    );
-                }
-            }
-        }
-
-        *self.health.lock().expect("health mutex poisoned") = AdapterHealth::Stopped;
+        self.lifecycle.stop(&self.config.robot_id).await;
         *self.last_state.lock().expect("last_state mutex poisoned") = None;
         Ok(())
     }
 
     fn health(&self) -> AdapterHealth {
-        self.health.lock().expect("health mutex poisoned").clone()
+        self.lifecycle.health()
     }
 
     fn subscribe(&self) -> broadcast::Receiver<CanonicalEvent> {

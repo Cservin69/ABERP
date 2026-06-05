@@ -34,6 +34,7 @@
 //! [`CanonicalEvent`](crate::CanonicalEvent)s on the other.
 
 pub mod barcode_scanner;
+pub mod common;
 pub mod mtconnect;
 pub mod ur_rtde;
 pub mod zebra;
