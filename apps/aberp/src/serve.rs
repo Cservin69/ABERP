@@ -9248,6 +9248,14 @@ pub struct DecideQaInspectionResponse {
     pub superseded_qa_id: Option<String>,
     pub rework_flipped_routing_op_back_to_active: bool,
     pub disposed_emitted_scrap_movement: bool,
+    /// PR-237 / S243 — `Some(wo_id)` when this Pass auto-completed the
+    /// parent WO (the QA gate became satisfied with this decision).
+    /// `None` for partial-pass decisions, Fail/Rework/Dispose, or when
+    /// the WO was already terminal. Per [[trust-code-not-operator]] the
+    /// SPA does not need to surface this — the WO state read at refresh
+    /// time is canonical — but the hook is reported so a banner / toast
+    /// can be added without a fresh round-trip.
+    pub wo_auto_completed: Option<String>,
 }
 
 async fn handle_decide_qa_inspection(
@@ -9322,6 +9330,7 @@ pub fn decide_qa_inspection_request(
         ledger_meta: &ledger_meta,
         ledger_actor,
     };
+    let idempotency_seed = body.idempotency_key.clone();
     let inputs = aberp_qa::DecideQaInputs {
         decision,
         reason: body.reason,
@@ -9330,6 +9339,34 @@ pub fn decide_qa_inspection_request(
         idempotency_key: body.idempotency_key,
     };
     let outcome = aberp_qa::decide_qa(&tx, &ctx, qa_id, inputs).map_err(map_qa_err)?;
+
+    // PR-237 / S243 — auto-complete the WO when this Pass satisfies the
+    // QA gate. Same tx so the WO flip + WoCompletion stock_movement +
+    // WorkOrderStateChanged audit ride the same commit as the QA decide.
+    // The hook is a no-op for Fail / Rework / Dispose AND for partial-
+    // pass states; `try_auto_complete_wo` re-runs the gate inside the
+    // tx so it sees this Pass + every prior live Passed inspection
+    // together.
+    let wo_auto_completed = if matches!(outcome.inspection.state, aberp_qa::QaState::Passed) {
+        let wo_ctx = aberp_work_orders::WoWriteContext {
+            tenant: state.tenant.as_str(),
+            actor: aberp_inventory::ActorKind::SpaOperator {
+                operator_login: operator_login.to_string(),
+            },
+            ledger_meta: &ledger_meta,
+            ledger_actor: Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        };
+        aberp_work_orders::try_auto_complete_wo(
+            &tx,
+            &wo_ctx,
+            &outcome.inspection.wo_id,
+            &idempotency_seed,
+        )
+        .map_err(map_wo_err)?
+    } else {
+        None
+    };
+
     tx.commit().context("commit QA decide transaction")?;
     sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
     Ok(DecideQaInspectionResponse {
@@ -9337,6 +9374,7 @@ pub fn decide_qa_inspection_request(
         superseded_qa_id: outcome.superseded_qa_id,
         rework_flipped_routing_op_back_to_active: outcome.rework_flipped_routing_op_back_to_active,
         disposed_emitted_scrap_movement: outcome.disposed_emitted_scrap_movement,
+        wo_auto_completed,
     })
 }
 

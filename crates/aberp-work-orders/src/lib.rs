@@ -52,10 +52,11 @@ pub use error::WorkOrderError;
 pub use repository::{
     count_work_orders_by_state, create_work_order, ensure_schema, list_active_bom_for_product,
     list_routing_ops_for_wo, list_work_orders, read_routing_op, read_work_order,
-    replace_bom_for_product, transition_routing_op, transition_work_order, BomLine, BomLineInput,
-    CreateWorkOrderInputs, RoutingOp, RoutingOpInput, RoutingOpTransitionInputs,
-    RoutingOpTransitionOutcome, TransitionInputs, WoWriteContext, WorkOrder, WorkOrderStateCounts,
-    WorkOrderTransitionOutcome, MAX_BOM_LINES_PER_REQUEST, MAX_ROUTING_OPS_PER_WO,
+    replace_bom_for_product, transition_routing_op, transition_work_order, try_auto_complete_wo,
+    BomLine, BomLineInput, CreateWorkOrderInputs, RoutingOp, RoutingOpInput,
+    RoutingOpTransitionInputs, RoutingOpTransitionOutcome, TransitionInputs, WoWriteContext,
+    WorkOrder, WorkOrderStateCounts, WorkOrderTransitionOutcome, MAX_BOM_LINES_PER_REQUEST,
+    MAX_ROUTING_OPS_PER_WO,
 };
 pub use state::{next_routing_op_state, next_state, RoutingOpStateError, WoStateError};
 pub use types::{RoutingOpAction, RoutingOpState, WoAction, WorkOrderState};

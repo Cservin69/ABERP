@@ -1602,3 +1602,69 @@ fn blocking_qa_op_names(tx: &Transaction<'_>, tenant: &str, wo_id: &str) -> anyh
     }
     Ok(blockers.join(", "))
 }
+
+/// PR-237 / S243 — auto-complete a WO when its QA gate becomes
+/// satisfied, called by the QA-decide route after a successful Pass
+/// so the operator does not have to remember to mark the WO done
+/// per [[trust-code-not-operator]].
+///
+/// Returns `Some(wo_id)` when the transition fired; `None` when the
+/// gate is not yet satisfied OR the WO is no longer InProgress
+/// (already terminal, never released, etc — all idempotent no-ops).
+/// All side effects (WO state UPDATE, WoCompletion stock_movement,
+/// WorkOrderStateChanged audit) flow through the existing
+/// [`transition_work_order`] handler so operator-click and auto-
+/// complete share ONE write path — no duplicated SQL.
+///
+/// Idempotency story:
+///   - Pre-check on `state == InProgress` makes repeat calls cheap
+///     no-ops (re-Pass after cross-actor supersede; a second QA pass
+///     that fires the hook after the WO already flipped Completed).
+///   - The supplied `idempotency_seed` is suffixed `:wo-auto-complete`
+///     so the audit-ledger F8 chain stays distinct from the QA
+///     decide's own key.
+pub fn try_auto_complete_wo(
+    tx: &Transaction<'_>,
+    ctx: &WoWriteContext<'_>,
+    wo_id: &str,
+    idempotency_seed: &str,
+) -> Result<Option<String>, WorkOrderError> {
+    let current_state_str: Option<String> = tx
+        .query_row(
+            "SELECT state FROM work_orders WHERE tenant_id = ? AND wo_id = ? LIMIT 1;",
+            params![ctx.tenant, wo_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            duckdb::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(anyhow!("read work_orders for auto-complete: {other}")),
+        })?;
+    let Some(state_str) = current_state_str else {
+        return Ok(None);
+    };
+    let current_state = WorkOrderState::from_storage_str(&state_str)
+        .map_err(|e| WorkOrderError::Storage(anyhow!("{e}: {state_str:?}")))?;
+    if !matches!(current_state, WorkOrderState::InProgress) {
+        return Ok(None);
+    }
+
+    let gate_ok = aberp_qa::all_live_inspections_passed_for_wo(tx, ctx.tenant, wo_id)
+        .map_err(|e| WorkOrderError::Storage(anyhow!("QA gate check (auto-complete): {e}")))?;
+    if !gate_ok {
+        return Ok(None);
+    }
+
+    transition_work_order(
+        tx,
+        ctx,
+        wo_id,
+        TransitionInputs {
+            action: WoAction::Complete,
+            reason: Some("auto-completed: all QA inspections passed".to_string()),
+            source_event_id: None,
+            idempotency_key: format!("{}:wo-auto-complete", idempotency_seed),
+        },
+    )?;
+    Ok(Some(wo_id.to_string()))
+}
