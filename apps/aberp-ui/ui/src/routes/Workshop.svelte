@@ -74,7 +74,14 @@
   // distracting": scan ticker faster than spotlight, both fast
   // enough to register inside a 10-15s tile glance.
   const DEMO_SCAN_TICK_MS = 3_500;
-  const DEMO_SPOTLIGHT_TICK_MS = 8_000;
+  // S249-F21 — spotlight rotation tick MUST exceed the CSS animation
+  // duration (`ws-spotlight-pulse`, 8s) by enough margin to let the
+  // prior tile's fade-out finish before the next tile claims focus.
+  // Pre-S249-F21 this was 8_000 (same as the keyframes) so every
+  // rotation hard-cut the trailing 2s fade-out. Demo wall is the polish
+  // surface — clipped fades read as "glitchy," not "polished."
+  // 9_000 = 8_000ms animation + 1_000ms quiescent buffer.
+  const DEMO_SPOTLIGHT_TICK_MS = 9_000;
   const DEMO_AUTO_SCROLL_TICK_MS = 6_000;
 
   let loadState: LoadState = $state("idle");

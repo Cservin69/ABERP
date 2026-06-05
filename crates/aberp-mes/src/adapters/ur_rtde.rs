@@ -649,6 +649,17 @@ async fn run_stream_loop(
     last_state_slot: &Arc<Mutex<Option<(RobotMode, SafetyMode)>>>,
     sender: &broadcast::Sender<CanonicalEvent>,
 ) {
+    // S249-F11 — first-frame sanity flag. SETUP_OUTPUTS validates types
+    // slot-by-slot but slots 1+2 are both INT32, so a controller (or
+    // buggy responder) that transposed robot_mode and safety_mode
+    // would pass validation while decode_data_payload reads bytes in
+    // declared order, silently mis-classifying ProtectiveStop as a
+    // benign mode change. On the first data frame in this connection
+    // we assert both decoded modes land in their documented integer
+    // ranges (not RobotMode::Unknown / SafetyMode::Unknown). On
+    // failure we drop the connection — the outer connect loop
+    // reconnects + re-handshakes per CLAUDE.md rule 12 (fail loud).
+    let mut first_frame_validated = false;
     loop {
         let read_attempt = tokio::time::timeout(
             config.stall_threshold,
@@ -664,7 +675,17 @@ async fn run_stream_loop(
                     config.pause_timeout,
                     write_frame(&mut stream, CMD_CONTROL_PACKAGE_PAUSE, &[]),
                 ).await;
-                let _ = stream.shutdown().await;
+                // S249-F14 — bound shutdown() too. A controller with a
+                // closed TCP window or full RX buffer can stall
+                // `stream.shutdown()` indefinitely, defeating S213's
+                // graceful-shutdown budget and producing user-visible
+                // "it won't quit → SIGKILL becomes routine" behaviour.
+                // Reuse the same pause_timeout — RST is acceptable on
+                // expiry; PAUSE intent already arrived best-effort.
+                let _ = tokio::time::timeout(
+                    config.pause_timeout,
+                    stream.shutdown(),
+                ).await;
                 return;
             }
             result = read_attempt => {
@@ -692,6 +713,23 @@ async fn run_stream_loop(
                     Ok(Ok((cmd, payload))) => {
                         set_health(health_slot, AdapterHealth::Healthy);
                         if cmd == CMD_DATA_PACKAGE {
+                            // S249-F11: validate the first decoded frame's
+                            // mode codes are in-range. Mis-classification
+                            // here would silently log ProtectiveStop as a
+                            // benign mode change — drop + reconnect.
+                            if !first_frame_validated {
+                                match validate_first_frame(&payload) {
+                                    Ok(()) => first_frame_validated = true,
+                                    Err(reason) => {
+                                        tracing::error!(
+                                            robot_id = %config.robot_id,
+                                            "RTDE first-frame sanity check failed: {reason}; \
+                                             dropping connection for re-handshake"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
                             handle_data_frame(
                                 &payload,
                                 &config.robot_id,
@@ -704,6 +742,31 @@ async fn run_stream_loop(
             }
         }
     }
+}
+
+/// S249-F11 — first-frame sanity check. Slot-swap defence: the
+/// SETUP_OUTPUTS reply only carries variable TYPES (both robot_mode
+/// and safety_mode are INT32), so a controller that returned the two
+/// variables transposed would pass `validate_output_types` while
+/// `decode_data_payload` reads bytes in declared order — silently
+/// mis-classifying ProtectiveStop as a benign mode change. We check
+/// the first decoded frame's modes land inside their documented
+/// integer ranges (anything mapping to `Unknown` is rejected) and
+/// drop the connection if either is Unknown so the outer connect
+/// loop re-handshakes. Per CLAUDE.md rule 12 — fail loud.
+pub(crate) fn validate_first_frame(payload: &[u8]) -> Result<(), String> {
+    let snap = decode_data_payload(payload).map_err(|e| format!("decode failed: {e}"))?;
+    if matches!(snap.robot_mode, RobotMode::Unknown) {
+        return Err(
+            "robot_mode decoded to Unknown on first frame — slot mis-order suspected".to_string(),
+        );
+    }
+    if matches!(snap.safety_mode, SafetyMode::Unknown) {
+        return Err(
+            "safety_mode decoded to Unknown on first frame — slot mis-order suspected".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Decode a data-package payload (recipe-ID byte + 120 bytes of
@@ -1418,6 +1481,38 @@ mod tests {
         let bad = types.join(",");
         let err = validate_output_types(&bad).expect_err("type mismatch must fail");
         assert!(err.contains("typed"), "{err}");
+    }
+
+    // ====== S249-F11: first-frame sanity ======
+
+    #[test]
+    fn validate_first_frame_accepts_in_range_modes() {
+        // robot_mode_code=7 (Running), safety_mode_code=1 (Normal).
+        let p = build_data_frame_payload(0.0, 7, 1, 2, [0.0; 6], [0.0; 6], 0, 1);
+        validate_first_frame(&p).expect("canonical values must pass");
+    }
+
+    #[test]
+    fn validate_first_frame_rejects_unknown_robot_mode() {
+        // 99 is out of -1..=8 → maps to RobotMode::Unknown.
+        let p = build_data_frame_payload(0.0, 99, 1, 2, [0.0; 6], [0.0; 6], 0, 1);
+        let err = validate_first_frame(&p).expect_err("Unknown robot_mode must reject");
+        assert!(err.contains("robot_mode"), "{err}");
+    }
+
+    #[test]
+    fn validate_first_frame_rejects_unknown_safety_mode() {
+        // 99 is out of 1..=11 → maps to SafetyMode::Unknown.
+        let p = build_data_frame_payload(0.0, 7, 99, 2, [0.0; 6], [0.0; 6], 0, 1);
+        let err = validate_first_frame(&p).expect_err("Unknown safety_mode must reject");
+        assert!(err.contains("safety_mode"), "{err}");
+    }
+
+    #[test]
+    fn validate_first_frame_rejects_short_payload() {
+        let too_short = vec![1u8; 10];
+        let err = validate_first_frame(&too_short).expect_err("short payload must reject");
+        assert!(err.contains("decode"), "{err}");
     }
 
     #[test]

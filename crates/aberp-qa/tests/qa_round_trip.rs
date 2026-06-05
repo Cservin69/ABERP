@@ -1054,3 +1054,196 @@ fn count_qa_inspections_by_state_is_tenant_scoped() {
     let own = count_qa_inspections_by_state(&conn, TEST_TENANT).unwrap();
     assert_eq!(own.pending, 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// S249-F18: decide_qa refuses Pass/Fail/Rework on Cancelled WO.
+// ─────────────────────────────────────────────────────────────────────
+
+fn cancel_wo(conn: &mut Connection, meta: &LedgerMeta, wo_id: &str, idem: &str) {
+    let tx = conn.transaction().unwrap();
+    transition_work_order(
+        &tx,
+        &wo_ctx_for(meta, "ervin"),
+        wo_id,
+        TransitionInputs {
+            action: WoAction::Cancel,
+            reason: Some("cancelled mid-prod".to_string()),
+            source_event_id: None,
+            idempotency_key: idem.to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+fn complete_op_get_qa_id(conn: &mut Connection, meta: &LedgerMeta, op_id: &str) -> String {
+    let tx = conn.transaction().unwrap();
+    let outcome = transition_routing_op(
+        &tx,
+        &wo_ctx_for(meta, "ervin"),
+        op_id,
+        RoutingOpTransitionInputs {
+            action: RoutingOpAction::Complete,
+            source_event_id: None,
+            idempotency_key: format!("op-complete-{op_id}"),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    outcome.qa_inspection_id
+}
+
+#[test]
+fn decide_qa_pass_refused_on_cancelled_wo() {
+    let mut conn = setup_db();
+    let meta = meta();
+    let (wo_id, op_ids) = create_and_release_wo_with_2_ops(&mut conn, &meta);
+    let qa_id = complete_op_get_qa_id(&mut conn, &meta, &op_ids[0]);
+    cancel_wo(&mut conn, &meta, &wo_id, "cancel-1");
+
+    let tx = conn.transaction().unwrap();
+    let err = decide_qa(
+        &tx,
+        &qa_ctx_for(&meta, "ervin"),
+        &qa_id,
+        DecideQaInputs {
+            decision: QaDecision::Pass,
+            reason: None,
+            measurement: None,
+            source_event_id: None,
+            idempotency_key: "decide-pass-on-cancelled".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    match err {
+        QaError::Validation(msg) => {
+            assert!(
+                msg.contains("cancelled") && msg.contains(&wo_id),
+                "expected cancelled+wo_id in msg, got: {msg}"
+            );
+        }
+        other => panic!("expected Validation, got {other:?}"),
+    }
+    drop(tx);
+    // No QaInspectionDecided audit row should have been written.
+    let decided = count_kind(&conn, "mes.qa_inspection_decided");
+    assert_eq!(decided, 0, "no decide audit row on refused decision");
+}
+
+#[test]
+fn decide_qa_fail_refused_on_cancelled_wo() {
+    let mut conn = setup_db();
+    let meta = meta();
+    let (wo_id, op_ids) = create_and_release_wo_with_2_ops(&mut conn, &meta);
+    let qa_id = complete_op_get_qa_id(&mut conn, &meta, &op_ids[0]);
+    cancel_wo(&mut conn, &meta, &wo_id, "cancel-2");
+
+    let tx = conn.transaction().unwrap();
+    let err = decide_qa(
+        &tx,
+        &qa_ctx_for(&meta, "ervin"),
+        &qa_id,
+        DecideQaInputs {
+            decision: QaDecision::Fail,
+            reason: Some("oot".to_string()),
+            measurement: None,
+            source_event_id: None,
+            idempotency_key: "decide-fail-on-cancelled".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, QaError::Validation(_)));
+}
+
+#[test]
+fn decide_qa_rework_refused_on_cancelled_wo() {
+    let mut conn = setup_db();
+    let meta = meta();
+    let (wo_id, op_ids) = create_and_release_wo_with_2_ops(&mut conn, &meta);
+    let qa_id = complete_op_get_qa_id(&mut conn, &meta, &op_ids[0]);
+
+    // First Fail (so the next state can be Rework per the state machine).
+    let tx = conn.transaction().unwrap();
+    decide_qa(
+        &tx,
+        &qa_ctx_for(&meta, "ervin"),
+        &qa_id,
+        DecideQaInputs {
+            decision: QaDecision::Fail,
+            reason: Some("bad".to_string()),
+            measurement: None,
+            source_event_id: None,
+            idempotency_key: "decide-fail-first".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    cancel_wo(&mut conn, &meta, &wo_id, "cancel-3");
+
+    let tx = conn.transaction().unwrap();
+    let err = decide_qa(
+        &tx,
+        &qa_ctx_for(&meta, "ervin"),
+        &qa_id,
+        DecideQaInputs {
+            decision: QaDecision::Rework,
+            reason: None,
+            measurement: None,
+            source_event_id: None,
+            idempotency_key: "decide-rework-on-cancelled".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, QaError::Validation(_)));
+}
+
+#[test]
+fn decide_qa_dispose_still_allowed_on_cancelled_wo() {
+    // Path: Pending → Fail (legal pre-cancel) → cancel WO → Dispose.
+    // Per ADR-0063 §"Dispose" Dispose is only reachable from Failed or
+    // Reworking, so the test seeds Failed first. The gate must still
+    // accept Dispose against a Cancelled WO — scrap is the natural
+    // outcome for a cancelled-mid-prod WO.
+    let mut conn = setup_db();
+    let meta = meta();
+    let (wo_id, op_ids) = create_and_release_wo_with_2_ops(&mut conn, &meta);
+    let qa_id = complete_op_get_qa_id(&mut conn, &meta, &op_ids[0]);
+
+    let tx = conn.transaction().unwrap();
+    decide_qa(
+        &tx,
+        &qa_ctx_for(&meta, "ervin"),
+        &qa_id,
+        DecideQaInputs {
+            decision: QaDecision::Fail,
+            reason: Some("oot".to_string()),
+            measurement: None,
+            source_event_id: None,
+            idempotency_key: "decide-fail-pre-cancel".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    cancel_wo(&mut conn, &meta, &wo_id, "cancel-4");
+
+    let tx = conn.transaction().unwrap();
+    let outcome = decide_qa(
+        &tx,
+        &qa_ctx_for(&meta, "ervin"),
+        &qa_id,
+        DecideQaInputs {
+            decision: QaDecision::Dispose,
+            reason: Some("scrap".to_string()),
+            measurement: None,
+            source_event_id: None,
+            idempotency_key: "decide-dispose-on-cancelled".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(outcome.inspection.state, QaState::Disposed);
+    assert!(outcome.disposed_emitted_scrap_movement);
+}

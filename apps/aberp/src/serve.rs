@@ -9363,11 +9363,18 @@ pub fn decide_qa_inspection_request(
             ledger_meta: &ledger_meta,
             ledger_actor,
         };
+        // S249-F19 — forward the originating source_event_id so the
+        // WorkOrderStateChanged audit emitted by auto-complete carries
+        // the same id as the upstream QaInspectionDecided audit. SPA
+        // decisions are guard-rejected above with `source_event_id:
+        // None`, so the live route ladder is None today; adapter-
+        // driven decide paths (ADR-0063 §3) thread the real id.
         aberp_work_orders::try_auto_complete_wo(
             &tx,
             &wo_ctx,
             &outcome.inspection.wo_id,
             &idempotency_seed,
+            outcome.inspection.source_event_id.clone(),
         )
         .map_err(map_wo_err)?
     } else {

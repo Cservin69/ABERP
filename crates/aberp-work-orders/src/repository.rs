@@ -1616,6 +1616,15 @@ fn blocking_qa_op_names(tx: &Transaction<'_>, tenant: &str, wo_id: &str) -> anyh
 /// [`transition_work_order`] handler so operator-click and auto-
 /// complete share ONE write path — no duplicated SQL.
 ///
+/// `source_event_id` plumbs the originating adapter event id through
+/// the cascade per ADR-0062 invariant 7. SPA-driven QA decisions pass
+/// `None`; adapter-driven QA decisions (per ADR-0063 §3) pass the
+/// adapter's event id so the `WorkOrderStateChanged` audit emitted by
+/// auto-complete carries the same `source_event_id` as the upstream
+/// `QaInspectionDecided` audit and the cascade stays reconstructible.
+/// Pre-S249-F19 this was hardcoded `None`, dropping causality at the
+/// QA→WO arrow.
+///
 /// Idempotency story:
 ///   - Pre-check on `state == InProgress` makes repeat calls cheap
 ///     no-ops (re-Pass after cross-actor supersede; a second QA pass
@@ -1628,6 +1637,7 @@ pub fn try_auto_complete_wo(
     ctx: &WoWriteContext<'_>,
     wo_id: &str,
     idempotency_seed: &str,
+    source_event_id: Option<String>,
 ) -> Result<Option<String>, WorkOrderError> {
     let current_state_str: Option<String> = tx
         .query_row(
@@ -1662,7 +1672,7 @@ pub fn try_auto_complete_wo(
         TransitionInputs {
             action: WoAction::Complete,
             reason: Some("auto-completed: all QA inspections passed".to_string()),
-            source_event_id: None,
+            source_event_id,
             idempotency_key: format!("{}:wo-auto-complete", idempotency_seed),
         },
     )?;

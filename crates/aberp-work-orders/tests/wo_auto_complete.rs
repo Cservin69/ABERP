@@ -298,7 +298,14 @@ fn decide_and_maybe_auto_complete(
     .unwrap();
     let wo_id = decide_outcome.inspection.wo_id.clone();
     let auto = if matches!(decide_outcome.inspection.state, QaState::Passed) {
-        try_auto_complete_wo(&tx, &wo_ctx(meta, "ervin"), &wo_id, idem).unwrap()
+        try_auto_complete_wo(
+            &tx,
+            &wo_ctx(meta, "ervin"),
+            &wo_id,
+            idem,
+            decide_outcome.inspection.source_event_id.clone(),
+        )
+        .unwrap()
     } else {
         None
     };
@@ -473,7 +480,8 @@ fn second_pass_after_auto_complete_is_a_noop() {
     // wo_id after the first auto-complete already fired. The
     // InProgress pre-check refuses → Ok(None).
     let tx = conn.transaction().unwrap();
-    let again = try_auto_complete_wo(&tx, &wo_ctx(&m, "ervin"), &wo_id, "qa3-4-repeat").unwrap();
+    let again =
+        try_auto_complete_wo(&tx, &wo_ctx(&m, "ervin"), &wo_id, "qa3-4-repeat", None).unwrap();
     tx.commit().unwrap();
     assert!(
         again.is_none(),
@@ -712,4 +720,281 @@ fn list_routing_ops_match_completed_after_auto_complete() {
             op.routing_op_id
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// S249-F19: adapter-driven QA Pass that triggers auto-complete must
+// forward `source_event_id` through the cascade so the
+// WorkOrderStateChanged audit carries the same id as the upstream
+// QaInspectionDecided audit. Pre-S249-F19 this was hardcoded `None`,
+// breaking the "adapter event → QA pass → WO completion" forward link
+// at the second arrow (ADR-0062 invariant 7).
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn auto_complete_carries_source_event_id_from_adapter_decide() {
+    let mut conn = setup_db();
+    let m = meta();
+    let (wo_id, op_ids) =
+        create_and_release_3_op_wo(&mut conn, &m, "WO-AC-019", "create-19", "release-19");
+
+    // Ops #1 and #2 — operator Pass (no adapter id).
+    let qa1 = complete_op(&mut conn, &m, &op_ids[0], "op1-complete-19");
+    decide_and_maybe_auto_complete(&mut conn, &m, &qa1, QaDecision::Pass, "qa1-19");
+    let qa2 = complete_op(&mut conn, &m, &op_ids[1], "op2-complete-19");
+    decide_and_maybe_auto_complete(&mut conn, &m, &qa2, QaDecision::Pass, "qa2-19");
+
+    // Op #3 — adapter-driven QA Pass with a real source_event_id.
+    // The adapter-decide must trigger auto-complete (gate now
+    // satisfied) AND propagate the event id into the
+    // WorkOrderStateChanged audit row.
+    let qa3 = complete_op(&mut conn, &m, &op_ids[2], "op3-complete-19");
+    let adapter_evt_id = "evt_adapter_rtde_42";
+
+    let tx = conn.transaction().unwrap();
+    let decide_outcome = decide_qa(
+        &tx,
+        &qa_adapter_ctx(&m, "renishaw-cell-A"),
+        &qa3,
+        DecideQaInputs {
+            decision: QaDecision::Pass,
+            reason: None,
+            measurement: Some("dim_a=12.50mm".to_string()),
+            source_event_id: Some(adapter_evt_id.to_string()),
+            idempotency_key: "qa3-19-adapter".to_string(),
+        },
+    )
+    .unwrap();
+    let auto = try_auto_complete_wo(
+        &tx,
+        &wo_ctx(&m, "ervin"),
+        &decide_outcome.inspection.wo_id,
+        "qa3-19-adapter",
+        decide_outcome.inspection.source_event_id.clone(),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(auto.as_deref(), Some(wo_id.as_str()));
+
+    // Two cascade audits must share the same source_event_id:
+    //   - QaInspectionDecided (adapter Pass)
+    //   - WorkOrderStateChanged (auto-completed)
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, payload FROM audit_ledger
+             WHERE kind IN ('mes.qa_inspection_decided', 'mes.work_order_state_changed');",
+        )
+        .unwrap();
+    let rows: Vec<(String, Vec<u8>)> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let mut found_qa = false;
+    let mut found_wo = false;
+    for (kind, payload) in &rows {
+        let v: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        let evt = v["source_event_id"].as_str();
+        if kind == "mes.qa_inspection_decided" && v["to_state"].as_str() == Some("passed") {
+            // Only the adapter-driven decide carries the id — operator
+            // decides earlier wrote source_event_id: None.
+            if evt == Some(adapter_evt_id) {
+                found_qa = true;
+            }
+        }
+        if kind == "mes.work_order_state_changed" && v["to_state"].as_str() == Some("completed") {
+            assert_eq!(
+                evt,
+                Some(adapter_evt_id),
+                "auto-complete must forward source_event_id; got {evt:?}"
+            );
+            found_wo = true;
+        }
+    }
+    assert!(
+        found_qa,
+        "expected a QaInspectionDecided{{Pass}} audit row carrying adapter source_event_id"
+    );
+    assert!(
+        found_wo,
+        "expected a WorkOrderStateChanged{{Completed}} audit row carrying adapter source_event_id"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// S249-F17: direct-call pin tests for `try_auto_complete_wo`'s internal
+// guards. The existing tests exercise the hook only via
+// `decide_and_maybe_auto_complete` which short-circuits on
+// `Fail/Rework/Dispose` and never invokes the hook for those decisions
+// — so the hook's own guard semantics (Cancelled / OnHold / gate-not-
+// satisfied / unknown wo_id) were untested. A refactor that inverted
+// the QA-state guard at the route layer would pass every existing
+// test while the hook returned Ok(None) for every InProgress case.
+// These tests pin each guard at the hook's call shape.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Cancel a WO via the canonical transition_work_order path. Mirrors
+/// the cancel_wo helper used in aberp-qa tests.
+fn cancel_wo(conn: &mut Connection, meta: &LedgerMeta, wo_id: &str, idem: &str) {
+    let tx = conn.transaction().unwrap();
+    transition_work_order(
+        &tx,
+        &wo_ctx(meta, "ervin"),
+        wo_id,
+        TransitionInputs {
+            action: WoAction::Cancel,
+            reason: Some("test cancel".to_string()),
+            source_event_id: None,
+            idempotency_key: idem.to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+/// Put a WO into OnHold via the canonical transition_work_order path.
+fn hold_wo(conn: &mut Connection, meta: &LedgerMeta, wo_id: &str, idem: &str) {
+    let tx = conn.transaction().unwrap();
+    transition_work_order(
+        &tx,
+        &wo_ctx(meta, "ervin"),
+        wo_id,
+        TransitionInputs {
+            action: WoAction::Hold,
+            reason: Some("test hold".to_string()),
+            source_event_id: None,
+            idempotency_key: idem.to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+#[test]
+fn try_auto_complete_returns_none_for_unknown_wo_id() {
+    let mut conn = setup_db();
+    let m = meta();
+    let _ = create_and_release_3_op_wo(&mut conn, &m, "WO-AC-G1", "create-g1", "release-g1");
+
+    let tx = conn.transaction().unwrap();
+    let res = try_auto_complete_wo(
+        &tx,
+        &wo_ctx(&m, "ervin"),
+        "wo_does_not_exist",
+        "guard-1",
+        None,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(
+        res.is_none(),
+        "unknown wo_id must Ok(None) — never error, never transition"
+    );
+}
+
+#[test]
+fn try_auto_complete_returns_none_when_wo_cancelled() {
+    let mut conn = setup_db();
+    let m = meta();
+    let (wo_id, _op_ids) =
+        create_and_release_3_op_wo(&mut conn, &m, "WO-AC-G2", "create-g2", "release-g2");
+    cancel_wo(&mut conn, &m, &wo_id, "guard-cancel");
+
+    let tx = conn.transaction().unwrap();
+    let res = try_auto_complete_wo(&tx, &wo_ctx(&m, "ervin"), &wo_id, "guard-2", None).unwrap();
+    tx.commit().unwrap();
+    assert!(
+        res.is_none(),
+        "Cancelled WO must Ok(None) — terminal-state guard"
+    );
+}
+
+#[test]
+fn try_auto_complete_returns_none_when_wo_on_hold() {
+    let mut conn = setup_db();
+    let m = meta();
+    let (wo_id, _op_ids) =
+        create_and_release_3_op_wo(&mut conn, &m, "WO-AC-G3", "create-g3", "release-g3");
+    hold_wo(&mut conn, &m, &wo_id, "guard-hold");
+
+    let tx = conn.transaction().unwrap();
+    let res = try_auto_complete_wo(&tx, &wo_ctx(&m, "ervin"), &wo_id, "guard-3", None).unwrap();
+    tx.commit().unwrap();
+    assert!(
+        res.is_none(),
+        "OnHold WO must Ok(None) — InProgress-only pre-check. \
+         See S249-F3 (🔴): if a brief asks to widen to OnHold + auto-Resume, \
+         re-investigate the audit-ordering decision first."
+    );
+}
+
+#[test]
+fn try_auto_complete_returns_none_when_gate_not_satisfied() {
+    let mut conn = setup_db();
+    let m = meta();
+    let (wo_id, op_ids) =
+        create_and_release_3_op_wo(&mut conn, &m, "WO-AC-G4", "create-g4", "release-g4");
+
+    // Complete op#1 — Pending inspection exists, NOT decided. The
+    // gate (all live inspections passed for WO) is therefore false.
+    let _qa1 = complete_op(&mut conn, &m, &op_ids[0], "op1-g4");
+
+    let tx = conn.transaction().unwrap();
+    let res = try_auto_complete_wo(&tx, &wo_ctx(&m, "ervin"), &wo_id, "guard-4", None).unwrap();
+    tx.commit().unwrap();
+    assert!(
+        res.is_none(),
+        "WO with Pending QA inspection must Ok(None) — gate-not-satisfied guard"
+    );
+
+    // And the WO is still InProgress (no transition fired).
+    let wo = read_work_order(&conn, TEST_TENANT, &wo_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(wo.state, WorkOrderState::InProgress);
+}
+
+#[test]
+fn auto_complete_carries_none_when_decide_had_none() {
+    // Pin the SPA-driven path's behaviour explicitly: source_event_id
+    // None propagates through unchanged. Catches any future refactor
+    // that swaps `None` for an unrelated default.
+    let mut conn = setup_db();
+    let m = meta();
+    let (wo_id, op_ids) =
+        create_and_release_3_op_wo(&mut conn, &m, "WO-AC-020", "create-20", "release-20");
+
+    let qa1 = complete_op(&mut conn, &m, &op_ids[0], "op1-complete-20");
+    decide_and_maybe_auto_complete(&mut conn, &m, &qa1, QaDecision::Pass, "qa1-20");
+    let qa2 = complete_op(&mut conn, &m, &op_ids[1], "op2-complete-20");
+    decide_and_maybe_auto_complete(&mut conn, &m, &qa2, QaDecision::Pass, "qa2-20");
+    let qa3 = complete_op(&mut conn, &m, &op_ids[2], "op3-complete-20");
+    let (_, ac) = decide_and_maybe_auto_complete(&mut conn, &m, &qa3, QaDecision::Pass, "qa3-20");
+    assert_eq!(ac.as_deref(), Some(wo_id.as_str()));
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT payload FROM audit_ledger
+             WHERE kind = 'mes.work_order_state_changed';",
+        )
+        .unwrap();
+    let payloads: Vec<Vec<u8>> = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    let completed_with_none = payloads
+        .iter()
+        .map(|p| serde_json::from_slice::<serde_json::Value>(p).unwrap())
+        .filter(|v| v["to_state"].as_str() == Some("completed"))
+        .filter(|v| v["source_event_id"].is_null())
+        .count();
+    assert_eq!(
+        completed_with_none, 1,
+        "SPA-driven auto-complete must carry source_event_id null"
+    );
 }

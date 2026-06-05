@@ -335,6 +335,36 @@ pub fn decide_qa(
     let current_state = QaState::from_storage_str(&current_state_str)
         .map_err(|e| QaError::Storage(anyhow!("{e}: {current_state_str:?}")))?;
 
+    // S249-F18: refuse Pass/Fail/Rework on a Cancelled WO. The auto-
+    // complete hook silently no-ops for terminal WOs (see
+    // aberp_work_orders::try_auto_complete_wo), so a concurrent
+    // Cancel between this tx's SELECT and the QA-decide would
+    // otherwise record `QaInspectionDecided{Passed}` against a
+    // terminal WO with no warning. Dispose stays legal — scrap is the
+    // natural outcome for a cancelled WO. Same in-tx raw-SQL posture
+    // as the Dispose branch below (deliberately no aberp-work-orders
+    // dep to avoid the cycle).
+    let wo_state_str: Option<String> = tx
+        .query_row(
+            "SELECT state FROM work_orders WHERE tenant_id = ? AND wo_id = ? LIMIT 1;",
+            params![ctx.tenant, &wo_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            duckdb::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(QaError::Storage(anyhow!(
+                "read work_orders for QA-decide gate: {other}"
+            ))),
+        })?;
+    if let Some(s) = wo_state_str.as_deref() {
+        if s == "cancelled" && !matches!(inputs.decision, QaDecision::Dispose) {
+            return Err(QaError::Validation(format!(
+                "WO {wo_id} is cancelled; only Dispose is legal against its QA inspections"
+            )));
+        }
+    }
+
     // Refuse illegal edges loud per the state machine.
     let new_state = next_qa_state(current_state, inputs.decision)?;
 
