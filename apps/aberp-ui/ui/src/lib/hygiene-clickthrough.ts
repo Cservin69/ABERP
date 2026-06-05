@@ -30,6 +30,7 @@
 // Pinned by `hygiene-clickthrough.test.ts`.
 
 import type { InvoiceState, RowKind } from "./api";
+import { parseAgingBucket, type AgingBucket } from "./aging";
 
 /** Closed-vocab of hygiene flags the StatisticsPage surfaces (mirrors
  * `HygienePanel` in `api.ts` — backend's `serve::HygienePanel`). One
@@ -82,11 +83,18 @@ export interface OutgoingUrlInit {
   state?: "All" | InvoiceState;
   row_kind?: "All" | RowKind;
   hygiene?: OutgoingHygieneFacet | null;
+  /** S262 / PR-251 — receivables-aging bucket the dashboard deep-linked
+   * to. `undefined` = not named (keep saved-prefs); the list filters its
+   * outstanding (unpaid, NAV-accepted) rows to this bucket. */
+  aging?: AgingBucket | null;
 }
 
 /** URL init for the incoming tab. */
 export interface IncomingUrlInit {
   hygiene?: IncomingHygieneFacet | null;
+  /** S262 / PR-251 — payables-aging bucket the dashboard deep-linked to.
+   * Filters Outstanding incoming rows to this bucket. */
+  aging?: AgingBucket | null;
 }
 
 /** Parsed shape of a `#/invoices?…` hash. `tab` is `null` when the
@@ -257,6 +265,16 @@ export function parseInvoicesUrl(hashOrQuery: string): InvoicesUrlInit {
       out.incoming.hygiene = hygiene as IncomingHygieneFacet;
       out.hasInit = true;
     }
+  }
+  // S262 / PR-251 — aging bucket. The same `aging` param string is legal
+  // on BOTH tabs (the dashboard's AR card targets `tab=outgoing`, the AP
+  // card `tab=incoming`); route it into both inits and let the active
+  // tab's list consume its own. Unknown vocab is discarded.
+  const bucket = parseAgingBucket(params.get("aging"));
+  if (bucket !== null) {
+    out.outgoing.aging = bucket;
+    out.incoming.aging = bucket;
+    out.hasInit = true;
   }
   return out;
 }

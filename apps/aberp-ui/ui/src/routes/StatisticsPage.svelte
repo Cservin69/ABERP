@@ -19,6 +19,7 @@
   import {
     getFinancialReport,
     type FinancialReport,
+    type AgingPanel,
   } from "../lib/api";
   import {
     buildPeriodOptions,
@@ -36,6 +37,13 @@
     clickTargetForFlag,
     type HygieneFlag,
   } from "../lib/hygiene-clickthrough";
+  // S262 / PR-251 — aging-bucket display + click-through into the lists.
+  import {
+    AGING_BUCKETS,
+    AGING_LABELS,
+    bucketAmount,
+    type AgingBucket,
+  } from "../lib/aging";
 
   type LoadState = "idle" | "loading" | "ready" | "error";
 
@@ -49,6 +57,21 @@
   let selectedPeriod = $state<string>(periodOptions[0]?.wire ?? "");
   let dateBasis: DateBasis = $state("teljesites");
 
+  // S262 / PR-251 — sentinel select value for the custom-range arm. The
+  // backend already parses `YYYY-MM-DD..YYYY-MM-DD` (reports::parse_period
+  // Custom arm); the SPA just composes that wire string from two date
+  // inputs. `__custom__` is NOT a wire value — picking it reveals the
+  // pickers and defers the load until Apply.
+  const CUSTOM_SENTINEL = "__custom__";
+  let periodChoice = $state<string>(periodOptions[0]?.wire ?? ""); // drives the <select>
+  let customFrom = $state<string>("");
+  let customTo = $state<string>("");
+  let customError = $state<string | null>(null);
+
+  // S262 / PR-251 — operator-configurable top-N (default 10, clamped
+  // 1..50 to match the backend ceiling). Reloads on change.
+  let topN = $state<number>(10);
+
   onMount(() => {
     void load();
   });
@@ -57,7 +80,7 @@
     loadState = "loading";
     errorMessage = null;
     try {
-      const r = await getFinancialReport(selectedPeriod, dateBasis);
+      const r = await getFinancialReport(selectedPeriod, dateBasis, topN);
       report = r;
       loadState = "ready";
     } catch (e) {
@@ -68,8 +91,54 @@
 
   function onPeriodChange(e: Event) {
     const target = e.target as HTMLSelectElement;
+    periodChoice = target.value;
+    customError = null;
+    if (target.value === CUSTOM_SENTINEL) {
+      // Reveal the date pickers; wait for Apply before loading.
+      return;
+    }
     selectedPeriod = target.value;
     void load();
+  }
+
+  function applyCustomRange() {
+    if (customFrom === "" || customTo === "") {
+      customError = "Adj meg kezdő és záró dátumot. / Pick a start and end date.";
+      return;
+    }
+    if (customTo < customFrom) {
+      customError = "A záró dátum nem lehet a kezdő előtt. / End date is before start.";
+      return;
+    }
+    customError = null;
+    selectedPeriod = `${customFrom}..${customTo}`;
+    void load();
+  }
+
+  function onTopNChange(e: Event) {
+    const raw = Number((e.target as HTMLInputElement).value);
+    const next = Number.isFinite(raw) ? Math.min(50, Math.max(1, Math.round(raw))) : 10;
+    if (next === topN) return;
+    topN = next;
+    void load();
+  }
+
+  // S262 / PR-251 — deep-link an aging bucket into the matching invoice
+  // list. Mutates the hash so App.svelte's hashchange router re-renders
+  // into InvoiceList / IncomingInvoiceList, which read `?aging=` on mount
+  // (see hygiene-clickthrough.parseInvoicesUrl). Zero-count buckets are
+  // rendered static by the template (no handler), matching the hygiene
+  // row posture.
+  function onAgingClick(tab: "outgoing" | "incoming", bucket: AgingBucket) {
+    window.location.hash = `#/invoices?tab=${tab}&aging=${bucket}`;
+  }
+
+  /** Percent of the currency-split bar a HUF-minor amount occupies. The
+   * denominator is the snapshot-HUF total (HUF native + EUR-as-HUF); 0
+   * when there is no revenue (the bar renders empty). */
+  function splitPct(part: number, total: number): number {
+    if (total <= 0) return 0;
+    return (part / total) * 100;
   }
 
   function setDateBasis(next: DateBasis) {
@@ -177,16 +246,48 @@
         Period
         <select
           aria-label="Period"
-          value={selectedPeriod}
+          value={periodChoice}
           onchange={onPeriodChange}
         >
           {#each periodOptions as opt (opt.wire)}
             <option value={opt.wire}>{opt.label}</option>
           {/each}
+          <option value={CUSTOM_SENTINEL}>Custom range… / Egyéni</option>
         </select>
+      </label>
+      <!-- S262 / PR-251 — top-N control for the customer/vendor lists. -->
+      <label class="stats__period">
+        Top-N
+        <input
+          type="number"
+          min="1"
+          max="50"
+          aria-label="Top-N customers and vendors"
+          value={topN}
+          onchange={onTopNChange}
+        />
       </label>
     </div>
   </header>
+
+  {#if periodChoice === CUSTOM_SENTINEL}
+    <!-- S262 / PR-251 — custom date-range pickers. Emits the backend's
+         `YYYY-MM-DD..YYYY-MM-DD` period wire form on Apply. -->
+    <div class="stats__custom" role="group" aria-label="Custom date range">
+      <label>
+        From / Kezdő
+        <input type="date" bind:value={customFrom} aria-label="Range start" />
+      </label>
+      <label>
+        To / Záró
+        <input type="date" bind:value={customTo} aria-label="Range end" />
+      </label>
+      <button type="button" onclick={applyCustomRange}>Apply / Alkalmaz</button>
+      {#if customError !== null}
+        <span class="stats__custom-err" role="alert">{customError}</span>
+      {/if}
+    </div>
+  {/if}
 
   {#if loadState === "loading"}
     <p class="stats__loading">Loading aggregates…</p>
@@ -351,6 +452,98 @@
           </span>
         </p>
       </article>
+    </section>
+
+    <!-- Row 2b: currency split (snapshot-rate HUF). S262 / PR-251 -->
+    {@const cs = r.currency_split}
+    {@const splitTotal = cs.huf_minor + cs.eur_as_huf_minor}
+    <section class="stats__split" aria-label="Revenue currency split">
+      <h3>Revenue currency split / Bevétel pénznem szerint</h3>
+      {#if splitTotal <= 0}
+        <p class="stats__empty">— no native outgoing revenue in this period —</p>
+      {:else}
+        <div
+          class="split-bar"
+          role="img"
+          aria-label={`HUF ${splitPct(cs.huf_minor, splitTotal).toFixed(0)} percent, EUR ${splitPct(cs.eur_as_huf_minor, splitTotal).toFixed(0)} percent of HUF-equivalent revenue`}
+        >
+          {#if cs.huf_minor > 0}
+            <div
+              class="split-seg split-seg--huf"
+              style={`width:${splitPct(cs.huf_minor, splitTotal)}%`}
+            ></div>
+          {/if}
+          {#if cs.eur_as_huf_minor > 0}
+            <div
+              class="split-seg split-seg--eur"
+              style={`width:${splitPct(cs.eur_as_huf_minor, splitTotal)}%`}
+            ></div>
+          {/if}
+        </div>
+        <ul class="split-legend">
+          <li>
+            <span class="split-dot split-dot--huf" aria-hidden="true"></span>
+            HUF <strong>{formatHuf(cs.huf_minor)}</strong>
+            <span class="muted">{splitPct(cs.huf_minor, splitTotal).toFixed(0)}% · ({cs.huf_count})</span>
+          </li>
+          <li>
+            <span class="split-dot split-dot--eur" aria-hidden="true"></span>
+            EUR <strong>{formatMinor(cs.eur_native_minor, "EUR")}</strong>
+            <span class="muted">→ {formatHuf(cs.eur_as_huf_minor)} · {splitPct(cs.eur_as_huf_minor, splitTotal).toFixed(0)}% · ({cs.eur_count})</span>
+          </li>
+        </ul>
+        <p class="stats__detail">
+          EUR converted at each invoice's snapshot MNB rate (issuance, not
+          today); native outgoing invoices only.
+        </p>
+      {/if}
+    </section>
+
+    <!-- Row 2c: AR + AP aging, click-through to filtered lists. S262 -->
+    {#snippet agingPanel(title: string, panel: AgingPanel, tab: "outgoing" | "incoming")}
+      <section class="stats__aging" aria-label={title}>
+        <h3>{title}</h3>
+        <ul class="aging-list">
+          {#each AGING_BUCKETS as bucket (bucket)}
+            {@const amt = bucketAmount(panel, bucket)}
+            {#if amt.count > 0}
+              <li class="aging-row clickable">
+                <button
+                  type="button"
+                  class="aging-row-btn"
+                  onclick={() => onAgingClick(tab, bucket)}
+                  title={`${AGING_LABELS[bucket]} — kattints a szűrt listához. / Click to open the filtered list.`}
+                  aria-label={`${AGING_LABELS[bucket]}: ${amt.count} invoices. Open the filtered list.`}
+                >
+                  <span class="aging-label">{AGING_LABELS[bucket]}</span>
+                  <strong class="aging-count">{amt.count}</strong>
+                  <span class="aging-amount">{formatHuf(amt.gross_minor)}*</span>
+                  <span class="aging-chevron" aria-hidden="true">›</span>
+                </button>
+              </li>
+            {:else}
+              <li class="aging-row">
+                <span class="aging-label">{AGING_LABELS[bucket]}</span>
+                <strong class="aging-count">0</strong>
+                <span class="aging-amount">—</span>
+              </li>
+            {/if}
+          {/each}
+        </ul>
+        <p class="stats__detail">* counts are exact; amounts sum HUF + EUR.</p>
+      </section>
+    {/snippet}
+    <section class="stats__aging-grid" aria-label="Aging">
+      {@render agingPanel(
+        "Receivables aging / Vevőkövetelés korosítás",
+        r.receivables_aging,
+        "outgoing",
+      )}
+      {@render agingPanel(
+        "Payables aging / Szállítói tartozás korosítás",
+        r.payables_aging,
+        "incoming",
+      )}
     </section>
 
     <!-- Row 3: VAT-by-rate breakdown -->
@@ -866,5 +1059,206 @@
   }
   .stats__error strong {
     color: var(--color-signal-negative);
+  }
+
+  /* S262 / PR-251 — top-N number input matches the period select chrome. */
+  .stats__period input[type="number"] {
+    width: 4.5rem;
+    background: var(--color-surface-raised);
+    color: var(--color-text-primary);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 3px;
+    padding: var(--space-1) var(--space-2);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
+  }
+
+  /* Custom date-range pickers. */
+  .stats__custom {
+    display: flex;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    padding: var(--space-3);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+  }
+  .stats__custom label {
+    display: inline-flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-secondary);
+  }
+  .stats__custom input[type="date"] {
+    background: var(--color-surface-sunken);
+    color: var(--color-text-primary);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 3px;
+    padding: var(--space-1) var(--space-2);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
+  }
+  .stats__custom button {
+    background: var(--color-surface-sunken);
+    color: var(--color-text-strong);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 3px;
+    padding: var(--space-1) var(--space-3);
+    cursor: pointer;
+    font-size: var(--type-size-sm);
+  }
+  .stats__custom button:hover {
+    border-color: var(--color-text-muted);
+  }
+  .stats__custom-err {
+    color: var(--color-signal-negative);
+    font-size: var(--type-size-sm);
+    align-self: center;
+  }
+
+  /* Currency split — stacked bar + legend. */
+  .stats__split {
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    padding: var(--space-3);
+    background: var(--color-surface-raised);
+  }
+  .stats__split h3 {
+    margin: 0 0 var(--space-2);
+    font-size: var(--type-size-sm);
+    font-weight: 600;
+    color: var(--color-text-secondary);
+  }
+  .split-bar {
+    display: flex;
+    width: 100%;
+    height: 18px;
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--color-surface-sunken);
+  }
+  .split-seg {
+    height: 100%;
+  }
+  .split-seg--huf {
+    background: var(--color-signal-positive);
+  }
+  .split-seg--eur {
+    background: var(--color-signal-warning);
+  }
+  .split-legend {
+    list-style: none;
+    margin: var(--space-2) 0 0;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-4);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-secondary);
+  }
+  .split-legend strong {
+    font-family: var(--type-family-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--color-text-strong);
+  }
+  .split-legend .muted {
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
+  }
+  .split-dot {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    margin-right: var(--space-1);
+  }
+  .split-dot--huf {
+    background: var(--color-signal-positive);
+  }
+  .split-dot--eur {
+    background: var(--color-signal-warning);
+  }
+
+  /* Aging — two side-by-side panels of clickable bucket rows. */
+  .stats__aging-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: var(--space-3);
+  }
+  .stats__aging {
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    padding: var(--space-3);
+    background: var(--color-surface-raised);
+  }
+  .stats__aging h3 {
+    margin: 0 0 var(--space-2);
+    font-size: var(--type-size-sm);
+    font-weight: 600;
+    color: var(--color-text-secondary);
+  }
+  .aging-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .aging-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-secondary);
+  }
+  .aging-row-btn {
+    display: flex;
+    width: 100%;
+    align-items: baseline;
+    gap: var(--space-2);
+    background: none;
+    border: 0;
+    padding: var(--space-1) 0;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+    text-align: inherit;
+  }
+  .aging-label {
+    color: var(--color-text-secondary);
+  }
+  .aging-count {
+    margin-left: auto;
+    font-family: var(--type-family-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--color-text-strong);
+  }
+  .aging-amount {
+    font-family: var(--type-family-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
+    min-width: 6rem;
+    text-align: right;
+  }
+  .aging-chevron {
+    color: var(--color-text-muted);
+    transition: transform var(--motion-fade-in);
+  }
+  .aging-row.clickable:hover .aging-label,
+  .aging-row.clickable:hover .aging-count {
+    color: var(--color-text-strong);
+  }
+  .aging-row.clickable:hover .aging-chevron {
+    color: var(--color-text-strong);
+    transform: translateX(2px);
+  }
+  .aging-row-btn:focus-visible {
+    outline: 2px solid var(--color-text-strong);
+    outline-offset: 2px;
   }
 </style>

@@ -41,6 +41,13 @@
   // PR-223 / S227 — URL-driven filter init from the StatisticsPage's
   // hygiene click-through.
   import { parseInvoicesUrl } from "../lib/hygiene-clickthrough";
+  // S262 / PR-251 — payables-aging bucket deep-link from the Finance
+  // dashboard's AP-aging card.
+  import {
+    agingBucketFor,
+    AGING_LABELS,
+    type AgingBucket,
+  } from "../lib/aging";
   import { formatTotal, formatInvoiceDate } from "../lib/format";
   import {
     actionsForStatus,
@@ -74,6 +81,13 @@
     initialPrefs.sort,
   );
   let filter: IncomingFilterSpec = $state(initialPrefs.filter);
+
+  // S262 / PR-251 — payables-aging bucket from the dashboard deep-link.
+  // TRANSIENT (unlike the persisted `filter.hygiene`): a deep-link bucket
+  // is a one-shot navigation, not a saved view, so it is NOT written to
+  // localStorage and resets on a fresh mount. A dismissable banner lets
+  // the operator clear it without hunting for a hidden saved facet.
+  let agingFacet = $state<AgingBucket | null>(null);
 
   // Sync-now spinner + toast.
   let syncInFlight = $state(false);
@@ -110,6 +124,10 @@
     if (!init.hasInit) return;
     if (init.incoming.hygiene !== undefined) {
       filter = { ...filter, hygiene: init.incoming.hygiene };
+    }
+    // S262 / PR-251 — aging bucket deep-link (transient).
+    if (init.incoming.aging !== undefined) {
+      agingFacet = init.incoming.aging;
     }
     // Strip the consumed query string so a refresh does not reapply.
     try {
@@ -219,6 +237,17 @@
       if (inv.local_status !== "Outstanding") return false;
       if (inv.payment_deadline === null) return false;
       if (inv.payment_deadline >= todayIso()) return false;
+    }
+    // S262 / PR-251 — payables-aging bucket gate. Mirrors the dashboard's
+    // `payables_aging` panel: Outstanding rows only, classified by
+    // `payment_deadline` vs today into the same buckets the backend
+    // `reports::aging_bucket_for` computes.
+    if (agingFacet !== null) {
+      if (inv.local_status !== "Outstanding") return false;
+      if (inv.payment_deadline === null) return false;
+      if (agingBucketFor(todayIso(), inv.payment_deadline) !== agingFacet) {
+        return false;
+      }
     }
     const needle = filter.needle.trim().toLowerCase();
     if (needle === "") return true;
@@ -408,6 +437,7 @@
 
   function clearFilters() {
     filter = { needle: "", status: "All", currency: "All" };
+    agingFacet = null;
   }
 
   function asCurrency(raw: string): Currency | null {
@@ -517,6 +547,23 @@
 
   {#if loadState === "error" && errorMessage !== null}
     <p class="error" role="alert">{errorMessage}</p>
+  {/if}
+
+  {#if agingFacet !== null}
+    <!-- S262 / PR-251 — active payables-aging deep-link filter. Dismissable
+         so the operator is never trapped in a transient bucket view. -->
+    <div class="aging-banner" role="status">
+      <span>
+        Korosítás szűrő / Aging filter: <strong>{AGING_LABELS[agingFacet]}</strong>
+        (csak nyitott tételek / Outstanding only)
+      </span>
+      <button
+        type="button"
+        class="aging-banner__clear"
+        onclick={() => (agingFacet = null)}
+        aria-label="Korosítás szűrő törlése / Clear aging filter"
+      >× törlés / clear</button>
+    </div>
   {/if}
 
   <table class="dense">
@@ -1210,5 +1257,37 @@
     display: flex;
     justify-content: flex-end;
     gap: var(--space-2);
+  }
+
+  /* S262 / PR-251 — transient aging deep-link banner. Quiet info chrome
+     (ADR-0017 §1-2): sunken surface, accent left border, dismiss link. */
+  .aging-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-bottom: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    background: var(--color-surface-sunken);
+    border: 1px solid var(--color-surface-divider);
+    border-left: 3px solid var(--color-signal-warning);
+    border-radius: 3px;
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-sm);
+  }
+  .aging-banner strong {
+    color: var(--color-text-strong);
+  }
+  .aging-banner__clear {
+    background: none;
+    border: 0;
+    color: var(--color-text-muted);
+    cursor: pointer;
+    font: inherit;
+    white-space: nowrap;
+    padding: 0;
+  }
+  .aging-banner__clear:hover {
+    color: var(--color-text-strong);
   }
 </style>

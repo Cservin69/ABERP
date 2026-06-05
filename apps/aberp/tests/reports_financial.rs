@@ -144,6 +144,7 @@ fn build_request(period: PeriodKind, today: time::Date) -> ReportRequest {
         period,
         date_basis: DateBasis::Teljesites,
         today,
+        top_n: 10,
     }
 }
 
@@ -403,6 +404,7 @@ fn date_basis_issued_uses_issue_date_axis() {
         period: PeriodKind::Month(2026, 6),
         date_basis: DateBasis::Issued,
         today: date!(2026 - 06 - 30),
+        top_n: 10,
     };
     let report = compute_financial_report(&db_path, tenant, BinaryHash::from_bytes([0u8; 32]), req)
         .expect("compute");

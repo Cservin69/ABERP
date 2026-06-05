@@ -3736,6 +3736,17 @@ struct InvoiceListItem {
     /// on a non-draft Own row would surface as the empty cell and
     /// indicate a real backend wiring gap).
     issue_date: Option<String>,
+    /// S262 / PR-251 — canonical ISO-8601 `YYYY-MM-DD` payment deadline
+    /// (Hungarian `Fizetési határidő`), the AR-aging anchor. The S227
+    /// hygiene click-through deliberately kept the AR "past deadline" row
+    /// static because this field was absent from the list wire shape;
+    /// PR-251 adds it so the Finance dashboard's receivables-aging bucket
+    /// rows can deep-link into the outgoing list filtered to a bucket.
+    /// Resolved value (the billing read path falls NULL → issue_date per
+    /// PR-84), so `Own` non-draft rows always carry a date; `None` only
+    /// for `Draft` (pre-issuance) and `ExtNav` (digest mirror has no
+    /// deadline). Pinned by `invoice_list_item_emits_payment_deadline`.
+    payment_deadline: Option<String>,
 }
 
 /// PR-73 / ADR-0040 §addendum — wire-shape mirror of the typed
@@ -11365,7 +11376,19 @@ async fn handle_list_restored_invoices(
 struct FinancialReportQuery {
     period: Option<String>,
     date_basis: Option<String>,
+    /// S262 / PR-251 — operator-chosen size of the top-customers /
+    /// top-vendors lists. Absent → 10. Clamped to `1..=50` at the route
+    /// layer ([`TOP_N_DEFAULT`] / [`TOP_N_MAX`]) so a hand-typed
+    /// `?top_n=0` or `?top_n=99999` cannot empty the list or force an
+    /// unbounded sort-and-emit (CLAUDE.md rule 12 — never trust the URL).
+    top_n: Option<usize>,
 }
+
+/// Default + ceiling for the top-N lists. 10 matches the SPA default
+/// control value; 50 is a generous ceiling well above any practical
+/// customer/vendor count for this operator.
+const TOP_N_DEFAULT: usize = 10;
+const TOP_N_MAX: usize = 50;
 
 async fn handle_financial_report(
     headers: HeaderMap,
@@ -11417,10 +11440,12 @@ async fn handle_financial_report(
     };
     let db_path = state.db_path.clone();
     let tenant = state.tenant.clone();
+    let top_n = q.top_n.unwrap_or(TOP_N_DEFAULT).clamp(1, TOP_N_MAX);
     let req = reports::ReportRequest {
         period,
         date_basis,
         today,
+        top_n,
     };
     let result = tokio::task::spawn_blocking(move || {
         reports::compute_financial_report(&db_path, tenant, binary_hash, req)
@@ -11955,6 +11980,9 @@ fn compute_workshop_dashboard(
         },
         date_basis: reports::DateBasis::Teljesites,
         today,
+        // Workshop tile reads only `today_invoice_total`; top-N is unused
+        // here but the field is required — the default keeps it cheap.
+        top_n: TOP_N_DEFAULT,
     };
     let today_report =
         reports::compute_financial_report(&state.db_path, state.tenant.clone(), binary_hash, req)
@@ -15499,6 +15527,10 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
             .and_then(|p| read_buyer_name_from_side_store(p));
         let payment = trace.payment.clone().map(PaymentRecordSummary::from);
         let issue_date = row.ready_invoice.issue_date.date().format(date_fmt).ok();
+        // S262 / PR-251 — resolved payment deadline (NULL→issue_date per
+        // PR-84) for the AR-aging click-through. Same descriptor as
+        // issue_date so both surface identical YYYY-MM-DD strings.
+        let payment_deadline = row.ready_invoice.payment_deadline.format(date_fmt).ok();
         items.push(InvoiceListItem {
             invoice_id: id,
             sequence_number: row.ready_invoice.sequence_number,
@@ -15519,6 +15551,7 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
             issue_date,
+            payment_deadline,
         });
     }
     // PR-213 / S215 — virtual union with `restored_invoice` (the
@@ -15605,6 +15638,8 @@ fn restored_to_list_item(ext: restore_outgoing::RestoredInvoice) -> Result<Invoi
         // `<invoiceIssueDate>` (NOT NULL by schema + `process_digest`
         // loud-fails when absent), already in `YYYY-MM-DD` form.
         issue_date: Some(ext.issue_date),
+        // S262 / PR-251 — the digest mirror carries no payment deadline.
+        payment_deadline: None,
     })
 }
 
@@ -15649,6 +15684,9 @@ fn draft_to_list_item(
         // per the PR brief) so the Outgoing column reflects "not yet
         // issued" without inventing a sentinel.
         issue_date: None,
+        // S262 / PR-251 — pre-issuance drafts have no deadline; aging
+        // excludes Draft rows by construction.
+        payment_deadline: None,
     })
 }
 
@@ -17877,6 +17915,7 @@ mod tests {
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
             issue_date: None,
+            payment_deadline: None,
         };
         let v = serde_json::to_value(&with_chain).expect("InvoiceListItem must always serialise");
         assert_eq!(
@@ -17900,6 +17939,7 @@ mod tests {
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
             issue_date: None,
+            payment_deadline: None,
         };
         let v =
             serde_json::to_value(&without_chain).expect("InvoiceListItem must always serialise");
@@ -17937,6 +17977,7 @@ mod tests {
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
             issue_date: None,
+            payment_deadline: None,
         };
         let v = serde_json::to_value(&storno_list).expect("InvoiceListItem must serialise");
         assert_eq!(
@@ -17993,6 +18034,7 @@ mod tests {
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
             issue_date: None,
+            payment_deadline: None,
         };
         let v = serde_json::to_value(&plain).expect("InvoiceListItem must serialise");
         assert_eq!(
@@ -18377,6 +18419,7 @@ mod tests {
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
             issue_date: None,
+            payment_deadline: None,
         };
         let v = serde_json::to_value(&huf).expect("InvoiceListItem must always serialise");
         assert_eq!(
@@ -18400,6 +18443,7 @@ mod tests {
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
             issue_date: None,
+            payment_deadline: None,
         };
         let v = serde_json::to_value(&eur).expect("InvoiceListItem must always serialise");
         assert_eq!(
@@ -18443,6 +18487,7 @@ mod tests {
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
             issue_date: None,
+            payment_deadline: None,
         };
         let v = serde_json::to_value(&with_name).expect("InvoiceListItem must always serialise");
         assert_eq!(
@@ -18466,6 +18511,7 @@ mod tests {
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
             issue_date: None,
+            payment_deadline: None,
         };
         let v = serde_json::to_value(&without_name).expect("InvoiceListItem must always serialise");
         assert!(
@@ -19283,6 +19329,7 @@ mod tests {
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
             issue_date: None,
+            payment_deadline: None,
         };
         let v = serde_json::to_value(&own).expect("InvoiceListItem must serialise");
         assert_eq!(
@@ -19313,6 +19360,7 @@ mod tests {
             row_kind: RowKind::ExtNav,
             source_nav_invoice_number: Some("BIL-2026-001".to_string()),
             issue_date: Some("2026-04-15".to_string()),
+            payment_deadline: None,
         };
         let v = serde_json::to_value(&ext).expect("InvoiceListItem must serialise");
         assert_eq!(
@@ -19358,6 +19406,7 @@ mod tests {
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
             issue_date: Some("2026-04-15".to_string()),
+            payment_deadline: None,
         };
         let v = serde_json::to_value(&with_date).expect("InvoiceListItem must serialise");
         assert_eq!(
@@ -19385,11 +19434,79 @@ mod tests {
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
             issue_date: None,
+            payment_deadline: None,
         };
         let v = serde_json::to_value(&draft).expect("InvoiceListItem must serialise");
         assert!(
             v.get("issue_date").map(|x| x.is_null()).unwrap_or(false),
             "issue_date MUST serialise as JSON null when None (not absent) — the SPA reads `string | null` strictly",
+        );
+    }
+
+    /// S262 / PR-251 — `InvoiceListItem` MUST carry a typed
+    /// `payment_deadline: Option<String>` on the JSON wire shape. The
+    /// Finance dashboard's receivables-aging bucket click-through filters
+    /// the outgoing list by this field (the SPA types it `string | null`
+    /// in `api.ts` and classifies each row into the SAME bucket the
+    /// backend `reports::aging_bucket_for` computes). A silent rename,
+    /// removal, or `skip_serializing_if` regression would break the AR
+    /// click-through that S227 deliberately deferred until this field
+    /// landed. CLAUDE.md rule 9: BOTH the `Some` (issued Own row) and
+    /// `None` (Draft / ExtNav digest mirror) branches are asserted so a
+    /// hard-coded value cannot pass vacuously; the `None` arm asserts
+    /// JSON null, not key-absent.
+    #[test]
+    fn invoice_list_item_emits_payment_deadline() {
+        let with_deadline = InvoiceListItem {
+            invoice_id: "inv_DUE".to_string(),
+            sequence_number: 7,
+            fiscal_year: 2026,
+            state: InvoiceState::Finalized,
+            total_gross: Some(254_000),
+            has_chain_children: false,
+            is_storno: false,
+            currency: Currency::Huf,
+            buyer_name: None,
+            payment: None,
+            bank_account: None,
+            row_kind: RowKind::Own,
+            source_nav_invoice_number: None,
+            issue_date: Some("2026-04-15".to_string()),
+            payment_deadline: Some("2026-05-15".to_string()),
+        };
+        let v = serde_json::to_value(&with_deadline).expect("InvoiceListItem must serialise");
+        assert_eq!(
+            v.get("payment_deadline").and_then(|x| x.as_str()),
+            Some("2026-05-15"),
+            "payment_deadline MUST serialise as the canonical YYYY-MM-DD string when Some",
+        );
+
+        // ExtNav / Draft arm — no deadline; `None` MUST serialise as JSON
+        // null (not key-absent) so the SPA's strict `string | null` read
+        // treats the row as un-bucketable rather than crashing.
+        let ext = InvoiceListItem {
+            invoice_id: "ext_NAV".to_string(),
+            sequence_number: 0,
+            fiscal_year: 2026,
+            state: InvoiceState::Unknown,
+            total_gross: Some(99_000),
+            has_chain_children: false,
+            is_storno: false,
+            currency: Currency::Huf,
+            buyer_name: None,
+            payment: None,
+            bank_account: None,
+            row_kind: RowKind::ExtNav,
+            source_nav_invoice_number: Some("X-1".to_string()),
+            issue_date: Some("2026-04-15".to_string()),
+            payment_deadline: None,
+        };
+        let v = serde_json::to_value(&ext).expect("InvoiceListItem must serialise");
+        assert!(
+            v.get("payment_deadline")
+                .map(|x| x.is_null())
+                .unwrap_or(false),
+            "payment_deadline MUST serialise as JSON null when None (not absent)",
         );
     }
 

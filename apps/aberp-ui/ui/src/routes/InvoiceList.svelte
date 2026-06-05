@@ -102,6 +102,14 @@
   // URL after consumption so a refresh / browser-back does not
   // reapply a stale init on top of the operator's interactive edits.
   import { parseInvoicesUrl } from "../lib/hygiene-clickthrough";
+  // S262 / PR-251 — receivables-aging bucket deep-link from the Finance
+  // dashboard's AR-aging card.
+  import {
+    agingBucketFor,
+    AGING_LABELS,
+    todayIsoLocal,
+    type AgingBucket,
+  } from "../lib/aging";
   import InvoiceDetail from "./InvoiceDetail.svelte";
   import ModificationInvoice from "./ModificationInvoice.svelte";
   // S220 / PR-217 — operator-paced partner picker for ExtNav rows.
@@ -151,6 +159,35 @@
   // `filterLabel` + `searchNeedle` reactive fields are subsumed here so
   // one object drives every filter surface.
   let filter: InvoiceFilterSpec = $state({ ...initialPrefs.filter });
+
+  // S262 / PR-251 — receivables-aging bucket from the dashboard deep-link.
+  // TRANSIENT (not persisted): a deep-link bucket is a one-shot
+  // navigation, cleared via the dismissable banner or a fresh mount.
+  let agingFacet = $state<AgingBucket | null>(null);
+
+  /** Receivable-eligible aging predicate for an outgoing row. Mirrors the
+   * backend `reports::aggregate_outgoing` receivables-aging gate: a
+   * NAV-accepted ("counted") invoice that is unpaid and is not a storno
+   * child, classified by `payment_deadline` into the clicked bucket.
+   * The "counted" set is approximated by the three revenue-recognized
+   * states {Submitted, Recovered, Finalized}; storno/amended BASE rows
+   * (a rarer edge) are excluded, so the list count can diverge slightly
+   * from the dashboard bucket count in those cases — the same
+   * best-effort posture S227 documented for the storno-chain row. */
+  function agingMatches(row: InvoiceListItem): boolean {
+    if (agingFacet === null) return true;
+    if (row.payment !== null) return false; // paid → not a receivable
+    if (row.is_storno) return false; // storno child
+    if (
+      row.state !== "Submitted" &&
+      row.state !== "Recovered" &&
+      row.state !== "Finalized"
+    ) {
+      return false;
+    }
+    if (row.payment_deadline === null) return false;
+    return agingBucketFor(todayIsoLocal(), row.payment_deadline) === agingFacet;
+  }
 
   // PR-94 / session-114 — sortable-columns state. `key === null` keeps
   // the legacy lifecycle-natural ordering (Unknown → Abandoned, then
@@ -346,6 +383,8 @@
     if (o.state !== undefined) next.state = o.state;
     if (o.row_kind !== undefined) next.row_kind = o.row_kind;
     if (o.hygiene !== undefined) next.hygiene = o.hygiene;
+    // S262 / PR-251 — aging bucket deep-link (transient component state).
+    if (o.aging !== undefined) agingFacet = o.aging;
     filter = next;
     // Strip the consumed query string so a refresh / back-button does
     // not reapply the init. Keeps `#/invoices` clean for bookmarking.
@@ -690,6 +729,7 @@
   //      tiebreaks on invoice_id ascending regardless of dir).
   let visibleRows = $derived(
     filterInvoices(rows, filter)
+      .filter(agingMatches)
       .slice()
       .sort((a, b) => {
         if (sort.key === null) {
@@ -949,6 +989,23 @@
 
   {#if loadState === "error"}
     <p class="error" role="alert">{errorMessage}</p>
+  {/if}
+
+  {#if agingFacet !== null}
+    <!-- S262 / PR-251 — active receivables-aging deep-link filter.
+         Dismissable so the operator is never trapped in the bucket view. -->
+    <div class="aging-banner" role="status">
+      <span>
+        Korosítás szűrő / Aging filter: <strong>{AGING_LABELS[agingFacet]}</strong>
+        (nyitott vevőkövetelés / Outstanding receivables)
+      </span>
+      <button
+        type="button"
+        class="aging-banner__clear"
+        onclick={() => (agingFacet = null)}
+        aria-label="Korosítás szűrő törlése / Clear aging filter"
+      >× törlés / clear</button>
+    </div>
   {/if}
 
   <table class="dense">
@@ -2138,5 +2195,37 @@
     overflow: hidden;
     clip: rect(0 0 0 0);
     white-space: nowrap;
+  }
+
+  /* S262 / PR-251 — transient aging deep-link banner (mirrors the AP
+     list). Quiet info chrome with an accent left border + dismiss link. */
+  .aging-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-bottom: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    background: var(--color-surface-sunken);
+    border: 1px solid var(--color-surface-divider);
+    border-left: 3px solid var(--color-signal-warning);
+    border-radius: 3px;
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-sm);
+  }
+  .aging-banner strong {
+    color: var(--color-text-strong);
+  }
+  .aging-banner__clear {
+    background: none;
+    border: 0;
+    color: var(--color-text-muted);
+    cursor: pointer;
+    font: inherit;
+    white-space: nowrap;
+    padding: 0;
+  }
+  .aging-banner__clear:hover {
+    color: var(--color-text-strong);
   }
 </style>

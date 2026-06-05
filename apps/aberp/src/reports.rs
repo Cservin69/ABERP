@@ -79,6 +79,11 @@ pub struct ReportRequest {
     /// "Today" anchor for aging / cashflow / running-YTD calculations.
     /// Always callable with `today_local()`; tests pass a fixed date.
     pub today: Date,
+    /// S262 / PR-251 — number of rows the top-customers / top-vendors
+    /// lists return. Operator-configurable from the SPA (`?top_n=`),
+    /// defaulting to 10. Clamped at the route layer to a sane range so a
+    /// hand-typed `?top_n=100000` cannot force an unbounded sort-and-emit.
+    pub top_n: usize,
 }
 
 /// Closed-vocab period selector. Default `Month(YYYY, MM)` per the
@@ -135,6 +140,10 @@ pub struct FinancialReport {
     pub vat_to_pay: CurrencyPair,
     pub receivables: CurrencyAggregate,
     pub payables: CurrencyAggregate,
+    /// S262 / PR-251 — currency split of NATIVE outgoing revenue,
+    /// expressed in a common HUF unit so HUF and EUR are comparable on
+    /// one stacked bar.
+    pub currency_split: CurrencySplitPanel,
     pub receivables_aging: AgingPanel,
     pub payables_aging: AgingPanel,
     pub dso_days: DsoPanel,
@@ -176,6 +185,35 @@ pub struct AmountAggregate {
 pub struct CurrencyPair {
     pub huf_minor: i64,
     pub eur_minor: i64,
+}
+
+/// S262 / PR-251 — currency split of native outgoing revenue.
+///
+/// HUF and EUR revenue live in different units (forints vs EUR cents), so
+/// a raw side-by-side bar would be meaningless (HUF dwarfs EUR ~400×). To
+/// make the split comparable, the EUR portion is converted to HUF at the
+/// **snapshot MNB rate stamped on each invoice at issuance** (the
+/// `huf_equivalent_total` column, ADR-0037 §1.c) — NOT today's rate. The
+/// SPA renders `huf_minor` + `eur_as_huf_minor` as one stacked bar and
+/// discloses the native EUR figure separately.
+///
+/// Basis: ISSUED native outgoing invoices (the `invoice` table only —
+/// restored/AP digest rows have no snapshot rate). `huf_minor` reuses the
+/// storno-adjusted native-revenue aggregate; `eur_as_huf_minor` sums
+/// `huf_equivalent_total` on an issued basis (EUR storno reversals are not
+/// sign-flipped here — a rare-case v1 approximation noted on the tile).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct CurrencySplitPanel {
+    /// Native HUF revenue gross, in forints (storno-adjusted).
+    pub huf_minor: i64,
+    pub huf_count: u64,
+    /// Native EUR revenue gross, in EUR cents (storno-adjusted) — shown
+    /// for disclosure beside the converted figure.
+    pub eur_native_minor: i64,
+    pub eur_count: u64,
+    /// EUR revenue converted to HUF at each invoice's snapshot rate, in
+    /// forints (issued basis). The comparable EUR contribution to the bar.
+    pub eur_as_huf_minor: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -797,6 +835,54 @@ fn row_to_outgoing(row: &duckdb::Row) -> duckdb::Result<OutgoingLineGroup> {
     })
 }
 
+/// S262 / PR-251 — sum of `huf_equivalent_total` (snapshot-rate HUF
+/// equivalent of gross, ADR-0037 §1.c) over EUR native invoices in the
+/// window. HUF invoices store NULL there (their gross IS the HUF figure),
+/// so the `= 'EUR'` predicate is what restricts the sum. Issued basis;
+/// see [`CurrencySplitPanel`] for the storno caveat. The window predicate
+/// mirrors `query_outgoing_groups` via [`build_date_where`].
+fn query_eur_huf_equivalent(
+    conn: &Connection,
+    window: DateWindow,
+    basis: DateBasis,
+) -> Result<i64> {
+    // `build_date_where` interpolates the teljesites date column; the
+    // existing outgoing query relies on the same shape, so the currency
+    // split stays consistent with the revenue figure it splits.
+    let _ = basis;
+    let (date_where, has_from, has_to) = build_date_where(window);
+    let currency_pred = "COALESCE(i.currency, 'HUF') = 'EUR'";
+    let where_clause = if date_where.is_empty() {
+        format!("WHERE {currency_pred}")
+    } else {
+        format!("{date_where} AND {currency_pred}")
+    };
+    let sql = format!(
+        "SELECT CAST(COALESCE(SUM(i.huf_equivalent_total), 0) AS VARCHAR) AS eur_huf
+           FROM invoice i
+          {where_clause}",
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("prepare EUR huf-equivalent SQL")?;
+    let from_s = window.from.map(date_str);
+    let to_s = window.to.map(date_str);
+    let read = |row: &duckdb::Row| -> duckdb::Result<i64> {
+        let s: String = row.get(0)?;
+        Ok(decimal_str_to_i64(&s).unwrap_or(0))
+    };
+    let mut rows = match (has_from, has_to) {
+        (true, true) => stmt.query_map(params![from_s.unwrap(), to_s.unwrap()], read)?,
+        (true, false) => stmt.query_map(params![from_s.unwrap()], read)?,
+        (false, true) => stmt.query_map(params![to_s.unwrap()], read)?,
+        (false, false) => stmt.query_map([], read)?,
+    };
+    match rows.next() {
+        Some(r) => Ok(r?),
+        None => Ok(0),
+    }
+}
+
 fn query_ap_rows(
     conn: &Connection,
     tenant: &str,
@@ -1254,6 +1340,21 @@ pub fn compute_financial_report(
 
     let mut outgoing = aggregate_outgoing(outgoing_groups, &walk.traces, req.today, &buyer_names);
 
+    // S262 / PR-251 — capture the NATIVE outgoing revenue (canonical
+    // `invoice` table only, storno-adjusted) BEFORE the restored-mirror
+    // loop folds digest rows into `outgoing.revenue`. The currency split
+    // is snapshot-rate based and restored/AP rows carry no per-invoice
+    // snapshot rate, so the split must exclude them.
+    let native_revenue = outgoing.revenue.clone();
+    let eur_as_huf_minor = query_eur_huf_equivalent(&conn, window, req.date_basis)?;
+    let currency_split = CurrencySplitPanel {
+        huf_minor: native_revenue.huf.gross_minor,
+        huf_count: native_revenue.huf.count,
+        eur_native_minor: native_revenue.eur.gross_minor,
+        eur_count: native_revenue.eur.count,
+        eur_as_huf_minor,
+    };
+
     // Restored rows contribute to revenue + VAT-collected. No line-level
     // breakdown available (digest-only). No storno detection (the
     // restored mirror is read-only).
@@ -1344,7 +1445,9 @@ pub fn compute_financial_report(
     }
 
     let deferred_notes: Vec<String> = vec![
-        "FX-aggregated (all-currencies-in-HUF-at-MNB-rate) total deferred to v2.2.1.".into(),
+        "Revenue currency split now ships in snapshot-rate HUF (S262); FX-aggregated \
+         expenses + a unified all-in-HUF P&L line remain deferred."
+            .into(),
         "HIPA base + KATA/KIVA threshold logic deferred to v2.3 (separate ADR).".into(),
         "AAM / reverse-charge / EU-0 VAT sub-buckets deferred — schema does not tag them today."
             .into(),
@@ -1400,9 +1503,9 @@ pub fn compute_financial_report(
         })
         .collect();
 
-    // Top-N — sort by gross_minor DESC, take 5.
-    let top_customers = top_n_from_map(outgoing.top_customers, 5);
-    let top_vendors = top_n_from_map(ap.top_vendors, 5);
+    // Top-N — sort by gross_minor DESC, take the operator-chosen N.
+    let top_customers = top_n_from_map(outgoing.top_customers, req.top_n);
+    let top_vendors = top_n_from_map(ap.top_vendors, req.top_n);
 
     // Hygiene panel — combine outgoing + ap + restored signals.
     let restored_no_partner_count = restored_rows
@@ -1470,6 +1573,7 @@ pub fn compute_financial_report(
         vat_to_pay,
         receivables: outgoing.receivables,
         payables: ap.payables,
+        currency_split,
         receivables_aging: outgoing.receivables_aging,
         payables_aging: ap.payables_aging,
         dso_days,
@@ -1825,5 +1929,48 @@ mod tests {
         let none: Vec<f64> = vec![];
         assert!(mean(&none).is_none());
         assert_eq!(mean(&[1.0, 2.0, 3.0]).unwrap(), 2.0);
+    }
+
+    /// S262 / PR-251 — `query_eur_huf_equivalent` sums the snapshot-rate
+    /// HUF equivalent ONLY over EUR invoices in the window. HUF invoices
+    /// (NULL `huf_equivalent_total`) must contribute nothing — the
+    /// currency split is the only consumer and double-counting HUF there
+    /// would inflate the EUR bar segment. Also asserts the date window
+    /// excludes out-of-period rows and the all-bounds (`All`) path works.
+    #[test]
+    fn eur_huf_equivalent_sums_only_eur_in_window() {
+        let conn = Connection::open_in_memory().expect("in-memory duckdb");
+        // Minimal `invoice` shape — only the columns the query reads.
+        conn.execute_batch(
+            "CREATE TABLE invoice (
+                 id VARCHAR,
+                 currency VARCHAR,
+                 issue_date VARCHAR,
+                 delivery_date DATE,
+                 huf_equivalent_total DECIMAL(18,0)
+             );
+             INSERT INTO invoice VALUES
+               ('eur-in',  'EUR', '2026-06-10', NULL, 190000),
+               ('eur-in2', 'EUR', '2026-06-20', NULL, 10000),
+               ('huf-in',  'HUF', '2026-06-12', NULL, NULL),
+               ('eur-out', 'EUR', '2026-05-31', NULL, 999999);",
+        )
+        .expect("seed invoice rows");
+
+        let window = DateWindow {
+            from: Some(Date::from_calendar_date(2026, Month::June, 1).unwrap()),
+            to: Some(Date::from_calendar_date(2026, Month::June, 30).unwrap()),
+        };
+        let got = query_eur_huf_equivalent(&conn, window, DateBasis::Teljesites).unwrap();
+        assert_eq!(
+            got, 200_000,
+            "only the two in-window EUR rows (190000 + 10000) contribute; HUF NULL and the May EUR row are excluded"
+        );
+
+        // `All` (unbounded) window includes the May EUR row too.
+        let got_all =
+            query_eur_huf_equivalent(&conn, DateWindow::unbounded(), DateBasis::Teljesites)
+                .unwrap();
+        assert_eq!(got_all, 1_199_999, "unbounded window sums every EUR row");
     }
 }

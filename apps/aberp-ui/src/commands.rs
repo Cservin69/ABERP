@@ -1218,14 +1218,16 @@ pub async fn get_workshop_dashboard(state: State<'_, AppState>) -> Result<Value,
 }
 
 /// S225 / PR-221 — financial-statistics dashboard. Forwards to the
-/// backend's `GET /api/reports/financial` aggregator. Both query params
+/// backend's `GET /api/reports/financial` aggregator. All query params
 /// are optional; the backend defaults to current month + `teljesites`
-/// date basis when either is empty.
+/// date basis when empty. S262 / PR-251 adds `top_n` (top-customers /
+/// top-vendors list size; backend defaults to 10, clamps to 1..=50).
 #[tauri::command]
 pub async fn get_financial_report(
     state: State<'_, AppState>,
     period: Option<String>,
     date_basis: Option<String>,
+    top_n: Option<u32>,
 ) -> Result<Value, String> {
     let mut path = String::from("/api/reports/financial");
     let mut sep = '?';
@@ -1242,7 +1244,13 @@ pub async fn get_financial_report(
             path.push(sep);
             path.push_str("date_basis=");
             path.push_str(&urlencode(b));
+            sep = '&';
         }
+    }
+    if let Some(n) = top_n {
+        path.push(sep);
+        path.push_str("top_n=");
+        path.push_str(&n.to_string());
     }
     forward_get(&state, &path, true).await
 }

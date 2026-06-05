@@ -124,10 +124,16 @@ export const MODULES: ErpModule[] = [
   {
     id: "statistics",
     area: "operational",
-    label_hu: "Statisztika",
-    label_en: "Statistics",
+    // S262 / PR-251 — relabelled "Statisztika / Statistics" → "Pénzügyek
+    // / Finance" as the dashboard grew from a stats read-out into the
+    // operator's day-to-day financial cockpit (AR/AP aging, currency
+    // split, custom ranges). The route SLUG stays `statistics` so
+    // existing deep-links / bookmarks / the hygiene click-through tests
+    // keep resolving (surgical — relabel only, no slug churn).
+    label_hu: "Pénzügyek",
+    label_en: "Finance",
     glyph: "∑",
-    routes: [{ id: "statistics", label: "Financial dashboard" }],
+    routes: [{ id: "statistics", label: "Pénzügyi áttekintő" }],
   },
   // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Production module
   // (Work Orders v1). Operational area — the daily-driver shop-floor

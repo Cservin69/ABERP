@@ -145,6 +145,16 @@ export interface InvoiceListItem {
    * placeholder, per the PR-236 brief. Pinned by
    * `invoice_list_item_emits_issue_date` on the Rust side. */
   issue_date: string | null;
+  /** S262 / PR-251 — canonical ISO-8601 `YYYY-MM-DD` payment deadline
+   * (Hungarian `Fizetési határidő`). The AR-aging anchor consumed by the
+   * Finance dashboard's receivables-aging bucket click-through (the
+   * outgoing list filters rows into the same buckets the backend
+   * `reports::aging_bucket_for` computes). Resolved value (billing read
+   * path falls NULL → issue_date per PR-84), so `Own` non-draft rows
+   * always carry a date; `null` for `Draft` (pre-issuance) and `ExtNav`
+   * (digest mirror has no deadline). Pinned by
+   * `invoice_list_item_emits_payment_deadline` on the Rust side. */
+  payment_deadline: string | null;
 }
 
 /** PR-213 / S215 — closed-vocab row discriminator for the unified
@@ -2795,6 +2805,20 @@ export interface CurrencyPair {
   eur_minor: number;
 }
 
+/** S262 / PR-251 — currency split of native outgoing revenue, made
+ * comparable by converting the EUR portion to HUF at each invoice's
+ * snapshot MNB rate (`eur_as_huf_minor`). The dashboard renders
+ * `huf_minor` + `eur_as_huf_minor` as one stacked bar; `eur_native_minor`
+ * is shown for disclosure. Issued basis (see backend `CurrencySplitPanel`
+ * for the EUR-storno caveat). */
+export interface CurrencySplitPanel {
+  huf_minor: number;
+  huf_count: number;
+  eur_native_minor: number;
+  eur_count: number;
+  eur_as_huf_minor: number;
+}
+
 /** AR / AP aging buckets in days-overdue. `current` = not yet due. */
 export interface AgingPanel {
   current: AmountAggregate;
@@ -2885,6 +2909,7 @@ export interface FinancialReport {
   vat_to_pay: CurrencyPair;
   receivables: CurrencyAggregate;
   payables: CurrencyAggregate;
+  currency_split: CurrencySplitPanel;
   receivables_aging: AgingPanel;
   payables_aging: AgingPanel;
   dso_days: DsoPanel;
@@ -2899,15 +2924,19 @@ export interface FinancialReport {
 }
 
 /** Fetch the financial-statistics snapshot for the given period +
- * date basis. Both args optional — backend defaults to current month +
- * `teljesites` (delivery-date) basis when either is empty. */
+ * date basis. All args optional — backend defaults to current month +
+ * `teljesites` (delivery-date) basis when empty. `topN` (S262 / PR-251)
+ * sizes the top-customers / top-vendors lists; the backend defaults to 10
+ * and clamps to `1..=50`. */
 export async function getFinancialReport(
   period?: string,
   dateBasis?: string,
+  topN?: number,
 ): Promise<FinancialReport> {
   return invoke<FinancialReport>("get_financial_report", {
     period: period ?? null,
     dateBasis: dateBasis ?? null,
+    topN: topN ?? null,
   });
 }
 

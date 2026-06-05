@@ -524,7 +524,7 @@ fn compose_subject(invoice_number: &str) -> String {
 /// "no templating engine beyond a simple bilingual body".
 fn compose_body_plain(invoice_number: &str, supplier_legal_name: &str) -> String {
     format!(
-        "Tisztelt Vevő,\n\
+        "Tisztelt Partner,\n\
          \n\
          Mellékelten küldjük a {invoice_number} számú számlát PDF formátumban.\n\
          A számla letöltése után kérjük ellenőrizze az adatokat.\n\
@@ -821,7 +821,7 @@ mod tests {
         let body = compose_body_plain("ABERP-2026/00001", "Áben Consulting KFT.");
         assert!(body.contains("ABERP-2026/00001"));
         assert!(body.contains("Áben Consulting KFT."));
-        assert!(body.contains("Tisztelt Vevő"));
+        assert!(body.contains("Tisztelt Partner"));
         assert!(body.contains("Dear Customer"));
     }
 

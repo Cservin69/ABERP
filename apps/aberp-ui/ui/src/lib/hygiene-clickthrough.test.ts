@@ -208,6 +208,28 @@ describe("parseInvoicesUrl — closed-vocab discard + edge cases", () => {
     const parsed = parseInvoicesUrl("#/invoices?state=%52ejected");
     expect(parsed.outgoing.state).toBe("Rejected");
   });
+
+  // S262 / PR-251 — aging bucket deep-link (Finance dashboard AR/AP
+  // aging cards → filtered list).
+  it("routes a legal aging bucket into BOTH tab inits", () => {
+    const parsed = parseInvoicesUrl("#/invoices?tab=outgoing&aging=d31_60");
+    expect(parsed.tab).toBe("outgoing");
+    expect(parsed.outgoing.aging).toBe("d31_60");
+    expect(parsed.incoming.aging).toBe("d31_60");
+    expect(parsed.hasInit).toBe(true);
+  });
+
+  it("parses the incoming AP-aging deep-link", () => {
+    const parsed = parseInvoicesUrl("#/invoices?tab=incoming&aging=d90_plus");
+    expect(parsed.tab).toBe("incoming");
+    expect(parsed.incoming.aging).toBe("d90_plus");
+  });
+
+  it("discards an unknown aging bucket (no coercion)", () => {
+    const parsed = parseInvoicesUrl("#/invoices?aging=days_31_60");
+    expect(parsed.outgoing.aging).toBeUndefined();
+    expect(parsed.incoming.aging).toBeUndefined();
+  });
 });
 
 // ──────────────────────────────────────────────────────────────────────
@@ -238,6 +260,7 @@ function frow(
     row_kind: overrides.row_kind ?? "Own",
     source_nav_invoice_number: overrides.source_nav_invoice_number ?? null,
     issue_date: overrides.issue_date ?? null,
+    payment_deadline: overrides.payment_deadline ?? null,
     ...overrides,
   };
 }
