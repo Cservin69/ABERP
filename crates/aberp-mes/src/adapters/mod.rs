@@ -18,8 +18,15 @@
 //! controller speaks (DMG MORI, Mazak, Haas, Okuma, …). Lives in-tree
 //! because the wire shape is HTTP+XML — no vendor SDK to isolate.
 //!
-//! Future phases add OPC-UA / Renishaw / robot adapters; each lives
-//! either inside this module (when the protocol code is small and
+//! Phase δ also ships the first robot adapter (S248 / PR-241):
+//! [`ur_rtde::UrRtdeAdapter`] — a raw-TCP consumer of Universal Robots'
+//! open RTDE binary protocol (port 30004) for cobot telemetry. Same
+//! [[spacex-vertical-integration]] posture as Zebra + MTConnect: one
+//! open protocol covers the entire UR family (UR3/5/10/16 + e-Series)
+//! without a vendor SDK.
+//!
+//! Future phases add OPC-UA / Renishaw / ABB / KUKA adapters; each
+//! lives either inside this module (when the protocol code is small and
 //! self-contained) or in a per-vendor crate (when it pulls vendor SDKs).
 //!
 //! Per ADR-0060 §"The next adapter author's first hour" — adapters
@@ -28,4 +35,5 @@
 
 pub mod barcode_scanner;
 pub mod mtconnect;
+pub mod ur_rtde;
 pub mod zebra;

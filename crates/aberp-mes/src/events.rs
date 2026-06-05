@@ -114,6 +114,30 @@ pub enum CanonicalEvent {
         priority: u8,
         at_iso8601: String,
     },
+
+    /// A robot's controller `robot_mode` and/or safety controller
+    /// `safety_mode` transitioned. Closed vocab per [`RobotMode`] +
+    /// [`SafetyMode`]. Emitted by Universal Robots RTDE / future ABB
+    /// RobotWare / KUKA RSI adapters. ONE event per transition cycle —
+    /// either `previous_mode != new_mode`, or
+    /// `previous_safety != new_safety`, or both. Carrying both
+    /// snapshots in a single event (rather than two parallel variants)
+    /// keeps the audit-ledger row count linear in physical transitions
+    /// and lets a single SPA / projection match transitions across both
+    /// state machines (e.g. a `Running → Idle` mode change coincident
+    /// with a `Normal → ProtectiveStop` safety change is a SINGLE
+    /// operator-meaningful event, not two).
+    ///
+    /// Added by S248 / PR-241 (third hardware-input adapter, first
+    /// robot).
+    RobotStateChanged {
+        robot_id: String,
+        previous_mode: RobotMode,
+        new_mode: RobotMode,
+        previous_safety: SafetyMode,
+        new_safety: SafetyMode,
+        at_iso8601: String,
+    },
 }
 
 impl CanonicalEvent {
@@ -129,6 +153,7 @@ impl CanonicalEvent {
             CanonicalEvent::ScanReceived { .. } => "scan_received",
             CanonicalEvent::WorkOrderStateChanged { .. } => "work_order_state_changed",
             CanonicalEvent::RobotTaskQueued { .. } => "robot_task_queued",
+            CanonicalEvent::RobotStateChanged { .. } => "robot_state_changed",
         }
     }
 }
@@ -158,6 +183,80 @@ pub enum QualityOutcome {
     Pass,
     Fail,
     HoldForReview,
+}
+
+/// Closed-vocab Universal Robots controller `robot_mode` per the UR
+/// controller manual (§"Robot Modes"). Integer-coded on the RTDE wire
+/// (range -1..=8); this enum is the typed shape that crosses into the
+/// audit ledger + downstream projections. Anything outside the documented
+/// range lands on [`RobotMode::Unknown`] — never on a default like Idle
+/// (silent misclassification is the failure mode CLAUDE.md rule 12
+/// names). Added by S248 / PR-241.
+///
+/// `Default` is `Unknown` — the adapter starts with no observation and
+/// only learns the real state from the first data frame.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RobotMode {
+    /// `-1` — no controller attached.
+    NoController,
+    /// `0` — controller present but client not yet connected.
+    Disconnected,
+    /// `1` — controller waiting for the operator to confirm safety.
+    ConfirmSafety,
+    /// `2` — controller bootstrapping.
+    Booting,
+    /// `3` — controller up, robot arm powered off.
+    PowerOff,
+    /// `4` — robot arm powered on, brakes engaged.
+    PowerOn,
+    /// `5` — brakes released, arm idle (no program running).
+    Idle,
+    /// `6` — backdrive mode (operator hand-jogging the arm).
+    Backdrive,
+    /// `7` — program running.
+    Running,
+    /// `8` — controller firmware update in progress.
+    UpdatingFirmware,
+    /// Catch-all for codes outside the documented `-1..=8` range.
+    #[default]
+    Unknown,
+}
+
+/// Closed-vocab Universal Robots safety-controller `safety_mode` per the
+/// UR controller manual (§"Safety Modes"). Integer-coded on the RTDE wire
+/// (1..=11); same Unknown-on-out-of-range posture as [`RobotMode`].
+/// Added by S248 / PR-241.
+///
+/// `Default` is `Unknown` for the same reason as [`RobotMode`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyMode {
+    /// `1` — normal operation.
+    Normal,
+    /// `2` — reduced-speed mode (operator near the cell).
+    Reduced,
+    /// `3` — protective stop (a safety input tripped; recoverable).
+    ProtectiveStop,
+    /// `4` — recovering from a protective / safeguard stop.
+    Recovery,
+    /// `5` — safeguard stop (door open / lightcurtain broken).
+    SafeguardStop,
+    /// `6` — system-level emergency stop.
+    SystemEmergencyStop,
+    /// `7` — robot-level emergency stop.
+    RobotEmergencyStop,
+    /// `8` — safety-rule violation detected.
+    Violation,
+    /// `9` — safety controller in fault state.
+    Fault,
+    /// `10` — joint-ID validation step (commissioning only).
+    ValidateJointId,
+    /// `11` — controller has not yet reported a safety mode.
+    Undefined,
+    /// Catch-all for codes outside the documented `1..=11` range.
+    #[default]
+    Unknown,
 }
 
 /// Closed-vocab work-order state. Six values covering the standard
@@ -235,6 +334,17 @@ mod tests {
         }
     }
 
+    fn sample_robot_state_changed() -> CanonicalEvent {
+        CanonicalEvent::RobotStateChanged {
+            robot_id: "ur10e-cell-A-robot".to_string(),
+            previous_mode: RobotMode::Idle,
+            new_mode: RobotMode::Running,
+            previous_safety: SafetyMode::Normal,
+            new_safety: SafetyMode::Normal,
+            at_iso8601: "2026-06-03T08:30:45Z".to_string(),
+        }
+    }
+
     /// Round-trip every variant through serde JSON. If a future
     /// contributor adds a variant + forgets to update `type_tag` or
     /// derives, this test fails. Hand-listed (not iterated) so the
@@ -249,6 +359,7 @@ mod tests {
             sample_scan_received(),
             sample_work_order_state_changed(),
             sample_robot_task_queued(),
+            sample_robot_state_changed(),
         ];
         for v in variants {
             let json = serde_json::to_vec(&v).expect("serialize");
@@ -274,6 +385,7 @@ mod tests {
                 sample_work_order_state_changed(),
             ),
             ("robot_task_queued", sample_robot_task_queued()),
+            ("robot_state_changed", sample_robot_state_changed()),
         ];
         for (expected_tag, event) in variants {
             assert_eq!(event.type_tag(), expected_tag);
@@ -396,6 +508,129 @@ mod tests {
         let json = serde_json::to_string(&with_some).unwrap();
         let back: CanonicalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, with_some);
+    }
+
+    /// `RobotMode` MUST round-trip; closed vocab is the on-disk schema.
+    /// Added by S248 / PR-241.
+    #[test]
+    fn robot_mode_round_trips() {
+        let all = [
+            RobotMode::NoController,
+            RobotMode::Disconnected,
+            RobotMode::ConfirmSafety,
+            RobotMode::Booting,
+            RobotMode::PowerOff,
+            RobotMode::PowerOn,
+            RobotMode::Idle,
+            RobotMode::Backdrive,
+            RobotMode::Running,
+            RobotMode::UpdatingFirmware,
+            RobotMode::Unknown,
+        ];
+        for m in all {
+            let json = serde_json::to_string(&m).unwrap();
+            let back: RobotMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, m);
+        }
+    }
+
+    /// `RobotMode` MUST emit snake_case discriminators — multi-word
+    /// variants (`NoController`, `ConfirmSafety`, `PowerOff`,
+    /// `UpdatingFirmware`) are the high-risk ones.
+    #[test]
+    fn robot_mode_is_snake_case_on_wire() {
+        assert_eq!(
+            serde_json::to_string(&RobotMode::NoController).unwrap(),
+            "\"no_controller\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RobotMode::ConfirmSafety).unwrap(),
+            "\"confirm_safety\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RobotMode::PowerOff).unwrap(),
+            "\"power_off\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RobotMode::PowerOn).unwrap(),
+            "\"power_on\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RobotMode::UpdatingFirmware).unwrap(),
+            "\"updating_firmware\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RobotMode::Backdrive).unwrap(),
+            "\"backdrive\""
+        );
+    }
+
+    /// `SafetyMode` MUST round-trip across the full 12-value vocab.
+    #[test]
+    fn safety_mode_round_trips() {
+        let all = [
+            SafetyMode::Normal,
+            SafetyMode::Reduced,
+            SafetyMode::ProtectiveStop,
+            SafetyMode::Recovery,
+            SafetyMode::SafeguardStop,
+            SafetyMode::SystemEmergencyStop,
+            SafetyMode::RobotEmergencyStop,
+            SafetyMode::Violation,
+            SafetyMode::Fault,
+            SafetyMode::ValidateJointId,
+            SafetyMode::Undefined,
+            SafetyMode::Unknown,
+        ];
+        for m in all {
+            let json = serde_json::to_string(&m).unwrap();
+            let back: SafetyMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, m);
+        }
+    }
+
+    /// `SafetyMode` MUST emit snake_case — `SystemEmergencyStop`,
+    /// `RobotEmergencyStop`, `ValidateJointId` are the high-risk ones.
+    #[test]
+    fn safety_mode_is_snake_case_on_wire() {
+        assert_eq!(
+            serde_json::to_string(&SafetyMode::ProtectiveStop).unwrap(),
+            "\"protective_stop\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SafetyMode::SafeguardStop).unwrap(),
+            "\"safeguard_stop\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SafetyMode::SystemEmergencyStop).unwrap(),
+            "\"system_emergency_stop\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SafetyMode::RobotEmergencyStop).unwrap(),
+            "\"robot_emergency_stop\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SafetyMode::ValidateJointId).unwrap(),
+            "\"validate_joint_id\""
+        );
+    }
+
+    /// `RobotStateChanged` carries both mode pairs side by side. A
+    /// round-trip where ONLY safety changed (mode equal) MUST survive —
+    /// pins the design call that one variant carries both transitions.
+    #[test]
+    fn robot_state_changed_round_trips_when_only_safety_transitioned() {
+        let evt = CanonicalEvent::RobotStateChanged {
+            robot_id: "ur5e-cell-B".into(),
+            previous_mode: RobotMode::Running,
+            new_mode: RobotMode::Running,
+            previous_safety: SafetyMode::Normal,
+            new_safety: SafetyMode::ProtectiveStop,
+            at_iso8601: "2026-06-03T08:31:00Z".into(),
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let back: CanonicalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, evt);
     }
 
     /// `ScanReceived`'s two Optional fields (`symbology`, `source_addr`)

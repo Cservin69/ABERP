@@ -68,6 +68,16 @@ pub use adapters::mtconnect::{
     DEFAULT_REQUEST_TIMEOUT as MTCONNECT_DEFAULT_REQUEST_TIMEOUT,
     DEFAULT_SLOW_THRESHOLD as MTCONNECT_DEFAULT_SLOW_THRESHOLD,
 };
+pub use adapters::ur_rtde::{
+    UrRtdeAdapter, UrRtdeAdapterConfig, DEFAULT_BACKOFF_CAP as UR_RTDE_DEFAULT_BACKOFF_CAP,
+    DEFAULT_CHANNEL_CAPACITY as UR_RTDE_DEFAULT_CHANNEL_CAPACITY,
+    DEFAULT_HANDSHAKE_TIMEOUT as UR_RTDE_DEFAULT_HANDSHAKE_TIMEOUT,
+    DEFAULT_INITIAL_BACKOFF as UR_RTDE_DEFAULT_INITIAL_BACKOFF,
+    DEFAULT_MAX_FRAME_BYTES as UR_RTDE_DEFAULT_MAX_FRAME_BYTES,
+    DEFAULT_PAUSE_TIMEOUT as UR_RTDE_DEFAULT_PAUSE_TIMEOUT,
+    DEFAULT_RTDE_PORT as UR_RTDE_DEFAULT_PORT,
+    DEFAULT_STALL_THRESHOLD as UR_RTDE_DEFAULT_STALL_THRESHOLD,
+};
 pub use adapters::zebra::{
     ZebraAdapter, ZebraAdapterConfig, DEFAULT_CONNECT_TIMEOUT as ZEBRA_DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_LISTEN_PORT as ZEBRA_DEFAULT_LISTEN_PORT,
@@ -78,7 +88,9 @@ pub use adapters::zebra::{
 };
 pub use audit::{audit_kind_string, write_mes_adapter_event, MesAdapterEventPayload};
 pub use error::{AdapterError, RegistryError};
-pub use events::{CanonicalEvent, MachineState, QualityOutcome, WorkOrderState};
+pub use events::{
+    CanonicalEvent, MachineState, QualityOutcome, RobotMode, SafetyMode, WorkOrderState,
+};
 pub use ledger_writer::{spawn_ledger_writer, LedgerWriterActor, LedgerWriterDeps};
 pub use noop::NoopAdapter;
 pub use registry::{AdapterHealthEntry, AdapterRegistry};
