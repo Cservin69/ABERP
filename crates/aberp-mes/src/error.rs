@@ -33,6 +33,15 @@ pub enum AdapterError {
     /// adapter implementations that want to fail-loud during setup.
     #[error("adapter invariant violated: {0}")]
     InvariantViolated(String),
+
+    /// An adapter-specific operation (other than lifecycle) failed —
+    /// e.g. the Zebra label printer's `print_zpl` could not deliver the
+    /// payload to the printer. Operator-readable; no credential bytes.
+    /// Added by S245 / PR-238 (first hardware-output adapter); reused by
+    /// every future write-back adapter that needs to surface a non-
+    /// lifecycle error without inventing its own error type.
+    #[error("adapter operation failed: {0}")]
+    OperationFailed(String),
 }
 
 /// Error returned by the [`AdapterRegistry`](crate::AdapterRegistry).

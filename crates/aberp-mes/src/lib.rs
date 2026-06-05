@@ -60,6 +60,14 @@ pub use adapters::barcode_scanner::{
     DEFAULT_CHANNEL_CAPACITY, DEFAULT_LISTEN_PORT, DEFAULT_MAX_CONCURRENT_CONNECTIONS,
     DEFAULT_MAX_PAYLOAD_LEN,
 };
+pub use adapters::zebra::{
+    ZebraAdapter, ZebraAdapterConfig, DEFAULT_CONNECT_TIMEOUT as ZEBRA_DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_LISTEN_PORT as ZEBRA_DEFAULT_LISTEN_PORT,
+    DEFAULT_MAX_PAYLOAD_LEN as ZEBRA_DEFAULT_MAX_PAYLOAD_LEN,
+    DEFAULT_PROBE_INTERVAL as ZEBRA_DEFAULT_PROBE_INTERVAL,
+    DEFAULT_RETRY_BACKOFF as ZEBRA_DEFAULT_RETRY_BACKOFF,
+    DEFAULT_SLOW_THRESHOLD as ZEBRA_DEFAULT_SLOW_THRESHOLD,
+};
 pub use audit::{audit_kind_string, write_mes_adapter_event, MesAdapterEventPayload};
 pub use error::{AdapterError, RegistryError};
 pub use events::{CanonicalEvent, MachineState, QualityOutcome, WorkOrderState};
