@@ -420,6 +420,41 @@ pub async fn delete_partner(state: State<'_, AppState>, partner_id: String) -> R
     forward_delete(&state, &path).await
 }
 
+// ── S257 / PR-246 — Settings → Adapters CRUD ─────────────────────────
+
+/// `GET /api/adapters` — list persisted adapters joined with live
+/// health. Backs the Settings → Adapters page list.
+#[tauri::command]
+pub async fn list_adapters(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/adapters", true).await
+}
+
+/// `POST /api/adapters` — add an adapter (starts immediately, no
+/// restart). Body is the typed `AddAdapterInput`.
+#[tauri::command]
+pub async fn create_adapter(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/adapters", body).await
+}
+
+/// `PUT /api/adapters/:id` — edit an adapter (hot restart in place).
+/// `:id` is the server-minted adapter_id.
+#[tauri::command]
+pub async fn update_adapter(
+    state: State<'_, AppState>,
+    adapter_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/adapters/{adapter_id}");
+    forward_put(&state, &path, body).await
+}
+
+/// `DELETE /api/adapters/:id` — stop + deregister + drop the TOML row.
+#[tauri::command]
+pub async fn delete_adapter(state: State<'_, AppState>, adapter_id: String) -> Result<(), String> {
+    let path = format!("/api/adapters/{adapter_id}");
+    forward_delete(&state, &path).await
+}
+
 // ── PR-172 — notes-history typeahead source ─────────────────────────
 
 /// PR-172 — `GET /api/notes-history?scope=line|invoice|storno`. Used

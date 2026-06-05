@@ -93,6 +93,8 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   workshop: "production",
   tenant: "settings",
   "nav-credentials": "settings",
+  // S257 / PR-246 — MES adapter management, settings-grouped.
+  adapters: "settings",
   // S180 / PR-180 — NAV-as-DR restore wizard, settings-grouped.
   "restore-from-nav": "settings",
 };
@@ -120,6 +122,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   tenant: "maintenance",
   "nav-credentials": "maintenance",
   maintenance: "maintenance",
+  // S257 / PR-246 — MES adapter management.
+  adapters: "maintenance",
   // S180 / PR-180 — NAV-as-DR restore wizard.
   "restore-from-nav": "maintenance",
 };
@@ -137,6 +141,8 @@ const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   "NavCredStatus",
   // S180 / PR-180 — NAV-as-DR restore wizard tile.
   "RestoredInvoiceCount",
+  // S257 / PR-246 — MES adapter management tile.
+  "AdapterCount",
 ]);
 
 // Every area must have a stable bilingual label and at least one

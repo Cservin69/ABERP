@@ -750,7 +750,13 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // never NAV bytes; never sweep a per-OUTGOING-invoice bundle.
         | EventKind::QuoteIntakePollAttempted
         | EventKind::QuoteIntakeRowAdded
-        | EventKind::QuoteIntakePollFailed => None,
+        | EventKind::QuoteIntakePollFailed
+        // S257 / PR-246 — adapter-config CRUD kinds. `mes.`-scoped
+        // operator configuration; no NAV bytes, never sweep a per-
+        // OUTGOING-invoice bundle.
+        | EventKind::AdapterAdded
+        | EventKind::AdapterUpdated
+        | EventKind::AdapterRemoved => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

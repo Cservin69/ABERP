@@ -116,6 +116,7 @@ clap = { workspace = true }
 # JSON input + (re-used) XML serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 quick-xml = { workspace = true }
 
 # Time, hashing

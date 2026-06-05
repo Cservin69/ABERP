@@ -50,6 +50,10 @@ pub mod mark_invoice_paid;
 // Reads `ABERP_BARCODE_SCANNER_*` env vars and spawns the barcode
 // scanner adapter + per-adapter ledger-writer task. Default-off.
 pub mod mes_boot;
+// S257 / PR-246 — `[[mes.adapters]]` seller.toml slot (7th preservation
+// section) + operator-managed adapter lifecycle (Settings → Adapters).
+pub mod mes_adapters_config;
+pub mod mes_manager;
 pub mod mnb_rates_provider;
 pub mod nav_xml;
 pub mod notes_history;

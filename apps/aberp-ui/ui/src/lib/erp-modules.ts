@@ -174,6 +174,10 @@ export const MODULES: ErpModule[] = [
     routes: [
       { id: "tenant", label: "Tenant settings" },
       { id: "nav-credentials", label: "NAV credentials" },
+      // S257 / PR-246 — MES adapter management (Settings → Adapters).
+      // Maintenance-area route under Settings; operator-managed adapter
+      // lifecycle (add / edit / delete) without env edits or restart.
+      { id: "adapters", label: "Adapters" },
       // S180 / PR-180 — NAV-as-DR restore wizard. Maintenance-area
       // route under Settings (rare-touch, load-bearing-when-touched).
       { id: "restore-from-nav", label: "Restore from NAV" },
@@ -314,7 +318,11 @@ export type MaintenanceTileStatusKind =
   // `restored_invoice` mirror table. The tile's chip surfaces "N
   // restored rows" so the operator can see at a glance whether
   // disaster recovery has been used.
-  | "RestoredInvoiceCount";
+  | "RestoredInvoiceCount"
+  // S257 / PR-246 — count of registered MES adapters. The tile's chip
+  // surfaces "N adapters" so the operator sees at a glance how many
+  // are configured.
+  | "AdapterCount";
 
 /** One tile on the maintenance landing dashboard. The dashboard
  * renders the tiles grouped under their sub-area headers (today:
@@ -373,6 +381,17 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Technikai felhasználó és kulcsok",
     description_en: "Technical user & keys",
     statusKind: "NavCredStatus",
+  },
+  // S257 / PR-246 — MES adapter management tile. One-click adapter
+  // lifecycle so the operator never edits env + restarts.
+  {
+    moduleId: "settings",
+    route: "adapters",
+    label_hu: "Adapterek",
+    label_en: "Adapters",
+    description_hu: "Gyártási adapterek kezelése",
+    description_en: "Manage manufacturing adapters",
+    statusKind: "AdapterCount",
   },
   // S180 / PR-180 — NAV-as-DR restore wizard tile. Operator-touch
   // surface for "the local DuckDB is gone — pull our year-of-record

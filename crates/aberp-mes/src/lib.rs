@@ -46,6 +46,7 @@
 #![warn(missing_debug_implementations)]
 
 mod adapter;
+mod adapter_config;
 pub mod adapters;
 mod audit;
 mod error;
@@ -55,6 +56,9 @@ mod noop;
 mod registry;
 
 pub use adapter::{Adapter, AdapterHealth};
+pub use adapter_config::{
+    build_adapter, AdapterConfigEntry, AdapterConfigError, AdapterConfigFieldError, AdapterKind,
+};
 pub use adapters::barcode_scanner::{
     aim_id_to_symbology, split_aim_prefix, BarcodeScannerAdapter, BarcodeScannerConfig,
     DEFAULT_CHANNEL_CAPACITY, DEFAULT_LISTEN_PORT, DEFAULT_MAX_CONCURRENT_CONNECTIONS,

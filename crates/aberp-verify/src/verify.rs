@@ -868,7 +868,14 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // `QuoteIntakePollCompleted` (which these supersede / accompany).
         | EventKind::QuoteIntakePollAttempted
         | EventKind::QuoteIntakeRowAdded
-        | EventKind::QuoteIntakePollFailed => (None, ""),
+        | EventKind::QuoteIntakePollFailed
+        // S257 / PR-246 — adapter-config CRUD kinds. `mes.`-scoped
+        // operator configuration (kind / host / port / friendly name);
+        // never carry NAV XML bytes, never sweep a per-OUTGOING-invoice
+        // bundle.
+        | EventKind::AdapterAdded
+        | EventKind::AdapterUpdated
+        | EventKind::AdapterRemoved => (None, ""),
     };
 
     Ok(NavExtraction {

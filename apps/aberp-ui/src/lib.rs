@@ -285,6 +285,11 @@ pub fn run() {
             commands::create_partner,
             commands::update_partner,
             commands::delete_partner,
+            // S257 / PR-246 — Settings → Adapters CRUD.
+            commands::list_adapters,
+            commands::create_adapter,
+            commands::update_adapter,
+            commands::delete_adapter,
             commands::list_notes_history,
             commands::list_products,
             commands::get_product,

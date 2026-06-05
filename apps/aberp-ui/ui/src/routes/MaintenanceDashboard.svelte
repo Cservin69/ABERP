@@ -30,6 +30,7 @@
   import {
     getNavCredentialsStatus,
     getSellerInfo,
+    listAdapters,
     listLowStockProducts,
     listPartners,
     listProducts,
@@ -195,6 +196,14 @@
         const rows = await listRestoredInvoices();
         const n = rows.length;
         return n === 1 ? "1 restored invoice" : `${n} restored invoices`;
+      }
+      case "AdapterCount": {
+        // S257 / PR-246 — count of registered MES adapters. "0
+        // adapters" is the expected default for a tenant not running
+        // the shop-floor strand.
+        const rows = await listAdapters();
+        const n = rows.length;
+        return n === 1 ? "1 adapter" : `${n} adapters`;
       }
     }
   }

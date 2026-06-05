@@ -89,6 +89,10 @@ fn build_state(db_path: PathBuf) -> AppState {
         })),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         adapter_registry: Arc::new(std::sync::RwLock::new(aberp_mes::AdapterRegistry::new())),
+        adapter_manager: Arc::new(aberp::mes_manager::AdapterManager::new(
+            Arc::new(std::sync::RwLock::new(aberp_mes::AdapterRegistry::new())),
+            tokio_util::sync::CancellationToken::new(),
+        )),
     }
 }
 

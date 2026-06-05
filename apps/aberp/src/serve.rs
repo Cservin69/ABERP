@@ -82,7 +82,7 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -899,6 +899,14 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // into both `AppState` (for the dashboard handler) and the MES boot
     // path (which registers adapters into it after `start()` succeeds).
     let adapter_registry = Arc::new(std::sync::RwLock::new(AdapterRegistry::new()));
+    // S257 / PR-246 — operator-managed adapter lifecycle. Shares the
+    // registry above + parents per-adapter cancellation tokens off the
+    // shutdown root so Settings → Adapters CRUD takes effect without a
+    // restart.
+    let adapter_manager = Arc::new(crate::mes_manager::AdapterManager::new(
+        adapter_registry.clone(),
+        shutdown_token_root.clone(),
+    ));
     let state = AppState {
         db_path: Arc::new(args.db.clone()),
         tenant,
@@ -909,6 +917,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         nav_poll_semaphore: Arc::new(tokio::sync::Semaphore::new(NAV_POLL_DAEMON_CONCURRENCY)),
         shutdown_token: shutdown_token_root.clone(),
         adapter_registry: adapter_registry.clone(),
+        adapter_manager: adapter_manager.clone(),
     };
 
     // 5. Build the axum router. Clone the state first so the app-boot
@@ -1353,20 +1362,21 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             }
         }
 
-        // S229 / PR-225 — Stage 3 manufacturing-adapter framework
-        // boot (ADR-0060 Phase β). The barcode scanner adapter binds
-        // a TCP listener and emits `CanonicalEvent::ScanReceived`
-        // events into the audit ledger via the per-adapter
-        // ledger-writer task. Opt-in via the
-        // `ABERP_BARCODE_SCANNER_ENABLED=true` env var; same posture
-        // as quote-intake S210 — keychain / seller.toml integration
-        // is deferred to a follow-up PR per the
-        // [[seller-toml-write-invariant]] family preservation
-        // discipline.
+        // S257 / PR-246 — Stage 3 manufacturing-adapter boot. The source
+        // of truth is now the `[[mes.adapters]]` seller.toml slot, NOT
+        // env vars (per [[trust-code-not-operator]]: operators manage
+        // adapters from Settings → Adapters, never by editing env +
+        // restart). Boot does two steps:
+        //   1. migrate any env-defined adapter into the TOML, ONE-SHOT +
+        //      idempotent (upsert by adapter_id) — an operator with
+        //      `ABERP_ZEBRA_ENABLED=true` sees that printer appear in the
+        //      Adapters page on first post-S257 boot with no action;
+        //   2. start every persisted adapter via the AdapterManager,
+        //      registering each spawned task with the shutdown
+        //      coordinator. One bad adapter is logged + skipped, not
+        //      boot-fatal (it stays in TOML for an operator fix).
         //
-        // DoS bounds (`max_payload_len`, `max_concurrent_connections`)
-        // stay at compiled defaults per [[trust-code-not-operator]] —
-        // env-var knobs are scanner_id + host + port only.
+        // DoS bounds stay compiled-in per [[trust-code-not-operator]].
         {
             let operator_login = match recovery_state.boot_state.read() {
                 Ok(guard) => match &*guard {
@@ -1378,7 +1388,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             let binary_hash = recovery_state
                 .binary_hash
                 .wait()
-                .context("await background binary hash for MES barcode-scanner boot")?;
+                .context("await background binary hash for MES adapter boot")?;
             let mes_deps = crate::mes_boot::MesBootDeps {
                 db_path: (*recovery_state.db_path).clone(),
                 tenant: recovery_state.tenant.clone(),
@@ -1386,19 +1396,28 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 operator_login,
                 session_id: Ulid::new().to_string(),
             };
-            match crate::mes_boot::boot_mes_adapters(
-                mes_deps,
-                coordinator.token.clone(),
-                recovery_state.adapter_registry.clone(),
+            let seller_toml_path = setup_seller_info::seller_toml_path_for_tenant(
+                recovery_state.tenant.as_str(),
             )
-            .await
+            .context("resolve seller.toml path for MES adapter boot")?;
+            match crate::mes_boot::migrate_env_adapters_to_toml(&seller_toml_path) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    migrated = n,
+                    "migrated {n} env-defined MES adapter(s) into [[mes.adapters]] (S257)"
+                ),
+                Err(e) => return Err(anyhow!("MES env→TOML adapter migration failed: {e:#}")),
+            }
+            match recovery_state
+                .adapter_manager
+                .boot_from_toml(&mes_deps, &seller_toml_path)
+                .await
             {
-                Ok(Some(spawned)) => {
-                    for (label, handle) in spawned.handles {
+                Ok(handles) => {
+                    for (label, handle) in handles {
                         coordinator.register(label, handle);
                     }
                 }
-                Ok(None) => {} // disabled — already logged inside boot_mes_adapters
                 Err(e) => {
                     return Err(anyhow!("MES adapter boot failed: {e:#}"));
                 }
@@ -1997,6 +2016,11 @@ pub struct AppState {
     /// the prior `snapshot_mes_adapter_config()` env-var read with a
     /// live registry probe per [[trust-code-not-operator]].
     pub adapter_registry: Arc<std::sync::RwLock<AdapterRegistry>>,
+    /// S257 / PR-246 — operator-managed adapter lifecycle. Owns the
+    /// per-adapter cancellation tokens + the mutation serialiser; shares
+    /// `adapter_registry` above. Backs the Settings → Adapters CRUD
+    /// routes; persists to the `[[mes.adapters]]` seller.toml slot.
+    pub adapter_manager: Arc<crate::mes_manager::AdapterManager>,
 }
 
 /// Session-161 — max number of NAV poll daemons polling concurrently.
@@ -2099,6 +2123,18 @@ fn build_router(state: AppState) -> Router {
             get(handle_get_partner)
                 .put(handle_update_partner)
                 .delete(handle_delete_partner),
+        )
+        // S257 / PR-246 — Settings → Adapters CRUD. List + create on the
+        // collection; update (hot restart) + delete on the resource.
+        // Ready-only + bearer-gated; the `:id` is the server-minted
+        // adapter_id (the registry key), not operator-typed.
+        .route(
+            "/api/adapters",
+            get(handle_list_adapters).post(handle_create_adapter),
+        )
+        .route(
+            "/api/adapters/:id",
+            put(handle_update_adapter).delete(handle_delete_adapter),
         )
         // PR-172 — buyer-facing notes typeahead source. GET-only,
         // ready+bearer-gated. `?scope=line|invoice|storno` is required.
@@ -7563,6 +7599,224 @@ pub fn delete_partner_request(
         Ok(())
     } else {
         Err(PartnerRouteError::NotFound)
+    }
+}
+
+// ── S257 / PR-246 — Settings → Adapters CRUD ─────────────────────────
+//
+// The Adapters page reads its LIST from the `[[mes.adapters]]` TOML
+// (the config source of truth) joined with the live `AdapterRegistry`
+// health (the state chip). Mutations flow through the AdapterManager,
+// which hot-starts / hot-restarts / stops adapters without a restart and
+// persists every change. Every CRUD writes a `mes.adapter_{added,
+// updated,removed}` audit row.
+
+/// One adapter row on the wire — config fields + the closed-vocab live
+/// status string the SPA chip dispatches on.
+#[derive(Debug, Serialize)]
+struct AdapterListItemWire {
+    adapter_id: String,
+    kind: &'static str,
+    friendly_name: String,
+    host: String,
+    port: u16,
+    /// `"healthy" | "degraded" | "unhealthy" | "starting" | "stopped"`.
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+/// Build the per-request MES deps (db / tenant / binary-hash / operator
+/// / fresh session) the AdapterManager threads into spawned tasks +
+/// audit appends.
+fn mes_deps_for_request(state: &AppState) -> Result<crate::mes_boot::MesBootDeps> {
+    let operator_login = match state.boot_state.read() {
+        Ok(guard) => match &*guard {
+            ServeBootState::Ready { operator_login } => operator_login.clone(),
+            _ => "operator".to_string(),
+        },
+        Err(_) => "operator".to_string(),
+    };
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await binary hash for adapter mutation")?;
+    Ok(crate::mes_boot::MesBootDeps {
+        db_path: (*state.db_path).clone(),
+        tenant: state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        session_id: Ulid::new().to_string(),
+    })
+}
+
+fn seller_toml_path_for_request(state: &AppState) -> Result<std::path::PathBuf> {
+    setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str())
+        .context("resolve seller.toml path for adapter mutation")
+}
+
+/// Map an [`crate::mes_manager::AdapterMutationError`] onto the right
+/// HTTP response (400 for operator-fixable validation / duplicate /
+/// bad-endpoint, 404 for unknown id, 500 for I/O).
+fn adapter_mutation_response(err: crate::mes_manager::AdapterMutationError) -> Response {
+    use crate::mes_manager::AdapterMutationError as E;
+    match err {
+        E::Validation(fields) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "validation_failed",
+                "fields": fields,
+            })),
+        )
+            .into_response(),
+        E::DuplicateEndpoint {
+            endpoint,
+            existing_id,
+        } => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "duplicate_endpoint",
+                "endpoint": endpoint,
+                "existing_id": existing_id,
+                "message": format!("endpoint {endpoint} is already used by adapter `{existing_id}`"),
+            })),
+        )
+            .into_response(),
+        E::Build(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "bad_endpoint",
+                "message": e.to_string(),
+            })),
+        )
+            .into_response(),
+        E::Start(msg) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "adapter_start_failed",
+                "message": msg,
+            })),
+        )
+            .into_response(),
+        E::NotFound(id) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not_found",
+                "message": format!("no adapter with id `{id}`"),
+            })),
+        )
+            .into_response(),
+        E::Io(e) => internal_error("adapter_mutation", e),
+    }
+}
+
+async fn handle_list_adapters(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let path = match seller_toml_path_for_request(&state) {
+        Ok(p) => p,
+        Err(e) => return internal_error("seller_toml_path_for_request", e),
+    };
+    match state.adapter_manager.list(&path) {
+        Ok(rows) => {
+            let items: Vec<AdapterListItemWire> = rows
+                .into_iter()
+                .map(|r| AdapterListItemWire {
+                    adapter_id: r.entry.adapter_id,
+                    kind: r.entry.kind.wire_str(),
+                    friendly_name: r.entry.friendly_name,
+                    host: r.entry.host,
+                    port: r.entry.port,
+                    status: adapter_health_status(&r.health),
+                    device_name: r.entry.device_name,
+                    model: r.entry.model,
+                })
+                .collect();
+            Json(serde_json::json!({ "adapters": items })).into_response()
+        }
+        Err(e) => internal_error("adapter_manager.list", e),
+    }
+}
+
+async fn handle_create_adapter(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(input): Json<crate::mes_manager::AddAdapterInput>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let deps = match mes_deps_for_request(&state) {
+        Ok(d) => d,
+        Err(e) => return internal_error("mes_deps_for_request", e),
+    };
+    let path = match seller_toml_path_for_request(&state) {
+        Ok(p) => p,
+        Err(e) => return internal_error("seller_toml_path_for_request", e),
+    };
+    match state.adapter_manager.add(&deps, &path, input).await {
+        Ok(entry) => (StatusCode::CREATED, Json(entry)).into_response(),
+        Err(e) => adapter_mutation_response(e),
+    }
+}
+
+async fn handle_update_adapter(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(input): Json<crate::mes_manager::EditAdapterInput>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let deps = match mes_deps_for_request(&state) {
+        Ok(d) => d,
+        Err(e) => return internal_error("mes_deps_for_request", e),
+    };
+    let path = match seller_toml_path_for_request(&state) {
+        Ok(p) => p,
+        Err(e) => return internal_error("seller_toml_path_for_request", e),
+    };
+    match state.adapter_manager.update(&deps, &path, &id, input).await {
+        Ok(entry) => Json(entry).into_response(),
+        Err(e) => adapter_mutation_response(e),
+    }
+}
+
+async fn handle_delete_adapter(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let deps = match mes_deps_for_request(&state) {
+        Ok(d) => d,
+        Err(e) => return internal_error("mes_deps_for_request", e),
+    };
+    let path = match seller_toml_path_for_request(&state) {
+        Ok(p) => p,
+        Err(e) => return internal_error("seller_toml_path_for_request", e),
+    };
+    match state.adapter_manager.remove(&deps, &path, &id).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => adapter_mutation_response(e),
     }
 }
 
@@ -18150,6 +18404,10 @@ mod tests {
             adapter_registry: std::sync::Arc::new(std::sync::RwLock::new(
                 aberp_mes::AdapterRegistry::new(),
             )),
+            adapter_manager: std::sync::Arc::new(crate::mes_manager::AdapterManager::new(
+                std::sync::Arc::new(std::sync::RwLock::new(aberp_mes::AdapterRegistry::new())),
+                tokio_util::sync::CancellationToken::new(),
+            )),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, storno_invoice_id)
@@ -18254,6 +18512,10 @@ mod tests {
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             adapter_registry: std::sync::Arc::new(std::sync::RwLock::new(
                 aberp_mes::AdapterRegistry::new(),
+            )),
+            adapter_manager: std::sync::Arc::new(crate::mes_manager::AdapterManager::new(
+                std::sync::Arc::new(std::sync::RwLock::new(aberp_mes::AdapterRegistry::new())),
+                tokio_util::sync::CancellationToken::new(),
             )),
         };
 

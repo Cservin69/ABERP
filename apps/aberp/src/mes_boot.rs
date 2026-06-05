@@ -1,58 +1,42 @@
-//! Stage 3 manufacturing-adapter framework boot wiring
-//! (S229 / PR-225 / ADR-0060 Phase β + S250 / PR-242 — sweep of S249
-//! finding 1 wires the Zebra / MTConnect / UR-RTDE adapters into the
-//! binary alongside the original barcode scanner).
+//! Stage 3 manufacturing-adapter boot config.
 //!
-//! Parses per-adapter env-var config, constructs the adapter, calls
-//! `start()`, spawns the per-adapter ledger-writer task, and spawns a
-//! cancellation-watcher that calls `adapter.stop()` when the shutdown
-//! coordinator's root token fires.
+//! S229/S250 wired adapters straight from env vars at boot. S257 /
+//! PR-246 moves the source of truth to the `[[mes.adapters]]`
+//! seller.toml slot ([[trust-code-not-operator]] — operators manage
+//! adapters from Settings → Adapters, never by editing env + restart).
 //!
-//! ## Why env vars and not seller.toml
+//! This module now does ONE thing at boot: a **one-shot, idempotent
+//! migration** of any env-defined adapter into the TOML. After
+//! migration the env vars are ignored — the persisted config is
+//! authoritative and [`crate::mes_manager::AdapterManager::boot_from_toml`]
+//! starts every persisted adapter. An operator who had
+//! `ABERP_ZEBRA_ENABLED=true` set sees that printer appear in the
+//! Adapters page on first boot post-S257 with no action required, and a
+//! second boot does not duplicate it (the migration upserts by
+//! `adapter_id`).
 //!
-//! Per ADR-0060 §"Open questions → Operator-configurable adapter
-//! registration", a `[mes]` section in `seller.toml` is the documented
-//! long-term home. Landing it requires updating the four
-//! [[seller-toml-write-invariant]] preservation paths (identity /
-//! banks / smtp / numbering) AND the snapshot tool AND the runbook —
-//! a substantial PR in its own right, deliberately separated from
-//! Phase β per [[pushback-as-method]].
+//! [`MesBootDeps`] still bundles the ledger-writer + audit dependencies
+//! the manager threads into each spawned adapter task.
 //!
-//! Phase β uses env vars to gate adapter presence. The pattern mirrors
-//! `ABERP_QUOTE_INTAKE_ENABLED=true` (S210). Default-off; production
-//! runs that don't set the env var see no adapter, no port bound, no
-//! ledger writer. Per [[trust-code-not-operator]] the DoS bounds
-//! (`max_payload_len`, `max_concurrent_connections`, `max_frame_bytes`,
-//! `handshake_timeout`, …) are NOT exposed as env vars — only the
-//! operator-meaningful identity + endpoint fields.
+//! ## DoS bounds stay compiled-in
 //!
-//! ## Single-instance per adapter type (S250 deliberate)
-//!
-//! S250 wires one instance of each adapter type, mirroring the
-//! barcode-scanner pattern exactly. The S249 brief floated an indexed
-//! `ABERP_ZEBRA_HOST_<N>` shape as "probably" the right call; we
-//! deliberately chose single-instance to stay symmetric with the
-//! pre-existing barcode pattern. Multi-instance per type is future work
-//! that should land alongside the `[mes]` seller.toml slot — env-var
-//! indexing for ~10 printers per plant is ergonomically worse than a
-//! TOML array. Flagged in the S250 report.
+//! Per [[trust-code-not-operator]] the DoS bounds (`max_payload_len`,
+//! `max_concurrent_connections`, `max_frame_bytes`, timeouts, …) are
+//! NOT operator-exposed — neither here nor in the TOML. Only the
+//! operator-meaningful identity + endpoint fields persist.
 
-use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Context, Result};
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 
 use aberp_audit_ledger::{BinaryHash, TenantId};
 use aberp_mes::{
-    spawn_ledger_writer, Adapter, AdapterRegistry, BarcodeScannerAdapter, BarcodeScannerConfig,
-    LedgerWriterActor, LedgerWriterDeps, MtconnectAdapter, MtconnectAdapterConfig, UrRtdeAdapter,
-    UrRtdeAdapterConfig, ZebraAdapter, ZebraAdapterConfig, DEFAULT_LISTEN_PORT,
-    MTCONNECT_DEFAULT_AGENT_PORT, UR_RTDE_DEFAULT_PORT, ZEBRA_DEFAULT_LISTEN_PORT,
+    AdapterConfigEntry, AdapterKind, DEFAULT_LISTEN_PORT, MTCONNECT_DEFAULT_AGENT_PORT,
+    UR_RTDE_DEFAULT_PORT, ZEBRA_DEFAULT_LISTEN_PORT,
 };
+
+use crate::mes_adapters_config;
 
 const ENV_BARCODE_ENABLED: &str = "ABERP_BARCODE_SCANNER_ENABLED";
 const ENV_BARCODE_ID: &str = "ABERP_BARCODE_SCANNER_ID";
@@ -90,10 +74,10 @@ const DEFAULT_UR_RTDE_ROBOT_ID: &str = "robot-default";
 const DEFAULT_UR_RTDE_FRIENDLY_NAME: &str = "UR Robot";
 const DEFAULT_UR_RTDE_MODEL: &str = "UR";
 
-/// Shared dependencies the MES boot path threads into each spawned
-/// ledger-writer task. Built from the existing `recovery_state` at
-/// the boot call site (`db_path` / `tenant` / `binary_hash`) +
-/// operator session info.
+/// Shared dependencies the MES boot + CRUD paths thread into each
+/// spawned ledger-writer task and every audit append. Built from the
+/// boot call site (`db_path` / `tenant` / `binary_hash`) + operator
+/// session info.
 #[derive(Debug, Clone)]
 pub struct MesBootDeps {
     pub db_path: PathBuf,
@@ -103,279 +87,58 @@ pub struct MesBootDeps {
     pub session_id: String,
 }
 
-/// Outcome of booting the MES adapter set: the spawned task handles
-/// the caller must register with the shutdown coordinator. Labels are
-/// `&'static str` to match the coordinator's `register` signature; the
-/// per-adapter identity is logged separately at spawn time and is not
-/// needed inside the shutdown summary line.
-#[derive(Debug)]
-pub struct SpawnedMesTasks {
-    pub handles: Vec<(&'static str, JoinHandle<()>)>,
-}
-
-/// Boot the MES adapter set as configured by env vars. Returns
-/// `Ok(None)` when no adapter is enabled — boot proceeds silently and
-/// `registry` is left empty.
+/// One-shot, idempotent migration of env-defined adapters into the
+/// `[[mes.adapters]]` TOML slot. Returns the number of NEW entries
+/// added (0 on a re-boot where everything is already migrated).
 ///
-/// Each adapter type (barcode / Zebra / MTConnect / UR RTDE) is gated
-/// by its own `ABERP_<TYPE>_ENABLED` flag and configured independently.
-/// A misconfigured adapter (parse error, blank id) fails the whole
-/// boot — per CLAUDE.md rule 12 we fail loud rather than silently
-/// dropping an adapter the operator asked for.
-///
-/// On success the registered tasks fan out from `cancel`: every
-/// spawned task respects `cancel.cancelled()` so a Tauri-window close
-/// or a Ctrl-C exits within ms. The same started adapter is also
-/// registered into `registry` so the Workshop dashboard route can
-/// probe live health (S240 / PR-234).
-pub async fn boot_mes_adapters(
-    deps: MesBootDeps,
-    cancel: CancellationToken,
-    registry: Arc<RwLock<AdapterRegistry>>,
-) -> Result<Option<SpawnedMesTasks>> {
-    let mut handles: Vec<(&'static str, JoinHandle<()>)> = Vec::new();
-
-    if barcode_scanner_enabled() {
-        handles.extend(boot_barcode_scanner(&deps, &cancel, &registry).await?);
-    } else {
-        tracing::info!(
-            "MES barcode-scanner adapter disabled ({ENV_BARCODE_ENABLED} != true); skipping"
-        );
-    }
-
-    if zebra_enabled() {
-        handles.extend(boot_zebra(&deps, &cancel, &registry).await?);
-    } else {
-        tracing::info!(
-            "MES Zebra label-printer adapter disabled ({ENV_ZEBRA_ENABLED} != true); skipping"
-        );
-    }
-
-    if mtconnect_enabled() {
-        handles.extend(boot_mtconnect(&deps, &cancel, &registry).await?);
-    } else {
-        tracing::info!(
-            "MES MTConnect adapter disabled ({ENV_MTCONNECT_ENABLED} != true); skipping"
-        );
-    }
-
-    if ur_rtde_enabled() {
-        handles.extend(boot_ur_rtde(&deps, &cancel, &registry).await?);
-    } else {
-        tracing::info!(
-            "MES Universal Robots RTDE adapter disabled ({ENV_UR_RTDE_ENABLED} != true); skipping"
-        );
-    }
-
-    if handles.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(SpawnedMesTasks { handles }))
-    }
-}
-
-// ===== Barcode scanner (S229 / PR-225) =====
-
-async fn boot_barcode_scanner(
-    deps: &MesBootDeps,
-    cancel: &CancellationToken,
-    registry: &Arc<RwLock<AdapterRegistry>>,
-) -> Result<Vec<(&'static str, JoinHandle<()>)>> {
-    let cfg =
-        read_barcode_scanner_config_from_env().context("read barcode-scanner config from env")?;
-    let scanner_id = cfg.scanner_id.clone();
-    let listen_addr = cfg.listen_addr;
-    let listen_port = cfg.listen_port;
-    tracing::info!(
-        scanner_id = %scanner_id,
-        listen_addr = %listen_addr,
-        listen_port,
-        "spawning MES barcode-scanner adapter (S229 / PR-225)"
-    );
-
-    let adapter: Arc<BarcodeScannerAdapter> = Arc::new(BarcodeScannerAdapter::new(cfg));
-    adapter
-        .start()
-        .await
-        .with_context(|| format!("barcode scanner adapter '{scanner_id}' start failed"))?;
-
-    register_started_adapter(registry, adapter.clone() as Arc<dyn Adapter>, &scanner_id)?;
-
-    let writer_handle = spawn_writer(adapter.clone() as Arc<dyn Adapter>, deps, cancel);
-    let stopper_handle = spawn_stopper(
-        adapter.clone() as Arc<dyn Adapter>,
-        cancel,
-        "barcode-scanner",
-    );
-
-    Ok(vec![
-        ("mes-barcode-scanner-writer", writer_handle),
-        ("mes-barcode-scanner-stopper", stopper_handle),
-    ])
-}
-
-// ===== Zebra label printer (S245 / PR-238) =====
-
-async fn boot_zebra(
-    deps: &MesBootDeps,
-    cancel: &CancellationToken,
-    registry: &Arc<RwLock<AdapterRegistry>>,
-) -> Result<Vec<(&'static str, JoinHandle<()>)>> {
-    let cfg = read_zebra_config_from_env().context("read Zebra label-printer config from env")?;
-    let printer_id = cfg.printer_id.clone();
-    let host = cfg.host.clone();
-    let port = cfg.port;
-    tracing::info!(
-        printer_id = %printer_id,
-        host = %host,
-        port,
-        "spawning MES Zebra label-printer adapter (S245 / PR-238)"
-    );
-
-    let adapter: Arc<ZebraAdapter> = Arc::new(ZebraAdapter::new(cfg));
-    adapter
-        .start()
-        .await
-        .with_context(|| format!("Zebra label-printer adapter '{printer_id}' start failed"))?;
-
-    register_started_adapter(registry, adapter.clone() as Arc<dyn Adapter>, &printer_id)?;
-
-    let writer_handle = spawn_writer(adapter.clone() as Arc<dyn Adapter>, deps, cancel);
-    let stopper_handle = spawn_stopper(adapter.clone() as Arc<dyn Adapter>, cancel, "zebra");
-
-    Ok(vec![
-        ("mes-zebra-writer", writer_handle),
-        ("mes-zebra-stopper", stopper_handle),
-    ])
-}
-
-// ===== MTConnect CNC (S247 / PR-240) =====
-
-async fn boot_mtconnect(
-    deps: &MesBootDeps,
-    cancel: &CancellationToken,
-    registry: &Arc<RwLock<AdapterRegistry>>,
-) -> Result<Vec<(&'static str, JoinHandle<()>)>> {
-    let cfg = read_mtconnect_config_from_env().context("read MTConnect config from env")?;
-    let machine_id = cfg.machine_id.clone();
-    let host = cfg.host.clone();
-    let port = cfg.port;
-    let device_name = cfg.device_name.clone();
-    tracing::info!(
-        machine_id = %machine_id,
-        host = %host,
-        port,
-        device_name = %device_name,
-        "spawning MES MTConnect adapter (S247 / PR-240)"
-    );
-
-    let adapter: Arc<MtconnectAdapter> = Arc::new(MtconnectAdapter::new(cfg));
-    adapter
-        .start()
-        .await
-        .with_context(|| format!("MTConnect adapter '{machine_id}' start failed"))?;
-
-    register_started_adapter(registry, adapter.clone() as Arc<dyn Adapter>, &machine_id)?;
-
-    let writer_handle = spawn_writer(adapter.clone() as Arc<dyn Adapter>, deps, cancel);
-    let stopper_handle = spawn_stopper(adapter.clone() as Arc<dyn Adapter>, cancel, "mtconnect");
-
-    Ok(vec![
-        ("mes-mtconnect-writer", writer_handle),
-        ("mes-mtconnect-stopper", stopper_handle),
-    ])
-}
-
-// ===== Universal Robots RTDE (S248 / PR-241) =====
-
-async fn boot_ur_rtde(
-    deps: &MesBootDeps,
-    cancel: &CancellationToken,
-    registry: &Arc<RwLock<AdapterRegistry>>,
-) -> Result<Vec<(&'static str, JoinHandle<()>)>> {
-    let cfg =
-        read_ur_rtde_config_from_env().context("read Universal Robots RTDE config from env")?;
-    let robot_id = cfg.robot_id.clone();
-    let host = cfg.host.clone();
-    let port = cfg.port;
-    let model = cfg.model.clone();
-    tracing::info!(
-        robot_id = %robot_id,
-        host = %host,
-        port,
-        model = %model,
-        "spawning MES Universal Robots RTDE adapter (S248 / PR-241)"
-    );
-
-    let adapter: Arc<UrRtdeAdapter> = Arc::new(UrRtdeAdapter::new(cfg));
-    adapter
-        .start()
-        .await
-        .with_context(|| format!("UR RTDE adapter '{robot_id}' start failed"))?;
-
-    register_started_adapter(registry, adapter.clone() as Arc<dyn Adapter>, &robot_id)?;
-
-    let writer_handle = spawn_writer(adapter.clone() as Arc<dyn Adapter>, deps, cancel);
-    let stopper_handle = spawn_stopper(adapter.clone() as Arc<dyn Adapter>, cancel, "ur-rtde");
-
-    Ok(vec![
-        ("mes-ur-rtde-writer", writer_handle),
-        ("mes-ur-rtde-stopper", stopper_handle),
-    ])
-}
-
-// ===== Shared helpers =====
-
-fn register_started_adapter(
-    registry: &Arc<RwLock<AdapterRegistry>>,
-    adapter: Arc<dyn Adapter>,
-    label: &str,
-) -> Result<()> {
-    // Done AFTER `start()` succeeds — a failed-to-start adapter must
-    // not appear in the dashboard list, per [[trust-code-not-operator]].
-    let mut guard = registry
-        .write()
-        .map_err(|_| anyhow!("adapter registry rwlock poisoned during boot"))?;
-    guard
-        .register(adapter)
-        .with_context(|| format!("register adapter '{label}' into runtime registry"))?;
-    Ok(())
-}
-
-fn spawn_writer(
-    adapter: Arc<dyn Adapter>,
-    deps: &MesBootDeps,
-    cancel: &CancellationToken,
-) -> JoinHandle<()> {
-    let writer_deps = LedgerWriterDeps {
-        db_path: deps.db_path.clone(),
-        tenant: deps.tenant.clone(),
-        binary_hash: deps.binary_hash,
-        actor: LedgerWriterActor {
-            session_id: deps.session_id.clone(),
-            operator_login: deps.operator_login.clone(),
-        },
-    };
-    spawn_ledger_writer(adapter, writer_deps, cancel.clone())
-}
-
-fn spawn_stopper(
-    adapter: Arc<dyn Adapter>,
-    cancel: &CancellationToken,
-    kind: &'static str,
-) -> JoinHandle<()> {
-    let stopper_cancel = cancel.clone();
-    tokio::spawn(async move {
-        stopper_cancel.cancelled().await;
-        if let Err(e) = adapter.stop().await {
-            tracing::warn!(
-                adapter_name = %adapter.name(),
-                kind,
-                error = %e,
-                "MES adapter stop failed during shutdown"
-            );
+/// Idempotency is by `adapter_id` absence: an env adapter whose id
+/// already has a TOML row is left untouched, so re-running on every
+/// boot never duplicates. (Chosen over an audit sentinel — the
+/// id-absence check is simpler, needs no ledger read, and is robust to
+/// an operator who hand-deletes a row and re-enables the env var,
+/// which correctly re-adds it.)
+pub fn migrate_env_adapters_to_toml(seller_toml_path: &Path) -> Result<usize> {
+    let mut entries = mes_adapters_config::read_mes_adapters(seller_toml_path)
+        .context("read existing [[mes.adapters]] for env migration")?;
+    let mut added = 0usize;
+    for env_entry in env_adapter_entries()? {
+        if entries.iter().any(|e| e.adapter_id == env_entry.adapter_id) {
+            continue; // already migrated — idempotent
         }
-    })
+        tracing::info!(
+            adapter_id = %env_entry.adapter_id,
+            kind = %env_entry.kind.wire_str(),
+            "migrating env-defined MES adapter into [[mes.adapters]] (S257)"
+        );
+        entries.push(env_entry);
+        added += 1;
+    }
+    if added > 0 {
+        mes_adapters_config::write_mes_adapters_section(seller_toml_path, &entries)
+            .context("persist migrated env adapters into [[mes.adapters]]")?;
+    }
+    Ok(added)
+}
+
+/// Collect a config entry for each enabled env adapter. A misconfigured
+/// adapter (blank id, malformed port) fails the whole migration loud
+/// per CLAUDE.md rule 12 — better to refuse boot than silently drop an
+/// adapter the operator's env asked for.
+fn env_adapter_entries() -> Result<Vec<AdapterConfigEntry>> {
+    let mut out = Vec::new();
+    if env_bool_true(ENV_BARCODE_ENABLED) {
+        out.push(read_barcode_entry_from_env().context("read barcode-scanner env config")?);
+    }
+    if env_bool_true(ENV_ZEBRA_ENABLED) {
+        out.push(read_zebra_entry_from_env().context("read Zebra env config")?);
+    }
+    if env_bool_true(ENV_MTCONNECT_ENABLED) {
+        out.push(read_mtconnect_entry_from_env().context("read MTConnect env config")?);
+    }
+    if env_bool_true(ENV_UR_RTDE_ENABLED) {
+        out.push(read_ur_rtde_entry_from_env().context("read UR RTDE env config")?);
+    }
+    Ok(out)
 }
 
 fn env_bool_true(key: &str) -> bool {
@@ -384,55 +147,41 @@ fn env_bool_true(key: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn barcode_scanner_enabled() -> bool {
-    env_bool_true(ENV_BARCODE_ENABLED)
-}
-
-fn zebra_enabled() -> bool {
-    env_bool_true(ENV_ZEBRA_ENABLED)
-}
-
-fn mtconnect_enabled() -> bool {
-    env_bool_true(ENV_MTCONNECT_ENABLED)
-}
-
-fn ur_rtde_enabled() -> bool {
-    env_bool_true(ENV_UR_RTDE_ENABLED)
-}
-
-fn read_barcode_scanner_config_from_env() -> Result<BarcodeScannerConfig> {
-    let scanner_id =
-        std::env::var(ENV_BARCODE_ID).unwrap_or_else(|_| DEFAULT_SCANNER_ID.to_string());
-    if scanner_id.trim().is_empty() {
-        return Err(anyhow!(
-            "{ENV_BARCODE_ID} is empty; refusing to start scanner with anonymous name"
-        ));
+fn env_port(key: &str, default: u16) -> Result<u16> {
+    match std::env::var(key) {
+        Ok(s) => s.parse::<u16>().with_context(|| format!("parse {key}={s}")),
+        Err(_) => Ok(default),
     }
-
-    let host_str = std::env::var(ENV_BARCODE_HOST).unwrap_or_else(|_| DEFAULT_HOST.to_string());
-    let listen_addr = IpAddr::from_str(&host_str)
-        .with_context(|| format!("parse {ENV_BARCODE_HOST}={host_str}"))?;
-
-    let listen_port = match std::env::var(ENV_BARCODE_PORT) {
-        Ok(s) => s
-            .parse::<u16>()
-            .with_context(|| format!("parse {ENV_BARCODE_PORT}={s}"))?,
-        Err(_) => DEFAULT_LISTEN_PORT,
-    };
-
-    let mut cfg = BarcodeScannerConfig::new(scanner_id);
-    cfg.listen_addr = listen_addr;
-    cfg.listen_port = listen_port;
-    Ok(cfg)
 }
 
-fn read_zebra_config_from_env() -> Result<ZebraAdapterConfig> {
-    let printer_id = std::env::var(ENV_ZEBRA_PRINTER_ID)
+fn read_barcode_entry_from_env() -> Result<AdapterConfigEntry> {
+    let adapter_id =
+        std::env::var(ENV_BARCODE_ID).unwrap_or_else(|_| DEFAULT_SCANNER_ID.to_string());
+    if adapter_id.trim().is_empty() {
+        return Err(anyhow!("{ENV_BARCODE_ID} is empty"));
+    }
+    let host = std::env::var(ENV_BARCODE_HOST).unwrap_or_else(|_| DEFAULT_HOST.to_string());
+    // Validate the listen address parses now so a bad env value fails
+    // the migration loud rather than at first boot_from_toml.
+    std::net::IpAddr::from_str(host.trim())
+        .with_context(|| format!("parse {ENV_BARCODE_HOST}={host}"))?;
+    let port = env_port(ENV_BARCODE_PORT, DEFAULT_LISTEN_PORT)?;
+    Ok(AdapterConfigEntry {
+        kind: AdapterKind::BarcodeScanner,
+        friendly_name: adapter_id.clone(),
+        adapter_id,
+        host,
+        port,
+        device_name: None,
+        model: None,
+    })
+}
+
+fn read_zebra_entry_from_env() -> Result<AdapterConfigEntry> {
+    let adapter_id = std::env::var(ENV_ZEBRA_PRINTER_ID)
         .unwrap_or_else(|_| DEFAULT_ZEBRA_PRINTER_ID.to_string());
-    if printer_id.trim().is_empty() {
-        return Err(anyhow!(
-            "{ENV_ZEBRA_PRINTER_ID} is empty; refusing to start printer with anonymous name"
-        ));
+    if adapter_id.trim().is_empty() {
+        return Err(anyhow!("{ENV_ZEBRA_PRINTER_ID} is empty"));
     }
     let friendly_name = std::env::var(ENV_ZEBRA_FRIENDLY_NAME)
         .unwrap_or_else(|_| DEFAULT_ZEBRA_FRIENDLY_NAME.to_string());
@@ -440,27 +189,23 @@ fn read_zebra_config_from_env() -> Result<ZebraAdapterConfig> {
     if host.trim().is_empty() {
         return Err(anyhow!("{ENV_ZEBRA_HOST} is empty"));
     }
-    let port = match std::env::var(ENV_ZEBRA_PORT) {
-        Ok(s) => s
-            .parse::<u16>()
-            .with_context(|| format!("parse {ENV_ZEBRA_PORT}={s}"))?,
-        Err(_) => ZEBRA_DEFAULT_LISTEN_PORT,
-    };
-    Ok(ZebraAdapterConfig::new(
-        printer_id,
+    let port = env_port(ENV_ZEBRA_PORT, ZEBRA_DEFAULT_LISTEN_PORT)?;
+    Ok(AdapterConfigEntry {
+        kind: AdapterKind::LabelPrinter,
+        adapter_id,
         friendly_name,
         host,
         port,
-    ))
+        device_name: None,
+        model: None,
+    })
 }
 
-fn read_mtconnect_config_from_env() -> Result<MtconnectAdapterConfig> {
-    let machine_id = std::env::var(ENV_MTCONNECT_MACHINE_ID)
+fn read_mtconnect_entry_from_env() -> Result<AdapterConfigEntry> {
+    let adapter_id = std::env::var(ENV_MTCONNECT_MACHINE_ID)
         .unwrap_or_else(|_| DEFAULT_MTCONNECT_MACHINE_ID.to_string());
-    if machine_id.trim().is_empty() {
-        return Err(anyhow!(
-            "{ENV_MTCONNECT_MACHINE_ID} is empty; refusing to start CNC adapter with anonymous name"
-        ));
+    if adapter_id.trim().is_empty() {
+        return Err(anyhow!("{ENV_MTCONNECT_MACHINE_ID} is empty"));
     }
     let friendly_name = std::env::var(ENV_MTCONNECT_FRIENDLY_NAME)
         .unwrap_or_else(|_| DEFAULT_MTCONNECT_FRIENDLY_NAME.to_string());
@@ -468,33 +213,28 @@ fn read_mtconnect_config_from_env() -> Result<MtconnectAdapterConfig> {
     if host.trim().is_empty() {
         return Err(anyhow!("{ENV_MTCONNECT_HOST} is empty"));
     }
-    let port = match std::env::var(ENV_MTCONNECT_PORT) {
-        Ok(s) => s
-            .parse::<u16>()
-            .with_context(|| format!("parse {ENV_MTCONNECT_PORT}={s}"))?,
-        Err(_) => MTCONNECT_DEFAULT_AGENT_PORT,
-    };
+    let port = env_port(ENV_MTCONNECT_PORT, MTCONNECT_DEFAULT_AGENT_PORT)?;
     let device_name = std::env::var(ENV_MTCONNECT_DEVICE_NAME)
         .unwrap_or_else(|_| DEFAULT_MTCONNECT_DEVICE_NAME.to_string());
     if device_name.trim().is_empty() {
         return Err(anyhow!("{ENV_MTCONNECT_DEVICE_NAME} is empty"));
     }
-    Ok(MtconnectAdapterConfig::new(
-        machine_id,
+    Ok(AdapterConfigEntry {
+        kind: AdapterKind::Cnc,
+        adapter_id,
         friendly_name,
         host,
         port,
-        device_name,
-    ))
+        device_name: Some(device_name),
+        model: None,
+    })
 }
 
-fn read_ur_rtde_config_from_env() -> Result<UrRtdeAdapterConfig> {
-    let robot_id = std::env::var(ENV_UR_RTDE_ROBOT_ID)
+fn read_ur_rtde_entry_from_env() -> Result<AdapterConfigEntry> {
+    let adapter_id = std::env::var(ENV_UR_RTDE_ROBOT_ID)
         .unwrap_or_else(|_| DEFAULT_UR_RTDE_ROBOT_ID.to_string());
-    if robot_id.trim().is_empty() {
-        return Err(anyhow!(
-            "{ENV_UR_RTDE_ROBOT_ID} is empty; refusing to start robot adapter with anonymous name"
-        ));
+    if adapter_id.trim().is_empty() {
+        return Err(anyhow!("{ENV_UR_RTDE_ROBOT_ID} is empty"));
     }
     let friendly_name = std::env::var(ENV_UR_RTDE_FRIENDLY_NAME)
         .unwrap_or_else(|_| DEFAULT_UR_RTDE_FRIENDLY_NAME.to_string());
@@ -502,30 +242,25 @@ fn read_ur_rtde_config_from_env() -> Result<UrRtdeAdapterConfig> {
     if host.trim().is_empty() {
         return Err(anyhow!("{ENV_UR_RTDE_HOST} is empty"));
     }
-    let port = match std::env::var(ENV_UR_RTDE_PORT) {
-        Ok(s) => s
-            .parse::<u16>()
-            .with_context(|| format!("parse {ENV_UR_RTDE_PORT}={s}"))?,
-        Err(_) => UR_RTDE_DEFAULT_PORT,
-    };
+    let port = env_port(ENV_UR_RTDE_PORT, UR_RTDE_DEFAULT_PORT)?;
     let model =
         std::env::var(ENV_UR_RTDE_MODEL).unwrap_or_else(|_| DEFAULT_UR_RTDE_MODEL.to_string());
-    Ok(UrRtdeAdapterConfig::new(
-        robot_id,
+    Ok(AdapterConfigEntry {
+        kind: AdapterKind::Robot,
+        adapter_id,
         friendly_name,
         host,
         port,
-        model,
-    ))
+        device_name: None,
+        model: Some(model),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // NOTE: env vars are process-global; these tests serialize on a
-    // shared mutex to avoid cross-test cross-talk. The set of tests is
-    // small enough that the serialisation overhead is negligible.
+    // env vars are process-global; serialise the env-touching tests.
     use std::sync::Mutex;
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -560,231 +295,110 @@ mod tests {
     }
 
     #[test]
-    fn enabled_defaults_to_false() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn no_env_means_no_entries() {
+        let _g = ENV_LOCK.lock().unwrap();
         clear_env();
-        assert!(!barcode_scanner_enabled());
-        assert!(!zebra_enabled());
-        assert!(!mtconnect_enabled());
-        assert!(!ur_rtde_enabled());
+        assert!(env_adapter_entries().unwrap().is_empty());
     }
 
     #[test]
-    fn enabled_is_case_insensitive_true() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn enabled_env_maps_to_typed_entries_with_defaults() {
+        let _g = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_BARCODE_ENABLED, "TRUE");
-        assert!(barcode_scanner_enabled());
-        std::env::set_var(ENV_BARCODE_ENABLED, "True");
-        assert!(barcode_scanner_enabled());
-        std::env::set_var(ENV_BARCODE_ENABLED, "true");
-        assert!(barcode_scanner_enabled());
-        std::env::set_var(ENV_BARCODE_ENABLED, "false");
-        assert!(!barcode_scanner_enabled());
+        std::env::set_var(ENV_ZEBRA_ENABLED, "true");
+        std::env::set_var(ENV_UR_RTDE_ENABLED, "TRUE");
+        let entries = env_adapter_entries().unwrap();
         clear_env();
-    }
-
-    #[test]
-    fn config_from_env_uses_documented_defaults() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        let cfg = read_barcode_scanner_config_from_env().unwrap();
-        assert_eq!(cfg.scanner_id, DEFAULT_SCANNER_ID);
-        assert_eq!(cfg.listen_port, DEFAULT_LISTEN_PORT);
-        assert_eq!(cfg.listen_addr, IpAddr::from_str(DEFAULT_HOST).unwrap());
-    }
-
-    #[test]
-    fn config_from_env_picks_up_overrides() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        std::env::set_var(ENV_BARCODE_ID, "barcode-scanner-receiving-dock");
-        std::env::set_var(ENV_BARCODE_HOST, "0.0.0.0");
-        std::env::set_var(ENV_BARCODE_PORT, "9100");
-        let cfg = read_barcode_scanner_config_from_env().unwrap();
-        assert_eq!(cfg.scanner_id, "barcode-scanner-receiving-dock");
-        assert_eq!(cfg.listen_port, 9100);
-        assert_eq!(cfg.listen_addr, IpAddr::from_str("0.0.0.0").unwrap());
-        clear_env();
-    }
-
-    #[test]
-    fn config_from_env_rejects_blank_scanner_id() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        std::env::set_var(ENV_BARCODE_ID, "   ");
-        let err = read_barcode_scanner_config_from_env().unwrap_err();
-        assert!(err.to_string().contains(ENV_BARCODE_ID));
-        clear_env();
-    }
-
-    #[test]
-    fn config_from_env_rejects_malformed_port() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        std::env::set_var(ENV_BARCODE_PORT, "not-a-number");
-        let err = read_barcode_scanner_config_from_env().unwrap_err();
-        assert!(err.to_string().contains(ENV_BARCODE_PORT));
-        clear_env();
-    }
-
-    /// S240 / PR-234 — when the adapter is disabled the boot path
-    /// leaves the shared registry empty. The dashboard handler then
-    /// renders the "no adapters configured" empty state — honest
-    /// replacement for the prior env-snapshot's "disabled" pill.
-    ///
-    /// Synchronous test driving the future with `block_on` so the
-    /// `ENV_LOCK` std-Mutex guard doesn't cross an `.await` point
-    /// (clippy `await_holding_lock`).
-    #[test]
-    fn boot_with_adapter_disabled_leaves_registry_empty() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        let registry = Arc::new(RwLock::new(AdapterRegistry::new()));
-        let deps = MesBootDeps {
-            db_path: PathBuf::from("/tmp/unused-by-disabled-path.duckdb"),
-            tenant: TenantId::new("tenant-test").unwrap(),
-            binary_hash: BinaryHash::from_bytes([0u8; 32]),
-            operator_login: "op".to_string(),
-            session_id: "sess".to_string(),
-        };
-        let cancel = CancellationToken::new();
-        let outcome = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(boot_mes_adapters(deps, cancel, registry.clone()))
+        assert_eq!(entries.len(), 2);
+        let zebra = entries
+            .iter()
+            .find(|e| e.kind == AdapterKind::LabelPrinter)
             .unwrap();
-        assert!(outcome.is_none());
-        assert!(registry.read().unwrap().is_empty());
+        assert_eq!(zebra.adapter_id, DEFAULT_ZEBRA_PRINTER_ID);
+        assert_eq!(zebra.friendly_name, DEFAULT_ZEBRA_FRIENDLY_NAME);
+        assert_eq!(zebra.host, DEFAULT_HOST);
+        assert_eq!(zebra.port, ZEBRA_DEFAULT_LISTEN_PORT);
+        let robot = entries
+            .iter()
+            .find(|e| e.kind == AdapterKind::Robot)
+            .unwrap();
+        assert_eq!(robot.adapter_id, DEFAULT_UR_RTDE_ROBOT_ID);
+        assert_eq!(robot.model.as_deref(), Some(DEFAULT_UR_RTDE_MODEL));
     }
 
     #[test]
-    fn config_from_env_rejects_malformed_host() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn barcode_env_rejects_non_ip_host() {
+        let _g = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_BARCODE_HOST, "not::an::ip::!!");
-        let err = read_barcode_scanner_config_from_env().unwrap_err();
-        assert!(err.to_string().contains(ENV_BARCODE_HOST));
+        std::env::set_var(ENV_BARCODE_ENABLED, "true");
+        std::env::set_var(ENV_BARCODE_HOST, "not-an-ip");
+        let err = env_adapter_entries().unwrap_err();
         clear_env();
-    }
-
-    // ===== S250 / PR-242 — Zebra / MTConnect / UR RTDE wiring pins =====
-
-    #[test]
-    fn zebra_config_from_env_uses_documented_defaults() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        let cfg = read_zebra_config_from_env().unwrap();
-        assert_eq!(cfg.printer_id, DEFAULT_ZEBRA_PRINTER_ID);
-        assert_eq!(cfg.friendly_name, DEFAULT_ZEBRA_FRIENDLY_NAME);
-        assert_eq!(cfg.host, DEFAULT_HOST);
-        assert_eq!(cfg.port, ZEBRA_DEFAULT_LISTEN_PORT);
+        assert!(
+            err.to_string().contains(ENV_BARCODE_HOST) || format!("{err:#}").contains("barcode")
+        );
     }
 
     #[test]
-    fn zebra_config_from_env_picks_up_overrides() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn migration_is_idempotent_by_adapter_id() {
+        let _g = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_ZEBRA_PRINTER_ID, "label-printer-dispatch-a");
-        std::env::set_var(ENV_ZEBRA_FRIENDLY_NAME, "Dispatch — left bench");
-        std::env::set_var(ENV_ZEBRA_HOST, "192.168.1.50");
-        std::env::set_var(ENV_ZEBRA_PORT, "9100");
-        let cfg = read_zebra_config_from_env().unwrap();
-        assert_eq!(cfg.printer_id, "label-printer-dispatch-a");
-        assert_eq!(cfg.friendly_name, "Dispatch — left bench");
-        assert_eq!(cfg.host, "192.168.1.50");
-        assert_eq!(cfg.port, 9100);
-        clear_env();
-    }
-
-    #[test]
-    fn zebra_config_from_env_rejects_blank_printer_id() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        std::env::set_var(ENV_ZEBRA_PRINTER_ID, "   ");
-        let err = read_zebra_config_from_env().unwrap_err();
-        assert!(err.to_string().contains(ENV_ZEBRA_PRINTER_ID));
-        clear_env();
-    }
-
-    #[test]
-    fn mtconnect_config_from_env_uses_documented_defaults() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        let cfg = read_mtconnect_config_from_env().unwrap();
-        assert_eq!(cfg.machine_id, DEFAULT_MTCONNECT_MACHINE_ID);
-        assert_eq!(cfg.friendly_name, DEFAULT_MTCONNECT_FRIENDLY_NAME);
-        assert_eq!(cfg.host, DEFAULT_HOST);
-        assert_eq!(cfg.port, MTCONNECT_DEFAULT_AGENT_PORT);
-        assert_eq!(cfg.device_name, DEFAULT_MTCONNECT_DEVICE_NAME);
-    }
-
-    #[test]
-    fn mtconnect_config_from_env_picks_up_overrides() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        std::env::set_var(ENV_MTCONNECT_MACHINE_ID, "cnc-line-a-1");
-        std::env::set_var(ENV_MTCONNECT_FRIENDLY_NAME, "Line A CNC");
+        std::env::set_var(ENV_MTCONNECT_ENABLED, "true");
+        std::env::set_var(ENV_MTCONNECT_MACHINE_ID, "cnc-line-a");
         std::env::set_var(ENV_MTCONNECT_HOST, "10.0.0.20");
-        std::env::set_var(ENV_MTCONNECT_PORT, "5000");
-        std::env::set_var(ENV_MTCONNECT_DEVICE_NAME, "M1");
-        let cfg = read_mtconnect_config_from_env().unwrap();
-        assert_eq!(cfg.machine_id, "cnc-line-a-1");
-        assert_eq!(cfg.friendly_name, "Line A CNC");
-        assert_eq!(cfg.host, "10.0.0.20");
-        assert_eq!(cfg.port, 5000);
-        assert_eq!(cfg.device_name, "M1");
+
+        let dir = std::env::temp_dir().join(format!("aberp-migrate-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seller.toml");
+
+        let first = migrate_env_adapters_to_toml(&path).unwrap();
+        assert_eq!(first, 1, "first migration adds the env adapter");
+        let second = migrate_env_adapters_to_toml(&path).unwrap();
+        assert_eq!(second, 0, "second migration is a no-op (idempotent)");
+
+        let entries = mes_adapters_config::read_mes_adapters(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].adapter_id, "cnc-line-a");
+        assert_eq!(entries[0].host, "10.0.0.20");
+        assert_eq!(entries[0].kind, AdapterKind::Cnc);
+
         clear_env();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Migration preserves an operator's hand-added adapter alongside the
+    /// migrated env one (no clobber of the other [[mes.adapters]] rows).
     #[test]
-    fn mtconnect_config_from_env_rejects_blank_device_name() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn migration_preserves_existing_adapters() {
+        let _g = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_MTCONNECT_DEVICE_NAME, "   ");
-        let err = read_mtconnect_config_from_env().unwrap_err();
-        assert!(err.to_string().contains(ENV_MTCONNECT_DEVICE_NAME));
-        clear_env();
-    }
+        let dir = std::env::temp_dir().join(format!("aberp-migrate2-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seller.toml");
 
-    #[test]
-    fn ur_rtde_config_from_env_uses_documented_defaults() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        let cfg = read_ur_rtde_config_from_env().unwrap();
-        assert_eq!(cfg.robot_id, DEFAULT_UR_RTDE_ROBOT_ID);
-        assert_eq!(cfg.friendly_name, DEFAULT_UR_RTDE_FRIENDLY_NAME);
-        assert_eq!(cfg.host, DEFAULT_HOST);
-        assert_eq!(cfg.port, UR_RTDE_DEFAULT_PORT);
-        assert_eq!(cfg.model, DEFAULT_UR_RTDE_MODEL);
-    }
+        // Pre-seed a hand-added adapter.
+        let preexisting = vec![AdapterConfigEntry {
+            kind: AdapterKind::Robot,
+            adapter_id: "robot-hand-added".to_string(),
+            friendly_name: "Cell A".to_string(),
+            host: "10.0.0.30".to_string(),
+            port: 30004,
+            device_name: None,
+            model: Some("UR10e".to_string()),
+        }];
+        mes_adapters_config::write_mes_adapters_section(&path, &preexisting).unwrap();
 
-    #[test]
-    fn ur_rtde_config_from_env_picks_up_overrides() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        std::env::set_var(ENV_UR_RTDE_ROBOT_ID, "cnc-cell-a-robot");
-        std::env::set_var(ENV_UR_RTDE_FRIENDLY_NAME, "Cell A — UR10e");
-        std::env::set_var(ENV_UR_RTDE_HOST, "10.0.0.30");
-        std::env::set_var(ENV_UR_RTDE_PORT, "30004");
-        std::env::set_var(ENV_UR_RTDE_MODEL, "UR10e");
-        let cfg = read_ur_rtde_config_from_env().unwrap();
-        assert_eq!(cfg.robot_id, "cnc-cell-a-robot");
-        assert_eq!(cfg.friendly_name, "Cell A — UR10e");
-        assert_eq!(cfg.host, "10.0.0.30");
-        assert_eq!(cfg.port, 30004);
-        assert_eq!(cfg.model, "UR10e");
-        clear_env();
-    }
+        std::env::set_var(ENV_ZEBRA_ENABLED, "true");
+        std::env::set_var(ENV_ZEBRA_PRINTER_ID, "lp-dispatch");
+        let added = migrate_env_adapters_to_toml(&path).unwrap();
+        assert_eq!(added, 1);
 
-    #[test]
-    fn ur_rtde_config_from_env_rejects_blank_robot_id() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let entries = mes_adapters_config::read_mes_adapters(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| e.adapter_id == "robot-hand-added"));
+        assert!(entries.iter().any(|e| e.adapter_id == "lp-dispatch"));
+
         clear_env();
-        std::env::set_var(ENV_UR_RTDE_ROBOT_ID, "   ");
-        let err = read_ur_rtde_config_from_env().unwrap_err();
-        assert!(err.to_string().contains(ENV_UR_RTDE_ROBOT_ID));
-        clear_env();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

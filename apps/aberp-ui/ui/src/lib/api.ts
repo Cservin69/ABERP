@@ -1431,6 +1431,94 @@ export async function deletePartner(partnerId: string): Promise<void> {
   await invoke<void>("delete_partner", { partnerId });
 }
 
+// ── S257 / PR-246 — Settings → Adapters CRUD ─────────────────────────
+
+/** Closed-vocab MES adapter kinds. Wire strings match each adapter's
+ * `Adapter::kind()` + the Rust `AdapterKind` serde rename. A SPA build
+ * older than the backend may see an unknown kind string in a list row —
+ * the Adapters page skips such rows gracefully (logs a console warning)
+ * rather than crashing. */
+export type AdapterKind =
+  | "barcode-scanner"
+  | "label-printer"
+  | "cnc-machine"
+  | "robot";
+
+// `AdapterStatus` (the closed-vocab live status vocab) is already
+// defined below for the Workshop dashboard — reused here verbatim.
+
+/** One adapter row from `GET /api/adapters` — persisted config joined
+ * with live registry health. `device_name` is MTConnect-only; `model`
+ * is UR-RTDE-only. */
+export interface AdapterListItem {
+  adapter_id: string;
+  kind: AdapterKind;
+  friendly_name: string;
+  host: string;
+  port: number;
+  status: AdapterStatus;
+  device_name?: string | null;
+  model?: string | null;
+}
+
+/** Body for `POST /api/adapters`. The `adapter_id` is server-minted —
+ * the operator supplies kind + friendly name + endpoint only. */
+export interface AddAdapterInput {
+  kind: AdapterKind;
+  friendly_name: string;
+  host: string;
+  port: number;
+  device_name?: string | null;
+  model?: string | null;
+}
+
+/** Body for `PUT /api/adapters/:id`. `kind` + `adapter_id` are
+ * immutable (changing the kind is a delete-then-add). */
+export interface EditAdapterInput {
+  friendly_name: string;
+  host: string;
+  port: number;
+  device_name?: string | null;
+  model?: string | null;
+}
+
+/** The full durable config the backend echoes on create/update. */
+export interface AdapterConfigEntry {
+  kind: AdapterKind;
+  adapter_id: string;
+  friendly_name: string;
+  host: string;
+  port: number;
+  device_name?: string | null;
+  model?: string | null;
+}
+
+/** S257 / PR-246 — `GET /api/adapters`. */
+export async function listAdapters(): Promise<AdapterListItem[]> {
+  const res = await invoke<{ adapters: AdapterListItem[] }>("list_adapters");
+  return res.adapters;
+}
+
+/** S257 / PR-246 — `POST /api/adapters`. Adapter starts immediately. */
+export async function createAdapter(
+  body: AddAdapterInput,
+): Promise<AdapterConfigEntry> {
+  return invoke<AdapterConfigEntry>("create_adapter", { body });
+}
+
+/** S257 / PR-246 — `PUT /api/adapters/:id`. Hot restart in place. */
+export async function updateAdapter(
+  adapterId: string,
+  body: EditAdapterInput,
+): Promise<AdapterConfigEntry> {
+  return invoke<AdapterConfigEntry>("update_adapter", { adapterId, body });
+}
+
+/** S257 / PR-246 — `DELETE /api/adapters/:id`. Stops + deregisters. */
+export async function deleteAdapter(adapterId: string): Promise<void> {
+  await invoke<void>("delete_adapter", { adapterId });
+}
+
 // ── PR-172 — buyer-facing notes-history typeahead source ─────────────
 
 /** PR-172 — closed-vocab discriminator for the notes-history scope.

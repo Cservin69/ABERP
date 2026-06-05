@@ -1127,6 +1127,40 @@ pub enum EventKind {
     ///
     /// F12 four-edit ritual fires once.
     QuoteIntakePollFailed,
+
+    /// S257 / PR-246 — an operator added a new MES adapter through the
+    /// Settings → Adapters page. The adapter is built from the typed
+    /// config, started, registered into the live registry, and
+    /// persisted into the tenant `[[mes.adapters]]` TOML slot — this
+    /// entry records the durable config (kind / adapter_id /
+    /// friendly_name / host / port). `mes.` prefix — manufacturing-
+    /// domain configuration, the namespace neighbour of
+    /// [`EventKind::MesAdapterEvent`]; never sweeps a per-OUTGOING-
+    /// invoice export bundle.
+    ///
+    /// Payload: `AdapterConfigAuditPayload` (aberp binary `mes_manager`).
+    /// F12 four-edit ritual fires once.
+    AdapterAdded,
+
+    /// S257 / PR-246 — an operator edited an existing MES adapter's
+    /// host / port / friendly name. The old adapter is stopped +
+    /// deregistered and a fresh one started in its place (the hot-
+    /// restart cycle); the TOML slot is rewritten. Carries the NEW
+    /// durable config. `mes.` prefix — see [`EventKind::AdapterAdded`].
+    ///
+    /// Payload: `AdapterConfigAuditPayload` (aberp binary `mes_manager`).
+    /// F12 four-edit ritual fires once.
+    AdapterUpdated,
+
+    /// S257 / PR-246 — an operator deleted an MES adapter. The adapter
+    /// is stopped + deregistered and its `[[mes.adapters]]` entry
+    /// removed. Carries the removed adapter's last durable config so
+    /// the deletion is reconstructable from the ledger. `mes.` prefix
+    /// — see [`EventKind::AdapterAdded`].
+    ///
+    /// Payload: `AdapterConfigAuditPayload` (aberp binary `mes_manager`).
+    /// F12 four-edit ritual fires once.
+    AdapterRemoved,
 }
 
 impl EventKind {
@@ -1189,6 +1223,9 @@ impl EventKind {
             EventKind::QuoteIntakePollAttempted => "system.quote_intake_poll_attempted",
             EventKind::QuoteIntakeRowAdded => "system.quote_intake_row_added",
             EventKind::QuoteIntakePollFailed => "system.quote_intake_poll_failed",
+            EventKind::AdapterAdded => "mes.adapter_added",
+            EventKind::AdapterUpdated => "mes.adapter_updated",
+            EventKind::AdapterRemoved => "mes.adapter_removed",
         }
     }
 
@@ -1262,6 +1299,9 @@ impl EventKind {
             "system.quote_intake_poll_attempted" => Ok(EventKind::QuoteIntakePollAttempted),
             "system.quote_intake_row_added" => Ok(EventKind::QuoteIntakeRowAdded),
             "system.quote_intake_poll_failed" => Ok(EventKind::QuoteIntakePollFailed),
+            "mes.adapter_added" => Ok(EventKind::AdapterAdded),
+            "mes.adapter_updated" => Ok(EventKind::AdapterUpdated),
+            "mes.adapter_removed" => Ok(EventKind::AdapterRemoved),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1327,6 +1367,9 @@ mod tests {
             EventKind::QuoteIntakePollAttempted,
             EventKind::QuoteIntakeRowAdded,
             EventKind::QuoteIntakePollFailed,
+            EventKind::AdapterAdded,
+            EventKind::AdapterUpdated,
+            EventKind::AdapterRemoved,
         ];
         for v in variants {
             let s = v.as_str();
@@ -2430,6 +2473,50 @@ mod tests {
             assert_ne!(k, EventKind::QuoteIntakePollCompleted.as_str());
             assert_ne!(k, EventKind::InvoicePickedUpFromQuote.as_str());
             assert_ne!(k, EventKind::IncomingInvoiceSyncCycleCompleted.as_str());
+        }
+    }
+
+    /// S257 / PR-246 — the three adapter-config CRUD kinds use the
+    /// `mes.` prefix (manufacturing-domain configuration, namespace
+    /// neighbour of `mes.adapter_event`), NOT `system.` or `invoice.`.
+    /// Same prefix-pin posture as the S250 MES kinds.
+    #[test]
+    fn s257_adapter_config_kinds_use_mes_prefix() {
+        for k in [
+            EventKind::AdapterAdded,
+            EventKind::AdapterUpdated,
+            EventKind::AdapterRemoved,
+        ] {
+            let s = k.as_str();
+            assert!(s.starts_with("mes."), "{s} must start with mes.");
+            assert!(
+                !s.starts_with("invoice."),
+                "{s} must not start with invoice."
+            );
+            assert!(!s.starts_with("system."), "{s} must not start with system.");
+        }
+        assert_eq!(EventKind::AdapterAdded.as_str(), "mes.adapter_added");
+        assert_eq!(EventKind::AdapterUpdated.as_str(), "mes.adapter_updated");
+        assert_eq!(EventKind::AdapterRemoved.as_str(), "mes.adapter_removed");
+    }
+
+    /// S257 / PR-246 — the three adapter-config kinds are pairwise-
+    /// distinct AND distinct from the pre-existing `mes.adapter_event`
+    /// runtime kind (whose storage string they neighbour but must not
+    /// collide with — a collision would mis-route runtime adapter
+    /// telemetry into the config-CRUD bucket on parse).
+    #[test]
+    fn s257_adapter_config_kinds_are_distinct() {
+        let new = [
+            EventKind::AdapterAdded.as_str(),
+            EventKind::AdapterUpdated.as_str(),
+            EventKind::AdapterRemoved.as_str(),
+        ];
+        assert_ne!(new[0], new[1]);
+        assert_ne!(new[0], new[2]);
+        assert_ne!(new[1], new[2]);
+        for k in new {
+            assert_ne!(k, EventKind::MesAdapterEvent.as_str());
         }
     }
 }
