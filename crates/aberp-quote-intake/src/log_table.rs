@@ -438,6 +438,48 @@ pub fn set_picked_up_drf_id(
     Ok(())
 }
 
+/// S264 / PR-253 (F4) — atomically CLAIM a quote for pickup. This is the
+/// compare-and-swap that makes a concurrent double-pickup impossible:
+/// `picked_up_drf_id` is set to `drf_id` ONLY when its current value
+/// still equals `expected_prior` (the value the caller read before it
+/// minted its draft). Returns the rows updated:
+///   - `1` — claim won; the column now points at this pickup's draft.
+///   - `0` — another pickup changed the column since the caller's read
+///           (it won the race); the caller MUST roll back its freshly-
+///           minted draft + audit and return the winner's draft instead.
+///
+/// `IS NOT DISTINCT FROM` is NULL-safe equality, so a first-time pickup
+/// (`expected_prior = None`) claims `WHERE picked_up_drf_id IS NULL`, and
+/// a re-pickup after an S239 delete (`expected_prior = Some(old_drf)`)
+/// claims `WHERE picked_up_drf_id = old_drf` — the legitimate overwrite
+/// still works, but ONLY if no concurrent pickup moved the column first.
+///
+/// This is the guard the route comments USED to claim the audit-ledger
+/// "F8 pin" provided — it did not (the ledger has no UNIQUE on
+/// `idempotency_key`). Per [[no-sql-specific]] the serialization
+/// invariant lives here in the app layer; the `quote_id` PRIMARY KEY is
+/// the single row the CAS contends on. A portable backend lacking
+/// `IS NOT DISTINCT FROM` spells the predicate
+/// `(picked_up_drf_id = ?4 OR (picked_up_drf_id IS NULL AND ?4 IS NULL))`.
+pub fn claim_for_pickup_in_tx(
+    conn: &Connection,
+    tenant_id: &str,
+    quote_id: &str,
+    drf_id: &str,
+    expected_prior: Option<&str>,
+) -> Result<usize, QuoteIntakeError> {
+    let n = conn
+        .execute(
+            "UPDATE quote_intake_log
+                SET picked_up_drf_id = ?1
+              WHERE quote_id = ?2 AND tenant_id = ?3
+                AND picked_up_drf_id IS NOT DISTINCT FROM ?4",
+            params![drf_id, quote_id, tenant_id, expected_prior],
+        )
+        .map_err(|e| QuoteIntakeError::Storage(format!("CAS claim picked_up_drf_id: {e}")))?;
+    Ok(n)
+}
+
 pub fn list_pending_writebacks(
     conn: &Connection,
     tenant_id: &str,
@@ -584,6 +626,61 @@ mod tests {
         // Re-running retry on an already-staged row is a no-op (guarded).
         let again = retry_parse_intake(&conn, "t", "q-err", "inv_Z", "{}").unwrap();
         assert_eq!(again, 0);
+    }
+
+    // ── S264 / PR-253 (F4) — pickup CAS ──────────────────────────────
+
+    /// The CAS rejects a STALE-NULL claim against an already-claimed row
+    /// (returns 0) and PRESERVES the winner's draft id. Pre-F4 the
+    /// writeback was an unconditional `UPDATE ... SET picked_up_drf_id`
+    /// with no guard — it would have returned 1 and clobbered the winner
+    /// with the loser's draft id, leaving two orphan drafts. This test
+    /// fails against that old unconditional UPDATE.
+    #[test]
+    fn claim_cas_rejects_stale_null_claim_and_preserves_winner() {
+        let conn = open_mem();
+        insert_intake(&conn, "t", "q", "inv_A", "r", now(), "{}", "{}").unwrap();
+
+        // Winner: claims the fresh (NULL) row → 1 row updated.
+        let won = claim_for_pickup_in_tx(&conn, "t", "q", "drf_WINNER", None).unwrap();
+        assert_eq!(won, 1, "first claim against a NULL row wins");
+
+        // Loser: read NULL earlier (stale), tries to claim with
+        // expected_prior = None, but the column is now drf_WINNER → 0.
+        let lost = claim_for_pickup_in_tx(&conn, "t", "q", "drf_LOSER", None).unwrap();
+        assert_eq!(lost, 0, "a stale-NULL claim against a claimed row loses");
+
+        // The winner's draft id must be intact (NOT clobbered).
+        let row = read_for_pickup(&conn, "t", "q").unwrap().unwrap();
+        assert_eq!(
+            row.picked_up_drf_id.as_deref(),
+            Some("drf_WINNER"),
+            "the loser must not overwrite the winner"
+        );
+    }
+
+    /// The CAS honours the legitimate re-pickup-after-S239-delete
+    /// overwrite: `expected_prior = Some(old_drf)` claims the row when it
+    /// still holds `old_drf`, but loses if a concurrent re-pickup already
+    /// moved it.
+    #[test]
+    fn claim_cas_overwrites_when_expected_matches_else_loses() {
+        let conn = open_mem();
+        insert_intake(&conn, "t", "q", "inv_A", "r", now(), "{}", "{}").unwrap();
+        set_picked_up_drf_id(&conn, "t", "q", "drf_OLD").unwrap();
+
+        // Re-pickup whose read saw drf_OLD overwrites to drf_NEW.
+        let ok = claim_for_pickup_in_tx(&conn, "t", "q", "drf_NEW", Some("drf_OLD")).unwrap();
+        assert_eq!(ok, 1, "expected-prior match overwrites the deleted draft");
+        let row = read_for_pickup(&conn, "t", "q").unwrap().unwrap();
+        assert_eq!(row.picked_up_drf_id.as_deref(), Some("drf_NEW"));
+
+        // A second re-pickup that still expects drf_OLD loses (the column
+        // is drf_NEW now).
+        let stale = claim_for_pickup_in_tx(&conn, "t", "q", "drf_OTHER", Some("drf_OLD")).unwrap();
+        assert_eq!(stale, 0, "a stale expected-prior loses the race");
+        let row = read_for_pickup(&conn, "t", "q").unwrap().unwrap();
+        assert_eq!(row.picked_up_drf_id.as_deref(), Some("drf_NEW"));
     }
 
     #[test]

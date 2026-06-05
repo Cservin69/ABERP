@@ -1603,14 +1603,40 @@ fn blocking_qa_op_names(tx: &Transaction<'_>, tenant: &str, wo_id: &str) -> anyh
     Ok(blockers.join(", "))
 }
 
+/// S264 / PR-253 (F7) — outcome of an auto-complete attempt. Pre-S264
+/// this was `Option<String>` (`Some` = completed wo_id, `None` =
+/// everything else), which silently swallowed the case where the QA gate
+/// is fully satisfied but the WO is parked (OnHold) — the operator got
+/// ZERO signal the WO was stuck and would not drain. The three-way
+/// outcome lets the route surface a "Resume the WO to complete it"
+/// prompt instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoCompleteOutcome {
+    /// The WO flipped to Completed. Carries the wo_id.
+    Completed(String),
+    /// No action and none owed: WO row missing, WO already Completed, or
+    /// the QA gate is not yet fully satisfied (other inspections open).
+    NotApplicable,
+    /// The QA gate is fully satisfied but the WO is in a state from which
+    /// auto-complete is illegal (OnHold — operator must Resume; or a
+    /// Cancelled edge). Carries the blocking state so the route can word
+    /// the operator prompt.
+    Blocked {
+        wo_id: String,
+        wo_state: WorkOrderState,
+    },
+}
+
 /// PR-237 / S243 — auto-complete a WO when its QA gate becomes
 /// satisfied, called by the QA-decide route after a successful Pass
 /// so the operator does not have to remember to mark the WO done
 /// per [[trust-code-not-operator]].
 ///
-/// Returns `Some(wo_id)` when the transition fired; `None` when the
-/// gate is not yet satisfied OR the WO is no longer InProgress
-/// (already terminal, never released, etc — all idempotent no-ops).
+/// Returns [`AutoCompleteOutcome`]: `Completed(wo_id)` when the
+/// transition fired; `NotApplicable` for the idempotent no-ops (gate
+/// not satisfied, WO missing/already-completed); `Blocked { .. }` when
+/// the gate passed but the WO is not InProgress (S264 / PR-253 F7 — the
+/// operator must Resume an OnHold WO).
 /// All side effects (WO state UPDATE, WoCompletion stock_movement,
 /// WorkOrderStateChanged audit) flow through the existing
 /// [`transition_work_order`] handler so operator-click and auto-
@@ -1638,7 +1664,7 @@ pub fn try_auto_complete_wo(
     wo_id: &str,
     idempotency_seed: &str,
     source_event_id: Option<String>,
-) -> Result<Option<String>, WorkOrderError> {
+) -> Result<AutoCompleteOutcome, WorkOrderError> {
     let current_state_str: Option<String> = tx
         .query_row(
             "SELECT state FROM work_orders WHERE tenant_id = ? AND wo_id = ? LIMIT 1;",
@@ -1651,18 +1677,39 @@ pub fn try_auto_complete_wo(
             other => Err(anyhow!("read work_orders for auto-complete: {other}")),
         })?;
     let Some(state_str) = current_state_str else {
-        return Ok(None);
+        // WO row missing — nothing to complete, no operator signal owed.
+        return Ok(AutoCompleteOutcome::NotApplicable);
     };
     let current_state = WorkOrderState::from_storage_str(&state_str)
         .map_err(|e| WorkOrderError::Storage(anyhow!("{e}: {state_str:?}")))?;
-    if !matches!(current_state, WorkOrderState::InProgress) {
-        return Ok(None);
+    // Already completed → idempotent no-op (a re-Pass after the WO flipped).
+    if matches!(current_state, WorkOrderState::Completed) {
+        return Ok(AutoCompleteOutcome::NotApplicable);
     }
 
+    // S264 / PR-253 (F7) — evaluate the QA gate BEFORE the state branch
+    // so we only flag a "blocked" WO when it would OTHERWISE be
+    // completable. If other inspections are still open the WO isn't ready
+    // regardless of its run-state, so that's NotApplicable, not Blocked.
     let gate_ok = aberp_qa::all_live_inspections_passed_for_wo(tx, ctx.tenant, wo_id)
         .map_err(|e| WorkOrderError::Storage(anyhow!("QA gate check (auto-complete): {e}")))?;
     if !gate_ok {
-        return Ok(None);
+        return Ok(AutoCompleteOutcome::NotApplicable);
+    }
+
+    // The QA gate is fully satisfied — every live inspection passed. Only
+    // an InProgress WO can auto-complete. Any other non-terminal state
+    // (OnHold — the operator parked it; or a Cancelled edge) means the
+    // final QA pass CANNOT drain the WO and the operator must intervene
+    // (Resume + complete). Pre-S264 this returned a silent `Ok(None)`,
+    // leaving the WO stuck with ZERO signal — a [[trust-code-not-operator]]
+    // violation on the exact lifecycle S243 was built to automate. Surface
+    // it instead.
+    if !matches!(current_state, WorkOrderState::InProgress) {
+        return Ok(AutoCompleteOutcome::Blocked {
+            wo_id: wo_id.to_string(),
+            wo_state: current_state,
+        });
     }
 
     transition_work_order(
@@ -1676,5 +1723,5 @@ pub fn try_auto_complete_wo(
             idempotency_key: format!("{}:wo-auto-complete", idempotency_seed),
         },
     )?;
-    Ok(Some(wo_id.to_string()))
+    Ok(AutoCompleteOutcome::Completed(wo_id.to_string()))
 }

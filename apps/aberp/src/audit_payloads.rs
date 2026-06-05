@@ -2372,6 +2372,26 @@ pub struct RestoreFromNavRunPayload {
     /// the count of rows freshly written this run (that is the per-row
     /// `InvoiceRestoredFromNav` entry count).
     pub invoice_count: u64,
+    /// S264 / PR-253 (F3) — the actual WRITE outcome of the run, so this
+    /// durable landmark can tell a CLEAN restore apart from a PARTIAL
+    /// one. Pre-S264 the payload carried only `invoice_count` (the
+    /// cardinality of the NAV set the `checksum` is computed over) +
+    /// `checksum` — there was NO way to distinguish "NAV held N and we
+    /// wrote all N" from "NAV held N but a month's digest-fetch failed
+    /// or a per-row insert errored". `errored > 0` is the witness that
+    /// the `checksum` does NOT certify local completeness: a failed
+    /// month truncates the checksummed set, and a failed per-row insert
+    /// leaves its number in the checksummed set but NOT in
+    /// `restored_invoice`. `restored` + `skipped` (already-present,
+    /// idempotent) + `errored` reconcile against the operator-facing
+    /// summary. `#[serde(default)]` so pre-S264 entries (which lack
+    /// these keys) still deserialize, reading 0.
+    #[serde(default)]
+    pub restored: u64,
+    #[serde(default)]
+    pub skipped: u64,
+    #[serde(default)]
+    pub errored: u64,
     /// Partners freshly inserted into the local `partners` master from
     /// this run's `<customerInfo>` extraction (S196 path). Zero on a
     /// pure re-run.
@@ -4777,5 +4797,62 @@ mod tests {
         let parsed: ExtNavPartnerManualLinkPayload =
             serde_json::from_slice(&bytes).expect("round-trip");
         assert_eq!(parsed, payload);
+    }
+
+    // ── S264 / PR-253 (F3) — restore landmark records the write outcome ──
+
+    fn restore_run_payload(restored: u64, skipped: u64, errored: u64) -> RestoreFromNavRunPayload {
+        RestoreFromNavRunPayload {
+            idempotency_key: "01HRESTOREKEY0000000000000".to_string(),
+            year: 2026,
+            invoice_count: restored + skipped + errored,
+            restored,
+            skipped,
+            errored,
+            partner_count: 0,
+            product_count: 0,
+            checksum: "abc123".to_string(),
+            ts: "2026-06-05T00:00:00Z".to_string(),
+        }
+    }
+
+    /// Pre-S264 the landmark carried only `invoice_count` + `checksum`,
+    /// so a CLEAN restore and one that silently dropped a month produced
+    /// byte-identical durable records. The write-outcome fields make a
+    /// partial run distinguishable, and `errored > 0` is the witness that
+    /// the checksum does NOT certify local completeness.
+    #[test]
+    fn restore_run_payload_distinguishes_clean_from_partial() {
+        let clean = restore_run_payload(100, 0, 0);
+        let partial = restore_run_payload(80, 0, 20);
+        assert_ne!(
+            clean, partial,
+            "a clean restore and a partial one must NOT be the same durable record"
+        );
+        assert_eq!(clean.errored, 0, "clean run records zero errors");
+        assert!(
+            partial.errored > 0,
+            "a partial run is recorded as non-clean"
+        );
+
+        let back: RestoreFromNavRunPayload =
+            serde_json::from_slice(&partial.to_bytes()).expect("round-trip");
+        assert_eq!(back, partial);
+    }
+
+    /// A pre-S264 landmark (no restored/skipped/errored keys) must still
+    /// deserialize — the missing write-outcome reads 0 via serde default,
+    /// so the additive payload change does not break old audit entries.
+    #[test]
+    fn restore_run_payload_pre_s264_json_defaults_outcome_to_zero() {
+        let json = r#"{"idempotency_key":"k","year":2026,"invoice_count":5,
+            "partner_count":1,"product_count":2,"checksum":"abc","ts":"2026-06-05T00:00:00Z"}"#;
+        let p: RestoreFromNavRunPayload = serde_json::from_str(json).expect("legacy decode");
+        assert_eq!(
+            (p.restored, p.skipped, p.errored),
+            (0, 0, 0),
+            "missing outcome keys default to 0"
+        );
+        assert_eq!(p.invoice_count, 5, "legacy fields still read");
     }
 }

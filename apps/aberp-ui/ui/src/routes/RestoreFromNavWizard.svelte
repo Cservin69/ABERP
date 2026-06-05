@@ -394,7 +394,10 @@
 
   {#if step === "done" && summary !== null}
     <section class="wizard__result" aria-live="polite">
-      <h3>Restore complete</h3>
+      <!-- S264 / PR-253 (F3) — a run with errored digests is NOT a
+           clean restore; the heading must say so rather than claim
+           "complete" with the failures buried in the count line. -->
+      <h3>{summary.errored > 0 ? "Restore completed with errors" : "Restore complete"}</h3>
       <p>{formatRestoreSummary(summary)}</p>
       {#if summary.checksum}
         <p class="wizard__note">

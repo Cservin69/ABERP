@@ -47,6 +47,29 @@ use crate::error::QaError;
 use crate::state::next_qa_state;
 use crate::types::{QaDecision, QaState};
 
+/// S264 / PR-253 (F6) — local, shape-compatible mirror of
+/// `aberp_work_orders::RoutingOpStateChangedPayload`. aberp-qa CANNOT
+/// depend on aberp-work-orders (that crate depends on aberp-qa — a Cargo
+/// cycle; aberp-work-orders is only a dev-dependency here), so the Rework
+/// branch emits the routing-op reverse transition (Completed → Active)
+/// through this struct. The field names AND the snake_case state strings
+/// (`"completed"` / `"active"`, matching `RoutingOpState`'s
+/// `#[serde(rename_all = "snake_case")]`) MUST stay identical to the
+/// work-orders payload so the audit ledger (generic JSON) and any
+/// "list routing-op transitions for this WO" query read ONE uniform
+/// schema. aberp-work-orders' `op_changed_payload_round_trips` pins the
+/// canonical shape; `rework_emits_routing_op_state_changed` below pins
+/// the literal JSON this emits.
+#[derive(serde::Serialize)]
+struct ReworkRoutingOpStateChangedPayload<'a> {
+    routing_op_id: &'a str,
+    wo_id: &'a str,
+    from_state: &'static str,
+    to_state: &'static str,
+    actor: &'a str,
+    idempotency_key: String,
+}
+
 // ── Schema ─────────────────────────────────────────────────────────
 
 /// Apply `V001__qa.sql`. Idempotent — calling against an already-
@@ -459,13 +482,18 @@ pub fn decide_qa(
             // (we deliberately do not depend on aberp-work-orders
             // to avoid the cycle — see Cargo.toml comment).
             //
-            // We do NOT emit a RoutingOpStateChanged audit here:
-            // the audit story is "operator decided Rework on QA
-            // inspection X" — the QA-decided audit row carries the
-            // full context (which routing_op_id) and the cascade
-            // from rework→re-complete→fresh-QA-inspection is
-            // re-traceable via the audit ledger. Cleaner than
-            // double-emitting.
+            // S264 / PR-253 (F6) — emit a `RoutingOpStateChanged`
+            // (Completed → Active) audit row for this reverse flip.
+            // Pre-S264 we did NOT (a comment here claimed it was
+            // "cleaner than double-emitting"), so the reverse transition
+            // was invisible to anyone reconstructing routing-op state
+            // from the ledger — the forward Active→Completed carries an
+            // audit, the reverse only lived implicitly inside the QA
+            // row. PR-243's F19 made the QA gate load-bearing for the
+            // auto-complete cascade that walks exactly this state, so the
+            // hole is on a now-load-bearing path. The QA row records the
+            // DECISION; the ledger needs the routing-op STATE TRANSITION
+            // as a first-class walkable row.
             let updated = tx
                 .execute(
                     "UPDATE routings SET state = ?, completed_at = NULL
@@ -482,6 +510,29 @@ pub fn decide_qa(
                     "Rework UPDATE matched no routings row for routing_op_id={routing_op_id}"
                 )));
             }
+            let rework_op_idem = format!("rework-op:{}:{}", routing_op_id, inputs.idempotency_key);
+            let rework_audit = ReworkRoutingOpStateChangedPayload {
+                routing_op_id: &routing_op_id,
+                wo_id: &wo_id,
+                from_state: "completed",
+                to_state: "active",
+                actor: &actor_str,
+                idempotency_key: rework_op_idem.clone(),
+            };
+            append_in_tx(
+                tx,
+                ctx.ledger_meta,
+                EventKind::RoutingOpStateChanged,
+                serde_json::to_vec(&rework_audit)
+                    .expect("JSON serialization of routing-op payload cannot fail"),
+                ctx.ledger_actor.clone(),
+                Some(rework_op_idem),
+            )
+            .map_err(|e| {
+                QaError::Storage(anyhow!(
+                    "audit append RoutingOpStateChanged (rework flip): {e}"
+                ))
+            })?;
             rework_flipped = true;
         }
         QaDecision::Dispose => {

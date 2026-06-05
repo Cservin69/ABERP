@@ -1971,6 +1971,11 @@ export interface DecideQaInspectionResponse {
   superseded_qa_id: string | null;
   rework_flipped_routing_op_back_to_active: boolean;
   disposed_emitted_scrap_movement: boolean;
+  /** S264 / PR-253 (F7) — set when this Pass satisfied the QA gate but
+   * the parent WO could not auto-complete because it is not InProgress
+   * (typically `on_hold` — the operator parked it). The operator must
+   * Resume the WO and complete it; pre-S264 this was a silent no-op. */
+  wo_auto_complete_blocked: { wo_id: string; wo_state: string } | null;
 }
 
 /** S233 — `GET /api/qa-inspections[?state=&limit=&offset=]`. */

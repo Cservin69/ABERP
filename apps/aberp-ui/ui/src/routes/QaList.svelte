@@ -47,6 +47,9 @@
   let selectedState: QaState | null = $state("pending");
 
   let actionError: string | null = $state(null);
+  // S264 / PR-253 (F7) — surfaced when a Pass satisfied the QA gate but
+  // the parent WO was parked (OnHold) so auto-complete could not fire.
+  let autoCompleteBlockedNotice: string | null = $state(null);
   let busyQaId: string | null = $state(null);
 
   // WO-context cache so the row can show "WO# — Op name" without a
@@ -179,13 +182,23 @@
     measurement: string | null,
   ): Promise<void> {
     busyQaId = qaId;
+    autoCompleteBlockedNotice = null;
     try {
-      await decideQaInspection(qaId, {
+      const resp = await decideQaInspection(qaId, {
         decision,
         reason,
         measurement,
         idempotency_key: mintIdempotencyKey(`qa-${decision}-${qaId}`),
       });
+      // S264 / PR-253 (F7) — the WO was ready to complete but is parked;
+      // tell the operator to Resume it rather than leaving it stuck.
+      if (resp.wo_auto_complete_blocked !== null) {
+        const b = resp.wo_auto_complete_blocked;
+        autoCompleteBlockedNotice =
+          b.wo_state === "on_hold"
+            ? `A WO ${b.wo_id} minden ellenőrzése megfelelt, de a munka fel van függesztve — folytasd (Resume), majd zárd le. / WO ${b.wo_id} passed all QA but is on hold — Resume it to complete.`
+            : `A WO ${b.wo_id} nem zárható le automatikusan (állapot: ${b.wo_state}). / WO ${b.wo_id} could not auto-complete (state: ${b.wo_state}).`;
+      }
       await refresh();
     } catch (e) {
       actionError = String(e);
@@ -250,6 +263,9 @@
   {:else}
     {#if actionError !== null}
       <p class="qa-error">Decision failed: {actionError}</p>
+    {/if}
+    {#if autoCompleteBlockedNotice !== null}
+      <p class="qa-notice" role="status">{autoCompleteBlockedNotice}</p>
     {/if}
     <table class="qa-table">
       <thead>
@@ -536,6 +552,14 @@
 
   .qa-error {
     color: var(--color-signal-negative);
+    font-size: var(--type-size-sm);
+  }
+
+  /* S264 / PR-253 (F7) — gate-passed-but-WO-parked prompt. Advisory
+     (not an error): the QA decision succeeded; the operator just needs
+     to Resume the parked WO. */
+  .qa-notice {
+    color: var(--color-signal-warning);
     font-size: var(--type-size-sm);
   }
 

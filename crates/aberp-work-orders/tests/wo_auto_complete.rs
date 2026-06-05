@@ -35,7 +35,7 @@ use aberp_qa::{
 use aberp_work_orders::{
     create_work_order, ensure_schema as ensure_wo_schema, list_routing_ops_for_wo, read_work_order,
     replace_bom_for_product, transition_routing_op, transition_work_order, try_auto_complete_wo,
-    BomLineInput, CreateWorkOrderInputs, RoutingOpAction, RoutingOpInput,
+    AutoCompleteOutcome, BomLineInput, CreateWorkOrderInputs, RoutingOpAction, RoutingOpInput,
     RoutingOpTransitionInputs, TransitionInputs, WoAction, WoWriteContext, WorkOrderState,
 };
 use duckdb::Connection;
@@ -297,8 +297,13 @@ fn decide_and_maybe_auto_complete(
     )
     .unwrap();
     let wo_id = decide_outcome.inspection.wo_id.clone();
+    // S264 / PR-253 (F7) — `try_auto_complete_wo` now returns the
+    // three-way `AutoCompleteOutcome`. These invariant tests only care
+    // about "did it complete?", so collapse Completed→Some(wo) and every
+    // other outcome→None here; the Blocked path has its own dedicated
+    // test (`auto_complete_blocked_when_gate_passed_but_wo_on_hold`).
     let auto = if matches!(decide_outcome.inspection.state, QaState::Passed) {
-        try_auto_complete_wo(
+        match try_auto_complete_wo(
             &tx,
             &wo_ctx(meta, "ervin"),
             &wo_id,
@@ -306,6 +311,10 @@ fn decide_and_maybe_auto_complete(
             decide_outcome.inspection.source_event_id.clone(),
         )
         .unwrap()
+        {
+            AutoCompleteOutcome::Completed(wo) => Some(wo),
+            _ => None,
+        }
     } else {
         None
     };
@@ -483,9 +492,10 @@ fn second_pass_after_auto_complete_is_a_noop() {
     let again =
         try_auto_complete_wo(&tx, &wo_ctx(&m, "ervin"), &wo_id, "qa3-4-repeat", None).unwrap();
     tx.commit().unwrap();
-    assert!(
-        again.is_none(),
-        "try_auto_complete_wo must be a no-op when WO is already Completed"
+    assert_eq!(
+        again,
+        AutoCompleteOutcome::NotApplicable,
+        "try_auto_complete_wo must be NotApplicable when WO is already Completed"
     );
 
     let wo = read_work_order(&conn, TEST_TENANT, &wo_id)
@@ -775,7 +785,7 @@ fn auto_complete_carries_source_event_id_from_adapter_decide() {
     .unwrap();
     tx.commit().unwrap();
 
-    assert_eq!(auto.as_deref(), Some(wo_id.as_str()));
+    assert_eq!(auto, AutoCompleteOutcome::Completed(wo_id.clone()));
 
     // Two cascade audits must share the same source_event_id:
     //   - QaInspectionDecided (adapter Pass)
@@ -890,9 +900,10 @@ fn try_auto_complete_returns_none_for_unknown_wo_id() {
     )
     .unwrap();
     tx.commit().unwrap();
-    assert!(
-        res.is_none(),
-        "unknown wo_id must Ok(None) — never error, never transition"
+    assert_eq!(
+        res,
+        AutoCompleteOutcome::NotApplicable,
+        "unknown wo_id must be NotApplicable — never error, never transition"
     );
 }
 
@@ -907,14 +918,17 @@ fn try_auto_complete_returns_none_when_wo_cancelled() {
     let tx = conn.transaction().unwrap();
     let res = try_auto_complete_wo(&tx, &wo_ctx(&m, "ervin"), &wo_id, "guard-2", None).unwrap();
     tx.commit().unwrap();
-    assert!(
-        res.is_none(),
-        "Cancelled WO must Ok(None) — terminal-state guard"
+    assert_eq!(
+        res,
+        AutoCompleteOutcome::NotApplicable,
+        "Cancelled WO with no passed inspections is NotApplicable — the gate is \
+         not satisfied (a Cancelled WO that HAD a fully-passed gate would be Blocked, \
+         but that edge cannot arise — you cannot pass every op on a cancelled WO)"
     );
 }
 
 #[test]
-fn try_auto_complete_returns_none_when_wo_on_hold() {
+fn try_auto_complete_not_applicable_when_on_hold_and_gate_unsatisfied() {
     let mut conn = setup_db();
     let m = meta();
     let (wo_id, _op_ids) =
@@ -924,12 +938,79 @@ fn try_auto_complete_returns_none_when_wo_on_hold() {
     let tx = conn.transaction().unwrap();
     let res = try_auto_complete_wo(&tx, &wo_ctx(&m, "ervin"), &wo_id, "guard-3", None).unwrap();
     tx.commit().unwrap();
-    assert!(
-        res.is_none(),
-        "OnHold WO must Ok(None) — InProgress-only pre-check. \
-         See S249-F3 (🔴): if a brief asks to widen to OnHold + auto-Resume, \
-         re-investigate the audit-ordering decision first."
+    // OnHold but the gate is NOT satisfied (no passed inspections) → there
+    // is genuinely nothing to complete, so NotApplicable is correct. The
+    // S264 (F7) Blocked signal is reserved for the dangerous case the WO
+    // IS ready but parked — see
+    // `auto_complete_blocked_when_gate_passed_but_wo_on_hold`.
+    assert_eq!(
+        res,
+        AutoCompleteOutcome::NotApplicable,
+        "OnHold WO with an unsatisfied gate is NotApplicable"
     );
+}
+
+/// S264 / PR-253 (F7) — THE finding's pin. When the QA gate is fully
+/// satisfied (every op passed) but the WO was parked OnHold before the
+/// final pass, auto-complete cannot fire — and pre-S264 it returned a
+/// SILENT `Ok(None)`, leaving the WO stuck with zero operator signal.
+/// Now it returns `Blocked { wo_state: OnHold }` so the route can prompt
+/// "Resume the WO to complete it". This test fails pre-fix (the old code
+/// returned `None` here, and the S252 sweep test even pinned that silent
+/// no-op as correct).
+#[test]
+fn auto_complete_blocked_when_gate_passed_but_wo_on_hold() {
+    let mut conn = setup_db();
+    let m = meta();
+    let (wo_id, op_ids) =
+        create_and_release_3_op_wo(&mut conn, &m, "WO-AC-G5", "create-g5", "release-g5");
+
+    // Pass op#1 and op#2 (WO drives to InProgress; gate not yet whole).
+    let qa1 = complete_op(&mut conn, &m, &op_ids[0], "op1-g5");
+    let _ = decide_and_maybe_auto_complete(&mut conn, &m, &qa1, QaDecision::Pass, "qa1-g5");
+    let qa2 = complete_op(&mut conn, &m, &op_ids[1], "op2-g5");
+    let _ = decide_and_maybe_auto_complete(&mut conn, &m, &qa2, QaDecision::Pass, "qa2-g5");
+
+    // Complete op#3 (QA3 Pending), then PARK the WO OnHold before the
+    // final pass.
+    let qa3 = complete_op(&mut conn, &m, &op_ids[2], "op3-g5");
+    hold_wo(&mut conn, &m, &wo_id, "hold-before-final-pass");
+
+    // Pass QA3 (legal on an OnHold WO) and attempt auto-complete in the
+    // same tx, exactly as the route composes it.
+    let tx = conn.transaction().unwrap();
+    let decided = decide_qa(
+        &tx,
+        &qa_ctx(&m, "ervin"),
+        &qa3,
+        DecideQaInputs {
+            decision: QaDecision::Pass,
+            reason: None,
+            measurement: None,
+            source_event_id: None,
+            idempotency_key: "qa3-g5".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(decided.inspection.state, QaState::Passed);
+    let res = try_auto_complete_wo(&tx, &wo_ctx(&m, "ervin"), &wo_id, "qa3-g5", None).unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(
+        res,
+        AutoCompleteOutcome::Blocked {
+            wo_id: wo_id.clone(),
+            wo_state: WorkOrderState::OnHold,
+        },
+        "a gate-satisfied but parked WO must surface Blocked, not a silent no-op"
+    );
+
+    // The WO is still OnHold (auto-complete did NOT fire), and the
+    // operator must Resume it.
+    let wo = read_work_order(&conn, TEST_TENANT, &wo_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(wo.state, WorkOrderState::OnHold);
 }
 
 #[test]
@@ -946,9 +1027,10 @@ fn try_auto_complete_returns_none_when_gate_not_satisfied() {
     let tx = conn.transaction().unwrap();
     let res = try_auto_complete_wo(&tx, &wo_ctx(&m, "ervin"), &wo_id, "guard-4", None).unwrap();
     tx.commit().unwrap();
-    assert!(
-        res.is_none(),
-        "WO with Pending QA inspection must Ok(None) — gate-not-satisfied guard"
+    assert_eq!(
+        res,
+        AutoCompleteOutcome::NotApplicable,
+        "WO with Pending QA inspection must be NotApplicable — gate-not-satisfied guard"
     );
 
     // And the WO is still InProgress (no transition fired).

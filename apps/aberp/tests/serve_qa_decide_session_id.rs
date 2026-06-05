@@ -245,6 +245,7 @@ fn build_state(db_path: PathBuf) -> AppState {
             tokio_util::sync::CancellationToken::new(),
         )),
         adapter_health_baseline: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        restore_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
 

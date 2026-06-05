@@ -937,6 +937,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         adapter_registry: adapter_registry.clone(),
         adapter_manager: adapter_manager.clone(),
         adapter_health_baseline: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        restore_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     // 5. Build the axum router. Clone the state first so the app-boot
@@ -2051,6 +2052,20 @@ pub struct AppState {
     /// two SPA sessions can't double-emit the same transition.
     pub adapter_health_baseline:
         Arc<std::sync::Mutex<std::collections::HashMap<String, &'static str>>>,
+    /// S264 / PR-253 (F1) — set TRUE only while a NAV-as-DR restore is
+    /// actively executing in THIS process; cleared (RAII guard) the
+    /// instant `restore_outgoing::run` returns. The restore lock is a
+    /// crash-surviving DB row, but the row alone cannot distinguish a
+    /// LIVE restore from one a crashed process left behind. The abandon
+    /// route consults this flag to refuse clearing a lock that a running
+    /// restore is actively using (per [[trust-code-not-operator]] —
+    /// "only abandon a crashed restore" is the operator-trust pattern the
+    /// lock was built to eliminate). A crash resets the process, so the
+    /// flag is `false` on the next boot → a genuinely-stale lock is
+    /// abandonable, a live one is not. Single-backend-process deployment:
+    /// there is exactly one `aberp serve` per tenant, so an in-memory
+    /// flag is a precise liveness signal (no cross-process restore).
+    pub restore_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Session-161 — max number of NAV poll daemons polling concurrently.
@@ -9604,6 +9619,23 @@ pub struct DecideQaInspectionResponse {
     /// time is canonical — but the hook is reported so a banner / toast
     /// can be added without a fresh round-trip.
     pub wo_auto_completed: Option<String>,
+    /// S264 / PR-253 (F7) — `Some(..)` when this Pass satisfied the QA
+    /// gate but the parent WO could NOT auto-complete because it is not
+    /// InProgress (typically OnHold — the operator parked it; or a
+    /// Cancelled edge). Pre-S264 this was a silent `Ok(None)` and the WO
+    /// sat un-drained with zero operator signal. The SPA toasts "Resume
+    /// the WO to complete it" so the operator knows to act. `None` in the
+    /// normal completed / partial-pass / not-applicable cases.
+    pub wo_auto_complete_blocked: Option<WoAutoCompleteBlocked>,
+}
+
+/// S264 / PR-253 (F7) — the parent WO the QA pass could not auto-complete.
+#[derive(Debug, Serialize)]
+pub struct WoAutoCompleteBlocked {
+    pub wo_id: String,
+    /// The blocking WO state as a snake_case wire string (`on_hold` /
+    /// `cancelled` / …). The SPA words the prompt on `on_hold`.
+    pub wo_state: String,
 }
 
 async fn handle_decide_qa_inspection(
@@ -9702,7 +9734,7 @@ pub fn decide_qa_inspection_request(
     // pass states; `try_auto_complete_wo` re-runs the gate inside the
     // tx so it sees this Pass + every prior live Passed inspection
     // together.
-    let wo_auto_completed = if matches!(outcome.inspection.state, aberp_qa::QaState::Passed) {
+    let auto_outcome = if matches!(outcome.inspection.state, aberp_qa::QaState::Passed) {
         let wo_ctx = aberp_work_orders::WoWriteContext {
             tenant: state.tenant.as_str(),
             actor: aberp_inventory::ActorKind::SpaOperator {
@@ -9726,7 +9758,20 @@ pub fn decide_qa_inspection_request(
         )
         .map_err(map_wo_err)?
     } else {
-        None
+        aberp_work_orders::AutoCompleteOutcome::NotApplicable
+    };
+    // S264 / PR-253 (F7) — split the three-way outcome into the two
+    // operator-facing fields: a completed wo_id, or a blocked-WO prompt.
+    let (wo_auto_completed, wo_auto_complete_blocked) = match auto_outcome {
+        aberp_work_orders::AutoCompleteOutcome::Completed(wo_id) => (Some(wo_id), None),
+        aberp_work_orders::AutoCompleteOutcome::NotApplicable => (None, None),
+        aberp_work_orders::AutoCompleteOutcome::Blocked { wo_id, wo_state } => (
+            None,
+            Some(WoAutoCompleteBlocked {
+                wo_id,
+                wo_state: wo_state.as_str().to_string(),
+            }),
+        ),
     };
 
     tx.commit().context("commit QA decide transaction")?;
@@ -9737,6 +9782,7 @@ pub fn decide_qa_inspection_request(
         rework_flipped_routing_op_back_to_active: outcome.rework_flipped_routing_op_back_to_active,
         disposed_emitted_scrap_movement: outcome.disposed_emitted_scrap_movement,
         wo_auto_completed,
+        wo_auto_complete_blocked,
     })
 }
 
@@ -11110,7 +11156,14 @@ async fn handle_restore_from_nav_outgoing(
             return internal_error("restore_from_nav_outgoing:build_inputs", e);
         }
     };
-    let run_result = restore_outgoing::run(inputs).await;
+    // S264 / PR-253 (F1) — mark the restore LIVE for the duration of
+    // `run`. The guard clears the flag on drop (incl. an early return or
+    // a panic-unwind), so the abandon route can never wrongly refuse
+    // after the run is done. While set, abandon returns 409.
+    let run_result = {
+        let _active = RestoreActiveGuard::new(&state.restore_active);
+        restore_outgoing::run(inputs).await
+    };
     // Release the lock regardless of the run's outcome — a failed run
     // leaves the per-row idempotency intact, so the safe recovery is a
     // re-run, which needs the lock free.
@@ -11135,6 +11188,25 @@ async fn handle_restore_from_nav_outgoing(
             Json(summary).into_response()
         }
         Err(e) => (StatusCode::BAD_GATEWAY, Json(error_body(format!("{e:#}")))).into_response(),
+    }
+}
+
+/// S264 / PR-253 (F1) — RAII flag for "a restore is actively running in
+/// this process". Sets the shared `AppState::restore_active` flag on
+/// construction and clears it on drop, so the LIVE window is exactly the
+/// scope the guard lives in — robust to early returns and panic unwinds.
+struct RestoreActiveGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl RestoreActiveGuard {
+    fn new(flag: &Arc<std::sync::atomic::AtomicBool>) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(flag.clone())
+    }
+}
+
+impl Drop for RestoreActiveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -11176,6 +11248,11 @@ async fn record_restore_from_nav_run_audit(
         idempotency_key: Ulid::new().to_string(),
         year: summary.year,
         invoice_count: summary.nav_invoice_count,
+        // S264 / PR-253 (F3) — record the actual write outcome so the
+        // landmark distinguishes a clean restore from a partial one.
+        restored: summary.restored,
+        skipped: summary.skipped,
+        errored: summary.errored,
         partner_count: summary.partners_restored,
         product_count: summary.products_restored,
         checksum: summary.checksum.clone(),
@@ -11284,6 +11361,29 @@ async fn handle_restore_lock_abandon(
                 "abandoning a restore requires `confirm_token` equal to the literal \
                  `{RESTORE_CONFIRMATION_TOKEN}` — operator-discipline ceremony"
             ))),
+        )
+            .into_response();
+    }
+    // S264 / PR-253 (F1) — refuse to abandon a lock that a restore is
+    // ACTIVELY using in this process. The lock row alone cannot tell a
+    // live restore from a crashed one; the in-memory flag can. Abandon
+    // is the crash-recovery escape hatch — clearing the lock from under a
+    // running restore would let a second restore start concurrently
+    // (and Finding 12's stale idempotency cache would then collide). A
+    // crash resets the process → flag false → a genuinely-stale lock
+    // stays abandonable.
+    if state
+        .restore_active
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(error_body(
+                "a restore is actively running in this process — it cannot be abandoned while \
+                 live. Wait for it to finish, or if it has truly hung, stop and restart aberp \
+                 (a crash clears the in-memory live flag so the lock becomes abandonable)."
+                    .to_string(),
+            )),
         )
             .into_response();
     }
@@ -18982,6 +19082,7 @@ mod tests {
             adapter_health_baseline: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            restore_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, storno_invoice_id)
@@ -19094,6 +19195,7 @@ mod tests {
             adapter_health_baseline: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            restore_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, invoice_id)
@@ -19815,5 +19917,156 @@ mod tests {
         wo.released_at = Some(String::new());
         wo.started_at = Some("2026-06-01T10:00:00Z".to_string());
         assert_eq!(wo_touched_at(&wo), "2026-06-01T10:00:00Z");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // S264 / PR-253 (F1) — abandon refuses a LIVE restore.
+    // ──────────────────────────────────────────────────────────────
+
+    /// Build a minimal `Ready` AppState backed by a scratch DuckDB path.
+    /// Only the fields the abandon handler touches matter
+    /// (`boot_state`, `session_token`, `db_path`, `tenant`,
+    /// `restore_active`); the rest are inert defaults.
+    fn abandon_test_state(db_path: std::path::PathBuf, tenant: &str) -> AppState {
+        AppState {
+            db_path: std::sync::Arc::new(db_path),
+            tenant: TenantId::new(tenant.to_string()).expect("tenant id"),
+            binary_hash: crate::binary_hash::BinaryHashHandle::from_ready(BinaryHash::from_bytes(
+                [0u8; 32],
+            )),
+            session_token: std::sync::Arc::new("test-token".to_string()),
+            secrets_cache: crate::secrets_cache::SecretsCache::empty(),
+            nav_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                NAV_POLL_DAEMON_CONCURRENCY,
+            )),
+            boot_state: std::sync::Arc::new(std::sync::RwLock::new(ServeBootState::Ready {
+                operator_login: "test-operator".to_string(),
+            })),
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
+            adapter_registry: std::sync::Arc::new(std::sync::RwLock::new(
+                aberp_mes::AdapterRegistry::new(),
+            )),
+            adapter_manager: std::sync::Arc::new(crate::mes_manager::AdapterManager::new(
+                std::sync::Arc::new(std::sync::RwLock::new(aberp_mes::AdapterRegistry::new())),
+                tokio_util::sync::CancellationToken::new(),
+            )),
+            adapter_health_baseline: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            restore_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("auth header"),
+        );
+        h
+    }
+
+    /// The RAII guard marks a restore LIVE for its scope and clears the
+    /// flag on drop — the live-window signal the abandon route consults.
+    #[test]
+    fn restore_active_guard_sets_and_clears_flag() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+        {
+            let _g = RestoreActiveGuard::new(&flag);
+            assert!(
+                flag.load(std::sync::atomic::Ordering::SeqCst),
+                "guard marks restore live"
+            );
+        }
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::SeqCst),
+            "guard clears the flag on drop (incl. early return / panic unwind)"
+        );
+    }
+
+    /// Pre-fix the abandon route deleted the lock unconditionally — it
+    /// could clear a lock a LIVE restore was actively using, permitting a
+    /// second concurrent restore. Post-fix it 409s while `restore_active`
+    /// is set, and proceeds once it clears (crash/finish).
+    #[tokio::test]
+    async fn abandon_refused_while_restore_active_then_allowed() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "aberp-s264-abandon-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            seq
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let db_path = dir.join("tenant.duckdb");
+        let state = abandon_test_state(db_path.clone(), "abandon-test");
+
+        // Acquire a lock so there is something to abandon.
+        restore_outgoing::acquire_restore_lock_at(
+            &db_path,
+            "abandon-test",
+            "ervin",
+            2026,
+            "2026-06-05T00:00:00Z",
+        )
+        .expect("acquire lock");
+
+        // A restore is LIVE → abandon must be refused with 409.
+        state.restore_active.store(true, Ordering::SeqCst);
+        let resp = handle_restore_lock_abandon(
+            bearer_headers("test-token"),
+            axum::extract::State(state.clone()),
+            Json(RestoreFromNavOutgoingRequest {
+                year: 2026,
+                confirm_token: RESTORE_CONFIRMATION_TOKEN.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "abandon must be refused while a restore is actively running"
+        );
+
+        // The lock must still be held (abandon did NOT delete it).
+        assert!(
+            restore_outgoing::read_restore_lock_at(&db_path, "abandon-test")
+                .expect("read lock")
+                .is_some(),
+            "a refused abandon must leave the live restore's lock intact"
+        );
+
+        // Restore finishes (or the process crashes → flag false on
+        // reboot) → abandon now succeeds.
+        state.restore_active.store(false, Ordering::SeqCst);
+        let resp2 = handle_restore_lock_abandon(
+            bearer_headers("test-token"),
+            axum::extract::State(state.clone()),
+            Json(RestoreFromNavOutgoingRequest {
+                year: 2026,
+                confirm_token: RESTORE_CONFIRMATION_TOKEN.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp2.status(),
+            StatusCode::OK,
+            "abandon must succeed once no restore is live"
+        );
+        assert!(
+            restore_outgoing::read_restore_lock_at(&db_path, "abandon-test")
+                .expect("read lock")
+                .is_none(),
+            "a successful abandon must clear the stale lock"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

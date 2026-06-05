@@ -426,6 +426,96 @@ fn cross_actor_decision_creates_new_row_supersedes_prior() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// S264 / PR-253 (F6): Rework emits a RoutingOpStateChanged audit row so
+// the Completed → Active reverse transition is walkable from the ledger.
+// Pre-fix the reverse flip was invisible to a routing-op state walk
+// (only the QA-decided row carried it implicitly) — this test fails
+// pre-fix because no `mes.routing_op_state_changed` row is appended.
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn rework_emits_routing_op_state_changed_audit() {
+    let mut conn = setup_db();
+    let meta = meta();
+    let (_wo_id, op_ids) = create_and_release_wo_with_2_ops(&mut conn, &meta);
+
+    // Complete op#1 → QA inspection auto-created (Pending).
+    let tx = conn.transaction().unwrap();
+    let outcome = transition_routing_op(
+        &tx,
+        &wo_ctx_for(&meta, "ervin"),
+        &op_ids[0],
+        RoutingOpTransitionInputs {
+            action: RoutingOpAction::Complete,
+            source_event_id: None,
+            idempotency_key: "op1-complete".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let qa_id = outcome.qa_inspection_id;
+
+    // Pending → Fail (allowed edge), then Fail → Rework (the flip).
+    let tx = conn.transaction().unwrap();
+    decide_qa(
+        &tx,
+        &qa_ctx_for(&meta, "ervin"),
+        &qa_id,
+        DecideQaInputs {
+            decision: QaDecision::Fail,
+            reason: None,
+            measurement: None,
+            source_event_id: None,
+            idempotency_key: "fail-1".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let before = count_kind(&conn, "mes.routing_op_state_changed");
+    let tx = conn.transaction().unwrap();
+    decide_qa(
+        &tx,
+        &qa_ctx_for(&meta, "ervin"),
+        &qa_id,
+        DecideQaInputs {
+            decision: QaDecision::Rework,
+            reason: Some("re-machine".to_string()),
+            measurement: None,
+            source_event_id: None,
+            idempotency_key: "rework-1".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let after = count_kind(&conn, "mes.routing_op_state_changed");
+    assert_eq!(
+        after - before,
+        1,
+        "Rework must emit exactly one RoutingOpStateChanged audit row"
+    );
+
+    // Audit-walk: recover the reverse transition from the ledger payload.
+    let payload: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM audit_ledger WHERE kind = ? ORDER BY seq DESC LIMIT 1;",
+            duckdb::params!["mes.routing_op_state_changed"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(v["routing_op_id"], serde_json::json!(op_ids[0]));
+    assert_eq!(v["from_state"], serde_json::json!("completed"));
+    assert_eq!(v["to_state"], serde_json::json!("active"));
+
+    // Upstream routing-op really is back to Active.
+    let op = read_routing_op(&conn, TEST_TENANT, &op_ids[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(op.state, aberp_work_orders::RoutingOpState::Active);
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // ADR-0063 invariant #4: same-actor decision UPDATEs the existing row.
 // ─────────────────────────────────────────────────────────────────────
 

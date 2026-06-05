@@ -246,8 +246,11 @@ pub struct CreateDraftInputs {
 
 /// Insert one `invoice_draft` row + emit one `InvoiceStaged` audit
 /// entry, all in the supplied transaction. Defence-in-depth:
-///   - `idempotency_key` non-empty (the ledger pin is the actual gate;
-///     this is the early-validate)
+///   - `idempotency_key` non-empty — an early-validate only. NOTE
+///     (S264 / PR-253 F4): the audit ledger does NOT enforce a UNIQUE on
+///     `idempotency_key`, so this is NOT a double-insert gate. Callers
+///     that need idempotency must guard at their own layer (e.g.
+///     quote-pickup's compare-and-swap on `picked_up_drf_id`).
 ///   - `partner_id` non-empty
 ///   - `product_id` non-empty
 pub fn create_draft_in_tx(

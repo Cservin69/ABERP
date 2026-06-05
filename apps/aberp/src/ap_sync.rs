@@ -180,6 +180,30 @@ pub struct CycleInputs {
     pub credentials: NavCredentials,
 }
 
+/// S264 / PR-253 (F2) — is a restore-from-NAV lock currently held for
+/// the tenant? Gates both the steady daemon loop and the bootstrap-year
+/// sweep so neither runs a parallel NAV walk during a restore (the boot
+/// banner promises exactly this; pre-S264 only the Issue + manual
+/// sync-now routes honoured it).
+///
+/// Fails OPEN with a loud log — a transient DB read hiccup must not
+/// permanently wedge AP-sync. This mirrors `serve.rs::restore_lock_block`'s
+/// posture: the hard guarantee is the restore's own per-row idempotency
+/// + the confirm-side lock acquire; this check is contention-avoidance,
+/// not a correctness gate, so a read error degrades to "run the cycle".
+fn restore_lock_held(db_path: &std::path::Path, tenant: &str) -> bool {
+    match crate::restore_from_nav_outgoing::read_restore_lock_at(db_path, tenant) {
+        Ok(lock) => lock.is_some(),
+        Err(e) => {
+            tracing::error!(
+                error = ?e,
+                "AP-sync restore-lock probe failed; proceeding with the cycle (fail-open)"
+            );
+            false
+        }
+    }
+}
+
 /// Spawn the auto-sync daemon as a background task. Returns
 /// immediately — the daemon ticks forever (or until the runtime
 /// shuts down). Boot-recovery posture: a daemon panic / loud-failure
@@ -229,6 +253,21 @@ where
             return;
         }
         match build_inputs() {
+            Ok(inputs) if restore_lock_held(&inputs.db_path, inputs.tenant.as_str()) => {
+                // S264 / PR-253 (F2) — a restore-from-NAV lock is held
+                // (or a crashed restore left one). A daemon NAV walk
+                // against the same tenant is exactly the parallel
+                // contention the lock exists to prevent — and the boot
+                // banner PROMISES AP-sync is blocked while a restore
+                // lock is held. Skip + log so that promise is truthful
+                // (the prior code ran the cycle anyway). The next tick
+                // re-checks; nothing is lost (ingestion is idempotent
+                // at the digest UNIQUE).
+                tracing::info!(
+                    "AP auto-sync cycle skipped — a restore-from-NAV lock is held; deferring \
+                     to avoid a parallel NAV walk against the same tenant DB"
+                );
+            }
             Ok(inputs) => match run_one_cycle(inputs, CycleTrigger::Daemon).await {
                 Ok(summary) => {
                     tracing::info!(
@@ -1115,6 +1154,20 @@ async fn run_bootstrap_year_once(build_inputs: &(dyn Fn() -> Result<CycleInputs>
         }
     };
 
+    // S264 / PR-253 (F2) — the bootstrap-year sweep runs at boot, which
+    // is precisely the crash-recovery boot where a restore lock is most
+    // likely held. A 12-month NAV walk here is the heaviest parallel-
+    // contention case the restore lock exists to prevent. Skip the whole
+    // sweep when a lock is held; the once-per-DB sentinel is NOT recorded
+    // on a skip, so the next boot (post-abandon) re-runs it.
+    if restore_lock_held(&inputs.db_path, inputs.tenant.as_str()) {
+        tracing::info!(
+            "AP bootstrap-year sweep skipped — a restore-from-NAV lock is held; will retry on a \
+             future boot once the restore is abandoned or completed"
+        );
+        return;
+    }
+
     // Sentinel check — already done? Skip silently.
     match bootstrap_year_already_recorded(
         &inputs.db_path,
@@ -1320,6 +1373,61 @@ mod tests {
         d.currency = Some("USD".to_string());
         let err = digest_to_ingestion_input(&d).expect_err("USD outside closed vocab");
         assert!(format!("{err:#}").contains("USD"), "{err:#}");
+    }
+
+    // S264 / PR-253 (F2) — the daemon + bootstrap consult
+    // `restore_lock_held` before every NAV walk so they defer to a live
+    // (or crashed) restore, making the boot banner's "AP-sync is blocked"
+    // promise truthful. Pre-fix the daemon ran the cycle regardless of
+    // the lock; this pins the gating predicate the loop now branches on.
+    #[test]
+    fn restore_lock_held_reflects_lock_presence() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "aberp-s264-apsync-lock-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            seq
+        ));
+        std::fs::create_dir_all(&dir).expect("create scoped tempdir");
+        let db_path = dir.join("tenant.duckdb");
+        let tenant = "test-tenant";
+
+        // No restore in progress → the daemon is free to run.
+        assert!(
+            !restore_lock_held(&db_path, tenant),
+            "fresh DB has no restore lock"
+        );
+
+        // A held restore lock must defer the cycle.
+        crate::restore_from_nav_outgoing::acquire_restore_lock_at(
+            &db_path,
+            tenant,
+            "ervin",
+            2026,
+            "2026-06-05T00:00:00Z",
+        )
+        .expect("acquire restore lock");
+        assert!(
+            restore_lock_held(&db_path, tenant),
+            "a held restore lock must gate AP-sync"
+        );
+
+        // Abandoning the lock re-opens AP-sync.
+        crate::restore_from_nav_outgoing::release_restore_lock_at(&db_path, tenant)
+            .expect("release restore lock");
+        assert!(
+            !restore_lock_held(&db_path, tenant),
+            "released lock must un-gate AP-sync"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

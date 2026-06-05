@@ -270,6 +270,21 @@ pub fn setup_seller_info_to_path(
                 "read existing [quote_intake] for preservation across identity write: {e}"
             ))
         })?;
+    // S264 / PR-253 (F5) — preserve `[[mes.adapters]]` across the
+    // identity write. SEVENTH slot of the seller.toml write invariant
+    // (banks/smtp/numbering/branding/quote_intake + this). S257 added the
+    // section + four other section-replace writers preserve it, but this
+    // from-scratch identity rebuild forgot it — so configuring adapters
+    // then editing company identity silently dropped every adapter on the
+    // next boot. This is the exact S170 regression class Ervin caught
+    // (lost smtp+numbering on a prod identity edit). See
+    // [[seller-toml-write-invariant]].
+    let preserved_mes_adapters =
+        crate::mes_adapters_config::read_mes_adapters(path).map_err(|e| {
+            SetupSellerInfoError::Backend(anyhow!(
+                "read existing [[mes.adapters]] for preservation across identity write: {e}"
+            ))
+        })?;
 
     let mut body = render_seller_toml(inputs);
     if !preserved.entries().is_empty() {
@@ -289,6 +304,14 @@ pub fn setup_seller_info_to_path(
     }
     if let Some(qi) = preserved_quote_intake.as_ref() {
         append_section(&mut body, &crate::quote_intake_config::to_toml_section(qi));
+    }
+    // S264 / PR-253 (F5) — re-append preserved adapters (no-op when none
+    // configured; `append_section` skips an empty section).
+    if !preserved_mes_adapters.is_empty() {
+        append_section(
+            &mut body,
+            &crate::mes_adapters_config::to_toml_section(&preserved_mes_adapters),
+        );
     }
 
     write_atomic(path, body.as_bytes()).map_err(SetupSellerInfoError::Backend)?;
@@ -1206,6 +1229,78 @@ primary_color = \"#1a2332\"
         assert_eq!(
             parsed.primary_color, "#1a2332",
             "operator's primary_color must survive identity save byte-for-byte"
+        );
+    }
+
+    /// S264 / PR-253 (F5) — `[[mes.adapters]]` (the 7th preserved slot,
+    /// added in S257) must survive an identity save. Pre-fix the
+    /// from-scratch identity rebuild dropped it, silently wiping every
+    /// configured MES adapter on the next boot — the exact S170
+    /// regression class. This test fails pre-fix (the section vanishes).
+    #[test]
+    fn identity_save_preserves_existing_mes_adapters() {
+        let tmp = test_dir("preserves_mes_adapters");
+        let path = tmp.join("seller.toml");
+        let pre = "\
+[seller]
+legal_name = \"Old Name\"
+tax_number = \"24904362-2-41\"
+
+[seller.address]
+country_code = \"HU\"
+postal_code = \"1037\"
+city = \"Budapest\"
+street = \"Old Street\"
+
+[[mes.adapters]]
+kind = \"robot\"
+adapter_id = \"r1\"
+host = \"10.0.0.6\"
+port = 30004
+";
+        std::fs::write(&path, pre).expect("write pre-condition file");
+
+        let inputs = good_inputs();
+        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+
+        let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
+        assert!(
+            after.contains("[[mes.adapters]]"),
+            "[[mes.adapters]] section lost across identity save: {after}"
+        );
+        let parsed =
+            crate::mes_adapters_config::read_mes_adapters(&path).expect("re-read mes adapters");
+        assert_eq!(parsed.len(), 1, "the one configured adapter must survive");
+        assert_eq!(
+            parsed[0].adapter_id, "r1",
+            "operator's adapter must survive identity save byte-for-byte"
+        );
+        assert_eq!(parsed[0].port, 30004);
+    }
+
+    /// S264 / PR-253 (F5) — no phantom `[[mes.adapters]]` when none was
+    /// configured (mirror of the branding "no phantom" pin).
+    #[test]
+    fn identity_save_does_not_materialise_mes_adapters_when_section_absent() {
+        let tmp = test_dir("no_phantom_mes_adapters");
+        let path = tmp.join("seller.toml");
+        let pre = "\
+[seller]
+legal_name = \"Old Name\"
+tax_number = \"24904362-2-41\"
+
+[seller.address]
+country_code = \"HU\"
+postal_code = \"1037\"
+city = \"Budapest\"
+street = \"Old Street\"
+";
+        std::fs::write(&path, pre).expect("write pre-condition file");
+        setup_seller_info_to_path(&path, &good_inputs()).expect("identity save");
+        let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
+        assert!(
+            !after.contains("[[mes.adapters]]"),
+            "no phantom [[mes.adapters]] section when none existed pre-write: {after}"
         );
     }
 

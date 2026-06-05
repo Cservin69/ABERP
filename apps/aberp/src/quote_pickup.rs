@@ -261,13 +261,15 @@ pub struct PickupQuoteInputs {
 ///
 /// Returns:
 ///   - `Ok(PickupQuoteOutcome { was_existing: true, .. })` if the
-///     quote was already picked up AND that draft still exists.
+///     quote was already picked up AND that draft still exists — OR if a
+///     concurrent pickup won the S264 (F4) compare-and-swap race (this
+///     call rolls back its own mint and returns the winner's draft).
 ///   - `Ok(PickupQuoteOutcome { was_existing: false, .. })` if a
 ///     fresh draft was minted (first-time pickup OR re-pickup after
 ///     S239 delete).
 ///   - `Err(_)` for: quote not staged, quote payload corrupted,
-///     partner resolver failure, audit-ledger F8 collision (shouldn't
-///     happen for a correctly-computed `idempotency_key`).
+///     partner resolver failure, or a lost-race winner whose draft row
+///     cannot be re-read (which would be a real corruption — loud-fail).
 ///
 /// The `conn` argument is `&mut` because the function opens an
 /// internal transaction for the draft INSERT + audit emit, mirroring
@@ -298,7 +300,17 @@ pub fn pickup_quote_as_draft(
     // Step 2 — idempotency walk. If the recorded draft still exists,
     // short-circuit. If it was deleted via S239, fall through to the
     // mint path.
-    if let Some(prior_drf_id) = row.picked_up_drf_id.as_deref() {
+    //
+    // S264 / PR-253 (F4) — capture the value we read here as
+    // `expected_prior`. This read is OUTSIDE the mint tx, so a
+    // concurrent pickup can change `picked_up_drf_id` before we write;
+    // the step-6 CAS uses `expected_prior` to detect exactly that and
+    // refuse to mint a second draft. (Pre-S264 a comment here claimed an
+    // "audit-ledger F8 pin" prevented the double-emit — it did not: the
+    // ledger has no UNIQUE on `idempotency_key`. The CAS is the real
+    // guard.)
+    let expected_prior = row.picked_up_drf_id.clone();
+    if let Some(prior_drf_id) = expected_prior.as_deref() {
         if let Some(existing) = invoice_draft::read_draft(conn, &inputs.tenant, prior_drf_id)
             .context("look up prior pickup draft")?
         {
@@ -309,10 +321,10 @@ pub fn pickup_quote_as_draft(
                 was_existing: true,
             });
         }
-        // Else: prior draft is gone (operator deleted via S239).
-        // Carry on to the fresh-mint path; the audit ledger's F8
-        // pin protects against double-emit because the caller passed
-        // a retry-suffixed idempotency_key.
+        // Else: the prior draft was deleted (operator via S239). Fall
+        // through to mint a fresh one; the step-6 CAS still guards
+        // against a concurrent re-pickup (it claims only while the
+        // column equals this `expected_prior`).
     }
 
     // Step 3 — parse prepared_draft JSON.
@@ -387,16 +399,31 @@ pub fn pickup_quote_as_draft(
     )
     .context("audit append InvoicePickedUpFromQuote")?;
 
-    // Stamp picked_up_drf_id INSIDE the tx so the SPA's "→ Draft" link
-    // and the route mint are atomic. A failure mid-cascade rolls back
-    // all three writes (draft row, two audit entries, log column).
-    tx.execute(
-        "UPDATE quote_intake_log
-            SET picked_up_drf_id = ?1
-          WHERE quote_id = ?2 AND tenant_id = ?3",
-        duckdb::params![draft.drf_id, inputs.quote_id, inputs.tenant,],
+    // S264 / PR-253 (F4) — CLAIM the quote inside the tx with a compare-
+    // and-swap, NOT an unconditional UPDATE. Two operators (or one on two
+    // machines) can both pass the step-2 idempotency read while
+    // `picked_up_drf_id` is still NULL; the unconditional writeback this
+    // replaces let BOTH mint a draft and last-writer-wins the column,
+    // leaving an orphan draft + a duplicate `InvoicePickedUpFromQuote`
+    // audit row. The CAS sets the column ONLY if it still equals what we
+    // read at step 2 (`expected_prior`) — so exactly one pickup wins.
+    let claimed = aberp_quote_intake::log_table::claim_for_pickup_in_tx(
+        &tx,
+        &inputs.tenant,
+        &inputs.quote_id,
+        &draft.drf_id,
+        expected_prior.as_deref(),
     )
-    .context("UPDATE quote_intake_log.picked_up_drf_id")?;
+    .map_err(|e| anyhow!("CAS claim quote_intake_log.picked_up_drf_id: {e}"))?;
+    if claimed != 1 {
+        // Lost the race: another pickup changed `picked_up_drf_id`
+        // between our step-2 read and this CAS. Roll back our freshly-
+        // minted draft + audit entries (drop the tx) and return the
+        // winner's draft so the operator lands on the real draft, not a
+        // 500. No orphan: the rollback discards everything this tx wrote.
+        drop(tx);
+        return resolve_pickup_winner(conn, &inputs.tenant, &inputs.quote_id);
+    }
 
     tx.commit().context("commit pickup tx")?;
 
@@ -405,6 +432,35 @@ pub fn pickup_quote_as_draft(
         partner_id,
         partner_created,
         was_existing: false,
+    })
+}
+
+/// S264 / PR-253 (F4) — a concurrent pickup won the CAS; re-read the
+/// now-committed winner and return ITS draft (so the loser's caller gets
+/// the real draft, marked `was_existing`). Loud-fails if the winning
+/// draft id or row cannot be found — the winner committed the column
+/// stamp and the draft row in one tx, so both MUST be present.
+fn resolve_pickup_winner(
+    conn: &Connection,
+    tenant: &str,
+    quote_id: &str,
+) -> Result<PickupQuoteOutcome> {
+    let row = aberp_quote_intake::log_table::read_for_pickup(conn, tenant, quote_id)
+        .map_err(|e| anyhow!("re-read quote_intake_log after lost pickup race: {e}"))?
+        .ok_or_else(|| anyhow!("quote {quote_id} vanished after a lost pickup race"))?;
+    let winner_drf = row.picked_up_drf_id.ok_or_else(|| {
+        anyhow!("lost pickup race for quote {quote_id} but no winning draft is recorded")
+    })?;
+    let existing = invoice_draft::read_draft(conn, tenant, &winner_drf)
+        .context("look up the winning pickup draft after a lost race")?
+        .ok_or_else(|| {
+            anyhow!("winning pickup draft {winner_drf} for quote {quote_id} not found")
+        })?;
+    Ok(PickupQuoteOutcome {
+        drf_id: existing.drf_id,
+        partner_id: existing.partner_id,
+        partner_created: false,
+        was_existing: true,
     })
 }
 
@@ -790,6 +846,48 @@ mod tests {
         assert_eq!(
             row.picked_up_drf_id.as_deref(),
             Some(second.drf_id.as_str())
+        );
+    }
+
+    /// S264 / PR-253 (F4) — the lost-race resolver returns the winner's
+    /// committed draft (marked `was_existing`), which is what
+    /// `pickup_quote_as_draft` returns when its CAS finds the quote was
+    /// claimed by a concurrent pickup. Combined with the log_table CAS
+    /// unit tests (which prove a stale claim updates 0 rows and never
+    /// clobbers the winner), this pins the no-orphan-draft contract.
+    #[test]
+    fn lost_race_resolves_to_committed_winner_draft() {
+        let mut conn = open_conn();
+        let prepared = sample_prepared_draft("q-race", "Race Buyer", "race@example.com");
+        stage_quote(
+            &conn,
+            "test-tenant",
+            "q-race",
+            &prepared,
+            "race@example.com",
+        );
+        let meta = ledger_meta();
+        let winner = pickup_quote_as_draft(
+            &mut conn,
+            &meta,
+            actor(),
+            PickupQuoteInputs {
+                tenant: "test-tenant".to_string(),
+                quote_id: "q-race".to_string(),
+                actor: "operator-A".to_string(),
+                idempotency_key: pickup_idempotency_key("q-race", 0),
+            },
+        )
+        .expect("winner pickup");
+        assert!(!winner.was_existing, "first pickup mints the winner");
+
+        // A pickup that lost the CAS lands here: re-read returns the
+        // winner's draft, was_existing = true, same drf_id.
+        let resolved = resolve_pickup_winner(&conn, "test-tenant", "q-race").expect("resolve");
+        assert!(resolved.was_existing, "loser returns the existing winner");
+        assert_eq!(
+            resolved.drf_id, winner.drf_id,
+            "loser must return the winner's draft, never a second orphan draft"
         );
     }
 
