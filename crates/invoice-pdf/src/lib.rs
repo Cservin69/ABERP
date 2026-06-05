@@ -114,6 +114,12 @@ const GOLD_ACCENT: Color = (0.72, 0.54, 0.12);
 /// flagged the `Adószám:123` look), now 10pt for breathing room.
 const LABEL_VALUE_GAP: i64 = 10;
 
+/// PR-249 (Bug A) — horizontal gutter (in points) kept clear between
+/// the Eladó and Vevő header columns. Each column's text is clamped to
+/// its cell width so a long legal name wraps inside the cell instead
+/// of running across the boundary and overprinting the other party.
+const COLUMN_GUTTER: i64 = 16;
+
 /// Stroke weight (in points) for `SILVER_LINE` structural rules.
 const RULE_WEIGHT_SILVER: f32 = 0.5;
 /// Stroke weight (in points) for the single `GOLD_ACCENT` rule above
@@ -325,8 +331,33 @@ fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel, logo_xobject_name: Option<
     let party_top = MARGIN_TOP - 78;
     let col_left = MARGIN_LEFT;
     let col_right = MARGIN_LEFT + (MARGIN_RIGHT - MARGIN_LEFT) / 2 + 8;
-    let after_seller = write_party(ops, "ELADÓ", &m.supplier, col_left, party_top, true);
-    let after_buyer = write_party(ops, "VEVŐ", &m.customer, col_right, party_top, false);
+    // PR-249 (Bug A) — clamp each cell to the space up to its column
+    // boundary. Seller stops a gutter short of `col_right`; buyer runs
+    // to the right margin. Text wider than the cell wraps (font-metrics
+    // break) instead of overprinting the neighbouring column.
+    let seller_width = col_right - COLUMN_GUTTER - col_left;
+    let buyer_width = MARGIN_RIGHT - col_right;
+    let after_seller = write_party(
+        ops,
+        "ELADÓ",
+        &m.supplier,
+        col_left,
+        party_top,
+        true,
+        seller_width,
+    );
+    let after_buyer = write_party(
+        ops,
+        "VEVŐ",
+        &m.customer,
+        col_right,
+        party_top,
+        false,
+        buyer_width,
+    );
+    // The block below the parties anchors to the TALLER column (the
+    // smaller / more-negative y), so a wrapped name never overlaps the
+    // date rows beneath it.
     let parties_bottom = after_seller.min(after_buyer);
 
     // Date block: SZÁMLA KELTE / TELJESÍTÉS KELTE on the left,
@@ -418,6 +449,7 @@ fn write_party(
     x: i64,
     y_top: i64,
     is_seller: bool,
+    max_width: i64,
 ) -> i64 {
     text_in(ops, "F1", 7, x, y_top, section_label, MUTED);
     // Session-148 (Ervin override 3) — the party name slot is rendered
@@ -426,36 +458,53 @@ fn write_party(
     // customer type; the PR-97 GDPR carve-out that skipped the slot for
     // a name-less PRIVATE_PERSON body is removed. "forget GDPR, show
     // the name, always."
-    text(ops, "FB", 13, x, y_top - 16, &party.name);
-    let mut y = y_top - 32;
+    //
+    // PR-249 (Bug A) — every field below wraps within `max_width`
+    // (font-metrics break) so a long legal name stacks vertically
+    // inside its column instead of overprinting the neighbouring one.
+    // For short fields (the common case) the wrap is a no-op and the
+    // emitted ops are byte-identical to the pre-PR-249 layout.
+    let name_last = draw_wrapped(
+        ops,
+        "FB",
+        13,
+        true,
+        x,
+        y_top - 16,
+        &party.name,
+        max_width,
+        15,
+        INK,
+    );
+    let mut y = name_last - 16;
     for line in &party.address_lines {
-        text(ops, "F1", 9, x, y, line);
-        y -= 11;
+        let last = draw_wrapped(ops, "F1", 9, false, x, y, line, max_width, 11, INK);
+        y = last - 11;
     }
     y -= 4;
     // PR-97 / ADR-0048 — natural-person buyers (PRIVATE_PERSON) carry
     // no ADÓSZÁM; the printed-PDF skips the label entirely rather than
     // rendering a "ADÓSZÁM: " line with an empty value.
     if !party.tax_number.trim().is_empty() {
-        label_value(ops, x, y, "ADÓSZÁM", &party.tax_number);
-        y -= 12;
+        let last = label_value_wrapped(ops, x, y, "ADÓSZÁM", &party.tax_number, max_width);
+        y = last - 12;
     }
     if is_seller {
         if let Some(v) = &party.bank_account_number {
-            label_value(ops, x, y, "BANKSZÁMLASZÁM", v);
-            y -= 12;
+            let last = label_value_wrapped(ops, x, y, "BANKSZÁMLASZÁM", v, max_width);
+            y = last - 12;
         }
         if let Some(v) = &party.iban {
-            label_value(ops, x, y, "IBAN", v);
-            y -= 12;
+            let last = label_value_wrapped(ops, x, y, "IBAN", v, max_width);
+            y = last - 12;
         }
         if let Some(v) = &party.bank_name {
-            label_value(ops, x, y, "BANK NEVE", v);
-            y -= 12;
+            let last = label_value_wrapped(ops, x, y, "BANK NEVE", v, max_width);
+            y = last - 12;
         }
         if let Some(v) = &party.swift_bic {
-            label_value(ops, x, y, "SWIFT/BIC", v);
-            y -= 12;
+            let last = label_value_wrapped(ops, x, y, "SWIFT/BIC", v, max_width);
+            y = last - 12;
         }
     }
     y
@@ -871,6 +920,46 @@ pub(crate) fn wrap_to_chars(text: &str, max_chars: usize) -> Vec<String> {
     out
 }
 
+/// PR-249 (Bug A) — width-based sibling of [`wrap_to_chars`] for the
+/// two-column header. Greedily packs whitespace-separated words onto a
+/// line until the next word would push the measured Helvetica width
+/// (via [`text::text_width_points`]) past `max_width` points, then
+/// breaks. Unlike [`wrap_to_chars`]'s char count, this measures real
+/// glyph advances — an all-caps legal name (wide caps) breaks at the
+/// right place where a 0.55-per-char proxy would let it overflow. A
+/// single word wider than `max_width` gets its own line (no mid-word
+/// break; never truncated).
+pub(crate) fn wrap_to_width(text: &str, max_width: i64, size: i64, bold: bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for paragraph in text.split('\n') {
+        if paragraph.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(word);
+            } else {
+                let candidate = format!("{current} {word}");
+                if crate::text::text_width_points(&candidate, size, bold) <= max_width {
+                    current = candidate;
+                } else {
+                    out.push(std::mem::take(&mut current));
+                    current.push_str(word);
+                }
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 /// Emit a left-anchored text run at `(x, y)` in `INK` colour using
 /// font alias `font` (one of `"F1"` / `"FB"` / `"FI"`) at `size`
 /// points. Convenience wrapper around [`text_in`].
@@ -1035,6 +1124,75 @@ fn label_value(ops: &mut Vec<Operation>, x: i64, y: i64, label: &str, value: &st
     // flag).
     let label_width = (label.chars().count() as i64 + 1) * 7 * 55 / 100 + LABEL_VALUE_GAP;
     text_in(ops, "FB", 9, x + label_width, y, value, INK);
+}
+
+/// PR-249 (Bug A) — [`label_value`] with the VALUE wrapped to the cell.
+/// The label sits at `x`; the value column starts at `x + label_width`
+/// and wraps to whatever width remains up to `max_width`. Continuation
+/// lines indent under the value (not the label) so the pair reads as
+/// one logical row. Returns the baseline of the LAST line emitted.
+///
+/// For a value that fits on one line (the common case) the emitted ops
+/// are byte-identical to [`label_value`].
+fn label_value_wrapped(
+    ops: &mut Vec<Operation>,
+    x: i64,
+    y: i64,
+    label: &str,
+    value: &str,
+    max_width: i64,
+) -> i64 {
+    text_in(ops, "F1", 7, x, y + 2, &format!("{}:", label), MUTED);
+    let label_width = (label.chars().count() as i64 + 1) * 7 * 55 / 100 + LABEL_VALUE_GAP;
+    // Floor the value width so a pathologically wide label can never
+    // drive it to zero (which would loop one-word-per-line forever-ish).
+    let value_width = (max_width - label_width).max(40);
+    draw_wrapped(
+        ops,
+        "FB",
+        9,
+        true,
+        x + label_width,
+        y,
+        value,
+        value_width,
+        11,
+        INK,
+    )
+}
+
+/// PR-249 (Bug A) — draw `content` left-anchored at `x`, wrapped to
+/// `max_width` points using real Helvetica glyph metrics
+/// ([`text::text_width_points`]). The first line sits at baseline
+/// `y_top`; each subsequent line drops `line_height`. Returns the
+/// baseline of the LAST line so callers can stack the next field below
+/// the TALLER of two columns. A single token wider than `max_width`
+/// prints on its own line and may visually overflow — the same
+/// no-mid-word-break, never-truncate policy as [`wrap_to_chars`].
+#[allow(clippy::too_many_arguments)]
+fn draw_wrapped(
+    ops: &mut Vec<Operation>,
+    font: &str,
+    size: i64,
+    bold: bool,
+    x: i64,
+    y_top: i64,
+    content: &str,
+    max_width: i64,
+    line_height: i64,
+    color: Color,
+) -> i64 {
+    let mut y = y_top;
+    for (i, line) in wrap_to_width(content, max_width, size, bold)
+        .iter()
+        .enumerate()
+    {
+        if i > 0 {
+            y -= line_height;
+        }
+        text_in(ops, font, size, x, y, line, color);
+    }
+    y
 }
 
 // ─── PR-176 — tenant-logo placement + XObject build ───────────────────
@@ -1204,7 +1362,7 @@ mod tests {
         };
         let mut ops: Vec<Operation> = Vec::new();
         // is_seller = false — the buyer party path.
-        write_party(&mut ops, "Vevő", &buyer, 40, 600, false);
+        write_party(&mut ops, "Vevő", &buyer, 40, 600, false, 240);
         let expected = text::winansi_bytes("Teszt Maganszemely");
         let rendered_name = ops.iter().any(|op| {
             op.operator == "Tj"
@@ -1240,7 +1398,7 @@ mod tests {
             swift_bic: None,
         };
         let mut ops: Vec<Operation> = Vec::new();
-        write_party(&mut ops, "Vevő", &buyer, 40, 600, false);
+        write_party(&mut ops, "Vevő", &buyer, 40, 600, false, 240);
 
         // Walk ops tracking the y from each `Td` so the y of each `Tj`
         // run can be recovered (BT, Tf, rg, Td(x,y), Tj, ET sequence).
@@ -1543,6 +1701,208 @@ mod tests {
             bytes.starts_with(b"%PDF"),
             "rendered output must be a PDF (starts with %PDF magic); first 16 bytes = {:?}",
             &bytes[..16.min(bytes.len())]
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // PR-249 / S260 — Bug A (header column clamp + wrap) pins
+    // ──────────────────────────────────────────────────────────────────
+
+    /// The two header column anchors, recomputed from the same formula
+    /// `layout()` uses, so the pins below assert against the live
+    /// geometry rather than magic numbers.
+    fn header_cols() -> (i64, i64, i64, i64) {
+        let col_left = MARGIN_LEFT;
+        let col_right = MARGIN_LEFT + (MARGIN_RIGHT - MARGIN_LEFT) / 2 + 8;
+        let seller_width = col_right - COLUMN_GUTTER - col_left;
+        let buyer_width = MARGIN_RIGHT - col_right;
+        (col_left, col_right, seller_width, buyer_width)
+    }
+
+    /// Walk the op stream and recover every `(x, raw-bytes)` `Tj` text
+    /// run (the renderer always emits `Td(x, y)` immediately before its
+    /// `Tj`).
+    fn tj_runs(ops: &[Operation]) -> Vec<(i64, Vec<u8>)> {
+        let mut last_x: i64 = 0;
+        let mut out = Vec::new();
+        for op in ops {
+            match op.operator.as_str() {
+                "Td" => {
+                    if let Some(Object::Integer(x)) = op.operands.first() {
+                        last_x = *x;
+                    }
+                }
+                "Tj" => {
+                    if let Some(Object::String(bytes, _)) = op.operands.first() {
+                        out.push((last_x, bytes.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn wrap_to_width_noop_for_short_text_and_breaks_long() {
+        let (_, _, seller_width, _) = header_cols();
+        // Short field — one line, identical content.
+        let short = wrap_to_width("Eladó Kft", seller_width, 13, true);
+        assert_eq!(short, vec!["Eladó Kft".to_string()]);
+        // Ervin's real legal name — must break into ≥ 2 lines, each
+        // measuring within the seller column, and losslessly reassemble.
+        let name = "ÁBEN CONSULTING KORLÁTOLT FELELŐSSÉGŰ TÁRSASÁG";
+        let lines = wrap_to_width(name, seller_width, 13, true);
+        assert!(
+            lines.len() >= 2,
+            "long all-caps legal name must wrap to ≥ 2 lines; got {lines:?}"
+        );
+        for line in &lines {
+            assert!(
+                crate::text::text_width_points(line, 13, true) <= seller_width,
+                "wrapped line {line:?} exceeds the seller column width {seller_width}"
+            );
+        }
+        assert_eq!(
+            lines.join(" "),
+            name,
+            "wrapping must not drop or reorder any word"
+        );
+    }
+
+    /// The headline Bug-A pin: with Ervin's long seller legal name and a
+    /// normal-length buyer, the seller cell wraps inside its column AND
+    /// the buyer name renders, in full, anchored in the buyer column —
+    /// i.e. it is no longer overprinted. Asserts layout positions, not
+    /// raw PDF bytes (per the brief's golden-file guidance).
+    #[test]
+    fn seller_name_wraps_and_buyer_name_stays_readable() {
+        let (col_left, col_right, seller_width, buyer_width) = header_cols();
+        let mut m = pin_model_with_brand(None);
+        m.supplier.name = "ÁBEN CONSULTING KORLÁTOLT FELELŐSSÉGŰ TÁRSASÁG".to_string();
+        m.customer.name = "Megrendelő Kft".to_string();
+
+        let mut ops: Vec<Operation> = Vec::new();
+        layout(&mut ops, &m, None);
+        let runs = tj_runs(&ops);
+
+        // The full unwrapped seller name must NOT appear as a single run
+        // (that was the overflow bug — one horizontal line).
+        let full = crate::text::winansi_bytes(&m.supplier.name);
+        assert!(
+            !runs.iter().any(|(_, b)| *b == full),
+            "seller name must be split across lines, never emitted as one run"
+        );
+
+        // Each wrapped seller line appears as its own run anchored at the
+        // seller column's left edge, never crossing into the buyer column.
+        let expected_lines = wrap_to_width(&m.supplier.name, seller_width, 13, true);
+        assert!(expected_lines.len() >= 2, "precondition: name wraps");
+        for line in &expected_lines {
+            let want = crate::text::winansi_bytes(line);
+            let hit = runs.iter().find(|(_, b)| *b == want);
+            let (x, _) = hit.unwrap_or_else(|| {
+                panic!("wrapped seller line {line:?} must render as a Tj run; runs={runs:?}")
+            });
+            assert_eq!(*x, col_left, "seller line {line:?} must anchor at col_left");
+            let right_edge = x + crate::text::text_width_points(line, 13, true);
+            assert!(
+                right_edge <= col_right - COLUMN_GUTTER + 1,
+                "seller line {line:?} right edge {right_edge} must stay left of the \
+                 buyer column boundary {}",
+                col_right - COLUMN_GUTTER
+            );
+        }
+
+        // The buyer name renders in full, as one run, inside the buyer
+        // column — readable, not overprinted.
+        let buyer = crate::text::winansi_bytes(&m.customer.name);
+        let (bx, _) = runs
+            .iter()
+            .find(|(_, b)| *b == buyer)
+            .expect("buyer name must render as a single, intact Tj run");
+        assert_eq!(*bx, col_right, "buyer name must anchor in the buyer column");
+        assert!(
+            crate::text::text_width_points(&m.customer.name, 13, true) <= buyer_width,
+            "buyer name must fit within the buyer column without wrapping"
+        );
+    }
+
+    /// A wrapped (taller) seller column must push the date rows below it
+    /// down — `layout()` anchors the block beneath the parties to the
+    /// shorter (more-negative) of the two column bottoms. Pin that the
+    /// long-name render lands the first date row strictly lower than the
+    /// short-name render would.
+    #[test]
+    fn wrapped_seller_pushes_dates_down() {
+        // Recover the y of the first date label ("SZÁMLA KELTE") below
+        // the party block for a given seller name.
+        let date_label_y = |seller_name: &str| -> i64 {
+            let mut m = pin_model_with_brand(None);
+            m.supplier.name = seller_name.to_string();
+            let mut ops: Vec<Operation> = Vec::new();
+            layout(&mut ops, &m, None);
+            let want = crate::text::winansi_bytes("SZÁMLA KELTE:");
+            let mut last_y = 0;
+            for op in &ops {
+                if op.operator == "Td" {
+                    if let Some(Object::Integer(y)) = op.operands.get(1) {
+                        last_y = *y;
+                    }
+                } else if op.operator == "Tj" {
+                    if let Some(Object::String(b, _)) = op.operands.first() {
+                        if *b == want {
+                            return last_y;
+                        }
+                    }
+                }
+            }
+            panic!("SZÁMLA KELTE label must render");
+        };
+        let short = date_label_y("Eladó Kft");
+        let long = date_label_y("ÁBEN CONSULTING KORLÁTOLT FELELŐSSÉGŰ TÁRSASÁG");
+        assert!(
+            long < short,
+            "the wrapped (taller) seller column must push the date rows \
+             down: long-name y={long} must be below short-name y={short}"
+        );
+    }
+
+    /// Bug B: an EUR invoice's emitted text runs carry the `€`(0x80) +
+    /// NBSP(0xA0) byte pair — symbol and amount visually separated yet
+    /// unbreakable. The HUF render carries no such pair (HUF is postfix
+    /// `… Ft`, unchanged). Asserted on the `layout()` op stream because
+    /// `render_invoice` deflates the saved content stream via
+    /// `doc.compress()`.
+    #[test]
+    fn eur_layout_emits_euro_nbsp_pair_huf_does_not() {
+        use rust_decimal::Decimal;
+        use time::macros::date;
+        let mut m = pin_model_with_brand(None);
+        m.currency = Currency::Eur;
+        m.rate_metadata = Some(aberp_billing::RateMetadata {
+            rate: Decimal::new(35669, 2),
+            source: "MNB".to_string(),
+            date: date!(2026 - 05 - 08),
+            huf_equivalent_total: 453,
+        });
+        let mut eur_ops: Vec<Operation> = Vec::new();
+        layout(&mut eur_ops, &m, None);
+        let has_pair = |ops: &[Operation]| -> bool {
+            tj_runs(ops)
+                .iter()
+                .any(|(_, b)| b.windows(2).any(|w| w == [0x80, 0xA0]))
+        };
+        assert!(
+            has_pair(&eur_ops),
+            "EUR layout must emit a € + NBSP (0x80,0xA0) text run"
+        );
+
+        let mut huf_ops: Vec<Operation> = Vec::new();
+        layout(&mut huf_ops, &pin_model_with_brand(None), None);
+        assert!(
+            !has_pair(&huf_ops),
+            "HUF layout must not emit a € + NBSP pair (HUF is postfix `Ft`)"
         );
     }
 }

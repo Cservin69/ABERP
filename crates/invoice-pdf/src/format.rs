@@ -8,10 +8,16 @@
 //!   regulatory record is the amount value, not the separator glyph.
 //!   PR-44ε.2 may upgrade to a proper narrow space once the renderer
 //!   embeds a Unicode font.
-//! - EUR: `€` prefix with a regular space, two decimals.
-//! - HUF: no symbol, suffix ` Ft` with a regular space, integer.
+//! - EUR: `€` prefix + a **non-breaking** space (U+00A0) + two
+//!   decimals (`€ 8 636,00`). PR-249 (Bug B) — the prior code emitted
+//!   no separator at all (`€8 636,00`), which read as cramped on the
+//!   real EUR invoice ABERP/2026/00001. The NBSP keeps the symbol and
+//!   amount visually distinct yet glued onto one line; WinAnsi maps
+//!   U+00A0 to 0xA0 (the font's nbspace == regular-space advance).
+//! - HUF: no symbol, suffix ` Ft` with a regular space, integer. The
+//!   suffix is unchanged — HUF is postfix, so it gets NO leading space.
 //! - Negative amounts: minus sign prefix INSIDE the currency symbol
-//!   (`-€8 636,00`), not outside. Storno chain children carry negative
+//!   (`-€ 8 636,00`), not outside. Storno chain children carry negative
 //!   line totals per ADR-0009 §6.
 
 use aberp_billing::Currency;
@@ -58,7 +64,13 @@ fn format_eur_cents(cents: i64) -> String {
     let abs = cents.unsigned_abs();
     let whole = abs / 100;
     let frac = abs % 100;
-    format!("{}\u{20AC}{},{:02}", sign, group_thousands(whole), frac)
+    // PR-249 (Bug B) — `\u{00A0}` (NBSP) between `€` and the amount.
+    format!(
+        "{}\u{20AC}\u{00A0}{},{:02}",
+        sign,
+        group_thousands(whole),
+        frac
+    )
 }
 
 fn format_huf_forints(forints: i64) -> String {
@@ -134,9 +146,26 @@ mod tests {
 
     #[test]
     fn eur_cents_round_trip() {
-        assert_eq!(money(Currency::Eur, 863_600), "\u{20AC}8 636,00");
-        assert_eq!(money(Currency::Eur, 50), "\u{20AC}0,50");
-        assert_eq!(money(Currency::Eur, -863_600), "-\u{20AC}8 636,00");
+        // PR-249 (Bug B) — NBSP (U+00A0) between `€` and the digits.
+        assert_eq!(money(Currency::Eur, 863_600), "\u{20AC}\u{00A0}8 636,00");
+        assert_eq!(money(Currency::Eur, 50), "\u{20AC}\u{00A0}0,50");
+        assert_eq!(money(Currency::Eur, -863_600), "-\u{20AC}\u{00A0}8 636,00");
+        // The separator is specifically the non-breaking space, never a
+        // regular space (which the layout engine could wrap) and never
+        // absent (the bug). Pin the exact code point.
+        let s = money(Currency::Eur, 820_420);
+        assert!(s.contains('\u{00A0}'), "EUR must use NBSP: {s:?}");
+        assert!(!s.contains("\u{20AC} "), "NBSP, not a regular space");
+        assert!(!s.contains("\u{20AC}8"), "symbol must not abut the digits");
+    }
+
+    #[test]
+    fn huf_keeps_no_leading_space() {
+        // PR-249 — Bug B is prefix-only. HUF is postfix `… Ft`; it must
+        // NOT gain a leading NBSP. Regression guard for the asymmetry.
+        let s = money(Currency::Huf, 820_420);
+        assert!(!s.starts_with('\u{00A0}'));
+        assert!(s.ends_with(" Ft"));
     }
 
     #[test]

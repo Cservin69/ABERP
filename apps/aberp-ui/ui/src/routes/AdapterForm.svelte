@@ -11,6 +11,7 @@
   // failed last-known state (S257 adversarial note): an Unhealthy
   // adapter still edits from its config host/port.
 
+  import { untrack } from "svelte";
   import {
     createAdapter,
     updateAdapter,
@@ -37,7 +38,9 @@
   // state once is correct (and avoids the `state_referenced_locally`
   // reactive-capture warning). Per the S257 adversarial note the form
   // seeds from the persisted CONFIG, never the failed last-known state.
-  const seed = initial;
+  // `untrack` is Svelte 5's explicit one-shot-snapshot idiom — same
+  // runtime behaviour, and it silences the compile-time warning.
+  const seed = untrack(() => initial);
 
   let kind = $state<AdapterKind>(seed?.kind ?? "barcode-scanner");
   let friendlyName = $state(seed?.friendly_name ?? "");
