@@ -1234,6 +1234,55 @@ pub enum EventKind {
     /// Payload: `serde_json::Value` (aberp binary `serve`).
     /// F12 four-edit ritual fires once.
     MaterialCataloguePushed,
+
+    /// S267 / PR-256 — an operator created, edited, or deleted a row in
+    /// the `quoting_complexity_rules` tunable table (the auto-quoting
+    /// engine's feature-time / size-bucket rules; design doc §11).
+    /// Carries the CRUD `op`, the composite-key fields (`feature_type`,
+    /// `size_bucket`, `count_min`), and a JSON snapshot of the row.
+    /// `quote.*` prefix family (auto-quoting catalogue / tunables).
+    /// Not invoice-scoped, never NAV bytes, never sweeps a per-
+    /// OUTGOING-invoice bundle.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    ComplexityRulesChanged,
+
+    /// S267 / PR-256 — an operator created, edited, or deleted a row in
+    /// the `quoting_tolerance_multipliers` tunable table (per-tolerance-
+    /// range multiplier on machining time + per-feature inspection
+    /// minutes; design doc §11). Carries the CRUD `op`, the
+    /// `tolerance_range` PK, and a JSON snapshot. `quote.*` prefix
+    /// family. Not invoice-scoped, never NAV bytes, never sweeps a per-
+    /// OUTGOING-invoice bundle.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    ToleranceMultipliersChanged,
+
+    /// S267 / PR-256 — an operator updated the `quoting_parameters`
+    /// singleton row (global knobs: scrap, margin, overhead, setup
+    /// amortization, min margin, exotic-material tax; design doc §11
+    /// / §6 PO-gate knobs land in a later session). Carries the JSON
+    /// snapshot. `quote.*` prefix family (no CRUD `op` — there's only
+    /// `update`; the singleton is created at boot by `ensure_schema`).
+    /// Not invoice-scoped, never NAV bytes, never sweeps a per-
+    /// OUTGOING-invoice bundle.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    ParametersChanged,
+
+    /// S267 / PR-256 — an operator created, edited, or deleted a row in
+    /// the `quoting_stock_adjustments` tunable table (per-material ×
+    /// per-stock-status signed % price tweak; design doc §11). Carries
+    /// the CRUD `op`, the composite-key fields (`grade`, `stock_status`),
+    /// and a JSON snapshot. `quote.*` prefix family. Not invoice-scoped,
+    /// never NAV bytes, never sweeps a per-OUTGOING-invoice bundle.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    StockAdjustmentsChanged,
 }
 
 impl EventKind {
@@ -1303,6 +1352,10 @@ impl EventKind {
             EventKind::AdapterHealthTransitioned => "mes.adapter_health_transitioned",
             EventKind::MaterialCatalogueChanged => "quote.material_catalogue_changed",
             EventKind::MaterialCataloguePushed => "quote.material_catalogue_pushed",
+            EventKind::ComplexityRulesChanged => "quote.complexity_rules_changed",
+            EventKind::ToleranceMultipliersChanged => "quote.tolerance_multipliers_changed",
+            EventKind::ParametersChanged => "quote.parameters_changed",
+            EventKind::StockAdjustmentsChanged => "quote.stock_adjustments_changed",
         }
     }
 
@@ -1383,6 +1436,10 @@ impl EventKind {
             "mes.adapter_health_transitioned" => Ok(EventKind::AdapterHealthTransitioned),
             "quote.material_catalogue_changed" => Ok(EventKind::MaterialCatalogueChanged),
             "quote.material_catalogue_pushed" => Ok(EventKind::MaterialCataloguePushed),
+            "quote.complexity_rules_changed" => Ok(EventKind::ComplexityRulesChanged),
+            "quote.tolerance_multipliers_changed" => Ok(EventKind::ToleranceMultipliersChanged),
+            "quote.parameters_changed" => Ok(EventKind::ParametersChanged),
+            "quote.stock_adjustments_changed" => Ok(EventKind::StockAdjustmentsChanged),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1455,6 +1512,10 @@ mod tests {
             EventKind::AdapterHealthTransitioned,
             EventKind::MaterialCatalogueChanged,
             EventKind::MaterialCataloguePushed,
+            EventKind::ComplexityRulesChanged,
+            EventKind::ToleranceMultipliersChanged,
+            EventKind::ParametersChanged,
+            EventKind::StockAdjustmentsChanged,
         ];
         for v in variants {
             let s = v.as_str();
@@ -2703,6 +2764,68 @@ mod tests {
         assert_ne!(new[1], new[2]);
         for k in new {
             assert_ne!(k, EventKind::MesAdapterEvent.as_str());
+        }
+    }
+
+    /// S267 / PR-256 — the four new tunables-CRUD kinds extend the
+    /// `quote.*` prefix family the S266 material-catalogue kinds opened
+    /// (auto-quoting strand, design doc Appendix). They are NOT
+    /// invoice-scoped, so the on-disk strings MUST carry `quote.` and
+    /// NOT `invoice.` / `system.` / `mes.` — otherwise the per-OUTGOING-
+    /// invoice export bundle's `invoice.*` glob would sweep a tunables-
+    /// CRUD entry into an invoice's evidence bundle. Same loud-fail
+    /// rationale as the S266 pin above.
+    #[test]
+    fn s267_tunables_kinds_use_quote_prefix() {
+        let cases: [(EventKind, &str); 4] = [
+            (
+                EventKind::ComplexityRulesChanged,
+                "quote.complexity_rules_changed",
+            ),
+            (
+                EventKind::ToleranceMultipliersChanged,
+                "quote.tolerance_multipliers_changed",
+            ),
+            (EventKind::ParametersChanged, "quote.parameters_changed"),
+            (
+                EventKind::StockAdjustmentsChanged,
+                "quote.stock_adjustments_changed",
+            ),
+        ];
+        for (k, expected) in cases {
+            assert_eq!(k.as_str(), expected);
+            let s = k.as_str();
+            assert!(s.starts_with("quote."), "{s} must start with quote.");
+            assert!(
+                !s.starts_with("invoice."),
+                "{s} must not start with invoice."
+            );
+            assert!(!s.starts_with("system."), "{s} must not start with system.");
+            assert!(!s.starts_with("mes."), "{s} must not start with mes.");
+        }
+    }
+
+    /// S267 / PR-256 — the four new tunables-CRUD storage strings are
+    /// pairwise-distinct AND distinct from the two pre-existing
+    /// `quote.material_catalogue_*` strings (S266) they neighbour. A
+    /// collision would mis-route a per-row CRUD entry to the wrong
+    /// tunables history bucket on parse.
+    #[test]
+    fn s267_tunables_kinds_are_distinct() {
+        let new = [
+            EventKind::ComplexityRulesChanged.as_str(),
+            EventKind::ToleranceMultipliersChanged.as_str(),
+            EventKind::ParametersChanged.as_str(),
+            EventKind::StockAdjustmentsChanged.as_str(),
+        ];
+        for i in 0..new.len() {
+            for j in (i + 1)..new.len() {
+                assert_ne!(new[i], new[j], "{} collides with {}", new[i], new[j]);
+            }
+        }
+        for k in new {
+            assert_ne!(k, EventKind::MaterialCatalogueChanged.as_str());
+            assert_ne!(k, EventKind::MaterialCataloguePushed.as_str());
         }
     }
 }

@@ -51,10 +51,20 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "partners",
   "products",
   "work-orders",
+  "qa",
+  "dispatch",
+  "workshop",
   "tenant",
   "nav-credentials",
   "maintenance",
   "restore-from-nav",
+  "adapters",
+  "material-catalogue",
+  // S267 / PR-256 — auto-quoting engine tunables (four routes).
+  "quoting-complexity-rules",
+  "quoting-tolerance-multipliers",
+  "quoting-parameters",
+  "quoting-stock-adjustments",
 ];
 
 // PR-79 / session 102 — closed set of AREA-landing routes. These are
@@ -97,6 +107,14 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   adapters: "settings",
   // S180 / PR-180 — NAV-as-DR restore wizard, settings-grouped.
   "restore-from-nav": "settings",
+  // S266 / PR-255 — material catalogue, settings-grouped (it pushes
+  // to the storefront — not quoting-engine-internal).
+  "material-catalogue": "settings",
+  // S267 / PR-256 — quoting-engine tunables, own module.
+  "quoting-complexity-rules": "quoting",
+  "quoting-tolerance-multipliers": "quoting",
+  "quoting-parameters": "quoting",
+  "quoting-stock-adjustments": "quoting",
 };
 
 // The expected area for each AppRoute. The two-area usage-frequency
@@ -128,6 +146,11 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   "material-catalogue": "maintenance",
   // S180 / PR-180 — NAV-as-DR restore wizard.
   "restore-from-nav": "maintenance",
+  // S267 / PR-256 — auto-quoting engine tunables (own module).
+  "quoting-complexity-rules": "maintenance",
+  "quoting-tolerance-multipliers": "maintenance",
+  "quoting-parameters": "maintenance",
+  "quoting-stock-adjustments": "maintenance",
 };
 
 // Closed-vocab set of accepted status kinds on a maintenance tile.
@@ -147,6 +170,11 @@ const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   "AdapterCount",
   // S266 / PR-255 — auto-quoting material catalogue tile.
   "MaterialCount",
+  // S267 / PR-256 — four auto-quoting tunables tiles.
+  "ComplexityRuleCount",
+  "ToleranceMultiplierCount",
+  "ParametersStatus",
+  "StockAdjustmentCount",
 ]);
 
 // Every area must have a stable bilingual label and at least one
@@ -306,7 +334,8 @@ describe("modulesInArea + defaultRouteForArea", () => {
     // S232 / PR-228 — "production" (Stage 3 Phase γ Work Orders) joins
     // the operational area after statistics per the registry order.
     expect(op.map((m) => m.id)).toEqual(["invoicing", "statistics", "production"]);
-    expect(mt.map((m) => m.id)).toEqual(["master-data", "settings"]);
+    // S267 / PR-256 — new `quoting` module joins maintenance after Settings.
+    expect(mt.map((m) => m.id)).toEqual(["master-data", "settings", "quoting"]);
   });
 
   it("modulesInArea partitions the registry (union covers every module, no overlap)", () => {

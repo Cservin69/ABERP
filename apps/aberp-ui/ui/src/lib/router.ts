@@ -39,7 +39,15 @@ export type AppRoute =
   | "maintenance"
   | "restore-from-nav"
   | "adapters"
-  | "material-catalogue";
+  | "material-catalogue"
+  // S267 / PR-256 — quoting-engine tunables (engine internals; the
+  // four routes hang off a dedicated `quoting` sub-nav under the
+  // maintenance area, distinct from `material-catalogue` which keeps
+  // its storefront-push posture under settings).
+  | "quoting-complexity-rules"
+  | "quoting-tolerance-multipliers"
+  | "quoting-parameters"
+  | "quoting-stock-adjustments";
 
 /** Default route the SPA falls back to on first paint (or on a hash
  * with an unknown slug). The Invoices list was the only screen
@@ -101,6 +109,14 @@ export function parseRoute(hash: string): AppRoute {
       return "adapters";
     case "material-catalogue":
       return "material-catalogue";
+    case "quoting-complexity-rules":
+      return "quoting-complexity-rules";
+    case "quoting-tolerance-multipliers":
+      return "quoting-tolerance-multipliers";
+    case "quoting-parameters":
+      return "quoting-parameters";
+    case "quoting-stock-adjustments":
+      return "quoting-stock-adjustments";
     default:
       return DEFAULT_ROUTE;
   }

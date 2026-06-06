@@ -892,7 +892,17 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // configuration / outbound notification; never carry NAV XML
         // bytes, never sweep a per-OUTGOING-invoice bundle.
         | EventKind::MaterialCatalogueChanged
-        | EventKind::MaterialCataloguePushed => (None, ""),
+        | EventKind::MaterialCataloguePushed
+        // S267 / PR-256 — quoting tunables CRUD kinds (`quote.*`):
+        // complexity rules, tolerance multipliers, global parameters
+        // singleton, and per-material × stock-status price adjustments.
+        // Same posture as the S266 catalogue kinds — operator-managed
+        // tunable-table edits; never carry NAV XML bytes, never sweep a
+        // per-OUTGOING-invoice bundle.
+        | EventKind::ComplexityRulesChanged
+        | EventKind::ToleranceMultipliersChanged
+        | EventKind::ParametersChanged
+        | EventKind::StockAdjustmentsChanged => (None, ""),
     };
 
     Ok(NavExtraction {

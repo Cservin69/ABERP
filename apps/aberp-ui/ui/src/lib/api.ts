@@ -1611,6 +1611,190 @@ export async function deleteQuotingMaterial(grade: string): Promise<void> {
   await invoke<void>("delete_quoting_material", { grade });
 }
 
+// ── S267 / PR-256 — quoting tunables types + endpoints ─────────────
+
+/** Closed-vocab feature type. Mirror of the Rust `FeatureType` enum. */
+export type FeatureType =
+  | "pocket"
+  | "hole"
+  | "slot"
+  | "thread"
+  | "undercut_5axis"
+  | "thin_wall"
+  | "surface"
+  | "engraving";
+
+export const FEATURE_TYPES: readonly FeatureType[] = [
+  "pocket",
+  "hole",
+  "slot",
+  "thread",
+  "undercut_5axis",
+  "thin_wall",
+  "surface",
+  "engraving",
+] as const;
+
+/** Closed-vocab size bucket. Boundaries are hardcoded in
+ * `quoting_tunables::SizeBucket::range_mm` (v1 isn't tunable; see
+ * module docs). */
+export type SizeBucket = "XS" | "S" | "M" | "L" | "XL";
+export const SIZE_BUCKETS: readonly SizeBucket[] = ["XS", "S", "M", "L", "XL"] as const;
+
+/** Closed-vocab tolerance range. */
+export type ToleranceRange =
+  | "loose"
+  | "standard"
+  | "tight"
+  | "precision"
+  | "ultra_precision";
+export const TOLERANCE_RANGES: readonly ToleranceRange[] = [
+  "loose",
+  "standard",
+  "tight",
+  "precision",
+  "ultra_precision",
+] as const;
+
+export interface ComplexityRule {
+  id: number;
+  feature_type: FeatureType;
+  size_bucket: SizeBucket;
+  count_min: number;
+  count_max: number | null;
+  base_time_minutes: number;
+  multiplier: number;
+  setup_penalty_minutes: number;
+  notes: string | null;
+  updated_at: string;
+  updated_by_actor: string;
+}
+
+export interface ComplexityRuleInput {
+  feature_type: FeatureType;
+  size_bucket: SizeBucket;
+  count_min: number;
+  count_max: number | null;
+  base_time_minutes: number;
+  multiplier: number;
+  setup_penalty_minutes: number;
+  notes: string | null;
+}
+
+export interface ToleranceMultiplier {
+  tolerance_range: ToleranceRange;
+  multiplier: number;
+  inspection_minutes_per_feature: number;
+  notes: string | null;
+  updated_at: string;
+  updated_by_actor: string;
+}
+
+export interface ToleranceMultiplierInput {
+  tolerance_range: ToleranceRange;
+  multiplier: number;
+  inspection_minutes_per_feature: number;
+  notes: string | null;
+}
+
+export interface QuotingParameters {
+  scrap_factor: number;
+  profit_margin_base: number;
+  overhead_factor: number;
+  setup_amortization_threshold: number;
+  min_margin: number;
+  exotic_material_tax: number;
+  notes: string | null;
+  updated_at: string;
+  updated_by_actor: string;
+}
+
+export interface QuotingParametersInput {
+  scrap_factor: number;
+  profit_margin_base: number;
+  overhead_factor: number;
+  setup_amortization_threshold: number;
+  min_margin: number;
+  exotic_material_tax: number;
+  notes: string | null;
+}
+
+export interface StockAdjustment {
+  id: number;
+  grade: string;
+  stock_status: StockStatus;
+  price_adjustment_pct: number;
+  notes: string | null;
+  updated_at: string;
+  updated_by_actor: string;
+}
+
+export interface StockAdjustmentInput {
+  grade: string;
+  stock_status: StockStatus;
+  price_adjustment_pct: number;
+  notes: string | null;
+}
+
+export async function listComplexityRules(): Promise<{ rules: ComplexityRule[] }> {
+  return invoke<{ rules: ComplexityRule[] }>("list_complexity_rules");
+}
+export async function createComplexityRule(
+  body: ComplexityRuleInput,
+): Promise<ComplexityRule> {
+  return invoke<ComplexityRule>("create_complexity_rule", { body });
+}
+export async function updateComplexityRule(
+  id: number,
+  body: ComplexityRuleInput,
+): Promise<ComplexityRule> {
+  return invoke<ComplexityRule>("update_complexity_rule", { id, body });
+}
+export async function deleteComplexityRule(id: number): Promise<void> {
+  await invoke<void>("delete_complexity_rule", { id });
+}
+
+export async function listToleranceMultipliers(): Promise<{
+  multipliers: ToleranceMultiplier[];
+}> {
+  return invoke<{ multipliers: ToleranceMultiplier[] }>("list_tolerance_multipliers");
+}
+export async function updateToleranceMultiplier(
+  range: ToleranceRange,
+  body: ToleranceMultiplierInput,
+): Promise<ToleranceMultiplier> {
+  return invoke<ToleranceMultiplier>("update_tolerance_multiplier", { range, body });
+}
+
+export async function getQuotingParameters(): Promise<QuotingParameters> {
+  return invoke<QuotingParameters>("get_quoting_parameters");
+}
+export async function updateQuotingParameters(
+  body: QuotingParametersInput,
+): Promise<QuotingParameters> {
+  return invoke<QuotingParameters>("update_quoting_parameters", { body });
+}
+
+export async function listStockAdjustments(): Promise<{
+  adjustments: StockAdjustment[];
+}> {
+  return invoke<{ adjustments: StockAdjustment[] }>("list_stock_adjustments");
+}
+export async function createStockAdjustment(
+  body: StockAdjustmentInput,
+): Promise<StockAdjustment> {
+  return invoke<StockAdjustment>("create_stock_adjustment", { body });
+}
+export async function updateStockAdjustment(
+  id: number,
+  body: StockAdjustmentInput,
+): Promise<StockAdjustment> {
+  return invoke<StockAdjustment>("update_stock_adjustment", { id, body });
+}
+export async function deleteStockAdjustment(id: number): Promise<void> {
+  await invoke<void>("delete_stock_adjustment", { id });
+}
+
 // ── PR-172 — buyer-facing notes-history typeahead source ─────────────
 
 /** PR-172 — closed-vocab discriminator for the notes-history scope.

@@ -42,7 +42,13 @@ export type ErpModuleId =
   | "statistics"
   | "production"
   | "master-data"
-  | "settings";
+  | "settings"
+  // S267 / PR-256 — auto-quoting engine tunables. Maintenance-area
+  // module sibling to Settings; the four quoting-engine tunable
+  // tables (complexity rules / tolerance multipliers / parameters /
+  // stock adjustments) live here as one sub-nav so the operator
+  // does not have to hunt for them inside Settings.
+  | "quoting";
 
 /** A route reference inside a module. `id` is the typed `AppRoute`
  * slug (the router's closed vocab); `label` is the chrome's display
@@ -193,6 +199,26 @@ export const MODULES: ErpModule[] = [
       { id: "restore-from-nav", label: "Restore from NAV" },
     ],
   },
+  // S267 / PR-256 — auto-quoting engine tunables. A dedicated
+  // maintenance-area module so the four quoting-engine tables read as
+  // one sub-nav (complexity rules / tolerance multipliers / parameters
+  // / stock adjustments) rather than being scattered across Settings.
+  // The material catalogue (S266) deliberately stays under Settings
+  // because its public projection is pushed to the storefront — it is
+  // catalogue-and-storefront, NOT engine tuning.
+  {
+    id: "quoting",
+    area: "maintenance",
+    label_hu: "Árajánlat",
+    label_en: "Quoting",
+    glyph: "≈",
+    routes: [
+      { id: "quoting-complexity-rules", label: "Complexity rules" },
+      { id: "quoting-tolerance-multipliers", label: "Tolerance multipliers" },
+      { id: "quoting-parameters", label: "Global parameters" },
+      { id: "quoting-stock-adjustments", label: "Stock adjustments" },
+    ],
+  },
 ];
 
 /** Look up the module that owns a given route. Total over `AppRoute`
@@ -335,7 +361,14 @@ export type MaintenanceTileStatusKind =
   | "AdapterCount"
   // S266 / PR-255 — count of material grades in the auto-quoting
   // catalogue. The tile's chip surfaces "N materials".
-  | "MaterialCount";
+  | "MaterialCount"
+  // S267 / PR-256 — auto-quoting tunables: complexity-rule count,
+  // tolerance-multiplier count (fixed 5 in v1), parameters "ok / not
+  // tuned" status, stock-adjustment row count.
+  | "ComplexityRuleCount"
+  | "ToleranceMultiplierCount"
+  | "ParametersStatus"
+  | "StockAdjustmentCount";
 
 /** One tile on the maintenance landing dashboard. The dashboard
  * renders the tiles grouped under their sub-area headers (today:
@@ -428,5 +461,45 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Vészhelyzeti adat-visszaállítás",
     description_en: "Disaster recovery — restore invoice data",
     statusKind: "RestoredInvoiceCount",
+  },
+  // S267 / PR-256 — four tiles for the new Quoting module. They each
+  // have a tiny status chip (count or "configured") and click through
+  // to the operator-tunable form. The four sit side-by-side so the
+  // operator's mental model is "tune the engine" as one sub-area.
+  {
+    moduleId: "quoting",
+    route: "quoting-complexity-rules",
+    label_hu: "Komplexitás",
+    label_en: "Complexity rules",
+    description_hu: "Jellemző × méret × darab szabályok",
+    description_en: "Feature × size × count rules",
+    statusKind: "ComplexityRuleCount",
+  },
+  {
+    moduleId: "quoting",
+    route: "quoting-tolerance-multipliers",
+    label_hu: "Tűrés-szorzók",
+    label_en: "Tolerance multipliers",
+    description_hu: "Tűréstartomány szerinti gépidő-szorzó",
+    description_en: "Per-band machining-time multiplier",
+    statusKind: "ToleranceMultiplierCount",
+  },
+  {
+    moduleId: "quoting",
+    route: "quoting-parameters",
+    label_hu: "Globális paraméterek",
+    label_en: "Global parameters",
+    description_hu: "Selejt, fedezet, általános költség",
+    description_en: "Scrap, margin, overhead",
+    statusKind: "ParametersStatus",
+  },
+  {
+    moduleId: "quoting",
+    route: "quoting-stock-adjustments",
+    label_hu: "Készlet-korrekciók",
+    label_en: "Stock adjustments",
+    description_hu: "Anyag × készletállapot árszorzó",
+    description_en: "Material × stock-status price tweak",
+    statusKind: "StockAdjustmentCount",
   },
 ];

@@ -771,7 +771,16 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // configuration / outbound notification; no NAV bytes, never
         // sweep a per-OUTGOING-invoice bundle.
         | EventKind::MaterialCatalogueChanged
-        | EventKind::MaterialCataloguePushed => None,
+        | EventKind::MaterialCataloguePushed
+        // S267 / PR-256 — quoting tunables CRUD kinds (`quote.*`).
+        // Operator-managed catalogue edits on the auto-quoting
+        // engine's complexity rules / tolerance multipliers / global
+        // parameters / stock adjustments. No NAV bytes; never sweep
+        // a per-OUTGOING-invoice bundle.
+        | EventKind::ComplexityRulesChanged
+        | EventKind::ToleranceMultipliersChanged
+        | EventKind::ParametersChanged
+        | EventKind::StockAdjustmentsChanged => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

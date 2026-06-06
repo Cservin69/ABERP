@@ -497,6 +497,94 @@ pub async fn delete_quoting_material(
     forward_delete(&state, &path).await
 }
 
+// ── S267 / PR-256 — quoting tunables CRUD ───────────────────────────
+
+#[tauri::command]
+pub async fn list_complexity_rules(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quoting-complexity-rules", true).await
+}
+
+#[tauri::command]
+pub async fn create_complexity_rule(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/quoting-complexity-rules", body).await
+}
+
+#[tauri::command]
+pub async fn update_complexity_rule(
+    state: State<'_, AppState>,
+    id: i64,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quoting-complexity-rules/{id}");
+    forward_put(&state, &path, body).await
+}
+
+#[tauri::command]
+pub async fn delete_complexity_rule(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let path = format!("/api/quoting-complexity-rules/{id}");
+    forward_delete(&state, &path).await
+}
+
+#[tauri::command]
+pub async fn list_tolerance_multipliers(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quoting-tolerance-multipliers", true).await
+}
+
+#[tauri::command]
+pub async fn update_tolerance_multiplier(
+    state: State<'_, AppState>,
+    range: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quoting-tolerance-multipliers/{}", urlencode(&range));
+    forward_put(&state, &path, body).await
+}
+
+#[tauri::command]
+pub async fn get_quoting_parameters(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quoting-parameters", true).await
+}
+
+#[tauri::command]
+pub async fn update_quoting_parameters(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_put(&state, "/api/quoting-parameters", body).await
+}
+
+#[tauri::command]
+pub async fn list_stock_adjustments(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quoting-stock-adjustments", true).await
+}
+
+#[tauri::command]
+pub async fn create_stock_adjustment(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/quoting-stock-adjustments", body).await
+}
+
+#[tauri::command]
+pub async fn update_stock_adjustment(
+    state: State<'_, AppState>,
+    id: i64,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quoting-stock-adjustments/{id}");
+    forward_put(&state, &path, body).await
+}
+
+#[tauri::command]
+pub async fn delete_stock_adjustment(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let path = format!("/api/quoting-stock-adjustments/{id}");
+    forward_delete(&state, &path).await
+}
+
 // ── PR-172 — notes-history typeahead source ─────────────────────────
 
 /// PR-172 — `GET /api/notes-history?scope=line|invoice|storno`. Used

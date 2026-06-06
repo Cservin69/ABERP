@@ -29,14 +29,18 @@
 
   import {
     getNavCredentialsStatus,
+    getQuotingParameters,
     getSellerInfo,
     listAdapters,
+    listComplexityRules,
     listLowStockProducts,
     listPartners,
     listQuotingMaterials,
     listProducts,
     listRestoredInvoices,
     listSellerBanks,
+    listStockAdjustments,
+    listToleranceMultipliers,
     type NavCredentialsStatusResponse,
     type SellerInfoResponse,
   } from "../lib/api";
@@ -213,6 +217,37 @@
         const res = await listQuotingMaterials();
         const n = res.materials.length;
         return n === 1 ? "1 material" : `${n} materials`;
+      }
+      case "ComplexityRuleCount": {
+        // S267 / PR-256 — count of complexity rules. Seeded empty on
+        // a fresh tenant (operator-built over time) so 0 is expected.
+        const res = await listComplexityRules();
+        const n = res.rules.length;
+        return n === 1 ? "1 rule" : `${n} rules`;
+      }
+      case "ToleranceMultiplierCount": {
+        // S267 / PR-256 — count of tolerance multipliers. Seeded with
+        // the five closed-vocab bands at boot.
+        const res = await listToleranceMultipliers();
+        const n = res.multipliers.length;
+        return n === 1 ? "1 band" : `${n} bands`;
+      }
+      case "ParametersStatus": {
+        // S267 / PR-256 — global parameters singleton. The seeded row
+        // always exists; the chip surfaces the active `profit_margin_base`
+        // so the operator sees at a glance whether defaults have been
+        // tuned. `boot` updated_by_actor marks an untouched seed.
+        const p = await getQuotingParameters();
+        const pct = (p.profit_margin_base * 100).toFixed(0);
+        const tuned = p.updated_by_actor === "boot" ? "default" : "tuned";
+        return `margin ${pct}% · ${tuned}`;
+      }
+      case "StockAdjustmentCount": {
+        // S267 / PR-256 — count of per-material × stock-status price
+        // adjustments. Seeded empty so 0 is expected on a fresh tenant.
+        const res = await listStockAdjustments();
+        const n = res.adjustments.length;
+        return n === 1 ? "1 adjustment" : `${n} adjustments`;
       }
     }
   }

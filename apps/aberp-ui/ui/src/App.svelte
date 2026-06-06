@@ -88,6 +88,11 @@
   import AdaptersList from "./routes/AdaptersList.svelte";
   // S266 / PR-255 — Settings → Material Catalogue page (auto-quoting).
   import MaterialCatalogueList from "./routes/MaterialCatalogueList.svelte";
+  // S267 / PR-256 — Maintenance → Quoting sub-nav (four engine tunables).
+  import QuotingComplexityRulesList from "./routes/QuotingComplexityRulesList.svelte";
+  import QuotingToleranceMultipliersList from "./routes/QuotingToleranceMultipliersList.svelte";
+  import QuotingParametersForm from "./routes/QuotingParametersForm.svelte";
+  import QuotingStockAdjustmentsList from "./routes/QuotingStockAdjustmentsList.svelte";
   import SellerConfigWizard from "./routes/SellerConfigWizard.svelte";
   import SetupWizard from "./routes/SetupWizard.svelte";
   // S225 / PR-221 — financial-statistics dashboard.
@@ -662,6 +667,14 @@
           <AdaptersList />
         {:else if route === "material-catalogue"}
           <MaterialCatalogueList />
+        {:else if route === "quoting-complexity-rules"}
+          <QuotingComplexityRulesList />
+        {:else if route === "quoting-tolerance-multipliers"}
+          <QuotingToleranceMultipliersList />
+        {:else if route === "quoting-parameters"}
+          <QuotingParametersForm />
+        {:else if route === "quoting-stock-adjustments"}
+          <QuotingStockAdjustmentsList />
         {:else if route === "invoices-new"}
           <!-- PR-87 / session-112 — full-page issuance route. The
                IssueInvoice form was a `<dialog>` modal mounted inside

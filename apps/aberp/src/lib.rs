@@ -73,6 +73,12 @@ pub mod quote_intake_query;
 // `source_quote_id` set + emits `InvoicePickedUpFromQuote`.
 pub mod quote_pickup;
 pub mod quoting_materials;
+// S267 / PR-256 — four tunable tables feeding the future
+// `aberp-quote-engine`: complexity rules, tolerance multipliers, the
+// global parameters singleton, and per-material × stock-status price
+// adjustments. None of these push to the storefront — they are
+// quoting-engine internals.
+pub mod quoting_tunables;
 pub mod recover_from_nav;
 pub mod reports;
 pub mod request_technical_annulment;

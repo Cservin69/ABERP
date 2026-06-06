@@ -736,6 +736,24 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             .context("ensure + seed quoting_materials at serve boot")?;
     }
 
+    // S267 / PR-256 — pin the four quoting tunables schemas at boot
+    // (complexity rules, tolerance multipliers, parameters singleton,
+    // stock adjustments). Idempotent CREATE IF NOT EXISTS + idempotent
+    // seeds for the tolerance enum + the parameters singleton. MUST run
+    // AFTER the materials migration above because `quoting_stock_adjustments`
+    // app-layer-FK-checks against `quoting_materials.grade`.
+    {
+        let _s = tracing::info_span!("serve.ensure_quoting_tunables_schema").entered();
+        let mut conn = Connection::open(&args.db).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for quoting_tunables boot migration",
+                args.db.display()
+            )
+        })?;
+        crate::quoting_tunables::ensure_schema(&mut conn, tenant.as_str())
+            .context("ensure quoting_tunables schemas + seeds at serve boot")?;
+    }
+
     // S232 / PR-228 / ADR-0062 — pin the work-orders schema at boot
     // (creates work_orders + boms + routings tables). Same idempotent
     // CREATE TABLE IF NOT EXISTS posture as the inventory migration
@@ -2263,6 +2281,40 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/quoting-materials/:grade",
             put(handle_update_quoting_material).delete(handle_delete_quoting_material),
+        )
+        // S267 / PR-256 — auto-quoting tunables CRUD (engine internals,
+        // NOT pushed to storefront). Four tables:
+        //   - quoting-complexity-rules: feature × size_bucket rules
+        //   - quoting-tolerance-multipliers: per-band multiplier (update-only)
+        //   - quoting-parameters: global knobs singleton (GET + PUT, no id)
+        //   - quoting-stock-adjustments: material × stock_status ±% tweak
+        .route(
+            "/api/quoting-complexity-rules",
+            get(handle_list_complexity_rules).post(handle_create_complexity_rule),
+        )
+        .route(
+            "/api/quoting-complexity-rules/:id",
+            put(handle_update_complexity_rule).delete(handle_delete_complexity_rule),
+        )
+        .route(
+            "/api/quoting-tolerance-multipliers",
+            get(handle_list_tolerance_multipliers),
+        )
+        .route(
+            "/api/quoting-tolerance-multipliers/:range",
+            put(handle_update_tolerance_multiplier),
+        )
+        .route(
+            "/api/quoting-parameters",
+            get(handle_get_parameters).put(handle_update_parameters),
+        )
+        .route(
+            "/api/quoting-stock-adjustments",
+            get(handle_list_stock_adjustments).post(handle_create_stock_adjustment),
+        )
+        .route(
+            "/api/quoting-stock-adjustments/:id",
+            put(handle_update_stock_adjustment).delete(handle_delete_stock_adjustment),
         )
         // PR-172 — buyer-facing notes typeahead source. GET-only,
         // ready+bearer-gated. `?scope=line|invoice|storno` is required.
@@ -8198,6 +8250,513 @@ async fn handle_delete_quoting_material(
         Ok(Err(e)) => material_write_response(e, "delete_quoting_material"),
         Err(join_err) => internal_error(
             "delete_quoting_material:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ── S267 / PR-256 — quoting tunables CRUD handlers ───────────────────
+//
+// Four tables, three share the same error-mapping shape (validation →
+// 400, conflict → 409, not-found → 404, other → 500). The parameters
+// singleton has no id and no create/delete path.
+//
+// None of these handlers trigger `state.catalogue_push.trigger()` —
+// the tunables are engine internals; only `quoting_materials` pushes to
+// the storefront.
+
+fn tunable_validation_response(errors: Vec<crate::quoting_tunables::ValidationError>) -> Response {
+    #[derive(Serialize)]
+    struct Body {
+        error: &'static str,
+        fields: Vec<crate::quoting_tunables::ValidationError>,
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        Json(Body {
+            error: "validation_failed",
+            fields: errors,
+        }),
+    )
+        .into_response()
+}
+
+fn tunable_write_response(
+    e: crate::quoting_tunables::TunableWriteError,
+    ctx: &'static str,
+) -> Response {
+    use crate::quoting_tunables::TunableWriteError as E;
+    match e {
+        E::Validation(errs) => tunable_validation_response(errs),
+        E::Conflict(detail) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "conflict",
+                "message": detail,
+            })),
+        )
+            .into_response(),
+        E::NotFound(detail) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!("not found: {detail}"))),
+        )
+            .into_response(),
+        E::Other(err) => internal_error(ctx, err),
+    }
+}
+
+fn tunable_ledger_meta(state: &AppState) -> Result<aberp_audit_ledger::LedgerMeta> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await binary hash for quoting-tunables audit")?;
+    Ok(aberp_audit_ledger::LedgerMeta::new(
+        state.tenant.clone(),
+        binary_hash,
+    ))
+}
+
+// ── quoting_complexity_rules ────────────────────────────────────────
+
+async fn handle_list_complexity_rules(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<Vec<crate::quoting_tunables::ComplexityRule>> {
+            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            crate::quoting_tunables::list_complexity_rules(&conn, state_for_task.tenant.as_str())
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({ "rules": rows })).into_response(),
+        Ok(Err(e)) => internal_error("list_complexity_rules", e),
+        Err(join_err) => internal_error(
+            "list_complexity_rules:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_create_complexity_rule(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<crate::quoting_tunables::ComplexityRuleInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_tunables::create_complexity_rule(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => (StatusCode::CREATED, Json(row)).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "create_complexity_rule"),
+        Err(join_err) => internal_error(
+            "create_complexity_rule:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_update_complexity_rule(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+    Json(inputs): Json<crate::quoting_tunables::ComplexityRuleInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_tunables::update_complexity_rule(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                id,
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => Json(row).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "update_complexity_rule"),
+        Err(join_err) => internal_error(
+            "update_complexity_rule:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_delete_complexity_rule(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<(), crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_tunables::delete_complexity_rule(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                id,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "delete_complexity_rule"),
+        Err(join_err) => internal_error(
+            "delete_complexity_rule:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ── quoting_tolerance_multipliers ───────────────────────────────────
+
+async fn handle_list_tolerance_multipliers(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<Vec<crate::quoting_tunables::ToleranceMultiplier>> {
+            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            crate::quoting_tunables::list_tolerance_multipliers(
+                &conn,
+                state_for_task.tenant.as_str(),
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({ "multipliers": rows })).into_response(),
+        Ok(Err(e)) => internal_error("list_tolerance_multipliers", e),
+        Err(join_err) => internal_error(
+            "list_tolerance_multipliers:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_update_tolerance_multiplier(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(range): AxumPath<String>,
+    Json(inputs): Json<crate::quoting_tunables::ToleranceMultiplierInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_tunables::update_tolerance_multiplier(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &range,
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => Json(row).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "update_tolerance_multiplier"),
+        Err(join_err) => internal_error(
+            "update_tolerance_multiplier:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ── quoting_parameters (singleton) ───────────────────────────────────
+
+async fn handle_get_parameters(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<crate::quoting_tunables::QuotingParameters> {
+            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            crate::quoting_tunables::get_parameters(&conn, state_for_task.tenant.as_str())
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => Json(row).into_response(),
+        Ok(Err(e)) => internal_error("get_parameters", e),
+        Err(join_err) => internal_error(
+            "get_parameters:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_update_parameters(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<crate::quoting_tunables::QuotingParametersInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_tunables::update_parameters(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => Json(row).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "update_parameters"),
+        Err(join_err) => internal_error(
+            "update_parameters:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ── quoting_stock_adjustments ───────────────────────────────────────
+
+async fn handle_list_stock_adjustments(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<Vec<crate::quoting_tunables::StockAdjustment>> {
+            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            crate::quoting_tunables::list_stock_adjustments(&conn, state_for_task.tenant.as_str())
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({ "adjustments": rows })).into_response(),
+        Ok(Err(e)) => internal_error("list_stock_adjustments", e),
+        Err(join_err) => internal_error(
+            "list_stock_adjustments:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_create_stock_adjustment(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<crate::quoting_tunables::StockAdjustmentInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_tunables::create_stock_adjustment(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => (StatusCode::CREATED, Json(row)).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "create_stock_adjustment"),
+        Err(join_err) => internal_error(
+            "create_stock_adjustment:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_update_stock_adjustment(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+    Json(inputs): Json<crate::quoting_tunables::StockAdjustmentInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_tunables::update_stock_adjustment(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                id,
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => Json(row).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "update_stock_adjustment"),
+        Err(join_err) => internal_error(
+            "update_stock_adjustment:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_delete_stock_adjustment(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<(), crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_tunables::delete_stock_adjustment(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                id,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "delete_stock_adjustment"),
+        Err(join_err) => internal_error(
+            "delete_stock_adjustment:join",
             anyhow!("blocking task panicked: {join_err}"),
         ),
     }
