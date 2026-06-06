@@ -19,8 +19,6 @@ use std::collections::HashMap;
 use anyhow::Result;
 use duckdb::{params, Connection};
 
-use aberp_quote_intake::log_table::flip_stock_alert_to_true;
-
 use crate::quote_stock_alert::{coerce_stock_alert, recompute_stock_alert};
 
 /// Row mirror for the SPA Quotes tab. The `*_summary` fields are
@@ -209,33 +207,47 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Quot
         let deal_work_order_id: Option<String> = row.get(19).ok().flatten();
 
         // S271 — recompute alert. Sticky on TRUE; downgrades trigger.
+        //
+        // S275 / F6 — narrow the recompute to rows the operator can still
+        // ACT on: only `staged` rows that are un-dealt + un-picked-up. A
+        // dealt row already locked the material commit (the REFRESH gate
+        // is moot after the saga commits); an `error` / `irrelevant` row
+        // is not pickable; a picked-up row already minted a draft and the
+        // alert no longer routes operator action. Skipping these stops
+        // post-DEAL catalogue churn from emitting noise audit entries and
+        // keeps the stored `stock_alert` aligned with rows the operator
+        // can still REFRESH-ack.
         let stored_alert = coerce_stock_alert(stored_alert_db);
+        let is_actionable =
+            intake_state == "staged" && deal_issued_at.is_none() && picked_up_drf_id.is_none();
         let current_status_for_quote = material_grade
             .as_deref()
             .and_then(|g| current_stock_by_grade.get(g).map(String::as_str));
-        let next_alert = recompute_stock_alert(
-            stock_status_at_accept.as_deref(),
-            current_status_for_quote,
-            stored_alert,
-        );
-        let stock_alert = if next_alert && !stored_alert {
-            // FALSE → TRUE transition; persist + queue the audit emit
-            // for the route layer. `flip_stock_alert_to_true` returns
-            // true on exactly the first transition (sticky in DB), so
-            // a parallel SPA reload between recompute and persist
-            // resolves to one audit emit per row.
-            let flipped = flip_stock_alert_to_true(conn, tenant_id, &quote_id)
-                .map_err(|e| anyhow::anyhow!("persist stock_alert flip: {e}"))?;
-            if flipped {
-                pending_alerts.push(StockAlertTriggered {
-                    quote_id: quote_id.clone(),
-                    material_grade: material_grade.clone().unwrap_or_default(),
-                    snapshot_status: stock_status_at_accept.clone().unwrap_or_default(),
-                    current_status: current_status_for_quote
-                        .map(str::to_string)
-                        .unwrap_or_default(),
-                });
-            }
+        let next_alert = if is_actionable {
+            recompute_stock_alert(
+                stock_status_at_accept.as_deref(),
+                current_status_for_quote,
+                stored_alert,
+            )
+        } else {
+            stored_alert
+        };
+        let stock_alert = if is_actionable && next_alert && !stored_alert {
+            // S275 / F2 — record the transition for the caller's
+            // per-row tx to persist + emit. The route layer (or the
+            // test-only persist helper) calls `flip_and_audit_in_tx`
+            // which runs the guarded UPDATE + audit append in one tx;
+            // the race between concurrent recompute passes is settled
+            // by DuckDB's `rows_affected == 1` semantics, not by the
+            // memo-snapshot here.
+            pending_alerts.push(StockAlertTriggered {
+                quote_id: quote_id.clone(),
+                material_grade: material_grade.clone().unwrap_or_default(),
+                snapshot_status: stock_status_at_accept.clone().unwrap_or_default(),
+                current_status: current_status_for_quote
+                    .map(str::to_string)
+                    .unwrap_or_default(),
+            });
             true
         } else {
             next_alert
@@ -685,8 +697,29 @@ mod tests {
         assert_eq!(alert.snapshot_status, "in_stock");
         assert_eq!(alert.current_status, "source_1_2d");
 
-        // Persistence pin: the second list call sees stock_alert TRUE
-        // in the DB and does NOT re-emit the transition (idempotent).
+        // S275 / F2 — the recompute pass NO LONGER persists in-place.
+        // The route (or this test) drives the persist via a CAS
+        // UPDATE; subsequent list calls then see stored=true and
+        // sticky-short-circuit without re-emitting. Without the
+        // persist, the recompute would re-push pending_alerts on
+        // every list call — pinned below.
+        let listing_no_persist = list_quote_intake_rows(&conn, "t1").unwrap();
+        assert!(
+            listing_no_persist.rows[0].stock_alert,
+            "alert still in-memory"
+        );
+        assert_eq!(
+            listing_no_persist.newly_triggered_alerts.len(),
+            1,
+            "without the route's persist, recompute re-pushes the transition"
+        );
+        // Run the route's CAS UPDATE so subsequent recomputes
+        // sticky-short-circuit (the audit emit is exercised in
+        // log_table.rs's own `flip_and_audit_in_tx` test).
+        let flipped =
+            aberp_quote_intake::log_table::flip_stock_alert_to_true(&conn, "t1", "q-alpha")
+                .unwrap();
+        assert!(flipped, "CAS UPDATE matched the FALSE→TRUE transition");
         let listing2 = list_quote_intake_rows(&conn, "t1").unwrap();
         assert!(listing2.rows[0].stock_alert, "alert persisted");
         assert!(
@@ -758,6 +791,111 @@ mod tests {
             !listing.rows[0].stock_alert,
             "no snapshot → no alert (pre-acceptance row)"
         );
+        assert!(listing.newly_triggered_alerts.is_empty());
+    }
+
+    /// S275 / F6 — a row that's already been DEALt no longer takes a
+    /// stock_alert recompute hit. A post-DEAL catalogue downgrade is
+    /// noise: the material commit is locked, the REFRESH gate doesn't
+    /// route anywhere, and emitting a `QuoteStockAlertTriggered` audit
+    /// entry adds zero forensic value while costing one ledger row.
+    #[test]
+    fn s275_recompute_skips_dealt_rows() {
+        let conn = open_mem();
+        seed_material(&conn, "t1", "6061-T6", "in_stock");
+        insert_accepted_quote(&conn, "t1", "q-dealt", "6061-T6", "in_stock");
+
+        // Mark the row DEALt — what the saga's CAS would write.
+        conn.execute_batch(S272_MIGRATION_BACKSTOP).unwrap();
+        conn.execute(
+            "UPDATE quote_intake_log
+                SET deal_issued_at = TIMESTAMP '2026-06-06 12:00:00',
+                    deal_sales_order_id = 'so_TEST',
+                    deal_work_order_id = 'wo_TEST'
+              WHERE quote_id = 'q-dealt' AND tenant_id = 't1'",
+            [],
+        )
+        .unwrap();
+
+        // Now downgrade the catalogue. Pre-F6 this would flip
+        // stock_alert TRUE on the dealt row + queue an audit entry.
+        conn.execute(
+            "UPDATE quoting_materials SET stock_status = 'special_order'
+              WHERE grade = '6061-T6' AND tenant_id = 't1'",
+            [],
+        )
+        .unwrap();
+
+        let listing = list_quote_intake_rows(&conn, "t1").unwrap();
+        assert_eq!(listing.rows.len(), 1);
+        assert!(
+            !listing.rows[0].stock_alert,
+            "dealt row stays un-flipped: recompute is a no-op post-DEAL"
+        );
+        assert!(
+            listing.newly_triggered_alerts.is_empty(),
+            "no audit entry queued for a dealt row's catalogue downgrade"
+        );
+    }
+
+    /// S275 / F6 — a picked-up row (operator already minted a draft from
+    /// the quote) also skips the recompute. The DEAL gate isn't the
+    /// operator's next action; alerting on the row doesn't route anywhere.
+    #[test]
+    fn s275_recompute_skips_picked_up_rows() {
+        let conn = open_mem();
+        seed_material(&conn, "t1", "6061-T6", "in_stock");
+        insert_accepted_quote(&conn, "t1", "q-picked", "6061-T6", "in_stock");
+        // Lazy schema backstops only land when `list_quote_intake_rows`
+        // runs; apply S255 manually before the test UPDATE writes the
+        // column.
+        conn.execute_batch(S255_MIGRATION_BACKSTOP).unwrap();
+        conn.execute(
+            "UPDATE quote_intake_log
+                SET picked_up_drf_id = 'drf_TEST'
+              WHERE quote_id = 'q-picked' AND tenant_id = 't1'",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "UPDATE quoting_materials SET stock_status = 'special_order'
+              WHERE grade = '6061-T6' AND tenant_id = 't1'",
+            [],
+        )
+        .unwrap();
+
+        let listing = list_quote_intake_rows(&conn, "t1").unwrap();
+        assert!(!listing.rows[0].stock_alert);
+        assert!(listing.newly_triggered_alerts.is_empty());
+    }
+
+    /// S275 / F6 — `error`-state rows are skipped too: they aren't
+    /// pickable and the operator's next action is retry/dismiss, not DEAL.
+    #[test]
+    fn s275_recompute_skips_error_rows() {
+        let conn = open_mem();
+        seed_material(&conn, "t1", "6061-T6", "in_stock");
+        insert_accepted_quote(&conn, "t1", "q-err", "6061-T6", "in_stock");
+        // Lazy schema backstops land inside `list_quote_intake_rows`;
+        // apply S256 manually so the UPDATE finds `intake_state` /
+        // `intake_error` columns.
+        conn.execute_batch(S256_MIGRATION_BACKSTOP).unwrap();
+        conn.execute(
+            "UPDATE quote_intake_log
+                SET intake_state = 'error', intake_error = 'bad'
+              WHERE quote_id = 'q-err' AND tenant_id = 't1'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE quoting_materials SET stock_status = 'special_order'
+              WHERE grade = '6061-T6' AND tenant_id = 't1'",
+            [],
+        )
+        .unwrap();
+        let listing = list_quote_intake_rows(&conn, "t1").unwrap();
+        assert!(!listing.rows[0].stock_alert);
         assert!(listing.newly_triggered_alerts.is_empty());
     }
 

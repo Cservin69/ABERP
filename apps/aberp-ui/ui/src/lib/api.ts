@@ -3054,6 +3054,14 @@ export interface QuoteIntakeRow {
   deal_sales_order_id: string | null;
   /** `wo_<ULID>` placeholder minted by the DEAL saga. */
   deal_work_order_id: string | null;
+  /** S275 / PR-264 / F5 — `true` once a DEAL saga has run on this row
+   * AND the saga's `material_commit` was `null` (the storefront pushed
+   * `material_grade = NULL` or `quantity = NULL`/0). Surfaced as a
+   * yellow chip on the row so the operator sees the silent skip
+   * without combing the audit ledger. Computed in the SPA from the
+   * dealQuote response (no separate column) — the QuotesList state
+   * mirror flips this when the saga returns. */
+  material_commit_skipped?: boolean;
 }
 
 export async function listQuoteIntake(): Promise<QuoteIntakeRow[]> {
@@ -3115,6 +3123,36 @@ export async function pickupQuoteAsDraft(quoteId: string): Promise<PickupQuoteOu
   return invoke<PickupQuoteOutcome>("pickup_quote_as_draft", { quoteId });
 }
 
+/** S275 / PR-264 / F1 — closed-vocab tag for what `qty` means on a
+ * material commit. Mirrors `aberp::material_inventory::QtyUnitKind`.
+ * Until the units → mm³ → kg conversion lands engine-side, every
+ * commit is `"units"` (the storefront's part count). The `"kg"` arm
+ * reserves the forward-compatible name. */
+export type QtyUnitKind = "units" | "kg";
+
+/** S273 / PR-262 — successful material-commit outcome returned on the
+ * DEAL saga's 200 body when the row carried `material_grade` +
+ * `quantity`. `null` on pre-storefront rows where the saga silently
+ * skipped the material branch (F5 — surfaced as a yellow chip). */
+export interface MaterialCommitOutcome {
+  reservation_id: string;
+  material_grade: string;
+  qty: number;
+  /** S275 / PR-264 / F1 — what `qty` means on this commit. */
+  qty_unit_kind: QtyUnitKind;
+  balance_after: {
+    on_hand_qty: number;
+    reserved_qty: number;
+    committed_qty: number;
+    consumed_qty: number;
+    available_qty: number;
+    material_grade: string;
+    tenant_id: string;
+    unit_of_measure: string;
+    last_updated: string;
+  };
+}
+
 /** S272 / PR-261 — DEAL saga outcome (ADR-0067).
  * `so_<ULID>` + `wo_<ULID>` are placeholders the future SO + WO
  * modules will adopt; for this PR they live only in the audit ledger.
@@ -3125,6 +3163,10 @@ export interface DealSagaOutcome {
   work_order_id: string;
   deal_issued_at: string;
   refresh_acknowledged: boolean;
+  /** S273 / PR-262 — material-commit outcome (`null` when the row
+   * carried no `material_grade`/`quantity` and the saga skipped the
+   * material branch). The SPA chip surfaces the skip per S275 / F5. */
+  material_commit: MaterialCommitOutcome | null;
 }
 
 /** Closed-vocab machine codes the SPA's 409 toast routes on. The
@@ -3136,7 +3178,9 @@ export type DealSagaErrorCode =
   | "deal_token_mismatch"
   | "deal_already_issued"
   | "not_actionable"
-  | "not_staged";
+  | "not_staged"
+  | "insufficient_material"
+  | "quote_expired";
 
 /** Typed wrapper carrying the parsed machine code so the SPA toast
  * can pick the right copy without substring matches on the raw error

@@ -88,6 +88,10 @@ export function dealSagaErrorTitle(code: DealSagaErrorCode | "unknown" | string)
       return "Az ajánlat nem dealelhető / Quote not actionable";
     case "not_staged":
       return "Az ajánlat nincs staged állapotban / Quote not staged";
+    case "insufficient_material":
+      return "Anyagkészlet nem elég / Insufficient material on hand";
+    case "quote_expired":
+      return "Az ajánlat érvényessége lejárt / Quote validity expired";
     default:
       return "A DEAL sikertelen / DEAL failed";
   }

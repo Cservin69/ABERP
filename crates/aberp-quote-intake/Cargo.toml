@@ -35,6 +35,9 @@ rust_decimal = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 zeroize = { workspace = true }
+# S275 / PR-264 / F2 — `flip_and_audit_in_tx` tests need
+# `Actor::test_only` which the ledger gates behind `test-support`.
+aberp-audit-ledger = { path = "../audit-ledger", features = ["test-support"] }
 
 # PR-235 / S241 — inherit workspace lint config.
 [lints]

@@ -90,13 +90,13 @@
   </header>
 
   <aside class="ib-page__notice">
-    <strong>v1:</strong> `qty` az árajánlat darabszáma (NEM kg). A
-    `units → mm³ → kg` konverzió a CAD-extract pipeline-tól vár (S275+).
-    Pirossal kiemelt sor = `available &lt; 0` invariáns-sértés.
+    <strong>v1:</strong> a mennyiségek minden DEAL-en stamp-elt
+    <code>unit_kind</code>-ot követnek (audit-bejegyzésben látható).
+    Pirossal kiemelt sor = <code>available &lt; 0</code> invariáns-sértés.
     <br />
-    <strong>v1:</strong> `qty` is QUOTE units (NOT kg). The units → mm³
-    → kg conversion waits on the CAD-extract pipeline (S275+). Red rows
-    = `available &lt; 0` invariant breach.
+    <strong>v1:</strong> quantities reflect the <code>unit_kind</code>
+    stamped on each commit; see the audit ledger entries for forensics.
+    Red rows = <code>available &lt; 0</code> invariant breach.
   </aside>
 
   {#if loadState === "error"}
@@ -120,7 +120,7 @@
             <th class="ib-table__th ib-table__th--text">Grade</th>
             <th class="ib-table__th ib-table__th--num">On hand</th>
             <th class="ib-table__th ib-table__th--num">Reserved</th>
-            <th class="ib-table__th ib-table__th--num">Committed</th>
+            <th class="ib-table__th ib-table__th--num" title="qty unit varies — see audit payload for unit_kind">Committed (qty)</th>
             <th class="ib-table__th ib-table__th--num">Consumed</th>
             <th class="ib-table__th ib-table__th--num">Available</th>
             <th class="ib-table__th ib-table__th--text">UoM</th>
@@ -278,7 +278,7 @@
     border-bottom: none;
   }
   .ib-table__row--breach {
-    background: rgba(255, 0, 0, 0.06);
+    background: color-mix(in srgb, var(--color-signal-negative) 6%, transparent);
   }
   .ib-table__td {
     padding: var(--space-2) var(--space-3);

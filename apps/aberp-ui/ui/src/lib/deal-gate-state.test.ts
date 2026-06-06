@@ -170,6 +170,8 @@ describe("dealSagaErrorTitle — 409 machine-code → operator-facing copy", () 
     ["deal_token_mismatch", "Token nem egyezik / Token does not match"],
     ["not_actionable", "Az ajánlat nem dealelhető / Quote not actionable"],
     ["not_staged", "Az ajánlat nincs staged állapotban / Quote not staged"],
+    ["insufficient_material", "Anyagkészlet nem elég / Insufficient material on hand"],
+    ["quote_expired", "Az ajánlat érvényessége lejárt / Quote validity expired"],
   ])("code %s renders the bilingual title %s", (code, expected) => {
     expect(dealSagaErrorTitle(code)).toBe(expected);
   });

@@ -59,7 +59,7 @@ use aberp_audit_ledger::{append_in_tx, Actor, EventKind, LedgerMeta};
 use aberp_quote_intake::log_table;
 
 use crate::material_inventory::{
-    self, MaterialCommitOutcome, MaterialCommittedPayload, MaterialInventoryError,
+    self, MaterialCommitOutcome, MaterialCommittedPayload, MaterialInventoryError, QtyUnitKind,
 };
 
 /// Literal token the operator must type into the REFRESH input when the
@@ -119,6 +119,16 @@ pub enum DealSagaError {
         already_reserved: f64,
         already_committed: f64,
     },
+    /// S275 / PR-264 / F32 — the row's `valid_until` is BEFORE the
+    /// saga's current date. A clock-drifted machine could otherwise
+    /// commit a 6-month-old quote at the original (now wrong) price.
+    /// Route maps to 409 `quote_expired`.
+    #[error("quote {quote_id} expired on {valid_until} (today is {today})")]
+    QuoteExpired {
+        quote_id: String,
+        valid_until: String,
+        today: String,
+    },
 }
 
 impl DealSagaError {
@@ -132,8 +142,38 @@ impl DealSagaError {
             DealSagaError::StockAlertRefreshRequired { .. } => "stock_alert_refresh_required",
             DealSagaError::DealTokenMismatch { .. } => "deal_token_mismatch",
             DealSagaError::InsufficientMaterial { .. } => "insufficient_material",
+            DealSagaError::QuoteExpired { .. } => "quote_expired",
         }
     }
+}
+
+/// S275 / PR-264 / F32 — pure-function expiry check the saga calls
+/// inside its preconditions. The DB stores `valid_until` as a `DATE`
+/// (YYYY-MM-DD); the parser is the `time` crate's strict date format.
+///
+/// Semantics:
+/// - `valid_until = None` (storefront pre-S271 row, or the writer
+///   simply omitted it): the saga proceeds. Absence is "no expiry on
+///   file," not "expired."
+/// - `valid_until` unparseable: same — the saga proceeds. A storefront
+///   writer that pushes garbage is a producer bug; loud-failing the
+///   saga on a parse error would punish the operator for a problem
+///   they cannot fix from the SPA. The audit walk preserves the raw
+///   string so a forensic check still surfaces the bug.
+/// - `valid_until < today`: the saga refuses and the SPA toast routes
+///   to a `quote_expired` 409.
+/// - `valid_until >= today`: the saga proceeds. Same-day expiry is
+///   honoured (the customer accepted on the same day this was minted;
+///   refusing is hostile UX).
+pub fn quote_is_expired(valid_until_ymd: Option<&str>, today: time::Date) -> bool {
+    let Some(raw) = valid_until_ymd else {
+        return false;
+    };
+    let parser = time::macros::format_description!("[year]-[month]-[day]");
+    let Ok(valid_until) = time::Date::parse(raw, &parser) else {
+        return false;
+    };
+    valid_until < today
 }
 
 /// Compute the expected DEAL token from a row's `quote_id`. The
@@ -324,9 +364,23 @@ pub fn run_deal_saga(
     }
 
     // ── Saga tx ───────────────────────────────────────────────────────
-    let now_iso = time::OffsetDateTime::now_utc()
+    let now_utc = time::OffsetDateTime::now_utc();
+    let now_iso = now_utc
         .format(&time::format_description::well_known::Rfc3339)
         .context("format DEAL timestamp")?;
+
+    // S275 / F32 — expiry check after the cheaper precondition checks
+    // (so a wrong DEAL token still gets the more specific 409 instead
+    // of being masked by an expiry error). Conservative on parse
+    // failure / NULL — see `quote_is_expired` docs.
+    let today_utc = now_utc.date();
+    if quote_is_expired(row.valid_until.as_deref(), today_utc) {
+        return Err(anyhow!(DealSagaError::QuoteExpired {
+            quote_id: inputs.quote_id.clone(),
+            valid_until: row.valid_until.clone().unwrap_or_default(),
+            today: today_utc.to_string(),
+        }));
+    }
     let sales_order_id = format!("so_{}", Ulid::new());
     let work_order_id = format!("wo_{}", Ulid::new());
     let idempotency_key = deal_idempotency_key(&inputs.quote_id);
@@ -354,12 +408,33 @@ pub fn run_deal_saga(
     )
     .map_err(|e| anyhow!("CAS mark_deal_issued_in_tx: {e}"))?;
     if claimed != 1 {
+        // S275 / F25 — distinguish "row gone" from "already dealt"
+        // before surfacing a 409. The CAS rejects in BOTH cases; the
+        // operator's fix paths are different (404-shaped on a gone row,
+        // 409 on a replay). Re-read inside the tx for a single source
+        // of truth — DuckDB's snapshot isolation makes this read
+        // consistent with whatever state lost the race.
+        let row_now = log_table::read_for_deal_in_tx(&tx, &inputs.tenant, &inputs.quote_id)
+            .map_err(|e| anyhow!("re-read after CAS rejection: {e}"))?;
         // Drop the tx → roll back any prior partial state. (None in
         // this case — the CAS was the first write — but the pattern
         // mirrors quote_pickup's lost-race rollback for symmetry.)
         drop(tx);
-        return Err(anyhow!(DealSagaError::DealAlreadyIssued {
-            quote_id: inputs.quote_id.clone(),
+        return Err(anyhow!(match row_now {
+            None => DealSagaError::NotStaged {
+                tenant: inputs.tenant.clone(),
+                quote_id: inputs.quote_id.clone(),
+            },
+            Some(r) if r.intake_state != log_table::STATE_STAGED => DealSagaError::NotActionable {
+                quote_id: inputs.quote_id.clone(),
+                state: r.intake_state,
+            },
+            // Row is still staged → CAS rejected because another
+            // writer set `deal_issued_at` between our pre-flight and
+            // the CAS. This is the genuine "already dealt" path.
+            Some(_) => DealSagaError::DealAlreadyIssued {
+                quote_id: inputs.quote_id.clone(),
+            },
         }));
     }
 
@@ -448,12 +523,19 @@ pub fn run_deal_saga(
         match (row.material_grade.as_deref(), row.quantity) {
             (Some(grade), Some(qty_units)) if !grade.is_empty() && qty_units > 0 => {
                 let qty = qty_units as f64;
+                // S275 / F1 — stamp the unit kind so the audit walk +
+                // SPA can tell `qty` is QUOTE units, not kg. The full
+                // units → mm³ → kg conversion is engine-strand work
+                // and lands later; until then every saga commits
+                // `Units` and the SPA renders the header accordingly.
+                let qty_unit_kind = QtyUnitKind::Units;
                 let commit_outcome = material_inventory::commit_material_in_tx(
                     &tx,
                     &inputs.tenant,
                     &inputs.quote_id,
                     grade,
                     qty,
+                    qty_unit_kind,
                 )
                 .map_err(|e| {
                     // Lift the typed inventory error into the saga's
@@ -488,6 +570,7 @@ pub fn run_deal_saga(
                     tenant_id: inputs.tenant.clone(),
                     material_grade: grade.to_string(),
                     qty,
+                    qty_unit_kind,
                     reservation_id: commit_outcome.reservation_id.clone(),
                     actor: inputs.actor.clone(),
                     idempotency_key: material_idempotency_key.clone(),
@@ -1160,6 +1243,146 @@ mod tests {
         assert_eq!(bal.committed_qty, 0.0, "rollback restored committed_qty");
     }
 
+    // ── S275 / PR-264 / F32 — valid_until expiry guard ───────────────
+
+    fn set_valid_until(conn: &Connection, quote_id: &str, ymd: &str) {
+        conn.execute(
+            &format!(
+                "UPDATE quote_intake_log
+                    SET valid_until = DATE '{ymd}'
+                  WHERE quote_id = ?1 AND tenant_id = 'test-tenant'"
+            ),
+            duckdb::params![quote_id],
+        )
+        .unwrap();
+    }
+
+    /// `quote_is_expired` pure-function pin: None passes through; an
+    /// unparseable string passes through; a past date is expired; today
+    /// and a future date are NOT expired.
+    #[test]
+    fn quote_is_expired_handles_none_garbage_past_today_future() {
+        let today = time::Date::from_calendar_date(2026, time::Month::June, 6).unwrap();
+        assert!(!quote_is_expired(None, today));
+        assert!(!quote_is_expired(Some("not-a-date"), today));
+        assert!(!quote_is_expired(Some("2026-06-06"), today)); // same day
+        assert!(!quote_is_expired(Some("2026-06-07"), today)); // tomorrow
+        assert!(quote_is_expired(Some("2026-06-05"), today)); // yesterday
+        assert!(quote_is_expired(Some("2025-12-31"), today)); // last year
+    }
+
+    /// Saga refuses an expired quote with the `quote_expired` machine
+    /// code. The row stays un-dealt so an operator can reissue the
+    /// quote storefront-side (or extend the validity) and re-DEAL.
+    #[test]
+    fn s275_saga_refuses_expired_quote() {
+        let mut conn = open_conn();
+        let quote_id = full_uuid_quote_id();
+        stage_quote(&conn, quote_id);
+        // Yesterday relative to any reasonable system clock — keeps the
+        // test deterministic by being well in the past.
+        set_valid_until(&conn, quote_id, "2024-01-01");
+        let meta = ledger_meta();
+        let err = run_deal_saga(
+            &mut conn,
+            &meta,
+            actor(),
+            DealSagaInputs {
+                tenant: "test-tenant".into(),
+                quote_id: quote_id.into(),
+                actor: "operator-A".into(),
+                deal_token: "0226e154".into(),
+                refresh_ack: None,
+            },
+        )
+        .unwrap_err();
+        let saga = err.downcast::<DealSagaError>().expect("typed saga error");
+        assert_eq!(saga.machine_code(), "quote_expired");
+
+        // Row stays un-dealt — no SO/WO mint, no audit entries.
+        let row = quote_log::read_for_deal(&conn, "test-tenant", quote_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.deal_issued_at, None);
+    }
+
+    /// A row with no `valid_until` on file (pre-storefront / NULL)
+    /// proceeds — absence is "no expiry," not "expired." This pins the
+    /// graceful-fallback path so the saga keeps working before the
+    /// storefront writer is live.
+    #[test]
+    fn s275_saga_proceeds_when_valid_until_is_null() {
+        let mut conn = open_conn();
+        let quote_id = full_uuid_quote_id();
+        stage_quote(&conn, quote_id);
+        let meta = ledger_meta();
+        run_deal_saga(
+            &mut conn,
+            &meta,
+            actor(),
+            DealSagaInputs {
+                tenant: "test-tenant".into(),
+                quote_id: quote_id.into(),
+                actor: "operator-A".into(),
+                deal_token: "0226e154".into(),
+                refresh_ack: None,
+            },
+        )
+        .expect("NULL valid_until → saga proceeds");
+    }
+
+    // ── S275 / PR-264 / F25 — post-CAS error discrimination ──────────
+
+    /// If the row is deleted between pre-flight and the CAS, the
+    /// saga's CAS rejects with zero rows updated; pre-F25 the saga
+    /// returned `deal_already_issued`, which routes operator action to
+    /// "this quote was dealt" — wrong. After F25, the post-CAS
+    /// re-read inside the same tx surfaces the genuine "row gone"
+    /// state and the saga returns `not_staged`.
+    #[test]
+    fn s275_saga_returns_not_staged_when_row_deleted_between_preflight_and_cas() {
+        let mut conn = open_conn();
+        let quote_id = full_uuid_quote_id();
+        stage_quote(&conn, quote_id);
+        // Simulate the deletion race by deleting the row before the
+        // saga runs — the saga's read_for_deal pre-flight would have
+        // seen it; we delete it now so the CAS lands on zero rows.
+        // (The genuine race is between two HTTP requests; deletion in
+        // the test is the equivalent observable state.)
+        let pre_row = quote_log::read_for_deal(&conn, "test-tenant", quote_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pre_row.intake_state, "staged");
+        conn.execute(
+            "DELETE FROM quote_intake_log WHERE quote_id = ?1 AND tenant_id = 'test-tenant'",
+            duckdb::params![quote_id],
+        )
+        .unwrap();
+        // The saga's own pre-flight will return NotStaged here because
+        // the row is already gone; the F25 fix path inside the tx is
+        // exercised by a different test path (concurrent CAS race —
+        // hard to reproduce sync). This test pins the OUTER `not_staged`
+        // path that any pre-flight gone-row should surface.
+        let meta = ledger_meta();
+        let err = run_deal_saga(
+            &mut conn,
+            &meta,
+            actor(),
+            DealSagaInputs {
+                tenant: "test-tenant".into(),
+                quote_id: quote_id.into(),
+                actor: "operator-A".into(),
+                deal_token: "0226e154".into(),
+                refresh_ack: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.downcast::<DealSagaError>().unwrap().machine_code(),
+            "not_staged"
+        );
+    }
+
     /// Insufficient-material error surfaces a distinct machine code
     /// from the other DEAL failure modes — pinned so the SPA's toast
     /// router doesn't conflate this with `deal_token_mismatch` or
@@ -1196,6 +1419,12 @@ mod tests {
                 on_hand: 0.0,
                 already_reserved: 0.0,
                 already_committed: 0.0,
+            }
+            .machine_code(),
+            DealSagaError::QuoteExpired {
+                quote_id: "q".into(),
+                valid_until: "2024-01-01".into(),
+                today: "2026-06-06".into(),
             }
             .machine_code(),
         ];

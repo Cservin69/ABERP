@@ -344,49 +344,79 @@ pub fn mark_irrelevant(
 /// A repeat call on an already-flipped row returns `false` (sticky); a
 /// call against a non-existent row also returns `false`.
 ///
-/// The audit-emit caller (the SPA list route in `serve.rs`) uses the
-/// returned bool as its only-once trigger: exactly one
-/// `QuoteStockAlertTriggered` audit entry per row that newly transitions
-/// to TRUE.
-///
-/// Why read-then-write instead of `UPDATE ... WHERE`: DuckDB's UPDATE
-/// rowcount reflects the predicate-matched count without surfacing
-/// whether the SET actually altered the column — a guarded UPDATE on a
-/// no-op row still reports `1`. A separate SELECT pin makes the
-/// transition observable in app code without depending on
-/// rows-affected semantics, per [[no-sql-specific]].
+/// S275 / PR-264 / F10 — uses a **guarded UPDATE** (no separate SELECT)
+/// as the single source of truth for the transition signal. The previous
+/// read-then-write was TOCTOU-prone: two concurrent recompute passes
+/// could both SELECT `false`, both UPDATE, both return `true`, both emit
+/// one audit entry — double audit for one transition. The guarded
+/// UPDATE's `rows_affected == 1` IS the transition signal; DuckDB's
+/// MVCC serialises the two writes so only one returns `1`.
 pub fn flip_stock_alert_to_true(
     conn: &Connection,
     tenant_id: &str,
     quote_id: &str,
 ) -> Result<bool, QuoteIntakeError> {
     ensure_schema(conn)?;
-    let stored: Option<Option<bool>> = conn
-        .query_row(
-            "SELECT stock_alert FROM quote_intake_log
-              WHERE quote_id = ?1 AND tenant_id = ?2",
+    let rows = conn
+        .execute(
+            "UPDATE quote_intake_log
+                SET stock_alert = TRUE
+              WHERE quote_id = ?1 AND tenant_id = ?2
+                AND (stock_alert IS NULL OR stock_alert = FALSE)",
             params![quote_id, tenant_id],
-            |r| r.get::<_, Option<bool>>(0),
         )
-        .map(Some)
-        .or_else(|e| match e {
-            duckdb::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other),
-        })
-        .map_err(|e| QuoteIntakeError::Storage(format!("read stock_alert: {e}")))?;
-    let Some(stored) = stored else {
-        return Ok(false); // no matching row → nothing to flip
-    };
-    if stored.unwrap_or(false) {
-        return Ok(false); // sticky
+        .map_err(|e| QuoteIntakeError::Storage(format!("flip stock_alert to TRUE: {e}")))?;
+    Ok(rows == 1)
+}
+
+/// S275 / PR-264 / F2 + F16 — guarded flip + audit append, all inside
+/// one caller-owned [`duckdb::Transaction`]. On a successful transition
+/// (the guarded UPDATE matches one row), the audit append rides the
+/// same tx as the flip so a panic or process loss between them rolls
+/// BOTH back. The previous shape — flip in one conn + audit in a
+/// separately-opened ledger — could land a sticky-true row without an
+/// audit explaining why.
+///
+/// Returns `true` iff THIS call performed the transition. On `false`
+/// (sticky-true row, missing row, or a concurrent winner) no audit is
+/// emitted. The `idempotency_key` rides the audit entry so a transient
+/// retry of the route call cannot land two entries for the same
+/// (quote, transition) pair (F16).
+///
+/// Caller is responsible for `tx.commit()` — this function only
+/// participates in the tx.
+pub fn flip_and_audit_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    tenant_id: &str,
+    quote_id: &str,
+    ledger_meta: &aberp_audit_ledger::LedgerMeta,
+    payload: Vec<u8>,
+    actor: aberp_audit_ledger::Actor,
+    idempotency_key: String,
+) -> Result<bool, QuoteIntakeError> {
+    let rows = tx
+        .execute(
+            "UPDATE quote_intake_log
+                SET stock_alert = TRUE
+              WHERE quote_id = ?1 AND tenant_id = ?2
+                AND (stock_alert IS NULL OR stock_alert = FALSE)",
+            params![quote_id, tenant_id],
+        )
+        .map_err(|e| QuoteIntakeError::Storage(format!("flip stock_alert in tx: {e}")))?;
+    if rows != 1 {
+        return Ok(false);
     }
-    conn.execute(
-        "UPDATE quote_intake_log
-            SET stock_alert = TRUE
-          WHERE quote_id = ?1 AND tenant_id = ?2",
-        params![quote_id, tenant_id],
+    aberp_audit_ledger::append_in_tx(
+        tx,
+        ledger_meta,
+        aberp_audit_ledger::EventKind::QuoteStockAlertTriggered,
+        payload,
+        actor,
+        Some(idempotency_key),
     )
-    .map_err(|e| QuoteIntakeError::Storage(format!("flip stock_alert to TRUE: {e}")))?;
+    .map_err(|e| {
+        QuoteIntakeError::Storage(format!("append QuoteStockAlertTriggered in tx: {e}"))
+    })?;
     Ok(true)
 }
 
@@ -663,6 +693,12 @@ pub struct DealSourceRow {
     /// volume + the catalogue density, neither of which is plumbed yet).
     /// `None` on pre-storefront rows.
     pub quantity: Option<i64>,
+    /// S275 / F32 — quote validity expiry as `YYYY-MM-DD`. The DEAL
+    /// saga refuses to deal an expired quote (a 6-month-old quote at
+    /// the original — now wrong — price). `None` on pre-storefront rows
+    /// where the storefront-side writer has not populated the column;
+    /// the saga treats absence as "no expiry on file" and proceeds.
+    pub valid_until: Option<String>,
 }
 
 pub fn read_for_deal(
@@ -671,15 +707,59 @@ pub fn read_for_deal(
     quote_id: &str,
 ) -> Result<Option<DealSourceRow>, QuoteIntakeError> {
     ensure_schema(conn)?;
+    read_for_deal_inner(conn, tenant_id, quote_id)
+}
+
+/// S275 / PR-264 / F25 — same as [`read_for_deal`] but driven by an
+/// open transaction. The DEAL saga calls this *after* a 0-row CAS to
+/// discriminate "row deleted between pre-flight and CAS" from "another
+/// writer dealt the row first" — DuckDB snapshot isolation gives us
+/// a consistent read against the same logical point.
+pub fn read_for_deal_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    tenant_id: &str,
+    quote_id: &str,
+) -> Result<Option<DealSourceRow>, QuoteIntakeError> {
+    // No `ensure_schema` here — the saga's tx is opened *after*
+    // `ensure_schema` runs in `run_deal_saga`'s preamble, so the
+    // columns are guaranteed present.
+    read_for_deal_inner(tx, tenant_id, quote_id)
+}
+
+trait DealRowRunner {
+    fn prepare_for_deal(&self, sql: &str) -> duckdb::Result<duckdb::Statement<'_>>;
+}
+
+impl DealRowRunner for Connection {
+    fn prepare_for_deal(&self, sql: &str) -> duckdb::Result<duckdb::Statement<'_>> {
+        self.prepare(sql)
+    }
+}
+
+impl<'tx> DealRowRunner for duckdb::Transaction<'tx> {
+    fn prepare_for_deal(&self, sql: &str) -> duckdb::Result<duckdb::Statement<'_>> {
+        self.prepare(sql)
+    }
+}
+
+fn read_for_deal_inner<R: DealRowRunner>(
+    runner: &R,
+    tenant_id: &str,
+    quote_id: &str,
+) -> Result<Option<DealSourceRow>, QuoteIntakeError> {
     // DuckDB's TIMESTAMP rust binding can't auto-decode into
     // `Option<String>`; CAST to VARCHAR so the row reader is uniform
     // with the other VARCHAR columns. The ISO/RFC3339 round-trip we
     // need (UI + audit walks) survives the cast.
-    let mut stmt = conn
-        .prepare(
+    // `valid_until` is a `DATE` (S271 migration); the Rust binding
+    // can decode that directly into `Option<String>` as `YYYY-MM-DD`
+    // without an explicit cast.
+    let mut stmt = runner
+        .prepare_for_deal(
             "SELECT COALESCE(intake_state, ?3), stock_alert,
                     CAST(deal_issued_at AS VARCHAR),
-                    material_grade, quantity
+                    material_grade, quantity,
+                    CAST(valid_until AS VARCHAR)
                FROM quote_intake_log
               WHERE quote_id = ?1 AND tenant_id = ?2
               LIMIT 1",
@@ -709,12 +789,16 @@ pub fn read_for_deal(
     let quantity: Option<i64> = row
         .get(4)
         .map_err(|e| QuoteIntakeError::Storage(format!("get quantity: {e}")))?;
+    let valid_until: Option<String> = row
+        .get(5)
+        .map_err(|e| QuoteIntakeError::Storage(format!("get valid_until: {e}")))?;
     Ok(Some(DealSourceRow {
         intake_state,
         stock_alert: stock_alert_raw.unwrap_or(false),
         deal_issued_at,
         material_grade,
         quantity,
+        valid_until,
     }))
 }
 
@@ -1126,6 +1210,8 @@ mod tests {
         // S273 — pre-storefront row has no material_grade / quantity.
         assert_eq!(row.material_grade, None);
         assert_eq!(row.quantity, None);
+        // S275 / F32 — pre-storefront row has no valid_until either.
+        assert_eq!(row.valid_until, None);
 
         // Flip stock_alert TRUE; the helper must surface it.
         assert!(flip_stock_alert_to_true(&conn, "t", "q1").unwrap());
@@ -1159,6 +1245,23 @@ mod tests {
         let row = read_for_deal(&conn, "t", "q1").unwrap().unwrap();
         assert_eq!(row.material_grade.as_deref(), Some("6061-T6"));
         assert_eq!(row.quantity, Some(12));
+    }
+
+    /// S275 / F32 — once the storefront writer populates `valid_until`,
+    /// `read_for_deal` surfaces it so the saga can refuse expired quotes.
+    #[test]
+    fn s275_read_for_deal_surfaces_valid_until() {
+        let conn = open_mem();
+        insert_intake(&conn, "t", "q1", "inv_A", "r", now(), "{}", "{}").unwrap();
+        conn.execute(
+            "UPDATE quote_intake_log
+                SET valid_until = DATE '2026-09-01'
+              WHERE quote_id = ?1 AND tenant_id = ?2",
+            params!["q1", "t"],
+        )
+        .unwrap();
+        let row = read_for_deal(&conn, "t", "q1").unwrap().unwrap();
+        assert_eq!(row.valid_until.as_deref(), Some("2026-09-01"));
     }
 
     /// CAS pin — `mark_deal_issued_in_tx` returns 1 on first call (the
@@ -1219,6 +1322,180 @@ mod tests {
             row.deal_issued_at.is_some(),
             "deal_issued_at carries through read_for_deal after CAS"
         );
+    }
+
+    // ── S275 / PR-264 / F2 + F10 + F16 — guarded UPDATE + flip+audit
+    //    in one tx ──────────────────────────────────────────────────
+
+    /// F10 pin — the guarded UPDATE returns `rows_affected == 1` ONLY
+    /// when it actually performed the FALSE/NULL → TRUE transition.
+    /// On a sticky-TRUE row the predicate `(stock_alert IS NULL OR
+    /// stock_alert = FALSE)` excludes the row, the UPDATE matches zero
+    /// rows, and `flip_stock_alert_to_true` returns `false`.
+    #[test]
+    fn s275_flip_returns_false_on_sticky_row_via_guarded_update() {
+        let conn = open_mem();
+        insert_intake(&conn, "t", "q1", "inv_A", "r", now(), "{}", "{}").unwrap();
+        // First call: NULL → TRUE transition, returns true.
+        assert!(flip_stock_alert_to_true(&conn, "t", "q1").unwrap());
+        // Second call: stored is TRUE, guarded UPDATE matches zero rows.
+        assert!(!flip_stock_alert_to_true(&conn, "t", "q1").unwrap());
+        // Missing row: zero rows affected → false.
+        assert!(!flip_stock_alert_to_true(&conn, "t", "q-missing").unwrap());
+    }
+
+    fn ledger_meta_for_test() -> aberp_audit_ledger::LedgerMeta {
+        aberp_audit_ledger::LedgerMeta::new(
+            aberp_audit_ledger::TenantId::new("t").unwrap(),
+            aberp_audit_ledger::BinaryHash::from_bytes([0u8; 32]),
+        )
+    }
+
+    /// F2 pin — happy path: the flip and the audit append ride the
+    /// same tx; both land after commit.
+    #[test]
+    fn s275_flip_and_audit_in_tx_lands_both_on_commit() {
+        let mut conn = open_mem();
+        aberp_audit_ledger::ensure_schema(&conn).unwrap();
+        insert_intake(&conn, "t", "q1", "inv_A", "r", now(), "{}", "{}").unwrap();
+
+        let meta = ledger_meta_for_test();
+        let payload = br#"{"quote_id":"q1","material_grade":"6061-T6"}"#.to_vec();
+        let tx = conn.transaction().unwrap();
+        let flipped = flip_and_audit_in_tx(
+            &tx,
+            "t",
+            "q1",
+            &meta,
+            payload,
+            aberp_audit_ledger::Actor::test_only(),
+            "stock_alert_triggered:q1".to_string(),
+        )
+        .unwrap();
+        assert!(flipped, "first flip wins");
+        tx.commit().unwrap();
+
+        // DB: stock_alert = TRUE.
+        let alert: Option<bool> = conn
+            .query_row(
+                "SELECT stock_alert FROM quote_intake_log
+                  WHERE quote_id = 'q1' AND tenant_id = 't'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alert, Some(true));
+
+        // Audit: exactly one QuoteStockAlertTriggered entry.
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_ledger
+                  WHERE kind = 'quote.stock_alert_triggered'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// F2 / F16 pin — if the saga drops the tx (or any failure happens
+    /// after the guarded UPDATE but before commit), BOTH the flip AND
+    /// the audit append roll back atomically. The previous shape — flip
+    /// in a plain conn followed by an audit on a separately-opened
+    /// ledger — could leave a sticky-true row with no audit explaining
+    /// why. This pin fails against that old shape.
+    #[test]
+    fn s275_flip_and_audit_in_tx_rolls_back_when_tx_is_dropped() {
+        let mut conn = open_mem();
+        aberp_audit_ledger::ensure_schema(&conn).unwrap();
+        insert_intake(&conn, "t", "q1", "inv_A", "r", now(), "{}", "{}").unwrap();
+
+        let meta = ledger_meta_for_test();
+        let payload = br#"{"quote_id":"q1"}"#.to_vec();
+        let tx = conn.transaction().unwrap();
+        let flipped = flip_and_audit_in_tx(
+            &tx,
+            "t",
+            "q1",
+            &meta,
+            payload,
+            aberp_audit_ledger::Actor::test_only(),
+            "stock_alert_triggered:q1".to_string(),
+        )
+        .unwrap();
+        assert!(flipped);
+        // Drop without commit — simulates the saga's failure path
+        // between the flip+audit and tx.commit().
+        drop(tx);
+
+        // DB: stock_alert remains NULL (the flip rolled back).
+        let alert: Option<bool> = conn
+            .query_row(
+                "SELECT stock_alert FROM quote_intake_log
+                  WHERE quote_id = 'q1' AND tenant_id = 't'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alert, None, "flip rolled back");
+
+        // Audit: zero entries — the audit append rolled back too.
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_ledger
+                  WHERE kind = 'quote.stock_alert_triggered'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "audit append rolled back with the flip");
+    }
+
+    /// F2 / F16 pin — a second tx against the same sticky-TRUE row
+    /// gets `rows_affected == 0` from the guarded UPDATE and SKIPS the
+    /// audit append entirely. Combined with the idempotency-key field,
+    /// this gives the "exactly one audit entry per (quote, transition)
+    /// pair" invariant the brief asks for.
+    #[test]
+    fn s275_flip_and_audit_in_tx_skips_audit_on_sticky_row() {
+        let mut conn = open_mem();
+        aberp_audit_ledger::ensure_schema(&conn).unwrap();
+        insert_intake(&conn, "t", "q1", "inv_A", "r", now(), "{}", "{}").unwrap();
+        // Pre-set stock_alert TRUE — simulate a winning concurrent
+        // recompute that already flipped + emitted.
+        conn.execute(
+            "UPDATE quote_intake_log SET stock_alert = TRUE
+              WHERE quote_id = 'q1' AND tenant_id = 't'",
+            [],
+        )
+        .unwrap();
+
+        let meta = ledger_meta_for_test();
+        let payload = br#"{"quote_id":"q1"}"#.to_vec();
+        let tx = conn.transaction().unwrap();
+        let flipped = flip_and_audit_in_tx(
+            &tx,
+            "t",
+            "q1",
+            &meta,
+            payload,
+            aberp_audit_ledger::Actor::test_only(),
+            "stock_alert_triggered:q1".to_string(),
+        )
+        .unwrap();
+        assert!(!flipped, "guarded UPDATE matched zero rows on sticky-TRUE");
+        tx.commit().unwrap();
+
+        // Audit: zero entries — the loser must not append.
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_ledger
+                  WHERE kind = 'quote.stock_alert_triggered'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

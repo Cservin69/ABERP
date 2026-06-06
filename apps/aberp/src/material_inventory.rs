@@ -113,6 +113,37 @@ use aberp_audit_ledger::{append_in_tx, Actor, EventKind, LedgerMeta};
 /// schema decision (the SPA's UoM column makes the convention visible).
 pub const DEFAULT_UOM: &str = "kg";
 
+/// S275 / PR-264 / F1 — closed-vocab tag for the `qty_unit_kind` column
+/// on `inventory_reservations` AND for the same field on the
+/// [`MaterialCommittedPayload`] audit body. Pre-S275 the DEAL saga
+/// passed quote *units* (number of parts) verbatim as `qty`, leaving
+/// the inventory balance numerically misleading — the SPA banner
+/// disclaimed it but the audit payload couldn't be cross-referenced for
+/// forensics without operator memory. Stamping the kind on the row +
+/// payload makes the unit explicit so a forensic walk N months out can
+/// read `"units"` and know NOT to interpret it as kg.
+///
+/// `Units`: legacy v1 — quote-quantity verbatim, NOT a mass.
+/// `Kg`: post-conversion — the units → mm³ (FeatureGraph volume) → kg
+/// (catalogue density) pipeline has fired. Until that pipeline lands
+/// the SPA never receives this variant; reserving the name now keeps
+/// the audit walk forward-compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QtyUnitKind {
+    Units,
+    Kg,
+}
+
+impl QtyUnitKind {
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            QtyUnitKind::Units => "units",
+            QtyUnitKind::Kg => "kg",
+        }
+    }
+}
+
 /// Closed-vocab reservation state per ADR-0069. App-layer enforced; the
 /// DB column is plain VARCHAR. Adding a state is a coordinated edit
 /// across the storage-string round-trip pin, the round-trip helpers,
@@ -213,6 +244,16 @@ CREATE TABLE IF NOT EXISTS inventory_reservations (
     created_at       VARCHAR NOT NULL,
     transitioned_at  VARCHAR NOT NULL
 );
+-- S275 / PR-264 / F1 — additive `qty_unit_kind` column. Stamps what
+-- `qty` actually means on this row: `units` (current — QUOTE units,
+-- the storefront's part count, NOT mass) or `kg` (post-S275+ engine
+-- conversion). A future ALTER must NOT add a SQL DEFAULT (DuckDB
+-- replay-clobber trap, same as the S271 `stock_alert` and
+-- `quoting_materials` notes). Coerced to a known value in the app
+-- layer at write time; reads tolerate NULL on pre-S275 rows by
+-- treating it as `units`.
+ALTER TABLE inventory_reservations
+    ADD COLUMN IF NOT EXISTS qty_unit_kind VARCHAR;
 ";
 
 /// Idempotent `CREATE TABLE IF NOT EXISTS` for both tables. Called at
@@ -398,7 +439,19 @@ pub struct MaterialCommitOutcome {
     pub reservation_id: String,
     pub material_grade: String,
     pub qty: f64,
+    /// S275 / PR-264 / F1 — what `qty` actually means. Defaults to
+    /// [`QtyUnitKind::Units`] on legacy commits; will flip to
+    /// [`QtyUnitKind::Kg`] when the units → mm³ → kg conversion lands.
+    /// `#[serde(default)]` so a wire body without the field deserializes
+    /// to the legacy default (back-compat for anything that round-trips
+    /// the saga outcome through JSON before the storefront cutover).
+    #[serde(default = "default_qty_unit_kind")]
+    pub qty_unit_kind: QtyUnitKind,
     pub balance_after: Balance,
+}
+
+fn default_qty_unit_kind() -> QtyUnitKind {
+    QtyUnitKind::Units
 }
 
 /// The core write path — called inside the DEAL saga's tx. Five steps,
@@ -429,6 +482,7 @@ pub fn commit_material_in_tx(
     quote_id: &str,
     material_grade: &str,
     qty: f64,
+    qty_unit_kind: QtyUnitKind,
 ) -> Result<MaterialCommitOutcome> {
     // Step 1 — ensure schema. CREATE TABLE IF NOT EXISTS inside a tx is
     // fine in DuckDB; the saga's tx is the same connection.
@@ -493,8 +547,8 @@ pub fn commit_material_in_tx(
     tx.execute(
         "INSERT INTO inventory_reservations (
             reservation_id, tenant_id, quote_id, material_grade,
-            qty, state, created_at, transitioned_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            qty, state, created_at, transitioned_at, qty_unit_kind
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
         params![
             &reservation_id,
             tenant,
@@ -503,6 +557,7 @@ pub fn commit_material_in_tx(
             qty,
             ReservationState::Committed.as_db_str(),
             &now_iso,
+            qty_unit_kind.as_db_str(),
         ],
     )
     .context("INSERT inventory_reservations")?;
@@ -529,6 +584,7 @@ pub fn commit_material_in_tx(
         reservation_id,
         material_grade: material_grade.to_string(),
         qty,
+        qty_unit_kind,
         balance_after: after,
     })
 }
@@ -544,6 +600,14 @@ pub struct MaterialCommittedPayload {
     pub tenant_id: String,
     pub material_grade: String,
     pub qty: f64,
+    /// S275 / PR-264 / F1 — what `qty` actually means on this entry.
+    /// A forensic walk reading `qty = 12` AND `qty_unit_kind = "units"`
+    /// knows NOT to interpret the 12 as kilograms. `#[serde(default)]`
+    /// so a payload written before the field existed deserialises to
+    /// the legacy `Units` default (the only path that ever wrote
+    /// `MaterialCommittedPayload` ran with `qty` as quote units).
+    #[serde(default = "default_qty_unit_kind")]
+    pub qty_unit_kind: QtyUnitKind,
     pub reservation_id: String,
     pub actor: String,
     pub idempotency_key: String,
@@ -655,7 +719,8 @@ mod tests {
         .unwrap();
 
         let tx = conn.transaction().unwrap();
-        let outcome = commit_material_in_tx(&tx, "t", "q1", "6061-T6", 12.0).unwrap();
+        let outcome =
+            commit_material_in_tx(&tx, "t", "q1", "6061-T6", 12.0, QtyUnitKind::Units).unwrap();
         tx.commit().unwrap();
 
         assert_eq!(outcome.material_grade, "6061-T6");
@@ -687,7 +752,8 @@ mod tests {
     fn commit_material_against_missing_balance_upserts_then_fails_insufficient() {
         let mut conn = open_conn();
         let tx = conn.transaction().unwrap();
-        let err = commit_material_in_tx(&tx, "t", "q1", "InconeL 718", 5.0).unwrap_err();
+        let err = commit_material_in_tx(&tx, "t", "q1", "InconeL 718", 5.0, QtyUnitKind::Units)
+            .unwrap_err();
         // The tx rolls back the upsert when dropped (we don't commit).
         drop(tx);
         let typed = err
@@ -723,7 +789,8 @@ mod tests {
         )
         .unwrap();
         let tx = conn.transaction().unwrap();
-        let err = commit_material_in_tx(&tx, "t", "q1", "316", 15.0).unwrap_err();
+        let err =
+            commit_material_in_tx(&tx, "t", "q1", "316", 15.0, QtyUnitKind::Units).unwrap_err();
         drop(tx);
         let typed = err.downcast::<MaterialInventoryError>().unwrap();
         assert_eq!(typed.machine_code(), "insufficient_material");
@@ -759,7 +826,8 @@ mod tests {
 
         // 15 fails (available is 10).
         let tx = conn.transaction().unwrap();
-        let err = commit_material_in_tx(&tx, "t", "q1", "Ti-6Al-4V", 15.0).unwrap_err();
+        let err = commit_material_in_tx(&tx, "t", "q1", "Ti-6Al-4V", 15.0, QtyUnitKind::Units)
+            .unwrap_err();
         drop(tx);
         assert_eq!(
             err.downcast::<MaterialInventoryError>()
@@ -770,7 +838,8 @@ mod tests {
 
         // 10 succeeds — exactly drains the available pool.
         let tx = conn.transaction().unwrap();
-        let outcome = commit_material_in_tx(&tx, "t", "q1", "Ti-6Al-4V", 10.0).unwrap();
+        let outcome =
+            commit_material_in_tx(&tx, "t", "q1", "Ti-6Al-4V", 10.0, QtyUnitKind::Units).unwrap();
         tx.commit().unwrap();
         assert_eq!(outcome.balance_after.committed_qty, 60.0);
         assert_eq!(outcome.balance_after.available_qty, 0.0);
@@ -791,10 +860,10 @@ mod tests {
         .unwrap();
 
         let tx = conn.transaction().unwrap();
-        commit_material_in_tx(&tx, "t", "q1", "304", 30.0).unwrap();
+        commit_material_in_tx(&tx, "t", "q1", "304", 30.0, QtyUnitKind::Units).unwrap();
         tx.commit().unwrap();
         let tx = conn.transaction().unwrap();
-        commit_material_in_tx(&tx, "t", "q2", "304", 20.0).unwrap();
+        commit_material_in_tx(&tx, "t", "q2", "304", 20.0, QtyUnitKind::Units).unwrap();
         tx.commit().unwrap();
 
         let bal = read_balance(&conn, "t", "304").unwrap().unwrap();
@@ -829,7 +898,7 @@ mod tests {
         .unwrap();
 
         let tx = conn.transaction().unwrap();
-        commit_material_in_tx(&tx, "t-B", "q1", "6061-T6", 5.0).unwrap_err(); // t-B has 0 on_hand
+        commit_material_in_tx(&tx, "t-B", "q1", "6061-T6", 5.0, QtyUnitKind::Units).unwrap_err(); // t-B has 0 on_hand
         drop(tx);
 
         // t-A's row is untouched.
@@ -895,6 +964,7 @@ mod tests {
             tenant_id: "t".into(),
             material_grade: "6061-T6".into(),
             qty: 12.0,
+            qty_unit_kind: QtyUnitKind::Units,
             reservation_id: "res_TEST".into(),
             actor: "operator".into(),
             idempotency_key: "quote_deal:q-X:material".into(),
@@ -906,6 +976,27 @@ mod tests {
         };
         let back: MaterialCommittedPayload = serde_json::from_slice(&p.to_bytes()).unwrap();
         assert_eq!(back, p);
+    }
+
+    /// S275 / F1 — a payload written BEFORE `qty_unit_kind` existed
+    /// (the legacy S273 shape) deserialises with `QtyUnitKind::Units`
+    /// as the default. Forensic walks across the pre-S275 ledger stay
+    /// readable; the field is only loud on new entries.
+    #[test]
+    fn s275_material_committed_payload_deserialises_legacy_shape_to_units() {
+        let legacy = r#"{
+            "quote_id": "q-X", "tenant_id": "t",
+            "material_grade": "6061-T6", "qty": 12.0,
+            "reservation_id": "res_T", "actor": "op",
+            "idempotency_key": "quote_deal:q-X:material",
+            "created_at": "2026-06-06T12:00:00Z",
+            "balance_after_on_hand": 100.0,
+            "balance_after_reserved": 0.0,
+            "balance_after_committed": 12.0,
+            "balance_after_consumed": 0.0
+        }"#;
+        let p: MaterialCommittedPayload = serde_json::from_str(legacy).unwrap();
+        assert_eq!(p.qty_unit_kind, QtyUnitKind::Units);
     }
 
     /// `append_material_committed_in_tx` writes one
@@ -921,6 +1012,7 @@ mod tests {
             tenant_id: "test-tenant".into(),
             material_grade: "6061-T6".into(),
             qty: 5.0,
+            qty_unit_kind: QtyUnitKind::Units,
             reservation_id: "res_TEST".into(),
             actor: "operator".into(),
             idempotency_key: "quote_deal:q-X:material".into(),

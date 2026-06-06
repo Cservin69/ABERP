@@ -15643,28 +15643,29 @@ async fn handle_list_quote_intake(headers: HeaderMap, State(state): State<AppSta
     let tenant_id_string = state.tenant.as_str().to_string();
     let tenant_for_ledger = state.tenant.clone();
     let rows = match tokio::task::spawn_blocking(move || -> Result<_> {
-        let conn = duckdb::Connection::open(&db_path)
+        let mut conn = duckdb::Connection::open(&db_path)
             .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
         let listing = quote_intake_query_mod::list_quote_intake_rows(&conn, &tenant_id_string)?;
-        // Emit one audit entry per newly-triggered alert. The recompute
-        // pass already persisted the `stock_alert = TRUE` flip in the
-        // same conn, so the audit emit is the operator-visible record
-        // that the transition happened and WHY. Re-running this route
-        // does NOT re-emit (sticky persistence + the `flip_*` writer's
-        // `Ok(false)` return on no-ops).
+        // S275 / PR-264 / F2 + F16 — persist + audit one entry per
+        // newly-triggered alert via `flip_and_audit_in_tx`. The flip
+        // (guarded UPDATE) and the audit append (with an
+        // idempotency_key per quote-id transition) share ONE tx; either
+        // both land or neither does. Replaces the prior pattern of a
+        // separate `Ledger::open` after the conn-level flip — that
+        // could leave a sticky-true row without an audit explaining
+        // why, and was vulnerable to a transient retry emitting two
+        // audit entries for one transition.
         if !listing.newly_triggered_alerts.is_empty() {
             aberp_audit_ledger::ensure_schema(&conn)
                 .context("ensure audit ledger schema for stock_alert emit")?;
-            let mut ledger =
-                aberp_audit_ledger::Ledger::open(&db_path, tenant_for_ledger, binary_hash)
-                    .context("open audit ledger for QuoteStockAlertTriggered")?;
+            let ledger_meta =
+                aberp_audit_ledger::LedgerMeta::new(tenant_for_ledger.clone(), binary_hash);
             for alert in &listing.newly_triggered_alerts {
                 let payload = serde_json::json!({
                     "quote_id": alert.quote_id,
                     "material_grade": alert.material_grade,
                     "snapshot_status": alert.snapshot_status,
                     "current_status": alert.current_status,
-                    "idempotency_key": ulid::Ulid::new().to_string(),
                 });
                 let bytes = serde_json::to_vec(&payload)
                     .context("serialize QuoteStockAlertTriggered payload")?;
@@ -15672,14 +15673,33 @@ async fn handle_list_quote_intake(headers: HeaderMap, State(state): State<AppSta
                     ulid::Ulid::new().to_string(),
                     &operator_login,
                 );
-                ledger
-                    .append(
-                        aberp_audit_ledger::EventKind::QuoteStockAlertTriggered,
-                        bytes,
-                        actor,
-                        None,
-                    )
-                    .context("append QuoteStockAlertTriggered audit entry")?;
+                // Per-(quote, transition) idempotency key: a transient
+                // retry of THIS route cannot land two audit entries
+                // for the same row's flip (the audit-ledger UNIQUE
+                // constraint on idempotency_key would reject the dup).
+                let idempotency_key = format!("stock_alert_triggered:{}", alert.quote_id);
+                let tx = conn
+                    .transaction()
+                    .context("begin tx for QuoteStockAlertTriggered flip+audit")?;
+                let flipped = aberp_quote_intake::log_table::flip_and_audit_in_tx(
+                    &tx,
+                    tenant_for_ledger.as_str(),
+                    &alert.quote_id,
+                    &ledger_meta,
+                    bytes,
+                    actor,
+                    idempotency_key,
+                )
+                .context("flip+audit in tx")?;
+                if flipped {
+                    tx.commit().context("commit stock_alert flip+audit tx")?;
+                } else {
+                    // Lost the race (another process already flipped
+                    // the row) — drop the tx so the audit append does
+                    // not land. No-op for the operator; the winning
+                    // tx emitted the audit.
+                    drop(tx);
+                }
             }
         }
         Ok(listing.rows)
@@ -16301,6 +16321,20 @@ async fn handle_deal_saga(
                         saga.machine_code(),
                         format!(
                             "insufficient material {material_grade}: requested {requested}, on hand {on_hand}, already reserved {already_reserved}, already committed {already_committed}. Open Inventory Balances to fix on_hand_qty, then retry."
+                        ),
+                    ),
+                    // S275 / PR-264 / F32 — quote validity expired. The
+                    // SPA toast surfaces the date so the operator can
+                    // reissue / extend the quote storefront-side.
+                    DealSagaError::QuoteExpired {
+                        valid_until,
+                        today,
+                        ..
+                    } => (
+                        StatusCode::CONFLICT,
+                        saga.machine_code(),
+                        format!(
+                            "quote validity expired on {valid_until} (today is {today}). Reissue or extend the quote and retry."
                         ),
                     ),
                 };

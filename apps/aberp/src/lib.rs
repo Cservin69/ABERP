@@ -30,6 +30,9 @@ pub mod catalogue_push;
 pub mod cli;
 pub mod drain_pending_retries;
 pub mod drain_submission_queue;
+// S275 / PR-264 / F22 — DuckDB-binding helpers + the project's
+// RFC3339-VARCHAR timestamp-storage convention.
+pub mod duckdb_helpers;
 pub mod email_invoice;
 pub mod export_invoice_bundle;
 pub mod first_launch;

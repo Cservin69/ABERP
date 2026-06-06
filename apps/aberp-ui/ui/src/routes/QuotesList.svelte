@@ -156,6 +156,10 @@
           deal_issued_at: outcome.deal_issued_at,
           deal_sales_order_id: outcome.sales_order_id,
           deal_work_order_id: outcome.work_order_id,
+          // S275 / PR-264 / F5 — flag the silent material-commit skip
+          // so the post-DEAL chip warns the operator that no
+          // reservation landed (storefront pushed NULL grade/qty).
+          material_commit_skipped: outcome.material_commit === null,
         };
       }
     } catch (e) {
@@ -279,8 +283,8 @@
         / {alertedCount} {alertedCount === 1 ? "quote has" : "quotes have"} a changed stock status since acceptance
       </strong>
       <p class="quotes-page__stock-alert-body">
-        REFRESH kötelező a DEAL előtt — a frissített token-mező S272-ben érkezik.
-        / REFRESH required before DEAL — typed-token gate ships in S272/PR-261.
+        Írja be a REFRESH szót a DEAL előtt — a sornál lévő piros token-mezőbe.
+        / Type REFRESH below to acknowledge the stock change before DEAL.
       </p>
       {#if alertedQuoteIds.length > 0}
         <p class="quotes-page__stock-alert-ids" data-testid="quotes-stock-alert-ids">
@@ -468,6 +472,21 @@
                   title={`DEAL issued ${row.deal_issued_at}`}
                 >
                   <span class="quotes-chip quotes-chip--done">✓ DEAL</span>
+                  {#if row.material_commit_skipped}
+                    <!-- S275 / PR-264 / F5 — the saga returned with
+                         material_commit=null because the row carried
+                         NULL `material_grade` and/or `quantity`. The
+                         DEAL still booked SO/WO placeholders but NO
+                         reservation landed in inventory_balances. The
+                         operator needs to know — they may want to
+                         hand-commit the material once the missing
+                         field is filled in. -->
+                    <span
+                      class="quotes-chip quotes-chip--material-skip"
+                      data-testid="quotes-row-material-skip"
+                      title="material_commit was null — storefront pushed missing grade/qty"
+                    >⚠ no material reservation</span>
+                  {/if}
                   {#if row.deal_sales_order_id}
                     <code
                       class="quotes-row__deal-id"
@@ -889,6 +908,16 @@
   .quotes-chip--stock-ok {
     color: var(--color-signal-positive);
     border-color: var(--color-signal-positive);
+  }
+
+  /* S275 / PR-264 / F5 — yellow chip on the post-DEAL state when the
+   * saga's material branch was skipped silently (storefront pushed
+   * NULL material_grade / quantity). Same `--color-signal-warning`
+   * token the error-state row hairline uses, so the operator's eye
+   * reads it as "needs attention but not critical." */
+  .quotes-chip--material-skip {
+    color: var(--color-signal-warning);
+    border-color: var(--color-signal-warning);
   }
 
   .quotes-table__material-grade {

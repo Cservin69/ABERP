@@ -38,6 +38,18 @@ use ulid::Ulid;
 /// The schema. Plain columns + PRIMARY KEY only — no CHECK, no triggers
 /// (`[[no-sql-specific]]`). `grade` is the operator-typed natural key
 /// (e.g. `6061-T6`); it is also what the storefront dropdown keys on.
+///
+/// **DuckDB DEFAULT-on-replay trap — DO NOT extend via `ALTER TABLE …
+/// ADD COLUMN IF NOT EXISTS <col> <type> DEFAULT V`.** The `DEFAULT`
+/// values below are SAFE because they ride a `CREATE TABLE IF NOT EXISTS`
+/// (one-shot at create time). The trap fires if a future contributor
+/// adds a column via `ALTER TABLE … ADD COLUMN … DEFAULT V` — DuckDB
+/// re-applies the default on every replay of that ALTER, clobbering any
+/// writes the app has made since the first migration run. See the same
+/// pin on [`aberp_quote_intake::log_table::S271_MIGRATION_SQL`] for the
+/// trail of evidence (S271 `stock_alert`, S272 `deal_issued_at`). The
+/// fix is always: omit the DEFAULT on the ALTER; coerce NULL → desired
+/// default in the app-layer reader.
 const QUOTING_MATERIALS_SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS quoting_materials (
     grade                   VARCHAR NOT NULL PRIMARY KEY,
