@@ -1,0 +1,39 @@
+[package]
+name = "aberp-cad-extract-wrapper"
+description = "S270 / PR-259 — Rust subprocess shim around the Python `aberp-cad-extract` CLI (S269). Spawns `python_bin -m aberp_cad_extract <input> --material-grade <grade>`, captures stdout, deserializes into the FeatureGraph type re-exported from `aberp-quote-engine` (S268), pins the JSON `_schema_version` against `EXPECTED_SCHEMA_VERSION`. Sync-only v1, no retry policy (caller decides), no global state."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_cad_extract_wrapper"
+path = "src/lib.rs"
+
+[dependencies]
+# Subprocess stdout is JSON; we own the parse here (per the engine's
+# lib.rs invariant: "parsing is the wrapper's job, not the engine's").
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Typed error variants per the workspace's library-crate posture
+# (`thiserror` for library crates, `anyhow` only at the binary boundary).
+thiserror = { workspace = true }
+
+# Re-export `FeatureGraph` from the engine crate so we don't duplicate
+# the wire-contract struct. The schema is the contract between the
+# Python extractor (S269) and the Rust scoring crate (S268); this
+# wrapper is the in-process narrow waist that validates it.
+aberp-quote-engine = { path = "../aberp-quote-engine" }
+
+[dev-dependencies]
+# Dev-only — tests synthesize STL fixtures + stub-python scripts on
+# disk under a `tempfile::TempDir`. No production code paths write
+# to disk; the wrapper is read-only on its caller's behalf.
+tempfile = "3"
+
+[lints]
+workspace = true
