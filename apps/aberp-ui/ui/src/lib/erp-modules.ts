@@ -184,6 +184,10 @@ export const MODULES: ErpModule[] = [
       // Maintenance-area route under Settings; operator-managed adapter
       // lifecycle (add / edit / delete) without env edits or restart.
       { id: "adapters", label: "Adapters" },
+      // S266 / PR-255 — auto-quoting material catalogue (Settings →
+      // Material catalogue). Operator-managed tunable table; the public
+      // fields push to the storefront dropdown.
+      { id: "material-catalogue", label: "Material catalogue" },
       // S180 / PR-180 — NAV-as-DR restore wizard. Maintenance-area
       // route under Settings (rare-touch, load-bearing-when-touched).
       { id: "restore-from-nav", label: "Restore from NAV" },
@@ -328,7 +332,10 @@ export type MaintenanceTileStatusKind =
   // S257 / PR-246 — count of registered MES adapters. The tile's chip
   // surfaces "N adapters" so the operator sees at a glance how many
   // are configured.
-  | "AdapterCount";
+  | "AdapterCount"
+  // S266 / PR-255 — count of material grades in the auto-quoting
+  // catalogue. The tile's chip surfaces "N materials".
+  | "MaterialCount";
 
 /** One tile on the maintenance landing dashboard. The dashboard
  * renders the tiles grouped under their sub-area headers (today:
@@ -398,6 +405,17 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Gyártási adapterek kezelése",
     description_en: "Manage manufacturing adapters",
     statusKind: "AdapterCount",
+  },
+  // S266 / PR-255 — auto-quoting material catalogue tile. Operator-
+  // managed tunable table; the public fields push to the storefront.
+  {
+    moduleId: "settings",
+    route: "material-catalogue",
+    label_hu: "Anyagkatalógus",
+    label_en: "Material catalogue",
+    description_hu: "Árazási anyagtábla, webáruház-feltöltéssel",
+    description_en: "Pricing material table, pushed to the storefront",
+    statusKind: "MaterialCount",
   },
   // S180 / PR-180 — NAV-as-DR restore wizard tile. Operator-touch
   // surface for "the local DuckDB is gone — pull our year-of-record

@@ -26,6 +26,7 @@ pub mod audit_query;
 pub mod binary_hash;
 pub mod branding_config;
 pub mod build_profile;
+pub mod catalogue_push;
 pub mod cli;
 pub mod drain_pending_retries;
 pub mod drain_submission_queue;
@@ -71,6 +72,7 @@ pub mod quote_intake_query;
 // quote_intake_log row. Mints an `invoice_draft` row with
 // `source_quote_id` set + emits `InvoicePickedUpFromQuote`.
 pub mod quote_pickup;
+pub mod quoting_materials;
 pub mod recover_from_nav;
 pub mod reports;
 pub mod request_technical_annulment;

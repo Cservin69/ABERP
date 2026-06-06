@@ -719,6 +719,23 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         aberp_inventory::ensure_schema(&conn).context("ensure inventory schema at serve boot")?;
     }
 
+    // S266 / PR-255 — pin the quoting_materials schema at boot + seed a
+    // small set of common grades on a brand-new (empty) table. Idempotent:
+    // the CREATE is IF NOT EXISTS and the seed is a no-op once any row
+    // exists (the operator may have edited or deleted seeds — we never
+    // re-add). First tunable table of the auto-quoting strand (design §3).
+    {
+        let _s = tracing::info_span!("serve.ensure_quoting_materials_schema").entered();
+        let mut conn = Connection::open(&args.db).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for quoting_materials boot migration",
+                args.db.display()
+            )
+        })?;
+        crate::quoting_materials::seed_if_empty(&mut conn, tenant.as_str())
+            .context("ensure + seed quoting_materials at serve boot")?;
+    }
+
     // S232 / PR-228 / ADR-0062 — pin the work-orders schema at boot
     // (creates work_orders + boms + routings tables). Same idempotent
     // CREATE TABLE IF NOT EXISTS posture as the inventory migration
@@ -938,6 +955,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         adapter_manager: adapter_manager.clone(),
         adapter_health_baseline: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         restore_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        catalogue_push: crate::catalogue_push::CataloguePushHandle::dormant(),
     };
 
     // 5. Build the axum router. Clone the state first so the app-boot
@@ -1340,6 +1358,21 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                         .binary_hash
                         .wait()
                         .context("await background binary hash for quote-intake daemon")?;
+                    // S266 / PR-255 — capture the storefront surface
+                    // (base_url + bearer) + audit context for the
+                    // catalogue-push daemon BEFORE `cfg`/`deps` are
+                    // consumed below. SPOC ([[aberp-smtp-spoc]]): the push
+                    // reuses the same storefront credential quote-intake
+                    // resolved — one secret per surface, no second token.
+                    let push_base_url = cfg.base_url.clone();
+                    let push_bearer = cfg.bearer_token.clone();
+                    let push_deps = crate::catalogue_push::CataloguePushDeps {
+                        db_path: (*st.db_path).clone(),
+                        tenant: st.tenant.clone(),
+                        binary_hash,
+                        operator_login: operator_login.clone(),
+                    };
+                    let push_handle = st.catalogue_push.clone();
                     let deps = QuoteIntakeDeps {
                         db_path: (*st.db_path).clone(),
                         tenant: st.tenant.clone(),
@@ -1366,6 +1399,35 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                         Err(e) => {
                             return Err(anyhow!(
                                 "quote-intake daemon refused to start: {e:#}"
+                            ));
+                        }
+                    }
+
+                    // S266 / PR-255 — spawn the catalogue-push daemon onto
+                    // the SAME storefront surface (design doc §4 / §14-C).
+                    // Reuses the shared dormant handle in AppState so the
+                    // CRUD routes' on-write trigger + the list route's
+                    // status read both reach this daemon.
+                    match crate::catalogue_push::CataloguePushService::new(
+                        push_handle,
+                        push_base_url,
+                        push_bearer,
+                        push_deps,
+                    ) {
+                        Ok(push_service) => {
+                            tracing::info!(
+                                cadence_secs = crate::catalogue_push::PUSH_CADENCE_SECS,
+                                "spawning catalogue-push daemon (S266 / PR-255)"
+                            );
+                            let push_token = coordinator.token.clone();
+                            let push_task_handle = tokio::spawn(async move {
+                                push_service.run_daemon_forever(push_token).await;
+                            });
+                            coordinator.register("catalogue-push", push_task_handle);
+                        }
+                        Err(e) => {
+                            return Err(anyhow!(
+                                "catalogue-push daemon refused to start: {e:#}"
                             ));
                         }
                     }
@@ -2066,6 +2128,13 @@ pub struct AppState {
     /// there is exactly one `aberp serve` per tenant, so an in-memory
     /// flag is a precise liveness signal (no cross-process restore).
     pub restore_active: Arc<std::sync::atomic::AtomicBool>,
+    /// S266 / PR-255 — shared handle for the storefront catalogue-push
+    /// daemon. Created dormant at boot; the daemon (spawned only when the
+    /// storefront is configured) marks it running. The Material Catalogue
+    /// CRUD routes call `.trigger()` after a successful write for an
+    /// immediate push; the list route reads `.snapshot()` for the
+    /// "last push" + paused (re-paste-bearer) banner.
+    pub catalogue_push: Arc<crate::catalogue_push::CataloguePushHandle>,
 }
 
 /// Session-161 — max number of NAV poll daemons polling concurrently.
@@ -2180,6 +2249,20 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/adapters/:id",
             put(handle_update_adapter).delete(handle_delete_adapter),
+        )
+        // S266 / PR-255 — Settings → Material Catalogue CRUD (the auto-
+        // quoting strand's first tunable table). List + create on the
+        // collection; update + delete on the resource. `:grade` is the
+        // operator-typed PRIMARY KEY (URL-encoded by the Tauri command).
+        // The list response also carries the catalogue-push status for
+        // the "last push" / re-paste-bearer banner. Ready-only + bearer.
+        .route(
+            "/api/quoting-materials",
+            get(handle_list_quoting_materials).post(handle_create_quoting_material),
+        )
+        .route(
+            "/api/quoting-materials/:grade",
+            put(handle_update_quoting_material).delete(handle_delete_quoting_material),
         )
         // PR-172 — buyer-facing notes typeahead source. GET-only,
         // ready+bearer-gated. `?scope=line|invoice|storno` is required.
@@ -7896,6 +7979,227 @@ async fn handle_delete_adapter(
     match state.adapter_manager.remove(&deps, &path, &id).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => adapter_mutation_response(e),
+    }
+}
+
+// ── S266 / PR-255 — Settings → Material Catalogue CRUD ───────────────
+
+fn material_validation_response(
+    errors: Vec<crate::quoting_materials::ValidationError>,
+) -> Response {
+    #[derive(Serialize)]
+    struct Body {
+        error: &'static str,
+        fields: Vec<crate::quoting_materials::ValidationError>,
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        Json(Body {
+            error: "validation_failed",
+            fields: errors,
+        }),
+    )
+        .into_response()
+}
+
+/// Map a [`crate::quoting_materials::MaterialWriteError`] to an HTTP
+/// response (validation → 400, conflict → 409, not-found → 404,
+/// other → 500). Shared by create/update/delete.
+fn material_write_response(
+    e: crate::quoting_materials::MaterialWriteError,
+    ctx: &'static str,
+) -> Response {
+    use crate::quoting_materials::MaterialWriteError as E;
+    match e {
+        E::Validation(errs) => material_validation_response(errs),
+        E::Conflict(grade) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "conflict",
+                "message": format!("A(z) `{grade}` anyagminőség már létezik / grade already exists"),
+            })),
+        )
+            .into_response(),
+        E::NotFound(grade) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!("grade `{grade}` not found"))),
+        )
+            .into_response(),
+        E::Other(err) => internal_error(ctx, err),
+    }
+}
+
+/// Build the audit `LedgerMeta` for a catalogue write from `AppState`.
+fn material_ledger_meta(state: &AppState) -> Result<aberp_audit_ledger::LedgerMeta> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await binary hash for material-catalogue audit")?;
+    Ok(aberp_audit_ledger::LedgerMeta::new(
+        state.tenant.clone(),
+        binary_hash,
+    ))
+}
+
+async fn handle_list_quoting_materials(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<Vec<crate::quoting_materials::Material>> {
+            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            crate::quoting_materials::list_materials(&conn, state_for_task.tenant.as_str())
+        })
+        .await;
+    match result {
+        Ok(Ok(materials)) => Json(serde_json::json!({
+            "materials": materials,
+            "push_status": state.catalogue_push.snapshot(),
+        }))
+        .into_response(),
+        Ok(Err(e)) => internal_error("list_quoting_materials", e),
+        Err(join_err) => internal_error(
+            "list_quoting_materials:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_create_quoting_material(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<crate::quoting_materials::MaterialInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_materials::MaterialWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = material_ledger_meta(&state_for_task)?;
+            crate::quoting_materials::create_material(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(material)) => {
+            // S266 — operator write → immediate storefront push attempt.
+            state.catalogue_push.trigger();
+            (StatusCode::CREATED, Json(material)).into_response()
+        }
+        Ok(Err(e)) => material_write_response(e, "create_quoting_material"),
+        Err(join_err) => internal_error(
+            "create_quoting_material:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_update_quoting_material(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(grade): AxumPath<String>,
+    Json(inputs): Json<crate::quoting_materials::MaterialInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_materials::MaterialWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = material_ledger_meta(&state_for_task)?;
+            crate::quoting_materials::update_material(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &grade,
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(material)) => {
+            state.catalogue_push.trigger();
+            Json(material).into_response()
+        }
+        Ok(Err(e)) => material_write_response(e, "update_quoting_material"),
+        Err(join_err) => internal_error(
+            "update_quoting_material:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_delete_quoting_material(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(grade): AxumPath<String>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<(), crate::quoting_materials::MaterialWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = material_ledger_meta(&state_for_task)?;
+            crate::quoting_materials::delete_material(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &grade,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => {
+            state.catalogue_push.trigger();
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Err(e)) => material_write_response(e, "delete_quoting_material"),
+        Err(join_err) => internal_error(
+            "delete_quoting_material:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
     }
 }
 
@@ -19083,6 +19387,7 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             restore_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            catalogue_push: crate::catalogue_push::CataloguePushHandle::dormant(),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, storno_invoice_id)
@@ -19196,6 +19501,7 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             restore_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            catalogue_push: crate::catalogue_push::CataloguePushHandle::dormant(),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, invoice_id)
@@ -19954,6 +20260,7 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             restore_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            catalogue_push: crate::catalogue_push::CataloguePushHandle::dormant(),
         }
     }
 

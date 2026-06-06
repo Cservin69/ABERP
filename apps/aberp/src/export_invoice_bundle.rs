@@ -765,7 +765,13 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // S258 / PR-247 — adapter health-transition telemetry. `mes.`-
         // scoped runtime observation; no NAV bytes, never sweeps a per-
         // OUTGOING-invoice bundle.
-        | EventKind::AdapterHealthTransitioned => None,
+        | EventKind::AdapterHealthTransitioned
+        // S266 / PR-255 — material-catalogue CRUD + storefront-push
+        // kinds (`quote.*`). Auto-quoting tunable-table operator
+        // configuration / outbound notification; no NAV bytes, never
+        // sweep a per-OUTGOING-invoice bundle.
+        | EventKind::MaterialCatalogueChanged
+        | EventKind::MaterialCataloguePushed => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

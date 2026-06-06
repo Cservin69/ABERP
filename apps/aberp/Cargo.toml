@@ -155,6 +155,13 @@ tokio = { workspace = true }
 # Coordinator lives in `src/shutdown.rs`.
 tokio-util = { workspace = true }
 
+# S266 / PR-255 — the catalogue-push daemon (`src/catalogue_push.rs`)
+# PUTs the material catalogue to the storefront over HTTPS. reqwest is
+# already a transitive dep (nav-transport, quote-intake); promoting it to
+# a direct dep lets the push live in the app where it can read the
+# `quoting_materials` table + reach the on-write trigger in AppState.
+reqwest = { workspace = true }
+
 # `keyring` is needed in production because the binary's
 # `setup-nav-credentials` subcommand WRITES to the keychain — the
 # library `aberp-nav-transport` only owns the READ path

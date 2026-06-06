@@ -455,6 +455,48 @@ pub async fn delete_adapter(state: State<'_, AppState>, adapter_id: String) -> R
     forward_delete(&state, &path).await
 }
 
+// ── S266 / PR-255 — Settings → Material Catalogue CRUD ──────────────
+
+/// `GET /api/quoting-materials` — list the material catalogue + the
+/// storefront-push status. Backs the Settings → Material Catalogue page.
+#[tauri::command]
+pub async fn list_quoting_materials(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quoting-materials", true).await
+}
+
+/// `POST /api/quoting-materials` — add a grade. Body is the typed
+/// `MaterialInputs`; validation failures surface as the
+/// `{ "error": "validation_failed", "fields": [...] }` envelope.
+#[tauri::command]
+pub async fn create_quoting_material(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/quoting-materials", body).await
+}
+
+/// `PUT /api/quoting-materials/:grade` — edit a grade in place. The PK
+/// `grade` is immutable; it is URL-encoded into the path.
+#[tauri::command]
+pub async fn update_quoting_material(
+    state: State<'_, AppState>,
+    grade: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quoting-materials/{}", urlencode(&grade));
+    forward_put(&state, &path, body).await
+}
+
+/// `DELETE /api/quoting-materials/:grade` — remove a grade (hard delete).
+#[tauri::command]
+pub async fn delete_quoting_material(
+    state: State<'_, AppState>,
+    grade: String,
+) -> Result<(), String> {
+    let path = format!("/api/quoting-materials/{}", urlencode(&grade));
+    forward_delete(&state, &path).await
+}
+
 // ── PR-172 — notes-history typeahead source ─────────────────────────
 
 /// PR-172 — `GET /api/notes-history?scope=line|invoice|storno`. Used

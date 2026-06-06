@@ -287,6 +287,7 @@ fn rotation_preserves_other_three_fields() {
         )),
         adapter_health_baseline: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         restore_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        catalogue_push: aberp::catalogue_push::CataloguePushHandle::dormant(),
     };
 
     // Rotate password only.

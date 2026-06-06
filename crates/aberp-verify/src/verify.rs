@@ -886,7 +886,13 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // scoped runtime observation (adapter_id / from_state / to_state
         // / ts); never carries NAV XML bytes, never sweeps a per-
         // OUTGOING-invoice bundle.
-        | EventKind::AdapterHealthTransitioned => (None, ""),
+        | EventKind::AdapterHealthTransitioned
+        // S266 / PR-255 — material-catalogue CRUD + storefront-push
+        // kinds (`quote.*`). Auto-quoting tunable-table operator
+        // configuration / outbound notification; never carry NAV XML
+        // bytes, never sweep a per-OUTGOING-invoice bundle.
+        | EventKind::MaterialCatalogueChanged
+        | EventKind::MaterialCataloguePushed => (None, ""),
     };
 
     Ok(NavExtraction {

@@ -397,3 +397,22 @@ New kinds for the F12 four-edit ritual (variant + `as_str` + `from_storage_str` 
 | `VendorPoFired` | `po.vendor_po_fired` | auto-PO under threshold | po |
 | `AutoPoThresholdExceeded` | `po.auto_threshold_exceeded` | operator gate | po |
 | `MachineSlotReserved` | `mes.machine_slot_reserved` | **specced, NOT emitted v1** (§7) | mes (future) |
+| `MaterialCatalogueChanged` | `quote.material_catalogue_changed` | materials CRUD (S266) | quote |
+| `MaterialCataloguePushed` | `quote.material_catalogue_pushed` | storefront push attempt (S266) | quote |
+
+---
+
+## Appendix B — Storefront catalogue-push contract (S266 / PR-255)
+
+The implementation of §11 `quoting_materials` + §14-C lands in **S266 / PR-255**. The ABERP side is built; the **storefront side** (`abenerp.com`) is a separate ABERP-site PR. The wire contract ABERP emits:
+
+**`PUT {storefront_base_url}/api/catalogue/materials`** (the `storefront_base_url` is the quote-intake `base_url` — same surface, SPOC).
+
+- **Auth:** `Authorization: Bearer <token>` — the **quote-intake bearer** (`ABERP_QUOTE_INTAKE_TOKEN` / keychain `quote_intake_token`). The brief named `ABERP_SITE_ADMIN_TOKEN`; no such var exists — the storefront surface's secret is the quote-intake bearer, reused per `[[aberp-smtp-spoc]]` (one secret per surface). Catalogue-push is therefore active **iff** quote-intake is configured.
+- **Body:** `{ "materials": [ { "grade", "display_name", "stock_status", "lead_time_default_days" }, … ] }` — the **public projection only**. Cost, multipliers, density, and machining factors are NEVER pushed.
+- **Cadence:** every 15 min (`PUSH_CADENCE_SECS`) **plus** an immediate attempt on each operator CRUD write (on-write trigger).
+- **Outcomes:** `2xx` = ok; `401` = pause the daemon + surface a "re-paste bearer" banner in Settings (resumes on next `aberp serve` boot); other non-2xx / transport error = exponential backoff `5s → 15s → 60s → cadence` (mirrors the S256 quote-intake daemon).
+- **Idempotency:** the PUT is a full-snapshot replace — the storefront should treat each PUT as the complete active catalogue (a grade absent from the body has been deleted).
+- **Audit:** each attempt emits `quote.material_catalogue_pushed` (`{ trigger, outcome, pushed_count, detail }`).
+
+**Storefront responsibilities (out of scope for PR-255):** accept the PUT, validate the bearer, cache the body, and serve the `/quote` material dropdown from that cache. The customer's browser reads the storefront cache, never ABERP.

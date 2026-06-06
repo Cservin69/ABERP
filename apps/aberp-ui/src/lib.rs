@@ -290,6 +290,11 @@ pub fn run() {
             commands::create_adapter,
             commands::update_adapter,
             commands::delete_adapter,
+            // S266 / PR-255 — Settings → Material Catalogue CRUD.
+            commands::list_quoting_materials,
+            commands::create_quoting_material,
+            commands::update_quoting_material,
+            commands::delete_quoting_material,
             commands::list_notes_history,
             commands::list_products,
             commands::get_product,

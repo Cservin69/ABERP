@@ -124,6 +124,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   maintenance: "maintenance",
   // S257 / PR-246 — MES adapter management.
   adapters: "maintenance",
+  // S266 / PR-255 — auto-quoting material catalogue.
+  "material-catalogue": "maintenance",
   // S180 / PR-180 — NAV-as-DR restore wizard.
   "restore-from-nav": "maintenance",
 };
@@ -143,6 +145,8 @@ const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   "RestoredInvoiceCount",
   // S257 / PR-246 — MES adapter management tile.
   "AdapterCount",
+  // S266 / PR-255 — auto-quoting material catalogue tile.
+  "MaterialCount",
 ]);
 
 // Every area must have a stable bilingual label and at least one

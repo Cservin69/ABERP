@@ -86,6 +86,8 @@
   import RestoreFromNavWizard from "./routes/RestoreFromNavWizard.svelte";
   // S257 / PR-246 — Settings → Adapters management page.
   import AdaptersList from "./routes/AdaptersList.svelte";
+  // S266 / PR-255 — Settings → Material Catalogue page (auto-quoting).
+  import MaterialCatalogueList from "./routes/MaterialCatalogueList.svelte";
   import SellerConfigWizard from "./routes/SellerConfigWizard.svelte";
   import SetupWizard from "./routes/SetupWizard.svelte";
   // S225 / PR-221 — financial-statistics dashboard.
@@ -658,6 +660,8 @@
           <RestoreFromNavWizard />
         {:else if route === "adapters"}
           <AdaptersList />
+        {:else if route === "material-catalogue"}
+          <MaterialCatalogueList />
         {:else if route === "invoices-new"}
           <!-- PR-87 / session-112 — full-page issuance route. The
                IssueInvoice form was a `<dialog>` modal mounted inside

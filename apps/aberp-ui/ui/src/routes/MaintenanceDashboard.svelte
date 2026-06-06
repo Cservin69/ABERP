@@ -33,6 +33,7 @@
     listAdapters,
     listLowStockProducts,
     listPartners,
+    listQuotingMaterials,
     listProducts,
     listRestoredInvoices,
     listSellerBanks,
@@ -204,6 +205,14 @@
         const rows = await listAdapters();
         const n = rows.length;
         return n === 1 ? "1 adapter" : `${n} adapters`;
+      }
+      case "MaterialCount": {
+        // S266 / PR-255 — count of material grades in the auto-quoting
+        // catalogue. Seeded with a handful of common grades on first
+        // boot, so a fresh tenant shows that seed count, not 0.
+        const res = await listQuotingMaterials();
+        const n = res.materials.length;
+        return n === 1 ? "1 material" : `${n} materials`;
       }
     }
   }

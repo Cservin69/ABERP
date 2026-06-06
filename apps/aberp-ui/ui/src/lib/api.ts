@@ -1529,6 +1529,88 @@ export async function deleteAdapter(adapterId: string): Promise<void> {
   await invoke<void>("delete_adapter", { adapterId });
 }
 
+// ── S266 / PR-255 — Material Catalogue (auto-quoting strand) ──────────
+
+/** Closed-vocab sourcing status. Mirrors the Rust `StockStatus`
+ * (snake_case wire). Kept in sync with `STOCK_STATUS_ORDER` in
+ * `material-catalogue.ts`. */
+export type StockStatus =
+  | "in_stock"
+  | "source_1_2d"
+  | "source_3_7d"
+  | "special_order";
+
+/** A persisted `quoting_materials` row, as returned by the backend. */
+export interface QuotingMaterial {
+  grade: string;
+  display_name: string;
+  density_g_cm3: number;
+  cost_per_kg_eur: number;
+  machinability_index: number;
+  carbide_life_multiplier: number;
+  stock_status: StockStatus;
+  lead_time_default_days: number;
+  quote_multiplier: number;
+  notes: string | null;
+  updated_at: string;
+  updated_by_actor: string;
+}
+
+/** Operator-supplied create/update body (no audit fields). */
+export interface QuotingMaterialInput {
+  grade: string;
+  display_name: string;
+  density_g_cm3: number;
+  cost_per_kg_eur: number;
+  machinability_index: number;
+  carbide_life_multiplier: number;
+  stock_status: StockStatus;
+  lead_time_default_days: number;
+  quote_multiplier: number;
+  notes: string | null;
+}
+
+/** Storefront catalogue-push status, surfaced as the "last push" /
+ * re-paste-bearer banner. */
+export interface CataloguePushStatus {
+  running: boolean;
+  paused: boolean;
+  last_attempt_at: string | null;
+  last_outcome: string | null;
+  last_pushed_count: number | null;
+  last_detail: string | null;
+}
+
+export interface MaterialCatalogueListResult {
+  materials: QuotingMaterial[];
+  push_status: CataloguePushStatus;
+}
+
+/** S266 / PR-255 — `GET /api/quoting-materials`. */
+export async function listQuotingMaterials(): Promise<MaterialCatalogueListResult> {
+  return invoke<MaterialCatalogueListResult>("list_quoting_materials");
+}
+
+/** S266 / PR-255 — `POST /api/quoting-materials`. */
+export async function createQuotingMaterial(
+  body: QuotingMaterialInput,
+): Promise<QuotingMaterial> {
+  return invoke<QuotingMaterial>("create_quoting_material", { body });
+}
+
+/** S266 / PR-255 — `PUT /api/quoting-materials/:grade`. */
+export async function updateQuotingMaterial(
+  grade: string,
+  body: QuotingMaterialInput,
+): Promise<QuotingMaterial> {
+  return invoke<QuotingMaterial>("update_quoting_material", { grade, body });
+}
+
+/** S266 / PR-255 — `DELETE /api/quoting-materials/:grade`. */
+export async function deleteQuotingMaterial(grade: string): Promise<void> {
+  await invoke<void>("delete_quoting_material", { grade });
+}
+
 // ── PR-172 — buyer-facing notes-history typeahead source ─────────────
 
 /** PR-172 — closed-vocab discriminator for the notes-history scope.

@@ -1207,6 +1207,33 @@ pub enum EventKind {
     /// `starting`/`stopped`).
     /// F12 four-edit ritual fires once.
     AdapterHealthTransitioned,
+
+    /// S266 / PR-255 — an operator created, edited, or deleted a row in
+    /// the `quoting_materials` tunable catalogue (the auto-quoting
+    /// strand's first DB-backed tuning table; design doc §11). Carries
+    /// the CRUD `op` (`create`/`update`/`delete`), the `grade` key, and a
+    /// JSON snapshot of the row's durable fields so the change is
+    /// reconstructable from the ledger (same per-row-history posture the
+    /// seller.toml writers use). FIRST member of the new `quote.*` prefix
+    /// family (design doc Appendix). Not invoice-scoped, never carries
+    /// NAV bytes, never sweeps a per-OUTGOING-invoice bundle.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    MaterialCatalogueChanged,
+
+    /// S266 / PR-255 — one outbound push attempt of the active material
+    /// catalogue to the storefront (`PUT /api/catalogue/materials`;
+    /// design doc §4 / §14-C). Emitted per attempt with its outcome
+    /// (`ok`/`unauthorized`/`transport`/`unexpected_status`), the pushed
+    /// row count, and the trigger (`daemon`/`on_write`). The audit trail
+    /// is how the Settings surface learns a 401 paused the daemon
+    /// ("re-paste bearer"). `quote.*` prefix family. Not invoice-scoped,
+    /// no NAV bytes, never sweeps a per-OUTGOING-invoice bundle.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    MaterialCataloguePushed,
 }
 
 impl EventKind {
@@ -1274,6 +1301,8 @@ impl EventKind {
             EventKind::AdapterUpdated => "mes.adapter_updated",
             EventKind::AdapterRemoved => "mes.adapter_removed",
             EventKind::AdapterHealthTransitioned => "mes.adapter_health_transitioned",
+            EventKind::MaterialCatalogueChanged => "quote.material_catalogue_changed",
+            EventKind::MaterialCataloguePushed => "quote.material_catalogue_pushed",
         }
     }
 
@@ -1352,6 +1381,8 @@ impl EventKind {
             "mes.adapter_updated" => Ok(EventKind::AdapterUpdated),
             "mes.adapter_removed" => Ok(EventKind::AdapterRemoved),
             "mes.adapter_health_transitioned" => Ok(EventKind::AdapterHealthTransitioned),
+            "quote.material_catalogue_changed" => Ok(EventKind::MaterialCatalogueChanged),
+            "quote.material_catalogue_pushed" => Ok(EventKind::MaterialCataloguePushed),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1422,6 +1453,8 @@ mod tests {
             EventKind::AdapterUpdated,
             EventKind::AdapterRemoved,
             EventKind::AdapterHealthTransitioned,
+            EventKind::MaterialCatalogueChanged,
+            EventKind::MaterialCataloguePushed,
         ];
         for v in variants {
             let s = v.as_str();
@@ -1473,6 +1506,35 @@ mod tests {
         assert!(!EventKind::UpgradeSnapshotMismatch
             .as_str()
             .starts_with("invoice."));
+    }
+
+    /// S266 / PR-255: the two material-catalogue kinds open the new
+    /// `quote.*` prefix family (auto-quoting strand, design doc
+    /// Appendix). They are NOT invoice-scoped, so the on-disk strings
+    /// MUST carry `quote.` and NOT `invoice.` — otherwise the per-
+    /// OUTGOING-invoice export bundle's `invoice.*` glob would sweep a
+    /// catalogue-CRUD or catalogue-push entry into an invoice's evidence
+    /// bundle. Same loud-fail rationale as the `system.` pins above.
+    #[test]
+    fn s266_material_catalogue_kinds_use_quote_prefix() {
+        assert_eq!(
+            EventKind::MaterialCatalogueChanged.as_str(),
+            "quote.material_catalogue_changed"
+        );
+        assert_eq!(
+            EventKind::MaterialCataloguePushed.as_str(),
+            "quote.material_catalogue_pushed"
+        );
+        for k in [
+            EventKind::MaterialCatalogueChanged,
+            EventKind::MaterialCataloguePushed,
+        ] {
+            assert!(k.as_str().starts_with("quote."), "{k:?} lost quote. prefix");
+            assert!(
+                !k.as_str().starts_with("invoice."),
+                "{k:?} must not use invoice. prefix"
+            );
+        }
     }
 
     /// PR-7-B-3 specifically: the three new on-disk strings must
