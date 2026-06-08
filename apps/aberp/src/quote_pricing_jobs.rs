@@ -191,6 +191,57 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         .with_context(|| "ensure quote_pricing_jobs schema")
 }
 
+/// S288 / PR-269 — does the orphan `quote_pricing_jobs_tenant_state_idx`
+/// secondary index currently exist on this DB? Queries DuckDB's
+/// `duckdb_indexes()` system table function; safe to call on a DB that
+/// hasn't yet seen `ensure_schema` (returns `Ok(false)` because the table
+/// itself doesn't exist).
+///
+/// Caller is `serve.rs` boot, BEFORE the first `ensure_schema` call —
+/// that's how the caller can observe the index's presence (`true`) and
+/// thus know whether to emit the one-shot
+/// `quote.pricing_jobs_index_migrated` audit row.
+pub fn detect_secondary_index_present(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM duckdb_indexes() \
+             WHERE index_name = 'quote_pricing_jobs_tenant_state_idx'",
+            [],
+            |r| r.get(0),
+        )
+        .context("query duckdb_indexes for orphan secondary index presence")?;
+    Ok(n > 0)
+}
+
+/// S288 / PR-269 — boot-time migration step. Detects whether the orphan
+/// `quote_pricing_jobs_tenant_state_idx` secondary index is present and,
+/// if so, drops it. Returns the *prior* presence (`true` = "we just
+/// migrated", `false` = "already migrated / fresh DB / no-op").
+///
+/// Idempotent: a `false` return on the second boot is the steady-state.
+/// On `Ok(true)` the caller (boot) emits the one-shot
+/// `quote.pricing_jobs_index_migrated` audit row.
+///
+/// **Ordering matters**: detection MUST run before `ensure_schema`,
+/// because `SCHEMA_SQL` itself includes a `DROP INDEX IF EXISTS` that
+/// would otherwise erase the evidence the audit row is recording.
+/// `duckdb_indexes()` is a system table function that returns zero rows
+/// on a fresh DB regardless of whether the user table exists, so
+/// pre-`ensure_schema` calls are safe.
+pub fn migrate_secondary_index_with_report(conn: &Connection) -> Result<bool> {
+    let was_present = detect_secondary_index_present(conn)?;
+    ensure_schema(conn)?;
+    if was_present {
+        // Belt + braces: ensure_schema dropped it via SCHEMA_SQL's
+        // `DROP INDEX IF EXISTS`. This explicit drop survives a future
+        // refactor that removes the SCHEMA_SQL line — the migration's
+        // correctness shouldn't depend on the schema-bootstrap path.
+        conn.execute_batch("DROP INDEX IF EXISTS quote_pricing_jobs_tenant_state_idx;")
+            .context("drop orphan secondary index (S288 migration)")?;
+    }
+    Ok(was_present)
+}
+
 /// Insert a new `Fetched` job. Idempotent via `quote_id` PK: a re-
 /// fetch on an existing row returns `Ok(false)`. The caller emits
 /// the `QuotePricingFetched` audit row ONLY when this returns
@@ -713,6 +764,14 @@ mod tests {
         conn
     }
 
+    /// S288 / PR-269 — open an in-memory DuckDB WITHOUT running
+    /// `ensure_schema`. Tests that need to simulate the pre-PR-268
+    /// prod schema (where the orphan secondary index existed) must
+    /// avoid `ensure_schema`'s SCHEMA_SQL `DROP INDEX IF EXISTS`.
+    fn open_bare_mem() -> Connection {
+        Connection::open_in_memory().expect("open bare mem")
+    }
+
     fn fixed_ts() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_750_000_000).unwrap()
     }
@@ -1154,6 +1213,237 @@ mod tests {
         assert!(
             res.is_ok(),
             "secondary index should be dropped before this CREATE; got {res:?}"
+        );
+    }
+
+    /// S288 / PR-269 — `detect_secondary_index_present` returns `false`
+    /// on a fresh DB (the `duckdb_indexes()` system function returns zero
+    /// rows when no user index named `..._tenant_state_idx` exists).
+    /// Pre-condition for the boot migration to behave idempotently after
+    /// PROD_v2.27.4: a clean install must NOT emit the
+    /// `quote.pricing_jobs_index_migrated` audit row.
+    #[test]
+    fn s288_detect_index_returns_false_on_fresh_db() {
+        let conn = open_mem();
+        // No ensure_schema yet — duckdb_indexes() is a system function
+        // and should not require the user table to exist.
+        let present = detect_secondary_index_present(&conn).expect("detect on fresh DB");
+        assert!(!present, "fresh DB has no orphan secondary index");
+    }
+
+    /// S288 / PR-269 — `detect_secondary_index_present` returns `true`
+    /// on a DB that still carries the orphan index from PROD_v2.27.[012].
+    /// This is the pin that drives the one-shot audit emit at boot:
+    /// without it, the operator-visible migration row would never fire.
+    #[test]
+    fn s288_detect_index_returns_true_when_present() {
+        let conn = open_mem();
+        ensure_schema(&conn).expect("schema for table");
+        // Simulate the pre-PR-268 prod schema by hand.
+        conn.execute_batch(
+            "CREATE INDEX quote_pricing_jobs_tenant_state_idx
+                ON quote_pricing_jobs (tenant_id, state);",
+        )
+        .expect("simulate prior-version index");
+        let present = detect_secondary_index_present(&conn).expect("detect");
+        assert!(present, "orphan index should be detected as present");
+    }
+
+    /// S288 / PR-269 — `migrate_secondary_index_with_report` returns
+    /// `true` the first time it runs against a DB that carried the
+    /// orphan index, and `false` on subsequent calls. This is the
+    /// invariant that makes the audit emit one-shot per upgrade: only
+    /// the `true` return fires the row.
+    #[test]
+    fn s288_migrate_reports_true_first_then_false() {
+        let conn = open_bare_mem();
+        // Pre-create the table + orphan index to simulate prod PROD_v2.27.2.
+        // Bypass SCHEMA_SQL's DROP INDEX by hand-rolling the CREATE TABLE
+        // with the EXACT column set from SCHEMA_SQL above (kept in sync
+        // by inspection — a schema-drift smell test would catch it).
+        conn.execute_batch(
+            "CREATE TABLE quote_pricing_jobs (
+                quote_id              VARCHAR NOT NULL PRIMARY KEY,
+                tenant_id             VARCHAR NOT NULL,
+                state                 VARCHAR NOT NULL,
+                fetched_at            VARCHAR NOT NULL,
+                updated_at            VARCHAR NOT NULL,
+                customer_email        VARCHAR NOT NULL,
+                customer_name         VARCHAR NOT NULL,
+                material_grade        VARCHAR NOT NULL,
+                quantity              INTEGER NOT NULL,
+                cad_filename          VARCHAR NOT NULL,
+                cad_local_path        VARCHAR NOT NULL,
+                feature_graph_hash    VARCHAR,
+                feature_graph_json    VARCHAR,
+                breakdown_json        VARCHAR,
+                pdf_path              VARCHAR,
+                total_price_eur       DOUBLE,
+                valid_until_iso       VARCHAR,
+                error_stage           VARCHAR,
+                error_reason          VARCHAR,
+                attempt_n             INTEGER NOT NULL
+            );
+            CREATE INDEX quote_pricing_jobs_tenant_state_idx
+                ON quote_pricing_jobs (tenant_id, state);",
+        )
+        .expect("pre-PR-268 schema seeding");
+        // First migration: detects orphan + drops it.
+        let first = migrate_secondary_index_with_report(&conn).expect("first migration");
+        assert!(first, "first call must detect + report orphan as present");
+        // Second migration: index gone, returns false.
+        let second = migrate_secondary_index_with_report(&conn).expect("second migration");
+        assert!(
+            !second,
+            "second call must report orphan as absent (no-op steady-state)"
+        );
+        // Fresh DBs also report false on their very first call.
+        let fresh = open_bare_mem();
+        let on_fresh = migrate_secondary_index_with_report(&fresh).expect("migrate on fresh");
+        assert!(!on_fresh, "fresh DB must report no orphan index present");
+    }
+
+    /// S288 / PR-269 — the load-bearing end-to-end pin (Brief B).
+    /// Simulate the exact PROD_v2.27.2/3 crash sequence in one test:
+    ///
+    /// 1. Pre-create the table with the orphan secondary index (the
+    ///    state every existing prod install is in after upgrade).
+    /// 2. Insert TWO rows: one mimicking the storefront-side legacy
+    ///    "no CAD file" enqueue-failed shape (state=Failed,
+    ///    last_reason=set), one being the actual c1cf32...042b row
+    ///    captured at Fetched state.
+    /// 3. Run the boot-time migration to drop the index.
+    /// 4. Advance the c1cf32 row Fetched→Extracting via `set_state`
+    ///    (the exact transition that FATALed at 13:28:39Z and
+    ///    15:36:23Z).
+    /// 5. Assert: the transition succeeds, no panic, the c1cf32 row
+    ///    is now at Extracting, the failed row is unchanged.
+    ///
+    /// This is the "the crash from 13:28:39Z and 15:36:23Z cannot
+    /// recur" pin — combines the migration prong + the SELECT-first
+    /// idempotency guard from S286 in one forensic replay.
+    #[test]
+    fn s288_prod_crash_replay_does_not_panic_after_migration() {
+        let conn = open_bare_mem();
+        // Step 1: simulate a PROD_v2.27.2-shaped DB with the orphan
+        // index intact. Hand-roll CREATE TABLE (matching SCHEMA_SQL)
+        // so the orphan index is created before our migration sees it.
+        conn.execute_batch(
+            "CREATE TABLE quote_pricing_jobs (
+                quote_id              VARCHAR NOT NULL PRIMARY KEY,
+                tenant_id             VARCHAR NOT NULL,
+                state                 VARCHAR NOT NULL,
+                fetched_at            VARCHAR NOT NULL,
+                updated_at            VARCHAR NOT NULL,
+                customer_email        VARCHAR NOT NULL,
+                customer_name         VARCHAR NOT NULL,
+                material_grade        VARCHAR NOT NULL,
+                quantity              INTEGER NOT NULL,
+                cad_filename          VARCHAR NOT NULL,
+                cad_local_path        VARCHAR NOT NULL,
+                feature_graph_hash    VARCHAR,
+                feature_graph_json    VARCHAR,
+                breakdown_json        VARCHAR,
+                pdf_path              VARCHAR,
+                total_price_eur       DOUBLE,
+                valid_until_iso       VARCHAR,
+                error_stage           VARCHAR,
+                error_reason          VARCHAR,
+                attempt_n             INTEGER NOT NULL
+            );
+            CREATE INDEX quote_pricing_jobs_tenant_state_idx
+                ON quote_pricing_jobs (tenant_id, state);",
+        )
+        .expect("pre-PR-268 schema seeding");
+        // Step 2a: legacy "no CAD file" enqueue-failure row — these
+        // populate the table from older storefront-side bugs. Uses the
+        // real columns (`error_stage`, `error_reason`) — NOT a made-up
+        // `last_reason` field.
+        let legacy_qid = "legacy-no-cad-001";
+        let tenant = "T";
+        let ts = fixed_ts()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("ts");
+        conn.execute(
+            "INSERT INTO quote_pricing_jobs (
+                quote_id, tenant_id, state, fetched_at, updated_at,
+                customer_email, customer_name, material_grade, quantity,
+                cad_filename, cad_local_path, attempt_n,
+                error_stage, error_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            params![
+                legacy_qid,
+                tenant,
+                STATE_FAILED,
+                ts,
+                ts,
+                "legacy@example.com",
+                "legacy customer",
+                "AL",
+                1,
+                "(missing)",
+                "(missing)",
+                "extract",
+                "no CAD file",
+            ],
+        )
+        .expect("insert legacy failed row");
+        // Step 2b: the c1cf32 prod row at Fetched, mirroring the
+        // storefront submission Ervin captured.
+        let prod_qid = "c1cf32ed-72b6-4708-8abb-6359d27f042b";
+        conn.execute(
+            "INSERT INTO quote_pricing_jobs (
+                quote_id, tenant_id, state, fetched_at, updated_at,
+                customer_email, customer_name, material_grade, quantity,
+                cad_filename, cad_local_path, attempt_n
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            params![
+                prod_qid,
+                tenant,
+                STATE_FETCHED,
+                ts,
+                ts,
+                "ervin@aben.ch",
+                "ervin csenger",
+                "unknown",
+                1,
+                "submission.stl",
+                "/var/aberp/quote-artifacts/c1cf32ed-.../submission.stl",
+            ],
+        )
+        .expect("insert c1cf32 prod row at Fetched");
+        // Step 3: boot-time migration runs. Reports `true` (orphan was
+        // present); drops index.
+        let migrated = migrate_secondary_index_with_report(&conn).expect("boot-time migration");
+        assert!(
+            migrated,
+            "the c31b3c6 forensic premise — boot must report the orphan as present on a v2.27.2-shaped DB"
+        );
+        // Step 4: replay the crashing transition (Fetched → Extracting).
+        // With the index dropped + SELECT-first guard, no FATAL.
+        let outcome = set_state(&conn, prod_qid, tenant, JobState::Extracting, fixed_ts())
+            .expect("Fetched→Extracting must not FATAL after migration");
+        assert_eq!(outcome, TransitionOutcome::Applied);
+        // Step 5: state invariants — c1cf32 advanced, legacy untouched.
+        let rows = list_jobs(&conn, tenant).expect("list after replay");
+        let by_qid: std::collections::HashMap<_, _> =
+            rows.into_iter().map(|r| (r.quote_id.clone(), r)).collect();
+        assert_eq!(
+            by_qid[prod_qid].state,
+            JobState::Extracting,
+            "c1cf32 must have advanced past the formerly-crashing transition"
+        );
+        assert_eq!(
+            by_qid[legacy_qid].state,
+            JobState::Failed,
+            "legacy enqueue-failure row must be untouched by the c1cf32 transition"
+        );
+        // Second migration call on the same DB now reports the steady-
+        // state (the post-PROD_v2.27.4 reboot scenario).
+        let again = migrate_secondary_index_with_report(&conn).expect("second migration call");
+        assert!(
+            !again,
+            "post-migration boot must report no orphan — one-shot audit guarantee"
         );
     }
 

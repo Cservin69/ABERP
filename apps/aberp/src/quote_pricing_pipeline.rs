@@ -1987,6 +1987,63 @@ pub fn emit_python_resolved_audit(
     Ok(())
 }
 
+// S288 / PR-269 — boot-time row recording that the orphan
+// `quote_pricing_jobs_tenant_state_idx` was detected and dropped.
+// Emitted at most once per install (`migrate_secondary_index_with_report`
+// returns `false` on every boot after the first). The audit row's
+// idempotency key is `quote_pricing_jobs_index_migrated:<tenant>` so a
+// pathological replay still collides at the audit-ledger's UNIQUE
+// defence — defence-in-depth.
+#[derive(Debug, Serialize)]
+struct QuotePricingJobsIndexMigratedPayload {
+    tenant_id: String,
+    index_name: String,
+    dropped_at: String,
+    actor: String,
+    idempotency_key: String,
+}
+
+/// Append the one-shot `quote.pricing_jobs_index_migrated` audit row.
+/// Call site is `serve.rs` boot, ONLY when
+/// [`crate::quote_pricing_jobs::migrate_secondary_index_with_report`]
+/// returned `Ok(true)`. Re-emit on a second boot is structurally
+/// impossible (the migration helper returns `false` once the index is
+/// gone), so the UNIQUE idempotency-key constraint is belt-and-braces.
+pub fn emit_index_migrated_audit(
+    db_path: &Path,
+    tenant_id: &str,
+    binary_hash: BinaryHash,
+    login: &str,
+) -> Result<()> {
+    let mut conn = duckdb::Connection::open(db_path).context("open DB for index-migrated audit")?;
+    audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
+    let tx = conn.transaction().context("open index-migrated tx")?;
+    let meta = LedgerMeta::new(TenantId::new(tenant_id).context("tenant id")?, binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), login);
+    let dropped_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .context("format dropped_at")?;
+    let payload = QuotePricingJobsIndexMigratedPayload {
+        tenant_id: tenant_id.to_string(),
+        index_name: "quote_pricing_jobs_tenant_state_idx".to_string(),
+        dropped_at,
+        actor: "system".to_string(),
+        idempotency_key: format!("quote_pricing_jobs_index_migrated:{tenant_id}"),
+    };
+    let bytes = serde_json::to_vec(&payload).context("encode index-migrated payload")?;
+    append_in_tx(
+        &tx,
+        &meta,
+        EventKind::QuotePricingJobsIndexMigrated,
+        bytes,
+        actor,
+        Some(payload.idempotency_key.clone()),
+    )
+    .context("append QuotePricingJobsIndexMigrated")?;
+    tx.commit().context("commit index-migrated")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

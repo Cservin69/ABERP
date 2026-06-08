@@ -1652,6 +1652,38 @@ pub enum EventKind {
     /// Payload: `serde_json::Value`.
     /// F12 four-edit ritual fires once.
     QuotePricingDaemonPanicked,
+
+    /// S288 / PR-269 — one-shot boot-time migration row recording that the
+    /// orphan `quote_pricing_jobs_tenant_state_idx` secondary index was
+    /// detected on an existing prod DB and dropped. Fires once per upgrade
+    /// (the first boot whose `migrate_secondary_index_with_report` returns
+    /// `was_present = true`); on subsequent boots the index is gone and no
+    /// row fires. Fresh DBs (post-PR-268) never had the index and never
+    /// emit.
+    ///
+    /// The migration's *correctness* is defended by SCHEMA_SQL's
+    /// `DROP INDEX IF EXISTS` + a forensic test (see [[s288-redrop-prong]]).
+    /// This audit row is the *operator-visible* evidence — a forensic
+    /// walker grepping `quote.*` for "what did the pricing pipeline do
+    /// on this install" sees the migration row alongside the daemon
+    /// resolution, panic, and per-job rows. Without it the migration is
+    /// silent (CLAUDE.md rule 12 — "fail loud", or in this case
+    /// "succeed loud").
+    ///
+    /// Carries `tenant_id`, `index_name` (verbatim so future renames are
+    /// traceable), `dropped_at` (ISO-8601 UTC), `actor` (`"system"`),
+    /// and `idempotency_key` (`quote_pricing_jobs_index_migrated:<tenant>`
+    /// — one row per tenant per install, ever; subsequent boots find
+    /// the index absent and don't fire, so the UNIQUE constraint is
+    /// defence-in-depth, not the primary idempotency guarantee).
+    ///
+    /// `quote.*` prefix family (same family as the other pricing-pipeline
+    /// kinds — keeps the forensic-query glob "everything the pricing
+    /// pipeline did" inside one prefix).
+    ///
+    /// Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePricingJobsIndexMigrated,
 }
 
 impl EventKind {
@@ -1744,6 +1776,7 @@ impl EventKind {
             EventKind::EmailRelayFailed => "email.relay_failed",
             EventKind::PipelinePythonResolved => "quote.pipeline_python_resolved",
             EventKind::QuotePricingDaemonPanicked => "quote.pricing_daemon_panicked",
+            EventKind::QuotePricingJobsIndexMigrated => "quote.pricing_jobs_index_migrated",
         }
     }
 
@@ -1847,6 +1880,7 @@ impl EventKind {
             "email.relay_failed" => Ok(EventKind::EmailRelayFailed),
             "quote.pipeline_python_resolved" => Ok(EventKind::PipelinePythonResolved),
             "quote.pricing_daemon_panicked" => Ok(EventKind::QuotePricingDaemonPanicked),
+            "quote.pricing_jobs_index_migrated" => Ok(EventKind::QuotePricingJobsIndexMigrated),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1942,6 +1976,7 @@ mod tests {
             EventKind::EmailRelayFailed,
             EventKind::PipelinePythonResolved,
             EventKind::QuotePricingDaemonPanicked,
+            EventKind::QuotePricingJobsIndexMigrated,
         ];
         for v in variants {
             let s = v.as_str();
@@ -3580,6 +3615,56 @@ mod tests {
             EventKind::QuotePricingPosted,
             EventKind::QuotePricingFailed,
             EventKind::PipelinePythonResolved,
+        ] {
+            assert_ne!(
+                s,
+                sibling.as_str(),
+                "{s} collides with {}",
+                sibling.as_str()
+            );
+        }
+    }
+
+    /// S288 / PR-269 — the boot-time index-migration kind sits in the
+    /// `quote.*` family alongside its siblings. The hotfix-on-hotfix
+    /// posture: a forensic walker grepping `quote.*` on a prod ledger
+    /// must surface the migration row that proves "this install's
+    /// pricing-pipeline DB has had the orphan secondary index removed".
+    #[test]
+    fn s288_pricing_jobs_index_migrated_uses_quote_prefix() {
+        let s = EventKind::QuotePricingJobsIndexMigrated.as_str();
+        assert_eq!(s, "quote.pricing_jobs_index_migrated");
+        assert!(s.starts_with("quote."), "{s} must start with quote.");
+        assert!(
+            !s.starts_with("invoice."),
+            "{s} must not start with invoice."
+        );
+        assert!(!s.starts_with("system."), "{s} must not start with system.");
+        assert!(!s.starts_with("mes."), "{s} must not start with mes.");
+        assert!(
+            !s.starts_with("inventory."),
+            "{s} must not start with inventory."
+        );
+        assert!(!s.starts_with("email."), "{s} must not start with email.");
+    }
+
+    /// S288 / PR-269 — index-migrated is distinct from every pricing-
+    /// pipeline sibling. A collision would mis-route the one-shot
+    /// migration row into a per-job bucket and (worse) leave the SPA's
+    /// "what venv / what migrations ran on this install" forensic view
+    /// silently incomplete.
+    #[test]
+    fn s288_pricing_jobs_index_migrated_is_distinct() {
+        let s = EventKind::QuotePricingJobsIndexMigrated.as_str();
+        for sibling in [
+            EventKind::QuotePricingFetched,
+            EventKind::QuotePricingExtracted,
+            EventKind::QuotePricingPriced,
+            EventKind::QuotePricingRendered,
+            EventKind::QuotePricingPosted,
+            EventKind::QuotePricingFailed,
+            EventKind::PipelinePythonResolved,
+            EventKind::QuotePricingDaemonPanicked,
         ] {
             assert_ne!(
                 s,

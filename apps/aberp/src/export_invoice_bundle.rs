@@ -832,7 +832,12 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // Supervisor-recovery telemetry; carries panic_msg +
         // restart_count + last_known_quote_id, never NAV XML bytes.
         // Never sweeps a per-OUTGOING-invoice export bundle.
-        | EventKind::QuotePricingDaemonPanicked => None,
+        | EventKind::QuotePricingDaemonPanicked
+        // S288 / PR-269 — one-shot pricing-jobs index-migrated kind
+        // (`quote.*`). Boot-time schema-migration record; carries
+        // tenant_id + index_name + dropped_at, never NAV XML bytes.
+        // Never sweeps a per-OUTGOING-invoice export bundle.
+        | EventKind::QuotePricingJobsIndexMigrated => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

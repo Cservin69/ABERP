@@ -1553,13 +1553,70 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                     db_path: (*st.db_path).clone(),
                                     tenant: st.tenant.clone(),
                                     binary_hash,
-                                    operator_login: pipeline_operator_login,
+                                    operator_login: pipeline_operator_login.clone(),
                                 };
                             match crate::quote_pricing_pipeline::PricingPipelineService::new(
                                 pipeline_cfg,
                                 pipeline_deps,
                             ) {
                                 Ok(service) => {
+                                    // S288 / PR-269 — boot-time migration:
+                                    // detect + drop the orphan
+                                    // `quote_pricing_jobs_tenant_state_idx`
+                                    // secondary index that caused the
+                                    // PROD_v2.27.2/3 DuckDB FATAL. Returns
+                                    // `true` when migrating an existing
+                                    // prod DB; `false` on fresh installs
+                                    // or post-migration boots. The audit
+                                    // row fires only on `true`, giving a
+                                    // forensic walker one-shot evidence
+                                    // that this install was migrated.
+                                    let migrate_db_path = (*st.db_path).clone();
+                                    let migrate_res = tokio::task::spawn_blocking(
+                                        move || -> Result<bool> {
+                                            let conn =
+                                                duckdb::Connection::open(&migrate_db_path)
+                                                    .context("open DB for index migration")?;
+                                            crate::quote_pricing_jobs::migrate_secondary_index_with_report(
+                                                &conn,
+                                            )
+                                        },
+                                    )
+                                    .await;
+                                    match migrate_res {
+                                        Ok(Ok(true)) => {
+                                            tracing::info!(
+                                                "quote_pricing_jobs orphan secondary index \
+                                                 detected + dropped (S288/PR-269 migration)"
+                                            );
+                                            if let Err(e) =
+                                                crate::quote_pricing_pipeline::emit_index_migrated_audit(
+                                                    st.db_path.as_path(),
+                                                    st.tenant.as_str(),
+                                                    binary_hash,
+                                                    &pipeline_operator_login,
+                                                )
+                                            {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "quote.pricing_jobs_index_migrated audit \
+                                                     emit failed (non-fatal)"
+                                                );
+                                            }
+                                        }
+                                        Ok(Ok(false)) => tracing::debug!(
+                                            "quote_pricing_jobs orphan index absent — \
+                                             migration no-op (S288/PR-269)"
+                                        ),
+                                        Ok(Err(e)) => tracing::warn!(
+                                            error = %e,
+                                            "quote_pricing_jobs index migration failed (non-fatal)"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            "index-migration spawn_blocking join failed"
+                                        ),
+                                    }
                                     // S286 / PR-268 hotfix — log the
                                     // existing-row population at boot so
                                     // the operator can see what's in

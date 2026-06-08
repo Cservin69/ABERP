@@ -958,7 +958,12 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // Supervisor-recovery telemetry; payload carries panic_msg /
         // restart_count / last_known_quote_id, never NAV XML bytes.
         // Never sweeps a per-OUTGOING-invoice bundle.
-        | EventKind::QuotePricingDaemonPanicked => (None, ""),
+        | EventKind::QuotePricingDaemonPanicked
+        // S288 / PR-269 — one-shot pricing-jobs index-migrated kind
+        // (`quote.*`). Boot-time migration record; payload carries
+        // tenant_id / index_name / dropped_at, never NAV XML bytes.
+        // Never sweeps a per-OUTGOING-invoice bundle.
+        | EventKind::QuotePricingJobsIndexMigrated => (None, ""),
     };
 
     Ok(NavExtraction {
