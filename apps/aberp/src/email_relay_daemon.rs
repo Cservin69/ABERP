@@ -1,0 +1,426 @@
+//! S281 / PR-266 — Background drain for [`crate::email_relay_queue`].
+//!
+//! Walks `Queued` rows through `Sending → Sent` (or `→ Failed` after
+//! exhausting retries) by composing a MIME message and calling
+//! `lettre` with ABERP's existing SMTP creds (per [[aberp-smtp-spoc]]).
+//!
+//! ## Drain cadence
+//!
+//! 2s baseline tick. On SMTP failure the row is **requeued** with an
+//! exponential backoff against wall-clock — but the daemon itself
+//! sleeps a flat 2s between ticks; backoff state lives on the row
+//! (`last_error` is observed, `attempt_n` caps the retry budget). A
+//! single-tenant deployment means one daemon, no contention.
+//!
+//! Retry budget per row: 5 attempts. After the 5th SMTP failure the
+//! row moves `Sending → Failed` and a terminal
+//! [`EventKind::EmailRelayFailed`] audit row lands.
+//!
+//! ## Why one daemon
+//!
+//! ABERP runs one `aberp serve` per tenant (single-process). One
+//! drain loop is sufficient; the CAS in
+//! [`email_relay_queue::claim_next_queued`] makes the design robust
+//! against accidental double-spawn at boot.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use duckdb::Connection;
+use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
+use zeroize::Zeroizing;
+
+use aberp_audit_ledger::{append_in_tx, Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
+use lettre::{
+    message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart},
+    transport::smtp::{authentication::Credentials, client::Tls, client::TlsParameters},
+    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+};
+
+use crate::audit_payloads::EmailRelayAuditPayload;
+use crate::email_relay_queue::{
+    self, claim_next_queued, mark_failed, mark_sent, read_row, requeue_for_retry, OutboundEmailRow,
+};
+use crate::secrets_cache::SecretsCache;
+use crate::smtp_config::{self, SmtpConfig, SmtpSecurity};
+
+/// Drain tick — how often the loop wakes when there's nothing to do.
+pub const DRAIN_TICK_SECS: u64 = 2;
+/// Retry cap per row. The 5th failure transitions the row to
+/// terminal `Failed`.
+pub const MAX_ATTEMPTS_PER_ROW: u32 = 5;
+/// Bound the wall-clock on each SMTP send. Inherited from
+/// [`crate::email_invoice`]'s `SMTP_SEND_TIMEOUT`.
+const SMTP_SEND_TIMEOUT_SECS: u64 = 30;
+
+/// Dependencies the daemon needs threaded from `AppState`.
+#[derive(Clone)]
+pub struct EmailRelayDaemonDeps {
+    pub db_path: PathBuf,
+    pub tenant: TenantId,
+    pub binary_hash: BinaryHash,
+    pub operator_login: String,
+    pub seller_toml_path: PathBuf,
+    pub secrets_cache: SecretsCache,
+}
+
+/// Run the drain loop until `cancel` fires. Cooperative shutdown via
+/// the standard [`tokio_util::sync::CancellationToken`] coordinator
+/// per [[graceful-shutdown-s213]].
+pub async fn run_drain_loop(deps: EmailRelayDaemonDeps, cancel: CancellationToken) {
+    tracing::info!("email-relay drain daemon started");
+    let tick = Duration::from_secs(DRAIN_TICK_SECS);
+    loop {
+        if cancel.is_cancelled() {
+            tracing::info!("email-relay drain daemon shutting down");
+            return;
+        }
+
+        // Process one row per tick. Single-process deployment so no
+        // need for a worker pool; the 2s cadence is well inside the
+        // human-noticeable threshold.
+        match process_one_row(&deps).await {
+            Ok(true) => {
+                // Worked something — loop immediately to drain
+                // backlog. Cancel-checked above.
+                continue;
+            }
+            Ok(false) => {
+                // Nothing to do — wait a tick or until cancel.
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, "email-relay drain step failed");
+            }
+        }
+
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("email-relay drain daemon shutting down");
+                return;
+            }
+            _ = tokio::time::sleep(tick) => {}
+        }
+    }
+}
+
+/// One drain step. Returns `Ok(true)` when a row was processed,
+/// `Ok(false)` when the queue was empty. Errors propagate to the
+/// caller for logging; the loop keeps running.
+async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
+    let db_path = deps.db_path.clone();
+    let now = time::OffsetDateTime::now_utc();
+    let claimed = tokio::task::spawn_blocking(move || -> Result<Option<OutboundEmailRow>> {
+        let conn = Connection::open(&db_path).with_context(|| {
+            format!("open DuckDB at {} for email-relay drain", db_path.display())
+        })?;
+        email_relay_queue::ensure_schema(&conn)?;
+        claim_next_queued(&conn, now)
+    })
+    .await
+    .context("join claim task")??;
+
+    let row = match claimed {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+
+    let attempt_n = row.attempt_n;
+    let smtp_outcome = send_one(deps, &row).await;
+
+    match smtp_outcome {
+        Ok(()) => {
+            let id = row.id.clone();
+            let db_path2 = deps.db_path.clone();
+            let now2 = time::OffsetDateTime::now_utc();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let conn = Connection::open(&db_path2).context("open DB to mark Sent")?;
+                mark_sent(&conn, &id, now2)
+            })
+            .await
+            .context("join mark_sent task")??;
+            write_relay_audit(
+                deps,
+                EventKind::EmailRelaySent,
+                EmailRelayAuditPayload::sent(
+                    &row.submitter,
+                    &row.id,
+                    &row.recipient_hash,
+                    &row.subject,
+                    row.byte_size,
+                    attempt_n,
+                ),
+            )
+            .await;
+            Ok(true)
+        }
+        Err(e) => {
+            // Retryable failure — requeue if budget remains, else mark
+            // terminal Failed + audit.
+            let detail = scrub_for_audit(&e.to_string());
+            if attempt_n >= MAX_ATTEMPTS_PER_ROW {
+                let id = row.id.clone();
+                let db_path2 = deps.db_path.clone();
+                let detail_for_db = detail.clone();
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let conn = Connection::open(&db_path2).context("open DB to mark Failed")?;
+                    mark_failed(&conn, &id, &detail_for_db)
+                })
+                .await
+                .context("join mark_failed task")??;
+                write_relay_audit(
+                    deps,
+                    EventKind::EmailRelayFailed,
+                    EmailRelayAuditPayload::failed(
+                        &row.submitter,
+                        &row.id,
+                        &row.recipient_hash,
+                        &row.subject,
+                        row.byte_size,
+                        attempt_n,
+                        &detail,
+                    ),
+                )
+                .await;
+                tracing::warn!(
+                    row_id = %row.id,
+                    attempts = attempt_n,
+                    "email-relay row terminally failed"
+                );
+            } else {
+                let id = row.id.clone();
+                let db_path2 = deps.db_path.clone();
+                let detail_for_db = detail.clone();
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let conn = Connection::open(&db_path2).context("open DB to requeue")?;
+                    requeue_for_retry(&conn, &id, &detail_for_db)
+                })
+                .await
+                .context("join requeue task")??;
+                tracing::warn!(
+                    row_id = %row.id,
+                    attempts = attempt_n,
+                    "email-relay row requeued for retry"
+                );
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// Compose + send one queued row via SMTP. Returns `Ok(())` on
+/// success, `Err(_)` with an operator-readable cause on failure.
+async fn send_one(deps: &EmailRelayDaemonDeps, row: &OutboundEmailRow) -> Result<()> {
+    let cfg = smtp_config::read_smtp_config(&deps.seller_toml_path)
+        .context("read [seller.smtp] from seller.toml")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no [seller.smtp] section in {}",
+                deps.seller_toml_path.display()
+            )
+        })?;
+    let password = deps
+        .secrets_cache
+        .smtp_password()
+        .ok_or_else(|| anyhow::anyhow!("SMTP password not present in secrets cache"))?;
+
+    let to_addrs: Vec<String> =
+        serde_json::from_str(&row.to_recipients_json).context("parse to_recipients_json")?;
+    let cc_addrs: Vec<String> = match row.cc_recipients_json.as_deref() {
+        Some(s) => serde_json::from_str(s).context("parse cc_recipients_json")?,
+        None => Vec::new(),
+    };
+
+    // Build From mailbox.
+    let from_mbox = build_mailbox(&cfg.from_address, cfg.from_display_name.as_deref(), "from")?;
+
+    // Assemble multipart body.
+    let mut multipart = MultiPart::mixed().singlepart(
+        SinglePart::builder()
+            .header(ContentType::TEXT_PLAIN)
+            .body(row.body_text.clone()),
+    );
+    if let Some(html) = &row.body_html {
+        multipart = multipart.singlepart(
+            SinglePart::builder()
+                .header(ContentType::TEXT_HTML)
+                .body(html.clone()),
+        );
+    }
+
+    // Attachments — read from disk (basenames sit under attachments_dir).
+    if let Some(rel_dir) = &row.attachments_dir {
+        let root = email_relay_queue::attachments_root_for_tenant(deps.tenant.as_str())
+            .context("resolve attachments root")?;
+        let dir = root.join(rel_dir);
+        if dir.exists() {
+            let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&dir)
+                .with_context(|| format!("read attachments dir {}", dir.display()))?
+                .collect::<std::io::Result<Vec<_>>>()
+                .with_context(|| format!("collect entries of {}", dir.display()))?;
+            // Sort by basename so the index prefix delivers a stable order.
+            entries.sort_by_key(|e| e.file_name());
+            for ent in entries {
+                let path = ent.path();
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("read attachment {}", path.display()))?;
+                let raw_name = ent.file_name().to_string_lossy().into_owned();
+                // Strip the `NN_` index prefix the writer prepended.
+                let display_name = match raw_name.split_once('_') {
+                    Some((idx, rest)) if idx.chars().all(|c| c.is_ascii_digit()) => {
+                        rest.to_string()
+                    }
+                    _ => raw_name.clone(),
+                };
+                let part = Attachment::new(display_name).body(
+                    bytes,
+                    ContentType::parse("application/octet-stream").context("content-type parse")?,
+                );
+                multipart = multipart.singlepart(part);
+            }
+        }
+    }
+
+    let mut builder = Message::builder()
+        .from(from_mbox)
+        .subject(row.subject.clone());
+    for addr in &to_addrs {
+        let mbox = build_mailbox(addr, None, "to")?;
+        builder = builder.to(mbox);
+    }
+    for addr in &cc_addrs {
+        let mbox = build_mailbox(addr, None, "cc")?;
+        builder = builder.cc(mbox);
+    }
+    let message = builder.multipart(multipart).context("build MIME message")?;
+
+    let transport = build_transport(&cfg, &password)?;
+    transport
+        .send(message)
+        .await
+        .map_err(|e| anyhow::anyhow!("SMTP transport: {e}"))?;
+    Ok(())
+}
+
+fn build_mailbox(address: &str, display_name: Option<&str>, label: &str) -> Result<Mailbox> {
+    let (local, domain) = address
+        .split_once('@')
+        .ok_or_else(|| anyhow::anyhow!("{label} address `{address}` has no `@`"))?;
+    let addr = lettre::Address::new(local, domain)
+        .map_err(|e| anyhow::anyhow!("{label} lettre Address::new({local}, {domain}): {e}"))?;
+    let name = display_name
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    Ok(Mailbox::new(name, addr))
+}
+
+fn build_transport(
+    cfg: &SmtpConfig,
+    password: &Zeroizing<String>,
+) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
+    let tls_params = TlsParameters::new(cfg.host.clone())
+        .with_context(|| format!("TlsParameters for {}", cfg.host))?;
+    let credentials = Credentials::new(cfg.username.clone(), password.as_str().to_string());
+    let builder = match cfg.security {
+        SmtpSecurity::Tls => AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.host)
+            .with_context(|| format!("lettre relay({})", cfg.host))?
+            .tls(Tls::Wrapper(tls_params)),
+        SmtpSecurity::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.host)
+            .with_context(|| format!("lettre starttls_relay({})", cfg.host))?
+            .tls(Tls::Required(tls_params)),
+    };
+    Ok(builder
+        .port(cfg.port)
+        .credentials(credentials)
+        .timeout(Some(Duration::from_secs(SMTP_SEND_TIMEOUT_SECS)))
+        .build())
+}
+
+/// Strip any bearer / password fragments from a transport error
+/// before it lands in an audit row. Mirror of catalogue_push's
+/// `scrub`.
+fn scrub_for_audit(s: &str) -> String {
+    let mut out = s.to_string();
+    if let Some(pos) = out.find("Bearer ") {
+        out.replace_range(pos.., "Bearer <redacted>");
+    }
+    // Truncate at 1000 chars per ADR-0007 (header-injection-safe).
+    if out.len() > 1000 {
+        out.truncate(1000);
+    }
+    out
+}
+
+/// Append one `email.*` audit entry. Mirror of catalogue_push's
+/// `write_audit` posture: spawn_blocking around the DuckDB write.
+pub(crate) async fn write_relay_audit(
+    deps: &EmailRelayDaemonDeps,
+    kind: EventKind,
+    payload: EmailRelayAuditPayload,
+) {
+    let db_path = deps.db_path.clone();
+    let tenant = deps.tenant.clone();
+    let binary_hash = deps.binary_hash;
+    let login = deps.operator_login.clone();
+    let res = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = Connection::open(&db_path).context("open DB for email-relay audit")?;
+        aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
+        let bytes = payload.to_bytes();
+        let tx = conn.transaction().context("begin email-relay audit tx")?;
+        let meta = LedgerMeta::new(tenant, binary_hash);
+        let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+        append_in_tx(&tx, &meta, kind, bytes, actor, None).context("append email-relay audit")?;
+        tx.commit().context("commit email-relay audit")?;
+        Ok(())
+    })
+    .await;
+    match res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(error = ?e, "email-relay audit write failed"),
+        Err(join) => tracing::error!(%join, "email-relay audit task panicked"),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn read_row_helper(
+    db_path: &std::path::Path,
+    id: &str,
+) -> Result<Option<OutboundEmailRow>> {
+    let conn = Connection::open(db_path).context("open DB")?;
+    read_row(&conn, id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrub_for_audit_strips_bearer_token_suffix() {
+        let raw = "request failed: Bearer abcDEF1234567890";
+        let scrubbed = scrub_for_audit(raw);
+        assert!(!scrubbed.contains("abcDEF1234567890"));
+        assert!(scrubbed.contains("<redacted>"));
+    }
+
+    #[test]
+    fn scrub_for_audit_truncates_long_strings() {
+        let big = "x".repeat(5000);
+        let out = scrub_for_audit(&big);
+        assert!(out.len() <= 1000);
+    }
+
+    #[test]
+    fn scrub_for_audit_preserves_short_clean_errors() {
+        let s = "connection refused";
+        assert_eq!(scrub_for_audit(s), s);
+    }
+
+    #[test]
+    fn retry_cap_matches_brief() {
+        // PR-266 brief §B: "max 5 attempts". Pin the value so a
+        // future contributor can't silently relax it.
+        assert_eq!(MAX_ATTEMPTS_PER_ROW, 5);
+    }
+}

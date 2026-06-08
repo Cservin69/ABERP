@@ -52,7 +52,12 @@ export type AppRoute =
   // under the maintenance area's Quoting sub-nav alongside the
   // tunables (operators reach it when they need to bump on_hand_qty
   // after a material delivery).
-  | "inventory-balances";
+  | "inventory-balances"
+  // S281 / PR-266 — operator inspector for the storefront email-relay
+  // queue (ADR-0007). Read-only list of `outbound_email_queue` rows
+  // with state filters (queued/sending/sent/failed). Lives under the
+  // maintenance area alongside the other operational queues.
+  | "email-relay-queue";
 
 /** Default route the SPA falls back to on first paint (or on a hash
  * with an unknown slug). The Invoices list was the only screen
@@ -124,6 +129,8 @@ export function parseRoute(hash: string): AppRoute {
       return "quoting-stock-adjustments";
     case "inventory-balances":
       return "inventory-balances";
+    case "email-relay-queue":
+      return "email-relay-queue";
     default:
       return DEFAULT_ROUTE;
   }

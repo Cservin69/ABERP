@@ -2623,6 +2623,144 @@ impl ExtNavPartnerManualLinkPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// EmailRelay{Queued,Sent,Failed} (S281 / PR-266) — ADR-0007 sister-
+// service email relay. The storefront POSTs `/api/internal/send-email`
+// to ABERP; the relay queues + sends via ABERP's existing SMTP creds.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for the three `email.relay_*` event kinds.
+///
+/// # GDPR-minimisation posture
+///
+/// - **Recipient addresses are HASHED.** The `to`/`cc` list is
+///   comma-joined (operator-byte-sort order) and SHA-256ed before
+///   landing in this payload. The full plaintext stays in the
+///   `outbound_email_queue.to_recipients_json` column (operationally
+///   visible during the row's lifetime) but NEVER reaches the
+///   hash-chained audit ledger per ADR-0007 §Audit.
+/// - **No body bytes.** The body lives on the queue row (and on disk
+///   for attachments); the audit payload carries the rendered size
+///   only.
+/// - **No attachment plaintext.** Same posture as `body_text`.
+/// - **Subject is plaintext.** Operator-visible by design — needed
+///   for triage; not PII-sensitive in our domain (same posture as
+///   `invoice.emailed_sent`'s `subject` field).
+///
+/// One payload struct serves all three siblings — `outcome` is the
+/// closed-vocab discriminator (`"queued" | "sent" | "failed"`). On
+/// `Failed` the `last_error` field carries the scrubbed-of-secrets
+/// detail and `attempt_n` records how many tries were exhausted; on
+/// `Queued`/`Sent` they may be `None`/`1`.
+///
+/// Pinned by `audit_payload_email_relay_carries_no_recipient_plaintext`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmailRelayAuditPayload {
+    /// Token-identified caller — `"storefront"` for the ADR-0007
+    /// caller; future surfaces may register different submitters.
+    /// Free-form; CR/LF rejected at the route layer.
+    pub submitter: String,
+    /// UUID of the persisted `outbound_email_queue` row this entry
+    /// records. Threads the audit row to the operational row so a
+    /// forensic walker can join the two.
+    pub queue_row_id: String,
+    /// SHA-256 of the comma-joined `to`-list (operator-byte-sort
+    /// order, lowercased) in lowercase hex. The hash is stable across
+    /// retries of the same request so the audit trail of one
+    /// queued-then-sent row joins by recipient_hash.
+    pub recipient_hash: String,
+    /// Verbatim subject line — operator-visible.
+    pub subject: String,
+    /// Rendered message + attachments size in bytes (after base64
+    /// decode for attachments).
+    pub byte_size: u64,
+    /// Closed-vocab — `"queued" | "sent" | "failed"`. Wire form is
+    /// the lowercase token verbatim.
+    pub outcome: String,
+    /// 1-based attempt counter. `1` on `queued` (first acceptance) and
+    /// on `sent`-on-first-try; higher on retry-driven `sent`/`failed`.
+    pub attempt_n: u32,
+    /// Scrubbed-of-secrets error detail, present iff
+    /// `outcome == "failed"`. `None` on success/queue rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl EmailRelayAuditPayload {
+    /// Construct a queued-acceptance payload. `attempt_n == 1`,
+    /// `outcome == "queued"`, `last_error == None`.
+    pub fn queued(
+        submitter: &str,
+        queue_row_id: &str,
+        recipient_hash: &str,
+        subject: &str,
+        byte_size: u64,
+    ) -> Self {
+        Self {
+            submitter: submitter.to_string(),
+            queue_row_id: queue_row_id.to_string(),
+            recipient_hash: recipient_hash.to_string(),
+            subject: subject.to_string(),
+            byte_size,
+            outcome: "queued".to_string(),
+            attempt_n: 1,
+            last_error: None,
+        }
+    }
+
+    /// Construct a sent-success payload. `attempt_n` is the 1-based
+    /// attempt that succeeded (1 = first try).
+    pub fn sent(
+        submitter: &str,
+        queue_row_id: &str,
+        recipient_hash: &str,
+        subject: &str,
+        byte_size: u64,
+        attempt_n: u32,
+    ) -> Self {
+        Self {
+            submitter: submitter.to_string(),
+            queue_row_id: queue_row_id.to_string(),
+            recipient_hash: recipient_hash.to_string(),
+            subject: subject.to_string(),
+            byte_size,
+            outcome: "sent".to_string(),
+            attempt_n,
+            last_error: None,
+        }
+    }
+
+    /// Construct a terminal-failure payload. `last_error` MUST be
+    /// pre-scrubbed by the caller per the same posture as
+    /// `InvoiceEmailedSentPayload::failed` — the audit payload type
+    /// can't run the scrub itself without re-importing the SMTP error
+    /// type.
+    pub fn failed(
+        submitter: &str,
+        queue_row_id: &str,
+        recipient_hash: &str,
+        subject: &str,
+        byte_size: u64,
+        attempt_n: u32,
+        last_error: &str,
+    ) -> Self {
+        Self {
+            submitter: submitter.to_string(),
+            queue_row_id: queue_row_id.to_string(),
+            recipient_hash: recipient_hash.to_string(),
+            subject: subject.to_string(),
+            byte_size,
+            outcome: "failed".to_string(),
+            attempt_n,
+            last_error: Some(last_error.to_string()),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -4854,5 +4992,99 @@ mod tests {
             "missing outcome keys default to 0"
         );
         assert_eq!(p.invoice_count, 5, "legacy fields still read");
+    }
+
+    // ── S281 / PR-266 — EmailRelayAuditPayload pins ───────────────────
+
+    /// Round-trip queued/sent/failed shapes through serde_json. A future
+    /// rename of any field would break the wire compatibility of
+    /// previously-written rows.
+    #[test]
+    fn email_relay_payload_queued_round_trips() {
+        let p = EmailRelayAuditPayload::queued(
+            "storefront",
+            "11111111-2222-3333-4444-555555555555",
+            "deadbeef".repeat(8).as_str(),
+            "Your Áben quote",
+            12345,
+        );
+        let bytes = p.to_bytes();
+        let back: EmailRelayAuditPayload = serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(back, p);
+        assert_eq!(back.outcome, "queued");
+        assert_eq!(back.attempt_n, 1);
+        assert!(back.last_error.is_none());
+    }
+
+    #[test]
+    fn email_relay_payload_sent_round_trips() {
+        let p = EmailRelayAuditPayload::sent(
+            "storefront",
+            "11111111-2222-3333-4444-555555555555",
+            "deadbeef".repeat(8).as_str(),
+            "Your Áben quote",
+            12345,
+            3,
+        );
+        let bytes = p.to_bytes();
+        let back: EmailRelayAuditPayload = serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(back, p);
+        assert_eq!(back.outcome, "sent");
+        assert_eq!(back.attempt_n, 3);
+        assert!(back.last_error.is_none());
+    }
+
+    #[test]
+    fn email_relay_payload_failed_round_trips() {
+        let p = EmailRelayAuditPayload::failed(
+            "storefront",
+            "11111111-2222-3333-4444-555555555555",
+            "deadbeef".repeat(8).as_str(),
+            "Your Áben quote",
+            12345,
+            5,
+            "SMTP transport failure: connection refused",
+        );
+        let bytes = p.to_bytes();
+        let back: EmailRelayAuditPayload = serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(back, p);
+        assert_eq!(back.outcome, "failed");
+        assert_eq!(back.attempt_n, 5);
+        assert!(back.last_error.as_deref().unwrap().contains("connection"));
+    }
+
+    /// S281 / PR-266 / ADR-0007 §Audit — the audit payload MUST NEVER
+    /// carry the plaintext recipient address. Recipient is hashed
+    /// (SHA-256) at the boundary; the payload's `recipient_hash` is the
+    /// only surface that touches "who got mailed." A future contributor
+    /// adding a `recipient_plaintext` field would break GDPR
+    /// minimisation; pin to prevent.
+    #[test]
+    fn email_relay_payload_carries_no_recipient_plaintext() {
+        let plaintext = "customer@example.com";
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(plaintext.as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        let p = EmailRelayAuditPayload::sent(
+            "storefront",
+            "11111111-2222-3333-4444-555555555555",
+            &hash,
+            "Your Áben quote",
+            42,
+            1,
+        );
+        let bytes = p.to_bytes();
+        let blob = String::from_utf8(bytes).expect("UTF-8");
+        assert!(
+            !blob.contains(plaintext),
+            "audit payload must never carry recipient plaintext; got: {blob}"
+        );
+        assert!(
+            blob.contains(&hash),
+            "audit payload must carry the recipient_hash; got: {blob}"
+        );
     }
 }

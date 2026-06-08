@@ -67,6 +67,8 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "quoting-stock-adjustments",
   // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
   "inventory-balances",
+  // S281 / PR-266 — storefront email-relay queue inspector.
+  "email-relay-queue",
 ];
 
 // PR-79 / session 102 — closed set of AREA-landing routes. These are
@@ -122,6 +124,8 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   // grade (the DEAL saga's auto-upsert lands the row at zeros until
   // the operator sets on_hand_qty here).
   "inventory-balances": "quoting",
+  // S281 / PR-266 — storefront email-relay queue inspector.
+  "email-relay-queue": "email-relay",
 };
 
 // The expected area for each AppRoute. The two-area usage-frequency
@@ -160,6 +164,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   "quoting-stock-adjustments": "maintenance",
   // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
   "inventory-balances": "maintenance",
+  // S281 / PR-266 — storefront email-relay queue inspector.
+  "email-relay-queue": "maintenance",
 };
 
 // Closed-vocab set of accepted status kinds on a maintenance tile.
@@ -186,6 +192,8 @@ const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   "StockAdjustmentCount",
   // S273 / PR-262 / ADR-0069 — material-side balances tile.
   "InventoryBalanceCount",
+  // S281 / PR-266 — storefront email-relay queue tile.
+  "EmailRelayQueueCount",
 ]);
 
 // Every area must have a stable bilingual label and at least one
@@ -346,7 +354,13 @@ describe("modulesInArea + defaultRouteForArea", () => {
     // the operational area after statistics per the registry order.
     expect(op.map((m) => m.id)).toEqual(["invoicing", "statistics", "production"]);
     // S267 / PR-256 — new `quoting` module joins maintenance after Settings.
-    expect(mt.map((m) => m.id)).toEqual(["master-data", "settings", "quoting"]);
+    // S281 / PR-266 — new `email-relay` module joins after Quoting.
+    expect(mt.map((m) => m.id)).toEqual([
+      "master-data",
+      "settings",
+      "quoting",
+      "email-relay",
+    ]);
   });
 
   it("modulesInArea partitions the registry (union covers every module, no overlap)", () => {

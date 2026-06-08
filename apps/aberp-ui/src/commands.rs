@@ -1897,6 +1897,48 @@ fn validate_qa_or_routing_op_id(s: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// S281 / PR-266 — list email-relay queue rows (read-only operator
+/// surface). Optional `state` filter (queued/sending/sent/failed) +
+/// `limit` (default 100, capped 500 by the backend). The drain
+/// daemon is the only writer; the SPA shows queue + last_error +
+/// attempt counts.
+#[tauri::command]
+pub async fn list_email_relay_queue(
+    state: State<'_, AppState>,
+    state_filter: Option<String>,
+    limit: Option<u32>,
+) -> Result<Value, String> {
+    let mut path = String::from("/api/email-relay/queue?");
+    if let Some(s) = state_filter.as_deref() {
+        path.push_str(&format!("state={}&", urlencode(s)));
+    }
+    if let Some(n) = limit {
+        path.push_str(&format!("limit={n}"));
+    }
+    forward_get(&state, &path, true).await
+}
+
+/// S281 / PR-266 — read one email-relay queue row by id (the UUID
+/// returned as `audit_id` on the 200 from `POST /api/internal/send-email`).
+#[tauri::command]
+pub async fn get_email_relay_row(
+    state: State<'_, AppState>,
+    row_id: String,
+) -> Result<Value, String> {
+    // Defence-in-depth: same alphanumeric+dash gate as invoice_id.
+    if row_id.is_empty() || row_id.len() > 64 {
+        return Err("row_id must be 1-64 chars".to_string());
+    }
+    if !row_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err("row_id contains characters outside [A-Za-z0-9_-]".to_string());
+    }
+    let path = format!("/api/email-relay/queue/{row_id}");
+    forward_get(&state, &path, true).await
+}
+
 /// Reject obviously malformed invoice ids before they reach the
 /// backend. The backend itself has its own (looser) parsing — this
 /// is defence in depth against a path-injection attempt from a

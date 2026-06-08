@@ -99,6 +99,11 @@ use crate::binary_hash::BinaryHashHandle;
 use crate::build_profile;
 use crate::cli::ServeArgs;
 use crate::email_invoice::{self, EmailSendError, SendInvoiceEmailInput, SendTrigger};
+// S281 / PR-266 — storefront email-relay surface (ADR-0007).
+use crate::audit_payloads::EmailRelayAuditPayload;
+use crate::email_relay;
+use crate::email_relay_credentials as email_relay_credentials_mod;
+use crate::email_relay_queue;
 use crate::incoming_invoices;
 use crate::invoice_bank_snapshot::load_invoice_bank_snapshot_in_tx;
 use crate::invoice_currency_metadata::{
@@ -974,6 +979,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         adapter_health_baseline: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         restore_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         catalogue_push: crate::catalogue_push::CataloguePushHandle::dormant(),
+        email_relay_rate_limiter: Arc::new(crate::email_relay::RateLimiter::new()),
     };
 
     // 5. Build the axum router. Clone the state first so the app-boot
@@ -1590,6 +1596,48 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     return Err(anyhow!("MES adapter boot failed: {e:#}"));
                 }
             }
+        }
+
+        // S281 / PR-266 — spawn the email-relay drain daemon. Always
+        // active (the queue table is process-local and a row can
+        // arrive any time the relay token is configured). The drain
+        // shutdown-cooperates via the coordinator's cancellation
+        // token per [[graceful-shutdown-s213]].
+        {
+            let operator_login = match recovery_state.boot_state.read() {
+                Ok(guard) => match &*guard {
+                    ServeBootState::Ready { operator_login } => operator_login.clone(),
+                    ServeBootState::NeedsSellerConfig { operator_login } => operator_login.clone(),
+                    _ => "boot".to_string(),
+                },
+                Err(_) => "boot".to_string(),
+            };
+            let binary_hash = recovery_state
+                .binary_hash
+                .wait()
+                .context("await background binary hash for email-relay drain daemon")?;
+            let seller_toml_path = setup_seller_info::seller_toml_path_for_tenant(
+                recovery_state.tenant.as_str(),
+            )
+            .context("resolve seller.toml path for email-relay drain")?;
+            let relay_deps = crate::email_relay_daemon::EmailRelayDaemonDeps {
+                db_path: (*recovery_state.db_path).clone(),
+                tenant: recovery_state.tenant.clone(),
+                binary_hash,
+                operator_login,
+                seller_toml_path,
+                secrets_cache: recovery_state.secrets_cache.clone(),
+            };
+            let relay_token = coordinator.token.clone();
+            let relay_handle = tokio::spawn(async move {
+                crate::email_relay_daemon::run_drain_loop(relay_deps, relay_token).await;
+            });
+            coordinator.register("email-relay-drain", relay_handle);
+            tracing::info!(
+                tick_secs = crate::email_relay_daemon::DRAIN_TICK_SECS,
+                retry_cap = crate::email_relay_daemon::MAX_ATTEMPTS_PER_ROW,
+                "spawned email-relay drain daemon (S281 / PR-266)"
+            );
         }
 
         let config = RustlsConfig::from_der(rustls_config.0, rustls_config.1)
@@ -2221,6 +2269,14 @@ pub struct AppState {
     /// immediate push; the list route reads `.snapshot()` for the
     /// "last push" + paused (re-paste-bearer) banner.
     pub catalogue_push: Arc<crate::catalogue_push::CataloguePushHandle>,
+    /// S281 / PR-266 — token-bucket rate limiter for the
+    /// `POST /api/internal/send-email` storefront-relay surface. One
+    /// bucket per submitter (identified by their bearer-token-resolved
+    /// id, e.g. `"storefront"`). 30 req/min cap matching ADR-0007 §2.
+    /// Lives in `AppState` so the rate-limit state survives across
+    /// requests but resets on every `aberp serve` restart (an operator
+    /// restart is itself rare enough that bucket drift is a non-issue).
+    pub email_relay_rate_limiter: Arc<crate::email_relay::RateLimiter>,
 }
 
 /// Session-161 — max number of NAV poll daemons polling concurrently.
@@ -2717,6 +2773,17 @@ fn build_router(state: AppState) -> Router {
         // token (first 8 chars of quote_id). Replay → 409
         // `deal_already_issued`.
         .route("/api/quote-intake/:quote_id/deal", post(handle_deal_saga))
+        // S281 / PR-266 — storefront email-relay (ADR-0007). The
+        // storefront POSTs `/api/internal/send-email` with the
+        // dedicated email-relay bearer; ABERP validates + persists +
+        // returns 200 with audit_id. List + per-row read for the SPA
+        // operator inspector.
+        .route("/api/internal/send-email", post(handle_relay_send_email))
+        .route("/api/email-relay/queue", get(handle_list_email_relay_queue))
+        .route(
+            "/api/email-relay/queue/:id",
+            get(handle_get_email_relay_row),
+        )
         .with_state(state)
 }
 
@@ -17915,6 +17982,449 @@ fn extract_invoice_id(entry: &Entry) -> Option<String> {
     Some(probe.invoice_id)
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// S281 / PR-266 — Email-relay handlers (ADR-0007)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Closed-vocab `submitter` identifier the relay route emits onto the
+/// queue row + audit payload. The relay-token bearer authenticates the
+/// caller; v1 only knows the storefront. Future surfaces (a second
+/// sister service) would each get their own token and a distinct
+/// submitter literal here.
+const RELAY_SUBMITTER_STOREFRONT: &str = "storefront";
+
+/// JSON body the route returns on validation failure. Stable shape so
+/// the storefront branches on `code` (closed-vocab) rather than parsing
+/// the message string.
+#[derive(Serialize)]
+struct RelayValidationErrorBody {
+    error: &'static str,
+    code: &'static str,
+    message: String,
+}
+
+/// JSON body the route returns on 200 acceptance.
+#[derive(Serialize)]
+struct RelayAcceptedBody {
+    audit_id: String,
+}
+
+/// `POST /api/internal/send-email` per ADR-0007. Bearer-gated by the
+/// dedicated email-relay token (NOT the session token); on accept,
+/// persists the row + writes attachments to disk + emits
+/// `EmailRelayQueued` and returns 200 with the audit id.
+async fn handle_relay_send_email(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    // 1. Authenticate with the dedicated email-relay keychain token.
+    //    Distinct from `state.session_token` per ADR-0007 §Auth (two
+    //    tokens → independent rotation).
+    let expected_token = match email_relay_credentials_mod::read_token(state.tenant.as_str()) {
+        Ok(z) => z,
+        Err(email_relay_credentials_mod::EmailRelayCredentialsError::Missing { tenant_id }) => {
+            tracing::warn!(
+                tenant = %tenant_id,
+                "email-relay route called but no keychain token configured for this tenant"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "email_relay_not_configured",
+                    "message": "ABERP has no email-relay bearer token configured for this tenant; \
+                                set ABERP_EMAIL_RELAY_TOKEN in the OS keychain first."
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "keychain read failed for email-relay token");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error_body("keychain read failed".to_string())),
+            )
+                .into_response();
+        }
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &expected_token) {
+        return resp;
+    }
+
+    // 2. Rate-limit per submitter — v1 has one submitter
+    //    ("storefront") but the bucket is keyed by the submitter
+    //    literal so a future per-token identity slots in cleanly.
+    let now_instant = std::time::Instant::now();
+    if let Err(retry_after) = state
+        .email_relay_rate_limiter
+        .try_acquire(RELAY_SUBMITTER_STOREFRONT, now_instant)
+    {
+        let mut resp = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "rate_limited",
+                "retry_after_secs": retry_after,
+                "message": format!(
+                    "submitter `{RELAY_SUBMITTER_STOREFRONT}` exceeded {} requests/min; \
+                     retry after {retry_after}s",
+                    email_relay::MAX_RELAY_PER_MINUTE
+                ),
+            })),
+        )
+            .into_response();
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&format!("{retry_after}")) {
+            resp.headers_mut().insert("Retry-After", hv);
+        }
+        return resp;
+    }
+
+    // 3. Size cap pre-check — refuse 25 MB+ bodies BEFORE we
+    //    serde_json::from_slice the whole thing (defence in depth on
+    //    top of axum's own body limit).
+    if (body_bytes.len() as u64) > email_relay::MAX_RELAY_BODY_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": "request_too_large",
+                "code": "body_too_large",
+                "max_bytes": email_relay::MAX_RELAY_BODY_BYTES,
+                "got_bytes": body_bytes.len(),
+            })),
+        )
+            .into_response();
+    }
+
+    // 4. Parse the body JSON.
+    let wire: email_relay::RelayRequestBody = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "bad_json",
+                    "message": format!("body is not valid JSON: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // 5. Run validation.
+    let validated = match email_relay::validate(RELAY_SUBMITTER_STOREFRONT, wire) {
+        Ok(v) => v,
+        Err(verr) => {
+            let status = match verr.code {
+                email_relay::ValidationCode::BodyTooLarge
+                | email_relay::ValidationCode::AttachmentTooLarge
+                | email_relay::ValidationCode::TooManyAttachments => StatusCode::PAYLOAD_TOO_LARGE,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            return (
+                status,
+                Json(RelayValidationErrorBody {
+                    error: "validation_failed",
+                    code: verr.code.as_str(),
+                    message: verr.message,
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // 6. Persist to DB + write attachments to disk + emit audit.
+    let row_id = Ulid::new().to_string();
+    let attachments_rel_dir = if validated.attachments.is_empty() {
+        None
+    } else {
+        Some(row_id.clone())
+    };
+    let attachments_root =
+        match email_relay_queue::attachments_root_for_tenant(state.tenant.as_str()) {
+            Ok(p) => p,
+            Err(e) => return internal_error("resolve email-relay attachments root", e),
+        };
+
+    if let Some(rel) = &attachments_rel_dir {
+        let abs = attachments_root.join(rel);
+        for (i, att) in validated.attachments.iter().enumerate() {
+            if let Err(e) = email_relay_queue::write_attachment(&abs, i, &att.filename, &att.bytes)
+            {
+                return internal_error("write email-relay attachment to disk", e);
+            }
+        }
+    }
+
+    let to_json = match serde_json::to_string(&validated.to) {
+        Ok(s) => s,
+        Err(e) => {
+            return internal_error(
+                "serialize to-recipients for queue row",
+                anyhow!("serde_json::to_string: {e}"),
+            )
+        }
+    };
+    let cc_json = if validated.cc.is_empty() {
+        None
+    } else {
+        Some(match serde_json::to_string(&validated.cc) {
+            Ok(s) => s,
+            Err(e) => {
+                return internal_error(
+                    "serialize cc-recipients for queue row",
+                    anyhow!("serde_json::to_string: {e}"),
+                )
+            }
+        })
+    };
+
+    let db_path = (*state.db_path).clone();
+    let row_id_for_blocking = row_id.clone();
+    let to_json_for_blocking = to_json.clone();
+    let cc_json_for_blocking = cc_json.clone();
+    let subject_for_blocking = validated.subject.clone();
+    let body_text_for_blocking = validated.body_text.clone();
+    let body_html_for_blocking = validated.body_html.clone();
+    let attachments_rel_dir_for_blocking = attachments_rel_dir.clone();
+    let recipient_hash_for_blocking = validated.recipient_hash.clone();
+    let byte_size = validated.byte_size;
+    let insert_res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = duckdb::Connection::open(&db_path).with_context(|| {
+            format!(
+                "open DuckDB at {} for relay queue insert",
+                db_path.display()
+            )
+        })?;
+        email_relay_queue::insert_queued(
+            &conn,
+            &row_id_for_blocking,
+            RELAY_SUBMITTER_STOREFRONT,
+            &to_json_for_blocking,
+            cc_json_for_blocking.as_deref(),
+            &subject_for_blocking,
+            &body_text_for_blocking,
+            body_html_for_blocking.as_deref(),
+            attachments_rel_dir_for_blocking.as_deref(),
+            &recipient_hash_for_blocking,
+            byte_size,
+            time::OffsetDateTime::now_utc(),
+        )
+    })
+    .await;
+    match insert_res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return internal_error("insert relay queue row", e),
+        Err(join) => {
+            return internal_error("relay queue insert task panicked", anyhow!("join: {join}"))
+        }
+    }
+
+    // 7. Emit the `EmailRelayQueued` audit row. spawn_blocking for the
+    //    DuckDB write; we don't await it before responding (operator-
+    //    facing UX-fast, post-issue-async posture) — but we DO log
+    //    on audit-write failure so a corrupted ledger surfaces in
+    //    tracing.
+    let deps = crate::email_relay_daemon::EmailRelayDaemonDeps {
+        db_path: (*state.db_path).clone(),
+        tenant: state.tenant.clone(),
+        binary_hash: match state.binary_hash.wait() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "binary_hash compute failed at email-relay accept; \
+                     audit skipped (defensive — the row is queued)"
+                );
+                return (StatusCode::OK, Json(RelayAcceptedBody { audit_id: row_id }))
+                    .into_response();
+            }
+        },
+        operator_login: operator_login_for_audit(&state),
+        seller_toml_path: match setup_seller_info::seller_toml_path_for_tenant(
+            state.tenant.as_str(),
+        ) {
+            Ok(p) => p,
+            Err(e) => return internal_error("resolve seller.toml path for relay audit", e),
+        },
+        secrets_cache: state.secrets_cache.clone(),
+    };
+    crate::email_relay_daemon::write_relay_audit(
+        &deps,
+        aberp_audit_ledger::EventKind::EmailRelayQueued,
+        EmailRelayAuditPayload::queued(
+            RELAY_SUBMITTER_STOREFRONT,
+            &row_id,
+            &validated.recipient_hash,
+            &validated.subject,
+            validated.byte_size,
+        ),
+    )
+    .await;
+
+    (StatusCode::OK, Json(RelayAcceptedBody { audit_id: row_id })).into_response()
+}
+
+/// `GET /api/email-relay/queue?state=queued|sending|sent|failed&limit=N`.
+/// Read-only operator inspector (session-token gated). Returns rows
+/// newest-first; default limit 100, max 500.
+async fn handle_list_email_relay_queue(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_filter = match q.get("state").map(|s| s.as_str()) {
+        Some("queued") => Some(email_relay_queue::QueueState::Queued),
+        Some("sending") => Some(email_relay_queue::QueueState::Sending),
+        Some("sent") => Some(email_relay_queue::QueueState::Sent),
+        Some("failed") => Some(email_relay_queue::QueueState::Failed),
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "bad_state_filter",
+                    "message": format!("unknown state `{other}`; allowed: queued/sending/sent/failed"),
+                })),
+            )
+                .into_response();
+        }
+        None => None,
+    };
+    let limit = q
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100)
+        .min(500);
+    let db_path = (*state.db_path).clone();
+    let rows_res = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<_>> {
+        let conn = duckdb::Connection::open(&db_path).with_context(|| {
+            format!("open DuckDB at {} for relay queue list", db_path.display())
+        })?;
+        email_relay_queue::list_rows(&conn, state_filter, limit)
+    })
+    .await;
+    let rows = match rows_res {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return internal_error("list relay queue rows", e),
+        Err(join) => {
+            return internal_error("relay queue list task panicked", anyhow!("join: {join}"))
+        }
+    };
+    let wire: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "created_at": r.created_at,
+                "submitter": r.submitter,
+                "subject": r.subject,
+                "state": r.state.as_str(),
+                "attempt_n": r.attempt_n,
+                "last_error": r.last_error,
+                "sent_at": r.sent_at,
+                "recipient_hash": r.recipient_hash,
+                "byte_size": r.byte_size,
+                "attachments_dir": r.attachments_dir,
+                "has_html": r.body_html.is_some(),
+                "to_count": serde_json::from_str::<Vec<String>>(&r.to_recipients_json)
+                    .map(|v| v.len())
+                    .unwrap_or(0),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "rows": wire })).into_response()
+}
+
+/// `GET /api/email-relay/queue/:id`. Single-row read with full body
+/// preview (subject + first 4 KiB of body_text) so the operator can
+/// triage a failed row without round-tripping a separate route.
+async fn handle_get_email_relay_row(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let db_path = (*state.db_path).clone();
+    let row_res = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = duckdb::Connection::open(&db_path)
+            .with_context(|| format!("open DuckDB at {} for relay queue row", db_path.display()))?;
+        email_relay_queue::read_row(&conn, &id)
+    })
+    .await;
+    let row = match row_res {
+        Ok(Ok(Some(r))) => r,
+        Ok(Ok(None)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(error_body("row not found".to_string())),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => return internal_error("read relay queue row", e),
+        Err(join) => {
+            return internal_error("relay queue read task panicked", anyhow!("join: {join}"))
+        }
+    };
+    let body_text_preview = if row.body_text.len() > 4096 {
+        format!(
+            "{}…[truncated, total {} bytes]",
+            &row.body_text[..4096],
+            row.body_text.len()
+        )
+    } else {
+        row.body_text.clone()
+    };
+    let to_addrs: Vec<String> = serde_json::from_str(&row.to_recipients_json).unwrap_or_default();
+    let cc_addrs: Vec<String> = row
+        .cc_recipients_json
+        .as_deref()
+        .map(|s| serde_json::from_str(s).unwrap_or_default())
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "id": row.id,
+        "created_at": row.created_at,
+        "submitter": row.submitter,
+        "subject": row.subject,
+        "state": row.state.as_str(),
+        "attempt_n": row.attempt_n,
+        "last_error": row.last_error,
+        "sent_at": row.sent_at,
+        "recipient_hash": row.recipient_hash,
+        "byte_size": row.byte_size,
+        "attachments_dir": row.attachments_dir,
+        "has_html": row.body_html.is_some(),
+        "to_count": to_addrs.len(),
+        "cc_count": cc_addrs.len(),
+        "body_text_preview": body_text_preview,
+    }))
+    .into_response()
+}
+
+/// Read the boot-cached operator login for audit-actor stamping. Used
+/// by the email-relay handlers (they don't run inside `require_ready`
+/// for the receive route — the relay endpoint is sister-service-auth,
+/// not operator-auth — so we extract the login eagerly).
+fn operator_login_for_audit(state: &AppState) -> String {
+    let guard = state.boot_state.read();
+    match guard {
+        Ok(b) => match &*b {
+            ServeBootState::Ready { operator_login } => operator_login.clone(),
+            ServeBootState::NeedsSellerConfig { operator_login } => operator_login.clone(),
+            ServeBootState::NeedsSetup => "system".to_string(),
+        },
+        Err(_) => "system".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! `mod tests` scan (per `feedback_rust_scan_existing_mod_blocks`):
@@ -20441,6 +20951,7 @@ mod tests {
             )),
             restore_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_push: crate::catalogue_push::CataloguePushHandle::dormant(),
+            email_relay_rate_limiter: std::sync::Arc::new(crate::email_relay::RateLimiter::new()),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, storno_invoice_id)
@@ -20555,6 +21066,7 @@ mod tests {
             )),
             restore_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_push: crate::catalogue_push::CataloguePushHandle::dormant(),
+            email_relay_rate_limiter: std::sync::Arc::new(crate::email_relay::RateLimiter::new()),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, invoice_id)
@@ -21314,6 +21826,7 @@ mod tests {
             )),
             restore_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_push: crate::catalogue_push::CataloguePushHandle::dormant(),
+            email_relay_rate_limiter: std::sync::Arc::new(crate::email_relay::RateLimiter::new()),
         }
     }
 

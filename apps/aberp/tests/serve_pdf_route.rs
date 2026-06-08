@@ -209,6 +209,7 @@ fn build_state(wired: &WiredInvoice) -> AppState {
         adapter_health_baseline: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         restore_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         catalogue_push: aberp::catalogue_push::CataloguePushHandle::dormant(),
+        email_relay_rate_limiter: std::sync::Arc::new(aberp::email_relay::RateLimiter::new()),
     }
 }
 

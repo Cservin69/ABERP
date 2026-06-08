@@ -98,6 +98,8 @@
   import QuotingStockAdjustmentsList from "./routes/QuotingStockAdjustmentsList.svelte";
   // S273 / PR-262 / ADR-0069 — material-side Inventory Balances view.
   import InventoryBalancesList from "./routes/InventoryBalancesList.svelte";
+  // S281 / PR-266 — storefront email-relay queue inspector (ADR-0007).
+  import EmailRelayQueueList from "./routes/EmailRelayQueueList.svelte";
   import SellerConfigWizard from "./routes/SellerConfigWizard.svelte";
   import SetupWizard from "./routes/SetupWizard.svelte";
   // S225 / PR-221 — financial-statistics dashboard.
@@ -682,6 +684,8 @@
           <QuotingStockAdjustmentsList />
         {:else if route === "inventory-balances"}
           <InventoryBalancesList />
+        {:else if route === "email-relay-queue"}
+          <EmailRelayQueueList />
         {:else if route === "invoices-new"}
           <!-- PR-87 / session-112 — full-page issuance route. The
                IssueInvoice form was a `<dialog>` modal mounted inside

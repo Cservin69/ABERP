@@ -3144,6 +3144,53 @@ export async function retryQuotePricingJob(
   return invoke("retry_quote_pricing_job", { quoteId });
 }
 
+/** S281 / PR-266 — one row of the email-relay queue (ADR-0007). Read-only
+ * operator inspector projection — the drain daemon is the only writer. */
+export interface EmailRelayQueueRow {
+  id: string;
+  created_at: string;
+  submitter: string;
+  subject: string;
+  /** Closed vocab: `queued | sending | sent | failed`. */
+  state: string;
+  attempt_n: number;
+  last_error: string | null;
+  sent_at: string | null;
+  recipient_hash: string;
+  byte_size: number;
+  attachments_dir: string | null;
+  has_html: boolean;
+  to_count: number;
+}
+
+interface EmailRelayQueueResponse {
+  rows: EmailRelayQueueRow[];
+}
+
+/** S281 / PR-266 — list email-relay queue rows. Optional state filter +
+ * limit (backend caps at 500). */
+export async function listEmailRelayQueue(
+  opts: { state?: string; limit?: number } = {},
+): Promise<EmailRelayQueueResponse> {
+  return invoke<EmailRelayQueueResponse>("list_email_relay_queue", {
+    stateFilter: opts.state,
+    limit: opts.limit,
+  });
+}
+
+/** S281 / PR-266 — read one email-relay queue row by id. Carries the
+ * subject + body preview + attachment + counts for operator triage. */
+export interface EmailRelayQueueRowDetail extends EmailRelayQueueRow {
+  cc_count: number;
+  body_text_preview: string;
+}
+
+export async function getEmailRelayRow(
+  rowId: string,
+): Promise<EmailRelayQueueRowDetail> {
+  return invoke<EmailRelayQueueRowDetail>("get_email_relay_row", { rowId });
+}
+
 /** S255 / PR-244 — outcome of POST `/api/quotes/{quote_id}/pickup-as-draft`.
  * The SPA navigates to `#/invoices` after pickup; `partner_created`
  * drives the optional ConfirmActionModal warning copy (and is shown

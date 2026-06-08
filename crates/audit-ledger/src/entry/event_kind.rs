@@ -1538,6 +1538,68 @@ pub enum EventKind {
     /// Payload: `serde_json::Value`.
     /// F12 four-edit ritual fires once.
     QuotePricingFailed,
+
+    /// S281 / PR-266 — storefront-side email-relay request was accepted
+    /// by ABERP's `POST /api/internal/send-email` endpoint (per
+    /// ADR-0007) and persisted to the `outbound_email_queue` table for
+    /// the background drain to send. ONE entry per accepted request
+    /// (validation passed, body persisted, attachments written to
+    /// disk). The 200 response carries this entry's id back to the
+    /// storefront as `audit_id`.
+    ///
+    /// Carries `submitter` (the token-identified caller — typically
+    /// `"storefront"`), `queue_row_id` (UUID of the persisted row),
+    /// `recipient_hash` (SHA-256 of the comma-joined `to`-list — full
+    /// addresses are NEVER persisted to the audit ledger per ADR-0007
+    /// §Audit; the hash lets a forensic walker answer "did we ever
+    /// relay to this person at all?" without retaining PII),
+    /// `subject` (kept plaintext — operator-visible by design, not
+    /// PII-sensitive in our domain), and `byte_size` (rendered message
+    /// + attachments).
+    ///
+    /// **NOT `invoice.`-prefixed.** The relay is sister-service
+    /// telemetry, not an outgoing-invoice surface — same posture as
+    /// `QuoteIntakePollCompleted`. The `email.*` prefix opens a new
+    /// family because the existing `invoice.emailed_sent` is keyed by
+    /// `invoice_id` and lives inside the outgoing-invoice export
+    /// bundle, whereas an email relay carries no invoice id at all (a
+    /// "quote ready" email is a quote-side artefact, not a regulated
+    /// invoice). The `email.*` prefix keeps the per-OUTGOING-invoice
+    /// `invoice.*` glob from sweeping these rows.
+    ///
+    /// F12 four-edit ritual fires once for the three sibling kinds.
+    EmailRelayQueued,
+
+    /// S281 / PR-266 — outbound email queue row succeeded on the SMTP
+    /// transport. Emitted by the background drain after `lettre`'s
+    /// `transport.send` returned `Ok(_)` and the row moved
+    /// `Sending → Sent`. ONE entry per successful send (re-sends after
+    /// SMTP-flake retries fire as one final `EmailRelaySent` for the
+    /// terminal success; the retry trail is the `attempt_n` field on
+    /// the queue row, not separate audit rows per attempt).
+    ///
+    /// Carries `submitter`, `queue_row_id`, `recipient_hash`,
+    /// `subject`, `byte_size`, and `attempt_n` (1-based; 1 means
+    /// "first try succeeded"). NO recipient plaintext, NO body bytes —
+    /// same GDPR-minimisation posture as [`EmailRelayQueued`].
+    ///
+    /// `email.*` prefix family.
+    EmailRelaySent,
+
+    /// S281 / PR-266 — outbound email queue row exhausted the retry
+    /// budget. Emitted when `attempt_n` reaches the retry cap (5 per
+    /// the brief) without a successful SMTP send; the row moves
+    /// `Sending → Failed` and stays there until operator action.
+    /// ONE entry per terminal failure (not per failed attempt).
+    ///
+    /// Carries `submitter`, `queue_row_id`, `recipient_hash`,
+    /// `subject`, `byte_size`, `attempt_n`, and `last_error` (the
+    /// scrubbed-of-secrets detail from the final
+    /// `EmailSendError::scrubbed_detail()` — same posture as
+    /// `invoice.emailed_sent`'s `error_detail`).
+    ///
+    /// `email.*` prefix family.
+    EmailRelayFailed,
 }
 
 impl EventKind {
@@ -1625,6 +1687,9 @@ impl EventKind {
             EventKind::QuotePricingRendered => "quote.pricing_rendered",
             EventKind::QuotePricingPosted => "quote.pricing_posted",
             EventKind::QuotePricingFailed => "quote.pricing_failed",
+            EventKind::EmailRelayQueued => "email.relay_queued",
+            EventKind::EmailRelaySent => "email.relay_sent",
+            EventKind::EmailRelayFailed => "email.relay_failed",
         }
     }
 
@@ -1723,6 +1788,9 @@ impl EventKind {
             "quote.pricing_rendered" => Ok(EventKind::QuotePricingRendered),
             "quote.pricing_posted" => Ok(EventKind::QuotePricingPosted),
             "quote.pricing_failed" => Ok(EventKind::QuotePricingFailed),
+            "email.relay_queued" => Ok(EventKind::EmailRelayQueued),
+            "email.relay_sent" => Ok(EventKind::EmailRelaySent),
+            "email.relay_failed" => Ok(EventKind::EmailRelayFailed),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1813,6 +1881,9 @@ mod tests {
             EventKind::QuotePricingRendered,
             EventKind::QuotePricingPosted,
             EventKind::QuotePricingFailed,
+            EventKind::EmailRelayQueued,
+            EventKind::EmailRelaySent,
+            EventKind::EmailRelayFailed,
         ];
         for v in variants {
             let s = v.as_str();
@@ -3306,6 +3377,61 @@ mod tests {
             assert_ne!(k, EventKind::QuoteDealIssued.as_str());
             assert_ne!(k, EventKind::QuoteSalesOrderCreated.as_str());
             assert_ne!(k, EventKind::QuoteWorkOrderCreated.as_str());
+        }
+    }
+
+    /// S281 / PR-266 — the three email-relay storage strings open the
+    /// new `email.*` prefix family. Distinct from every prior family
+    /// (`invoice.`, `system.`, `mes.`, `quote.`, `inventory.`) so the
+    /// per-OUTGOING-invoice export bundle's `invoice.*` glob never
+    /// sweeps a relay row. The existing `invoice.emailed_sent` is a
+    /// per-invoice surface and stays where it is; the relay surface
+    /// carries no invoice id and lives in its own family.
+    #[test]
+    fn s281_email_relay_kinds_use_email_prefix() {
+        let cases: [(EventKind, &str); 3] = [
+            (EventKind::EmailRelayQueued, "email.relay_queued"),
+            (EventKind::EmailRelaySent, "email.relay_sent"),
+            (EventKind::EmailRelayFailed, "email.relay_failed"),
+        ];
+        for (k, expected) in cases {
+            assert_eq!(k.as_str(), expected);
+            let s = k.as_str();
+            assert!(s.starts_with("email."), "{s} must start with email.");
+            assert!(
+                !s.starts_with("invoice."),
+                "{s} must not start with invoice."
+            );
+            assert!(!s.starts_with("system."), "{s} must not start with system.");
+            assert!(!s.starts_with("quote."), "{s} must not start with quote.");
+            assert!(!s.starts_with("mes."), "{s} must not start with mes.");
+            assert!(
+                !s.starts_with("inventory."),
+                "{s} must not start with inventory."
+            );
+        }
+    }
+
+    /// S281 / PR-266 — the three email-relay storage strings are
+    /// pairwise-distinct AND distinct from the existing
+    /// `invoice.emailed_sent` (a different surface — per-invoice send,
+    /// not sister-service relay). A future contributor collapsing
+    /// `EmailRelaySent` onto `InvoiceEmailedSent` would lose the
+    /// submitter / queue_row_id discriminator; pin to prevent.
+    #[test]
+    fn s281_email_relay_kinds_are_distinct() {
+        let new = [
+            EventKind::EmailRelayQueued.as_str(),
+            EventKind::EmailRelaySent.as_str(),
+            EventKind::EmailRelayFailed.as_str(),
+        ];
+        for i in 0..new.len() {
+            for j in (i + 1)..new.len() {
+                assert_ne!(new[i], new[j], "{} collides with {}", new[i], new[j]);
+            }
+        }
+        for k in new {
+            assert_ne!(k, EventKind::InvoiceEmailedSent.as_str());
         }
     }
 }

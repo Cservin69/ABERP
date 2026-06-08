@@ -48,7 +48,10 @@ export type ErpModuleId =
   // tables (complexity rules / tolerance multipliers / parameters /
   // stock adjustments) live here as one sub-nav so the operator
   // does not have to hunt for them inside Settings.
-  | "quoting";
+  | "quoting"
+  // S281 / PR-266 — storefront email-relay (ADR-0007). Maintenance-
+  // area module owning the queue-inspector route.
+  | "email-relay";
 
 /** A route reference inside a module. `id` is the typed `AppRoute`
  * slug (the router's closed vocab); `label` is the chrome's display
@@ -224,6 +227,18 @@ export const MODULES: ErpModule[] = [
       { id: "inventory-balances", label: "Inventory balances" },
     ],
   },
+  // S281 / PR-266 — storefront email-relay queue inspector (ADR-0007).
+  // Its own maintenance-area module so the operator has a stable place
+  // to triage stuck mail. Read-only in v1; the daemon does retry +
+  // termination on its own.
+  {
+    id: "email-relay",
+    area: "maintenance",
+    label_hu: "E-mail továbbító",
+    label_en: "Email relay",
+    glyph: "✉",
+    routes: [{ id: "email-relay-queue", label: "Outbound queue" }],
+  },
 ];
 
 /** Look up the module that owns a given route. Total over `AppRoute`
@@ -380,7 +395,12 @@ export type MaintenanceTileStatusKind =
   // is the most common state for a fresh tenant; the first DEAL auto-
   // upserts a row, after which the operator visits to set
   // `on_hand_qty`.
-  | "InventoryBalanceCount";
+  | "InventoryBalanceCount"
+  // S281 / PR-266 — count of `outbound_email_queue` rows (all
+  // states). Surfaced as "N queued / sent / failed" in the chip; zero
+  // is the most common state when no storefront relay traffic has
+  // flowed.
+  | "EmailRelayQueueCount";
 
 /** One tile on the maintenance landing dashboard. The dashboard
  * renders the tiles grouped under their sub-area headers (today:
@@ -527,5 +547,18 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "On-hand / reserved / committed anyagminőség szerint",
     description_en: "On-hand / reserved / committed per material grade",
     statusKind: "InventoryBalanceCount",
+  },
+  // S281 / PR-266 — storefront email-relay queue tile (ADR-0007). The
+  // operator visits when triaging stuck outbound mail; the daemon
+  // does retry + termination autonomously, but this tile is the
+  // forensic surface.
+  {
+    moduleId: "email-relay",
+    route: "email-relay-queue",
+    label_hu: "Kimenő levélsor",
+    label_en: "Outbound queue",
+    description_hu: "Storefront továbbított levelek állapota",
+    description_en: "Storefront-relayed mail status",
+    statusKind: "EmailRelayQueueCount",
   },
 ];

@@ -411,6 +411,11 @@ pub fn run() {
             commands::list_invoice_drafts,
             commands::get_invoice_draft,
             commands::delete_invoice_draft,
+            // S281 / PR-266 — storefront email-relay queue inspector
+            // (read-only operator surface). The drain daemon is the
+            // only writer; this command pair surfaces queue state.
+            commands::list_email_relay_queue,
+            commands::get_email_relay_row,
         ])
         .on_window_event(handle_window_event)
         .run(tauri::generate_context!())

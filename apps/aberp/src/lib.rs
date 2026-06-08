@@ -34,6 +34,16 @@ pub mod drain_submission_queue;
 // RFC3339-VARCHAR timestamp-storage convention.
 pub mod duckdb_helpers;
 pub mod email_invoice;
+// S281 / PR-266 — storefront email-relay surface (ADR-0007). The
+// storefront POSTs `/api/internal/send-email` to ABERP; we validate +
+// persist to `outbound_email_queue` (email_relay_queue) and let the
+// background drain (email_relay_daemon) send via the existing SMTP
+// creds per [[aberp-smtp-spoc]]. Dedicated keychain entry
+// (email_relay_credentials) for independent rotation per ADR-0007 §Auth.
+pub mod email_relay;
+pub mod email_relay_credentials;
+pub mod email_relay_daemon;
+pub mod email_relay_queue;
 pub mod export_invoice_bundle;
 pub mod first_launch;
 pub mod incoming_invoices;

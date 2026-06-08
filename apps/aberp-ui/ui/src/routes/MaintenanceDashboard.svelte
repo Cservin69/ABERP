@@ -33,6 +33,7 @@
     getSellerInfo,
     listAdapters,
     listComplexityRules,
+    listEmailRelayQueue,
     listInventoryBalances,
     listLowStockProducts,
     listPartners,
@@ -258,6 +259,19 @@
         const res = await listInventoryBalances();
         const n = res.balances.length;
         return n === 1 ? "1 grade" : `${n} grades`;
+      }
+      case "EmailRelayQueueCount": {
+        // S281 / PR-266 — count of `outbound_email_queue` rows across
+        // all states. Zero is the most common state on a fresh tenant
+        // (no storefront relay traffic). Surface a small breakdown
+        // when there is anything in the queue so the operator sees
+        // failed rows at a glance.
+        const res = await listEmailRelayQueue();
+        const n = res.rows.length;
+        if (n === 0) return "0 rows";
+        const failed = res.rows.filter((r) => r.state === "failed").length;
+        if (failed > 0) return `${n} rows · ${failed} failed`;
+        return n === 1 ? "1 row" : `${n} rows`;
       }
     }
   }

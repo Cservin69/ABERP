@@ -938,7 +938,17 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::QuotePricingPriced
         | EventKind::QuotePricingRendered
         | EventKind::QuotePricingPosted
-        | EventKind::QuotePricingFailed => (None, ""),
+        | EventKind::QuotePricingFailed
+        // S281 / PR-266 — email-relay kinds (`email.*` family). Per
+        // ADR-0007 the storefront emails relay through ABERP's SMTP
+        // via `POST /api/internal/send-email`. The audit payload
+        // carries `submitter` + `recipient_hash` + `subject` +
+        // `byte_size` — never NAV XML bytes. The `email.*` prefix
+        // family excludes the per-OUTGOING-invoice bundle by glob;
+        // this arm exists for exhaustiveness only.
+        | EventKind::EmailRelayQueued
+        | EventKind::EmailRelaySent
+        | EventKind::EmailRelayFailed => (None, ""),
     };
 
     Ok(NavExtraction {
