@@ -172,6 +172,36 @@ fn serve_artifacts_dir(tenant: &str) -> Result<PathBuf> {
     Ok(home.join(".aberp").join("serve").join(tenant))
 }
 
+/// S291 / PR-272 — env-var override for the loopback HTTPS port. The
+/// dev-test.sh launcher pins ABERP to a fixed port so the storefront's
+/// sister-service URL stays stable across restarts. Pure function so
+/// `serve.rs::tests` can pin the precedence + parse-error behaviour
+/// without touching the listener.
+///
+/// Precedence:
+/// - `ABERP_HTTPS_PORT` parses as `u16` → use it
+/// - `ABERP_HTTPS_PORT` unset OR unparseable → `args_port`
+///
+/// We do NOT loud-fail on a typo'd env value: the dev-test launcher
+/// sets a known-good value and the operator pathway with `--port`
+/// keeps working unchanged. A typo'd env in some unrelated shell
+/// shouldn't deny boot.
+pub(crate) fn resolve_listener_port(args_port: u16) -> u16 {
+    match std::env::var("ABERP_HTTPS_PORT") {
+        Ok(s) => match s.trim().parse::<u16>() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    raw = %s,
+                    "ABERP_HTTPS_PORT set but not a valid u16 — falling back to --port / dynamic"
+                );
+                args_port
+            }
+        },
+        Err(_) => args_port,
+    }
+}
+
 /// We deliberately do NOT import the `dirs` crate (one more dep, one
 /// more supply-chain surface). `std::env::var("HOME")` covers macOS
 /// and Linux; `USERPROFILE` covers Windows. Loud-fail if neither is
@@ -1009,15 +1039,30 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     //    which made the handshake unparseable: the operator-visible
     //    line read `https://127.0.0.1:0/`, and the desktop shell's
     //    handshake parser had no way to learn the resolved port.
-    tracing::info!(port = args.port, "boot step: binding loopback TCP listener");
-    let bind_addr: SocketAddr = format!("127.0.0.1:{}", args.port)
-        .parse()
-        .with_context(|| {
-            format!(
-                "parse loopback socket address 127.0.0.1:{} (port out of range?)",
-                args.port
-            )
-        })?;
+    // S291 / PR-272 — `ABERP_HTTPS_PORT` env override. The dev-test.sh
+    // launcher pins ABERP to a fixed port (e.g. 18443) so the storefront
+    // sister-service has a stable `ABERP_INTERNAL_BASE_URL` across
+    // restarts; the previous "operator runs `lsof` after every restart"
+    // shape was a [[trust-code-not-operator]] gap. Env wins over the
+    // clap default of 0; an explicit `--port` flag still wins over the
+    // env (the launcher only sets env, never both). Invalid env value
+    // logs at WARN and falls back to `args.port` rather than aborting —
+    // a typo here shouldn't deny boot when the dynamic-port path still
+    // works.
+    let effective_port = resolve_listener_port(args.port);
+    tracing::info!(
+        port = effective_port,
+        from_env = effective_port != args.port,
+        "boot step: binding loopback TCP listener"
+    );
+    let bind_addr: SocketAddr =
+        format!("127.0.0.1:{effective_port}")
+            .parse()
+            .with_context(|| {
+                format!(
+                    "parse loopback socket address 127.0.0.1:{effective_port} (port out of range?)"
+                )
+            })?;
     let listener = {
         let _s = tracing::info_span!("serve.tcp_bind").entered();
         TcpListener::bind(bind_addr).with_context(|| format!("bind TCP listener at {bind_addr}"))?
@@ -1056,6 +1101,36 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         "READY {} sha256:{} state={}",
         resolved_addr, fingerprint_hex, state_token_at_print
     );
+
+    // S291 / PR-272 — write the runtime-discovery file (brief D). The
+    // storefront's dev launcher reads this to learn the resolved port +
+    // TLS fingerprint + keychain pointer without `lsof` or operator
+    // memory. Best-effort: a write failure logs at WARN and continues —
+    // the SPA handshake above is the load-bearing surface for the
+    // desktop shell; the discovery file is a convenience for the
+    // sister-service launcher.
+    let started_at = {
+        use time::format_description::well_known::Rfc3339;
+        time::OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+    };
+    let relay_keychain = format!(
+        "{}.{}",
+        crate::email_relay_credentials::service_name(&args.tenant),
+        crate::email_relay_credentials::ITEM_EMAIL_RELAY_TOKEN,
+    );
+    let discovery = crate::runtime_discovery::RuntimeDiscovery {
+        tenant: args.tenant.clone(),
+        base_url: format!("https://{resolved_addr}"),
+        tls_fingerprint: fingerprint_hex.clone(),
+        started_at,
+        relay_token_keychain_service: relay_keychain,
+    };
+    match crate::runtime_discovery::write(&discovery) {
+        Ok(p) => tracing::info!(path = %p.display(), "wrote runtime-discovery file"),
+        Err(e) => tracing::warn!(error = ?e, "runtime-discovery write failed (boot continues)"),
+    }
 
     runtime.block_on(async move {
         // PR-209 / S213 — graceful-shutdown coordinator. Uses the
@@ -1373,7 +1448,29 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     Err(other) => Err(other),
                 };
             match cfg_result {
-                Ok(cfg) => {
+                Ok(mut cfg) => {
+                    // S291 / PR-272 — `ABERP_SISTER_SERVICE_BASE_URL`
+                    // env override (brief C). The dev-test launcher
+                    // sets this so a local-loopback session uses
+                    // `http://localhost:5173` regardless of seller.toml
+                    // / SPA-saved value. ONE-SHOT log at INFO so the
+                    // operator-visible boot stream names what got
+                    // overridden — silent override would re-introduce
+                    // the [[trust-code-not-operator]] gap S289 closed.
+                    // SPA edits post-boot still take effect via
+                    // `state.storefront_credential.set` (matches the
+                    // hot-reload posture already established).
+                    if let Some(override_url) =
+                        crate::storefront_credential::read_sister_service_base_url_override()
+                    {
+                        tracing::info!(
+                            from = %cfg.base_url,
+                            to = %override_url,
+                            env = crate::storefront_credential::SISTER_SERVICE_BASE_URL_ENV,
+                            "sister-service base URL overridden by env var"
+                        );
+                        cfg.base_url = override_url;
+                    }
                     let operator_login = match st.boot_state.read() {
                         Ok(guard) => match &*guard {
                             ServeBootState::Ready { operator_login } => operator_login.clone(),
@@ -1928,6 +2025,18 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         let shutdown_result = coordinator.shutdown(timeout).await;
         log_shutdown_result(&shutdown_result);
         write_shutdown_audit_entry(&recovery_state, &trigger, &shutdown_result);
+
+        // S291 / PR-272 — best-effort delete of the runtime-discovery
+        // file (brief D). A leaked file from a crash is harmless
+        // (next boot overwrites it), but the storefront's dev launcher
+        // reads this as "is ABERP running?"; a stale-but-present file
+        // would lie. Logged at DEBUG (the operator's local-loopback
+        // test path needs no signal here on the success path).
+        match crate::runtime_discovery::delete(recovery_state.tenant.as_str()) {
+            Ok(true) => tracing::debug!("runtime-discovery file deleted"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = ?e, "runtime-discovery delete failed"),
+        }
 
         // The serve_result was captured BEFORE the drain so a hard
         // axum error still bubbles up via the runtime. We return
@@ -22498,5 +22607,51 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // S291 / PR-272 — `ABERP_HTTPS_PORT` env override precedence pins.
+    // The pure helper makes this trivial to assert without touching
+    // the listener.
+    // ──────────────────────────────────────────────────────────────
+
+    static PORT_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn resolve_listener_port_returns_args_port_when_env_unset() {
+        let _g = PORT_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("ABERP_HTTPS_PORT");
+        assert_eq!(resolve_listener_port(0), 0);
+        assert_eq!(resolve_listener_port(8443), 8443);
+    }
+
+    #[test]
+    fn resolve_listener_port_returns_env_when_valid_u16() {
+        let _g = PORT_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("ABERP_HTTPS_PORT", "18443");
+        assert_eq!(resolve_listener_port(0), 18443);
+        // Env wins over a non-zero args_port too (the launcher only
+        // sets one; this pin documents which would win if both did).
+        assert_eq!(resolve_listener_port(8443), 18443);
+        std::env::remove_var("ABERP_HTTPS_PORT");
+    }
+
+    #[test]
+    fn resolve_listener_port_falls_back_when_env_unparseable() {
+        let _g = PORT_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("ABERP_HTTPS_PORT", "not-a-port");
+        assert_eq!(resolve_listener_port(8443), 8443);
+        std::env::set_var("ABERP_HTTPS_PORT", "99999");
+        // 99999 doesn't fit in u16 → fall back.
+        assert_eq!(resolve_listener_port(8443), 8443);
+        std::env::remove_var("ABERP_HTTPS_PORT");
+    }
+
+    #[test]
+    fn resolve_listener_port_trims_whitespace() {
+        let _g = PORT_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("ABERP_HTTPS_PORT", "  18443  ");
+        assert_eq!(resolve_listener_port(0), 18443);
+        std::env::remove_var("ABERP_HTTPS_PORT");
     }
 }

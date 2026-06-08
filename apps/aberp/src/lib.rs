@@ -123,6 +123,7 @@ pub mod request_technical_annulment;
 pub mod restore_from_nav_extract;
 pub mod restore_from_nav_outgoing;
 pub mod retry_submission;
+pub mod runtime_discovery;
 pub mod secrets_cache;
 pub mod seller_banks;
 pub mod seller_toml_backup;

@@ -134,6 +134,26 @@ impl StorefrontCredentialHandle {
 /// magic string.
 pub const PROD_STOREFRONT_HOST: &str = "https://abenerp.com";
 
+/// S291 / PR-272 — env-var override name for the sister-service base
+/// URL. `dev-test.sh` sets this so a local-loopback dev session uses
+/// `http://localhost:5173` regardless of the seller.toml / SPA value.
+/// Surgical scope: env wins at boot only; subsequent SPA edits still
+/// take effect via `StorefrontCredentialHandle::set` — that matches the
+/// existing hot-reload posture for `/api/quote-intake/config`.
+pub const SISTER_SERVICE_BASE_URL_ENV: &str = "ABERP_SISTER_SERVICE_BASE_URL";
+
+/// Resolve the sister-service base-URL override from the environment.
+/// Returns `None` if unset, empty, or whitespace-only. The trimmed
+/// value is returned with no further validation — bad URLs surface at
+/// the daemon's HTTP call, matching how toml + SPA-saved URLs are
+/// treated today (one validation path, not two).
+pub fn read_sister_service_base_url_override() -> Option<String> {
+    std::env::var(SISTER_SERVICE_BASE_URL_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// One-shot fail-loud warning, fired AT BOOT only. When
 /// `ABERP_DEV_MODE=1` (or `=true`) is set but the configured
 /// `base_url` points at production, log a single WARN telling the
@@ -188,6 +208,7 @@ mod tests {
 
     fn clear_env() {
         std::env::remove_var("ABERP_DEV_MODE");
+        std::env::remove_var(SISTER_SERVICE_BASE_URL_ENV);
     }
 
     #[test]
@@ -284,6 +305,34 @@ mod tests {
         clear_env();
         std::env::set_var("ABERP_DEV_MODE", "false");
         assert!(!emit_dev_mode_prod_url_warning(PROD_STOREFRONT_HOST));
+        clear_env();
+    }
+
+    #[test]
+    fn sister_service_override_returns_none_when_env_unset() {
+        let _g = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear_env();
+        assert_eq!(read_sister_service_base_url_override(), None);
+    }
+
+    #[test]
+    fn sister_service_override_returns_trimmed_value() {
+        let _g = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear_env();
+        std::env::set_var(SISTER_SERVICE_BASE_URL_ENV, "  http://localhost:5173  ");
+        assert_eq!(
+            read_sister_service_base_url_override(),
+            Some("http://localhost:5173".to_string())
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn sister_service_override_treats_blank_as_unset() {
+        let _g = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear_env();
+        std::env::set_var(SISTER_SERVICE_BASE_URL_ENV, "   ");
+        assert_eq!(read_sister_service_base_url_override(), None);
         clear_env();
     }
 
