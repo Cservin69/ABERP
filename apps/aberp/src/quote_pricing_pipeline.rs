@@ -1,0 +1,1432 @@
+//! S279 / PR-265 — auto-quoting producer pipeline.
+//!
+//! ## What this module is
+//!
+//! Orchestration glue between four moving pieces:
+//!
+//! 1. Storefront polling — `/api/quotes?status=received` to discover
+//!    new submissions, `/api/quotes/{id}/files/{name}` to pull the
+//!    CAD blob, `/api/quotes/{id}/status` to flip the customer-facing
+//!    state to `quoting` on extract start.
+//! 2. [`aberp_cad_extract_wrapper`] — Python subprocess that emits a
+//!    `FeatureGraph` from the CAD file.
+//! 3. [`aberp_quote_engine`] — pure scoring function that turns
+//!    FeatureGraph + catalogue snapshot into a `QuoteBreakdown`.
+//! 4. [`aberp_quote_pdf`] — pure renderer that turns FeatureGraph +
+//!    QuoteBreakdown + customer info into PDF bytes.
+//!
+//! Then the priced-writeback POST to `/api/quotes/{id}/priced` per
+//! ADR-0004's multipart contract, with the `feature_graph_hash` as
+//! the idempotency key.
+//!
+//! ## State machine
+//!
+//! See [`crate::quote_pricing_jobs`] — `Fetched → Extracting →
+//! Pricing → Rendering → PostingBack → Posted | Failed`. The pipeline
+//! advances one row per `poll_once` cycle to keep memory pressure
+//! bounded (the Python extractor can be 100 MB+ resident).
+//!
+//! ## Why a separate daemon from quote-intake
+//!
+//! The existing [`aberp_quote_intake`] daemon polls `status=approved`
+//! and stages rows into `quote_intake_log` for operator pickup. The
+//! pipeline polls `status=received` and drives them through pricing
+//! into the storefront's `quoted` state. The two never overlap: the
+//! storefront's accept-click on a `quoted` quote later transitions
+//! it to `approved`, at which point the existing intake daemon picks
+//! it up. Single-responsibility per daemon — easier to reason about
+//! cadences, audit emit, and shutdown semantics.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+use tokio::task::spawn_blocking;
+use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
+use zeroize::Zeroizing;
+
+use aberp_audit_ledger::{
+    append_in_tx, ensure_schema as audit_ensure_schema, Actor, BinaryHash, EventKind, LedgerMeta,
+    TenantId,
+};
+use aberp_cad_extract_wrapper::{CadExtractor, ExtractRequest};
+use aberp_quote_engine::{
+    self as engine, ComplexityRule as EngineComplexityRule, FeatureGraph,
+    Material as EngineMaterial, QuoteBreakdown, QuotingParameters, StockAdjustment, StockStatus,
+    ToleranceMultiplier, ToleranceRange,
+};
+use aberp_quote_pdf::QuoteInputs;
+
+use crate::quote_pricing_jobs::{self as jobs, JobState, PricingJobRow};
+
+/// What every pricing-pipeline cycle reports back. Used for the SPA
+/// "last cycle" indicator + the daemon's log line.
+#[derive(Debug, Clone, Default)]
+pub struct PipelineCycleSummary {
+    /// `received` quotes polled this cycle.
+    pub fetched_from_storefront: u32,
+    /// New `quote_pricing_jobs` rows inserted (idempotent — a quote
+    /// already in the table doesn't bump this).
+    pub enqueued: u32,
+    /// Number of jobs advanced one step this cycle (extract / price
+    /// / render / post). Caps at the per-cycle batch limit.
+    pub advanced: u32,
+    /// Number of jobs that hit `Failed` this cycle. The audit row is
+    /// the durable record.
+    pub failed: u32,
+    /// Number of jobs that reached the terminal `Posted` state this
+    /// cycle. UI badges key on this to surface "quote sent" toasts.
+    pub posted: u32,
+    /// Wall-clock elapsed_ms for the cycle.
+    pub elapsed_ms: u64,
+    /// Top-level cycle error if any (transport flake, audit-ledger
+    /// failure). Per-job errors are NOT surfaced here — those go on
+    /// the job row's `error_reason`.
+    pub error: Option<String>,
+}
+
+/// Per-cycle batch cap. Honest v1 latency: a slow Python extractor
+/// at 30s × 5 jobs = 150s, well under the 60s storefront poll cadence
+/// so the cycle still completes within roughly the cadence period.
+const MAX_JOBS_PER_CYCLE: u32 = 5;
+
+/// Default valid_until window for an indicative quote, in days. Per
+/// ADR-0004 the storefront requires `YYYY-MM-DD` in the future; 30
+/// days is the "reasonable indicative window" the design doc names.
+const DEFAULT_VALID_UNTIL_DAYS: i64 = 30;
+
+/// Pipeline config — the daemon needs the storefront URL + bearer +
+/// the local artifact-dir to land downloaded CADs and rendered PDFs.
+#[derive(Debug, Clone)]
+pub struct PricingPipelineConfig {
+    pub base_url: String,
+    pub bearer_token: Zeroizing<String>,
+    /// How often the daemon loops. The Stage 2 baseline is 60s
+    /// (matches the storefront design doc §3 customer-facing copy).
+    pub poll_interval: Duration,
+    /// Local filesystem dir where `<quote_id>/{cad,priced.pdf}` land.
+    /// Created on demand.
+    pub artifact_dir: PathBuf,
+    /// Python interpreter for `aberp-cad-extract`. Absolute path is
+    /// expected (the wrapper's venv gotcha; see S270 memory).
+    pub python_bin: PathBuf,
+    /// `ToleranceRange` default for v1. The storefront submission
+    /// form does not yet collect a tolerance band, so the daemon
+    /// quotes everything at `Standard` until the storefront's
+    /// `/quote` page surfaces a picker.
+    pub default_tolerance: ToleranceRange,
+}
+
+/// Shared daemon dependencies — same shape as
+/// [`aberp_quote_intake::service::QuoteIntakeDeps`]. The audit
+/// context lets every per-job append carry the same tenant + binary
+/// hash + operator login the rest of ABERP's audit ledger uses.
+#[derive(Debug, Clone)]
+pub struct PricingPipelineDeps {
+    pub db_path: PathBuf,
+    pub tenant: TenantId,
+    pub binary_hash: BinaryHash,
+    pub operator_login: String,
+}
+
+/// The daemon struct. Holds the HTTP client, the audit context, and
+/// the local config. Cheap to clone (`Arc`-style internal shape).
+pub struct PricingPipelineService {
+    config: PricingPipelineConfig,
+    deps: PricingPipelineDeps,
+    client: reqwest::Client,
+}
+
+impl std::fmt::Debug for PricingPipelineService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PricingPipelineService")
+            .field("base_url", &self.config.base_url)
+            .field("bearer", &"<redacted>")
+            .field("poll_interval", &self.config.poll_interval)
+            .finish()
+    }
+}
+
+impl PricingPipelineService {
+    pub fn new(config: PricingPipelineConfig, deps: PricingPipelineDeps) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("build pricing-pipeline HTTP client")?;
+        Ok(Self {
+            config,
+            deps,
+            client,
+        })
+    }
+
+    pub fn poll_interval(&self) -> Duration {
+        self.config.poll_interval
+    }
+
+    /// One full sweep: storefront list → enqueue new rows → advance
+    /// up to `MAX_JOBS_PER_CYCLE` non-terminal rows by one state.
+    pub async fn poll_once(&self) -> PipelineCycleSummary {
+        let started = Instant::now();
+        let mut summary = PipelineCycleSummary::default();
+
+        match self.list_and_enqueue_received().await {
+            Ok((fetched, enqueued)) => {
+                summary.fetched_from_storefront = fetched;
+                summary.enqueued = enqueued;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "pricing-pipeline storefront list failed");
+                summary.error = Some(format!("storefront list: {e:#}"));
+                summary.elapsed_ms = started.elapsed().as_millis() as u64;
+                return summary;
+            }
+        }
+
+        for _ in 0..MAX_JOBS_PER_CYCLE {
+            let row = match self.next_actionable_blocking().await {
+                Ok(Some(r)) => r,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "pricing-pipeline next-job lookup failed");
+                    summary.error = Some(format!("next_actionable: {e:#}"));
+                    break;
+                }
+            };
+            match self.advance_one_step(row).await {
+                Ok(StepOutcome::Advanced) => summary.advanced += 1,
+                Ok(StepOutcome::Posted) => {
+                    summary.advanced += 1;
+                    summary.posted += 1;
+                }
+                Ok(StepOutcome::Failed) => {
+                    summary.advanced += 1;
+                    summary.failed += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "pricing-pipeline advance error");
+                    summary.error = Some(format!("advance: {e:#}"));
+                    break;
+                }
+            }
+        }
+
+        summary.elapsed_ms = started.elapsed().as_millis() as u64;
+        summary
+    }
+
+    async fn list_and_enqueue_received(&self) -> Result<(u32, u32)> {
+        let url = format!("{}/api/quotes?status=received", self.config.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", self.bearer_header()?)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow!("storefront list returned HTTP {status}"));
+        }
+        let parsed: StorefrontListResponse = resp
+            .json()
+            .await
+            .context("parse storefront /api/quotes JSON")?;
+        let fetched = parsed.quotes.len() as u32;
+        let mut enqueued = 0u32;
+        for quote in parsed.quotes {
+            match self.enqueue_one(quote).await {
+                Ok(true) => enqueued += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "pricing-pipeline enqueue failed");
+                }
+            }
+        }
+        Ok((fetched, enqueued))
+    }
+
+    /// Pull metadata + the first CAD file, save to artifact_dir,
+    /// insert a `Fetched` job, and emit `QuotePricingFetched`. Returns
+    /// `Ok(true)` when a fresh row was inserted, `Ok(false)` when the
+    /// quote already had a pricing-jobs row (idempotent).
+    async fn enqueue_one(&self, quote: StorefrontQuote) -> Result<bool> {
+        let qid = &quote.id;
+        // Pick the first .stl/.step file — v1 is single-CAD-per-quote
+        // per the design doc; a multi-CAD quote will need explicit
+        // operator routing.
+        let cad = quote
+            .files
+            .iter()
+            .find(|f| {
+                let lower = f.filename.to_lowercase();
+                lower.ends_with(".stl") || lower.ends_with(".step") || lower.ends_with(".stp")
+            })
+            .ok_or_else(|| anyhow!("no CAD file on quote {qid}"))?;
+
+        // Download to artifact_dir/<id>/<filename>.
+        let dest_dir = self.config.artifact_dir.join(qid);
+        std::fs::create_dir_all(&dest_dir)
+            .with_context(|| format!("mkdir {}", dest_dir.display()))?;
+        let dest_path = dest_dir.join(&cad.filename);
+        let file_url = format!(
+            "{}/api/quotes/{}/files/{}",
+            self.config.base_url, qid, cad.filename
+        );
+        let resp = self
+            .client
+            .get(&file_url)
+            .header("Authorization", self.bearer_header()?)
+            .send()
+            .await
+            .with_context(|| format!("GET {file_url}"))?;
+        let s = resp.status();
+        if !s.is_success() {
+            return Err(anyhow!("CAD download {file_url} returned HTTP {s}"));
+        }
+        let body = resp.bytes().await.context("read CAD body")?;
+        std::fs::write(&dest_path, &body)
+            .with_context(|| format!("write {}", dest_path.display()))?;
+
+        let material_grade = quote.request.material_preference.clone();
+        let quantity = quote.request.quantity.unwrap_or(1).max(1) as u32;
+        let customer_email = quote.contact.email.clone();
+        let customer_name = quote.contact.name.clone();
+
+        let db_path = self.deps.db_path.clone();
+        let tenant_id = self.deps.tenant.as_str().to_string();
+        let quote_id = qid.clone();
+        let filename = cad.filename.clone();
+        let dest_path_str = dest_path.to_string_lossy().into_owned();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+
+        let inserted = spawn_blocking(move || -> Result<bool> {
+            let mut conn = duckdb::Connection::open(&db_path).context("open DB for enqueue")?;
+            audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
+            jobs::ensure_schema(&conn).context("ensure quote_pricing_jobs schema")?;
+            let now = OffsetDateTime::now_utc();
+            let inserted = jobs::insert_fetched_job(
+                &conn,
+                &quote_id,
+                &tenant_id,
+                &customer_email,
+                &customer_name,
+                &material_grade,
+                quantity,
+                &filename,
+                &dest_path_str,
+                now,
+            )?;
+            if !inserted {
+                return Ok(false);
+            }
+            // Emit QuotePricingFetched in its own short tx — same posture as
+            // the existing intake-daemon audit emits.
+            let tx = conn.transaction().context("open fetched-audit tx")?;
+            let meta =
+                LedgerMeta::new(TenantId::new(&tenant_id).context("tenant_id")?, binary_hash);
+            let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+            let payload = QuotePricingFetchedPayload {
+                quote_id: quote_id.clone(),
+                tenant_id: tenant_id.clone(),
+                customer_email,
+                material_grade,
+                quantity,
+                cad_filename: filename,
+                cad_local_path: dest_path_str,
+                actor: "system".to_string(),
+                idempotency_key: format!("quote_pricing_fetched:{quote_id}"),
+                fetched_at: now
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string()),
+            };
+            let bytes = serde_json::to_vec(&payload).context("encode fetched payload")?;
+            append_in_tx(
+                &tx,
+                &meta,
+                EventKind::QuotePricingFetched,
+                bytes,
+                actor,
+                Some(payload.idempotency_key.clone()),
+            )
+            .context("append QuotePricingFetched")?;
+            tx.commit().context("commit fetched-audit")?;
+            Ok(true)
+        })
+        .await
+        .context("enqueue spawn_blocking join")??;
+
+        if inserted {
+            // Storefront customer-facing chip flips to `quoting` per
+            // ADR-0004. Best-effort — a failure here logs but doesn't
+            // abort the enqueue; the row is already in the local table
+            // and the next cycle's POST-back will still drive the
+            // customer-facing state to `quoted` directly.
+            if let Err(e) = self
+                .writeback_quoting_status(qid, "ABERP pricing pipeline picked up CAD")
+                .await
+            {
+                tracing::warn!(quote_id = qid, error = %e, "writeback quoting status failed");
+            }
+        }
+        Ok(inserted)
+    }
+
+    async fn writeback_quoting_status(&self, quote_id: &str, notes: &str) -> Result<()> {
+        let url = format!("{}/api/quotes/{}/status", self.config.base_url, quote_id);
+        let body = serde_json::json!({ "status": "quoting", "notes": notes });
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", self.bearer_header()?)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("status writeback HTTP {}", resp.status()));
+        }
+        Ok(())
+    }
+
+    async fn next_actionable_blocking(&self) -> Result<Option<PricingJobRow>> {
+        let db_path = self.deps.db_path.clone();
+        let tenant_id = self.deps.tenant.as_str().to_string();
+        spawn_blocking(move || -> Result<Option<PricingJobRow>> {
+            let conn = duckdb::Connection::open(&db_path).context("open DB for next-job")?;
+            jobs::next_actionable_job(&conn, &tenant_id)
+        })
+        .await
+        .context("next-actionable spawn_blocking join")?
+    }
+
+    /// Advance one job by one state. Returns whether the job reached
+    /// terminal `Posted`, terminal `Failed`, or simply advanced.
+    async fn advance_one_step(&self, row: PricingJobRow) -> Result<StepOutcome> {
+        match row.state {
+            JobState::Fetched | JobState::Extracting => self.advance_extract(row).await,
+            JobState::Pricing => self.advance_price(row).await,
+            JobState::Rendering => self.advance_render(row).await,
+            JobState::PostingBack => self.advance_post(row).await,
+            // Terminal states should never appear from
+            // next_actionable_job; if they do something is wrong.
+            JobState::Posted | JobState::Failed => Ok(StepOutcome::Advanced),
+        }
+    }
+
+    async fn advance_extract(&self, row: PricingJobRow) -> Result<StepOutcome> {
+        let db_path = self.deps.db_path.clone();
+        let tenant_id_string = self.deps.tenant.as_str().to_string();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+        let python_bin = self.config.python_bin.clone();
+        let quote_id = row.quote_id.clone();
+        let material_grade = row.material_grade.clone();
+
+        let outcome = spawn_blocking(move || -> Result<StepOutcome> {
+            let mut conn = duckdb::Connection::open(&db_path).context("open DB for extract")?;
+            audit_ensure_schema(&conn).context("audit schema")?;
+            jobs::ensure_schema(&conn).context("jobs schema")?;
+            jobs::set_state(
+                &conn,
+                &quote_id,
+                &tenant_id_string,
+                JobState::Extracting,
+                OffsetDateTime::now_utc(),
+            )?;
+            let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
+            let extractor = CadExtractor::new().with_python_bin(python_bin);
+            let req = ExtractRequest {
+                input_path: PathBuf::from(&arts.cad_local_path),
+                material_grade: material_grade.clone(),
+            };
+            match extractor.extract(&req) {
+                Ok(graph) => {
+                    let canonical =
+                        serde_json::to_vec(&graph).context("encode FeatureGraph for hash")?;
+                    let hash = blake3::hash(&canonical);
+                    let hash_str = format!("blake3:{}", hash.to_hex());
+                    let json =
+                        String::from_utf8(canonical).context("FeatureGraph json was not utf8")?;
+                    jobs::set_extracted(
+                        &mut conn,
+                        &quote_id,
+                        &tenant_id_string,
+                        &hash_str,
+                        &json,
+                        OffsetDateTime::now_utc(),
+                    )?;
+                    let tx = conn.transaction().context("open extract-audit tx")?;
+                    let meta = LedgerMeta::new(
+                        TenantId::new(&tenant_id_string).context("tenant id")?,
+                        binary_hash,
+                    );
+                    let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+                    let payload = QuotePricingExtractedPayload {
+                        quote_id: quote_id.clone(),
+                        tenant_id: tenant_id_string.clone(),
+                        feature_graph_hash: hash_str,
+                        extractor_version: aberp_cad_extract_wrapper::WRAPPER_VERSION.to_string(),
+                        volume_mm3: graph.volume_mm3,
+                        bounding_box_mm: graph.bounding_box_mm,
+                        feature_count: graph.features.len() as u32,
+                        requires_5_axis: graph.requires_5_axis,
+                        thin_wall_present: graph.thin_wall_present,
+                        actor: "system".to_string(),
+                        idempotency_key: format!("quote_pricing_extracted:{quote_id}"),
+                    };
+                    let bytes = serde_json::to_vec(&payload).context("encode extracted")?;
+                    append_in_tx(
+                        &tx,
+                        &meta,
+                        EventKind::QuotePricingExtracted,
+                        bytes,
+                        actor,
+                        Some(payload.idempotency_key.clone()),
+                    )
+                    .context("append extracted")?;
+                    tx.commit().context("commit extract-audit")?;
+                    Ok(StepOutcome::Advanced)
+                }
+                Err(e) => {
+                    let reason = e.to_string();
+                    emit_failure(
+                        &mut conn,
+                        &tenant_id_string,
+                        binary_hash,
+                        &login,
+                        &quote_id,
+                        "extract",
+                        &reason,
+                        row.attempt_n,
+                    )?;
+                    Ok(StepOutcome::Failed)
+                }
+            }
+        })
+        .await
+        .context("extract spawn_blocking join")??;
+        Ok(outcome)
+    }
+
+    async fn advance_price(&self, row: PricingJobRow) -> Result<StepOutcome> {
+        let db_path = self.deps.db_path.clone();
+        let tenant_id_string = self.deps.tenant.as_str().to_string();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+        let quote_id = row.quote_id.clone();
+        let qty = row.quantity.max(1);
+        let target_tol = self.config.default_tolerance;
+
+        let outcome = spawn_blocking(move || -> Result<StepOutcome> {
+            let mut conn = duckdb::Connection::open(&db_path).context("open DB for price")?;
+            audit_ensure_schema(&conn).context("audit schema")?;
+            jobs::ensure_schema(&conn).context("jobs schema")?;
+            let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
+            let graph_json = arts
+                .feature_graph_json
+                .ok_or_else(|| anyhow!("Pricing state but no feature_graph_json"))?;
+            let graph: FeatureGraph =
+                serde_json::from_str(&graph_json).context("decode FeatureGraph")?;
+
+            // Catalogue snapshot — read all four tables synchronously
+            // inside the blocking task. Per-pricing-pass to honor live
+            // tunables edits; the snapshot is cheap (under 100 rows
+            // across all four tables in v1).
+            let materials = crate::quoting_materials::list_materials(&conn, &tenant_id_string)
+                .context("list_materials")?;
+            let complexity =
+                crate::quoting_tunables::list_complexity_rules(&conn, &tenant_id_string)
+                    .context("list_complexity_rules")?;
+            let tolerance =
+                crate::quoting_tunables::list_tolerance_multipliers(&conn, &tenant_id_string)
+                    .context("list_tolerance_multipliers")?;
+            let stock_adjustments =
+                crate::quoting_tunables::list_stock_adjustments(&conn, &tenant_id_string)
+                    .context("list_stock_adjustments")?;
+            let params = crate::quoting_tunables::get_parameters(&conn, &tenant_id_string)
+                .context("get_parameters")?;
+
+            let engine_materials = convert_materials(&materials)?;
+            let engine_complexity = convert_complexity(&complexity);
+            let engine_tolerance = convert_tolerance(&tolerance);
+            let engine_stock_adjustments = convert_stock_adjustments(&stock_adjustments);
+            let engine_params = convert_parameters(&params);
+
+            match engine::quote(
+                &graph,
+                &engine_materials,
+                &engine_complexity,
+                &engine_tolerance,
+                &engine_stock_adjustments,
+                &engine_params,
+                qty,
+                target_tol,
+            ) {
+                Ok(breakdown) => {
+                    let json = serde_json::to_string(&breakdown).context("encode breakdown")?;
+                    jobs::set_priced(
+                        &mut conn,
+                        &quote_id,
+                        &tenant_id_string,
+                        &json,
+                        breakdown.total_price,
+                        OffsetDateTime::now_utc(),
+                    )?;
+                    let tx = conn.transaction().context("open priced-audit tx")?;
+                    let meta = LedgerMeta::new(
+                        TenantId::new(&tenant_id_string).context("tenant id")?,
+                        binary_hash,
+                    );
+                    let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+                    let payload = QuotePricingPricedPayload {
+                        quote_id: quote_id.clone(),
+                        tenant_id: tenant_id_string.clone(),
+                        engine_version: breakdown.engine_version.clone(),
+                        total_price_eur: breakdown.total_price,
+                        material_cost_eur: breakdown.material_cost,
+                        labor_cost_eur: breakdown.labor_cost,
+                        setup_cost_eur: breakdown.setup_cost,
+                        overhead_eur: breakdown.overhead,
+                        margin_eur: breakdown.margin,
+                        actor: "system".to_string(),
+                        idempotency_key: format!("quote_pricing_priced:{quote_id}"),
+                    };
+                    let bytes = serde_json::to_vec(&payload).context("encode priced")?;
+                    append_in_tx(
+                        &tx,
+                        &meta,
+                        EventKind::QuotePricingPriced,
+                        bytes,
+                        actor,
+                        Some(payload.idempotency_key.clone()),
+                    )
+                    .context("append priced")?;
+                    tx.commit().context("commit priced-audit")?;
+                    Ok(StepOutcome::Advanced)
+                }
+                Err(e) => {
+                    let reason = e.to_string();
+                    emit_failure(
+                        &mut conn,
+                        &tenant_id_string,
+                        binary_hash,
+                        &login,
+                        &quote_id,
+                        "price",
+                        &reason,
+                        row.attempt_n,
+                    )?;
+                    Ok(StepOutcome::Failed)
+                }
+            }
+        })
+        .await
+        .context("price spawn_blocking join")??;
+        Ok(outcome)
+    }
+
+    async fn advance_render(&self, row: PricingJobRow) -> Result<StepOutcome> {
+        let db_path = self.deps.db_path.clone();
+        let tenant_id_string = self.deps.tenant.as_str().to_string();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+        let artifact_dir = self.config.artifact_dir.clone();
+        let quote_id = row.quote_id.clone();
+        let customer_email = row.customer_email.clone();
+        let customer_name = row.customer_name.clone();
+        let qty = row.quantity.max(1);
+        let target_tol = self.config.default_tolerance;
+
+        let outcome = spawn_blocking(move || -> Result<StepOutcome> {
+            let mut conn = duckdb::Connection::open(&db_path).context("open DB for render")?;
+            audit_ensure_schema(&conn).context("audit schema")?;
+            jobs::ensure_schema(&conn).context("jobs schema")?;
+            let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
+            let graph: FeatureGraph = serde_json::from_str(
+                arts.feature_graph_json
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("Rendering state but no feature_graph_json"))?,
+            )
+            .context("decode FeatureGraph for render")?;
+            let breakdown: QuoteBreakdown = serde_json::from_str(
+                arts.breakdown_json
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("Rendering state but no breakdown_json"))?,
+            )
+            .context("decode QuoteBreakdown for render")?;
+            let valid_until = (OffsetDateTime::now_utc().date()
+                + time::Duration::days(DEFAULT_VALID_UNTIL_DAYS))
+            .format(&time::format_description::parse("[year]-[month]-[day]").expect("valid"))
+            .context("format valid_until")?;
+            let inputs = QuoteInputs {
+                quote_id: &quote_id,
+                customer_email: &customer_email,
+                customer_name: &customer_name,
+                customer_company: "",
+                quantity: qty,
+                notes: "",
+                valid_until_iso: &valid_until,
+                extractor_version: aberp_cad_extract_wrapper::WRAPPER_VERSION,
+                engine_version: &breakdown.engine_version,
+                feature_graph: &graph,
+                breakdown: &breakdown,
+                target_tolerance: target_tol,
+            };
+            match aberp_quote_pdf::render(&inputs) {
+                Ok(bytes) => {
+                    let dest_dir = artifact_dir.join(&quote_id);
+                    std::fs::create_dir_all(&dest_dir).context("mkdir pdf dest")?;
+                    let pdf_path = dest_dir.join("priced.pdf");
+                    std::fs::write(&pdf_path, &bytes).context("write priced.pdf")?;
+                    let pdf_path_str = pdf_path.to_string_lossy().into_owned();
+                    let pdf_size = bytes.len() as u64;
+                    jobs::set_rendered(
+                        &mut conn,
+                        &quote_id,
+                        &tenant_id_string,
+                        &pdf_path_str,
+                        &valid_until,
+                        OffsetDateTime::now_utc(),
+                    )?;
+                    let tx = conn.transaction().context("open rendered-audit tx")?;
+                    let meta = LedgerMeta::new(
+                        TenantId::new(&tenant_id_string).context("tenant id")?,
+                        binary_hash,
+                    );
+                    let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+                    let payload = QuotePricingRenderedPayload {
+                        quote_id: quote_id.clone(),
+                        tenant_id: tenant_id_string.clone(),
+                        pdf_path: pdf_path_str,
+                        pdf_size_bytes: pdf_size,
+                        pdf_renderer_version: aberp_quote_pdf::QUOTE_PDF_RENDERER_VERSION
+                            .to_string(),
+                        actor: "system".to_string(),
+                        idempotency_key: format!("quote_pricing_rendered:{quote_id}"),
+                    };
+                    let bytes_payload = serde_json::to_vec(&payload).context("encode rendered")?;
+                    append_in_tx(
+                        &tx,
+                        &meta,
+                        EventKind::QuotePricingRendered,
+                        bytes_payload,
+                        actor,
+                        Some(payload.idempotency_key.clone()),
+                    )
+                    .context("append rendered")?;
+                    tx.commit().context("commit rendered-audit")?;
+                    Ok(StepOutcome::Advanced)
+                }
+                Err(e) => {
+                    let reason = e.to_string();
+                    emit_failure(
+                        &mut conn,
+                        &tenant_id_string,
+                        binary_hash,
+                        &login,
+                        &quote_id,
+                        "render",
+                        &reason,
+                        row.attempt_n,
+                    )?;
+                    Ok(StepOutcome::Failed)
+                }
+            }
+        })
+        .await
+        .context("render spawn_blocking join")??;
+        Ok(outcome)
+    }
+
+    async fn advance_post(&self, row: PricingJobRow) -> Result<StepOutcome> {
+        // Read row artifacts off-thread, then do the async HTTP POST
+        // on the main runtime.
+        let db_path = self.deps.db_path.clone();
+        let tenant_id_string = self.deps.tenant.as_str().to_string();
+        let quote_id = row.quote_id.clone();
+        let read_arts = {
+            let qid = quote_id.clone();
+            let tid = tenant_id_string.clone();
+            let db = db_path.clone();
+            spawn_blocking(move || -> Result<(jobs::JobArtifacts, String, String)> {
+                let conn = duckdb::Connection::open(&db).context("open DB for post")?;
+                let arts = jobs::get_job_artifacts(&conn, &qid, &tid)?;
+                // Re-fetch the persisted breakdown + hash from the row.
+                let mut stmt = conn.prepare(
+                    "SELECT feature_graph_hash, valid_until_iso
+                        FROM quote_pricing_jobs WHERE quote_id = ? AND tenant_id = ?",
+                )?;
+                let mut rows = stmt.query(duckdb::params![qid, tid])?;
+                let r = rows.next()?.ok_or_else(|| anyhow!("no row for post"))?;
+                let hash: String = r.get(0)?;
+                let valid_until: String = r.get(1)?;
+                Ok((arts, hash, valid_until))
+            })
+            .await
+            .context("post-read spawn_blocking join")??
+        };
+        let (arts, hash, valid_until) = read_arts;
+        let pdf_path = arts
+            .pdf_path
+            .ok_or_else(|| anyhow!("PostingBack state but no pdf_path"))?;
+        let breakdown_json = arts
+            .breakdown_json
+            .ok_or_else(|| anyhow!("PostingBack state but no breakdown_json"))?;
+        let pdf_bytes = std::fs::read(&pdf_path).with_context(|| format!("read pdf {pdf_path}"))?;
+
+        let post_result = self
+            .post_priced_writeback(
+                &quote_id,
+                &hash,
+                &valid_until,
+                &breakdown_json,
+                pdf_bytes.as_slice(),
+            )
+            .await;
+
+        let post_outcome_state = post_result.as_ref().map(|r| r.outcome).ok();
+        let db_path = self.deps.db_path.clone();
+        let tenant_id_string = self.deps.tenant.as_str().to_string();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+        let quote_id_persist = quote_id.clone();
+        let attempt_n = row.attempt_n;
+
+        let final_outcome = spawn_blocking(move || -> Result<StepOutcome> {
+            let mut conn = duckdb::Connection::open(&db_path).context("open DB for post-finish")?;
+            audit_ensure_schema(&conn).context("audit schema")?;
+            jobs::ensure_schema(&conn).context("jobs schema")?;
+            match post_result {
+                Ok(PostResult { outcome, .. }) => {
+                    jobs::set_state(
+                        &conn,
+                        &quote_id_persist,
+                        &tenant_id_string,
+                        JobState::Posted,
+                        OffsetDateTime::now_utc(),
+                    )?;
+                    let tx = conn.transaction().context("open posted-audit tx")?;
+                    let meta = LedgerMeta::new(
+                        TenantId::new(&tenant_id_string).context("tenant id")?,
+                        binary_hash,
+                    );
+                    let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+                    let payload = QuotePricingPostedPayload {
+                        quote_id: quote_id_persist.clone(),
+                        tenant_id: tenant_id_string.clone(),
+                        feature_graph_hash: hash.clone(),
+                        idempotent: matches!(outcome, PostOutcome::Idempotent),
+                        valid_until_iso: valid_until.clone(),
+                        actor: "system".to_string(),
+                        idempotency_key: format!("quote_pricing_posted:{quote_id_persist}"),
+                    };
+                    let bytes_payload = serde_json::to_vec(&payload).context("encode posted")?;
+                    append_in_tx(
+                        &tx,
+                        &meta,
+                        EventKind::QuotePricingPosted,
+                        bytes_payload,
+                        actor,
+                        Some(payload.idempotency_key.clone()),
+                    )
+                    .context("append posted")?;
+                    tx.commit().context("commit posted-audit")?;
+                    let _ = post_outcome_state;
+                    Ok(StepOutcome::Posted)
+                }
+                Err(e) => {
+                    let reason = e.to_string();
+                    emit_failure(
+                        &mut conn,
+                        &tenant_id_string,
+                        binary_hash,
+                        &login,
+                        &quote_id_persist,
+                        "post",
+                        &reason,
+                        attempt_n,
+                    )?;
+                    Ok(StepOutcome::Failed)
+                }
+            }
+        })
+        .await
+        .context("post-finish spawn_blocking join")??;
+        Ok(final_outcome)
+    }
+
+    /// Hand-rolled multipart POST against `/api/quotes/{id}/priced`
+    /// per ADR-0004's contract. Hand-rolled rather than feature-
+    /// flagging reqwest's `multipart` to avoid bloating the global
+    /// HTTP-client feature surface for this one caller.
+    async fn post_priced_writeback(
+        &self,
+        quote_id: &str,
+        feature_graph_hash: &str,
+        valid_until_iso: &str,
+        breakdown_json: &str,
+        pdf_bytes: &[u8],
+    ) -> Result<PostResult> {
+        let url = format!("{}/api/quotes/{}/priced", self.config.base_url, quote_id);
+        let boundary = format!("aberp-mp-{}", Ulid::new());
+        let body = build_priced_multipart(
+            &boundary,
+            feature_graph_hash,
+            valid_until_iso,
+            breakdown_json,
+            pdf_bytes,
+        )?;
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", self.bearer_header()?)
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("priced-writeback HTTP {status} body={body_text}"));
+        }
+        // 200 path: distinguish idempotent replay via JSON shape per
+        // ADR-0004 — `{status:"quoted", idempotent:true}` vs the
+        // fresh `{status:"quoted"}` shape.
+        let parsed: PricedWritebackOk = serde_json::from_str(&body_text)
+            .with_context(|| format!("parse priced-writeback ok JSON: {body_text}"))?;
+        let outcome = if parsed.idempotent.unwrap_or(false) {
+            PostOutcome::Idempotent
+        } else {
+            PostOutcome::Fresh
+        };
+        Ok(PostResult { outcome })
+    }
+
+    fn bearer_header(&self) -> Result<reqwest::header::HeaderValue> {
+        let s = format!("Bearer {}", &*self.config.bearer_token);
+        let mut hv = reqwest::header::HeaderValue::from_str(&s)
+            .context("invalid bearer header (control chars)")?;
+        hv.set_sensitive(true);
+        Ok(hv)
+    }
+
+    /// Loop forever until cancelled. Boots with a 30s delay to let
+    /// other ABERP daemons settle (matches the intake-daemon posture).
+    /// On a cycle error, backs off 5s → 15s → 60s → cadence (matching
+    /// the intake-daemon's S256 backoff). Exit on cancel via tokio::select.
+    pub async fn run_daemon_forever(self, cancel: CancellationToken) {
+        let cadence = self.config.poll_interval;
+        let service = Arc::new(self);
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+        }
+        let mut backoff_idx: usize = 0;
+        loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let s = service.clone();
+            let summary = s.poll_once().await;
+            tracing::info!(
+                fetched = summary.fetched_from_storefront,
+                enqueued = summary.enqueued,
+                advanced = summary.advanced,
+                posted = summary.posted,
+                failed = summary.failed,
+                elapsed_ms = summary.elapsed_ms,
+                error = ?summary.error,
+                "pricing-pipeline cycle complete"
+            );
+            let sleep_dur = if summary.error.is_some() {
+                let dur = backoff_duration(backoff_idx, cadence);
+                backoff_idx = backoff_idx.saturating_add(1);
+                dur
+            } else {
+                backoff_idx = 0;
+                cadence
+            };
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(sleep_dur) => {}
+            }
+        }
+    }
+}
+
+/// Result of one state-machine step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepOutcome {
+    Advanced,
+    Posted,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostOutcome {
+    Fresh,
+    Idempotent,
+}
+
+#[derive(Debug, Clone)]
+struct PostResult {
+    outcome: PostOutcome,
+}
+
+#[derive(Debug, Deserialize)]
+struct PricedWritebackOk {
+    #[allow(dead_code)]
+    status: Option<String>,
+    idempotent: Option<bool>,
+}
+
+/// 5s/15s/60s/cadence backoff schedule — mirrors the intake-daemon
+/// shape from S256.
+fn backoff_duration(idx: usize, cadence: Duration) -> Duration {
+    match idx {
+        0 => Duration::from_secs(5),
+        1 => Duration::from_secs(15),
+        2 => Duration::from_secs(60),
+        _ => cadence,
+    }
+}
+
+/// Best-effort failure path used by every state-machine arm. Writes
+/// the `Failed` row + emits `QuotePricingFailed`. Tracing is
+/// downstream of the audit row (the audit is the durable record).
+#[allow(clippy::too_many_arguments)]
+fn emit_failure(
+    conn: &mut duckdb::Connection,
+    tenant_id: &str,
+    binary_hash: BinaryHash,
+    login: &str,
+    quote_id: &str,
+    stage: &str,
+    reason: &str,
+    attempt_n: u32,
+) -> Result<()> {
+    jobs::set_failed(
+        conn,
+        quote_id,
+        tenant_id,
+        stage,
+        reason,
+        OffsetDateTime::now_utc(),
+    )?;
+    let tx = conn.transaction().context("open failed-audit tx")?;
+    let meta = LedgerMeta::new(TenantId::new(tenant_id).context("tenant id")?, binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), login);
+    let payload = QuotePricingFailedPayload {
+        quote_id: quote_id.to_string(),
+        tenant_id: tenant_id.to_string(),
+        stage: stage.to_string(),
+        reason: reason.chars().take(1000).collect(),
+        attempt_n,
+        actor: "system".to_string(),
+        idempotency_key: format!("quote_pricing_failed:{quote_id}:{attempt_n}"),
+    };
+    let bytes = serde_json::to_vec(&payload).context("encode failed payload")?;
+    append_in_tx(
+        &tx,
+        &meta,
+        EventKind::QuotePricingFailed,
+        bytes,
+        actor,
+        Some(payload.idempotency_key.clone()),
+    )
+    .context("append QuotePricingFailed")?;
+    tx.commit().context("commit failed-audit")?;
+    Ok(())
+}
+
+/// Convert local catalogue rows into engine input shape. The two
+/// share field names but the local row has more columns (audit
+/// metadata, display_name); the engine only takes what scoring needs.
+fn convert_materials(locals: &[crate::quoting_materials::Material]) -> Result<Vec<EngineMaterial>> {
+    locals
+        .iter()
+        .map(|m| {
+            Ok(EngineMaterial {
+                grade: m.grade.clone(),
+                density_g_cm3: m.density_g_cm3,
+                cost_per_kg_eur: m.cost_per_kg_eur,
+                machinability_index: m.machinability_index,
+                quote_multiplier: m.quote_multiplier,
+                stock_status: parse_stock_status(&m.stock_status)?,
+            })
+        })
+        .collect()
+}
+
+fn parse_stock_status(s: &str) -> Result<StockStatus> {
+    match s {
+        "in_stock" => Ok(StockStatus::InStock),
+        "source_1_2d" => Ok(StockStatus::Source1_2d),
+        "source_3_7d" => Ok(StockStatus::Source3_7d),
+        "special_order" => Ok(StockStatus::SpecialOrder),
+        other => Err(anyhow!("unknown stock_status: {other:?}")),
+    }
+}
+
+fn convert_complexity(
+    locals: &[crate::quoting_tunables::ComplexityRule],
+) -> Vec<EngineComplexityRule> {
+    locals
+        .iter()
+        .map(|r| EngineComplexityRule {
+            id: r.id,
+            feature_type: r.feature_type.clone(),
+            size_bucket: r.size_bucket.clone(),
+            // Local table uses i64 for SPA-friendly form-handling; engine
+            // expects u32. Clamp negative (forbidden by app-layer validation
+            // anyway, but defence-in-depth) and saturate above u32::MAX.
+            count_min: r.count_min.clamp(0, u32::MAX as i64) as u32,
+            count_max: r.count_max.map(|c| c.clamp(0, u32::MAX as i64) as u32),
+            base_time_minutes: r.base_time_minutes,
+            multiplier: r.multiplier,
+            setup_penalty_minutes: r.setup_penalty_minutes,
+        })
+        .collect()
+}
+
+fn convert_tolerance(
+    locals: &[crate::quoting_tunables::ToleranceMultiplier],
+) -> Vec<ToleranceMultiplier> {
+    locals
+        .iter()
+        .map(|t| ToleranceMultiplier {
+            tolerance_range: t.tolerance_range.clone(),
+            multiplier: t.multiplier,
+            inspection_minutes_per_feature: t.inspection_minutes_per_feature,
+        })
+        .collect()
+}
+
+fn convert_stock_adjustments(
+    locals: &[crate::quoting_tunables::StockAdjustment],
+) -> Vec<StockAdjustment> {
+    locals
+        .iter()
+        .map(|a| StockAdjustment {
+            grade: a.grade.clone(),
+            stock_status: a.stock_status.clone(),
+            price_adjustment_pct: a.price_adjustment_pct,
+        })
+        .collect()
+}
+
+/// Hard-coded `machining_rate_eur_per_minute` until the local
+/// `quoting_parameters` table grows the column.
+///
+/// **Gap:** the S267 `quoting_parameters` singleton (CRUD'd from
+/// Settings → Quoting Parameters) does NOT yet carry a `machining_rate`
+/// field, but the engine's S268 [`QuotingParameters`] requires one.
+/// Documented pushback: this PR ships the producer-side bridge with a
+/// flat 1.0 EUR/min default — pricing is wrong-but-monotonic until the
+/// column lands. The right follow-up is a one-row migration on
+/// `quoting_parameters` + the matching SPA form field; out of scope here
+/// because the schema-edit + SPA edit + audit kind broaden the PR
+/// beyond producer-pipeline plumbing.
+const DEFAULT_MACHINING_RATE_EUR_PER_MIN: f64 = 1.0;
+
+fn convert_parameters(local: &crate::quoting_tunables::QuotingParameters) -> QuotingParameters {
+    QuotingParameters {
+        scrap_factor: local.scrap_factor,
+        machining_rate_eur_per_minute: DEFAULT_MACHINING_RATE_EUR_PER_MIN,
+        // Local table uses i64; engine expects u32. Clamp negative +
+        // saturate; the SPA enforces ≥ 1 already (per S267 validation).
+        setup_amortization_threshold: local.setup_amortization_threshold.clamp(0, u32::MAX as i64)
+            as u32,
+        overhead_factor: local.overhead_factor,
+        profit_margin_base: local.profit_margin_base,
+        min_margin: local.min_margin,
+        exotic_material_tax: local.exotic_material_tax,
+    }
+}
+
+/// Build the multipart body per ADR-0004 §"Wire shape". Two parts:
+/// JSON `meta` + binary `pdf`. Bytes are CRLF-delimited per RFC 7578.
+pub(crate) fn build_priced_multipart(
+    boundary: &str,
+    feature_graph_hash: &str,
+    valid_until_iso: &str,
+    breakdown_json: &str,
+    pdf_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let breakdown_value: serde_json::Value = serde_json::from_str(breakdown_json)
+        .with_context(|| format!("re-parse breakdown_json: {breakdown_json}"))?;
+    let meta = serde_json::json!({
+        "breakdown_json": breakdown_value,
+        "valid_until": valid_until_iso,
+        "feature_graph_hash": feature_graph_hash,
+        "extractor_version": aberp_cad_extract_wrapper::WRAPPER_VERSION,
+        "engine_version": engine::ENGINE_VERSION,
+        "stock_alert": false,
+    });
+    let meta_bytes = serde_json::to_vec(&meta).context("encode meta JSON")?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(pdf_bytes.len() + meta_bytes.len() + 512);
+    out.extend_from_slice(b"--");
+    out.extend_from_slice(boundary.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(b"Content-Disposition: form-data; name=\"meta\"\r\n");
+    out.extend_from_slice(b"Content-Type: application/json\r\n\r\n");
+    out.extend_from_slice(&meta_bytes);
+    out.extend_from_slice(b"\r\n");
+
+    out.extend_from_slice(b"--");
+    out.extend_from_slice(boundary.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"pdf\"; filename=\"quote.pdf\"\r\n",
+    );
+    out.extend_from_slice(b"Content-Type: application/pdf\r\n\r\n");
+    out.extend_from_slice(pdf_bytes);
+    out.extend_from_slice(b"\r\n");
+
+    out.extend_from_slice(b"--");
+    out.extend_from_slice(boundary.as_bytes());
+    out.extend_from_slice(b"--\r\n");
+    Ok(out)
+}
+
+/// Storefront `/api/quotes?status=received` response. Shape mirrors
+/// the existing `aberp_quote_intake::payload::QuoteListResponse`.
+#[derive(Debug, Deserialize)]
+struct StorefrontListResponse {
+    quotes: Vec<StorefrontQuote>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorefrontQuote {
+    id: String,
+    contact: StorefrontContact,
+    request: StorefrontRequest,
+    #[serde(default)]
+    files: Vec<StorefrontFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorefrontContact {
+    name: String,
+    email: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorefrontRequest {
+    material_preference: String,
+    #[serde(default)]
+    quantity: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorefrontFile {
+    filename: String,
+}
+
+// ── Audit payload structs ────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct QuotePricingFetchedPayload {
+    quote_id: String,
+    tenant_id: String,
+    customer_email: String,
+    material_grade: String,
+    quantity: u32,
+    cad_filename: String,
+    cad_local_path: String,
+    actor: String,
+    idempotency_key: String,
+    fetched_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QuotePricingExtractedPayload {
+    quote_id: String,
+    tenant_id: String,
+    feature_graph_hash: String,
+    extractor_version: String,
+    volume_mm3: f64,
+    bounding_box_mm: [f64; 3],
+    feature_count: u32,
+    requires_5_axis: bool,
+    thin_wall_present: bool,
+    actor: String,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QuotePricingPricedPayload {
+    quote_id: String,
+    tenant_id: String,
+    engine_version: String,
+    total_price_eur: f64,
+    material_cost_eur: f64,
+    labor_cost_eur: f64,
+    setup_cost_eur: f64,
+    overhead_eur: f64,
+    margin_eur: f64,
+    actor: String,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QuotePricingRenderedPayload {
+    quote_id: String,
+    tenant_id: String,
+    pdf_path: String,
+    pdf_size_bytes: u64,
+    pdf_renderer_version: String,
+    actor: String,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QuotePricingPostedPayload {
+    quote_id: String,
+    tenant_id: String,
+    feature_graph_hash: String,
+    idempotent: bool,
+    valid_until_iso: String,
+    actor: String,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QuotePricingFailedPayload {
+    quote_id: String,
+    tenant_id: String,
+    stage: String,
+    reason: String,
+    attempt_n: u32,
+    actor: String,
+    idempotency_key: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_follows_5_15_60_then_cadence() {
+        let cadence = Duration::from_secs(60);
+        assert_eq!(backoff_duration(0, cadence), Duration::from_secs(5));
+        assert_eq!(backoff_duration(1, cadence), Duration::from_secs(15));
+        assert_eq!(backoff_duration(2, cadence), Duration::from_secs(60));
+        assert_eq!(backoff_duration(3, cadence), cadence);
+        assert_eq!(backoff_duration(99, cadence), cadence);
+    }
+
+    #[test]
+    fn parse_stock_status_round_trips_closed_vocab() {
+        assert_eq!(
+            parse_stock_status("in_stock").unwrap(),
+            StockStatus::InStock
+        );
+        assert_eq!(
+            parse_stock_status("source_1_2d").unwrap(),
+            StockStatus::Source1_2d
+        );
+        assert_eq!(
+            parse_stock_status("source_3_7d").unwrap(),
+            StockStatus::Source3_7d
+        );
+        assert_eq!(
+            parse_stock_status("special_order").unwrap(),
+            StockStatus::SpecialOrder
+        );
+        assert!(parse_stock_status("garbage").is_err());
+    }
+
+    #[test]
+    fn build_priced_multipart_carries_meta_and_pdf() {
+        let boundary = "test-bdry";
+        let body = build_priced_multipart(
+            boundary,
+            "blake3:abcd",
+            "2026-07-06",
+            "{\"k\":1}",
+            b"%PDF-1.5 fakebody",
+        )
+        .expect("build");
+        let s = String::from_utf8_lossy(&body).to_string();
+        assert!(s.contains("--test-bdry"));
+        assert!(s.contains("name=\"meta\""));
+        assert!(s.contains("Content-Type: application/json"));
+        assert!(s.contains("blake3:abcd"));
+        assert!(s.contains("2026-07-06"));
+        assert!(s.contains("name=\"pdf\""));
+        assert!(s.contains("Content-Type: application/pdf"));
+        assert!(s.contains("--test-bdry--"));
+        assert!(s.contains("%PDF-1.5 fakebody"));
+    }
+
+    /// ADR-0004 mandates `breakdown_json` as a JSON OBJECT inside
+    /// `meta` (not a string). The hand-rolled multipart must emit the
+    /// breakdown as a JSON value, not the encoded string. Loud-fail
+    /// pin so the storefront's `breakdown_json must be a JSON object`
+    /// rejection (line 46 of `+server.ts`) doesn't bite us later.
+    #[test]
+    fn priced_multipart_breakdown_is_json_object_not_string() {
+        let body = build_priced_multipart(
+            "b",
+            "blake3:deadbeef",
+            "2026-07-06",
+            "{\"total\":42.0}",
+            b"x",
+        )
+        .expect("build");
+        let s = String::from_utf8_lossy(&body).to_string();
+        // The breakdown must appear as `"breakdown_json":{"total":42.0}`,
+        // NOT `"breakdown_json":"{\"total\":42.0}"` (a string).
+        assert!(
+            s.contains("\"breakdown_json\":{"),
+            "breakdown_json must be a nested object, body: {s}"
+        );
+        assert!(
+            !s.contains("\"breakdown_json\":\""),
+            "breakdown_json must NOT be a string"
+        );
+    }
+
+    #[test]
+    fn priced_multipart_stamps_extractor_and_engine_versions() {
+        let body =
+            build_priced_multipart("b", "blake3:1", "2026-07-06", "{}", b"x").expect("build");
+        let s = String::from_utf8_lossy(&body).to_string();
+        assert!(
+            s.contains("\"extractor_version\":"),
+            "missing extractor_version"
+        );
+        assert!(s.contains("\"engine_version\":"), "missing engine_version");
+        assert!(s.contains("\"stock_alert\":false"), "missing stock_alert");
+    }
+
+    #[test]
+    fn parse_priced_writeback_ok_recognises_idempotent_flag() {
+        let fresh: PricedWritebackOk =
+            serde_json::from_str(r#"{"status":"quoted"}"#).expect("fresh");
+        assert!(!fresh.idempotent.unwrap_or(false));
+        let idem: PricedWritebackOk =
+            serde_json::from_str(r#"{"status":"quoted","idempotent":true}"#).expect("idem");
+        assert!(idem.idempotent.unwrap_or(false));
+    }
+
+    #[test]
+    fn convert_materials_with_unknown_stock_status_is_loud() {
+        // Need to construct a local Material; instead test the parse
+        // helper directly to keep the surface narrow.
+        assert!(parse_stock_status("not_a_status").is_err());
+    }
+}

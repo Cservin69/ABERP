@@ -70,6 +70,20 @@ aberp-invoice-pdf = { path = "../../crates/invoice-pdf" }
 # is dormant. Per [[aberp-versioning-policy]] this is the first
 # Stage 2 module landing.
 aberp-quote-intake = { path = "../../crates/aberp-quote-intake" }
+# S279 / PR-265 — auto-quoting producer pipeline: the three pricing
+# crates the daemon orchestrates. `aberp-quote-engine` is the pure
+# scoring function (S268); `aberp-cad-extract-wrapper` is the Python
+# subprocess shim (S270); `aberp-quote-pdf` is this PR's indicative-
+# PDF renderer.
+aberp-quote-engine = { path = "../../crates/aberp-quote-engine" }
+aberp-cad-extract-wrapper = { path = "../../crates/aberp-cad-extract-wrapper" }
+aberp-quote-pdf = { path = "../../crates/aberp-quote-pdf" }
+# S279 / PR-265 — blake3 backs the `feature_graph_hash` idempotency key
+# that the storefront's priced-writeback uses to detect retried POSTs
+# (ADR-0004). The engine is pure so the hash is purely derived from the
+# extracted FeatureGraph; same hash ⇒ same priced PDF ⇒ storefront 200
+# idempotent replay.
+blake3 = { workspace = true }
 # S229 / PR-225 — Stage 3 manufacturing-execution adapter framework
 # (ADR-0060 Phase β). The binary owns the boot-time `AdapterRegistry`
 # + per-adapter ledger-writer spawn. The first real adapter shipped

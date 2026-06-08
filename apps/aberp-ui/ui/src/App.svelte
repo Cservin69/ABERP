@@ -65,6 +65,9 @@
   // S211 / PR-210 — Quotes operational tab (third tab under
   // Invoices, alongside Outgoing / Incoming).
   import QuotesList from "./routes/QuotesList.svelte";
+  // S279 / PR-265 — pricing-pipeline operator surface (Fetched →
+  // Extracting → Pricing → Rendering → PostingBack → Posted / Failed).
+  import PricingJobsList from "./routes/PricingJobsList.svelte";
   import IssueInvoice from "./routes/IssueInvoice.svelte";
   import MaintenanceDashboard from "./routes/MaintenanceDashboard.svelte";
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
@@ -768,11 +771,30 @@
                 >{quoteUnpickedCount}</span>
               {/if}
             </button>
+            <!-- S279 / PR-265 — fourth tab, auto-quoting producer pipeline.
+                 Customer submissions ABERP is currently pricing
+                 (Fetched/Extracting/Pricing/Rendering/PostingBack/Posted/
+                 Failed). Distinct from `quotes` (operator pickup queue
+                 for approved quotes awaiting DEAL). -->
+            <button
+              type="button"
+              role="tab"
+              class="invoices-tab"
+              class:invoices-tab--active={invoicesTab === "pricing"}
+              aria-selected={invoicesTab === "pricing"}
+              onclick={() => setInvoicesTab("pricing")}
+              data-testid="invoices-tab-pricing"
+            >
+              <span class="invoices-tab__label">Auto-árazás</span>
+              <span class="invoices-tab__sub">Pricing</span>
+            </button>
           </div>
           {#if invoicesTab === "incoming"}
             <IncomingInvoiceList />
           {:else if invoicesTab === "quotes"}
             <QuotesList />
+          {:else if invoicesTab === "pricing"}
+            <PricingJobsList />
           {:else}
             <InvoiceList />
           {/if}

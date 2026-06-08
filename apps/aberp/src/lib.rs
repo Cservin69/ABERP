@@ -91,6 +91,15 @@ pub mod quote_deal;
 // downgraded since acceptance. Sticky: only operator REFRESH (S272+)
 // untriggers an alert.
 pub mod quote_stock_alert;
+// S279 / PR-265 — pricing-pipeline state machine + jobs table.
+// Distinct from `quote_intake_log` (approved quotes awaiting DEAL);
+// this table tracks `received → quoted` storefront-side state-flips
+// the ABERP-driven pricing daemon walks rows through.
+pub mod quote_pricing_jobs;
+// S279 / PR-265 — orchestration glue around the three crates
+// (`aberp-cad-extract-wrapper` extract / `aberp-quote-engine` price /
+// `aberp-quote-pdf` render) + the storefront priced-writeback POST.
+pub mod quote_pricing_pipeline;
 pub mod quoting_materials;
 // S267 / PR-256 — four tunable tables feeding the future
 // `aberp-quote-engine`: complexity rules, tolerance multipliers, the

@@ -1436,6 +1436,108 @@ pub enum EventKind {
     /// Payload: `serde_json::Value` (aberp binary `serve`).
     /// F12 four-edit ritual fires once.
     MaterialReleased,
+
+    /// S279 / PR-265 — first audit row of the pricing pipeline. Emitted
+    /// when the ABERP pricing daemon has pulled a `received`-state quote
+    /// off the storefront and staged a `quote_pricing_jobs` row in state
+    /// `Fetched`. One entry per pulled quote (idempotent via the
+    /// `quote_pricing_jobs.quote_id` PK — a re-fetch on an existing row
+    /// is a no-op and emits no audit).
+    ///
+    /// Carries `quote_id` (the storefront UUID), `tenant_id`, `cad_path`
+    /// (local tmp path under `quote-artifacts/`), `material_grade`, the
+    /// requested `quantity`, the customer email (for forensic-walk
+    /// "which customer asked for this price"), `actor` (`system` —
+    /// daemon-driven), and the F8 idempotency key.
+    ///
+    /// `quote.*` prefix family alongside the other auto-quoting kinds.
+    /// Pushback against the brief's `quote.pricing.*` three-segment
+    /// shape: codebase convention is `prefix.snake_case_name` (one
+    /// dot); keeping six kinds in the same shape avoids forking the
+    /// audit-string grammar mid-stream.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    QuotePricingFetched,
+
+    /// S279 / PR-265 — pricing-pipeline FeatureGraph extracted from
+    /// CAD. Emitted when `aberp-cad-extract-wrapper` returned `Ok(_)`
+    /// and the `quote_pricing_jobs` row moved `Fetched → Extracting →
+    /// Pricing`. Carries `quote_id`, `tenant_id`, `extractor_version`
+    /// (from `aberp_cad_extract_wrapper::WRAPPER_VERSION`), the
+    /// `feature_graph_hash` (blake3 of the canonical JSON — the
+    /// idempotency key against the storefront's priced-writeback
+    /// per ADR-0004), and the bounding-box / volume snapshot so a
+    /// forensic walk can reconstruct what the engine saw.
+    ///
+    /// `quote.*` prefix family.
+    ///
+    /// Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePricingExtracted,
+
+    /// S279 / PR-265 — pricing-pipeline QuoteBreakdown produced.
+    /// Emitted when `aberp_quote_engine::quote()` returned `Ok(_)` and
+    /// the row moved `Pricing → Rendering`. Carries `quote_id`,
+    /// `tenant_id`, `engine_version`, `total_price_eur`,
+    /// `material_cost_eur`, `labor_cost_eur`, `setup_cost_eur`,
+    /// `overhead_eur`, `margin_eur` — every number on the breakdown
+    /// (NOT the reasoning_log, which would bloat the ledger; the log
+    /// is persisted on the job row's `breakdown_json` column).
+    ///
+    /// `quote.*` prefix family.
+    ///
+    /// Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePricingPriced,
+
+    /// S279 / PR-265 — pricing-pipeline indicative PDF rendered.
+    /// Emitted when `aberp_quote_pdf::render` produced bytes and the
+    /// row moved `Rendering → PostingBack`. Carries `quote_id`,
+    /// `tenant_id`, `pdf_path` (under `quote-artifacts/<id>/`),
+    /// `pdf_size_bytes`, and `pdf_renderer_version`.
+    ///
+    /// `quote.*` prefix family.
+    ///
+    /// Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePricingRendered,
+
+    /// S279 / PR-265 — pricing-pipeline priced-writeback POST succeeded.
+    /// Emitted when `POST /api/quotes/{id}/priced` returned 200 (per
+    /// ADR-0004) and the row moved `PostingBack → Posted`. Carries
+    /// `quote_id`, `tenant_id`, the canonical `feature_graph_hash`
+    /// (echoed for forensic reconciliation against the storefront
+    /// `metadata.json.pricing.feature_graph_hash`), an `idempotent`
+    /// boolean (true on the storefront's `{ status: "quoted",
+    /// idempotent: true }` replay-success shape), the `valid_until`
+    /// date stamped on the writeback, and the F8 idempotency key.
+    ///
+    /// `quote.*` prefix family.
+    ///
+    /// Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePricingPosted,
+
+    /// S279 / PR-265 — pricing-pipeline job failed at any stage. Emitted
+    /// when the state machine moves into `Failed`. ONE entry per failure
+    /// transition — operator retry on a Failed row re-emits a fresh
+    /// `QuotePricingFetched` and the failure history is the audit chain,
+    /// not the row.
+    ///
+    /// Carries `quote_id`, `tenant_id`, `stage` (closed-vocab string —
+    /// `"fetch" | "extract" | "price" | "render" | "post"`), `reason`
+    /// (operator-readable message, header-injection-safe truncated to
+    /// 1000 chars), `actor` (`system` for daemon failures, operator
+    /// login for retry-induced failures), and the F8 idempotency key
+    /// (`quote_pricing_failed:<quote_id>:<attempt_n>` — `attempt_n`
+    /// counts retries so re-failures don't UNIQUE-collide).
+    ///
+    /// `quote.*` prefix family.
+    ///
+    /// Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePricingFailed,
 }
 
 impl EventKind {
@@ -1517,6 +1619,12 @@ impl EventKind {
             EventKind::MaterialCommitted => "inventory.material_committed",
             EventKind::MaterialConsumed => "inventory.material_consumed",
             EventKind::MaterialReleased => "inventory.material_released",
+            EventKind::QuotePricingFetched => "quote.pricing_fetched",
+            EventKind::QuotePricingExtracted => "quote.pricing_extracted",
+            EventKind::QuotePricingPriced => "quote.pricing_priced",
+            EventKind::QuotePricingRendered => "quote.pricing_rendered",
+            EventKind::QuotePricingPosted => "quote.pricing_posted",
+            EventKind::QuotePricingFailed => "quote.pricing_failed",
         }
     }
 
@@ -1609,6 +1717,12 @@ impl EventKind {
             "inventory.material_committed" => Ok(EventKind::MaterialCommitted),
             "inventory.material_consumed" => Ok(EventKind::MaterialConsumed),
             "inventory.material_released" => Ok(EventKind::MaterialReleased),
+            "quote.pricing_fetched" => Ok(EventKind::QuotePricingFetched),
+            "quote.pricing_extracted" => Ok(EventKind::QuotePricingExtracted),
+            "quote.pricing_priced" => Ok(EventKind::QuotePricingPriced),
+            "quote.pricing_rendered" => Ok(EventKind::QuotePricingRendered),
+            "quote.pricing_posted" => Ok(EventKind::QuotePricingPosted),
+            "quote.pricing_failed" => Ok(EventKind::QuotePricingFailed),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1693,6 +1807,12 @@ mod tests {
             EventKind::MaterialCommitted,
             EventKind::MaterialConsumed,
             EventKind::MaterialReleased,
+            EventKind::QuotePricingFetched,
+            EventKind::QuotePricingExtracted,
+            EventKind::QuotePricingPriced,
+            EventKind::QuotePricingRendered,
+            EventKind::QuotePricingPosted,
+            EventKind::QuotePricingFailed,
         ];
         for v in variants {
             let s = v.as_str();
@@ -3117,6 +3237,75 @@ mod tests {
         for k in new {
             assert_ne!(k, EventKind::StockMovementRecorded.as_str());
             assert_ne!(k, EventKind::QuoteDealIssued.as_str());
+        }
+    }
+
+    /// S279 / PR-265 — the six new pricing-pipeline kinds extend the
+    /// `quote.*` prefix family (alongside S266 catalogue, S267 tunables,
+    /// S271 stock-alert, S272 DEAL saga). Pushback against the brief's
+    /// `quote.pricing.*` three-segment shape: codebase convention is
+    /// `prefix.snake_case_name` (single dot). Loud-fail pin so a future
+    /// edit collapsing the prefix or re-introducing the two-dot shape
+    /// fails at test time.
+    #[test]
+    fn s279_pricing_kinds_use_quote_prefix() {
+        let cases: [(EventKind, &str); 6] = [
+            (EventKind::QuotePricingFetched, "quote.pricing_fetched"),
+            (EventKind::QuotePricingExtracted, "quote.pricing_extracted"),
+            (EventKind::QuotePricingPriced, "quote.pricing_priced"),
+            (EventKind::QuotePricingRendered, "quote.pricing_rendered"),
+            (EventKind::QuotePricingPosted, "quote.pricing_posted"),
+            (EventKind::QuotePricingFailed, "quote.pricing_failed"),
+        ];
+        for (k, expected) in cases {
+            assert_eq!(k.as_str(), expected);
+            let s = k.as_str();
+            assert!(s.starts_with("quote."), "{s} must start with quote.");
+            assert!(
+                !s.starts_with("invoice."),
+                "{s} must not start with invoice."
+            );
+            assert!(!s.starts_with("system."), "{s} must not start with system.");
+            assert!(!s.starts_with("mes."), "{s} must not start with mes.");
+            assert!(
+                !s.starts_with("inventory."),
+                "{s} must not start with inventory."
+            );
+        }
+    }
+
+    /// S279 / PR-265 — the six pricing-pipeline storage strings are
+    /// pairwise-distinct AND distinct from every other `quote.*`
+    /// neighbour (catalogue, tunables, stock-alert, DEAL-saga trio).
+    /// A collision would mis-route a pricing event into a neighbour
+    /// bucket on parse — e.g. `pricing_failed` mis-spelled as
+    /// `stock_alert_triggered` would mute the alert badge.
+    #[test]
+    fn s279_pricing_kinds_are_distinct() {
+        let new = [
+            EventKind::QuotePricingFetched.as_str(),
+            EventKind::QuotePricingExtracted.as_str(),
+            EventKind::QuotePricingPriced.as_str(),
+            EventKind::QuotePricingRendered.as_str(),
+            EventKind::QuotePricingPosted.as_str(),
+            EventKind::QuotePricingFailed.as_str(),
+        ];
+        for i in 0..new.len() {
+            for j in (i + 1)..new.len() {
+                assert_ne!(new[i], new[j], "{} collides with {}", new[i], new[j]);
+            }
+        }
+        for k in new {
+            assert_ne!(k, EventKind::MaterialCatalogueChanged.as_str());
+            assert_ne!(k, EventKind::MaterialCataloguePushed.as_str());
+            assert_ne!(k, EventKind::ComplexityRulesChanged.as_str());
+            assert_ne!(k, EventKind::ToleranceMultipliersChanged.as_str());
+            assert_ne!(k, EventKind::ParametersChanged.as_str());
+            assert_ne!(k, EventKind::StockAdjustmentsChanged.as_str());
+            assert_ne!(k, EventKind::QuoteStockAlertTriggered.as_str());
+            assert_ne!(k, EventKind::QuoteDealIssued.as_str());
+            assert_ne!(k, EventKind::QuoteSalesOrderCreated.as_str());
+            assert_ne!(k, EventKind::QuoteWorkOrderCreated.as_str());
         }
     }
 }

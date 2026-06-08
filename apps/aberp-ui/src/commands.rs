@@ -1298,6 +1298,27 @@ pub async fn quote_intake_mark_irrelevant(
     forward_post(&state, &path, Value::Null).await
 }
 
+/// S279 / PR-265 — read-only list of the pricing-pipeline jobs table
+/// (Fetched/Extracting/Pricing/Rendering/PostingBack/Posted/Failed).
+/// The daemon is the only writer; the SPA shows progress + the retry
+/// affordance on Failed rows.
+#[tauri::command]
+pub async fn list_quote_pricing_jobs(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quote-pricing-jobs", true).await
+}
+
+/// S279 / PR-265 — re-enqueue a Failed job at Fetched. Bumps the row's
+/// attempt counter so the next QuotePricingFailed audit row's
+/// idempotency key doesn't UNIQUE-collide with the prior failure.
+#[tauri::command]
+pub async fn retry_quote_pricing_job(
+    state: State<'_, AppState>,
+    quote_id: String,
+) -> Result<Value, String> {
+    let path = format!("/api/quote-pricing-jobs/{quote_id}/retry");
+    forward_post(&state, &path, Value::Null).await
+}
+
 /// S272 / PR-261 — DEAL saga (ADR-0067). `POST /api/quote-intake/{quote_id}/deal`
 /// with body `{ deal_token, refresh_ack? }`. Backend mints SO/WO
 /// placeholder ids + emits three audit entries in a single tx; 409s

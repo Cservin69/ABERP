@@ -927,7 +927,18 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::MaterialReserved
         | EventKind::MaterialCommitted
         | EventKind::MaterialConsumed
-        | EventKind::MaterialReleased => (None, ""),
+        | EventKind::MaterialReleased
+        // S279 / PR-265 — pricing-pipeline kinds (`quote.*`). Six-stage
+        // daemon-driven auto-quoting flow (fetch → extract → price →
+        // render → post / failed). Same posture as the S271/S272 kinds —
+        // quote-strand telemetry, no NAV XML bytes carried, never sweeps
+        // a per-OUTGOING-invoice bundle.
+        | EventKind::QuotePricingFetched
+        | EventKind::QuotePricingExtracted
+        | EventKind::QuotePricingPriced
+        | EventKind::QuotePricingRendered
+        | EventKind::QuotePricingPosted
+        | EventKind::QuotePricingFailed => (None, ""),
     };
 
     Ok(NavExtraction {

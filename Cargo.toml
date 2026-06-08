@@ -70,6 +70,7 @@ members = [
     "crates/aberp-mes",
     "crates/aberp-quote-engine",
     "crates/aberp-cad-extract-wrapper",
+    "crates/aberp-quote-pdf",
     "crates/aberp-inventory",
     "crates/aberp-work-orders",
     "crates/aberp-qa",
@@ -155,6 +156,14 @@ sha2 = "0.10"
 sha3 = "0.10"
 aes = "0.8"
 zeroize = { version = "1", features = ["zeroize_derive"] }
+
+# S279 / PR-265 — blake3 for the priced-writeback idempotency key. The
+# storefront's ADR-0004 contract mandates a `blake3:[0-9a-f]+` hash on
+# every priced-writeback POST so a retransmitted POST on the same
+# extracted FeatureGraph is recognised as idempotent (returns 200 with
+# `idempotent:true`). Single-dep cost ≈ +50 KB compiled; the only
+# direct user is the pricing pipeline.
+blake3 = "1"
 
 # base64 — used by PR-7-B-1's per-invoice-index signature extension
 # (SHA3-512(operation || base64(invoiceData)) per ADR-0009 §4) and by

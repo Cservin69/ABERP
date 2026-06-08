@@ -9,13 +9,18 @@
 // operator queue. Closed-vocab discard pattern from S175 means a
 // previously-saved unknown value falls back to the default.
 
-export type InvoiceTab = "outgoing" | "incoming" | "quotes";
+// S279 / PR-265 — fourth value `pricing` added for the auto-quoting
+// producer pipeline operator surface. Distinct from `quotes`
+// (approved-quote operator pickup queue): `pricing` lists the
+// daemon-tracked Fetched/Extracting/Pricing/Rendering/PostingBack/
+// Posted/Failed states.
+export type InvoiceTab = "outgoing" | "incoming" | "quotes" | "pricing";
 
 export const INVOICE_TAB_KEY = "aberp:invoice-tab";
 
 export const DEFAULT_INVOICE_TAB: InvoiceTab = "outgoing";
 
-const LEGAL_TABS: readonly InvoiceTab[] = ["outgoing", "incoming", "quotes"];
+const LEGAL_TABS: readonly InvoiceTab[] = ["outgoing", "incoming", "quotes", "pricing"];
 
 export function loadInvoiceTab(
   storage: Pick<Storage, "getItem"> | null = localStorageOrNull(),

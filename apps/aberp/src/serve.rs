@@ -1384,6 +1384,11 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     // resolved — one secret per surface, no second token.
                     let push_base_url = cfg.base_url.clone();
                     let push_bearer = cfg.bearer_token.clone();
+                    // S279 / PR-265 — capture another snapshot for the
+                    // pricing-pipeline daemon spawn below (after the
+                    // catalogue-push block consumes `push_base_url` /
+                    // `push_bearer`).
+                    let pipeline_operator_login = operator_login.clone();
                     let push_deps = crate::catalogue_push::CataloguePushDeps {
                         db_path: (*st.db_path).clone(),
                         tenant: st.tenant.clone(),
@@ -1426,6 +1431,8 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     // Reuses the shared dormant handle in AppState so the
                     // CRUD routes' on-write trigger + the list route's
                     // status read both reach this daemon.
+                    let catalogue_base_url = push_base_url.clone();
+                    let catalogue_bearer = push_bearer.clone();
                     match crate::catalogue_push::CataloguePushService::new(
                         push_handle,
                         push_base_url,
@@ -1448,6 +1455,67 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                 "catalogue-push daemon refused to start: {e:#}"
                             ));
                         }
+                    }
+
+                    // S279 / PR-265 — spawn the pricing pipeline daemon onto
+                    // the SAME storefront surface. Polls `?status=received`,
+                    // walks each row through extract → price → render → post.
+                    // Only spawns when the operator has typed an
+                    // `ABERP_QUOTE_PIPELINE_PYTHON` env var (the absolute path
+                    // to the `aberp-cad-extract` venv's python3). Without it
+                    // the daemon would crash on its first extract attempt;
+                    // honest dormant-by-default posture matches the existing
+                    // intake-daemon's `enabled=true` opt-in shape.
+                    if let Ok(python_bin) = std::env::var("ABERP_QUOTE_PIPELINE_PYTHON") {
+                        let artifact_dir = std::env::var("ABERP_QUOTE_PIPELINE_ARTIFACT_DIR")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|_| {
+                                std::path::PathBuf::from("./quote-artifacts")
+                            });
+                        let pipeline_cfg = crate::quote_pricing_pipeline::PricingPipelineConfig {
+                            base_url: catalogue_base_url,
+                            bearer_token: catalogue_bearer,
+                            poll_interval: std::time::Duration::from_secs(60),
+                            artifact_dir,
+                            python_bin: std::path::PathBuf::from(python_bin),
+                            default_tolerance:
+                                aberp_quote_engine::ToleranceRange::Standard,
+                        };
+                        let pipeline_deps = crate::quote_pricing_pipeline::PricingPipelineDeps {
+                            db_path: (*st.db_path).clone(),
+                            tenant: st.tenant.clone(),
+                            binary_hash,
+                            operator_login: pipeline_operator_login,
+                        };
+                        match crate::quote_pricing_pipeline::PricingPipelineService::new(
+                            pipeline_cfg,
+                            pipeline_deps,
+                        ) {
+                            Ok(service) => {
+                                tracing::info!(
+                                    "spawning quote-pricing-pipeline daemon (S279 / PR-265)"
+                                );
+                                let pipeline_token = coordinator.token.clone();
+                                let pipeline_handle = tokio::spawn(async move {
+                                    service.run_daemon_forever(pipeline_token).await;
+                                });
+                                coordinator.register(
+                                    "quote-pricing-pipeline",
+                                    pipeline_handle,
+                                );
+                            }
+                            Err(e) => {
+                                return Err(anyhow!(
+                                    "quote-pricing-pipeline daemon refused to start: {e:#}"
+                                ));
+                            }
+                        }
+                    } else {
+                        tracing::info!(
+                            "quote-pricing-pipeline daemon dormant \
+                             (set ABERP_QUOTE_PIPELINE_PYTHON to an absolute \
+                             path to the aberp-cad-extract venv's python3 to enable)"
+                        );
                     }
                 }
                 Err(QuoteIntakeError::Disabled) => {
@@ -2605,6 +2673,18 @@ fn build_router(state: AppState) -> Router {
             post(handle_test_quote_intake_connection),
         )
         .route("/api/quote-intake/quotes", get(handle_list_quote_intake))
+        // S279 / PR-265 — pricing-pipeline operator surface. Read-only list of
+        // `quote_pricing_jobs` (Fetched/Extracting/Pricing/Rendering/PostingBack/
+        // Posted/Failed) + a per-row retry button that re-enqueues a Failed
+        // row at Fetched. The daemon does the work; the SPA shows progress.
+        .route(
+            "/api/quote-pricing-jobs",
+            get(handle_list_quote_pricing_jobs),
+        )
+        .route(
+            "/api/quote-pricing-jobs/:quote_id/retry",
+            post(handle_retry_quote_pricing_job),
+        )
         // S256 / PR-245 — one polled endpoint feeding the sidebar badge
         // (un-picked count, DB truth) + the arrival toast (live arrivals
         // past the catch-up boundary) + the 401 re-paste-bearer prompt.
@@ -15910,6 +15990,126 @@ fn quote_intake_auth_paused(state: &AppState) -> Result<bool> {
         (Some(_), None) => true,
         _ => false,
     })
+}
+
+/// S279 / PR-265 — wire shape for the `/api/quote-pricing-jobs` list.
+/// Read-only operator view; the daemon is the only writer. Closed-vocab
+/// `state` matches [`crate::quote_pricing_jobs::JobState`] storage strings.
+#[derive(Debug, serde::Serialize)]
+struct PricingJobView {
+    quote_id: String,
+    state: String,
+    fetched_at: String,
+    updated_at: String,
+    customer_email: String,
+    customer_name: String,
+    material_grade: String,
+    quantity: u32,
+    feature_graph_hash: Option<String>,
+    total_price_eur: Option<f64>,
+    error_stage: Option<String>,
+    error_reason: Option<String>,
+    attempt_n: u32,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PricingJobsResponse {
+    jobs: Vec<PricingJobView>,
+}
+
+async fn handle_list_quote_pricing_jobs(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let db_path = (*state.db_path).clone();
+    let tenant_id = state.tenant.as_str().to_string();
+    let rows = match tokio::task::spawn_blocking(move || -> Result<Vec<_>> {
+        let conn = duckdb::Connection::open(&db_path).context("open DB")?;
+        crate::quote_pricing_jobs::list_jobs(&conn, &tenant_id)
+    })
+    .await
+    {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => return internal_error("list_quote_pricing_jobs", e),
+        Err(e) => return internal_error("list_quote_pricing_jobs:join", anyhow!(e)),
+    };
+    let body = PricingJobsResponse {
+        jobs: rows
+            .into_iter()
+            .map(|r| PricingJobView {
+                quote_id: r.quote_id,
+                state: r.state.as_str().to_string(),
+                fetched_at: r.fetched_at,
+                updated_at: r.updated_at,
+                customer_email: r.customer_email,
+                customer_name: r.customer_name,
+                material_grade: r.material_grade,
+                quantity: r.quantity,
+                feature_graph_hash: r.feature_graph_hash,
+                total_price_eur: r.total_price_eur,
+                error_stage: r.error_stage,
+                error_reason: r.error_reason,
+                attempt_n: r.attempt_n,
+            })
+            .collect(),
+    };
+    (axum::http::StatusCode::OK, axum::Json(body)).into_response()
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RetryResponse {
+    quote_id: String,
+    new_attempt_n: u32,
+}
+
+async fn handle_retry_quote_pricing_job(
+    AxumPath(quote_id): AxumPath<String>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    // Defence-in-depth on the quote id — only allow the storefront UUID
+    // shape that the daemon enqueues. Stops a path-traversal attempt
+    // from poisoning the DuckDB `WHERE` clause via the URL segment.
+    let uuid_re =
+        quote_id.len() == 36 && quote_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    if !uuid_re {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "invalid quote_id"})),
+        )
+            .into_response();
+    }
+    let db_path = (*state.db_path).clone();
+    let tenant_id = state.tenant.as_str().to_string();
+    let qid = quote_id.clone();
+    let new_n = match tokio::task::spawn_blocking(move || -> Result<u32> {
+        let mut conn = duckdb::Connection::open(&db_path).context("open DB")?;
+        let now = time::OffsetDateTime::now_utc();
+        crate::quote_pricing_jobs::retry_job(&mut conn, &qid, &tenant_id, now)
+    })
+    .await
+    {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return internal_error("retry_quote_pricing_job", e),
+        Err(e) => return internal_error("retry_quote_pricing_job:join", anyhow!(e)),
+    };
+    let body = RetryResponse {
+        quote_id,
+        new_attempt_n: new_n,
+    };
+    (axum::http::StatusCode::OK, axum::Json(body)).into_response()
 }
 
 #[derive(Debug, serde::Serialize)]

@@ -389,6 +389,12 @@ pub fn run() {
             commands::quote_intake_notifications,
             commands::quote_intake_retry_parse,
             commands::quote_intake_mark_irrelevant,
+            // S279 / PR-265 — pricing-pipeline jobs operator surface.
+            // Read-only list + per-row retry on Failed rows. The daemon
+            // is the only writer; this command pair just surfaces what
+            // it has done.
+            commands::list_quote_pricing_jobs,
+            commands::retry_quote_pricing_job,
             // S272 / PR-261 — DEAL saga (ADR-0067). Single-tx mint of
             // SO/WO placeholder ids + 3 audit entries; replay-protected
             // CAS; EVE addendum 2 (REFRESH ack) + addendum 3 (BIG/RED

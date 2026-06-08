@@ -1,0 +1,26 @@
+[package]
+name = "aberp-quote-pdf"
+description = "Indicative-quote PDF renderer for the auto-quoting pipeline. S279 / PR-265."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_quote_pdf"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+lopdf = { workspace = true }
+aberp-quote-engine = { path = "../aberp-quote-engine" }
+time = { workspace = true }
+
+[dev-dependencies]
+pdf-extract = { workspace = true }
+
+[lints]
+workspace = true

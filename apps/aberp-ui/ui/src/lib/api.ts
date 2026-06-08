@@ -3106,6 +3106,44 @@ export async function markQuoteIntakeIrrelevant(
   return invoke("quote_intake_mark_irrelevant", { quoteId });
 }
 
+/** S279 / PR-265 — one row of the `quote_pricing_jobs` SPA list. Read-only
+ * operator view; the daemon is the only writer. */
+export interface PricingJobRow {
+  quote_id: string;
+  /** Closed vocab: `fetched | extracting | pricing | rendering |
+   * posting_back | posted | failed`. */
+  state: string;
+  fetched_at: string;
+  updated_at: string;
+  customer_email: string;
+  customer_name: string;
+  material_grade: string;
+  quantity: number;
+  feature_graph_hash: string | null;
+  total_price_eur: number | null;
+  error_stage: string | null;
+  error_reason: string | null;
+  attempt_n: number;
+}
+
+interface PricingJobsResponse {
+  jobs: PricingJobRow[];
+}
+
+/** S279 / PR-265 — list the pricing-pipeline jobs surface. */
+export async function listQuotePricingJobs(): Promise<PricingJobRow[]> {
+  const out = await invoke<PricingJobsResponse>("list_quote_pricing_jobs");
+  return out.jobs ?? [];
+}
+
+/** S279 / PR-265 — retry a Failed pricing job. The daemon's next sweep
+ * picks it up again at `Fetched`. Returns `{ quote_id, new_attempt_n }`. */
+export async function retryQuotePricingJob(
+  quoteId: string,
+): Promise<{ quote_id: string; new_attempt_n: number }> {
+  return invoke("retry_quote_pricing_job", { quoteId });
+}
+
 /** S255 / PR-244 — outcome of POST `/api/quotes/{quote_id}/pickup-as-draft`.
  * The SPA navigates to `#/invoices` after pickup; `partner_created`
  * drives the optional ConfirmActionModal warning copy (and is shown

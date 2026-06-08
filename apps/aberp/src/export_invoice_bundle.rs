@@ -803,7 +803,17 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::MaterialReserved
         | EventKind::MaterialCommitted
         | EventKind::MaterialConsumed
-        | EventKind::MaterialReleased => None,
+        | EventKind::MaterialReleased
+        // S279 / PR-265 — pricing-pipeline kinds (`quote.*`). Six-stage
+        // daemon-driven auto-quoting flow. Same `quote.*`-not-`invoice.*`
+        // posture as the S271/S272 kinds; never sweeps a per-OUTGOING-
+        // invoice export bundle.
+        | EventKind::QuotePricingFetched
+        | EventKind::QuotePricingExtracted
+        | EventKind::QuotePricingPriced
+        | EventKind::QuotePricingRendered
+        | EventKind::QuotePricingPosted
+        | EventKind::QuotePricingFailed => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

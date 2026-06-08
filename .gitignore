@@ -121,3 +121,9 @@ CLAUDE.md
 # Per-session scheduler lock (sessionId + pid); runtime junk, never
 # part of the repo's history.
 .claude/scheduled_tasks.lock
+
+# --- S279 / PR-265 — pricing-pipeline artifacts -------------
+# Downloaded customer CADs + rendered indicative PDFs land under
+# this dir (configurable via ABERP_QUOTE_PIPELINE_ARTIFACT_DIR).
+# Per-tenant local cache, never part of the repo's history.
+quote-artifacts/
