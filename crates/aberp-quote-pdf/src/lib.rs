@@ -476,9 +476,7 @@ fn wrap_chunks(s: &str, width: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
     for word in s.split_whitespace() {
-        if current.chars().count() + 1 + word.chars().count() > width
-            && !current.is_empty()
-        {
+        if current.chars().count() + 1 + word.chars().count() > width && !current.is_empty() {
             out.push(std::mem::take(&mut current));
         }
         if !current.is_empty() {
