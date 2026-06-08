@@ -195,6 +195,7 @@ fn build_state(boot_state: ServeBootState, tenant: &str) -> AppState {
         email_relay_rate_limiter: std::sync::Arc::new(aberp::email_relay::RateLimiter::new()),
         pipeline_python_resolution: aberp::quote_pricing_pipeline::PythonResolutionHandle::dormant(
         ),
+        storefront_credential: aberp::storefront_credential::StorefrontCredentialHandle::dormant(),
     }
 }
 

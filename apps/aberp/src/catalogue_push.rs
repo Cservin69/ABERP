@@ -36,6 +36,18 @@
 //! the daemon (a rotated bearer) and the `quote.material_catalogue_pushed`
 //! audit entry + the in-memory status drive the Settings "re-paste bearer"
 //! prompt. Resumption is on the next `aberp serve` boot.
+//!
+//! ## S289 / PR-270 — hot-reload via [`crate::storefront_credential`]
+//!
+//! Pre-S289 the daemon cached `base_url` + `bearer` at boot, so an
+//! operator changing the SPA URL only took effect after a restart. The
+//! WARN-spam Ervin saw against `https://abenerp.com` while quote-intake
+//! polled localhost was that gap. The service now holds an
+//! `Arc<StorefrontCredentialHandle>` instead and re-resolves at the
+//! top of every push cycle. The PUT `/api/quote-intake/config` route
+//! calls `handle.set(...)` after a successful save, so the very next
+//! cycle (operator-triggered or cadence) sees the new value. A dormant
+//! handle ⇒ skip the cycle (record a `dormant` outcome and back off).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,9 +60,10 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
-use zeroize::Zeroizing;
 
 use aberp_audit_ledger::{append_in_tx, Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
+
+use crate::storefront_credential::StorefrontCredentialHandle;
 
 /// 15 minutes (design doc §4). Not operator-tunable in v1.
 pub const PUSH_CADENCE_SECS: u64 = 900;
@@ -128,16 +141,32 @@ impl CataloguePushHandle {
             }
         }
     }
+
+    /// S289 / PR-270 — clear the sticky paused flag on a fresh successful
+    /// push. Mirrors the daemon's "operator re-pasted the bearer → next
+    /// cycle picks it up → un-pause" arc.
+    pub fn clear_paused(&self) {
+        if let Ok(mut s) = self.status.lock() {
+            s.paused = false;
+        }
+    }
 }
 
 // ── Outcome ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushOutcome {
-    Ok { count: i64 },
+    Ok {
+        count: i64,
+    },
     Unauthorized,
     Transport(String),
     UnexpectedStatus(u16),
+    /// S289 / PR-270 — the storefront credential handle was empty when
+    /// the cycle started (operator hadn't configured the storefront, or
+    /// flipped `enabled=false`). Distinct from `Transport` so the SPA
+    /// banner reads "dormant" instead of an alarming error.
+    Dormant,
 }
 
 impl PushOutcome {
@@ -147,6 +176,7 @@ impl PushOutcome {
             PushOutcome::Unauthorized => "unauthorized",
             PushOutcome::Transport(_) => "transport",
             PushOutcome::UnexpectedStatus(_) => "unexpected_status",
+            PushOutcome::Dormant => "dormant",
         }
     }
     fn is_ok(&self) -> bool {
@@ -160,7 +190,7 @@ impl PushOutcome {
     }
     fn detail(&self) -> Option<String> {
         match self {
-            PushOutcome::Ok { .. } | PushOutcome::Unauthorized => None,
+            PushOutcome::Ok { .. } | PushOutcome::Unauthorized | PushOutcome::Dormant => None,
             PushOutcome::Transport(s) => Some(s.clone()),
             PushOutcome::UnexpectedStatus(c) => Some(format!("HTTP {c}")),
         }
@@ -186,21 +216,22 @@ pub struct CataloguePushDeps {
 
 pub struct CataloguePushService {
     handle: Arc<CataloguePushHandle>,
-    base_url: String,
-    bearer: Zeroizing<String>,
+    /// S289 / PR-270 — shared storefront credential. Read on every push
+    /// so an operator URL/bearer change in Settings → Quote Intake takes
+    /// effect on the next cycle (no restart needed).
+    credential: Arc<StorefrontCredentialHandle>,
     cadence: Duration,
     client: reqwest::Client,
     deps: CataloguePushDeps,
 }
 
 impl CataloguePushService {
-    /// `base_url` + `bearer` are the already-resolved quote-intake storefront
-    /// credentials (SPOC). `base_url` has no trailing slash (the resolver
-    /// strips it).
+    /// `credential` is the same hot-reloadable handle that the boot
+    /// resolver populates and the PUT `/api/quote-intake/config` route
+    /// updates. The daemon snapshots it at the top of every cycle.
     pub fn new(
         handle: Arc<CataloguePushHandle>,
-        base_url: String,
-        bearer: Zeroizing<String>,
+        credential: Arc<StorefrontCredentialHandle>,
         deps: CataloguePushDeps,
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
@@ -209,8 +240,7 @@ impl CataloguePushService {
             .context("build catalogue-push reqwest client")?;
         Ok(Self {
             handle,
-            base_url,
-            bearer,
+            credential,
             cadence: Duration::from_secs(PUSH_CADENCE_SECS),
             client,
             deps,
@@ -218,7 +248,20 @@ impl CataloguePushService {
     }
 
     /// The boot-spawned loop. 30s settle, then push on cadence OR when the
-    /// operator triggers a write. Backoff on transient failure; PAUSE on 401.
+    /// operator triggers a write. Backoff on transient failure; 401 marks
+    /// the handle paused.
+    ///
+    /// ## S289 / PR-270 — no-exit on 401
+    ///
+    /// Pre-S289 a 401 returned (killing the daemon for the rest of the
+    /// process) on the theory "don't hammer a rotated bearer until the
+    /// operator restarts". With hot-reload that decision is wrong: the
+    /// operator's re-paste-bearer in Settings → Quote Intake calls
+    /// `handle.set(new_url, new_bearer)`, and the very next cycle picks
+    /// it up — that's the whole point of S289. We therefore stay in the
+    /// loop on 401 (one audit row per cadence = 4/hour at the 15-min
+    /// cadence, well below spam threshold), set the sticky `paused` flag
+    /// for the SPA banner, and let the next cycle clear it on success.
     pub async fn run_daemon_forever(self, cancel: CancellationToken) {
         self.handle.mark_running();
         tokio::select! {
@@ -233,17 +276,23 @@ impl CataloguePushService {
             }
             let outcome = self.push_once("daemon").await;
 
-            if matches!(outcome, PushOutcome::Unauthorized) {
-                tracing::error!(
-                    "catalogue-push daemon PAUSED: storefront returned 401 \
-                     (bearer rotated/invalid). Re-paste the bearer token in \
-                     Settings → Quote Intake and restart ABERP to resume."
-                );
-                return;
-            }
-
             let sleep_dur = if outcome.is_ok() {
                 backoff_idx = 0;
+                // S289 — a successful cycle clears the sticky pause:
+                // re-pasting the bearer was the fix.
+                self.handle.clear_paused();
+                self.cadence
+            } else if matches!(outcome, PushOutcome::Unauthorized) {
+                // Stay in the loop, but at cadence (NOT exponential) so
+                // the operator's re-paste-bearer is picked up at most
+                // ~15 min later without restart.
+                tracing::error!(
+                    "catalogue-push daemon: storefront returned 401 \
+                     (bearer rotated/invalid). Re-paste the bearer token \
+                     in Settings → Quote Intake — the next cycle will \
+                     pick it up automatically (S289 hot-reload). Paused \
+                     status banner is sticky until the next success."
+                );
                 self.cadence
             } else {
                 let d = backoff_duration(backoff_idx, self.cadence);
@@ -266,11 +315,27 @@ impl CataloguePushService {
         }
     }
 
-    /// One push attempt: read the public projection, PUT it, classify,
-    /// audit, and record the status. Used by the daemon and (via the
-    /// trigger) on operator write.
+    /// One push attempt: snapshot the credential, read the public
+    /// projection, PUT it, classify, audit, and record the status. Used
+    /// by the daemon and (via the trigger) on operator write.
     pub async fn push_once(&self, trigger: &str) -> PushOutcome {
         let attempt_at = now_rfc3339();
+
+        // S289 / PR-270 — re-resolve the storefront credential at the
+        // top of every cycle so an SPA URL/bearer save takes effect on
+        // the very next cycle (no restart). A dormant snapshot ⇒ the
+        // storefront isn't configured (operator set enabled=false or
+        // hasn't filled the form). Record a `dormant` outcome and back
+        // off — the operator-visible status banner reads "dormant"
+        // rather than an alarming network error.
+        let credential = match self.credential.snapshot() {
+            Some(c) => c,
+            None => {
+                let outcome = PushOutcome::Dormant;
+                self.finish(trigger, attempt_at, outcome.clone()).await;
+                return outcome;
+            }
+        };
 
         // Read the public catalogue off the DB (sync duckdb on a blocking
         // thread).
@@ -299,8 +364,8 @@ impl CataloguePushService {
 
         let count = rows.len() as i64;
         let body = CatalogueBody { materials: rows };
-        let url = format!("{}{CATALOGUE_PATH}", self.base_url);
-        let auth = format!("Bearer {}", &*self.bearer);
+        let url = format!("{}{CATALOGUE_PATH}", credential.base_url);
+        let auth = format!("Bearer {}", &*credential.bearer);
 
         let outcome = match self
             .client
@@ -430,6 +495,10 @@ mod tests {
             PushOutcome::UnexpectedStatus(503).detail(),
             Some("HTTP 503".to_string())
         );
+        // S289 / PR-270 — dormant is a distinct, non-alarming outcome.
+        assert_eq!(PushOutcome::Dormant.label(), "dormant");
+        assert!(PushOutcome::Dormant.detail().is_none());
+        assert!(PushOutcome::Dormant.pushed_count().is_none());
     }
 
     #[test]
@@ -453,6 +522,22 @@ mod tests {
             &PushOutcome::Unauthorized,
         );
         assert!(h.snapshot().paused, "401 must set the sticky paused flag");
+    }
+
+    #[test]
+    fn clear_paused_clears_only_the_pause_flag() {
+        let h = CataloguePushHandle::dormant();
+        h.record(
+            "2026-06-06T00:15:00Z".to_string(),
+            &PushOutcome::Unauthorized,
+        );
+        assert!(h.snapshot().paused);
+        h.clear_paused();
+        let s = h.snapshot();
+        assert!(!s.paused);
+        // The last_outcome string is preserved — `clear_paused` is the
+        // un-pause hook, not a full status wipe.
+        assert_eq!(s.last_outcome.as_deref(), Some("unauthorized"));
     }
 
     #[test]

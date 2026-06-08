@@ -982,6 +982,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         email_relay_rate_limiter: Arc::new(crate::email_relay::RateLimiter::new()),
         pipeline_python_resolution: crate::quote_pricing_pipeline::PythonResolutionHandle::dormant(
         ),
+        storefront_credential: crate::storefront_credential::StorefrontCredentialHandle::dormant(),
     };
 
     // 5. Build the axum router. Clone the state first so the app-boot
@@ -1384,18 +1385,33 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                         .binary_hash
                         .wait()
                         .context("await background binary hash for quote-intake daemon")?;
-                    // S266 / PR-255 — capture the storefront surface
-                    // (base_url + bearer) + audit context for the
-                    // catalogue-push daemon BEFORE `cfg`/`deps` are
-                    // consumed below. SPOC ([[aberp-smtp-spoc]]): the push
-                    // reuses the same storefront credential quote-intake
-                    // resolved — one secret per surface, no second token.
-                    let push_base_url = cfg.base_url.clone();
-                    let push_bearer = cfg.bearer_token.clone();
+                    // S289 / PR-270 — populate the shared, hot-reloadable
+                    // storefront credential ONCE here (boot resolve). The
+                    // catalogue-push daemon reads it per cycle; the SPA
+                    // PUT `/api/quote-intake/config` route updates it on
+                    // save, so an operator URL/bearer change takes effect
+                    // on the very next cycle without restart. SPOC
+                    // ([[aberp-smtp-spoc]]): same handle covers both
+                    // daemons' need for `{base_url}` + bearer (the
+                    // quote-intake crate's daemon + the pricing-pipeline
+                    // daemon stay restart-required per surgical scope —
+                    // their observed behaviour was already correct;
+                    // hot-reload only added to the daemon that drifted).
+                    st.storefront_credential
+                        .set(cfg.base_url.clone(), cfg.bearer_token.clone());
+                    // Brief B — one-shot WARN if the operator is in
+                    // dev-mode but the configured URL points at prod.
+                    // The trap Ervin hit (PROD_v2.27.4 evening test):
+                    // local dev box with `ABERP_DEV_MODE=1` AND a
+                    // stale-but-prod URL → daemons hammered abenerp.com.
+                    crate::storefront_credential::emit_dev_mode_prod_url_warning(&cfg.base_url);
+                    // The pricing-pipeline daemon (S279) shares the same
+                    // storefront credential at boot — capture clones now.
+                    // It does NOT hot-reload in this PR (surgical scope).
+                    let catalogue_base_url = cfg.base_url.clone();
+                    let catalogue_bearer = cfg.bearer_token.clone();
                     // S279 / PR-265 — capture another snapshot for the
-                    // pricing-pipeline daemon spawn below (after the
-                    // catalogue-push block consumes `push_base_url` /
-                    // `push_bearer`).
+                    // pricing-pipeline daemon spawn below.
                     let pipeline_operator_login = operator_login.clone();
                     let push_deps = crate::catalogue_push::CataloguePushDeps {
                         db_path: (*st.db_path).clone(),
@@ -1404,6 +1420,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                         operator_login: operator_login.clone(),
                     };
                     let push_handle = st.catalogue_push.clone();
+                    let push_credential = st.storefront_credential.clone();
                     let deps = QuoteIntakeDeps {
                         db_path: (*st.db_path).clone(),
                         tenant: st.tenant.clone(),
@@ -1438,13 +1455,13 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     // the SAME storefront surface (design doc §4 / §14-C).
                     // Reuses the shared dormant handle in AppState so the
                     // CRUD routes' on-write trigger + the list route's
-                    // status read both reach this daemon.
-                    let catalogue_base_url = push_base_url.clone();
-                    let catalogue_bearer = push_bearer.clone();
+                    // status read both reach this daemon. S289 / PR-270
+                    // hot-reload: the daemon takes a clone of the
+                    // `storefront_credential` Arc and re-snapshots it at
+                    // the top of every push cycle.
                     match crate::catalogue_push::CataloguePushService::new(
                         push_handle,
-                        push_base_url,
-                        push_bearer,
+                        push_credential,
                         push_deps,
                     ) {
                         Ok(push_service) => {
@@ -2454,6 +2471,16 @@ pub struct AppState {
     /// drive the `PricingJobsList` empty-state copy (active vs RED-
     /// venv-missing vs AMBER-spawn-errored).
     pub pipeline_python_resolution: Arc<crate::quote_pricing_pipeline::PythonResolutionHandle>,
+    /// S289 / PR-270 — shared, hot-reloadable storefront credential
+    /// ([`quote_intake`] base_url + keychain bearer). The boot block
+    /// populates it ONCE from env-vars-or-seller.toml-and-keychain; the
+    /// PUT `/api/quote-intake/config` route updates it on save; the
+    /// catalogue-push daemon snapshots it at the top of every push so
+    /// an operator URL change in SPA → Maintenance → Quote Intake takes
+    /// effect on the very next cycle (no restart). See
+    /// [`crate::storefront_credential`] for the design rationale and
+    /// the SPOC-vs-split argument.
+    pub storefront_credential: Arc<crate::storefront_credential::StorefrontCredentialHandle>,
 }
 
 /// Session-161 — max number of NAV poll daemons polling concurrently.
@@ -2582,6 +2609,18 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/quoting-materials/:grade",
             put(handle_update_quoting_material).delete(handle_delete_quoting_material),
+        )
+        // S289 / PR-270 (brief D) — operator-clicked "Test catalogue push"
+        // button on Settings → Material Catalogue. Runs ONE push attempt
+        // using the current storefront credential snapshot and returns
+        // the typed outcome inline. Mirror of `/api/quote-intake/test`
+        // (which probes the read-only `/api/quotes` endpoint); this one
+        // probes the write-side `/api/catalogue/materials` endpoint so
+        // the operator can confirm auth + payload BEFORE waiting on the
+        // 15-min cadence + audit row.
+        .route(
+            "/api/quoting-materials/test-push",
+            post(handle_test_catalogue_push),
         )
         // S267 / PR-256 — auto-quoting tunables CRUD (engine internals,
         // NOT pushed to storefront). Four tables:
@@ -8601,6 +8640,178 @@ async fn handle_delete_quoting_material(
             anyhow!("blocking task panicked: {join_err}"),
         ),
     }
+}
+
+// ── S289 / PR-270 — "Test catalogue push" route (brief D) ────────────
+//
+// Operator-clicked from Settings → Material Catalogue. Performs ONE
+// push attempt against the current storefront credential snapshot
+// (same `Arc<StorefrontCredentialHandle>` the daemon reads) and returns
+// the typed outcome to the SPA. NO retries, NO mutation of the
+// daemon's status snapshot, NO audit row — this is a probe, not a
+// daemon cycle.
+//
+// Mirror of `/api/quote-intake/test` but writes to the storefront's
+// catalogue endpoint (PUT, mutating). The storefront treats the
+// catalogue push as idempotent (it replaces the cached materials list);
+// re-running this probe back-to-back has the same effect as the first
+// push.
+
+#[derive(Debug, serde::Serialize)]
+struct CataloguePushTestOutcome {
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_detail: Option<String>,
+    /// Count of materials pushed on success — same shape the SPA
+    /// banner already reads off `CataloguePushStatus.last_pushed_count`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pushed_count: Option<i64>,
+}
+
+async fn handle_test_catalogue_push(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+
+    let credential = match state.storefront_credential.snapshot() {
+        Some(c) => c,
+        None => {
+            return Json(CataloguePushTestOutcome {
+                outcome: "failed",
+                error_class: Some("dormant"),
+                error_detail: Some(
+                    "No storefront credential configured. Set the Base URL \
+                     and paste the bearer token in Settings → Quote Intake, \
+                     then re-run this test."
+                        .to_string(),
+                ),
+                pushed_count: None,
+            })
+            .into_response();
+        }
+    };
+
+    // Read the public catalogue off the DB (same projection the daemon
+    // uses) on a blocking task.
+    let db_path = (*state.db_path).clone();
+    let tenant_str = state.tenant.as_str().to_string();
+    let rows = match tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(&db_path).with_context(|| {
+            format!(
+                "open DuckDB at {} for test-push catalogue read",
+                db_path.display()
+            )
+        })?;
+        crate::quoting_materials::list_public(&conn, &tenant_str)
+    })
+    .await
+    {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => {
+            return Json(CataloguePushTestOutcome {
+                outcome: "failed",
+                error_class: Some("storage"),
+                error_detail: Some(format!("read catalogue: {e:#}")),
+                pushed_count: None,
+            })
+            .into_response();
+        }
+        Err(join) => {
+            return Json(CataloguePushTestOutcome {
+                outcome: "failed",
+                error_class: Some("storage"),
+                error_detail: Some(format!("read task panicked: {join}")),
+                pushed_count: None,
+            })
+            .into_response();
+        }
+    };
+
+    let count = rows.len() as i64;
+    let body = serde_json::json!({ "materials": rows });
+    let url = format!("{}/api/catalogue/materials", credential.base_url);
+    let auth = format!("Bearer {}", &*credential.bearer);
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(CataloguePushTestOutcome {
+                outcome: "failed",
+                error_class: Some("transport"),
+                error_detail: Some(format!("build reqwest client: {e}")),
+                pushed_count: None,
+            })
+            .into_response();
+        }
+    };
+
+    match client
+        .put(&url)
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                Json(CataloguePushTestOutcome {
+                    outcome: "succeeded",
+                    error_class: None,
+                    error_detail: None,
+                    pushed_count: Some(count),
+                })
+                .into_response()
+            } else if status.as_u16() == 401 {
+                Json(CataloguePushTestOutcome {
+                    outcome: "failed",
+                    error_class: Some("auth"),
+                    error_detail: Some(
+                        "storefront responded 401 Unauthorized — \
+                         re-paste the bearer token and Save in Settings \
+                         → Quote Intake, then re-run this test."
+                            .to_string(),
+                    ),
+                    pushed_count: None,
+                })
+                .into_response()
+            } else {
+                Json(CataloguePushTestOutcome {
+                    outcome: "failed",
+                    error_class: Some("transport"),
+                    error_detail: Some(format!("storefront responded HTTP {}", status.as_u16())),
+                    pushed_count: None,
+                })
+                .into_response()
+            }
+        }
+        Err(e) => Json(CataloguePushTestOutcome {
+            outcome: "failed",
+            error_class: Some("transport"),
+            error_detail: Some(scrub_reqwest_error(&e.to_string())),
+            pushed_count: None,
+        })
+        .into_response(),
+    }
+}
+
+/// Strip any bearer token from a reqwest error string. Mirror of
+/// [`crate::catalogue_push::scrub`] (private to that module).
+fn scrub_reqwest_error(s: &str) -> String {
+    let mut out = s.to_string();
+    if let Some(pos) = out.find("Bearer ") {
+        out.replace_range(pos.., "Bearer <redacted>");
+    }
+    out
 }
 
 // ── S267 / PR-256 — quoting tunables CRUD handlers ───────────────────
@@ -15847,6 +16058,30 @@ async fn handle_put_quote_intake_config(
             }
         }
     }
+    // S289 / PR-270 — push the new URL + bearer into the shared
+    // hot-reloadable handle so the catalogue-push daemon picks them up
+    // on its next cycle (no restart). When `enabled=false` or the URL
+    // is empty, clear the handle — the daemon then records a `dormant`
+    // outcome rather than hammering a stale URL.
+    if cfg.enabled {
+        if let Some(url) = cfg.base_url.as_deref() {
+            match quote_intake_credentials_mod::read_token(state.tenant.as_str()) {
+                Ok(bearer) => {
+                    state.storefront_credential.set(url.to_string(), bearer);
+                }
+                Err(_) => {
+                    // Bearer not in keychain → daemon should stay
+                    // dormant; clear the handle. The SPA will surface
+                    // has_token=false so the operator notices.
+                    state.storefront_credential.clear();
+                }
+            }
+        } else {
+            state.storefront_credential.clear();
+        }
+    } else {
+        state.storefront_credential.clear();
+    }
     let has_token = quote_intake_credentials_mod::read_token(state.tenant.as_str()).is_ok();
     let last_poll = latest_quote_intake_poll(&state).ok().flatten();
     let body = QuoteIntakeConfigResponse {
@@ -21254,6 +21489,8 @@ mod tests {
             email_relay_rate_limiter: std::sync::Arc::new(crate::email_relay::RateLimiter::new()),
             pipeline_python_resolution:
                 crate::quote_pricing_pipeline::PythonResolutionHandle::dormant(),
+            storefront_credential:
+                crate::storefront_credential::StorefrontCredentialHandle::dormant(),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, storno_invoice_id)
@@ -21371,6 +21608,8 @@ mod tests {
             email_relay_rate_limiter: std::sync::Arc::new(crate::email_relay::RateLimiter::new()),
             pipeline_python_resolution:
                 crate::quote_pricing_pipeline::PythonResolutionHandle::dormant(),
+            storefront_credential:
+                crate::storefront_credential::StorefrontCredentialHandle::dormant(),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, invoice_id)
@@ -22133,6 +22372,8 @@ mod tests {
             email_relay_rate_limiter: std::sync::Arc::new(crate::email_relay::RateLimiter::new()),
             pipeline_python_resolution:
                 crate::quote_pricing_pipeline::PythonResolutionHandle::dormant(),
+            storefront_credential:
+                crate::storefront_credential::StorefrontCredentialHandle::dormant(),
         }
     }
 

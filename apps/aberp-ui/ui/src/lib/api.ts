@@ -1611,6 +1611,23 @@ export async function deleteQuotingMaterial(grade: string): Promise<void> {
   await invoke<void>("delete_quoting_material", { grade });
 }
 
+/** S289 / PR-270 — `POST /api/quoting-materials/test-push`. Outcome
+ * envelope returned to the Settings → Material Catalogue "Test
+ * catalogue push" button. */
+export interface CataloguePushTestOutcome {
+  outcome: "succeeded" | "failed";
+  error_class?: "auth" | "transport" | "storage" | "dormant";
+  error_detail?: string;
+  pushed_count?: number;
+}
+
+/** S289 / PR-270 — operator-clicked probe of the storefront catalogue
+ * endpoint. Uses the current storefront credential snapshot (same one
+ * the daemon reads); no body needed. */
+export async function testCataloguePush(): Promise<CataloguePushTestOutcome> {
+  return invoke<CataloguePushTestOutcome>("test_catalogue_push");
+}
+
 // ── S267 / PR-256 — quoting tunables types + endpoints ─────────────
 
 /** Closed-vocab feature type. Mirror of the Rust `FeatureType` enum. */

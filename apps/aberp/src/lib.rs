@@ -132,6 +132,7 @@ pub mod setup_seller_info;
 pub mod shutdown;
 pub mod smtp_config;
 pub mod smtp_credentials;
+pub mod storefront_credential;
 pub mod submission_queue;
 pub mod submit_annulment;
 pub mod submit_invoice;

@@ -11,7 +11,9 @@
   import {
     deleteQuotingMaterial,
     listQuotingMaterials,
+    testCataloguePush,
     type CataloguePushStatus,
+    type CataloguePushTestOutcome,
     type QuotingMaterial,
   } from "../lib/api";
   import {
@@ -41,6 +43,13 @@
   let confirmDelete = $state<QuotingMaterial | null>(null);
   let deleting = $state(false);
   let deleteError = $state<string | null>(null);
+
+  // S289 / PR-270 — "Test catalogue push" probe (brief D). Runs ONE
+  // push using the current storefront credential snapshot and surfaces
+  // the typed outcome inline.
+  let testPushing = $state(false);
+  let testPushOutcome = $state<CataloguePushTestOutcome | null>(null);
+  let testPushError = $state<string | null>(null);
 
   const demo = isDemoMode();
 
@@ -101,6 +110,19 @@
     confirmDelete = row;
   }
 
+  async function onTestPush(): Promise<void> {
+    testPushing = true;
+    testPushError = null;
+    testPushOutcome = null;
+    try {
+      testPushOutcome = await testCataloguePush();
+    } catch (e) {
+      testPushError = e instanceof Error ? e.message : String(e);
+    } finally {
+      testPushing = false;
+    }
+  }
+
   async function doDelete(): Promise<void> {
     if (confirmDelete === null) return;
     deleting = true;
@@ -142,6 +164,16 @@
         data-testid="material-refresh"
       >
         {loadState === "loading" ? "Frissítés…" : "Frissítés / Refresh"}
+      </button>
+      <button
+        type="button"
+        class="mat-page__refresh"
+        disabled={testPushing}
+        onclick={() => void onTestPush()}
+        data-testid="material-test-push"
+        title="Try one push against the storefront using the current Quote Intake Base URL + bearer."
+      >
+        {testPushing ? "Tesztelés…" : "Teszt push / Test push"}
       </button>
       <button
         type="button"
@@ -190,6 +222,29 @@
         {:else}
           Webáruház-feltöltés aktív, még nem futott. / Storefront push
           running, no attempt yet.
+        {/if}
+      </div>
+    {/if}
+  {/if}
+
+  {#if testPushError !== null}
+    <div class="mat-page__error" role="alert" data-testid="material-test-push-error">
+      <strong>A teszt push nem futott le / Test push could not run.</strong>
+      <p class="mat-page__error-detail">{testPushError}</p>
+    </div>
+  {:else if testPushOutcome !== null}
+    {#if testPushOutcome.outcome === "succeeded"}
+      <div class="mat-page__push" role="status" data-testid="material-test-push-success">
+        Teszt push sikeres / Test push succeeded
+        {#if testPushOutcome.pushed_count !== undefined}
+          · {testPushOutcome.pushed_count} tétel / rows
+        {/if}
+      </div>
+    {:else}
+      <div class="mat-page__error" role="alert" data-testid="material-test-push-failure">
+        <strong>Teszt push sikertelen ({testPushOutcome.error_class ?? "other"}) / Test push failed.</strong>
+        {#if testPushOutcome.error_detail}
+          <p class="mat-page__error-detail">{testPushOutcome.error_detail}</p>
         {/if}
       </div>
     {/if}

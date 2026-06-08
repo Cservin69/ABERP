@@ -295,6 +295,8 @@ pub fn run() {
             commands::create_quoting_material,
             commands::update_quoting_material,
             commands::delete_quoting_material,
+            // S289 / PR-270 — "Test catalogue push" probe button.
+            commands::test_catalogue_push,
             // S267 / PR-256 — quoting tunables CRUD (engine internals).
             commands::list_complexity_rules,
             commands::create_complexity_rule,

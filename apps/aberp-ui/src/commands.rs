@@ -497,6 +497,21 @@ pub async fn delete_quoting_material(
     forward_delete(&state, &path).await
 }
 
+/// S289 / PR-270 — operator-clicked "Test catalogue push" on Settings →
+/// Material Catalogue. POSTs to `/api/quoting-materials/test-push` which
+/// performs one push using the current storefront credential snapshot
+/// and returns the typed outcome (succeeded / failed + error_class +
+/// pushed_count). No body — the route reads everything from `AppState`.
+#[tauri::command]
+pub async fn test_catalogue_push(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_post(
+        &state,
+        "/api/quoting-materials/test-push",
+        Value::Object(serde_json::Map::new()),
+    )
+    .await
+}
+
 // ── S267 / PR-256 — quoting tunables CRUD ───────────────────────────
 
 #[tauri::command]
