@@ -47,6 +47,23 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install Node.js
+        # apps/aberp-ui embeds the Svelte SPA via Tauri's `generate_context!`
+        # macro, which reads `frontendDist=ui/dist` at compile time. Without
+        # a pre-built SPA bundle the macro panics and the whole workspace
+        # build fails. Node + npm ci + vite build must run BEFORE cargo.
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: apps/aberp-ui/ui/package-lock.json
+
+      - name: Build SPA bundle (populates apps/aberp-ui/ui/dist)
+        working-directory: apps/aberp-ui/ui
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
