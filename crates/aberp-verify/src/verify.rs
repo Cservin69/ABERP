@@ -968,7 +968,18 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // Companion to QuotePricingFailed; payload carries failure_kind /
         // last_error / attempt_n, never NAV XML bytes. Never sweeps a
         // per-OUTGOING-invoice bundle.
-        | EventKind::QuotePricingFailureClassified => (None, ""),
+        | EventKind::QuotePricingFailureClassified
+        // S307 / PR-276 — email-outbox poll-daemon kinds (`quote.*` family).
+        // Daemon polls the storefront `/api/internal/email-queue` per
+        // ADR-0009 and delivers via ABERP's SMTP. Payload carries
+        // submitter / queue_row_id / recipient_hash / subject / byte_size /
+        // outcome — never NAV XML bytes. Exhaustiveness arm only; this
+        // family's verifier is the bytes-trip checked elsewhere via the
+        // payload type's serde round-trip pin.
+        | EventKind::EmailOutboxFetched
+        | EventKind::EmailOutboxClaimed
+        | EventKind::EmailOutboxSent
+        | EventKind::EmailOutboxFailed => (None, ""),
     };
 
     Ok(NavExtraction {

@@ -1717,6 +1717,93 @@ pub enum EventKind {
     /// Payload: `serde_json::Value`.
     /// F12 four-edit ritual fires once.
     QuotePricingFailureClassified,
+
+    /// S307 / PR-276 — one entry per email-outbox poll cycle. Fires
+    /// once per successful `GET /api/internal/email-queue` against the
+    /// storefront, regardless of whether the cycle returned 0 entries
+    /// or N. The payload's `fetched_count` lets a forensic walker
+    /// answer "did this install poll at all during window X, and how
+    /// much was in the queue at each cycle?" — the audit-trail analogue
+    /// of the SPA's `last_poll_ts` indicator.
+    ///
+    /// Polling cadence is 5s by default
+    /// (`email_outbox_poll_daemon::POLL_TICK_SECS_DEFAULT`). A cycle
+    /// that errored on the GET does NOT fire this event — only
+    /// successful fetches land here so the audit row is a positive
+    /// "cycle completed" signal, not a polluted-with-transient-failures
+    /// heartbeat.
+    ///
+    /// Carries `fetched_count`, `since_cursor` (the ISO timestamp
+    /// passed as `?since=`, or `null` on first fetch), and `cycle_at`
+    /// (ISO-8601 UTC of the cycle wall-clock; the cycle's own forensic
+    /// timestamp, distinct from the audit-ledger insertion timestamp).
+    ///
+    /// `quote.*` prefix family — same family as the pricing-pipeline
+    /// kinds so a forensic walker grepping `quote.*` on a prod ledger
+    /// surfaces "everything the auto-quoting pipeline did, including
+    /// the outbound emails it polled and delivered". The brief
+    /// explicitly named this prefix despite the surface being email-
+    /// shaped (the email-relay strand uses `email.*` instead — this is
+    /// a deliberate split because the outbox flow is part of the auto-
+    /// quoting pipeline whereas the S281 relay is sister-service
+    /// push from any surface).
+    ///
+    /// Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once for the four sibling kinds.
+    EmailOutboxFetched,
+
+    /// S307 / PR-276 — one entry per email-outbox entry claim. Fires
+    /// after the daemon's `POST /api/internal/email-queue/{id}/claim`
+    /// returns `200` (claimed by us). A `409` (already claimed by a
+    /// hypothetical concurrent ABERP) does NOT fire this event — the
+    /// row stays the other claimer's responsibility. Per ADR-0009 the
+    /// single-tenant deployment means contention is overkill defence,
+    /// not a frequent path; one row per claim keeps the audit trail
+    /// linear.
+    ///
+    /// Carries `submitter` (the storefront-supplied `submitter` field
+    /// from the queue entry — `"submission_received" | "priced_ready" |
+    /// "accept_confirmation" | "other"`), `queue_row_id` (the
+    /// storefront-side ULID), `recipient_hash` (SHA-256 of the
+    /// to ∪ cc list per the email-relay hashing rule — NO plaintext
+    /// recipients), `subject` (verbatim), `byte_size` (decoded total).
+    ///
+    /// `quote.*` prefix family.
+    EmailOutboxClaimed,
+
+    /// S307 / PR-276 — terminal success row per outbox entry. Fires after
+    /// the SMTP `transport.send` returns `Ok(_)` AND the storefront
+    /// write-back POST `/api/internal/email-queue/{id}/sent` returns
+    /// `2xx`. If SMTP succeeded but the write-back failed, this event
+    /// does NOT fire (the daemon retries the write-back on the next
+    /// cycle; the row stays in `claimed/` storefront-side until the
+    /// write-back lands — duplicate-send risk is acceptable per
+    /// [[trust-code-not-operator]] vs. silent lying about delivery).
+    ///
+    /// Carries the same per-entry fields as
+    /// [`Self::EmailOutboxClaimed`] plus `attempt_n` (always `1` in v1
+    /// — the daemon does not retry SMTP within a cycle; a failed SMTP
+    /// send moves the row to `failed/` and stays there).
+    ///
+    /// `quote.*` prefix family.
+    EmailOutboxSent,
+
+    /// S307 / PR-276 — terminal failure row per outbox entry. Fires after
+    /// the SMTP `transport.send` returns `Err(_)` AND the storefront
+    /// write-back POST `/api/internal/email-queue/{id}/failed` returns
+    /// `2xx`. v1 ships no SMTP retry within a cycle — one attempt then
+    /// terminal-fail per [[trust-code-not-operator]] (a failed SMTP
+    /// row is operator-visible in the SPA panel rather than masked by
+    /// background retry).
+    ///
+    /// Carries the same per-entry fields as
+    /// [`Self::EmailOutboxClaimed`] plus `error_class` (closed-vocab
+    /// short token; `"smtp_transport" | "writeback" | "compose" |
+    /// "other"`) and `error_detail` (scrubbed-of-secrets cause string,
+    /// ≤ 1000 chars).
+    ///
+    /// `quote.*` prefix family.
+    EmailOutboxFailed,
 }
 
 impl EventKind {
@@ -1811,6 +1898,10 @@ impl EventKind {
             EventKind::QuotePricingDaemonPanicked => "quote.pricing_daemon_panicked",
             EventKind::QuotePricingJobsIndexMigrated => "quote.pricing_jobs_index_migrated",
             EventKind::QuotePricingFailureClassified => "quote.pricing_failure_classified",
+            EventKind::EmailOutboxFetched => "quote.email_outbox_fetched",
+            EventKind::EmailOutboxClaimed => "quote.email_outbox_claimed",
+            EventKind::EmailOutboxSent => "quote.email_outbox_sent",
+            EventKind::EmailOutboxFailed => "quote.email_outbox_failed",
         }
     }
 
@@ -1916,6 +2007,10 @@ impl EventKind {
             "quote.pricing_daemon_panicked" => Ok(EventKind::QuotePricingDaemonPanicked),
             "quote.pricing_jobs_index_migrated" => Ok(EventKind::QuotePricingJobsIndexMigrated),
             "quote.pricing_failure_classified" => Ok(EventKind::QuotePricingFailureClassified),
+            "quote.email_outbox_fetched" => Ok(EventKind::EmailOutboxFetched),
+            "quote.email_outbox_claimed" => Ok(EventKind::EmailOutboxClaimed),
+            "quote.email_outbox_sent" => Ok(EventKind::EmailOutboxSent),
+            "quote.email_outbox_failed" => Ok(EventKind::EmailOutboxFailed),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2013,6 +2108,10 @@ mod tests {
             EventKind::QuotePricingDaemonPanicked,
             EventKind::QuotePricingJobsIndexMigrated,
             EventKind::QuotePricingFailureClassified,
+            EventKind::EmailOutboxFetched,
+            EventKind::EmailOutboxClaimed,
+            EventKind::EmailOutboxSent,
+            EventKind::EmailOutboxFailed,
         ];
         for v in variants {
             let s = v.as_str();
@@ -3758,6 +3857,89 @@ mod tests {
                 "{s} collides with {}",
                 sibling.as_str()
             );
+        }
+    }
+
+    /// S307 / PR-276 — the four email-outbox poll-daemon kinds live in
+    /// the `quote.*` family. The brief explicitly chose `quote.*` over
+    /// `email.*` because the outbox is part of the auto-quoting
+    /// pipeline strand (submission-received / priced-ready / accept-
+    /// confirmation are all quote-flow emails). The S281 `email.relay_*`
+    /// kinds stay in their own `email.*` family — that surface is the
+    /// deprecated push-based path, not part of the polling pipeline.
+    #[test]
+    fn s307_email_outbox_kinds_use_quote_prefix() {
+        let cases: [(EventKind, &str); 4] = [
+            (EventKind::EmailOutboxFetched, "quote.email_outbox_fetched"),
+            (EventKind::EmailOutboxClaimed, "quote.email_outbox_claimed"),
+            (EventKind::EmailOutboxSent, "quote.email_outbox_sent"),
+            (EventKind::EmailOutboxFailed, "quote.email_outbox_failed"),
+        ];
+        for (k, expected) in cases {
+            let s = k.as_str();
+            assert_eq!(s, expected);
+            assert!(s.starts_with("quote."), "{s} must start with quote.");
+            assert!(
+                !s.starts_with("invoice."),
+                "{s} must not start with invoice."
+            );
+            assert!(!s.starts_with("system."), "{s} must not start with system.");
+            assert!(!s.starts_with("mes."), "{s} must not start with mes.");
+            assert!(
+                !s.starts_with("inventory."),
+                "{s} must not start with inventory."
+            );
+            assert!(!s.starts_with("email."), "{s} must not start with email.");
+        }
+    }
+
+    /// S307 / PR-276 — the four email-outbox kinds are pairwise-distinct
+    /// AND distinct from every pricing-pipeline sibling. A collision
+    /// would mis-route a per-cycle / per-entry outbox row into a pricing-
+    /// stage bucket and silently mute the SPA panel's "last poll" /
+    /// "in flight" / "recent failures" surfaces — exactly the failure
+    /// mode CLAUDE.md rule 12 ("fail loud") guards against. Additionally
+    /// distinct from the S281 `email.relay_*` kinds (different surface,
+    /// different prefix family, but a future contributor collapsing the
+    /// strings would lose the polling-vs-push discriminator).
+    #[test]
+    fn s307_email_outbox_kinds_are_distinct() {
+        let new = [
+            EventKind::EmailOutboxFetched.as_str(),
+            EventKind::EmailOutboxClaimed.as_str(),
+            EventKind::EmailOutboxSent.as_str(),
+            EventKind::EmailOutboxFailed.as_str(),
+        ];
+        // Pairwise distinct.
+        for i in 0..new.len() {
+            for j in (i + 1)..new.len() {
+                assert_ne!(new[i], new[j], "{} collides with {}", new[i], new[j]);
+            }
+        }
+        // Distinct from every pricing-pipeline sibling.
+        for k in new {
+            for sibling in [
+                EventKind::QuotePricingFetched,
+                EventKind::QuotePricingExtracted,
+                EventKind::QuotePricingPriced,
+                EventKind::QuotePricingRendered,
+                EventKind::QuotePricingPosted,
+                EventKind::QuotePricingFailed,
+                EventKind::PipelinePythonResolved,
+                EventKind::QuotePricingDaemonPanicked,
+                EventKind::QuotePricingJobsIndexMigrated,
+                EventKind::QuotePricingFailureClassified,
+                EventKind::EmailRelayQueued,
+                EventKind::EmailRelaySent,
+                EventKind::EmailRelayFailed,
+            ] {
+                assert_ne!(
+                    k,
+                    sibling.as_str(),
+                    "{k} collides with sibling {}",
+                    sibling.as_str()
+                );
+            }
         }
     }
 }

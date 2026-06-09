@@ -1013,6 +1013,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         pipeline_python_resolution: crate::quote_pricing_pipeline::PythonResolutionHandle::dormant(
         ),
         storefront_credential: crate::storefront_credential::StorefrontCredentialHandle::dormant(),
+        email_outbox_daemon: crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(),
     };
 
     // 5. Build the axum router. Clone the state first so the app-boot
@@ -1923,6 +1924,64 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             );
         }
 
+        // S307 / PR-276 — spawn the email-outbox poll daemon (ADR-0009).
+        // Polls the storefront's `/api/internal/email-queue` outbound and
+        // delivers via the same SMTP creds the S281 drain uses. The kill
+        // switch `ABERP_EMAIL_OUTBOX_POLL_DISABLED=1` suppresses the
+        // spawn for local-dev (when the operator is hitting the
+        // deprecated push endpoint directly) or for emergency rollback.
+        // The storefront-credential handle is the shared S289 SPOC; the
+        // daemon snapshots it per cycle, so an operator URL change in
+        // SPA → Settings → Quote Intake takes effect without a restart.
+        if crate::email_outbox_poll_daemon::is_disabled() {
+            tracing::info!(
+                env = crate::email_outbox_poll_daemon::POLL_DISABLE_ENV,
+                "email-outbox poll daemon disabled by env (S307 / PR-276)"
+            );
+        } else {
+            let operator_login = match recovery_state.boot_state.read() {
+                Ok(guard) => match &*guard {
+                    ServeBootState::Ready { operator_login } => operator_login.clone(),
+                    ServeBootState::NeedsSellerConfig { operator_login } => operator_login.clone(),
+                    _ => "boot".to_string(),
+                },
+                Err(_) => "boot".to_string(),
+            };
+            let binary_hash = recovery_state
+                .binary_hash
+                .wait()
+                .context("await background binary hash for email-outbox poll daemon")?;
+            let seller_toml_path = setup_seller_info::seller_toml_path_for_tenant(
+                recovery_state.tenant.as_str(),
+            )
+            .context("resolve seller.toml path for email-outbox poll")?;
+            let poll_interval = crate::email_outbox_poll_daemon::resolve_poll_interval();
+            let outbox_sender =
+                std::sync::Arc::new(crate::email_outbox_poll_daemon::LettreSender {
+                    seller_toml_path,
+                    secrets_cache: recovery_state.secrets_cache.clone(),
+                });
+            let outbox_deps = crate::email_outbox_poll_daemon::EmailOutboxPollDaemonDeps {
+                db_path: (*recovery_state.db_path).clone(),
+                tenant: recovery_state.tenant.clone(),
+                binary_hash,
+                operator_login,
+                storefront_credential: recovery_state.storefront_credential.clone(),
+                status: recovery_state.email_outbox_daemon.clone(),
+                poll_interval,
+                sender: outbox_sender,
+            };
+            let outbox_token = coordinator.token.clone();
+            let outbox_handle = tokio::spawn(async move {
+                crate::email_outbox_poll_daemon::run_supervised(outbox_deps, outbox_token).await;
+            });
+            coordinator.register("email-outbox-poll", outbox_handle);
+            tracing::info!(
+                poll_interval_secs = poll_interval.as_secs(),
+                "spawned email-outbox poll daemon (S307 / PR-276)"
+            );
+        }
+
         let config = RustlsConfig::from_der(rustls_config.0, rustls_config.1)
             .await
             .context("build axum-server RustlsConfig")?;
@@ -2590,6 +2649,15 @@ pub struct AppState {
     /// [`crate::storefront_credential`] for the design rationale and
     /// the SPOC-vs-split argument.
     pub storefront_credential: Arc<crate::storefront_credential::StorefrontCredentialHandle>,
+    /// S307 / PR-276 — shared status surface for the email-outbox poll
+    /// daemon (ADR-0009). Created dormant at boot; the daemon writes
+    /// `record_spawned` on its first scheduled tick. The
+    /// `GET /api/quote-pipeline/email-outbox/status` route reads
+    /// `.snapshot()` to hydrate the SPA panel. Lives in `AppState` so
+    /// the same handle survives the supervisor's re-spawn loop (S286
+    /// pattern) — restarts after a panic do not reset the operator-
+    /// facing counters.
+    pub email_outbox_daemon: Arc<crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle>,
 }
 
 /// Session-161 — max number of NAV poll daemons polling concurrently.
@@ -3074,6 +3142,16 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/quote-pipeline/status",
             get(handle_quote_pipeline_status),
+        )
+        // S307 / PR-276 — email-outbox poll daemon status (ADR-0009).
+        // Drives the new SPA panel above the email-relay queue inspector
+        // (`EmailRelayQueueList.svelte`): last poll, last seen cursor,
+        // in-flight count, lifetime counters, panic count. The handler
+        // is a thin read of the in-memory `EmailOutboxDaemonHandle`
+        // snapshot — no DB walk.
+        .route(
+            "/api/quote-pipeline/email-outbox/status",
+            get(handle_email_outbox_status),
         )
         // S256 / PR-245 — one polled endpoint feeding the sidebar badge
         // (un-picked count, DB truth) + the arrival toast (live arrivals
@@ -16824,6 +16902,21 @@ fn count_recent_daemon_panics(
     })
 }
 
+/// S307 / PR-276 — `GET /api/quote-pipeline/email-outbox/status` handler.
+/// Returns the in-memory daemon status verbatim. Bearer-gated like every
+/// other quote-pipeline status surface; bypasses `require_ready` because
+/// the panel must be readable even before the daemon successfully
+/// spawned (e.g. operator hasn't yet entered seller config). The dormant
+/// snapshot is meaningful in that state — it tells the operator the
+/// daemon is waiting on config.
+async fn handle_email_outbox_status(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let snap = state.email_outbox_daemon.snapshot();
+    (axum::http::StatusCode::OK, axum::Json(snap)).into_response()
+}
+
 /// S286 / PR-268 — `GET /api/quote-pipeline/status` body shape. Superset
 /// of `PipelinePythonStatus` (S282 / PR-267 fields) plus the panic
 /// telemetry. The SPA type in `apps/aberp-ui/ui/src/lib/api.ts` mirrors
@@ -18678,11 +18771,41 @@ struct RelayAcceptedBody {
 /// dedicated email-relay token (NOT the session token); on accept,
 /// persists the row + writes attachments to disk + emits
 /// `EmailRelayQueued` and returns 200 with the audit id.
+///
+/// **S307 / PR-276 — DEPRECATED.** ADR-0009 supersedes ADR-0007's push
+/// posture with a polling architecture: the storefront enqueues to its
+/// own filesystem and ABERP's [`crate::email_outbox_poll_daemon`] (S307)
+/// pulls outbound. This route is kept functional for local-dev
+/// (single-process testing) and for manual API testing; in production
+/// it emits a one-line WARN per invocation so an operator notices a
+/// stray storefront still pushing instead of enqueuing. The endpoint
+/// will be removed in a session after the queue path has been
+/// validated end-to-end through one real customer quote.
 async fn handle_relay_send_email(
     headers: HeaderMap,
     State(state): State<AppState>,
     body_bytes: axum::body::Bytes,
 ) -> Response {
+    // S307 / PR-276 — deprecation warning. ADR-0009 supersedes the
+    // push-based relay; production callers should be on the
+    // email-outbox queue path. Local-dev / manual-API-testing is the
+    // only legitimate non-dev-mode caller, so we WARN once per
+    // request rather than 410-ing the surface (a hard removal would
+    // surprise an operator mid-troubleshoot).
+    let dev_mode = std::env::var("ABERP_DEV_MODE")
+        .ok()
+        .map(|v| {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false);
+    if !dev_mode {
+        tracing::warn!(
+            "DEPRECATED POST /api/internal/send-email received in non-dev mode; \
+             storefront should use the email-outbox queue path per ADR-0009 \
+             (`GET /api/internal/email-queue` + ABERP poll daemon S307)"
+        );
+    }
     // 1. Authenticate with the dedicated email-relay keychain token.
     //    Distinct from `state.session_token` per ADR-0007 §Auth (two
     //    tokens → independent rotation).
@@ -21621,6 +21744,8 @@ mod tests {
                 crate::quote_pricing_pipeline::PythonResolutionHandle::dormant(),
             storefront_credential:
                 crate::storefront_credential::StorefrontCredentialHandle::dormant(),
+            email_outbox_daemon: crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(
+            ),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, storno_invoice_id)
@@ -21740,6 +21865,8 @@ mod tests {
                 crate::quote_pricing_pipeline::PythonResolutionHandle::dormant(),
             storefront_credential:
                 crate::storefront_credential::StorefrontCredentialHandle::dormant(),
+            email_outbox_daemon: crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(
+            ),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, invoice_id)
@@ -22504,6 +22631,8 @@ mod tests {
                 crate::quote_pricing_pipeline::PythonResolutionHandle::dormant(),
             storefront_credential:
                 crate::storefront_credential::StorefrontCredentialHandle::dormant(),
+            email_outbox_daemon: crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(
+            ),
         }
     }
 

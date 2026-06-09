@@ -401,6 +401,11 @@ pub fn run() {
             // the empty-state copy on `PricingJobsList` (active vs
             // RED venv-missing vs AMBER spawn-errored).
             commands::quote_pipeline_status,
+            // S307 / PR-276 — email-outbox poll daemon status (ADR-0009).
+            // Drives the panel above the email-relay queue inspector:
+            // last poll, last seen cursor, in-flight count, lifetime
+            // counters, panic count.
+            commands::email_outbox_status,
             // S272 / PR-261 — DEAL saga (ADR-0067). Single-tx mint of
             // SO/WO placeholder ids + 3 audit entries; replay-protected
             // CAS; EVE addendum 2 (REFRESH ack) + addendum 3 (BIG/RED

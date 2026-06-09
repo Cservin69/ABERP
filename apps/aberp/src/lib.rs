@@ -40,6 +40,7 @@ pub mod email_invoice;
 // background drain (email_relay_daemon) send via the existing SMTP
 // creds per [[aberp-smtp-spoc]]. Dedicated keychain entry
 // (email_relay_credentials) for independent rotation per ADR-0007 §Auth.
+pub mod email_outbox_poll_daemon;
 pub mod email_relay;
 pub mod email_relay_credentials;
 pub mod email_relay_daemon;

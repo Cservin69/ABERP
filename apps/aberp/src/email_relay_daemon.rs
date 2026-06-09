@@ -53,7 +53,9 @@ pub const DRAIN_TICK_SECS: u64 = 2;
 pub const MAX_ATTEMPTS_PER_ROW: u32 = 5;
 /// Bound the wall-clock on each SMTP send. Inherited from
 /// [`crate::email_invoice`]'s `SMTP_SEND_TIMEOUT`.
-const SMTP_SEND_TIMEOUT_SECS: u64 = 30;
+/// `pub(crate)` so [`crate::email_outbox_poll_daemon`] (S307) reuses the
+/// same timeout — one source of truth per [[aberp-smtp-spoc]].
+pub(crate) const SMTP_SEND_TIMEOUT_SECS: u64 = 30;
 
 /// Dependencies the daemon needs threaded from `AppState`.
 #[derive(Clone)]
@@ -303,7 +305,14 @@ async fn send_one(deps: &EmailRelayDaemonDeps, row: &OutboundEmailRow) -> Result
     Ok(())
 }
 
-fn build_mailbox(address: &str, display_name: Option<&str>, label: &str) -> Result<Mailbox> {
+/// `pub(crate)` so [`crate::email_outbox_poll_daemon`] (S307) shares the
+/// same lettre `Mailbox` builder — one validation path for both relay
+/// and outbox sender, per [[aberp-smtp-spoc]].
+pub(crate) fn build_mailbox(
+    address: &str,
+    display_name: Option<&str>,
+    label: &str,
+) -> Result<Mailbox> {
     let (local, domain) = address
         .split_once('@')
         .ok_or_else(|| anyhow::anyhow!("{label} address `{address}` has no `@`"))?;
@@ -316,7 +325,10 @@ fn build_mailbox(address: &str, display_name: Option<&str>, label: &str) -> Resu
     Ok(Mailbox::new(name, addr))
 }
 
-fn build_transport(
+/// `pub(crate)` so [`crate::email_outbox_poll_daemon`] (S307) shares the
+/// same lettre transport builder — one TLS/StartTLS branch, one timeout
+/// constant, one credential threading, per [[aberp-smtp-spoc]].
+pub(crate) fn build_transport(
     cfg: &SmtpConfig,
     password: &Zeroizing<String>,
 ) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
@@ -340,8 +352,9 @@ fn build_transport(
 
 /// Strip any bearer / password fragments from a transport error
 /// before it lands in an audit row. Mirror of catalogue_push's
-/// `scrub`.
-fn scrub_for_audit(s: &str) -> String {
+/// `scrub`. `pub(crate)` so [`crate::email_outbox_poll_daemon`] (S307)
+/// reuses the same scrubbing rule for its terminal-failure events.
+pub(crate) fn scrub_for_audit(s: &str) -> String {
     let mut out = s.to_string();
     if let Some(pos) = out.find("Bearer ") {
         out.replace_range(pos.., "Bearer <redacted>");

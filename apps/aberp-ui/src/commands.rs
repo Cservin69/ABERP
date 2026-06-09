@@ -1343,6 +1343,15 @@ pub async fn quote_pipeline_status(state: State<'_, AppState>) -> Result<Value, 
     forward_get(&state, "/api/quote-pipeline/status", true).await
 }
 
+/// S307 / PR-276 — read the email-outbox poll daemon status (ADR-0009).
+/// Drives the SPA panel above the email-relay queue inspector: last
+/// poll, last seen cursor, in-flight count, lifetime counters, panic
+/// count.
+#[tauri::command]
+pub async fn email_outbox_status(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quote-pipeline/email-outbox/status", true).await
+}
+
 /// S272 / PR-261 — DEAL saga (ADR-0067). `POST /api/quote-intake/{quote_id}/deal`
 /// with body `{ deal_token, refresh_ack? }`. Backend mints SO/WO
 /// placeholder ids + emits three audit entries in a single tx; 409s

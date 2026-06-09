@@ -2761,6 +2761,167 @@ impl EmailRelayAuditPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// S307 / PR-276 — email-outbox poll daemon payloads (ADR-0009).
+// ──────────────────────────────────────────────────────────────────────
+
+/// Per-cycle payload for [`crate::email_outbox_poll_daemon`]. Emitted
+/// once per successful `GET /api/internal/email-queue` against the
+/// storefront. NOT emitted on a cycle that errored on the GET — that
+/// would pollute the heartbeat into a transient-failure log; the SPA
+/// status panel's `last_error_*` fields surface the failure path.
+///
+/// Carries `fetched_count` (entries the storefront returned this
+/// cycle), `since_cursor` (the ISO timestamp the daemon passed as
+/// `?since=`, `null` on the boot-time first fetch), and `cycle_at`
+/// (ISO-8601 UTC of the cycle wall-clock, distinct from the audit-
+/// ledger insertion `created_at`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmailOutboxFetchedPayload {
+    pub fetched_count: u32,
+    pub since_cursor: Option<String>,
+    pub cycle_at: String,
+}
+
+impl EmailOutboxFetchedPayload {
+    pub fn new(fetched_count: u32, since_cursor: Option<String>, cycle_at: &str) -> Self {
+        Self {
+            fetched_count,
+            since_cursor: since_cursor.map(|s| s.to_string()),
+            cycle_at: cycle_at.to_string(),
+        }
+    }
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Per-entry payload for [`crate::email_outbox_poll_daemon`] events
+/// `EmailOutboxClaimed` / `EmailOutboxSent` / `EmailOutboxFailed`.
+/// Outcome is a closed-vocab string discriminator (`"claimed" | "sent"
+/// | "failed"`) so a forensic walker can fold all three event-kinds
+/// into one query and branch on the field.
+///
+/// **GDPR posture mirrors [`EmailRelayAuditPayload`]:** NO plaintext
+/// recipients, NO body bytes — the recipient_hash is the join key, the
+/// subject is operator-visible, byte_size is forensic. Same shape as
+/// the S281 relay payload, distinct type so a future contributor can't
+/// silently collapse the two surfaces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmailOutboxEntryAuditPayload {
+    /// Storefront-supplied `submitter` field from the queue entry —
+    /// closed-vocab in v1 (`"submission_received" | "priced_ready" |
+    /// "accept_confirmation" | "other"`). Free-form on the wire; CR/LF
+    /// rejected at the route layer.
+    pub submitter: String,
+    /// Storefront-side queue entry ULID (`01H...` 26-char Crockford-
+    /// base32). Joins the audit row to the storefront filesystem record.
+    pub queue_row_id: String,
+    /// SHA-256 of the comma-joined `to ∪ cc` list (lowercased local
+    /// parts, byte-sort) in lowercase hex. Stable across retries; joins
+    /// claimed → sent / failed rows for the same entry. Same hashing
+    /// rule as [`crate::email_relay::hash_recipient_list`].
+    pub recipient_hash: String,
+    /// Verbatim subject — operator-visible.
+    pub subject: String,
+    /// Decoded total bytes (body_text + body_html + attachments).
+    pub byte_size: u64,
+    /// Closed-vocab — `"claimed" | "sent" | "failed"`. Wire form is
+    /// the lowercase token verbatim.
+    pub outcome: String,
+    /// 1-based attempt counter. Always `1` in v1 — the daemon takes
+    /// one shot per cycle per entry; a failed SMTP send is terminal
+    /// (per [[trust-code-not-operator]]: don't mask delivery failures
+    /// behind background retry). Field preserved for forward-compat
+    /// if a future SMTP-retry policy lands.
+    pub attempt_n: u32,
+    /// Closed-vocab error classification, present iff
+    /// `outcome == "failed"`. `"smtp_transport" | "writeback" |
+    /// "compose" | "other"`. `None` on success/claim rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    /// Scrubbed-of-secrets cause string, present iff `outcome ==
+    /// "failed"`. Truncated to 1000 chars (CR/LF/NUL stripped) by the
+    /// caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
+}
+
+impl EmailOutboxEntryAuditPayload {
+    /// Construct a `claimed` payload. `attempt_n == 1`, no error fields.
+    pub fn claimed(
+        submitter: &str,
+        queue_row_id: &str,
+        recipient_hash: &str,
+        subject: &str,
+        byte_size: u64,
+    ) -> Self {
+        Self {
+            submitter: submitter.to_string(),
+            queue_row_id: queue_row_id.to_string(),
+            recipient_hash: recipient_hash.to_string(),
+            subject: subject.to_string(),
+            byte_size,
+            outcome: "claimed".to_string(),
+            attempt_n: 1,
+            error_class: None,
+            error_detail: None,
+        }
+    }
+
+    /// Construct a `sent`-success payload.
+    pub fn sent(
+        submitter: &str,
+        queue_row_id: &str,
+        recipient_hash: &str,
+        subject: &str,
+        byte_size: u64,
+        attempt_n: u32,
+    ) -> Self {
+        Self {
+            submitter: submitter.to_string(),
+            queue_row_id: queue_row_id.to_string(),
+            recipient_hash: recipient_hash.to_string(),
+            subject: subject.to_string(),
+            byte_size,
+            outcome: "sent".to_string(),
+            attempt_n,
+            error_class: None,
+            error_detail: None,
+        }
+    }
+
+    /// Construct a terminal-`failed` payload. `error_detail` MUST be
+    /// pre-scrubbed by the caller per the same posture as
+    /// [`EmailRelayAuditPayload::failed`].
+    pub fn failed(
+        submitter: &str,
+        queue_row_id: &str,
+        recipient_hash: &str,
+        subject: &str,
+        byte_size: u64,
+        attempt_n: u32,
+        error_class: &str,
+        error_detail: &str,
+    ) -> Self {
+        Self {
+            submitter: submitter.to_string(),
+            queue_row_id: queue_row_id.to_string(),
+            recipient_hash: recipient_hash.to_string(),
+            subject: subject.to_string(),
+            byte_size,
+            outcome: "failed".to_string(),
+            attempt_n,
+            error_class: Some(error_class.to_string()),
+            error_detail: Some(error_detail.to_string()),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -5086,5 +5247,132 @@ mod tests {
             blob.contains(&hash),
             "audit payload must carry the recipient_hash; got: {blob}"
         );
+    }
+
+    // ── S307 / PR-276 — EmailOutbox payload pins ──────────────────────
+
+    #[test]
+    fn email_outbox_fetched_payload_round_trips() {
+        let p = EmailOutboxFetchedPayload::new(
+            3,
+            Some("2026-06-09T12:00:00Z".to_string()),
+            "2026-06-09T12:00:05Z",
+        );
+        let bytes = p.to_bytes();
+        let back: EmailOutboxFetchedPayload = serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(back, p);
+        assert_eq!(back.fetched_count, 3);
+        assert_eq!(back.since_cursor.as_deref(), Some("2026-06-09T12:00:00Z"));
+    }
+
+    #[test]
+    fn email_outbox_fetched_payload_omits_null_since() {
+        let p = EmailOutboxFetchedPayload::new(0, None, "2026-06-09T12:00:00Z");
+        let bytes = p.to_bytes();
+        let back: EmailOutboxFetchedPayload = serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(back, p);
+        assert!(back.since_cursor.is_none());
+    }
+
+    #[test]
+    fn email_outbox_entry_payload_claimed_round_trips() {
+        let p = EmailOutboxEntryAuditPayload::claimed(
+            "submission_received",
+            "01H0000000000000000000000A",
+            "deadbeef".repeat(8).as_str(),
+            "Az Áben árajánlat-kérése megérkezett",
+            512,
+        );
+        let bytes = p.to_bytes();
+        let back: EmailOutboxEntryAuditPayload = serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(back, p);
+        assert_eq!(back.outcome, "claimed");
+        assert_eq!(back.attempt_n, 1);
+        assert!(back.error_class.is_none());
+        assert!(back.error_detail.is_none());
+    }
+
+    #[test]
+    fn email_outbox_entry_payload_sent_round_trips() {
+        let p = EmailOutboxEntryAuditPayload::sent(
+            "priced_ready",
+            "01H0000000000000000000000B",
+            "deadbeef".repeat(8).as_str(),
+            "Az Ön árajánlata elkészült",
+            10240,
+            1,
+        );
+        let bytes = p.to_bytes();
+        let back: EmailOutboxEntryAuditPayload = serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(back, p);
+        assert_eq!(back.outcome, "sent");
+        assert!(back.error_class.is_none());
+    }
+
+    #[test]
+    fn email_outbox_entry_payload_failed_round_trips() {
+        let p = EmailOutboxEntryAuditPayload::failed(
+            "accept_confirmation",
+            "01H0000000000000000000000C",
+            "deadbeef".repeat(8).as_str(),
+            "Megrendelés visszaigazolása",
+            2048,
+            1,
+            "smtp_transport",
+            "connection refused after 30s",
+        );
+        let bytes = p.to_bytes();
+        let back: EmailOutboxEntryAuditPayload = serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(back, p);
+        assert_eq!(back.outcome, "failed");
+        assert_eq!(back.error_class.as_deref(), Some("smtp_transport"));
+        assert!(back.error_detail.as_deref().unwrap().contains("refused"));
+    }
+
+    /// S307 / PR-276 — same GDPR posture as the S281 sibling. The
+    /// payload MUST NEVER carry the plaintext recipient address; only
+    /// the SHA-256 hash. A future contributor adding a
+    /// `recipient_plaintext` field would break GDPR minimisation; pin.
+    #[test]
+    fn email_outbox_entry_payload_carries_no_recipient_plaintext() {
+        let plaintext = "customer@example.com";
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(plaintext.as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        let p = EmailOutboxEntryAuditPayload::sent(
+            "priced_ready",
+            "01H0000000000000000000000B",
+            &hash,
+            "Az Ön árajánlata elkészült",
+            42,
+            1,
+        );
+        let bytes = p.to_bytes();
+        let blob = String::from_utf8(bytes).expect("UTF-8");
+        assert!(
+            !blob.contains(plaintext),
+            "outbox payload must never carry recipient plaintext; got: {blob}"
+        );
+        assert!(
+            blob.contains(&hash),
+            "outbox payload must carry the recipient_hash; got: {blob}"
+        );
+    }
+
+    /// S307 / PR-276 — the outcome vocab is closed. A typo
+    /// "succeeded" / "delivered" / "ok" would silently mute the SPA
+    /// panel's branch. Pin the three legal strings the constructors
+    /// emit so a future rename surfaces in CI rather than at runtime.
+    #[test]
+    fn email_outbox_entry_payload_outcome_vocab_is_closed() {
+        let claimed = EmailOutboxEntryAuditPayload::claimed("x", "y", "z", "s", 1);
+        let sent = EmailOutboxEntryAuditPayload::sent("x", "y", "z", "s", 1, 1);
+        let failed = EmailOutboxEntryAuditPayload::failed("x", "y", "z", "s", 1, 1, "c", "d");
+        assert_eq!(claimed.outcome, "claimed");
+        assert_eq!(sent.outcome, "sent");
+        assert_eq!(failed.outcome, "failed");
     }
 }

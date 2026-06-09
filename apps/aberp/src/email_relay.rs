@@ -1,5 +1,24 @@
 //! S281 / PR-266 — Email-relay endpoint + helpers.
 //!
+//! **S307 / PR-276 — DEPRECATED by [ADR-0009].** The push-based posture
+//! ADR-0007 originally landed (storefront → ABERP POST) is superseded by
+//! a polling architecture: the storefront enqueues outbound mail to its
+//! own filesystem (`/var/lib/aberp-site/email-outbox/queued/`) and
+//! ABERP's [`crate::email_outbox_poll_daemon`] (S307) pulls each entry,
+//! delivers via SMTP, and POSTs `.../sent` or `.../failed` back. The
+//! storefront-to-ABERP-loopback path that motivated this module no
+//! longer exists in prod; this module stays for local-dev (single-
+//! process testing, where running both halves on one box is easier with
+//! push) and for manual API testing. In production every POST hits a
+//! WARN log line — see [`crate::serve::handle_relay_send_email`].
+//!
+//! The validation, queue, and drain machinery below remain correct for
+//! the local-dev path and so are kept intact. Removal of the entire
+//! module is scheduled for a future session AFTER ADR-0009's end-to-end
+//! validation criterion fires (one real customer quote round-tripped).
+//!
+//! Historical S281 description follows.
+//!
 //! The storefront POSTs `/api/internal/send-email` to ABERP per
 //! ADR-0007. ABERP authenticates with the dedicated email-relay
 //! bearer ([[email-relay-token-spoc]]), validates the body, persists
@@ -7,6 +26,8 @@
 //! disk, emits an `EmailRelayQueued` audit entry, and returns 200 with
 //! `audit_id`. The background drain ([`crate::email_relay_daemon`])
 //! then walks the row through `Sending → Sent | Failed`.
+//!
+//! [ADR-0009]: ../../../docs/adr/0009-storefront-as-queue-no-tunnel.md
 //!
 //! ## Validation cliff
 //!

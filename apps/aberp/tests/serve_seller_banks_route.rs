@@ -100,6 +100,7 @@ fn build_state(db_path: PathBuf) -> AppState {
         pipeline_python_resolution: aberp::quote_pricing_pipeline::PythonResolutionHandle::dormant(
         ),
         storefront_credential: aberp::storefront_credential::StorefrontCredentialHandle::dormant(),
+        email_outbox_daemon: aberp::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(),
     }
 }
 

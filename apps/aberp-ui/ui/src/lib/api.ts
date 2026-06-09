@@ -3221,6 +3221,49 @@ export async function fetchQuotePipelineStatus(): Promise<PipelinePythonStatus> 
   return invoke("quote_pipeline_status");
 }
 
+/** S307 / PR-276 — email-outbox poll daemon status (ADR-0009). The
+ * daemon polls the storefront's `/api/internal/email-queue` and delivers
+ * via ABERP's local SMTP; this snapshot drives the SPA panel above the
+ * email-relay queue inspector. Hydrated by the `email_outbox_status`
+ * Tauri command which forwards to `GET /api/quote-pipeline/email-outbox/status`. */
+export interface EmailOutboxDaemonStatus {
+  /** True iff the daemon was spawned (kill switch + dev-mode both off).
+   * Lets the SPA distinguish "polling, nothing in queue" (GREEN) from
+   * "daemon disabled by operator" (AMBER). */
+  spawned: boolean;
+  /** Cadence the daemon is using this boot (seconds). */
+  poll_interval_secs: number;
+  /** ISO-8601 UTC of the last completed cycle (success OR error path).
+   * `null` until the first cycle completes. */
+  last_poll_ts: string | null;
+  /** The `?since=<iso>` cursor the daemon currently sends. `null`
+   * before the first non-empty fetch. */
+  last_seen_iso: string | null;
+  /** Number of entries the daemon is currently mid-claim/send on.
+   * Single-flight per cycle so this is 0 or 1. */
+  entries_in_progress: number;
+  /** Lifetime cycle counter since boot. */
+  total_cycles_since_boot: number;
+  /** Lifetime entries-fetched counter since boot. */
+  total_fetched_since_boot: number;
+  /** Lifetime entries-sent counter since boot. */
+  total_sent_since_boot: number;
+  /** Lifetime entries-failed counter since boot. */
+  total_failed_since_boot: number;
+  /** ISO-8601 UTC of the last error (HTTP / SMTP / writeback). */
+  last_error_ts: string | null;
+  /** Scrubbed-of-secrets last error string. */
+  last_error_detail: string | null;
+  /** Supervisor-counted Rust-side panics. */
+  recent_panic_count: number;
+  last_panic_ts: string | null;
+  last_panic_msg: string | null;
+}
+
+export async function fetchEmailOutboxStatus(): Promise<EmailOutboxDaemonStatus> {
+  return invoke("email_outbox_status");
+}
+
 /** S281 / PR-266 — one row of the email-relay queue (ADR-0007). Read-only
  * operator inspector projection — the drain daemon is the only writer. */
 export interface EmailRelayQueueRow {
