@@ -42,6 +42,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Tauri system dependencies (Linux only)
+        # apps/aberp-ui pulls in the Tauri 2 runtime (`wry`, `tao`,
+        # `tauri-runtime-wry`, `webkit2gtk-sys`, etc.). On macOS those
+        # crates link against system frameworks (Cocoa/WebKit) that are
+        # always present; on Ubuntu they invoke `pkg-config` against
+        # webkit2gtk-4.1, gtk-3, libsoup-3.0, librsvg, and ayatana
+        # appindicator. Without these `-dev` packages installed the
+        # cargo build fails at the build-script / link stage of `wry`
+        # or `tao`. List mirrors the canonical Tauri 2 Ubuntu 22.04+
+        # prerequisites (https://tauri.app/start/prerequisites/).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libgtk-3-dev
+
       - name: Install Rust stable (matches rust-toolchain.toml's channel pin)
         uses: dtolnay/rust-toolchain@stable
         with:
