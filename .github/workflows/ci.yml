@@ -89,6 +89,33 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
 
+      - name: Install Python (matches python/aberp-cad-extract pyproject min)
+        # `crates/aberp-cad-extract-wrapper/tests/*` shell out to the
+        # Python CLI at `python/aberp-cad-extract`. Without `python -m
+        # aberp_cad_extract` importable, `extract_smoke` /
+        # `step_extract_smoke` / `error_paths` / `schema_version` all
+        # fail loud with "No module named aberp_cad_extract" (S303).
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: python/aberp-cad-extract/pyproject.toml
+
+      - name: Install aberp-cad-extract Python package (with [step] extra)
+        # The `[step]` extra pulls cadquery-ocp + cadquery-ocp-proxy +
+        # vtk (~70 MB total). Required by `step_extract_smoke.rs` for
+        # OCCT-backed STEP parsing (S292/PR-273). STL-only tests would
+        # work without it, but installing once covers both fixtures.
+        #
+        # `ABERP_TEST_PYTHON` must be an ABSOLUTE path or pwd-drift in
+        # the cargo test harness kills the error-path tests
+        # ([[cad-extract-wrapper-s270]] memory). `sys.executable` is
+        # always absolute, so use that instead of `which python`.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e 'python/aberp-cad-extract[step]'
+          echo "ABERP_TEST_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
