@@ -941,6 +941,68 @@ mod tests {
         assert!(!json.contains("machinability"));
     }
 
+    /// S338 — the storefront `/api/catalogue/materials` receiver validates
+    /// every pushed grade against `GRADE_RE` in `catalogue-store.ts`. Pre-S338
+    /// that regex was `/^[A-Z][A-Z0-9_]*$/`, which 400'd every real grade
+    /// ("6061-T6", "304", "Ti-6Al-4V", "Inconel 718", …) — so the *entire*
+    /// push was rejected and the `/quote` dropdown stayed on its generic
+    /// fallback. The relaxed contract is `^[A-Za-z0-9][A-Za-z0-9 ._+/-]*$`.
+    /// This pins the wire contract from the ABERP end: every grade we would
+    /// PUT must satisfy what the storefront will ACCEPT. If a future seed (or
+    /// operator-typed grade in a fixture) drifts outside the charset, this
+    /// fails here rather than silently 400-looping in prod.
+    ///
+    /// Keep this pattern in lockstep with `GRADE_RE` in the storefront's
+    /// `src/lib/server/catalogue-store.ts`.
+    fn grade_satisfies_storefront_contract(grade: &str) -> bool {
+        let mut chars = grade.chars();
+        match chars.next() {
+            // First char must be alphanumeric (no leading separator/space).
+            Some(c) if c.is_ascii_alphanumeric() => {}
+            _ => return false,
+        }
+        // Remaining chars: alnum or the safe separators ` . _ + / -`.
+        chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '+' | '/' | '-'))
+    }
+
+    #[test]
+    fn s338_catalogue_push_delivers_snapshot_to_storefront_on_change() {
+        let mut c = conn();
+        seed_if_empty(&mut c, TENANT).expect("seed");
+        let pub_rows = list_public(&c, TENANT).expect("public projection");
+        // The body we would PUT is non-empty (an empty snapshot is itself the
+        // fallback-dropdown symptom).
+        assert!(!pub_rows.is_empty(), "public projection must not be empty");
+        // …and every grade in it satisfies the storefront's accept contract,
+        // so the push lands (200) instead of being rejected wholesale (400).
+        for m in &pub_rows {
+            assert!(
+                grade_satisfies_storefront_contract(&m.grade),
+                "seed grade {:?} would be rejected by the storefront receiver",
+                m.grade
+            );
+        }
+    }
+
+    #[test]
+    fn s338_contract_helper_rejects_the_old_failure_shapes() {
+        // Real grades the pre-S338 regex wrongly rejected — now accepted.
+        for g in [
+            "6061-T6",
+            "304",
+            "Ti-6Al-4V",
+            "Inconel 718",
+            "17-4PH",
+            "PEEK",
+        ] {
+            assert!(grade_satisfies_storefront_contract(g), "{g} must pass");
+        }
+        // Genuinely unsafe / malformed shapes stay rejected.
+        for g in ["-6061", " 304", "AL\r\n6061", "AL<x>", "AL;DROP", ""] {
+            assert!(!grade_satisfies_storefront_contract(g), "{g:?} must fail");
+        }
+    }
+
     fn count_catalogue_audit(conn: &Connection) -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'quote.material_catalogue_changed';",
