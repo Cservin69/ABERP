@@ -66,6 +66,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 use zeroize::Zeroizing;
@@ -104,6 +106,28 @@ pub const POLL_INTERVAL_ENV: &str = "ABERP_EMAIL_OUTBOX_POLL_SECS";
 /// HTTP timeout for storefront calls. Matches the S279 pricing-pipeline
 /// client constant — same network surface, same bound.
 const HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// S335 — idle-liveness heartbeat cadence.
+///
+/// Pre-S335 the daemon emitted one `EmailOutboxFetched` audit row on
+/// **every** poll cycle, including idle (zero-row) cycles — ~17k rows/day
+/// at the 5s cadence, by far the highest-frequency producer in the
+/// tamper-evident ledger and the volume driver behind the DuckDB ART
+/// crash Ervin saw (see `docs/findings/s335-email-outbox-throttle.md`).
+///
+/// S335 throttles idle cycles to silence (a `tracing::debug!` line
+/// instead of a ledger row), but still emits **one** idle
+/// `EmailOutboxFetched{fetched_count:0}` at most once per this interval
+/// so an operator can still confirm "daemon alive and idle" from the
+/// durable ledger without the flood. 5 minutes keeps the idle footprint
+/// at ~288 rows/day (a ~98% cut) while staying well inside a
+/// human-noticeable liveness window.
+///
+/// Conservative call (cadence is a judgement, not a derived value) —
+/// flagged in the findings doc. NOT operator-overridable in v1; if a
+/// future need arises, plumb it through `EmailOutboxPollDaemonDeps`
+/// rather than an env knob (avoids a second hot-reload surface).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Hard cap on `?limit=` we ask the storefront for. v1 ships no
 /// pagination loop within a cycle; one page of up to 50 entries is
@@ -239,6 +263,13 @@ pub fn is_disabled() -> bool {
 #[derive(Debug, Default)]
 pub struct EmailOutboxDaemonHandle {
     inner: Mutex<EmailOutboxDaemonStatus>,
+    /// S335 — wall-clock of the last `EmailOutboxFetched` row this daemon
+    /// emitted (real fetch, errored cycle, OR idle heartbeat). Drives the
+    /// idle-heartbeat cadence in [`Self::heartbeat_due_and_stamp`]. Kept
+    /// OUT of the serialized [`EmailOutboxDaemonStatus`] snapshot — it's
+    /// internal cadence state, not an operator-facing field, and
+    /// `OffsetDateTime` would bloat the SPA payload for no consumer.
+    last_fetched_emit: Mutex<Option<OffsetDateTime>>,
 }
 
 impl EmailOutboxDaemonHandle {
@@ -287,6 +318,33 @@ impl EmailOutboxDaemonHandle {
             g.last_error_ts = Some(cycle_at);
             g.last_error_detail = Some(format!("dormant: {reason}"));
             g.entries_in_progress = 0;
+        }
+    }
+
+    /// S335 — decide whether an idle-liveness heartbeat `EmailOutboxFetched`
+    /// is due, stamping the emit clock when it returns `true`. Returns
+    /// `true` at most once per `interval`. `now` is passed in (not read
+    /// from the clock here) so the cadence is deterministically testable.
+    fn heartbeat_due_and_stamp(&self, now: OffsetDateTime, interval: Duration) -> bool {
+        if let Ok(mut g) = self.last_fetched_emit.lock() {
+            let due = heartbeat_due(*g, now, interval);
+            if due {
+                *g = Some(now);
+            }
+            due
+        } else {
+            false
+        }
+    }
+
+    /// S335 — record that an `EmailOutboxFetched` row was just emitted on a
+    /// non-heartbeat path (a real fetch or an errored cycle). Resets the
+    /// idle-heartbeat clock so a busy or continuously-erroring daemon — both
+    /// of which already write rows that prove liveness — does not also emit
+    /// a redundant idle heartbeat.
+    fn stamp_fetched_emit(&self, now: OffsetDateTime) {
+        if let Ok(mut g) = self.last_fetched_emit.lock() {
+            *g = Some(now);
         }
     }
 
@@ -491,7 +549,10 @@ async fn run_loop(deps: Arc<EmailOutboxPollDaemonDeps>, cancel: CancellationToke
 /// deterministically without sleeping. Errors are caught and recorded
 /// on the status handle; this function does not propagate them.
 pub async fn poll_once(deps: &EmailOutboxPollDaemonDeps, client: &reqwest::Client) {
-    let cycle_at = iso8601_now();
+    // S335 — capture the cycle clock ONCE: reused for the audit `cycle_at`
+    // string AND the idle-heartbeat cadence decision below.
+    let now_dt = OffsetDateTime::now_utc();
+    let cycle_at = iso8601(now_dt);
     let snap = match deps.storefront_credential.snapshot() {
         Some(s) => s,
         None => {
@@ -513,6 +574,12 @@ pub async fn poll_once(deps: &EmailOutboxPollDaemonDeps, client: &reqwest::Clien
             // durable). Now: every cycle attempt fires the same EventKind
             // with `fetched_count: 0` and the error fields populated.
             tracing::warn!(error = %detail, error_class, "email-outbox fetch failed");
+            // Errored cycles ALWAYS emit (S311 F13/F18 — the silent-401
+            // observability path is the whole point of erroring loudly into
+            // the ledger). S335 — stamp the heartbeat clock so this row
+            // counts as liveness and we don't also emit a redundant idle
+            // heartbeat on the next quiet cycle.
+            deps.status.stamp_fetched_emit(now_dt);
             emit_fetched_error_audit(deps, since.clone(), &cycle_at, error_class, &detail).await;
             let mut outcome = CycleOutcome {
                 cycle_at,
@@ -525,7 +592,30 @@ pub async fn poll_once(deps: &EmailOutboxPollDaemonDeps, client: &reqwest::Clien
     };
     let fetched_count = entries.len() as u32;
     let max_queued_at: Option<String> = entries.iter().map(|e| e.queued_at.clone()).max();
-    emit_fetched_audit(deps, fetched_count, since.clone(), &cycle_at).await;
+    // S335 — throttle idle (zero-row) emits. Pre-S335 this `emit_fetched_audit`
+    // fired on every cycle including idle ones — ~17k rows/day into the
+    // monotonic-`seq` ART, the volume driver behind the DuckDB ART crash
+    // (docs/findings/s335-email-outbox-throttle.md). Now:
+    //   * a real batch (`fetched_count > 0`) always emits — full work
+    //     observability is unchanged;
+    //   * an idle cycle emits at most one liveness heartbeat per
+    //     `HEARTBEAT_INTERVAL` and is otherwise a `tracing::debug!` line.
+    // The audit event-schema and wire format are unchanged — only the
+    // emit FREQUENCY drops (~98% on the idle path).
+    if fetched_count > 0 {
+        deps.status.stamp_fetched_emit(now_dt);
+        emit_fetched_audit(deps, fetched_count, since.clone(), &cycle_at).await;
+    } else if deps
+        .status
+        .heartbeat_due_and_stamp(now_dt, HEARTBEAT_INTERVAL)
+    {
+        emit_fetched_audit(deps, 0, since.clone(), &cycle_at).await;
+    } else {
+        tracing::debug!(
+            since = ?since,
+            "email-outbox idle cycle (0 fetched); EmailOutboxFetched emit throttled (S335)"
+        );
+    }
 
     let mut sent_count: u32 = 0;
     let mut failed_count: u32 = 0;
@@ -1016,6 +1106,22 @@ async fn emit_failed_audit(
 }
 
 async fn write_audit(deps: &EmailOutboxPollDaemonDeps, kind: EventKind, bytes: Vec<u8>) {
+    // S335 — this DELIBERATELY opens a fresh `Connection` per write rather
+    // than holding a persistent one. DuckDB `Connection::open` creates an
+    // independent `Database` instance with no shared buffer cache across
+    // handles (incoming_invoices.rs:54-74). A persistent connection does
+    // NOT observe rows another daemon's connection committed, so on its
+    // next append it reads a STALE chain head, recomputes a `seq` already
+    // taken, and FORKS the tamper-evident hash chain (silently losing a
+    // row) — proven by the S335 coherence probe and pinned by
+    // `tests/s335_email_outbox_audit_write_coherence.rs`. Reopen-per-write
+    // is the coherence mechanism EVERY ABERP daemon relies on: each fresh
+    // open reads current disk state and computes the correct next seq.
+    //
+    // The ART-pressure fix is therefore to write LESS OFTEN (the S335 idle
+    // throttle in `poll_once`), NOT to persist the connection. Do not
+    // "optimize" this into a held connection without first making ALL
+    // audit writers share a single serialized connection.
     let db_path = deps.db_path.clone();
     let tenant = deps.tenant.clone();
     let binary_hash = deps.binary_hash;
@@ -1044,10 +1150,34 @@ async fn write_audit(deps: &EmailOutboxPollDaemonDeps, kind: EventKind, bytes: V
 // ── small helpers ─────────────────────────────────────────────────────
 
 fn iso8601_now() -> String {
-    use time::format_description::well_known::Rfc3339;
-    time::OffsetDateTime::now_utc()
-        .format(&Rfc3339)
+    iso8601(OffsetDateTime::now_utc())
+}
+
+/// Format an [`OffsetDateTime`] as RFC-3339, with the same infallible
+/// fallback `iso8601_now` has always used. Split out (S335) so `poll_once`
+/// can capture the cycle's `OffsetDateTime` ONCE — both for the audit
+/// `cycle_at` string and for the idle-heartbeat cadence decision — without
+/// re-reading the clock or re-parsing the formatted string.
+fn iso8601(dt: OffsetDateTime) -> String {
+    dt.format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// S335 — is an idle-liveness heartbeat `EmailOutboxFetched` due?
+///
+/// Pure (no clock, no I/O) so the cadence is unit-testable. `None` — no
+/// prior emit this boot — is always due, so a freshly-booted idle daemon
+/// leaves exactly one liveness row immediately rather than going dark for
+/// the first [`HEARTBEAT_INTERVAL`].
+fn heartbeat_due(last_emit: Option<OffsetDateTime>, now: OffsetDateTime, interval: Duration) -> bool {
+    match last_emit {
+        None => true,
+        // Compare in whole milliseconds: `now - prev` is a `time::Duration`
+        // and `interval` a `std::time::Duration`; the two don't compare
+        // directly, and a non-monotonic wall clock could make `now < prev`
+        // (returns false → no spurious heartbeat, which is the safe arm).
+        Some(prev) => (now - prev).whole_milliseconds() >= interval.as_millis() as i128,
+    }
 }
 
 /// Minimal URL-encoder for the `?since=<iso>` query parameter.
@@ -1370,6 +1500,63 @@ mod tests {
         assert!(!out.contains('\n'));
         assert!(!out.contains('\0'));
         assert!(out.len() <= 1000);
+    }
+
+    #[test]
+    fn s335_email_outbox_heartbeat_emits_at_cadence() {
+        let base = OffsetDateTime::now_utc();
+        let interval = Duration::from_secs(5 * 60);
+        // First-ever decision (no prior emit) is always due — a freshly
+        // booted idle daemon leaves one liveness row immediately.
+        assert!(heartbeat_due(None, base, interval), "None must be due");
+        // Inside the interval: NOT due (this is the throttle).
+        assert!(
+            !heartbeat_due(Some(base), base + Duration::from_secs(60), interval),
+            "60s < 5min must NOT be due"
+        );
+        assert!(
+            !heartbeat_due(
+                Some(base),
+                base + Duration::from_secs(5 * 60 - 1),
+                interval
+            ),
+            "just under 5min must NOT be due"
+        );
+        // At/after the interval: due again.
+        assert!(
+            heartbeat_due(Some(base), base + Duration::from_secs(5 * 60), interval),
+            "exactly 5min must be due"
+        );
+        assert!(
+            heartbeat_due(Some(base), base + Duration::from_secs(600), interval),
+            "10min must be due"
+        );
+        // Non-monotonic wall clock (now < prev) takes the safe arm: NOT due.
+        assert!(
+            !heartbeat_due(Some(base), base - Duration::from_secs(60), interval),
+            "clock skew backwards must NOT spuriously fire"
+        );
+    }
+
+    #[test]
+    fn s335_heartbeat_due_and_stamp_fires_once_then_throttles() {
+        let h = EmailOutboxDaemonHandle::dormant();
+        let interval = Duration::from_secs(5 * 60);
+        let t0 = OffsetDateTime::now_utc();
+        // First idle decision: due, and stamps.
+        assert!(h.heartbeat_due_and_stamp(t0, interval));
+        // Immediately after: throttled.
+        assert!(!h.heartbeat_due_and_stamp(t0 + Duration::from_secs(5), interval));
+        assert!(!h.heartbeat_due_and_stamp(t0 + Duration::from_secs(120), interval));
+        // Past the interval: due again.
+        assert!(h.heartbeat_due_and_stamp(t0 + Duration::from_secs(5 * 60), interval));
+        // A non-heartbeat emit (real fetch / errored cycle) resets the clock.
+        let t1 = t0 + Duration::from_secs(20 * 60);
+        h.stamp_fetched_emit(t1);
+        assert!(
+            !h.heartbeat_due_and_stamp(t1 + Duration::from_secs(60), interval),
+            "stamp_fetched_emit must reset the heartbeat clock"
+        );
     }
 
     #[test]
