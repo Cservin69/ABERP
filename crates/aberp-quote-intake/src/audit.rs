@@ -56,6 +56,13 @@ pub enum PollFailureReason {
     ServiceUnavailable,
     /// Any other non-2xx HTTP status.
     UnexpectedStatus,
+    /// S348 / PR-39 (F1) — a 200 `text/html` response (CDN serving the SPA
+    /// shell instead of the quotes API). Distinct from `Parse` so a routing
+    /// misconfig is dashboardable apart from a real storefront contract drift.
+    RoutingMisconfigured,
+    /// S348 / PR-39 (F1) — any other non-`application/json` body refused at
+    /// the Content-Type gate.
+    NonJsonResponse,
     /// 2xx body that failed to parse as the expected quote envelope.
     Parse,
 }
@@ -67,6 +74,8 @@ impl PollFailureReason {
             PollFailureReason::Unauthorized => "unauthorized",
             PollFailureReason::ServiceUnavailable => "service_unavailable",
             PollFailureReason::UnexpectedStatus => "unexpected_status",
+            PollFailureReason::RoutingMisconfigured => "routing_misconfigured",
+            PollFailureReason::NonJsonResponse => "non_json_response",
             PollFailureReason::Parse => "parse",
         }
     }
@@ -81,6 +90,10 @@ impl PollFailureReason {
             QuoteIntakeError::Unauthorized => Some(PollFailureReason::Unauthorized),
             QuoteIntakeError::ServiceUnavailable => Some(PollFailureReason::ServiceUnavailable),
             QuoteIntakeError::UnexpectedStatus { .. } => Some(PollFailureReason::UnexpectedStatus),
+            QuoteIntakeError::RoutingMisconfigured { .. } => {
+                Some(PollFailureReason::RoutingMisconfigured)
+            }
+            QuoteIntakeError::NonJsonResponse { .. } => Some(PollFailureReason::NonJsonResponse),
             QuoteIntakeError::Parse(_) => Some(PollFailureReason::Parse),
             QuoteIntakeError::Storage(_)
             | QuoteIntakeError::Mapping { .. }
@@ -318,7 +331,43 @@ mod tests {
             PollFailureReason::UnexpectedStatus.as_str(),
             "unexpected_status"
         );
+        assert_eq!(
+            PollFailureReason::RoutingMisconfigured.as_str(),
+            "routing_misconfigured"
+        );
+        assert_eq!(
+            PollFailureReason::NonJsonResponse.as_str(),
+            "non_json_response"
+        );
         assert_eq!(PollFailureReason::Parse.as_str(), "parse");
+    }
+
+    #[test]
+    fn s348_non_json_errors_map_to_distinct_reasons() {
+        // F1: a 200 text/html misroute is no longer a generic `parse`.
+        assert_eq!(
+            PollFailureReason::from_error(&QuoteIntakeError::RoutingMisconfigured {
+                status: 200,
+                content_type: "text/html".into(),
+                body_excerpt: "<!doctype html>".into(),
+            }),
+            Some(PollFailureReason::RoutingMisconfigured)
+        );
+        assert_eq!(
+            PollFailureReason::from_error(&QuoteIntakeError::NonJsonResponse {
+                status: 502,
+                content_type: "text/plain".into(),
+                body_excerpt: "bad gateway".into(),
+            }),
+            Some(PollFailureReason::NonJsonResponse)
+        );
+        // Both are cycle-aborting → they DO produce a QuoteIntakePollFailed row.
+        assert!(QuoteIntakeError::RoutingMisconfigured {
+            status: 200,
+            content_type: "text/html".into(),
+            body_excerpt: "x".into(),
+        }
+        .is_cycle_aborting());
     }
 
     #[test]

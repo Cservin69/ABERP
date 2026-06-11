@@ -224,21 +224,47 @@ impl PricingPipelineService {
 
     async fn list_and_enqueue_received(&self) -> Result<(u32, u32)> {
         let url = format!("{}/api/quotes?status=received", self.config.base_url);
-        let resp = self
+        // S348 / PR-39 (F1) — classify the response by status + Content-Type
+        // BEFORE parsing. A send/body-read failure (no HTTP response) or a
+        // 200 `text/html` (CDN misroute serving the SPA shell) used to crash
+        // `resp.json()` and abort the cycle with an opaque reason; now every
+        // such case is a typed `WritebackOutcome`, audited as a
+        // `quote.poll_outcome` row, and surfaced with a granular reason.
+        let resp = match self
             .client
             .get(&url)
             .header("Authorization", self.bearer_header()?)
             .send()
             .await
-            .with_context(|| format!("GET {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(anyhow!("storefront list returned HTTP {status}"));
-        }
-        let parsed: StorefrontListResponse = resp
-            .json()
-            .await
-            .context("parse storefront /api/quotes JSON")?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let outcome = classify_send_error(&e);
+                self.emit_poll_outcome_audit(&outcome).await;
+                return Err(anyhow!("poll {url}: {}", outcome.failure_reason()));
+            }
+        };
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let body_text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                let outcome = classify_send_error(&e);
+                self.emit_poll_outcome_audit(&outcome).await;
+                return Err(anyhow!("poll {url}: {}", outcome.failure_reason()));
+            }
+        };
+        let parsed = match classify_poll_response(status, content_type.as_deref(), &body_text) {
+            Ok(list) => list,
+            Err(outcome) => {
+                self.emit_poll_outcome_audit(&outcome).await;
+                return Err(anyhow!("poll {url}: {}", outcome.failure_reason()));
+            }
+        };
         let fetched = parsed.quotes.len() as u32;
         let mut enqueued = 0u32;
         for quote in parsed.quotes {
@@ -395,6 +421,65 @@ impl PricingPipelineService {
             return Err(anyhow!("status writeback HTTP {}", resp.status()));
         }
         Ok(())
+    }
+
+    /// S348 / PR-39 (F1) — write ONE `quote.poll_outcome` audit row for a
+    /// FAILED list-poll cycle, carrying the granular transport verdict
+    /// (variant tag + http_status + content_type + body_excerpt + retryable).
+    /// Fires ONLY on failure — a healthy cycle's success is already implied
+    /// by the per-quote `QuotePricingFetched` rows, and emitting a row every
+    /// idle cadence would reproduce exactly the audit-spam S335 throttled for
+    /// `EmailOutboxFetched`. Best-effort: an audit-write failure is logged
+    /// but never changes the cycle's already-decided failure outcome. Own DB
+    /// connection + tx (the poll path has no surrounding `spawn_blocking`).
+    async fn emit_poll_outcome_audit(&self, outcome: &WritebackOutcome) {
+        let db_path = self.deps.db_path.clone();
+        let tenant_id = self.deps.tenant.as_str().to_string();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+        let tag = outcome.tag().to_string();
+        let http_status = outcome.http_status();
+        let content_type = outcome.content_type();
+        let body_excerpt = outcome.body_excerpt().map(|s| s.to_string());
+        let retryable = outcome.retryable();
+        let res = spawn_blocking(move || -> Result<()> {
+            let mut conn =
+                duckdb::Connection::open(&db_path).context("open DB for poll-outcome audit")?;
+            audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
+            let tx = conn.transaction().context("open poll-outcome tx")?;
+            let meta =
+                LedgerMeta::new(TenantId::new(&tenant_id).context("tenant id")?, binary_hash);
+            let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+            let idempotency_key = format!("quote_poll_outcome:{}", Ulid::new());
+            let payload = QuotePollOutcomePayload {
+                tenant_id: tenant_id.clone(),
+                outcome: tag,
+                http_status,
+                content_type,
+                body_excerpt,
+                retryable,
+                actor: "system".to_string(),
+                idempotency_key: idempotency_key.clone(),
+            };
+            let bytes = serde_json::to_vec(&payload).context("encode poll-outcome payload")?;
+            append_in_tx(
+                &tx,
+                &meta,
+                EventKind::QuotePollOutcome,
+                bytes,
+                actor,
+                Some(idempotency_key),
+            )
+            .context("append QuotePollOutcome")?;
+            tx.commit().context("commit poll-outcome")?;
+            Ok(())
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "poll-outcome audit write failed"),
+            Err(e) => tracing::warn!(error = %e, "poll-outcome audit task panicked"),
+        }
     }
 
     async fn next_actionable_blocking(&self) -> Result<Option<PricingJobRow>> {
@@ -1581,7 +1666,60 @@ fn classify_writeback_response(
     content_type: Option<&str>,
     body: &str,
 ) -> WritebackOutcome {
-    let excerpt = response_excerpt(body);
+    match classify_response_gate(status, content_type, body) {
+        // 2xx + application/json — the only path where the caller's contract
+        // shape is parsed. `status` REQUIRED: `{"unexpected":"shape"}` parses
+        // into PricedWritebackOk{status:None,..} (both fields optional), so
+        // presence of `status` is the real malformed-vs-ok signal.
+        Ok(()) => match serde_json::from_str::<PricedWritebackOk>(body) {
+            Ok(parsed) if parsed.status.is_some() => WritebackOutcome::Success {
+                idempotent: parsed.idempotent.unwrap_or(false),
+            },
+            _ => WritebackOutcome::MalformedAppResponse {
+                http_status: status,
+                body_excerpt: response_excerpt(body),
+            },
+        },
+        Err(outcome) => outcome,
+    }
+}
+
+/// S348 / PR-39 (F1) — poll-site classifier. Same Content-Type + status
+/// gate as the writeback, but the 2xx+JSON success path parses the
+/// `StorefrontListResponse` envelope instead of the priced-writeback ok
+/// shape. `Ok(list)` on a clean 2xx `application/json`; `Err(outcome)`
+/// carries the typed transport-vs-app verdict — a 200 `text/html` (CDN
+/// serving the SPA shell) is `RoutingMisconfigured`, NEVER fed to the JSON
+/// parser as it was before this fix. Reuses [`WritebackOutcome`] (same
+/// crate) rather than duplicating the variant set (CLAUDE.md #8/#13).
+fn classify_poll_response(
+    status: u16,
+    content_type: Option<&str>,
+    body: &str,
+) -> Result<StorefrontListResponse, WritebackOutcome> {
+    classify_response_gate(status, content_type, body)?;
+    serde_json::from_str::<StorefrontListResponse>(body).map_err(|_| {
+        WritebackOutcome::MalformedAppResponse {
+            http_status: status,
+            body_excerpt: response_excerpt(body),
+        }
+    })
+}
+
+/// S347 / PR-39 (F1) — the shared Content-Type + status gate. PURE, no I/O.
+/// `Ok(())` ONLY for a 2xx `application/json` response (the caller then
+/// parses its own contract shape); every transport/routing/auth/non-JSON/
+/// 4xx/5xx response is an `Err(outcome)`. Auth verdicts (401/403) take
+/// precedence over the Content-Type gate because they are actionable as
+/// auth regardless of the body the CDN attached. Factored out of
+/// [`classify_writeback_response`] so the writeback POST and the
+/// list-poll GET share ONE gate (CLAUDE.md #13 — no duplicated skeleton).
+fn classify_response_gate(
+    status: u16,
+    content_type: Option<&str>,
+    body: &str,
+) -> Result<(), WritebackOutcome> {
+    let excerpt = || response_excerpt(body);
     // Normalise: drop the `; charset=…` parameter, trim, lowercase.
     let ct_norm = content_type.map(|c| {
         c.split(';')
@@ -1594,16 +1732,16 @@ fn classify_writeback_response(
 
     match status {
         401 => {
-            return WritebackOutcome::Unauthorized {
+            return Err(WritebackOutcome::Unauthorized {
                 http_status: status,
-                body_excerpt: excerpt,
-            }
+                body_excerpt: excerpt(),
+            })
         }
         403 => {
-            return WritebackOutcome::Forbidden {
+            return Err(WritebackOutcome::Forbidden {
                 http_status: status,
-                body_excerpt: excerpt,
-            }
+                body_excerpt: excerpt(),
+            })
         }
         _ => {}
     }
@@ -1611,47 +1749,36 @@ fn classify_writeback_response(
     if !is_json {
         let ct = ct_norm.unwrap_or_default();
         if status == 200 && ct.starts_with("text/html") {
-            return WritebackOutcome::RoutingMisconfigured {
+            return Err(WritebackOutcome::RoutingMisconfigured {
                 http_status: status,
                 content_type: ct,
-                body_excerpt: excerpt,
-            };
+                body_excerpt: excerpt(),
+            });
         }
-        return WritebackOutcome::NonJsonResponse {
+        return Err(WritebackOutcome::NonJsonResponse {
             http_status: status,
             content_type: ct,
-            body_excerpt: excerpt,
-        };
+            body_excerpt: excerpt(),
+        });
     }
 
     // application/json from here down.
     match status {
-        200..=299 => match serde_json::from_str::<PricedWritebackOk>(body) {
-            // `status` REQUIRED — `{"unexpected":"shape"}` parses into
-            // PricedWritebackOk{status:None,..} (both fields optional), so
-            // presence of `status` is the real malformed-vs-ok signal.
-            Ok(parsed) if parsed.status.is_some() => WritebackOutcome::Success {
-                idempotent: parsed.idempotent.unwrap_or(false),
-            },
-            _ => WritebackOutcome::MalformedAppResponse {
-                http_status: status,
-                body_excerpt: excerpt,
-            },
-        },
-        400..=499 => WritebackOutcome::AppRejected {
+        200..=299 => Ok(()),
+        400..=499 => Err(WritebackOutcome::AppRejected {
             http_status: status,
-            body_excerpt: excerpt,
-        },
-        500..=599 => WritebackOutcome::AppErrored {
+            body_excerpt: excerpt(),
+        }),
+        500..=599 => Err(WritebackOutcome::AppErrored {
             http_status: status,
-            body_excerpt: excerpt,
-        },
+            body_excerpt: excerpt(),
+        }),
         // Genuinely weird 1xx/3xx with a JSON body — not a contract we
         // expect; malformed rather than silently "ok".
-        _ => WritebackOutcome::MalformedAppResponse {
+        _ => Err(WritebackOutcome::MalformedAppResponse {
             http_status: status,
-            body_excerpt: excerpt,
-        },
+            body_excerpt: excerpt(),
+        }),
     }
 }
 
@@ -2271,6 +2398,32 @@ struct QuotePricedWritebackOutcomePayload {
     /// Whether the daemon should bother retrying (Transient-class verdicts).
     retryable: bool,
     attempt_n: u32,
+    actor: String,
+    idempotency_key: String,
+}
+
+/// S348 / PR-39 (F1) — payload for `quote.poll_outcome`. One row per FAILED
+/// `GET /api/quotes?status=received` cycle; carries the same granular
+/// transport-vs-app verdict as the writeback row but spans a list poll, so
+/// there is no single `quote_id`. Reuses [`WritebackOutcome`]'s closed-vocab
+/// `outcome` tag.
+#[derive(Debug, Serialize)]
+struct QuotePollOutcomePayload {
+    tenant_id: String,
+    /// Closed-vocab tag from [`WritebackOutcome::tag`] — `routing_misconfigured`,
+    /// `unauthorized`, `non_json_response`, `app_errored`, `timeout`, …
+    /// (`success` never reaches this payload — the poll only audits failures).
+    outcome: String,
+    /// HTTP status when a response was received; `null` for transport
+    /// failures (timeout / connection) that never reached one.
+    http_status: Option<u16>,
+    /// Response Content-Type when it's part of the verdict; `null` for
+    /// auth + transport outcomes.
+    content_type: Option<String>,
+    /// Bearer-scrubbed, ≤200-char body excerpt; `null` for timeout.
+    body_excerpt: Option<String>,
+    /// Whether the next cycle should bother retrying (Transient-class verdicts).
+    retryable: bool,
     actor: String,
     idempotency_key: String,
 }
@@ -3860,5 +4013,200 @@ mod tests {
             "got {o:?}"
         );
         assert!(o.is_success());
+    }
+
+    // ── S348 / PR-39 (F1) — list-poll Content-Type gate ───────────────────
+
+    #[test]
+    fn s348_classify_poll_html_200_is_routing_misconfigured_not_parsed() {
+        // THE incident shape on the poll site: a 200 text/html body must be
+        // refused at the gate, never fed to the StorefrontListResponse parser.
+        let r = classify_poll_response(
+            200,
+            Some("text/html; charset=utf-8"),
+            "<!doctype html><html>spa shell</html>",
+        );
+        match r {
+            Err(WritebackOutcome::RoutingMisconfigured { content_type, .. }) => {
+                assert_eq!(content_type, "text/html");
+            }
+            other => panic!("expected RoutingMisconfigured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn s348_classify_poll_401_403_take_precedence() {
+        assert!(matches!(
+            classify_poll_response(401, Some("text/html"), "<html>no</html>"),
+            Err(WritebackOutcome::Unauthorized { .. })
+        ));
+        assert!(matches!(
+            classify_poll_response(403, Some("application/json"), r#"{"e":"no"}"#),
+            Err(WritebackOutcome::Forbidden { .. })
+        ));
+    }
+
+    #[test]
+    fn s348_classify_poll_500_json_is_app_errored_and_retryable() {
+        match classify_poll_response(500, Some("application/json"), r#"{"error":"db"}"#) {
+            Err(o @ WritebackOutcome::AppErrored { .. }) => {
+                assert!(o.retryable());
+                assert_eq!(o.failure_kind(), FailureKind::Transient);
+            }
+            other => panic!("expected AppErrored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn s348_classify_poll_missing_content_type_is_non_json() {
+        // A valid-looking JSON body with NO Content-Type is still refused —
+        // the gate requires an explicit application/json, never sniffs.
+        assert!(matches!(
+            classify_poll_response(200, None, r#"{"quotes":[]}"#),
+            Err(WritebackOutcome::NonJsonResponse { .. })
+        ));
+    }
+
+    #[test]
+    fn s348_classify_poll_200_json_wrong_shape_is_malformed() {
+        // 200 + application/json but not the {quotes:[...]} envelope.
+        assert!(matches!(
+            classify_poll_response(200, Some("application/json"), r#"{"unexpected":"shape"}"#),
+            Err(WritebackOutcome::MalformedAppResponse { .. })
+        ));
+    }
+
+    #[test]
+    fn s348_classify_poll_200_valid_envelope_is_ok() {
+        let r = classify_poll_response(
+            200,
+            Some("application/json"),
+            r#"{"quotes":[{"id":"q1","contact":{"email":"a@b.c","name":"A"},"request":{"material_preference":"6061-T6","quantity":2},"files":[]}]}"#,
+        );
+        let list = r.expect("valid envelope must parse");
+        assert_eq!(list.quotes.len(), 1);
+    }
+
+    fn s348_poll_service(
+        addr: &std::net::SocketAddr,
+        db_path: std::path::PathBuf,
+    ) -> PricingPipelineService {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(400))
+            .build()
+            .expect("client");
+        PricingPipelineService {
+            config: PricingPipelineConfig {
+                base_url: format!("http://{addr}"),
+                bearer_token: Zeroizing::new("t0k3n".to_string()),
+                poll_interval: Duration::from_secs(60),
+                artifact_dir: std::env::temp_dir(),
+                python_bin: PathBuf::from("/usr/bin/python3"),
+                default_tolerance: ToleranceRange::Standard,
+            },
+            deps: PricingPipelineDeps {
+                db_path,
+                tenant: TenantId::new("T").expect("tid"),
+                binary_hash: BinaryHash::from_bytes([0u8; 32]),
+                operator_login: "ervin".to_string(),
+            },
+            client,
+        }
+    }
+
+    /// Drive `list_and_enqueue_received` against a canned response and return
+    /// the Err reason (the failure cases never reach enqueue, so no CAD
+    /// download / job insert happens). `db_path` is real so the
+    /// `quote.poll_outcome` audit emit actually writes.
+    async fn s348_run_poll(addr: &std::net::SocketAddr, db_path: std::path::PathBuf) -> String {
+        let svc = s348_poll_service(addr, db_path);
+        let err = svc
+            .list_and_enqueue_received()
+            .await
+            .expect_err("poll must fail on a non-JSON / error response");
+        format!("{err:#}")
+    }
+
+    fn s348_temp_db() -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("aberp-s348-poll-{}.duckdb", Ulid::new()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[tokio::test]
+    async fn s348_e2e_poll_html_200_is_routing_misconfig_and_audited() {
+        use aberp_audit_ledger::recent_entries;
+        let addr = s347_spawn_writeback_mock(Some(s347_http_canned(
+            "200 OK",
+            "text/html; charset=utf-8",
+            "<!doctype html><html>spa shell</html>",
+        )))
+        .await;
+        let db = s348_temp_db();
+        let reason = s348_run_poll(&addr, db.clone()).await;
+        assert!(
+            reason.contains("routing_misconfigured"),
+            "reason must name the routing misconfig, got: {reason}"
+        );
+        // The failure is durably audited as exactly ONE quote.poll_outcome row.
+        let conn = duckdb::Connection::open(&db).expect("reopen");
+        let entries = recent_entries(&conn, 10).expect("recent");
+        let poll_rows: Vec<_> = entries
+            .iter()
+            .filter(|e| e.kind.as_str() == "quote.poll_outcome")
+            .collect();
+        assert_eq!(poll_rows.len(), 1, "exactly one poll-outcome row");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&poll_rows[0].payload).expect("decode");
+        assert_eq!(payload["outcome"], "routing_misconfigured");
+        assert_eq!(payload["http_status"], 200);
+        assert_eq!(payload["content_type"], "text/html");
+        assert_eq!(payload["retryable"], false);
+        drop(conn);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn s348_e2e_poll_401_is_unauthorized() {
+        let addr = s347_spawn_writeback_mock(Some(s347_http_canned(
+            "401 Unauthorized",
+            "application/json",
+            r#"{"message":"Unauthorized"}"#,
+        )))
+        .await;
+        let reason = s348_run_poll(&addr, s348_temp_db()).await;
+        assert!(reason.contains("unauthorized"), "got: {reason}");
+    }
+
+    #[tokio::test]
+    async fn s348_e2e_poll_500_is_app_errored() {
+        let addr = s347_spawn_writeback_mock(Some(s347_http_canned(
+            "500 Internal Server Error",
+            "application/json",
+            r#"{"error":"db down"}"#,
+        )))
+        .await;
+        let reason = s348_run_poll(&addr, s348_temp_db()).await;
+        assert!(reason.contains("app_errored"), "got: {reason}");
+    }
+
+    #[tokio::test]
+    async fn s348_e2e_poll_200_malformed_json_is_malformed() {
+        let addr = s347_spawn_writeback_mock(Some(s347_http_canned(
+            "200 OK",
+            "application/json",
+            r#"{"unexpected":"shape"}"#,
+        )))
+        .await;
+        let reason = s348_run_poll(&addr, s348_temp_db()).await;
+        assert!(reason.contains("malformed_app_response"), "got: {reason}");
+    }
+
+    #[tokio::test]
+    async fn s348_e2e_poll_timeout_is_timeout() {
+        let addr = s347_spawn_writeback_mock(None).await;
+        let reason = s348_run_poll(&addr, s348_temp_db()).await;
+        assert!(reason.contains("timeout"), "got: {reason}");
     }
 }

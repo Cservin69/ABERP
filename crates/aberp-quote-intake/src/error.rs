@@ -29,6 +29,34 @@ pub enum QuoteIntakeError {
     #[error("quote-intake unexpected HTTP status {status}")]
     UnexpectedStatus { status: u16 },
 
+    /// S348 / PR-39 (F1) — a 200 `text/html` response (CDN serving the SPA
+    /// shell instead of the quotes API — the 2026-06-11 misroute). Refused
+    /// at the Content-Type gate BEFORE the JSON parser, so an HTML body can
+    /// never masquerade as a malformed-JSON `Parse` error. Carries the
+    /// status, the offending content-type, and a bearer-scrubbed body
+    /// excerpt for the operator.
+    #[error(
+        "quote-intake routing misconfigured (HTTP {status}, content-type {content_type}): {body_excerpt}"
+    )]
+    RoutingMisconfigured {
+        status: u16,
+        content_type: String,
+        body_excerpt: String,
+    },
+
+    /// S348 / PR-39 (F1) — any other non-`application/json` response body.
+    /// Like [`Self::RoutingMisconfigured`] but for content-types other than
+    /// a 200 `text/html` (e.g. a 5xx HTML error page, `text/plain`, an empty
+    /// `application/octet-stream`). Refused at the gate, never parsed as JSON.
+    #[error(
+        "quote-intake non-JSON response (HTTP {status}, content-type {content_type}): {body_excerpt}"
+    )]
+    NonJsonResponse {
+        status: u16,
+        content_type: String,
+        body_excerpt: String,
+    },
+
     #[error("quote-intake response parse error: {0}")]
     Parse(String),
 
@@ -48,6 +76,8 @@ impl QuoteIntakeError {
                 | QuoteIntakeError::Unauthorized
                 | QuoteIntakeError::ServiceUnavailable
                 | QuoteIntakeError::UnexpectedStatus { .. }
+                | QuoteIntakeError::RoutingMisconfigured { .. }
+                | QuoteIntakeError::NonJsonResponse { .. }
                 | QuoteIntakeError::Config(_)
                 | QuoteIntakeError::Disabled
         )
@@ -73,6 +103,16 @@ mod tests {
                 quote_id: "q-abc".to_string(),
                 message: "no email".to_string(),
             },
+            QuoteIntakeError::RoutingMisconfigured {
+                status: 200,
+                content_type: "text/html".to_string(),
+                body_excerpt: "<!doctype html>".to_string(),
+            },
+            QuoteIntakeError::NonJsonResponse {
+                status: 502,
+                content_type: "text/plain".to_string(),
+                body_excerpt: "bad gateway".to_string(),
+            },
         ] {
             let s = e.to_string();
             assert!(!s.contains("Bearer"), "{s:?}");
@@ -85,6 +125,18 @@ mod tests {
         assert!(QuoteIntakeError::Unauthorized.is_cycle_aborting());
         assert!(QuoteIntakeError::ServiceUnavailable.is_cycle_aborting());
         assert!(QuoteIntakeError::Transport("x".into()).is_cycle_aborting());
+        assert!(QuoteIntakeError::RoutingMisconfigured {
+            status: 200,
+            content_type: "text/html".into(),
+            body_excerpt: "<!doctype html>".into(),
+        }
+        .is_cycle_aborting());
+        assert!(QuoteIntakeError::NonJsonResponse {
+            status: 502,
+            content_type: "text/plain".into(),
+            body_excerpt: "x".into(),
+        }
+        .is_cycle_aborting());
         assert!(!QuoteIntakeError::Parse("x".into()).is_cycle_aborting());
         assert!(!QuoteIntakeError::Storage("x".into()).is_cycle_aborting());
         assert!(!QuoteIntakeError::Mapping {

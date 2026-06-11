@@ -1741,6 +1741,27 @@ pub enum EventKind {
     /// F12 four-edit ritual fires once.
     QuotePricedWritebackOutcome,
 
+    /// S348 / PR-39 (F1) — the typed transport-vs-app verdict for ONE
+    /// `GET /api/quotes?status=received` storefront list-poll cycle in the
+    /// pricing pipeline. The S347 Content-Type gate, extended to the poll
+    /// site: a 200 `text/html` (CDN serving the SPA shell instead of the
+    /// quotes API — the same misroute that produced the 2026-06-11 incident)
+    /// is now classified `routing_misconfigured` instead of crashing the
+    /// `resp.json()` parse and aborting the cycle with an opaque reason.
+    /// Reuses [`WritebackOutcome`]'s closed-vocab tags. Emitted ONLY on a
+    /// failed poll (never on a healthy cycle) to avoid the idle-audit-spam
+    /// that S335 throttled for `EmailOutboxFetched`.
+    ///
+    /// Carries `tenant_id`, `outcome` (closed-vocab tag), `http_status`
+    /// (nullable), `content_type` (nullable), `body_excerpt` (nullable,
+    /// bearer-scrubbed, ≤200 chars), `retryable`, `actor` (`"system"`),
+    /// `idempotency_key` (`quote_poll_outcome:<ulid>`). No `quote_id` — a
+    /// list poll spans many quotes.
+    ///
+    /// `quote.*` prefix family. Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePollOutcome,
+
     /// S307 / PR-276 — one entry per email-outbox poll cycle. Fires
     /// once per successful `GET /api/internal/email-queue` against the
     /// storefront, regardless of whether the cycle returned 0 entries
@@ -1971,6 +1992,7 @@ impl EventKind {
             EventKind::QuotePricingJobsIndexMigrated => "quote.pricing_jobs_index_migrated",
             EventKind::QuotePricingFailureClassified => "quote.pricing_failure_classified",
             EventKind::QuotePricedWritebackOutcome => "quote.priced_writeback_outcome",
+            EventKind::QuotePollOutcome => "quote.poll_outcome",
             EventKind::EmailOutboxFetched => "quote.email_outbox_fetched",
             EventKind::EmailOutboxClaimed => "quote.email_outbox_claimed",
             EventKind::EmailOutboxSent => "quote.email_outbox_sent",
@@ -2084,6 +2106,7 @@ impl EventKind {
             "quote.pricing_jobs_index_migrated" => Ok(EventKind::QuotePricingJobsIndexMigrated),
             "quote.pricing_failure_classified" => Ok(EventKind::QuotePricingFailureClassified),
             "quote.priced_writeback_outcome" => Ok(EventKind::QuotePricedWritebackOutcome),
+            "quote.poll_outcome" => Ok(EventKind::QuotePollOutcome),
             "quote.email_outbox_fetched" => Ok(EventKind::EmailOutboxFetched),
             "quote.email_outbox_claimed" => Ok(EventKind::EmailOutboxClaimed),
             "quote.email_outbox_sent" => Ok(EventKind::EmailOutboxSent),
@@ -2189,6 +2212,7 @@ mod tests {
             EventKind::QuotePricingJobsIndexMigrated,
             EventKind::QuotePricingFailureClassified,
             EventKind::QuotePricedWritebackOutcome,
+            EventKind::QuotePollOutcome,
             EventKind::EmailOutboxFetched,
             EventKind::EmailOutboxClaimed,
             EventKind::EmailOutboxSent,
@@ -4116,6 +4140,38 @@ mod tests {
             "round-trip mismatch for {s}"
         );
         for sibling in [
+            EventKind::QuotePricingPosted,
+            EventKind::QuotePricingFailed,
+            EventKind::QuotePricingFailureClassified,
+            EventKind::QuotePricingRendered,
+        ] {
+            assert_ne!(
+                s,
+                sibling.as_str(),
+                "{s} collides with {}",
+                sibling.as_str()
+            );
+        }
+    }
+
+    /// S348 / PR-39 (F1) — F12 ritual for the list-poll-outcome kind:
+    /// round-trips, carries the `quote.` prefix, and is distinct from the
+    /// per-writeback verdict + every pricing sibling so a poll-cycle misroute
+    /// can never be mis-bucketed as a per-quote writeback row (CLAUDE.md
+    /// rule 12).
+    #[test]
+    fn s348_poll_outcome_kind_round_trips_and_is_distinct() {
+        let k = EventKind::QuotePollOutcome;
+        let s = k.as_str();
+        assert_eq!(s, "quote.poll_outcome");
+        assert!(s.starts_with("quote."), "{s} must start with quote.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+        for sibling in [
+            EventKind::QuotePricedWritebackOutcome,
             EventKind::QuotePricingPosted,
             EventKind::QuotePricingFailed,
             EventKind::QuotePricingFailureClassified,

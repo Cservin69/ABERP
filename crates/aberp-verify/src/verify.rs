@@ -989,7 +989,10 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // S347 / PR-39 — priced-writeback transport verdict. App-layer JSON
         // payload (quote_id / outcome tag / http_status / content_type /
         // body_excerpt), never NAV XML bytes. Exhaustiveness arm only.
-        | EventKind::QuotePricedWritebackOutcome => (None, ""),
+        | EventKind::QuotePricedWritebackOutcome
+        // S348 / PR-39 — list-poll transport verdict. Same app-layer JSON
+        // shape minus quote_id; never NAV XML bytes. Exhaustiveness arm only.
+        | EventKind::QuotePollOutcome => (None, ""),
     };
 
     Ok(NavExtraction {
