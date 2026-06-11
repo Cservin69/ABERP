@@ -14,3 +14,6 @@ pub use crate::export_control::{
     MockExportControlProvider, PartyRef, ScreeningResult,
 };
 pub use crate::lot_heat::{HeatId, LotId, MaterialTraceabilitySeed, TraceabilityError, MAX_ID_LEN};
+pub use crate::uid::{
+    validate_iac, Iuid, IuidConstruct1, IuidConstruct2, UidError, MAX_IAC_LEN, MAX_UID_FIELD_LEN,
+};

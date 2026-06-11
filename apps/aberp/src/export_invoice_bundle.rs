@@ -883,7 +883,13 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // JSON payloads, never NAV XML bytes. `material.*`-not-`invoice.*`
         // posture; never sweeps a per-OUTGOING-invoice export bundle by glob.
         | EventKind::MaterialCertAttached
-        | EventKind::MaterialHeatLotAssigned => None,
+        | EventKind::MaterialHeatLotAssigned
+        // S358 / PR-45 — part.* per-unit serialization family (ADR-0075).
+        // Serial-assign record + UID-mark state transition; app-layer JSON
+        // payloads, never NAV XML bytes. `part.*`-not-`invoice.*` posture;
+        // never sweeps a per-OUTGOING-invoice export bundle by glob.
+        | EventKind::PartSerialAssigned
+        | EventKind::PartUidMarked => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -1586,6 +1592,31 @@ mod tests {
                 .append(
                     kind.clone(),
                     br#"{"material_id":"6061-T6"}"#.to_vec(),
+                    actor,
+                    None,
+                )
+                .unwrap();
+            let entries = ledger.entries().unwrap();
+            let nav = extract_nav_xml(&entries[0]).unwrap();
+            assert!(nav.is_none(), "{} must produce no nav/ file", kind.as_str());
+        }
+    }
+
+    /// S358 / PR-45 (ADR-0075) — the two `part.*` per-unit serialization kinds
+    /// carry app-layer JSON payloads, never NAV XML, so `extract_nav_xml` MUST
+    /// return `None` for each. The Rust exhaustiveness check already forces the
+    /// new variants into the no-NAV-bytes arm at compile time; this is the
+    /// belt-and-braces runtime pin that the verdict actually holds, so a part-
+    /// serialization row never produces a `nav/` file in a per-OUTGOING-invoice
+    /// export bundle.
+    #[test]
+    fn extract_nav_xml_returns_none_for_part_kinds() {
+        for kind in [EventKind::PartSerialAssigned, EventKind::PartUidMarked] {
+            let (mut ledger, actor, _bh) = fixture_ledger();
+            ledger
+                .append(
+                    kind.clone(),
+                    br#"{"part_id":"PRT-7781"}"#.to_vec(),
                     actor,
                     None,
                 )

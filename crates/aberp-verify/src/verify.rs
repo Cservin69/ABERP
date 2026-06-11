@@ -1017,7 +1017,14 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // never NAV XML bytes. `material.*`-not-`invoice.*` posture; never
         // sweeps a per-OUTGOING-invoice bundle. Exhaustiveness arm only.
         | EventKind::MaterialCertAttached
-        | EventKind::MaterialHeatLotAssigned => (None, ""),
+        | EventKind::MaterialHeatLotAssigned
+        // S358 / PR-45 — part.* per-unit serialization family (ADR-0075).
+        // Serial-assign record + UID-mark state transition; app-layer JSON
+        // payloads (part_id / serial_number / uid_iri / uid_construct_code / …),
+        // never NAV XML bytes. `part.*`-not-`invoice.*` posture; never sweeps a
+        // per-OUTGOING-invoice bundle. Exhaustiveness arm only.
+        | EventKind::PartSerialAssigned
+        | EventKind::PartUidMarked => (None, ""),
     };
 
     Ok(NavExtraction {

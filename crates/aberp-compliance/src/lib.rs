@@ -29,6 +29,8 @@
 //!   [`ExportScreeningStatus`].
 //! - [`nist_800_171`] — the 110 control identifiers as constants, for future
 //!   audit-event tagging.
+//! - [`uid`] — MIL-STD-130N IUID format types ([`Iuid`] / [`IuidConstruct1`] /
+//!   [`IuidConstruct2`] + [`validate_iac`]) for DoD item unique identification.
 //!
 //! Out of scope (future work): real providers, audit `EventKind`s that
 //! reference these types, the e-signature ceremony, the SPA surfaces.
@@ -44,6 +46,10 @@
 //! [`DpasRating`]: avl::DpasRating
 //! [`QualLevel`]: avl::QualLevel
 //! [`ExportScreeningStatus`]: avl::ExportScreeningStatus
+//! [`Iuid`]: uid::Iuid
+//! [`IuidConstruct1`]: uid::IuidConstruct1
+//! [`IuidConstruct2`]: uid::IuidConstruct2
+//! [`validate_iac`]: uid::validate_iac
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -54,3 +60,4 @@ pub mod export_control;
 pub mod lot_heat;
 pub mod nist_800_171;
 pub mod prelude;
+pub mod uid;

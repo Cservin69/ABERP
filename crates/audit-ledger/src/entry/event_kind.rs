@@ -2093,6 +2093,64 @@ pub enum EventKind {
     /// `material.*` prefix family — same segregation rationale as
     /// [`Self::MaterialCertAttached`].
     MaterialHeatLotAssigned,
+
+    /// S358 / PR-45 (ADR-0075) — a serial number was assigned to an
+    /// individual part. FIRST member of the new `part.*` prefix family — the
+    /// per-unit serialization strand of the aerospace pivot
+    /// (`[[defense-aerospace-pivot]]`). This is the MIL-STD-130N / DoD 5000.64
+    /// "item unique identification" *record* anchor for the serial half: a
+    /// durable, hash-chained note that part P now carries serial S.
+    ///
+    /// Deliberately split from [`Self::PartUidMarked`] — see ADR-0075 for why.
+    /// A serial is *assigned* (a logical fact, possibly at order entry or work-
+    /// order release) before the UID is *physically marked* on the metal; the
+    /// two facts happen at different times, by different operators, and one can
+    /// occur without the other. This kind records the assignment only.
+    ///
+    /// Payload (`serde_json::Value`): `part_id` (the part instance key the
+    /// serial belongs to), `serial_number` (the assigned serial), `assigned_at_ms`
+    /// (epoch-ms stamp of the assignment), `assigned_by_operator_id` (who made
+    /// the assignment — the accountability anchor), and optional
+    /// `related_invoice_id` / `related_work_order_id` (the fiscal / production
+    /// document the serialization was triggered by, when known).
+    ///
+    /// `part.*` prefix family — NOT `invoice.*` / `system.*` / `mes.*` /
+    /// `quote.*` / `inventory.*` / `email.*` / `personnel.*` / `material.*`. A
+    /// new prefix keeps the per-unit serialization surface globbable on its own
+    /// (`part.*` = "every serial assignment / UID mark on this install")
+    /// without sweeping fiscal, manufacturing, quoting, access-trail, or
+    /// material-traceability traffic — and the per-OUTGOING-invoice export
+    /// bundle's `invoice.*` glob (ADR-0009 §8) never sweeps a part-serialization
+    /// row by construction.
+    ///
+    /// S358 ships the kind only; firing sites land in a later session. F12
+    /// four-edit ritual fires once for the two sibling `part.*` kinds.
+    PartSerialAssigned,
+
+    /// S358 / PR-45 (ADR-0075) — the MIL-STD-130N Item Unique Identifier (UID)
+    /// was physically marked on a part. The *state transition* counterpart to
+    /// [`Self::PartSerialAssigned`]: the part now bears its machine-readable
+    /// IUID (a Construct-1 or Construct-2 Type-1/Type-2 IRI per MIL-STD-130N),
+    /// data-matrix-marked on the metal. Distinct from the serial assignment
+    /// (a logical fact) — this kind records that the mark physically exists and
+    /// whether it satisfies MIL-STD-130N, the load-bearing fact a DoD-IUID
+    /// auditor resolves a part's pedigree through.
+    ///
+    /// Carries the IRI string built from the validated UID types in
+    /// [`aberp_compliance::uid`] (`Iuid` / `IuidConstruct1` / `IuidConstruct2`);
+    /// the firing site (later session) constructs them, so a malformed IAC /
+    /// enterprise id can never reach the ledger.
+    ///
+    /// Payload (`serde_json::Value`): `part_id` (the part instance key),
+    /// `uid_iri` (the rendered MIL-STD-130N IRI), `uid_construct_code` (the
+    /// construct discriminator — e.g. `construct_1` / `construct_2`),
+    /// `mil_std_130_compliant` (bool — whether the mark passed the standard's
+    /// format gate), `marked_at_ms` (epoch-ms stamp), and `marked_by_operator_id`
+    /// (who marked it).
+    ///
+    /// `part.*` prefix family — same segregation rationale as
+    /// [`Self::PartSerialAssigned`].
+    PartUidMarked,
 }
 
 impl EventKind {
@@ -2204,6 +2262,8 @@ impl EventKind {
             EventKind::PersonnelAccessDenied => "personnel.access_denied",
             EventKind::MaterialCertAttached => "material.cert_attached",
             EventKind::MaterialHeatLotAssigned => "material.heat_lot_assigned",
+            EventKind::PartSerialAssigned => "part.serial_assigned",
+            EventKind::PartUidMarked => "part.uid_marked",
         }
     }
 
@@ -2326,6 +2386,8 @@ impl EventKind {
             "personnel.access_denied" => Ok(EventKind::PersonnelAccessDenied),
             "material.cert_attached" => Ok(EventKind::MaterialCertAttached),
             "material.heat_lot_assigned" => Ok(EventKind::MaterialHeatLotAssigned),
+            "part.serial_assigned" => Ok(EventKind::PartSerialAssigned),
+            "part.uid_marked" => Ok(EventKind::PartUidMarked),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2440,6 +2502,8 @@ mod tests {
             EventKind::PersonnelAccessDenied,
             EventKind::MaterialCertAttached,
             EventKind::MaterialHeatLotAssigned,
+            EventKind::PartSerialAssigned,
+            EventKind::PartUidMarked,
         ];
         for v in variants {
             let s = v.as_str();
@@ -4840,5 +4904,150 @@ mod tests {
         assert!(parsed["source_supplier"].is_string());
         assert!(parsed["assigned_at_ms"].is_i64());
         assert!(parsed["assigned_by_operator_id"].is_string());
+    }
+
+    // ── S358 / PR-45 (ADR-0075) — part.* per-unit serialization family ──────
+    //
+    // Two kinds open the new `part.*` prefix family (the ninth): the serial-
+    // assign RECORD event and the UID-mark STATE TRANSITION. Per the brief each
+    // variant gets a focused round-trip test, each payload shape is pinned by a
+    // serialization test, the family shares one prefix-and-distinctness test,
+    // and a no-NAV-bytes pin lives with the exhaustive-match consumers
+    // (`aberp-verify`, `export_invoice_bundle`).
+
+    #[test]
+    fn s358_part_serial_assigned_round_trips() {
+        let k = EventKind::PartSerialAssigned;
+        let s = k.as_str();
+        assert_eq!(s, "part.serial_assigned");
+        assert!(s.starts_with("part."), "{s} must start with part.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    #[test]
+    fn s358_part_uid_marked_round_trips() {
+        let k = EventKind::PartUidMarked;
+        let s = k.as_str();
+        assert_eq!(s, "part.uid_marked");
+        assert!(s.starts_with("part."), "{s} must start with part.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    /// S358 — the two `part.*` kinds share the new prefix family, carry NO
+    /// other prefix, and are distinct from each other AND from a sample of
+    /// every other prefix family. A collision (or a wrong prefix) would either
+    /// mis-bucket a serialization row into a fiscal / manufacturing / quoting /
+    /// access-trail / material-traceability bucket OR let the per-OUTGOING-
+    /// invoice export bundle's `invoice.*` glob sweep a part-serialization row —
+    /// both are the silent-omission failure mode CLAUDE.md rule 12 names.
+    #[test]
+    fn s358_part_kinds_use_part_prefix_and_are_distinct() {
+        let new = [EventKind::PartSerialAssigned, EventKind::PartUidMarked];
+        for k in &new {
+            let s = k.as_str();
+            assert!(s.starts_with("part."), "{s} must start with part.");
+            for foreign in [
+                "invoice.",
+                "system.",
+                "mes.",
+                "quote.",
+                "inventory.",
+                "email.",
+                "personnel.",
+                "material.",
+            ] {
+                assert!(!s.starts_with(foreign), "{s} must not start with {foreign}");
+            }
+        }
+        // Distinct within the family.
+        assert_ne!(
+            new[0].as_str(),
+            new[1].as_str(),
+            "{} collides with {}",
+            new[0].as_str(),
+            new[1].as_str()
+        );
+        // Distinct from a sample sibling per other prefix family.
+        let strs: Vec<&str> = new.iter().map(EventKind::as_str).collect();
+        for k in &strs {
+            for sibling in [
+                EventKind::InvoiceDraftCreated,
+                EventKind::FirstProdLaunchAcknowledged,
+                EventKind::MesAdapterEvent,
+                EventKind::QuotePricingOperatorAccepted,
+                EventKind::MaterialCatalogueChanged,
+                EventKind::MaterialReserved,
+                EventKind::EmailRelaySent,
+                EventKind::PersonnelIdRegistered,
+                EventKind::MaterialCertAttached,
+            ] {
+                assert_ne!(
+                    *k,
+                    sibling.as_str(),
+                    "{k} collides with foreign-family {}",
+                    sibling.as_str()
+                );
+            }
+        }
+    }
+
+    /// S358 — pin the documented `part.serial_assigned` payload shape so a
+    /// future firing site has a stable contract. The kind stores a free-form
+    /// `serde_json::Value` (same posture as the `material.*` / `personnel.*`
+    /// kinds); this asserts the documented fields are present with the
+    /// documented JSON types after a serialize → parse round-trip. The optional
+    /// `related_invoice_id` / `related_work_order_id` are exercised so the
+    /// document-linked assignment is pinned too.
+    #[test]
+    fn s358_part_serial_assigned_payload_serializes() {
+        let payload = serde_json::json!({
+            "part_id": "PRT-7781",
+            "serial_number": "SN-0001",
+            "assigned_at_ms": 1_750_000_000_000_i64,
+            "assigned_by_operator_id": "mock-op-001",
+            "related_invoice_id": "INV-2026-0042",
+            "related_work_order_id": "WO-2026-0099",
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["part_id"].is_string());
+        assert!(parsed["serial_number"].is_string());
+        assert!(parsed["assigned_at_ms"].is_i64());
+        assert!(parsed["assigned_by_operator_id"].is_string());
+        assert!(parsed["related_invoice_id"].is_string());
+        assert!(parsed["related_work_order_id"].is_string());
+    }
+
+    /// S358 — pin the documented `part.uid_marked` payload shape. `uid_iri` is
+    /// the rendered MIL-STD-130N IRI (the firing site builds it through
+    /// `aberp_compliance::uid` before it reaches the ledger);
+    /// `mil_std_130_compliant` is the bool format-gate verdict and must survive
+    /// as a bool.
+    #[test]
+    fn s358_part_uid_marked_payload_serializes() {
+        let payload = serde_json::json!({
+            "part_id": "PRT-7781",
+            "uid_iri": "0LH1234567ABC123SN-0001",
+            "uid_construct_code": "construct_1",
+            "mil_std_130_compliant": true,
+            "marked_at_ms": 1_750_000_000_000_i64,
+            "marked_by_operator_id": "mock-op-001",
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["part_id"].is_string());
+        assert!(parsed["uid_iri"].is_string());
+        assert!(parsed["uid_construct_code"].is_string());
+        assert!(parsed["mil_std_130_compliant"].is_boolean());
+        assert!(parsed["marked_at_ms"].is_i64());
+        assert!(parsed["marked_by_operator_id"].is_string());
     }
 }
