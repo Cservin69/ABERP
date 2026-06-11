@@ -1673,7 +1673,10 @@ pub(crate) fn resolved_writeback_url(base: &str, quote_id: &str, suffix: &str) -
 /// unit-testable. Auth verdicts (401/403) take precedence over the
 /// Content-Type gate because they are actionable as auth regardless of the
 /// body the CDN attached.
-fn classify_writeback_response(
+// `pub(crate)` so the operator accept-on-behalf POST in `serve.rs`
+// reuses the SAME transport-vs-app classifier as the priced-writeback
+// (CLAUDE.md #8/#13 — one gate, no drift).
+pub(crate) fn classify_writeback_response(
     status: u16,
     content_type: Option<&str>,
     body: &str,
@@ -1799,7 +1802,7 @@ fn classify_response_gate(
 /// Timeout`]; everything else (connect / DNS / TLS / body drop) →
 /// [`WritebackOutcome::TransportError`]. The Display is run through
 /// `response_excerpt` to bearer-scrub + bound it.
-fn classify_send_error(e: &reqwest::Error) -> WritebackOutcome {
+pub(crate) fn classify_send_error(e: &reqwest::Error) -> WritebackOutcome {
     if e.is_timeout() {
         return WritebackOutcome::Timeout;
     }

@@ -866,7 +866,10 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::QuotePollOutcome
         // S350 / PR-39 — operator material-grade edit. App-layer JSON
         // payload, never NAV XML bytes.
-        | EventKind::QuotePricingMaterialEdited => None,
+        | EventKind::QuotePricingMaterialEdited
+        // S354 / PR-42 — operator accept-on-behalf. App-layer JSON
+        // payload (channel / note / outcome tag), never NAV XML bytes.
+        | EventKind::QuotePricingOperatorAccepted => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

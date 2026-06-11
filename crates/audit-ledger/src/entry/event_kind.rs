@@ -1785,6 +1785,37 @@ pub enum EventKind {
     /// F12 four-edit ritual fires once.
     QuotePricingMaterialEdited,
 
+    /// S354 / PR-42 (U16) — operator accept-on-behalf. The audit-of-record
+    /// for marking a quote accepted when the customer accepted
+    /// off-channel (phone / e-mail / in person / other) instead of
+    /// clicking the DEAL link. Distinct from the customer-owned
+    /// typed-ACCEPT path (which the storefront records itself); this is
+    /// ABERP's local commitment, emitted on EVERY attempt regardless of
+    /// whether the storefront writeback succeeded, so a forensic walker
+    /// sees both the successful accept and any failed-sync retries.
+    ///
+    /// Carries `quote_id`, `tenant_id`, `channel` (closed vocab:
+    /// `phone` / `email` / `in_person` / `other`), `note` (operator free
+    /// text), `operator_user_id` (the Bearer-subject operator login who
+    /// accepted on the customer's behalf), `accepted_at_ms` (the epoch-ms
+    /// stamp bound into the HMAC sent to the storefront),
+    /// `customer_confirmation_path` (optional operator-supplied path to a
+    /// CC screenshot / scanned confirmation), `outcome` (the
+    /// `WritebackOutcome` tag of the storefront POST: `success` /
+    /// `routing_misconfigured` / `app_rejected` / …), `retry_available`
+    /// (`true` for any non-`success` outcome — the storefront state was
+    /// not advanced so the operator may re-attempt; `false` once
+    /// synced), `writeback_http_status` (nullable),
+    /// `writeback_body_excerpt` (nullable, ≤200 chars), `actor`,
+    /// `idempotency_key`
+    /// (`quote_operator_accepted:<quote_id>:<accepted_at_ms>` — the
+    /// per-attempt timestamp disambiguates a retried accept the way the
+    /// per-stage `attempt_n` suffix does elsewhere).
+    ///
+    /// `quote.*` prefix family. Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePricingOperatorAccepted,
+
     /// S307 / PR-276 — one entry per email-outbox poll cycle. Fires
     /// once per successful `GET /api/internal/email-queue` against the
     /// storefront, regardless of whether the cycle returned 0 entries
@@ -2016,6 +2047,7 @@ impl EventKind {
             EventKind::QuotePricingFailureClassified => "quote.pricing_failure_classified",
             EventKind::QuotePricedWritebackOutcome => "quote.priced_writeback_outcome",
             EventKind::QuotePricingMaterialEdited => "quote.material_grade_edited",
+            EventKind::QuotePricingOperatorAccepted => "quote.operator_accepted",
             EventKind::QuotePollOutcome => "quote.poll_outcome",
             EventKind::EmailOutboxFetched => "quote.email_outbox_fetched",
             EventKind::EmailOutboxClaimed => "quote.email_outbox_claimed",
@@ -2131,6 +2163,7 @@ impl EventKind {
             "quote.pricing_failure_classified" => Ok(EventKind::QuotePricingFailureClassified),
             "quote.priced_writeback_outcome" => Ok(EventKind::QuotePricedWritebackOutcome),
             "quote.material_grade_edited" => Ok(EventKind::QuotePricingMaterialEdited),
+            "quote.operator_accepted" => Ok(EventKind::QuotePricingOperatorAccepted),
             "quote.poll_outcome" => Ok(EventKind::QuotePollOutcome),
             "quote.email_outbox_fetched" => Ok(EventKind::EmailOutboxFetched),
             "quote.email_outbox_claimed" => Ok(EventKind::EmailOutboxClaimed),
@@ -2239,6 +2272,7 @@ mod tests {
             EventKind::QuotePricedWritebackOutcome,
             EventKind::QuotePollOutcome,
             EventKind::QuotePricingMaterialEdited,
+            EventKind::QuotePricingOperatorAccepted,
             EventKind::EmailOutboxFetched,
             EventKind::EmailOutboxClaimed,
             EventKind::EmailOutboxSent,
@@ -4239,6 +4273,44 @@ mod tests {
             EventKind::QuotePricingPosted,
             EventKind::QuotePricingFailed,
             EventKind::QuotePricingFailureClassified,
+            EventKind::QuotePricedWritebackOutcome,
+            EventKind::QuotePollOutcome,
+        ] {
+            assert_ne!(
+                s,
+                sibling.as_str(),
+                "{s} collides with {}",
+                sibling.as_str()
+            );
+        }
+    }
+
+    /// S354 / PR-42 (U16) — the operator accept-on-behalf kind. Storage
+    /// string is `quote.operator_accepted` (operator-readable when a
+    /// forensic walker greps `quote.*` for "who accepted this quote, by
+    /// what channel"); a collision with the customer-owned accept or any
+    /// per-stage kind would mis-route the off-channel acceptance into the
+    /// wrong bucket and hide who marked it accepted.
+    #[test]
+    fn s354_operator_accepted_kind_round_trips_and_is_distinct() {
+        let k = EventKind::QuotePricingOperatorAccepted;
+        let s = k.as_str();
+        assert_eq!(s, "quote.operator_accepted");
+        assert!(s.starts_with("quote."), "{s} must start with quote.");
+        assert!(
+            !s.starts_with("invoice."),
+            "{s} must not start with invoice."
+        );
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+        for sibling in [
+            EventKind::QuotePricingFetched,
+            EventKind::QuotePricingPosted,
+            EventKind::QuotePricingFailed,
+            EventKind::QuotePricingMaterialEdited,
             EventKind::QuotePricedWritebackOutcome,
             EventKind::QuotePollOutcome,
         ] {

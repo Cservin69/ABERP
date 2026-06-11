@@ -3257,6 +3257,88 @@ export function parseMaterialEditError(e: unknown): MaterialEditError {
   return new MaterialEditError("unknown", status, raw);
 }
 
+/** S354 / PR-42 (U16) — request body for operator accept-on-behalf. */
+export interface AcceptQuoteRequest {
+  channel: "phone" | "email" | "in_person" | "other";
+  note: string;
+  /** Optional operator-supplied path/reference to a CC confirmation. */
+  customer_confirmation_path?: string;
+}
+
+/** S354 / PR-42 (U16) — 200 body of a synced operator accept. Mirrors
+ * `serve::AcceptQuotePricingJobResponse`. */
+export interface AcceptQuoteOutcome {
+  quote_id: string;
+  accepted_at_ms: number;
+  status: string;
+  outcome: string;
+}
+
+/** S354 / PR-42 (U16) — typed wrapper carrying the parsed status + machine
+ * code so the panel picks the right inline copy. `code` is the backend
+ * `error` field (e.g. `JobAlreadyAccepted`, `JobNotAcceptable`,
+ * `WritebackFailed`); `outcome` is the `WritebackOutcome` tag on a 502. */
+export class AcceptQuoteError extends Error {
+  readonly code: string;
+  readonly status: number;
+  readonly outcome: string | null;
+
+  constructor(code: string, status: number, message: string, outcome: string | null = null) {
+    super(message);
+    this.code = code;
+    this.status = status;
+    this.outcome = outcome;
+    this.name = "AcceptQuoteError";
+  }
+}
+
+/** S354 / PR-42 (U16) — operator accept-on-behalf.
+ * `POST /api/quote-pricing-jobs/:quote_id/accept`. On 400/409/502 the
+ * promise rejects with an `AcceptQuoteError` carrying the typed `code`
+ * (and `outcome` tag for a writeback-failure 502) so the panel branches
+ * to the right inline message. On success the quote is `approved`
+ * storefront-side and the caller refreshes from the detail endpoint. */
+export async function acceptQuotePricingJob(
+  quoteId: string,
+  body: AcceptQuoteRequest,
+): Promise<AcceptQuoteOutcome> {
+  try {
+    return await invoke<AcceptQuoteOutcome>("accept_quote_pricing_job", {
+      quoteId,
+      body,
+    });
+  } catch (e) {
+    throw parseAcceptQuoteError(e);
+  }
+}
+
+/** S354 / PR-42 (U16) — lossy parse of `forward_post`'s wrapped non-2xx
+ * string (`backend returned 409 ...: {"error":"JobAlreadyAccepted"}` /
+ * `... 502 ...: {"error":"WritebackFailed","outcome":"routing_misconfigured",...}`)
+ * into a typed `AcceptQuoteError`. Exported for the unit test. */
+export function parseAcceptQuoteError(e: unknown): AcceptQuoteError {
+  if (e instanceof AcceptQuoteError) return e;
+  const raw = e instanceof Error ? e.message : String(e);
+  const statusMatch = raw.match(/backend returned (\d{3})/);
+  const status = statusMatch ? Number(statusMatch[1]) : 0;
+  const bodyMatch = raw.match(/:\s*(\{.*\})\s*$/);
+  if (bodyMatch) {
+    try {
+      const parsed = JSON.parse(bodyMatch[1]) as {
+        error?: string;
+        outcome?: string;
+        message?: string;
+      };
+      const code = parsed.error ?? "unknown";
+      const outcome = typeof parsed.outcome === "string" ? parsed.outcome : null;
+      return new AcceptQuoteError(code, status, parsed.message ?? raw, outcome);
+    } catch {
+      // Fall through to unknown.
+    }
+  }
+  return new AcceptQuoteError("unknown", status, raw);
+}
+
 /** S349 / PR-40 (U1) — the priced breakdown sub-object on a job detail.
  * Mirrors `aberp_quote_engine::QuoteBreakdown`. Every field is optional
  * on the wire so a future engine-schema change can't break the panel
