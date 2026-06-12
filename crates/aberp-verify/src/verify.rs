@@ -1064,6 +1064,25 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
     })
 }
 
+/// S364 / ADR-0081 — coverage drift tripwire.
+///
+/// `extract_nav_xml` above is exhaustive on `EventKind`, so adding a
+/// variant already breaks the build until an arm exists. But the
+/// compiler only forces *an* arm, not a *correct* one — a contributor
+/// could lazily fold a new variant into the no-NAV `(None, "")` group
+/// without deciding whether it actually carries NAV bytes. This
+/// `const _` pins the variant count: when `EventKind::ALL_KINDS_COUNT`
+/// changes, this assertion fails at compile time, forcing a deliberate
+/// revisit of the arm above for the new variant. Belt-and-braces with
+/// the per-family `*_no_nav_bytes` runtime tests below.
+const _: () = {
+    assert!(
+        EventKind::ALL_KINDS_COUNT == 103,
+        "EventKind count changed — re-review aberp-verify::extract_nav_xml \
+         for the new variant's NAV decision, then bump this pin (ADR-0081)"
+    );
+};
+
 /// Check that the verbatim XML bytes start with one of the expected
 /// root-element local names per ADR-0035 §4. Namespaces are matched
 /// at the local-name level (`<ns0:ManageInvoiceResponse>` accepts
@@ -1411,6 +1430,136 @@ mod tests {
             known_kinds.len(),
             "round-trip count must match known kinds"
         );
+    }
+
+    /// The nine NAV-bearing kinds whose payloads carry verbatim NAV XML
+    /// bytes (request_xml / response_xml). Every OTHER `EventKind` must
+    /// produce `NavExtraction { bytes: None, .. }` — that is the
+    /// no-leakage invariant the per-family tests below pin. Kept in one
+    /// place so the `all_kinds_no_nav_bytes` sweep and the per-family
+    /// tests agree on the allowlist.
+    const NAV_BEARING: &[EventKind] = &[
+        EventKind::InvoiceSubmissionAttempt,
+        EventKind::InvoiceSubmissionResponse,
+        EventKind::InvoiceAckStatus,
+        EventKind::InvoiceAnnulmentSubmissionAttempt,
+        EventKind::InvoiceAnnulmentSubmissionResponse,
+        EventKind::InvoiceAnnulmentAckStatus,
+        EventKind::InvoiceAnnulmentReceiverConfirmation,
+        EventKind::InvoiceSubmissionAttemptFailed,
+        EventKind::InvoiceCheckPerformed,
+    ];
+
+    /// Build a one-entry ledger of `kind` carrying `payload`, return the
+    /// reconstructed `Entry` the verifier sees. Non-NAV kinds ignore the
+    /// payload in `extract_nav_xml`, so `b"{}"` is a sufficient stand-in.
+    fn entry_of(kind: EventKind, payload: &[u8]) -> Entry {
+        let (mut ledger, actor) = fixture_ledger();
+        ledger
+            .append(kind, payload.to_vec(), actor, None)
+            .expect("append");
+        ledger.entries().expect("entries").remove(0)
+    }
+
+    /// Assert every kind in `family` extracts to no NAV bytes. Shared by
+    /// the per-family pins below (S364 / ADR-0081 belt-and-braces — the
+    /// exhaustive match already forces an arm at compile time; this pins
+    /// that the arm's verdict is actually "no NAV bytes" at runtime).
+    fn assert_family_no_nav(family: &[EventKind]) {
+        for kind in family {
+            let entry = entry_of(kind.clone(), b"{}");
+            let extraction = extract_nav_xml(&entry).expect("non-NAV kind decodes");
+            assert!(
+                extraction.bytes.is_none(),
+                "{} leaked NAV bytes from the verifier's extract_nav_xml",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn personnel_no_nav_bytes() {
+        assert_family_no_nav(&[
+            EventKind::PersonnelIdRegistered,
+            EventKind::PersonnelSignatureApplied,
+            EventKind::PersonnelAccessGranted,
+            EventKind::PersonnelAccessDenied,
+        ]);
+    }
+
+    #[test]
+    fn material_no_nav_bytes() {
+        assert_family_no_nav(&[
+            EventKind::MaterialCertAttached,
+            EventKind::MaterialHeatLotAssigned,
+        ]);
+    }
+
+    #[test]
+    fn part_no_nav_bytes() {
+        assert_family_no_nav(&[EventKind::PartSerialAssigned, EventKind::PartUidMarked]);
+    }
+
+    #[test]
+    fn export_no_nav_bytes() {
+        assert_family_no_nav(&[
+            EventKind::ExportClassificationSet,
+            EventKind::ExportAccessCheck,
+            EventKind::ExportShipmentLogged,
+        ]);
+    }
+
+    #[test]
+    fn cui_no_nav_bytes() {
+        assert_family_no_nav(&[EventKind::CuiMarkingApplied, EventKind::CuiAccessEvent]);
+    }
+
+    #[test]
+    fn supplier_no_nav_bytes() {
+        assert_family_no_nav(&[
+            EventKind::SupplierDpasPrioritySet,
+            EventKind::SupplierExportScreened,
+        ]);
+    }
+
+    #[test]
+    fn incident_no_nav_bytes() {
+        assert_family_no_nav(&[EventKind::IncidentCyberDetected]);
+    }
+
+    /// S364 / ADR-0081 — the future-proof sweep. Every variant in
+    /// `EventKind::ALL_KINDS` that is NOT on the `NAV_BEARING` allowlist
+    /// MUST extract to no NAV bytes. A *new* variant automatically lands
+    /// here: if its `extract_nav_xml` arm wrongly routes it to a
+    /// NAV-decode path, the `b"{}"` payload fails to deserialize and the
+    /// `expect` panics; if it returns bytes, the assert fires. Either way
+    /// a leak fails the test without anyone remembering to add a
+    /// per-family pin. Also pins that `NAV_BEARING` itself stays a subset
+    /// of the known kinds.
+    #[test]
+    fn all_kinds_no_nav_bytes() {
+        for kind in EventKind::ALL_KINDS {
+            if NAV_BEARING.contains(kind) {
+                continue;
+            }
+            let entry = entry_of(kind.clone(), b"{}");
+            let extraction = extract_nav_xml(&entry)
+                .unwrap_or_else(|e| panic!("{} should decode as non-NAV: {e}", kind.as_str()));
+            assert!(
+                extraction.bytes.is_none(),
+                "{} is not on the NAV_BEARING allowlist yet leaked NAV bytes — \
+                 re-review extract_nav_xml (ADR-0081)",
+                kind.as_str()
+            );
+        }
+        // Every allowlisted kind must be a real, known variant.
+        for kind in NAV_BEARING {
+            assert!(
+                EventKind::ALL_KINDS.contains(kind),
+                "NAV_BEARING lists a kind absent from ALL_KINDS: {}",
+                kind.as_str()
+            );
+        }
     }
 
     /// End-to-end smoke: build a one-entry ledger, recompute its

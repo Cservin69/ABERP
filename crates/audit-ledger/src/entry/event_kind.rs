@@ -2646,9 +2646,133 @@ impl EventKind {
     }
 }
 
+impl EventKind {
+    /// Every `EventKind` variant, in `as_str` declaration order.
+    ///
+    /// Hand-maintained (no proc-macro per S364 scope). Adding a variant
+    /// forces edits to [`EventKind::as_str`] and
+    /// [`EventKind::from_storage_str`] (compile error / round-trip test);
+    /// the convention — pinned by `all_kinds_count_is_pinned` below — is
+    /// to add it here too. `ALL_KINDS_COUNT` then changes, which trips
+    /// the `const _` drift assertions in `aberp-verify::extract_nav_xml`
+    /// and `export_invoice_bundle::extract_nav_xml` so a contributor must
+    /// re-review the NAV-leakage gate for the new variant (ADR-0081).
+    pub const ALL_KINDS: &[EventKind] = &[
+        EventKind::Test,
+        EventKind::InvoiceSequenceReserved,
+        EventKind::InvoiceDraftCreated,
+        EventKind::InvoiceSubmissionAttempt,
+        EventKind::InvoiceSubmissionResponse,
+        EventKind::InvoiceAckStatus,
+        EventKind::InvoiceRetryRequested,
+        EventKind::InvoiceMarkedAbandoned,
+        EventKind::InvoiceStornoIssued,
+        EventKind::InvoiceModificationIssued,
+        EventKind::InvoiceTechnicalAnnulmentRequested,
+        EventKind::InvoiceAnnulmentSubmissionAttempt,
+        EventKind::InvoiceAnnulmentSubmissionResponse,
+        EventKind::InvoiceAnnulmentAckStatus,
+        EventKind::InvoiceAnnulmentReceiverConfirmation,
+        EventKind::InvoiceSubmissionAttemptFailed,
+        EventKind::InvoiceCheckPerformed,
+        EventKind::InvoicePaymentRecorded,
+        EventKind::InvoiceEmailedSent,
+        EventKind::FirstProdLaunchAcknowledged,
+        EventKind::UpgradeSnapshotMismatch,
+        EventKind::IncomingInvoiceIngested,
+        EventKind::IncomingInvoiceStatusChanged,
+        EventKind::IncomingInvoiceSyncCycleCompleted,
+        EventKind::InvoiceRestoredFromNav,
+        EventKind::QuoteIntakePollCompleted,
+        EventKind::DaemonShutdownCompleted,
+        EventKind::RestoreBuyerBackfillCycleCompleted,
+        EventKind::RestoreFromNavRun,
+        EventKind::ExtNavPartnerManualLink,
+        EventKind::MesAdapterEvent,
+        EventKind::StockMovementRecorded,
+        EventKind::WorkOrderCreated,
+        EventKind::WorkOrderStateChanged,
+        EventKind::RoutingOpStateChanged,
+        EventKind::QaInspectionCreated,
+        EventKind::QaInspectionDecided,
+        EventKind::DispatchCreated,
+        EventKind::DispatchShipped,
+        EventKind::InvoiceStaged,
+        EventKind::InvoiceDraftDeleted,
+        EventKind::InvoicePickedUpFromQuote,
+        EventKind::QuoteIntakePollAttempted,
+        EventKind::QuoteIntakeRowAdded,
+        EventKind::QuoteIntakePollFailed,
+        EventKind::AdapterAdded,
+        EventKind::AdapterUpdated,
+        EventKind::AdapterRemoved,
+        EventKind::AdapterHealthTransitioned,
+        EventKind::MaterialCatalogueChanged,
+        EventKind::MaterialCataloguePushed,
+        EventKind::ComplexityRulesChanged,
+        EventKind::ToleranceMultipliersChanged,
+        EventKind::ParametersChanged,
+        EventKind::StockAdjustmentsChanged,
+        EventKind::QuoteStockAlertTriggered,
+        EventKind::QuoteDealIssued,
+        EventKind::QuoteSalesOrderCreated,
+        EventKind::QuoteWorkOrderCreated,
+        EventKind::MaterialReserved,
+        EventKind::MaterialCommitted,
+        EventKind::MaterialConsumed,
+        EventKind::MaterialReleased,
+        EventKind::QuotePricingFetched,
+        EventKind::QuotePricingExtracted,
+        EventKind::QuotePricingPriced,
+        EventKind::QuotePricingRendered,
+        EventKind::QuotePricingPosted,
+        EventKind::QuotePricingFailed,
+        EventKind::EmailRelayQueued,
+        EventKind::EmailRelaySent,
+        EventKind::EmailRelayFailed,
+        EventKind::PipelinePythonResolved,
+        EventKind::QuotePricingDaemonPanicked,
+        EventKind::QuotePricingJobsIndexMigrated,
+        EventKind::QuotePricingFailureClassified,
+        EventKind::QuotePricedWritebackOutcome,
+        EventKind::QuotePricingMaterialEdited,
+        EventKind::QuotePricingOperatorAccepted,
+        EventKind::QuotePollOutcome,
+        EventKind::EmailOutboxFetched,
+        EventKind::EmailOutboxClaimed,
+        EventKind::EmailOutboxSent,
+        EventKind::EmailOutboxFailed,
+        EventKind::QuotePdfRerenderEnqueued,
+        EventKind::QuotePdfRerendered,
+        EventKind::QuotePdfRerenderFailed,
+        EventKind::PersonnelIdRegistered,
+        EventKind::PersonnelSignatureApplied,
+        EventKind::PersonnelAccessGranted,
+        EventKind::PersonnelAccessDenied,
+        EventKind::MaterialCertAttached,
+        EventKind::MaterialHeatLotAssigned,
+        EventKind::PartSerialAssigned,
+        EventKind::PartUidMarked,
+        EventKind::ExportClassificationSet,
+        EventKind::ExportAccessCheck,
+        EventKind::ExportShipmentLogged,
+        EventKind::CuiMarkingApplied,
+        EventKind::CuiAccessEvent,
+        EventKind::SupplierDpasPrioritySet,
+        EventKind::SupplierExportScreened,
+        EventKind::IncidentCyberDetected,
+    ];
+
+    /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
+    /// gates so a variant addition forces a deliberate re-review
+    /// (ADR-0081).
+    pub const ALL_KINDS_COUNT: usize = Self::ALL_KINDS.len();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     /// Round-trip every known variant. If a future contributor adds a
     /// variant + `as_str` arm but forgets the `from_storage_str` arm,
@@ -2766,11 +2890,59 @@ mod tests {
             EventKind::SupplierExportScreened,
             EventKind::IncidentCyberDetected,
         ];
-        for v in variants {
+        for v in &variants {
             let s = v.as_str();
             let parsed = EventKind::from_storage_str(s).unwrap_or_else(|e| panic!("{s:?} -> {e}"));
-            assert_eq!(parsed, v, "round-trip mismatch for {s:?}");
+            assert_eq!(&parsed, v, "round-trip mismatch for {s:?}");
         }
+        // Double-entry: this hand-list and `EventKind::ALL_KINDS` are two
+        // independently-maintained enumerations. Tying them here means a
+        // contributor who adds a variant to one but forgets the other is
+        // caught at test time. That is what makes `ALL_KINDS_COUNT` a
+        // trustworthy drift signal for the NAV-leakage gates (ADR-0081):
+        // it only stays put if BOTH lists stayed put. Compared as sets —
+        // the two lists need not share an ordering, only their membership.
+        let round_trip_set: BTreeSet<&str> = variants.iter().map(|k| k.as_str()).collect();
+        let all_kinds_set: BTreeSet<&str> =
+            EventKind::ALL_KINDS.iter().map(|k| k.as_str()).collect();
+        assert_eq!(
+            round_trip_set, all_kinds_set,
+            "EventKind::ALL_KINDS drifted from the round-trip variant list — \
+             add the new variant to both (and re-review the NAV-leakage gates \
+             per ADR-0081)"
+        );
+    }
+
+    /// Pin the variant count. A bump here is the deliberate signal that a
+    /// new `EventKind` landed; the `const _` drift assertions in
+    /// `aberp-verify` and `export_invoice_bundle` carry the same number,
+    /// so all three must be updated together — forcing a re-review of the
+    /// NAV-leakage gate for the new variant (ADR-0081).
+    #[test]
+    fn all_kinds_count_is_pinned() {
+        assert_eq!(
+            EventKind::ALL_KINDS_COUNT,
+            103,
+            "EventKind count changed — update this pin AND the matching \
+             `const _` drift assertions in aberp-verify::extract_nav_xml and \
+             export_invoice_bundle::extract_nav_xml, re-reviewing the new \
+             variant's NAV decision (ADR-0081)"
+        );
+    }
+
+    /// `ALL_KINDS` entries are distinct (no accidental duplicate, which
+    /// would make `ALL_KINDS_COUNT` over-count and mask a missing variant).
+    #[test]
+    fn all_kinds_has_no_duplicates() {
+        let mut seen = BTreeSet::new();
+        for k in EventKind::ALL_KINDS {
+            assert!(
+                seen.insert(k.as_str()),
+                "duplicate in ALL_KINDS: {}",
+                k.as_str()
+            );
+        }
+        assert_eq!(seen.len(), EventKind::ALL_KINDS_COUNT);
     }
 
     #[test]

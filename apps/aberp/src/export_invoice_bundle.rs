@@ -938,6 +938,22 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
     }))
 }
 
+/// S364 / ADR-0081 — coverage drift tripwire (mirror of the one in
+/// `aberp-verify::extract_nav_xml`). The match above is exhaustive on
+/// `EventKind`, so a new variant breaks the build until an arm exists —
+/// but the compiler only forces *an* arm, not a *correct* one. This
+/// `const _` pins the variant count so that when `ALL_KINDS_COUNT`
+/// changes, compilation fails here, forcing a deliberate re-review of
+/// whether the new variant carries NAV bytes. Belt-and-braces with the
+/// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
+const _: () = {
+    assert!(
+        EventKind::ALL_KINDS_COUNT == 103,
+        "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
+         for the new variant's NAV decision, then bump this pin (ADR-0081)"
+    );
+};
+
 /// Pack the manifest + chain.jsonl + nav/* files into a
 /// `.tar.zst` archive at `out_path`. The archive's top-level
 /// directory is `bundle/` so the inspector untarring it gets
@@ -1762,6 +1778,46 @@ mod tests {
             "{} must produce no nav/ file",
             EventKind::IncidentCyberDetected.as_str()
         );
+    }
+
+    /// S364 / ADR-0081 — future-proof sweep over the bundle writer's
+    /// gate. Every variant in `EventKind::ALL_KINDS` that is not one of
+    /// the nine NAV-bearing invoice kinds MUST produce no `nav/` file. A
+    /// *new* variant lands here automatically: if its `extract_nav_xml`
+    /// arm wrongly routes it to a NAV path, `b"{}"` fails to decode and
+    /// the `expect` panics; if it returns a file, the assert fires.
+    /// Catches a leak even when nobody adds a per-family pin above.
+    #[test]
+    fn all_kinds_produce_no_nav_file_except_nav_bearing() {
+        const NAV_BEARING: &[EventKind] = &[
+            EventKind::InvoiceSubmissionAttempt,
+            EventKind::InvoiceSubmissionResponse,
+            EventKind::InvoiceAckStatus,
+            EventKind::InvoiceAnnulmentSubmissionAttempt,
+            EventKind::InvoiceAnnulmentSubmissionResponse,
+            EventKind::InvoiceAnnulmentAckStatus,
+            EventKind::InvoiceAnnulmentReceiverConfirmation,
+            EventKind::InvoiceSubmissionAttemptFailed,
+            EventKind::InvoiceCheckPerformed,
+        ];
+        for kind in EventKind::ALL_KINDS {
+            if NAV_BEARING.contains(kind) {
+                continue;
+            }
+            let (mut ledger, actor, _bh) = fixture_ledger();
+            ledger
+                .append(kind.clone(), b"{}".to_vec(), actor, None)
+                .unwrap();
+            let entries = ledger.entries().unwrap();
+            let nav = extract_nav_xml(&entries[0])
+                .unwrap_or_else(|e| panic!("{} should decode as non-NAV: {e}", kind.as_str()));
+            assert!(
+                nav.is_none(),
+                "{} is not NAV-bearing yet produced a nav/ file — \
+                 re-review extract_nav_xml (ADR-0081)",
+                kind.as_str()
+            );
+        }
     }
 
     /// ADR-0029 §3: `chain.jsonl` carries one JSON object per
