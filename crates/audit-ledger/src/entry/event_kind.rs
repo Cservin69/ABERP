@@ -2278,6 +2278,65 @@ pub enum EventKind {
     /// `cui.*` prefix family — same segregation rationale as
     /// [`Self::CuiMarkingApplied`].
     CuiAccessEvent,
+
+    /// S361 / PR-48 (ADR-0078) — a DoD Defense Priorities Allocation System
+    /// (DPAS) priority rating was assigned to an approved supplier. FIRST
+    /// member of the new `supplier.*` prefix family — the twelfth — the
+    /// Approved-Vendor-List strand of the aerospace pivot
+    /// (`[[defense-aerospace-pivot]]`). DPAS (15 CFR § 700 / FAR 11.6) lets a
+    /// rated defense order compel a supplier to prioritise it over unrated
+    /// commercial work; recording *which* rating a supplier is approved to
+    /// service is the AVL's accountable anchor for that obligation.
+    ///
+    /// The `dpas_rating` value is the rendered rating the firing site (later
+    /// session) produces through [`aberp_compliance::avl::DpasRating::as_str`]
+    /// — a typed rating renders the string, so a free-text rating can never
+    /// reach the ledger.
+    ///
+    /// Payload (`serde_json::Value`): `partner_id` (the AVL supplier this
+    /// rating attaches to), `dpas_rating` (the rendered rating, e.g.
+    /// `"DX-C1"` / `"DO-C1"` / `"NONE"`), `set_by_operator_id` (who assigned
+    /// it — the accountability anchor), and `set_at_ms` (epoch-ms stamp).
+    ///
+    /// `supplier.*` prefix family — NOT `invoice.*` / `system.*` / `mes.*` /
+    /// `quote.*` / `inventory.*` / `email.*` / `personnel.*` / `material.*` /
+    /// `part.*` / `export.*` / `cui.*`. A new prefix keeps the AVL surface
+    /// globbable on its own (`supplier.*` = "every DPAS / screening decision on
+    /// this install") without sweeping fiscal, manufacturing, quoting,
+    /// access-trail, material-traceability, per-unit-serialization, CUI, or
+    /// export-classification traffic — and the per-OUTGOING-invoice export
+    /// bundle's `invoice.*` glob (ADR-0009 §8) never sweeps a supplier row by
+    /// construction.
+    ///
+    /// No PII at rest: the payload records WHICH partner was rated and WHO
+    /// rated it (operator id — an opaque accountability handle). S361 ships the
+    /// kind only; firing sites land in a later session (no AVL CRUD surface
+    /// exists yet). F12 four-edit ritual fires once for the two sibling
+    /// `supplier.*` kinds.
+    SupplierDpasPrioritySet,
+
+    /// S361 / PR-48 (ADR-0078) — an approved supplier was screened against the
+    /// export-control denied-party lists. The *decision* counterpart to
+    /// [`Self::SupplierDpasPrioritySet`]: a durable record that supplier S was
+    /// run against the BIS Entity List / OFAC SDN / State DDTC debarred lists
+    /// (EAR § 744 / consolidated screening) and the screen returned clear, a
+    /// hit, or an inconclusive result. A denied-party hit blocks transacting,
+    /// so the screening-decision trail is load-bearing — it evidences the AVL
+    /// did its EAR § 744 diligence (the `personnel.access_*` /
+    /// `export.access_check` posture specialised to a supplier screen).
+    ///
+    /// Payload (`serde_json::Value`): `partner_id` (the screened supplier),
+    /// `screening_result` (`"clear"` / `"hit"` / `"inconclusive"` — the
+    /// [`aberp_compliance::avl::ExportScreeningStatus`] outcome vocab),
+    /// `screening_source` (which list / service answered — e.g.
+    /// `"mock-bis-csl"`), `screened_at_ms` (epoch-ms stamp),
+    /// `screened_by_operator_id` (who ran it), and an optional `hit_details`
+    /// (the list / reason string, present only on a hit / inconclusive — never
+    /// on a clear).
+    ///
+    /// `supplier.*` prefix family — same segregation rationale as
+    /// [`Self::SupplierDpasPrioritySet`].
+    SupplierExportScreened,
 }
 
 impl EventKind {
@@ -2396,6 +2455,8 @@ impl EventKind {
             EventKind::ExportShipmentLogged => "export.shipment_logged",
             EventKind::CuiMarkingApplied => "cui.marking_applied",
             EventKind::CuiAccessEvent => "cui.access_event",
+            EventKind::SupplierDpasPrioritySet => "supplier.dpas_priority_set",
+            EventKind::SupplierExportScreened => "supplier.export_screened",
         }
     }
 
@@ -2525,6 +2586,8 @@ impl EventKind {
             "export.shipment_logged" => Ok(EventKind::ExportShipmentLogged),
             "cui.marking_applied" => Ok(EventKind::CuiMarkingApplied),
             "cui.access_event" => Ok(EventKind::CuiAccessEvent),
+            "supplier.dpas_priority_set" => Ok(EventKind::SupplierDpasPrioritySet),
+            "supplier.export_screened" => Ok(EventKind::SupplierExportScreened),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2646,6 +2709,8 @@ mod tests {
             EventKind::ExportShipmentLogged,
             EventKind::CuiMarkingApplied,
             EventKind::CuiAccessEvent,
+            EventKind::SupplierDpasPrioritySet,
+            EventKind::SupplierExportScreened,
         ];
         for v in variants {
             let s = v.as_str();
@@ -5522,5 +5587,151 @@ mod tests {
         assert_eq!(parsed["decision"], "denied");
         assert!(parsed["reason"].is_string());
         assert!(parsed["accessed_at_ms"].is_i64());
+    }
+
+    // ── S361 / PR-48 (ADR-0078) — supplier.* Approved-Vendor-List family ──
+    //
+    // Two kinds open the new `supplier.*` prefix family (the twelfth): the
+    // DPAS-priority-set RECORD event and the export-screened DECISION event.
+    // Per the brief each variant gets a focused round-trip test, each payload
+    // shape is pinned by a serialization test, the family shares one prefix-
+    // and-distinctness test, and a no-NAV-bytes pin lives with the exhaustive-
+    // match consumer (`export_invoice_bundle`).
+
+    #[test]
+    fn s361_supplier_dpas_priority_set_round_trips() {
+        let k = EventKind::SupplierDpasPrioritySet;
+        let s = k.as_str();
+        assert_eq!(s, "supplier.dpas_priority_set");
+        assert!(s.starts_with("supplier."), "{s} must start with supplier.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    #[test]
+    fn s361_supplier_export_screened_round_trips() {
+        let k = EventKind::SupplierExportScreened;
+        let s = k.as_str();
+        assert_eq!(s, "supplier.export_screened");
+        assert!(s.starts_with("supplier."), "{s} must start with supplier.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    /// S361 — the two `supplier.*` kinds share the new prefix family, carry NO
+    /// other prefix, and are distinct from each other AND from a sample of
+    /// every other prefix family. A collision (or a wrong prefix) would either
+    /// mis-bucket an AVL row into a fiscal / manufacturing / quoting /
+    /// access-trail / material-traceability / serialization / CUI / export
+    /// bucket OR let the per-OUTGOING-invoice export bundle's `invoice.*` glob
+    /// sweep an AVL row — both are the silent-omission failure mode CLAUDE.md
+    /// rule 12 names.
+    #[test]
+    fn s361_supplier_kinds_use_supplier_prefix_and_are_distinct() {
+        let new = [
+            EventKind::SupplierDpasPrioritySet,
+            EventKind::SupplierExportScreened,
+        ];
+        for k in &new {
+            let s = k.as_str();
+            assert!(s.starts_with("supplier."), "{s} must start with supplier.");
+            for foreign in [
+                "invoice.",
+                "system.",
+                "mes.",
+                "quote.",
+                "inventory.",
+                "email.",
+                "personnel.",
+                "material.",
+                "part.",
+                "export.",
+                "cui.",
+            ] {
+                assert!(!s.starts_with(foreign), "{s} must not start with {foreign}");
+            }
+        }
+        // Distinct within the family.
+        let strs: Vec<&str> = new.iter().map(EventKind::as_str).collect();
+        for i in 0..strs.len() {
+            for j in (i + 1)..strs.len() {
+                assert_ne!(strs[i], strs[j], "{} collides with {}", strs[i], strs[j]);
+            }
+        }
+        // Distinct from a sample sibling per other prefix family.
+        for k in &strs {
+            for sibling in [
+                EventKind::InvoiceDraftCreated,
+                EventKind::FirstProdLaunchAcknowledged,
+                EventKind::MesAdapterEvent,
+                EventKind::QuotePricingOperatorAccepted,
+                EventKind::MaterialReserved,
+                EventKind::EmailRelaySent,
+                EventKind::PersonnelIdRegistered,
+                EventKind::MaterialCertAttached,
+                EventKind::PartSerialAssigned,
+                EventKind::ExportClassificationSet,
+                EventKind::CuiMarkingApplied,
+            ] {
+                assert_ne!(
+                    *k,
+                    sibling.as_str(),
+                    "{k} collides with foreign-family {}",
+                    sibling.as_str()
+                );
+            }
+        }
+    }
+
+    /// S361 — pin the documented `supplier.dpas_priority_set` payload shape so a
+    /// future firing site has a stable contract. The kind stores a free-form
+    /// `serde_json::Value` (same posture as the `export.*` / `cui.*` kinds);
+    /// this asserts the documented fields are present with the documented JSON
+    /// types after a serialize → parse round-trip. `dpas_rating` is the rendered
+    /// [`aberp_compliance::avl::DpasRating`] string — no PII at rest.
+    #[test]
+    fn s361_supplier_dpas_priority_set_payload_serializes() {
+        let payload = serde_json::json!({
+            "partner_id": "partner-4711",
+            "dpas_rating": "DX-C1",
+            "set_by_operator_id": "mock-op-001",
+            "set_at_ms": 1_750_000_000_000_i64,
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["partner_id"].is_string());
+        assert!(parsed["dpas_rating"].is_string());
+        assert!(parsed["set_by_operator_id"].is_string());
+        assert!(parsed["set_at_ms"].is_i64());
+    }
+
+    /// S361 — pin the documented `supplier.export_screened` payload shape.
+    /// `screening_result` must survive as the `"clear"` / `"hit"` /
+    /// `"inconclusive"` string the firing site writes; `hit_details` is optional
+    /// (present only on a hit / inconclusive).
+    #[test]
+    fn s361_supplier_export_screened_payload_serializes() {
+        let payload = serde_json::json!({
+            "partner_id": "partner-4711",
+            "screening_result": "hit",
+            "screening_source": "mock-bis-csl",
+            "screened_at_ms": 1_750_000_000_000_i64,
+            "screened_by_operator_id": "mock-op-002",
+            "hit_details": "BIS Entity List partial-name match (manual review)",
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["partner_id"].is_string());
+        assert_eq!(parsed["screening_result"], "hit");
+        assert!(parsed["screening_source"].is_string());
+        assert!(parsed["screened_at_ms"].is_i64());
+        assert!(parsed["screened_by_operator_id"].is_string());
+        assert!(parsed["hit_details"].is_string());
     }
 }

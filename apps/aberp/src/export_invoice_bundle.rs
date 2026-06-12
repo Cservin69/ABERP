@@ -904,7 +904,14 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // itself. `cui.*`-not-`invoice.*` posture; never sweeps a per-OUTGOING-
         // invoice export bundle by glob.
         | EventKind::CuiMarkingApplied
-        | EventKind::CuiAccessEvent => None,
+        | EventKind::CuiAccessEvent
+        // S361 / PR-48 — supplier.* Approved-Vendor-List family (ADR-0078).
+        // DPAS-priority-set record + export-screened decision; app-layer JSON
+        // payloads (partner_id / dpas_rating / screening_result / …), never NAV
+        // XML bytes. `supplier.*`-not-`invoice.*` posture; never sweeps a
+        // per-OUTGOING-invoice export bundle by glob.
+        | EventKind::SupplierDpasPrioritySet
+        | EventKind::SupplierExportScreened => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -1686,6 +1693,34 @@ mod tests {
                 .append(
                     kind.clone(),
                     br#"{"entity_id":"DWG-7781-A"}"#.to_vec(),
+                    actor,
+                    None,
+                )
+                .unwrap();
+            let entries = ledger.entries().unwrap();
+            let nav = extract_nav_xml(&entries[0]).unwrap();
+            assert!(nav.is_none(), "{} must produce no nav/ file", kind.as_str());
+        }
+    }
+
+    /// S361 / PR-48 (ADR-0078) — the two `supplier.*` Approved-Vendor-List
+    /// kinds carry app-layer JSON payloads, never NAV XML, so `extract_nav_xml`
+    /// MUST return `None` for each. The Rust exhaustiveness check already forces
+    /// the new variants into the no-NAV-bytes arm at compile time; this is the
+    /// belt-and-braces runtime pin that the verdict actually holds, so a DPAS /
+    /// screening row never produces a `nav/` file in a per-OUTGOING-invoice
+    /// export bundle.
+    #[test]
+    fn extract_nav_xml_returns_none_for_supplier_kinds() {
+        for kind in [
+            EventKind::SupplierDpasPrioritySet,
+            EventKind::SupplierExportScreened,
+        ] {
+            let (mut ledger, actor, _bh) = fixture_ledger();
+            ledger
+                .append(
+                    kind.clone(),
+                    br#"{"partner_id":"partner-4711"}"#.to_vec(),
                     actor,
                     None,
                 )

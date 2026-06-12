@@ -1041,7 +1041,14 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // `invoice.*` posture; never sweeps a per-OUTGOING-invoice bundle.
         // Exhaustiveness arm only.
         | EventKind::CuiMarkingApplied
-        | EventKind::CuiAccessEvent => (None, ""),
+        | EventKind::CuiAccessEvent
+        // S361 / PR-48 — supplier.* Approved-Vendor-List family (ADR-0078).
+        // DPAS-priority-set record + export-screened decision; app-layer JSON
+        // payloads (partner_id / dpas_rating / screening_result / …), never NAV
+        // XML bytes. `supplier.*`-not-`invoice.*` posture; never sweeps a
+        // per-OUTGOING-invoice bundle. Exhaustiveness arm only.
+        | EventKind::SupplierDpasPrioritySet
+        | EventKind::SupplierExportScreened => (None, ""),
     };
 
     Ok(NavExtraction {

@@ -35,11 +35,53 @@ pub enum DpasRating {
     DxC1,
 }
 
-/// Where a supplier stands against the export / denied-party screen.
+impl DpasRating {
+    /// Render in the on-disk / audit-payload form — the canonical string the
+    /// S361 `supplier.dpas_priority_set` firing site writes and the partners
+    /// `dpas_rating` column stores. Paired with [`DpasRating::from_storage_str`]
+    /// as a round-trip-proven pair, mirroring the export-control
+    /// [`crate::export_control::Jurisdiction`] discipline (S359). A free-text
+    /// rating can never reach the ledger or the column — it must round-trip
+    /// through this typed pair first.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DpasRating::None => "NONE",
+            DpasRating::DoC1 => "DO-C1",
+            DpasRating::DxC1 => "DX-C1",
+        }
+    }
+
+    /// Parse the on-disk / audit-payload form back into a `DpasRating`. Errors
+    /// on unknown strings — silent fallback would mask schema drift (CLAUDE.md
+    /// rule 12, "fail loud"); a mis-parse of an unrecognised rating to
+    /// [`DpasRating::None`] would silently strip a defense order's priority.
+    pub fn from_storage_str(s: &str) -> Result<Self, &'static str> {
+        match s {
+            "NONE" => Ok(DpasRating::None),
+            "DO-C1" => Ok(DpasRating::DoC1),
+            "DX-C1" => Ok(DpasRating::DxC1),
+            _ => Err("unknown DpasRating storage string"),
+        }
+    }
+}
+
+/// The outcome of screening a supplier against the export-control denied-party
+/// lists — the stored status on the AVL entry (S361, ADR-0078).
 ///
-/// Distinct from [`crate::export_control::ScreeningResult`]: that is the
-/// *outcome of a screening call*, this is the *stored status* on the AVL
-/// entry, which can be `NotScreened` before the first screen runs.
+/// Distinct from [`crate::export_control::ScreeningResult`]: that is the typed
+/// *adjudication* of a single screening call (clear / restricted-with-reason /
+/// denied-with-reason); this is the *stored screening-outcome status* on the
+/// AVL entry, which can be `NotScreened` before the first screen runs.
+///
+/// S361 reshapes the S345 scaffold vocabulary onto the denial-list-screening
+/// outcome the BIS Consolidated Screening List / OFAC / State DDTC actually
+/// return — `Clear` (no match), `Hit` (a denied-party match), `Inconclusive`
+/// (a partial / common-name match needing manual review). The placeholder
+/// `Restricted` / `Denied` variants the scaffold guessed are dropped: the
+/// restricted-vs-denied *adjudication* is the job of
+/// [`crate::export_control::ScreeningResult`], not the stored AVL status. These
+/// are the exact tokens the `supplier.export_screened` payload `screening_result`
+/// field and the partners `export_screening_status` column carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ExportScreeningStatus {
     /// No screening has been performed yet.
@@ -47,10 +89,42 @@ pub enum ExportScreeningStatus {
     NotScreened,
     /// Screened clear — no denied-party match.
     Clear,
-    /// Screened with a restriction (license required, partial match).
-    Restricted,
-    /// Screened to a denied-party match — must not transact.
-    Denied,
+    /// Screened to a denied-party match (e.g. BIS Entity List / OFAC SDN) —
+    /// must not transact until adjudicated.
+    Hit,
+    /// Screened with an inconclusive result — a partial / common-name match
+    /// that needs manual review before the supplier may transact.
+    Inconclusive,
+}
+
+impl ExportScreeningStatus {
+    /// Render in the on-disk / audit-payload form — the canonical string the
+    /// S361 `supplier.export_screened` firing site writes and the partners
+    /// `export_screening_status` column stores. Round-trip-proven with
+    /// [`ExportScreeningStatus::from_storage_str`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExportScreeningStatus::NotScreened => "not_screened",
+            ExportScreeningStatus::Clear => "clear",
+            ExportScreeningStatus::Hit => "hit",
+            ExportScreeningStatus::Inconclusive => "inconclusive",
+        }
+    }
+
+    /// Parse the on-disk / audit-payload form back into an
+    /// `ExportScreeningStatus`. Errors on unknown strings — a silent fallback
+    /// to `Clear` would be the worst-class export-control bug (it would mark an
+    /// unscreened / hit supplier as clear to transact). Fail loud (CLAUDE.md
+    /// rule 12).
+    pub fn from_storage_str(s: &str) -> Result<Self, &'static str> {
+        match s {
+            "not_screened" => Ok(ExportScreeningStatus::NotScreened),
+            "clear" => Ok(ExportScreeningStatus::Clear),
+            "hit" => Ok(ExportScreeningStatus::Hit),
+            "inconclusive" => Ok(ExportScreeningStatus::Inconclusive),
+            _ => Err("unknown ExportScreeningStatus storage string"),
+        }
+    }
 }
 
 /// The qualification level of a supplier on the AVL (AS9100D §8.4).

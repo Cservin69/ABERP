@@ -591,6 +591,47 @@ UPDATE partners
     WHERE issued_invoice_count IS NULL;
 ";
 
+/// S361 / PR-48 (ADR-0078) — additive Approved-Vendor-List (AVL) overlay
+/// columns on the partner record, the data-model half of the `supplier.*`
+/// audit family. All four are nullable and carry NO SQL `DEFAULT` — the same
+/// DuckDB DEFAULT-on-replay trap the S357 `quoting_materials` migration pins:
+/// `ADD COLUMN IF NOT EXISTS … DEFAULT V` re-applies `V` on every replay, and
+/// `ensure_schema` runs at the top of every writer, so a DEFAULT-bearing
+/// column would be clobbered on every unrelated partner `set_*` call. NULL is
+/// the "not yet captured" sentinel (no DPAS rating / not yet screened); the
+/// future firing site (later session — AVL CRUD does not exist yet) interprets
+/// NULL in the app layer.
+///
+/// - `dpas_rating VARCHAR` — the DPAS priority the supplier is approved to
+///   service, written by the `supplier.dpas_priority_set` firing site.
+///   Validated against the [`aberp_compliance::avl::DpasRating`] `as_str`
+///   format (`NONE` / `DO-C1` / `DX-C1`) at the write boundary, NOT a DB CHECK
+///   (per [[no-sql-specific]]).
+/// - `eccn VARCHAR` — the supplier's product Export Control Classification
+///   Number (EAR / Commerce Control List), free-form: an ECCN is a structured
+///   but open vocabulary (`7A994`, `EAR99`, …) the classification service
+///   determines, never validated by a closed enum here.
+/// - `export_screening_status VARCHAR` — the stored denial-list screening
+///   outcome, validated against the
+///   [`aberp_compliance::avl::ExportScreeningStatus`] `as_str` vocab
+///   (`not_screened` / `clear` / `hit` / `inconclusive`) at the write boundary.
+/// - `export_screened_at VARCHAR` — RFC3339 stamp of the last screen. VARCHAR
+///   (not a SQL `TIMESTAMP`) to match this table's `created_at` / `updated_at`
+///   convention (every timestamp on `partners` is a `VARCHAR NOT NULL`
+///   RFC3339 string); keeping one timestamp representation per table beats
+///   matching the brief's loose "timestamp" wording. Flagged in the PR report
+///   (the same S357 `cert_attached_at` flag).
+const PARTNERS_S361_AVL_MIGRATION_SQL: &str = "
+ALTER TABLE partners
+    ADD COLUMN IF NOT EXISTS dpas_rating VARCHAR;
+ALTER TABLE partners
+    ADD COLUMN IF NOT EXISTS eccn VARCHAR;
+ALTER TABLE partners
+    ADD COLUMN IF NOT EXISTS export_screening_status VARCHAR;
+ALTER TABLE partners
+    ADD COLUMN IF NOT EXISTS export_screened_at VARCHAR;
+";
+
 /// Idempotent `CREATE TABLE IF NOT EXISTS` + PR-97 additive migration
 /// for the partners table. Callers (HTTP route handlers, tests) hit
 /// this on every entry so a fresh tenant DB picks up the schema lazily
@@ -604,6 +645,11 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     // post-PR-97 boot the ALTER is a no-op.
     conn.execute_batch(PARTNERS_PR97_MIGRATION_SQL)
         .context("apply PR-97 partners migration (customer_vat_status)")?;
+    // S361 / PR-48 — additive AVL overlay columns. Idempotent on a post-S361
+    // boot (each ALTER is `IF NOT EXISTS`); fills pre-S361 rows with NULL (no
+    // DPAS rating / not yet screened — the "not yet on the AVL" state).
+    conn.execute_batch(PARTNERS_S361_AVL_MIGRATION_SQL)
+        .context("apply S361 partners AVL migration (dpas/eccn/screening)")?;
     Ok(())
 }
 
@@ -1694,6 +1740,120 @@ mod tests {
             by_empty_tax.is_none(),
             "empty buyer tax_number must NOT resolve the PrivatePerson partner — \
              this is the bug S164 fixes by keying on partner_id"
+        );
+    }
+
+    // ── S361 / PR-48 (ADR-0078) — AVL overlay migration ──────────────────
+
+    /// The additive AVL migration is idempotent: `ensure_schema` (which runs
+    /// `PARTNERS_S361_AVL_MIGRATION_SQL` after the `CREATE TABLE IF NOT EXISTS`)
+    /// may be called any number of times without error, and — critically — a
+    /// value written to one of the new columns SURVIVES a subsequent
+    /// `ensure_schema` call. The survival assertion is the real teeth: it proves
+    /// the columns carry NO SQL `DEFAULT`, so the DuckDB DEFAULT-on-replay trap
+    /// (which would clobber the value on every unrelated writer's `ensure_schema`
+    /// call) does not fire. A "no error" check alone could pass while the trap
+    /// silently reset the data. Mirrors the S357 `quoting_materials` pattern.
+    #[test]
+    fn s361_avl_migration_is_idempotent_and_does_not_clobber() {
+        use aberp_compliance::avl::{DpasRating, ExportScreeningStatus};
+
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        // First ensure_schema runs the migration once.
+        ensure_schema(&conn).expect("first ensure_schema");
+        // Running it again must be a no-op (each ALTER is `IF NOT EXISTS`).
+        ensure_schema(&conn).expect("second ensure_schema is a no-op");
+
+        let tenant = "test-tenant";
+        let p = create_partner(&conn, tenant, &minimal_valid_inputs()).expect("create");
+
+        // Populate the new AVL columns directly (no firing site exists yet —
+        // this stands in for the future writer) with canonical-form values.
+        conn.execute(
+            "UPDATE partners
+             SET dpas_rating = ?,
+                 eccn = ?,
+                 export_screening_status = ?,
+                 export_screened_at = ?
+             WHERE tenant_id = ? AND id = ?;",
+            params![
+                DpasRating::DxC1.as_str(),
+                "7A994",
+                ExportScreeningStatus::Hit.as_str(),
+                "2026-06-12T10:00:00Z",
+                tenant,
+                &p.id
+            ],
+        )
+        .expect("populate AVL columns");
+
+        // Replay the migration twice more — the DEFAULT-on-replay trap, if it
+        // existed, would clobber the values here.
+        ensure_schema(&conn).expect("third ensure_schema");
+        ensure_schema(&conn).expect("fourth ensure_schema");
+
+        let (dpas, eccn, status, at): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT dpas_rating, eccn, export_screening_status, export_screened_at
+                 FROM partners WHERE tenant_id = ? AND id = ?;",
+                params![tenant, &p.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("read back AVL columns");
+        assert_eq!(dpas.as_deref(), Some("DX-C1"), "dpas_rating clobbered");
+        assert_eq!(eccn.as_deref(), Some("7A994"), "eccn clobbered");
+        assert_eq!(
+            status.as_deref(),
+            Some("hit"),
+            "export_screening_status clobbered"
+        );
+        assert_eq!(
+            at.as_deref(),
+            Some("2026-06-12T10:00:00Z"),
+            "export_screened_at clobbered"
+        );
+        // The stored strings round-trip back through the validated newtypes —
+        // proving the column only ever holds well-formed values.
+        assert_eq!(
+            DpasRating::from_storage_str(&dpas.unwrap()).expect("valid dpas"),
+            DpasRating::DxC1
+        );
+        assert_eq!(
+            ExportScreeningStatus::from_storage_str(&status.unwrap()).expect("valid status"),
+            ExportScreeningStatus::Hit
+        );
+    }
+
+    /// A freshly-created partner reads NULL on all four AVL columns — the
+    /// documented "not yet on the AVL" sentinel (no DPAS rating, never
+    /// screened). Confirms the migration adds the columns without a backfill.
+    #[test]
+    fn s361_fresh_partner_reads_null_avl_columns() {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        ensure_schema(&conn).expect("schema");
+        let tenant = "test-tenant";
+        let p = create_partner(&conn, tenant, &minimal_valid_inputs()).expect("create");
+
+        let null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM partners
+                 WHERE tenant_id = ? AND id = ?
+                   AND dpas_rating IS NULL
+                   AND eccn IS NULL
+                   AND export_screening_status IS NULL
+                   AND export_screened_at IS NULL;",
+                params![tenant, &p.id],
+                |r| r.get(0),
+            )
+            .expect("count untouched row");
+        assert_eq!(
+            null_count, 1,
+            "a fresh partner must read NULL on all four AVL columns"
         );
     }
 }

@@ -69,3 +69,67 @@ fn s345_dpas_rating_roundtrip() {
         assert_eq!(r, back);
     }
 }
+
+// ── S361 / PR-48 (ADR-0078) — storage-string newtype validation ──
+//
+// The partners `dpas_rating` / `export_screening_status` columns and the
+// `supplier.*` audit payloads store the canonical `as_str` form; the firing
+// site (later session) validates an inbound string through `from_storage_str`
+// before it reaches the column / ledger. These pin that the `as_str` ⇄
+// `from_storage_str` pair round-trips every variant and rejects garbage, so a
+// malformed value can never reach storage.
+
+#[test]
+fn s361_dpas_rating_storage_str_round_trips_every_variant() {
+    for r in [DpasRating::None, DpasRating::DoC1, DpasRating::DxC1] {
+        let s = r.as_str();
+        assert_eq!(
+            DpasRating::from_storage_str(s).expect("round-trip"),
+            r,
+            "round-trip mismatch for {s}"
+        );
+    }
+}
+
+#[test]
+fn s361_dpas_rating_storage_tokens_are_pinned_and_reject_unknown() {
+    assert_eq!(DpasRating::None.as_str(), "NONE");
+    assert_eq!(DpasRating::DoC1.as_str(), "DO-C1");
+    assert_eq!(DpasRating::DxC1.as_str(), "DX-C1");
+    // Unknown / wrong-case strings fail loud — never a silent default.
+    assert!(DpasRating::from_storage_str("").is_err());
+    assert!(DpasRating::from_storage_str("do-c1").is_err());
+    assert!(DpasRating::from_storage_str("DX").is_err());
+}
+
+#[test]
+fn s361_export_screening_status_storage_str_round_trips_every_variant() {
+    for st in [
+        ExportScreeningStatus::NotScreened,
+        ExportScreeningStatus::Clear,
+        ExportScreeningStatus::Hit,
+        ExportScreeningStatus::Inconclusive,
+    ] {
+        let s = st.as_str();
+        assert_eq!(
+            ExportScreeningStatus::from_storage_str(s).expect("round-trip"),
+            st,
+            "round-trip mismatch for {s}"
+        );
+    }
+}
+
+#[test]
+fn s361_export_screening_status_tokens_match_brief_vocab_and_reject_unknown() {
+    // The exact `clear` / `hit` / `inconclusive` / `not_screened` vocab the
+    // brief pins for the column + the `supplier.export_screened` payload.
+    assert_eq!(ExportScreeningStatus::NotScreened.as_str(), "not_screened");
+    assert_eq!(ExportScreeningStatus::Clear.as_str(), "clear");
+    assert_eq!(ExportScreeningStatus::Hit.as_str(), "hit");
+    assert_eq!(ExportScreeningStatus::Inconclusive.as_str(), "inconclusive");
+    // A mis-parse to Clear would mark an unscreened / hit supplier clear to
+    // transact — the worst-class export-control bug. Must fail loud.
+    assert!(ExportScreeningStatus::from_storage_str("CLEAR").is_err());
+    assert!(ExportScreeningStatus::from_storage_str("denied").is_err());
+    assert!(ExportScreeningStatus::from_storage_str("").is_err());
+}
