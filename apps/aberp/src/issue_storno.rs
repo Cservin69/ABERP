@@ -383,61 +383,39 @@ pub fn storno_from_inputs(
         start_value: template.start_value,
     };
 
-    // 8. One transaction across base-load + chain-index walk + storno
-    //    allocator + three audit-ledger appends.
-    let outcome = run_single_tx(
-        conn,
-        &ledger_meta,
-        allocate_args,
-        idempotency_key,
-        actor,
-        references,
-        nav_xml_out.clone(),
-        // PR-83 — thread the buyer-facing storno reason into the audit
-        // payload via `with_notes`. Stamps both the storno-level
-        // `invoice_note` AND the per-line notes (inherited from the
-        // base) onto the `InvoiceDraftCreated` payload so the
-        // operator-twin record matches the printed-PDF surface.
-        storno_reason.clone(),
-        // PR-97 / ADR-0048 — pass buyer-kind discriminator from the
-        // base's side-stored input.json through to the audit payload.
-        input.customer.vat_status,
-    )?;
+    // S375 — read the BASE invoice's NAV-side identity from its on-disk
+    // XML BEFORE the tx so the render closure (run inside the tx, before
+    // commit) has everything it needs.
+    //
+    // S184 — the base `<invoiceNumber>` IS the canonical record of what
+    // NAV saw on the original `manageInvoice` POST (written at base
+    // issuance time, never re-rewritten). Re-deriving via
+    // `template.render_for_build(base_year, base_seq)` is fragile: an
+    // operator edit to the seller.toml numbering literal between base
+    // issuance and storno emission silently drifts the rendered string →
+    // NAV ABORTED with INVALID_INVOICE_REFERENCE. The on-disk read is
+    // immune to that drift. CLAUDE.md rule 12 — fail loud (the helper
+    // bails if the XML is missing / malformed / lacks the element)
+    // rather than silently substituting a possibly-wrong render.
+    let base_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path)?;
+    // S369 — read the BASE's line count from the same on-disk XML so the
+    // storno's CREATE lines continue PAST the base's line numbers (NAV
+    // INVOICE_LINE_ALREADY_EXISTS, S370). On-disk read mirrors the
+    // base_invoice_number S184 discipline — immune to in-memory row drift.
+    let base_line_count = crate::nav_xml::count_invoice_lines_from_xml(&base_nav_xml_path)?;
 
-    let storno = outcome.storno;
-    let modification_index = outcome.modification_index;
-    let base_sequence_number = outcome.base_sequence_number;
-    let base_issue_year = outcome.base_issue_year;
-    let was_fresh = outcome.was_fresh;
-    let chain_currency = outcome.chain_currency;
-    let chain_rate_metadata = outcome.chain_rate_metadata;
-    tracing::info!(
-        seq = storno.sequence_number,
-        modification_index,
-        base_sequence_number,
-        fresh = was_fresh,
-        idempotency_key = ?idempotency_key,
-        "storno issued"
-    );
-
-    // 9. Verify the audit chain — success-criterion gate.
-    let ledger = Ledger::open(db, tenant.clone(), binary_hash_bytes)
-        .context("re-open audit ledger after storno commit")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER storno issuance")?;
-    tracing::info!(entries_verified = verified, "audit chain verified");
-
-    // 9a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    //     post-commit (matches the issue_invoice posture).
-    let mirror_path = audit_ledger::mirror_path_for(db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after storno commit")?;
-
-    // 10. Render the storno's <InvoiceData> XML with negated amounts +
-    //     <invoiceReference> chain block. Then run ADR-0022's runtime
-    //     XSD invariant check before writing to disk.
+    // S375 — build the storno's <InvoiceData> render+validate+write as a
+    // closure that `run_single_tx` runs INSIDE the tx, AFTER the three
+    // audit appends and BEFORE `tx.commit()`. Pre-S375 the render ran
+    // post-commit (after a crash-prone `Ledger::open` re-open), so a
+    // render/validate/write failure left a committed storno row + audit
+    // chain-link with no XML on disk → a phantom row whose Submit is
+    // broken. Running it before commit makes the storno atomic: any
+    // failure rolls the allocation + three appends back.
+    //
+    // The STORNO's own number IS a fresh emit (NAV has not seen it yet)
+    // so it uses the current template — its render is what NAV records on
+    // the storno's first `manageInvoice` POST.
     let parties = NavParties {
         supplier: SupplierInfo {
             tax_number: input.supplier.tax_number,
@@ -477,68 +455,114 @@ pub fn storno_from_inputs(
             }),
         },
     };
-    // S184 — read the BASE invoice's `<invoiceNumber>` from its on-disk
-    // NAV XML. That string IS the canonical record of what NAV saw on
-    // the original `manageInvoice` POST (the XML was written at base
-    // issuance time and never re-rewritten). Re-deriving via
-    // `template.render_for_build(base_year, base_seq)` is fragile: any
-    // operator edit to the seller.toml numbering literal between base
-    // issuance and storno emission silently drifts the rendered string
-    // → NAV ABORTED with INVALID_INVOICE_REFERENCE. The on-disk read
-    // is immune to that drift. CLAUDE.md rule 12 — fail loud (the
-    // helper bails if the XML is missing / malformed / lacks the
-    // element) rather than silently substituting a possibly-wrong
-    // render.
-    //
-    // The STORNO's own number IS a fresh emit (NAV has not seen it yet)
-    // so it uses the current template — its render is what NAV will
-    // record on the storno's first `manageInvoice` POST. base_issue_year
-    // is unused now; left as a `_` to preserve the audit-payload contract
-    // for future readers (the chain payload still records
-    // base_sequence_number for ADR-0023 §3 denormalization).
-    let _base_issue_year = base_issue_year;
-    let base_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path)?;
-    // S369 — read the BASE's line count from the same on-disk XML so the
-    // storno's CREATE lines continue PAST the base's line numbers (NAV
-    // INVOICE_LINE_ALREADY_EXISTS, S370). On-disk read mirrors the
-    // base_invoice_number S184 discipline — immune to in-memory row drift.
-    let base_line_count = crate::nav_xml::count_invoice_lines_from_xml(&base_nav_xml_path)?;
-    let storno_invoice_number =
-        template.render_for_build(storno.issue_date.year(), storno.sequence_number);
-    let storno_reference = StornoReference {
-        base_invoice_number,
-        modification_index,
-        base_line_count,
+    let render_series_code = series_code.clone();
+    let render_payment_method = input.payment_method;
+    let render_nav_out = nav_xml_out.clone();
+    // Captures `template` by move — its only remaining use is here. The
+    // chain-dependent values (storno seq, modification_index, inherited
+    // currency + rate metadata) are passed in by `run_single_tx` because
+    // they are only known inside the tx.
+    let render_and_write = move |storno: &ReadyInvoice,
+                                 modification_index: u32,
+                                 chain_currency: Currency,
+                                 chain_rate_metadata: Option<&RateMetadata>|
+          -> Result<String> {
+        let storno_invoice_number =
+            template.render_for_build(storno.issue_date.year(), storno.sequence_number);
+        let storno_reference = StornoReference {
+            base_invoice_number,
+            modification_index,
+            base_line_count,
+        };
+        let xml = nav_xml::render_storno_data_with_number(
+            storno,
+            &render_series_code,
+            &parties,
+            &storno_reference,
+            chain_currency,
+            chain_rate_metadata,
+            // S160 — the storno inherits the base invoice's payment
+            // method, which rides the base's side-stored `input.json`
+            // (defaults to `Transfer` for pre-S160 bases).
+            render_payment_method,
+            Some(&storno_invoice_number),
+        )
+        .context("render NAV storno XML")?;
+        aberp_nav_xsd_validator::validate_invoice_data(&xml).context(
+            "NAV InvoiceData v3.0 invariant check (ADR-0022) failed for rendered storno XML",
+        )?;
+        tracing::info!(
+            bytes = xml.len(),
+            nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
+            "NAV storno InvoiceData XML passed v3.0 invariant check"
+        );
+        nav_xml::write_to_path(&render_nav_out, &xml)?;
+        tracing::info!(
+            path = %render_nav_out.display(),
+            bytes = xml.len(),
+            "NAV storno XML written"
+        );
+        Ok(storno_invoice_number)
     };
-    let xml = nav_xml::render_storno_data_with_number(
-        &storno,
-        &series_code,
-        &parties,
-        &storno_reference,
-        chain_currency,
-        chain_rate_metadata.as_ref(),
-        // S160 — the storno inherits the base invoice's payment method,
-        // which rides the base's side-stored `input.json` (defaults to
-        // `Transfer` for pre-S160 bases).
-        input.payment_method,
-        Some(&storno_invoice_number),
-    )
-    .context("render NAV storno XML")?;
-    aberp_nav_xsd_validator::validate_invoice_data(&xml).context(
-        "NAV InvoiceData v3.0 invariant check (ADR-0022) failed for rendered storno XML",
-    )?;
-    tracing::info!(
-        bytes = xml.len(),
-        nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
-        "NAV storno InvoiceData XML passed v3.0 invariant check"
-    );
-    nav_xml::write_to_path(&nav_xml_out, &xml)?;
-    tracing::info!(path = %nav_xml_out.display(), bytes = xml.len(), "NAV storno XML written");
 
-    // PR-89 — reuse the template-rendered storno number computed above.
+    // 8. One transaction across base-load + chain-index walk + storno
+    //    allocator + three audit-ledger appends + (S375) the NAV-XML
+    //    render+write. `run_single_tx` runs the render closure before
+    //    committing and hands the post-commit Connection back so the
+    //    verify path below reuses it (no crash-prone re-open).
+    let (outcome, conn) = run_single_tx(
+        conn,
+        &ledger_meta,
+        allocate_args,
+        idempotency_key,
+        actor,
+        references,
+        nav_xml_out.clone(),
+        // PR-83 — thread the buyer-facing storno reason into the audit
+        // payload via `with_notes`. Stamps both the storno-level
+        // `invoice_note` AND the per-line notes (inherited from the
+        // base) onto the `InvoiceDraftCreated` payload so the
+        // operator-twin record matches the printed-PDF surface.
+        storno_reason.clone(),
+        // PR-97 / ADR-0048 — pass buyer-kind discriminator from the
+        // base's side-stored input.json through to the audit payload.
+        input.customer.vat_status,
+        render_and_write,
+    )?;
+
+    let modification_index = outcome.modification_index;
+    tracing::info!(
+        seq = outcome.storno.sequence_number,
+        modification_index,
+        base_sequence_number = outcome.base_sequence_number,
+        fresh = outcome.was_fresh,
+        idempotency_key = ?idempotency_key,
+        "storno issued"
+    );
+
+    // 9. Verify the audit chain — success-criterion gate. S375 — run
+    //    `verify_chain` + `sync_mirror` on the SAME post-commit
+    //    Connection `run_single_tx` handed back, rather than dropping it
+    //    and calling `Ledger::open` (a fresh `Connection::open` that
+    //    triggers DuckDB 1.5.x's LoadCheckpoint/ReadIndex ART assertion,
+    //    S332 / duckdb#23046 — the original DEV storno crash). No file
+    //    re-open → that crash is unreachable.
+    let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
+    let verified = ledger
+        .verify_chain()
+        .context("audit-ledger chain verification failed AFTER storno issuance")?;
+    tracing::info!(entries_verified = verified, "audit chain verified");
+
+    // 9a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
+    //     post-commit (matches the issue_invoice posture).
+    let mirror_path = audit_ledger::mirror_path_for(db);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after storno commit")?;
+
     Ok(StornoIssuedSummary {
-        invoice_id: storno.id.to_prefixed_string(),
-        invoice_number: storno_invoice_number,
+        invoice_id: outcome.storno.id.to_prefixed_string(),
+        invoice_number: outcome.storno_invoice_number,
         modification_index,
         entries_verified: verified,
     })
@@ -827,24 +851,14 @@ struct TxOutcome {
     storno: ReadyInvoice,
     modification_index: u32,
     base_sequence_number: u64,
-    /// PR-89 — calendar year of the BASE invoice's issue date. Needed
-    /// so the storno's `<originalInvoiceNumber>` element renders the
-    /// base's number against the same template-Year shape the base was
-    /// issued under (e.g. `ABERP-2025/000017` even when the storno
-    /// itself is issued in 2026). Read from `base_invoice.issue_date`
-    /// inside the tx so the year is consistent with the row the
-    /// audit ledger says is Finalized.
-    base_issue_year: i32,
     was_fresh: bool,
-    /// PR-44γ.1 — currency inherited from the base invoice via
-    /// `invoice_currency_metadata::inherit_rate_metadata_for_chain`.
-    /// The chain renderer reads this; the audit-payload constructor
-    /// branches on it.
-    chain_currency: Currency,
-    /// PR-44γ.1 — rate metadata inherited from base (verbatim
-    /// `rate` / `source` / `date`), with `huf_equivalent_total`
-    /// recomputed from the storno's own negated gross. `None` for HUF.
-    chain_rate_metadata: Option<RateMetadata>,
+    /// S375 — the storno's `<series>/<seq>` NAV number, rendered inside
+    /// the tx by the `render_and_write` closure and returned so the
+    /// caller threads it straight into the operator-facing summary
+    /// (no second template render). The inherited currency + rate
+    /// metadata that the closure used are consumed inside the tx and no
+    /// longer cross the commit boundary.
+    storno_invoice_number: String,
 }
 
 /// Open one DuckDB transaction; under it: load the base invoice row,
@@ -854,7 +868,7 @@ struct TxOutcome {
 /// halves; `apps/aberp/tests/rollback_conformance.rs` exercises the
 /// shape).
 #[allow(clippy::too_many_arguments)]
-fn run_single_tx(
+fn run_single_tx<F>(
     mut conn: Connection,
     ledger_meta: &LedgerMeta,
     mut allocate_args: AllocateArgs,
@@ -875,7 +889,18 @@ fn run_single_tx(
     // `InvoiceDraftCreated` audit payload so the chain operation's
     // tamper-evident trail mirrors the base's as-of-issuance choice.
     customer_vat_status: crate::nav_xml::CustomerVatStatus,
-) -> Result<TxOutcome> {
+    // S375 — NAV-XML render+validate+write step, run inside the tx
+    // AFTER the three audit appends and BEFORE commit so the storno is
+    // atomic (a render/write failure rolls back the allocation + the
+    // three appends). Receives the chain-dependent values only known
+    // inside the tx (storno seq via `&ReadyInvoice`, modification_index,
+    // inherited currency + rate metadata) and returns the rendered NAV
+    // invoice number.
+    render_and_write: F,
+) -> Result<(TxOutcome, Connection)>
+where
+    F: FnOnce(&ReadyInvoice, u32, Currency, Option<&RateMetadata>) -> Result<String>,
+{
     let tx = conn
         .transaction()
         .context("begin DuckDB transaction (storno: billing + audit-ledger)")?;
@@ -1063,17 +1088,31 @@ fn run_single_tx(
         tracing::info!("replay path: no new audit entries written (storno idempotency hit)");
     }
 
+    // S375 — render + XSD-validate + write the storno NAV XML BEFORE
+    // commit, on both the Fresh and Replay paths (matches the pre-S375
+    // unconditional post-commit render). A failure here returns `Err` so
+    // the tx drops un-committed → the allocation + three appends roll
+    // back together and no committed-but-XML-less storno row survives.
+    let storno_invoice_number = render_and_write(
+        &storno_invoice,
+        modification_index,
+        inherited_currency,
+        inherited_rate_metadata.as_ref(),
+    )
+    .context("render + XSD-validate + write NAV storno XML before commit (S375 atomicity)")?;
+
     tx.commit()
         .context("commit DuckDB transaction (storno: billing + audit-ledger)")?;
-    Ok(TxOutcome {
-        storno: storno_invoice,
-        modification_index,
-        base_sequence_number,
-        base_issue_year: base_invoice.issue_date.year(),
-        was_fresh,
-        chain_currency: inherited_currency,
-        chain_rate_metadata: inherited_rate_metadata,
-    })
+    Ok((
+        TxOutcome {
+            storno: storno_invoice,
+            modification_index,
+            base_sequence_number,
+            was_fresh,
+            storno_invoice_number,
+        },
+        conn,
+    ))
 }
 
 /// Walk `audit_ledger` inside the borrowed transaction for every

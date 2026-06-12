@@ -159,6 +159,29 @@ impl Ledger {
         Self::initialise(conn, tenant_id, binary_hash)
     }
 
+    /// Wrap an ALREADY-OPEN DuckDB [`Connection`] as a `Ledger`
+    /// WITHOUT re-opening the file (S375).
+    ///
+    /// The binary's issue / storno paths own the post-commit
+    /// [`Connection`] and need `verify_chain` + `sync_mirror` after the
+    /// tx commits. The pre-S375 pattern dropped that Connection and
+    /// called [`Ledger::open`] again — a fresh `Connection::open(path)`
+    /// that triggers DuckDB 1.5.x's `LoadCheckpoint`/`ReadIndex` replay,
+    /// which hits the metadata-pointer assertion of the
+    /// checkpoint/ART corruption family (`duckdb/duckdb#23046`, S332).
+    /// Reusing the already-open handle never re-opens the file, so that
+    /// assertion is unreachable.
+    ///
+    /// Schema is assumed already present — the issue / storno paths run
+    /// [`ensure_schema`] in their pre-tx setup — so this does NOT re-run
+    /// DDL (and therefore does no checkpoint replay of its own).
+    pub fn from_connection(conn: Connection, tenant_id: TenantId, binary_hash: BinaryHash) -> Self {
+        Self {
+            conn,
+            meta: LedgerMeta::new(tenant_id, binary_hash),
+        }
+    }
+
     fn initialise(
         conn: Connection,
         tenant_id: TenantId,
@@ -828,5 +851,102 @@ CREATE TABLE IF NOT EXISTS audit_ledger (
         migrate_drop_unique_art_if_present(&conn).unwrap();
         assert!(!audit_ledger_has_unique_constraints(&conn).unwrap());
         assert_eq!(read_all_entries(&conn).unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod from_connection_tests {
+    //! S375 — [`Ledger::from_connection`] lets the binary's post-commit
+    //! issue / storno path run `verify_chain` + `sync_mirror` on the
+    //! Connection it already holds, instead of dropping it and calling
+    //! [`Ledger::open`] (which re-opens the file and triggers the
+    //! DuckDB 1.5.x checkpoint/ART assertion — S332 / duckdb#23046).
+    //!
+    //! The load-bearing claim these tests pin: a file-backed Connection
+    //! that has just committed appends can be wrapped via
+    //! `from_connection` and verified WITHOUT a second
+    //! `Connection::open`. That is the exact post-commit shape the
+    //! issue / storno paths now use.
+
+    use super::*;
+
+    fn tenant() -> TenantId {
+        TenantId::new("from-conn-test".to_string()).unwrap()
+    }
+    fn meta() -> LedgerMeta {
+        LedgerMeta::new(tenant(), BinaryHash::from_bytes([7u8; 32]))
+    }
+    fn actor() -> Actor {
+        Actor::from_local_cli("01H0000000000000000000000Z".to_string(), "t")
+    }
+
+    fn temp_db_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "aberp-s375-from-conn-{}-{}-{:?}.duckdb",
+            std::process::id(),
+            tag,
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// Append N entries to a FILE-backed Connection, commit, then wrap
+    /// that SAME Connection with `from_connection` and verify the chain.
+    /// No second `Connection::open` — this is the crash-avoidance the
+    /// S375 fix relies on.
+    #[test]
+    fn from_connection_verifies_chain_on_post_commit_handle_without_reopen() {
+        let path = temp_db_path("verify");
+        let m = meta();
+
+        // Open the file once, ensure schema, append + commit 3 entries —
+        // exactly the pre-commit half of the issue / storno path.
+        let mut conn = Connection::open(&path).unwrap();
+        ensure_schema(&conn).unwrap();
+        for i in 0..3 {
+            let tx = conn.transaction().unwrap();
+            append_in_tx(
+                &tx,
+                &m,
+                EventKind::Test,
+                format!("{{\"i\":{i}}}").into_bytes(),
+                actor(),
+                None,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Wrap the already-open handle — NOT a fresh Ledger::open — and
+        // verify. This is what `run_single_tx`'s returned Connection now
+        // feeds into.
+        let ledger = Ledger::from_connection(conn, tenant(), BinaryHash::from_bytes([7u8; 32]));
+        let verified = ledger.verify_chain().expect("verify on reused handle");
+        assert_eq!(verified, 3, "all three committed entries must verify");
+
+        // sync_mirror must also work off the reused handle (the second
+        // post-commit call the issue / storno path makes).
+        let mirror = path.with_extension("mirror.jsonl");
+        let synced = ledger.sync_mirror(&mirror).expect("sync mirror off reused handle");
+        assert_eq!(synced, 3, "mirror sync must report all three entries");
+
+        drop(ledger);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&mirror);
+    }
+
+    /// Empty (genesis) case: a freshly-schema'd Connection with no
+    /// appends wraps + verifies to 0, mirroring the replay/no-op path.
+    #[test]
+    fn from_connection_verifies_empty_genesis() {
+        let path = temp_db_path("empty");
+        let conn = Connection::open(&path).unwrap();
+        ensure_schema(&conn).unwrap();
+        let ledger = Ledger::from_connection(conn, tenant(), BinaryHash::from_bytes([7u8; 32]));
+        assert_eq!(ledger.verify_chain().expect("verify empty"), 0);
+        drop(ledger);
+        let _ = std::fs::remove_file(&path);
     }
 }

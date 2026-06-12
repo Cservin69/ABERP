@@ -654,86 +654,20 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         start_value: template.start_value,
     };
 
-    // 8. One transaction across the billing writes and audit appends.
-    //    `run_single_tx` owns the tx lifecycle: it commits on Ok and
-    //    relies on `Transaction::drop` for rollback on Err or panic.
+    // S375 — build the NAV-XML render+validate+write step as a closure
+    //    that `run_single_tx` runs INSIDE the tx, AFTER the audit appends
+    //    and BEFORE `tx.commit()`. Pre-S375 the render ran post-commit, so
+    //    a render/validate/write failure left a committed invoice row +
+    //    audit draft with no XML on disk → a phantom "Ready" row whose
+    //    Submit is broken. Running it before commit makes issuance atomic:
+    //    if render OR validate OR write_to_path fails, the tx rolls back
+    //    and no row / no audit entry survives.
     //
-    //    PR-18 / ADR-0031 §2: the `nav_xml_out` path is threaded into
-    //    `run_single_tx` so the InvoiceDraftCreated payload's
-    //    `nav_xml_path` field records where the XML will be written.
-    //    The drain worker consumes this at submit time without
-    //    requiring an operator-supplied path argument.
-    let outcome = run_single_tx(
-        conn,
-        &ledger_meta,
-        allocate_args,
-        idempotency_key,
-        actor,
-        nav_xml_out.clone(),
-        currency,
-        rate_metadata.clone(),
-        bank_snapshot.clone(),
-        // PR-82 — invoice-level buyer note. Threaded into the audit
-        // payload alongside the per-line notes (which the audit payload
-        // builder reads off `outcome.invoice.lines[i].note`).
-        input.invoice_note.clone(),
-        // PR-84 — operator's SPA-form override discriminant for the
-        // delivery-date choice. `None` means in-range (default path,
-        // no audit flag); `Some(...)` carries the operator's confirmed
-        // out-of-range choice verbatim for the audit trail. The audit
-        // payload's `with_invoice_dates` builder also stamps the two
-        // calendar dates so an inspector can reconstruct the
-        // comfort-zone classification independently.
-        input.delivery_date_override.clone(),
-        // PR-97 / ADR-0048 — pass the operator's buyer-kind discriminator
-        // through to the audit payload builder so the tamper-evident
-        // trail captures the as-of-issuance value verbatim.
-        input.customer.vat_status,
-        // PR-97 / ADR-0048 (Ervin override 1) — pass the saved-partner
-        // id (when present on the wire body) for the counter
-        // increment that drives the PartnerForm field-selective lock.
-        input.customer.partner_id.clone(),
-    )?;
-
-    let invoice = outcome.invoice;
-    let is_fresh = outcome.was_fresh;
-    tracing::info!(
-        seq = invoice.sequence_number,
-        fresh = is_fresh,
-        idempotency_key = ?idempotency_key,
-        "invoice issued"
-    );
-
-    // 9. Verify the audit chain — the success-criterion gate. Per the
-    //    session-6 verify-path decision: re-open a fresh Ledger after
-    //    the tx commits and the tx-Connection drops.
-    let ledger =
-        Ledger::open(db, tenant.clone(), binary_hash_bytes).context("open audit ledger")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER issuance")?;
-    tracing::info!(entries_verified = verified, "audit chain verified");
-
-    // 9a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    //     post-commit. On a fresh DB (or first post-PR-17 invocation
-    //     on a pre-existing DB) `sync_mirror` runs the implicit
-    //     one-time backfill per ADR-0030 §7 and logs
-    //     `audit_mirror_initialized` at INFO.
-    let mirror_path = audit_ledger::mirror_path_for(db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after commit")?;
-
-    // 10. Serialize the ReadyInvoice to NAV XML.
-    //
-    // PR-44δ — currency + rate_metadata thread into `render_invoice_data`
-    // so EUR invoices serialize `<currencyCode>EUR`, `<exchangeRate>` at
-    // 6 decimals, and per-VAT-rate `*HUF` amounts computed from the
-    // stamped MNB rate (NOT re-fetched — read from the in-memory
-    // `RateMetadata` we just stamped onto the DuckDB row + audit payload
-    // earlier in this same call). HUF invoices serialize the same
-    // byte-near-identical shape as pre-PR-44δ with `<exchangeRate>1.000000`
-    // (uniformly 6-decimal per C11 — the prior `1` form is superseded).
+    //    PR-44δ — currency + rate_metadata thread into
+    //    `render_invoice_data` so EUR invoices serialize `<currencyCode>`,
+    //    a 6-decimal `<exchangeRate>`, and per-VAT-rate `*HUF` amounts
+    //    computed from the stamped MNB rate (NOT re-fetched). HUF invoices
+    //    serialize `<exchangeRate>1.000000` (uniformly 6-decimal per C11).
     let parties = NavParties {
         supplier: SupplierInfo {
             tax_number: input.supplier.tax_number,
@@ -777,46 +711,129 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
             }),
         },
     };
-    // PR-89 + PR-90 — render the invoice number from the template we
-    // resolved at pre-tx setup. The issue-date year drives BOTH the
-    // rendered Year segment AND (under OnYearChange) the counter's
-    // reset-year bucket — by construction they cannot disagree.
-    let issue_year = invoice.issue_date.year();
-    // S165 — `render_for_build` carries the `TEST-` prefix on dev/test
-    // builds so test-endpoint submissions are visually distinct; prod
-    // builds render unprefixed. The DB counter is unchanged.
-    let invoice_number = template.render_for_build(issue_year, invoice.sequence_number);
+    let render_currency = currency;
+    let render_rate_metadata = rate_metadata.clone();
+    let render_payment_method = input.payment_method;
+    let render_series_code = series_code.clone();
+    let render_nav_out = nav_xml_out.clone();
+    // Captures `template` by move — its only remaining use is here. The
+    // closure computes + returns the rendered invoice number so the
+    // caller threads it into the operator-facing summary.
+    let render_and_write = move |invoice: &aberp_billing::ReadyInvoice| -> Result<String> {
+        // PR-89 + PR-90 — the issue-date year drives BOTH the rendered
+        // Year segment AND (under OnYearChange) the counter's reset-year
+        // bucket — by construction they cannot disagree. S165 —
+        // `render_for_build` carries the `TEST-` prefix on dev/test
+        // builds; prod builds render unprefixed.
+        let invoice_number =
+            template.render_for_build(invoice.issue_date.year(), invoice.sequence_number);
+        let xml = nav_xml::render_invoice_data_with_number(
+            invoice,
+            &render_series_code,
+            &parties,
+            render_currency,
+            render_rate_metadata.as_ref(),
+            // S160 — operator's per-invoice payment method (Fizetési mód),
+            // defaulting to `Transfer` for pre-S160 side-stored bodies.
+            render_payment_method,
+            Some(&invoice_number),
+        )
+        .context("render NAV XML")?;
+        // PR-9-0 / ADR-0022: runtime <InvoiceData> v3.0 invariant check
+        // between render and disk write. On failure the typed
+        // `NavXsdValidationError` flows up as `anyhow::Error` — loud-fail
+        // per CLAUDE.md rule 12 keeps malformed XML off both disk and the
+        // wire. S375 — because this runs BEFORE the commit, the failure
+        // also rolls back the sequence allocation + audit appends, so
+        // there is no orphaned "allocated but never rendered" row to
+        // recover; the operator simply re-runs with corrected input.
+        aberp_nav_xsd_validator::validate_invoice_data(&xml)
+            .context("NAV InvoiceData v3.0 invariant check (ADR-0022) failed for rendered XML")?;
+        tracing::info!(
+            bytes = xml.len(),
+            nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
+            "NAV InvoiceData XML passed v3.0 invariant check"
+        );
+        nav_xml::write_to_path(&render_nav_out, &xml)?;
+        tracing::info!(path = %render_nav_out.display(), bytes = xml.len(), "NAV XML written");
+        Ok(invoice_number)
+    };
 
-    let xml = nav_xml::render_invoice_data_with_number(
-        &invoice,
-        &series_code,
-        &parties,
+    // 8. One transaction across the billing writes, audit appends, and
+    //    (S375) the NAV-XML render+write. `run_single_tx` owns the tx
+    //    lifecycle: it runs the render closure before committing and
+    //    relies on `Transaction::drop` for rollback on Err or panic. It
+    //    hands the post-commit Connection back so the verify path below
+    //    reuses it instead of re-opening the file (S375).
+    //
+    //    PR-18 / ADR-0031 §2: the `nav_xml_out` path is threaded into
+    //    `run_single_tx` so the InvoiceDraftCreated payload's
+    //    `nav_xml_path` field records where the XML is written.
+    let (outcome, conn) = run_single_tx(
+        conn,
+        &ledger_meta,
+        allocate_args,
+        idempotency_key,
+        actor,
+        nav_xml_out.clone(),
         currency,
-        rate_metadata.as_ref(),
-        // S160 — operator's per-invoice payment method (Fizetési mód),
-        // defaulting to `Transfer` for pre-S160 side-stored bodies.
-        input.payment_method,
-        Some(&invoice_number),
-    )
-    .context("render NAV XML")?;
-    // PR-9-0 / ADR-0022: runtime <InvoiceData> v3.0 invariant check
-    // between render and disk write. On failure the typed
-    // `NavXsdValidationError` flows up as `anyhow::Error` — loud-fail
-    // per CLAUDE.md rule 12 keeps malformed XML off both disk and the
-    // wire. Audit entries from the prior commit DO remain in the
-    // ledger (they describe what happened — the sequence was
-    // allocated); recovery is to fix the emitter/validator and re-run
-    // with the same input JSON, hitting the Replay branch which
-    // returns the same invoice and re-renders cleanly.
-    aberp_nav_xsd_validator::validate_invoice_data(&xml)
-        .context("NAV InvoiceData v3.0 invariant check (ADR-0022) failed for rendered XML")?;
+        rate_metadata.clone(),
+        bank_snapshot.clone(),
+        // PR-82 — invoice-level buyer note. Threaded into the audit
+        // payload alongside the per-line notes (which the audit payload
+        // builder reads off `outcome.invoice.lines[i].note`).
+        input.invoice_note.clone(),
+        // PR-84 — operator's SPA-form override discriminant for the
+        // delivery-date choice. `None` means in-range (default path,
+        // no audit flag); `Some(...)` carries the operator's confirmed
+        // out-of-range choice verbatim for the audit trail. The audit
+        // payload's `with_invoice_dates` builder also stamps the two
+        // calendar dates so an inspector can reconstruct the
+        // comfort-zone classification independently.
+        input.delivery_date_override.clone(),
+        // PR-97 / ADR-0048 — pass the operator's buyer-kind discriminator
+        // through to the audit payload builder so the tamper-evident
+        // trail captures the as-of-issuance value verbatim.
+        input.customer.vat_status,
+        // PR-97 / ADR-0048 (Ervin override 1) — pass the saved-partner
+        // id (when present on the wire body) for the counter
+        // increment that drives the PartnerForm field-selective lock.
+        input.customer.partner_id.clone(),
+        render_and_write,
+    )?;
+
+    let invoice = outcome.invoice;
+    let invoice_number = outcome.invoice_number;
+    let is_fresh = outcome.was_fresh;
     tracing::info!(
-        bytes = xml.len(),
-        nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
-        "NAV InvoiceData XML passed v3.0 invariant check"
+        seq = invoice.sequence_number,
+        fresh = is_fresh,
+        idempotency_key = ?idempotency_key,
+        "invoice issued"
     );
-    nav_xml::write_to_path(&nav_xml_out, &xml)?;
-    tracing::info!(path = %nav_xml_out.display(), bytes = xml.len(), "NAV XML written");
+
+    // 9. Verify the audit chain — the success-criterion gate. S375 — run
+    //    `verify_chain` + `sync_mirror` on the SAME post-commit
+    //    Connection `run_single_tx` handed back, rather than dropping it
+    //    and calling `Ledger::open` (a fresh `Connection::open` that
+    //    triggers DuckDB 1.5.x's LoadCheckpoint/ReadIndex ART assertion,
+    //    S332 / duckdb#23046). No file re-open → that crash is
+    //    unreachable.
+    let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
+    let verified = ledger
+        .verify_chain()
+        .context("audit-ledger chain verification failed AFTER issuance")?;
+    tracing::info!(entries_verified = verified, "audit chain verified");
+
+    // 9a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
+    //     post-commit. On a fresh DB (or first post-PR-17 invocation
+    //     on a pre-existing DB) `sync_mirror` runs the implicit
+    //     one-time backfill per ADR-0030 §7 and logs
+    //     `audit_mirror_initialized` at INFO.
+    let mirror_path = audit_ledger::mirror_path_for(db);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after commit")?;
 
     tracing::info!(
         invoice_number = %invoice_number,
@@ -923,16 +940,32 @@ fn ensure_series<S: BillingStore + ?Sized>(
 // ──────────────────────────────────────────────────────────────────────
 
 /// Carrier for the single-tx outcome that the caller actually needs
-/// after commit: the ready invoice and the fresh-vs-replay bit. Keeps
-/// `run_single_tx`'s return type narrow.
+/// after commit: the ready invoice, the fresh-vs-replay bit, and
+/// (S375) the NAV invoice number the in-tx render closure produced.
+/// Keeps `run_single_tx`'s return type narrow.
 struct TxOutcome {
     invoice: aberp_billing::ReadyInvoice,
     was_fresh: bool,
+    /// S375 — the `<series>/<seq>` number rendered inside the tx by the
+    /// `render_and_write` closure. Returned so the caller does not
+    /// re-derive it from the template a second time.
+    invoice_number: String,
 }
 
-/// Open one DuckDB transaction, run the ADR-0009 §3 allocator and the
-/// ADR-0008 §Storage audit appends inside it, and commit. Returns the
-/// outcome the caller needs after commit.
+/// Open one DuckDB transaction, run the ADR-0009 §3 allocator, the
+/// ADR-0008 §Storage audit appends, and (S375) the NAV-XML
+/// render+validate+write inside it, then commit. Returns the outcome
+/// the caller needs after commit ALONGSIDE the still-open `Connection`
+/// so the caller can `verify_chain` + `sync_mirror` without re-opening
+/// the file (S375 — the re-open triggered DuckDB 1.5.x's
+/// LoadCheckpoint/ReadIndex ART assertion).
+///
+/// `render_and_write` runs AFTER the appends and BEFORE `tx.commit()`,
+/// on both the Fresh and Replay paths. Its `Err` (render / XSD-validate
+/// / disk-write failure) drops the tx before commit → full rollback, so
+/// a failed render never leaves a committed-but-XML-less invoice row.
+/// It returns the rendered NAV invoice number, surfaced via
+/// `TxOutcome::invoice_number`.
 ///
 /// Rollback contract: if any step returns `Err`, the function returns
 /// without committing; `Transaction::drop` rolls back. If a panic
@@ -940,7 +973,7 @@ struct TxOutcome {
 /// the tenant DB in its pre-call state. Exercised by
 /// `apps/aberp/tests/rollback_conformance.rs`.
 #[allow(clippy::too_many_arguments)]
-fn run_single_tx(
+fn run_single_tx<F>(
     mut conn: Connection,
     ledger_meta: &LedgerMeta,
     allocate_args: AllocateArgs,
@@ -979,7 +1012,15 @@ fn run_single_tx(
     // partner read AND so a rolled-back issuance doesn't leave a
     // stale counter. `None` for one-off buyers + CLI callers.
     customer_partner_id: Option<String>,
-) -> Result<TxOutcome> {
+    // S375 — NAV-XML render+validate+write step, run inside the tx
+    // AFTER the appends and BEFORE commit so issuance is atomic (a
+    // render/write failure rolls back the allocation + audit appends).
+    // Returns the rendered NAV invoice number.
+    render_and_write: F,
+) -> Result<(TxOutcome, Connection)>
+where
+    F: FnOnce(&aberp_billing::ReadyInvoice) -> Result<String>,
+{
     let tx = conn
         .transaction()
         .context("begin DuckDB transaction (billing + audit-ledger)")?;
@@ -1105,9 +1146,24 @@ fn run_single_tx(
         tracing::info!("replay path: no new audit entries written");
     }
 
+    // S375 — render + XSD-validate + write the NAV XML BEFORE commit, on
+    // both the Fresh and Replay paths (matches the pre-S375 unconditional
+    // post-commit render). A failure here returns `Err` so the tx drops
+    // un-committed → the allocation + audit appends roll back together and
+    // no committed-but-XML-less invoice row survives.
+    let invoice_number = render_and_write(&invoice)
+        .context("render + XSD-validate + write NAV XML before invoice commit (S375 atomicity)")?;
+
     tx.commit()
         .context("commit DuckDB transaction (billing + audit-ledger)")?;
-    Ok(TxOutcome { invoice, was_fresh })
+    Ok((
+        TxOutcome {
+            invoice,
+            was_fresh,
+            invoice_number,
+        },
+        conn,
+    ))
 }
 
 // ──────────────────────────────────────────────────────────────────────
