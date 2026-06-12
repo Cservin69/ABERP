@@ -1828,10 +1828,8 @@ pub fn count_invoice_lines_from_xml(path: &std::path::Path) -> Result<usize> {
                 path.display()
             )
         })? {
-            quick_xml::events::Event::Start(e) => {
-                if e.name().local_name().as_ref() == b"line" {
-                    count += 1;
-                }
+            quick_xml::events::Event::Start(e) if e.name().local_name().as_ref() == b"line" => {
+                count += 1;
             }
             quick_xml::events::Event::Eof => return Ok(count),
             _ => {}
