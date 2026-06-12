@@ -13,6 +13,9 @@ pub use crate::export_control::{
     Classifiable, ExportClassification, ExportControlError, ExportControlProvider, Jurisdiction,
     MockExportControlProvider, PartyRef, ScreeningResult,
 };
+pub use crate::incident::{
+    dod_72h_report_due_at_ms, DetectionSource, IncidentSeverity, DFARS_72H_REPORT_WINDOW_MS,
+};
 pub use crate::lot_heat::{HeatId, LotId, MaterialTraceabilitySeed, TraceabilityError, MAX_ID_LEN};
 pub use crate::uid::{
     validate_iac, Iuid, IuidConstruct1, IuidConstruct2, UidError, MAX_IAC_LEN, MAX_UID_FIELD_LEN,

@@ -32,6 +32,9 @@
 //!   audit-event tagging.
 //! - [`uid`] — MIL-STD-130N IUID format types ([`Iuid`] / [`IuidConstruct1`] /
 //!   [`IuidConstruct2`] + [`validate_iac`]) for DoD item unique identification.
+//! - [`incident`] — DFARS 252.204-7012 cyber-incident vocabulary
+//!   ([`IncidentSeverity`] / [`DetectionSource`] +
+//!   [`dod_72h_report_due_at_ms`]) for the 72-hour reporting strand (S362).
 //!
 //! Out of scope (future work): real providers, audit `EventKind`s that
 //! reference these types, the e-signature ceremony, the SPA surfaces.
@@ -52,6 +55,9 @@
 //! [`IuidConstruct1`]: uid::IuidConstruct1
 //! [`IuidConstruct2`]: uid::IuidConstruct2
 //! [`validate_iac`]: uid::validate_iac
+//! [`IncidentSeverity`]: incident::IncidentSeverity
+//! [`DetectionSource`]: incident::DetectionSource
+//! [`dod_72h_report_due_at_ms`]: incident::dod_72h_report_due_at_ms
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -59,6 +65,7 @@
 pub mod avl;
 pub mod cui;
 pub mod export_control;
+pub mod incident;
 pub mod lot_heat;
 pub mod nist_800_171;
 pub mod prelude;

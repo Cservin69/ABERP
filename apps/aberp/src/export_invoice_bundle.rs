@@ -911,7 +911,14 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // XML bytes. `supplier.*`-not-`invoice.*` posture; never sweeps a
         // per-OUTGOING-invoice export bundle by glob.
         | EventKind::SupplierDpasPrioritySet
-        | EventKind::SupplierExportScreened => None,
+        | EventKind::SupplierExportScreened
+        // S362 / PR-49 — incident.* cyber-incident-reporting family (ADR-0079).
+        // Cyber-incident-detected record (DFARS 252.204-7012(c)(1) 72-hour
+        // clock); app-layer JSON payloads (detected_at_ms / severity /
+        // cdi_affected / detection_source / …), never NAV XML bytes, and never
+        // raw log dumps. `incident.*`-not-`invoice.*` posture; never sweeps a
+        // per-OUTGOING-invoice export bundle by glob.
+        | EventKind::IncidentCyberDetected => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -1729,6 +1736,32 @@ mod tests {
             let nav = extract_nav_xml(&entries[0]).unwrap();
             assert!(nav.is_none(), "{} must produce no nav/ file", kind.as_str());
         }
+    }
+
+    /// S362 / PR-49 (ADR-0079) — the lone `incident.*` cyber-incident kind
+    /// carries an app-layer JSON payload, never NAV XML, so `extract_nav_xml`
+    /// MUST return `None`. The Rust exhaustiveness check already forces the new
+    /// variant into the no-NAV-bytes arm at compile time; this is the belt-and-
+    /// braces runtime pin that the verdict actually holds, so a cyber-incident
+    /// row never produces a `nav/` file in a per-OUTGOING-invoice export bundle.
+    #[test]
+    fn extract_nav_xml_returns_none_for_incident_kind() {
+        let (mut ledger, actor, _bh) = fixture_ledger();
+        ledger
+            .append(
+                EventKind::IncidentCyberDetected,
+                br#"{"detected_at_ms":1750000000000,"severity":"high"}"#.to_vec(),
+                actor,
+                None,
+            )
+            .unwrap();
+        let entries = ledger.entries().unwrap();
+        let nav = extract_nav_xml(&entries[0]).unwrap();
+        assert!(
+            nav.is_none(),
+            "{} must produce no nav/ file",
+            EventKind::IncidentCyberDetected.as_str()
+        );
     }
 
     /// ADR-0029 §3: `chain.jsonl` carries one JSON object per

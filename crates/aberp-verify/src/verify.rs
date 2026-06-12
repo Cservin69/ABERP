@@ -1048,7 +1048,14 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // XML bytes. `supplier.*`-not-`invoice.*` posture; never sweeps a
         // per-OUTGOING-invoice bundle. Exhaustiveness arm only.
         | EventKind::SupplierDpasPrioritySet
-        | EventKind::SupplierExportScreened => (None, ""),
+        | EventKind::SupplierExportScreened
+        // S362 / PR-49 — incident.* cyber-incident-reporting family (ADR-0079).
+        // Cyber-incident-detected record (DFARS 252.204-7012(c)(1) 72-hour
+        // clock); app-layer JSON payloads (detected_at_ms / severity /
+        // cdi_affected / detection_source / …), never NAV XML bytes, and never
+        // raw log dumps. `incident.*`-not-`invoice.*` posture; never sweeps a
+        // per-OUTGOING-invoice bundle. Exhaustiveness arm only.
+        | EventKind::IncidentCyberDetected => (None, ""),
     };
 
     Ok(NavExtraction {

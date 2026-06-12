@@ -2337,6 +2337,57 @@ pub enum EventKind {
     /// `supplier.*` prefix family — same segregation rationale as
     /// [`Self::SupplierDpasPrioritySet`].
     SupplierExportScreened,
+
+    /// S362 / PR-49 (ADR-0079) — a cyber incident affecting (or potentially
+    /// affecting) a covered defense information system was detected. FIRST and
+    /// only member of the new `incident.*` prefix family — the thirteenth — the
+    /// cyber-incident-reporting strand of the aerospace pivot
+    /// (`[[defense-aerospace-pivot]]`). DFARS 252.204-7012(c)(1) requires a
+    /// contractor to report a cyber incident that affects Controlled Defense
+    /// Information (CDI) or the contractor's ability to perform requirements
+    /// designated operationally critical **within 72 hours of discovery** to
+    /// the DoD (via the DIBNet / SPRS portal). The *detection* of an incident is
+    /// the accountable anchor that starts that 72-hour clock — recording *when*
+    /// it was detected, *who* reported it, *what* it touched, and *whether* CDI
+    /// / CUI is implicated is the artifact that evidences the reporting
+    /// obligation was triggered and tracked.
+    ///
+    /// Payload (`serde_json::Value`): `detected_at_ms` (epoch-ms discovery stamp
+    /// — the 72-hour clock's start), `reporter_operator_id` (who logged it — an
+    /// opaque accountability handle, never PII), `severity` (the rendered
+    /// [`aberp_compliance::incident::IncidentSeverity::as_str`] form —
+    /// `"informational"` / `"low"` / `"medium"` / `"high"` / `"critical"`),
+    /// `scope_description` (a free-text scope summary — NOT raw log dumps, per
+    /// the no-PII / no-controlled-content-at-rest posture), `cdi_affected`
+    /// (bool — Controlled Defense Information per DFARS), `cui_affected` (bool —
+    /// CUI per 32 CFR Part 2002), `exfiltration_suspected` (bool),
+    /// `affected_systems` (a string array of system identifiers),
+    /// `detection_source` (the rendered
+    /// [`aberp_compliance::incident::DetectionSource::as_str`] form — `"siem"` /
+    /// `"user_report"` / `"vendor_notification"` / `"audit"` / `"other"`), an
+    /// optional `mitigation_notes`, and an optional `dod_72h_report_due_at_ms`
+    /// (present when `cdi_affected` is true — `detected_at_ms` + 72h, the DFARS
+    /// reporting deadline, computed by
+    /// [`aberp_compliance::incident::dod_72h_report_due_at_ms`]).
+    ///
+    /// `incident.*` prefix family — NOT `invoice.*` / `system.*` / `mes.*` /
+    /// `quote.*` / `inventory.*` / `email.*` / `personnel.*` / `material.*` /
+    /// `part.*` / `export.*` / `cui.*` / `supplier.*`. A new prefix keeps the
+    /// cyber-incident surface globbable on its own (`incident.*` = "every
+    /// cyber-incident detection on this install") without sweeping fiscal,
+    /// manufacturing, quoting, access-trail, material-traceability,
+    /// per-unit-serialization, CUI, export-classification, or supplier-AVL
+    /// traffic — and the per-OUTGOING-invoice export bundle's `invoice.*` glob
+    /// (ADR-0009 §8) never sweeps an incident row by construction.
+    ///
+    /// No PII / no controlled content at rest: the payload records a
+    /// `scope_description` summary (not raw log dumps), an opaque
+    /// `reporter_operator_id` (not PII), and system *identifiers* (not their
+    /// contents). S362 ships the kind only; the SPRS report submission, the SIEM
+    /// integration, the incident-entry UI, and the 72-hour deadline alerting all
+    /// land in later sessions (mock-first, no firing site exists yet). F12
+    /// four-edit ritual fires for this single `incident.*` kind.
+    IncidentCyberDetected,
 }
 
 impl EventKind {
@@ -2457,6 +2508,7 @@ impl EventKind {
             EventKind::CuiAccessEvent => "cui.access_event",
             EventKind::SupplierDpasPrioritySet => "supplier.dpas_priority_set",
             EventKind::SupplierExportScreened => "supplier.export_screened",
+            EventKind::IncidentCyberDetected => "incident.cyber_detected",
         }
     }
 
@@ -2588,6 +2640,7 @@ impl EventKind {
             "cui.access_event" => Ok(EventKind::CuiAccessEvent),
             "supplier.dpas_priority_set" => Ok(EventKind::SupplierDpasPrioritySet),
             "supplier.export_screened" => Ok(EventKind::SupplierExportScreened),
+            "incident.cyber_detected" => Ok(EventKind::IncidentCyberDetected),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2711,6 +2764,7 @@ mod tests {
             EventKind::CuiAccessEvent,
             EventKind::SupplierDpasPrioritySet,
             EventKind::SupplierExportScreened,
+            EventKind::IncidentCyberDetected,
         ];
         for v in variants {
             let s = v.as_str();
@@ -5733,5 +5787,124 @@ mod tests {
         assert!(parsed["screened_at_ms"].is_i64());
         assert!(parsed["screened_by_operator_id"].is_string());
         assert!(parsed["hit_details"].is_string());
+    }
+
+    // ── S362 / PR-49 (ADR-0079) — incident.* cyber-incident-reporting family ──
+    //
+    // One kind opens the new `incident.*` prefix family (the thirteenth): the
+    // cyber-incident DETECTION event that starts the DFARS 252.204-7012(c)(1)
+    // 72-hour reporting clock. A focused round-trip test, a payload-shape pin
+    // (all fields populated), and a prefix-and-distinctness test. The no-NAV-
+    // bytes pin lives with the exhaustive-match consumer (`export_invoice_bundle`).
+
+    #[test]
+    fn s362_incident_cyber_detected_round_trips() {
+        let k = EventKind::IncidentCyberDetected;
+        let s = k.as_str();
+        assert_eq!(s, "incident.cyber_detected");
+        assert!(s.starts_with("incident."), "{s} must start with incident.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    /// S362 — the lone `incident.*` kind opens the new prefix family, carries NO
+    /// other prefix, and is distinct from a sample of every other prefix family.
+    /// A wrong prefix would either mis-bucket a cyber-incident row into a fiscal
+    /// / manufacturing / quoting / access-trail / material-traceability /
+    /// serialization / CUI / export / supplier bucket OR let the per-OUTGOING-
+    /// invoice export bundle's `invoice.*` glob sweep an incident row — both are
+    /// the silent-omission failure mode CLAUDE.md rule 12 names.
+    #[test]
+    fn s362_incident_kind_uses_incident_prefix_and_is_distinct() {
+        let k = EventKind::IncidentCyberDetected;
+        let s = k.as_str();
+        assert!(s.starts_with("incident."), "{s} must start with incident.");
+        for foreign in [
+            "invoice.",
+            "system.",
+            "mes.",
+            "quote.",
+            "inventory.",
+            "email.",
+            "personnel.",
+            "material.",
+            "part.",
+            "export.",
+            "cui.",
+            "supplier.",
+        ] {
+            assert!(!s.starts_with(foreign), "{s} must not start with {foreign}");
+        }
+        // Distinct from a sample sibling per other prefix family.
+        for sibling in [
+            EventKind::InvoiceDraftCreated,
+            EventKind::FirstProdLaunchAcknowledged,
+            EventKind::MesAdapterEvent,
+            EventKind::QuotePricingOperatorAccepted,
+            EventKind::MaterialReserved,
+            EventKind::EmailRelaySent,
+            EventKind::PersonnelIdRegistered,
+            EventKind::MaterialCertAttached,
+            EventKind::PartSerialAssigned,
+            EventKind::ExportClassificationSet,
+            EventKind::CuiMarkingApplied,
+            EventKind::SupplierDpasPrioritySet,
+        ] {
+            assert_ne!(
+                s,
+                sibling.as_str(),
+                "{s} collides with foreign-family {}",
+                sibling.as_str()
+            );
+        }
+    }
+
+    /// S362 — pin the documented `incident.cyber_detected` payload shape with
+    /// ALL fields populated (including the two optionals `mitigation_notes` and
+    /// `dod_72h_report_due_at_ms`) so a future firing site has a stable
+    /// contract. The kind stores a free-form `serde_json::Value` (same posture
+    /// as the `export.*` / `cui.*` / `supplier.*` kinds); this asserts the
+    /// documented fields are present with the documented JSON types after a
+    /// serialize → parse round-trip. `severity` / `detection_source` are the
+    /// rendered [`aberp_compliance::incident`] enum strings; `scope_description`
+    /// is a summary, never raw log dumps — no PII / controlled content at rest.
+    #[test]
+    fn s362_incident_cyber_detected_payload_serializes() {
+        let detected_at_ms = 1_750_000_000_000_i64;
+        let payload = serde_json::json!({
+            "detected_at_ms": detected_at_ms,
+            "reporter_operator_id": "mock-op-007",
+            "severity": "high",
+            "scope_description": "Anomalous outbound traffic from CAD workstation segment",
+            "cdi_affected": true,
+            "cui_affected": true,
+            "exfiltration_suspected": false,
+            "affected_systems": ["cad-ws-04", "file-srv-02"],
+            "detection_source": "siem",
+            "mitigation_notes": "Segment isolated; credentials rotated.",
+            "dod_72h_report_due_at_ms": detected_at_ms + 72 * 60 * 60 * 1000,
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["detected_at_ms"].is_i64());
+        assert!(parsed["reporter_operator_id"].is_string());
+        assert_eq!(parsed["severity"], "high");
+        assert!(parsed["scope_description"].is_string());
+        assert_eq!(parsed["cdi_affected"], true);
+        assert_eq!(parsed["cui_affected"], true);
+        assert_eq!(parsed["exfiltration_suspected"], false);
+        assert!(parsed["affected_systems"].is_array());
+        assert_eq!(parsed["affected_systems"][0], "cad-ws-04");
+        assert_eq!(parsed["detection_source"], "siem");
+        assert!(parsed["mitigation_notes"].is_string());
+        assert!(parsed["dod_72h_report_due_at_ms"].is_i64());
+        // The 72-hour deadline is exactly 72h after detection.
+        assert_eq!(
+            parsed["dod_72h_report_due_at_ms"].as_i64().unwrap() - detected_at_ms,
+            72 * 60 * 60 * 1000
+        );
     }
 }
