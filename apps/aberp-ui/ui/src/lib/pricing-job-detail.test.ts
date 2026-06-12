@@ -119,7 +119,9 @@ describe("writebackOutcomeBadge", () => {
   it("maps routing_misconfigured to the RED routing badge", () => {
     const b = writebackOutcomeBadge("routing_misconfigured");
     expect(b.className).toBe("chip chip--err");
-    expect(b.label).toContain("Routing misconfigured");
+    // S368 — the chip now names the 404-masked-by-CloudFront cause too.
+    expect(b.label).toContain("masked by CloudFront");
+    expect(b.label).toContain("404");
   });
 
   it("surfaces an unknown tag verbatim rather than dropping it", () => {

@@ -1570,7 +1570,9 @@ impl WritebackOutcome {
     pub fn label_hu(&self) -> &'static str {
         match self {
             WritebackOutcome::Success { .. } => "✓ Sikeres",
-            WritebackOutcome::RoutingMisconfigured { .. } => "🛑 Útvonal-hiba",
+            WritebackOutcome::RoutingMisconfigured { .. } => {
+                "🛑 Útvonal vagy 404 — CloudFront elfedte"
+            }
             WritebackOutcome::Unauthorized { .. } => "🛑 Hitelesítési hiba",
             WritebackOutcome::Forbidden { .. } => "🛑 Hozzáférés megtagadva",
             WritebackOutcome::NonJsonResponse { .. } => "🛑 Nem-JSON válasz",
@@ -1586,7 +1588,9 @@ impl WritebackOutcome {
     pub fn label_en(&self) -> &'static str {
         match self {
             WritebackOutcome::Success { .. } => "Success",
-            WritebackOutcome::RoutingMisconfigured { .. } => "Routing misconfigured",
+            WritebackOutcome::RoutingMisconfigured { .. } => {
+                "Routing or 404 — masked by CloudFront"
+            }
             WritebackOutcome::Unauthorized { .. } => "Unauthorized",
             WritebackOutcome::Forbidden { .. } => "Forbidden",
             WritebackOutcome::NonJsonResponse { .. } => "Non-JSON response",
@@ -1603,8 +1607,11 @@ impl WritebackOutcome {
         match self {
             WritebackOutcome::Success { .. } => "",
             WritebackOutcome::RoutingMisconfigured { .. } => {
-                "CloudFront route missing or behavior precedence wrong — the storefront returned \
-                 the SPA shell (HTML) instead of the priced API; fix the CDN routing"
+                "Origin returned HTML where JSON expected. Two known causes: (1) CloudFront route \
+                 missing — `/api/*` behavior not matching this URL path. (2) Storefront returned \
+                 404 (e.g. quote not found, ABERP_SITE_QUOTE_DIR misconfigured) and CloudFront's \
+                 `404→/index.html` rule overrode the response code to 200. Check storefront logs \
+                 for the actual request status; check CloudFront CustomErrorResponses panel."
             }
             WritebackOutcome::Unauthorized { .. } => {
                 "X-CloudFront-Secret or Bearer mismatch; check ADR-0009 secret rotation"
@@ -3820,6 +3827,34 @@ mod tests {
                 v.tag()
             );
         }
+    }
+
+    /// S368 / Scope B — the RoutingMisconfigured operator hint must enumerate
+    /// BOTH known causes (CDN route missing AND the 404-masked-as-200 case), so
+    /// an operator chasing a 404 isn't sent only to the CloudFront routing
+    /// panel. The bilingual chip labels carry the "or 404 / masked" wording.
+    #[test]
+    fn s368_routing_hint_names_both_causes() {
+        let o = WritebackOutcome::RoutingMisconfigured {
+            http_status: 200,
+            content_type: "text/html".to_string(),
+            body_excerpt: "<!doctype html>".to_string(),
+        };
+        let hint = o.operator_hint();
+        assert!(hint.contains("CloudFront route missing"), "{hint}");
+        assert!(hint.contains("404"), "{hint}");
+        assert!(
+            hint.contains("ABERP_SITE_QUOTE_DIR"),
+            "hint must point at the storefront quote-dir cause: {hint}"
+        );
+        assert!(hint.contains("index.html"), "{hint}");
+        assert!(o.label_hu().contains("404"), "{}", o.label_hu());
+        assert!(o.label_en().contains("404"), "{}", o.label_en());
+        assert!(
+            o.label_en().to_lowercase().contains("masked"),
+            "{}",
+            o.label_en()
+        );
     }
 
     #[test]

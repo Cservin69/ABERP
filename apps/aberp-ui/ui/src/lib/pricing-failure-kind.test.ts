@@ -143,8 +143,8 @@ describe("failureKindBadge", () => {
     const b = failureKindBadge("permanent", reason);
     expect(b).not.toBeNull();
     expect(b!.className).toBe("chip chip--err");
-    expect(b!.label).toContain("Routing misconfigured");
-    expect(b!.label).toContain("Útvonal-hiba");
+    expect(b!.label).toContain("masked by CloudFront");
+    expect(b!.label).toContain("Útvonal vagy 404");
     expect(b!.label).not.toContain("Ismeretlen");
     expect(b!.label).not.toContain("Operator retry required");
   });

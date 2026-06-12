@@ -52,7 +52,7 @@ function isMarginFloorReason(errorReason: string | null | undefined): boolean {
 // must act). Keep this map in sync with the Rust enum.
 const WRITEBACK_BADGES: Record<string, FailureKindBadge> = {
   routing_misconfigured: {
-    label: "🛑 Útvonal-hiba / Routing misconfigured",
+    label: "🛑 Útvonal vagy 404 — CloudFront elfedte / Routing or 404 — masked by CloudFront",
     className: "chip chip--err",
   },
   unauthorized: {

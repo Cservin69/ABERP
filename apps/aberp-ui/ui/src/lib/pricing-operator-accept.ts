@@ -93,7 +93,7 @@ function writebackFailureCopy(outcome: string | null): string {
     " Az elfogadás rögzítve, de a webshop szinkron sikertelen — próbáld újra. / The accept was recorded but the storefront sync failed — retry.";
   switch (outcome) {
     case "routing_misconfigured":
-      return `🛑 Útvonal-hiba — a webshop HTML-t adott vissza JSON helyett. / Routing misconfigured — the storefront returned HTML.${tail}`;
+      return `🛑 Útvonal vagy 404 — a webshop HTML-t adott vissza JSON helyett (CDN-útvonal hiányzik, vagy egy 404-et a CloudFront 200-ra maszkolt). / Routing or 404 — the storefront returned HTML instead of JSON (CDN route missing, or a 404 masked as 200 by CloudFront).${tail}`;
     case "unauthorized":
     case "forbidden":
       return `🛑 Hitelesítési hiba — token eltérés. / Auth failed — token mismatch.${tail}`;
