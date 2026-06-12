@@ -6560,6 +6560,126 @@ impl From<anyhow::Error> for SubmitRouteError {
     }
 }
 
+/// S378 / F44 — pre-flight dedupe verdict for an operator-triggered
+/// NAV submission. `None` means "state is `Ready`, proceed with the
+/// manageInvoice send". `Some(message)` is the operator-facing body
+/// for a `409 Conflict`: the invoice is not in a state where a fresh
+/// `manageInvoice` may be sent, so we refuse in code rather than let
+/// NAV reject it.
+///
+/// # Why this gate exists
+///
+/// NAV keys its invoice store on `InvoiceData/invoiceNumber` and
+/// rejects any second submission of a number it has already seen with
+/// `INVOICE_NUMBER_NOT_UNIQUE` ("A megadott számla sorszámmal már
+/// történt adatszolgáltatás"). Every submission also counts toward the
+/// taxpayer's ÁFA reporting, so a duplicate is not a harmless retry.
+/// The safety property therefore lives in code — we refuse a re-send
+/// whenever the audit ledger already records a submission for this
+/// invoice (per the no-smoke-test-in-prod / trust-code-not-operator
+/// posture), instead of trusting the operator to notice.
+///
+/// # invoice_number vs invoice_id
+///
+/// We key on the ABERP `invoice_id` (the ULID), not the NAV
+/// `invoiceNumber` string. For ABERP-issued ("Own") invoices the two
+/// are 1:1: the number is `series + sequence_number`, allocated
+/// exactly once at issuance behind a gap-free, `UNIQUE`-keyed
+/// allocator, and never re-bound to a different id. So "any prior
+/// submission for this invoice_number" ≡ "any prior submission for
+/// this invoice_id". Keying on the id is correct and avoids parsing
+/// `invoiceNumber` out of the opaque `request_xml` bytes the audit
+/// payloads carry (the number is not a queryable field).
+fn submission_dedupe_message(state: InvoiceState, transaction_id: Option<&str>) -> Option<String> {
+    let txn = match transaction_id {
+        Some(t) if !t.is_empty() => format!(", NAV transactionId={t}"),
+        _ => String::new(),
+    };
+    match state {
+        // The only state from which a fresh submission is allowed.
+        InvoiceState::Ready => None,
+        // State-2: Attempt committed, no Response yet. NAV may or may
+        // not already hold the submission (the wire leg is exactly the
+        // ambiguous window F44 describes); either way a blind re-send
+        // risks INVOICE_NUMBER_NOT_UNIQUE. Refuse and point at recovery.
+        InvoiceState::Pending => Some(format!(
+            "submission already in progress for this invoice{txn}; refusing a \
+             duplicate manageInvoice send. Poll the acknowledgement (poll-ack) \
+             or refresh from NAV to learn the current status."
+        )),
+        InvoiceState::PendingNavExists => Some(format!(
+            "NAV already holds a submission for this invoice{txn}; refusing a \
+             duplicate manageInvoice send. Poll-ack to fetch the \
+             acknowledgement status."
+        )),
+        // State-3: Response on the ledger — NAV has definitely seen it.
+        InvoiceState::Submitted | InvoiceState::Recovered => Some(format!(
+            "invoice already submitted to NAV{txn}; refusing a duplicate \
+             manageInvoice send. Poll-ack to fetch the acknowledgement status."
+        )),
+        // Terminal-by-NAV.
+        InvoiceState::Finalized => Some(format!(
+            "invoice already accepted by NAV (SAVED){txn}; no further \
+             submission is possible."
+        )),
+        InvoiceState::Rejected => Some(format!(
+            "invoice was already submitted and rejected by NAV (ABORTED){txn}; \
+             NAV will not accept a re-submission of this invoiceNumber — issue \
+             a fresh invoice with a new number."
+        )),
+        // Structurally not submittable — keep the pre-S378 precondition
+        // framing (stale UI / wrong affordance) rather than a dedupe story.
+        InvoiceState::Unknown
+        | InvoiceState::Draft
+        | InvoiceState::Storno
+        | InvoiceState::Amended
+        | InvoiceState::Abandoned => Some(format!(
+            "POST /invoices/.../submit requires state `Ready`; current state is \
+             `{state:?}`. Re-fetch the invoice detail and retry."
+        )),
+    }
+}
+
+/// S378 / F44 — process-wide, per-invoice submission gate.
+///
+/// Returns the async `Mutex` that serialises every
+/// [`submit_invoice_request`] for a given `(tenant, invoice_id)`. The
+/// caller holds it across the read-state → TX1-Attempt-commit → wire-
+/// send window so two concurrent submissions of the same invoice can
+/// no longer both observe `Ready` and both POST to NAV — the second
+/// waiter re-derives state *after* the first's Attempt commit, sees
+/// `Pending`/`Submitted`, and is refused by [`submission_dedupe_message`].
+///
+/// This closes the F44 double-submit (the invoice-0047 incident): the
+/// race is real because `submit_invoice_request` runs both from the
+/// auto-submit-on-issue background task and from the manual
+/// `POST /invoices/:id/submit` route, which can fire concurrently on a
+/// still-`Ready` invoice.
+///
+/// In-process only. Cross-process double-submit (two `aberp serve`
+/// instances on one tenant) is NOT covered here — that needs the
+/// flock/pidfile single-instance guard tracked separately (S386 per
+/// `docs/findings/s382-concurrency-db-lock-hardening.md`). The map
+/// retains one small entry per invoice ever submitted in this process;
+/// for the deployment's invoice volumes (and upgrade-time restarts)
+/// that is negligible and not pruned.
+fn submission_gate(tenant: &str, invoice_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let registry = GATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    // Tuple key — no string concat, so no tenant / invoice_id pair can
+    // ever alias another regardless of the bytes either contains.
+    let key = (tenant.to_string(), invoice_id.to_string());
+    let mut guard = registry
+        .lock()
+        .expect("submission-gate registry mutex poisoned");
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// PR-44η / session-60 — library helper that wires
 /// `submit_invoice::submit_from_inputs` over the [`AppState`]'s
 /// db_path + tenant + operator login. `pub` so the integration test
@@ -6599,15 +6719,27 @@ pub async fn submit_invoice_request(
         }
     };
 
-    // 1. Precondition check — derive current state from audit trace.
+    // S378 / F44 — acquire the per-invoice submission gate BEFORE
+    // deriving state and hold it across the wire send. This serialises
+    // concurrent submissions of the same invoice (auto-submit-on-issue
+    // background task vs. a manual Submit click) so the second waiter
+    // re-derives state after the first's TX1 Attempt commit and is
+    // refused below instead of POSTing a duplicate manageInvoice that
+    // NAV rejects INVOICE_NUMBER_NOT_UNIQUE (the invoice-0047 incident).
+    let gate = submission_gate(state.tenant.as_str(), invoice_id);
+    let _gate = gate.lock().await;
+
+    // 1. Precondition + dedupe gate — derive current state from the
+    //    audit trace. Only `Ready` proceeds; every other state is a
+    //    409 Conflict naming the existing status (and NAV transactionId
+    //    when known) per `submission_dedupe_message`.
     let derived = derive_state_for(state, invoice_id)?;
-    if !matches!(derived.state, InvoiceState::Ready) {
+    if let Some(message) =
+        submission_dedupe_message(derived.state, derived.transaction_id.as_deref())
+    {
         return Err(SubmitRouteError::PreconditionMismatch {
             current_state: format!("{:?}", derived.state),
-            message: format!(
-                "POST /invoices/{invoice_id}/submit requires state `Ready`; \
-                 re-fetch detail and retry"
-            ),
+            message,
         });
     }
 
@@ -16093,6 +16225,28 @@ fn poll_terminal_diagnostic(t: &poll_ack::PollAckTerminal) -> Option<String> {
 struct DerivedStateForInvoice {
     state: InvoiceState,
     nav_xml_path: Option<std::path::PathBuf>,
+    /// S378 / F44 — NAV `transactionId` from the most-recent
+    /// `InvoiceSubmissionResponse` for this invoice, when one exists.
+    /// Surfaced to the operator on the dedupe-gate 409 so a refused
+    /// re-submit names the existing NAV transaction it is protecting
+    /// (instead of a bare "wrong state" message). `None` when the
+    /// invoice has no Response entry yet (Ready / Pending).
+    transaction_id: Option<String>,
+}
+
+/// S378 / F44 — extract the NAV `transactionId` carried by an
+/// `InvoiceSubmissionResponse` entry for `invoice_id`, or `None` for
+/// any other entry kind / other invoice / undecodable payload. Shared
+/// by [`derive_state_for`] and its test so the dedupe-gate's
+/// transaction_id surfacing is pinned against the real extraction.
+fn response_transaction_id(entry: &Entry, invoice_id: &str) -> Option<String> {
+    if entry.kind != EventKind::InvoiceSubmissionResponse {
+        return None;
+    }
+    serde_json::from_slice::<audit_payloads::InvoiceSubmissionResponsePayload>(&entry.payload)
+        .ok()
+        .filter(|parsed| parsed.invoice_id == invoice_id)
+        .map(|parsed| parsed.transaction_id)
 }
 
 /// PR-44η / session-60 — walk the audit ledger once and compute the
@@ -16118,6 +16272,7 @@ fn derive_state_for(
 
     let mut trace = InvoiceTrace::default();
     let mut nav_xml_path: Option<std::path::PathBuf> = None;
+    let mut transaction_id: Option<String> = None;
     let mut found_any = false;
     for entry in &entries {
         if let Some(id) = extract_invoice_id(entry) {
@@ -16133,6 +16288,12 @@ fn derive_state_for(
                             nav_xml_path = Some(std::path::PathBuf::from(path_str));
                         }
                     }
+                }
+                // S378 / F44 — carry the NAV transactionId off the most-
+                // recent Response so the dedupe-gate 409 can name the
+                // existing transaction. Walk is seq order; last wins.
+                if let Some(txid) = response_transaction_id(entry, invoice_id) {
+                    transaction_id = Some(txid);
                 }
             }
         }
@@ -16156,6 +16317,7 @@ fn derive_state_for(
     Ok(DerivedStateForInvoice {
         state: trace.derive_state(),
         nav_xml_path,
+        transaction_id,
     })
 }
 
@@ -21571,6 +21733,144 @@ mod tests {
             }
         }
         trace
+    }
+
+    // ── S378 / F44 — pre-flight submission dedupe gate ─────────────
+
+    /// Brief case 1 + 3 + 4: an invoice with a prior submission is
+    /// refused, and the message names the NAV transactionId when the
+    /// ledger has a Response. Each row pins a distinct business rule
+    /// (CLAUDE.md rule 9): a `submission_dedupe_message` that returned a
+    /// constant would fail the `Ready → None` row AND the per-state
+    /// message-content rows.
+    #[test]
+    fn submission_dedupe_message_refuses_already_submitted_states() {
+        // Case 2: brand-new, issued, not yet submitted → proceed.
+        assert_eq!(
+            submission_dedupe_message(InvoiceState::Ready, None),
+            None,
+            "Ready is the only state from which a fresh submission may proceed"
+        );
+
+        // Case 4: in-progress (Attempt committed, no Response) → refuse,
+        // no transactionId known yet.
+        let pending = submission_dedupe_message(InvoiceState::Pending, None)
+            .expect("Pending must be refused");
+        assert!(
+            pending.contains("in progress"),
+            "Pending message should say submission is in progress: {pending}"
+        );
+
+        // Case 1: prior Submitted with a Response → refuse, name the txid.
+        let submitted =
+            submission_dedupe_message(InvoiceState::Submitted, Some("TXID-0047")).unwrap();
+        assert!(
+            submitted.contains("already submitted") && submitted.contains("TXID-0047"),
+            "Submitted message should say already-submitted and carry the transactionId: {submitted}"
+        );
+
+        // Case 3: prior REJECTED (NAV ABORTED) → still refuse; NAV will
+        // not accept a re-submission of the same invoiceNumber.
+        let rejected =
+            submission_dedupe_message(InvoiceState::Rejected, Some("TXID-0047")).unwrap();
+        assert!(
+            rejected.contains("rejected") && rejected.contains("new number"),
+            "Rejected message should refuse and steer to a fresh number: {rejected}"
+        );
+
+        // Finalized (SAVED) and the structural non-Ready states are all
+        // refused too — the gate's invariant is "only Ready proceeds".
+        for state in [
+            InvoiceState::PendingNavExists,
+            InvoiceState::Recovered,
+            InvoiceState::Finalized,
+            InvoiceState::Unknown,
+            InvoiceState::Draft,
+            InvoiceState::Storno,
+            InvoiceState::Amended,
+            InvoiceState::Abandoned,
+        ] {
+            assert!(
+                submission_dedupe_message(state, None).is_some(),
+                "{state:?} must be refused by the dedupe gate"
+            );
+        }
+    }
+
+    /// The dedupe-gate 409 surfaces the NAV transactionId the same way
+    /// `derive_state_for` extracts it — via the shared
+    /// `response_transaction_id` helper. Builds the invoice-0047 trace
+    /// (Draft → Attempt → Response) and asserts the last Response's
+    /// transactionId flows through, so a regression in the production
+    /// extraction surfaces here (CLAUDE.md rule 9).
+    #[test]
+    fn response_transaction_id_is_extracted_from_the_latest_response() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_draft(&mut ledger, &actor, "inv_0047", idem);
+        write_submission_attempt(&mut ledger, &actor, "inv_0047", idem);
+        write_submission_response_originally_witnessed(
+            &mut ledger,
+            &actor,
+            "inv_0047",
+            idem,
+            "TXID-0047",
+        );
+
+        let entries = ledger.entries().unwrap();
+        let txid = entries
+            .iter()
+            .filter_map(|e| response_transaction_id(e, "inv_0047"))
+            .next_back();
+        assert_eq!(txid.as_deref(), Some("TXID-0047"));
+
+        // A Draft / Attempt entry carries no transactionId, and a
+        // Response for a DIFFERENT invoice is ignored.
+        assert!(response_transaction_id(&entries[0], "inv_0047").is_none());
+        assert!(response_transaction_id(&entries[2], "inv_OTHER").is_none());
+
+        // End-to-end: the extracted txid lands in the operator's 409.
+        let msg = submission_dedupe_message(InvoiceState::Submitted, txid.as_deref()).unwrap();
+        assert!(
+            msg.contains("TXID-0047"),
+            "409 body must name the txid: {msg}"
+        );
+    }
+
+    /// F44 race closure: `submission_gate` returns the SAME mutex for a
+    /// given `(tenant, invoice_id)` — so two concurrent submissions of
+    /// one invoice serialise on it — and DIFFERENT mutexes for
+    /// different invoices / tenants (no cross-invoice head-of-line
+    /// blocking, no key collision via string concat).
+    #[test]
+    fn submission_gate_keys_per_tenant_invoice() {
+        let a1 = submission_gate("tenant-a", "inv_0047");
+        let a1_again = submission_gate("tenant-a", "inv_0047");
+        assert!(
+            Arc::ptr_eq(&a1, &a1_again),
+            "same (tenant, invoice) must share one gate so concurrent submits serialise"
+        );
+
+        let a2 = submission_gate("tenant-a", "inv_0048");
+        assert!(
+            !Arc::ptr_eq(&a1, &a2),
+            "different invoices must have independent gates"
+        );
+
+        let b1 = submission_gate("tenant-b", "inv_0047");
+        assert!(
+            !Arc::ptr_eq(&a1, &b1),
+            "same invoice id under a different tenant must not collide"
+        );
+
+        // The tuple key is unambiguous regardless of the bytes either
+        // component carries — no concat means no boundary aliasing.
+        let split_left = submission_gate("a", "bxc");
+        let split_right = submission_gate("axb", "c");
+        assert!(
+            !Arc::ptr_eq(&split_left, &split_right),
+            "tenant/invoice boundary must never alias"
+        );
     }
 
     /// PR-23 / ADR-0036 §8 — parameterized expected-label table.

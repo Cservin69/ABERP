@@ -185,9 +185,12 @@ fn write_ack(ledger: &mut Ledger, actor: &Actor, invoice_id: &str, txid: &str, s
 // Pin tests
 // ──────────────────────────────────────────────────────────────────────
 
-/// Submit precondition — a Finalized invoice (Draft + Attempt +
-/// Response + SAVED ack) must surface as `PreconditionMismatch`
-/// with `current_state == "Finalized"`. The route maps this to 409.
+/// Submit precondition + S378/F44 dedupe gate — a Finalized invoice
+/// (Draft + Attempt + Response + SAVED ack) must surface as
+/// `PreconditionMismatch` with `current_state == "Finalized"`, and the
+/// 409 body must explain it is already accepted by NAV and name the
+/// existing NAV `transactionId` (so the operator sees what the refusal
+/// is protecting, not a bare "wrong state"). The route maps this to 409.
 #[tokio::test]
 async fn submit_route_rejects_finalized_invoice_with_precondition_mismatch() {
     let dir = test_dir("submit-finalized");
@@ -219,8 +222,9 @@ async fn submit_route_rejects_finalized_invoice_with_precondition_mismatch() {
                 "current_state must serialise as `Finalized`"
             );
             assert!(
-                message.contains("requires state `Ready`"),
-                "error message must name the required state, got: {message}"
+                message.contains("already accepted by NAV (SAVED)") && message.contains("TXID-A"),
+                "error message must explain the Finalized refusal and name the \
+                 existing NAV transactionId, got: {message}"
             );
         }
         other => panic!("expected PreconditionMismatch, got {other:?}"),
