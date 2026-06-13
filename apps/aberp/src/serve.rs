@@ -15292,13 +15292,18 @@ async fn handle_put_seller_numbering(
     State(state): State<AppState>,
     Json(wire): Json<NumberingTemplateWire>,
 ) -> Response {
-    if let Err(resp) = require_ready(&state) {
-        return resp;
-    }
+    // S394 — `require_ready` returns the operator login the audit-of-record
+    // records (the SPA only surfaces this form once the backend is Ready,
+    // so the login is always resolvable — same posture as the first-launch
+    // acknowledgement route).
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match put_seller_numbering_request(&state, wire, None) {
+    match put_seller_numbering_request(&state, wire, &operator_login, None) {
         Ok(template) => Json(NumberingTemplateWire::from_domain(&template)).into_response(),
         Err(NumberingPutError::Validation(e)) => {
             (StatusCode::UNPROCESSABLE_ENTITY, e.operator_message()).into_response()
@@ -15329,6 +15334,7 @@ impl From<anyhow::Error> for NumberingPutError {
 pub fn put_seller_numbering_request(
     state: &AppState,
     wire: NumberingTemplateWire,
+    operator_login: &str,
     path_override: Option<&Path>,
 ) -> std::result::Result<NumberingTemplate, NumberingPutError> {
     let template = wire.into_domain().map_err(NumberingPutError::Validation)?;
@@ -15343,9 +15349,79 @@ pub fn put_seller_numbering_request(
             owned_path.as_path()
         }
     };
+    // S394 — capture the pre-write `start_value` for the audit-of-record so
+    // the ledger shows the transition (e.g. 1 → 56), not just the new value.
+    // `read_numbering_template` returns the default template (start_value=1)
+    // for an absent file / section, so a first-ever save records `1 → N`.
+    let old_start_value = numbering_mod::read_numbering_template(path)
+        .map(|t| t.start_value)
+        .unwrap_or_else(|_| numbering_mod::default_template().start_value);
     numbering_mod::write_numbering_section(path, &template)
         .context("write [seller.numbering] section")?;
+    // S394 — audit-of-record AFTER the write succeeds. The seller.toml write
+    // is the operator's primary intent; ordering the append second means an
+    // append failure loud-fails the request (CLAUDE.md rule 12) without
+    // un-writing the saved file, mirroring `acknowledge_first_prod_launch`.
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash for numbering-change audit")?;
+    record_numbering_change_audit(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        old_start_value,
+        &template,
+    )?;
     Ok(template)
+}
+
+/// S394 — append a single `NumberingTemplateChanged` entry to the on-disk
+/// audit ledger. Split from [`put_seller_numbering_request`] so the
+/// ledger-write half is unit-testable against a scratch DuckDB without
+/// constructing an [`AppState`] (same posture as
+/// [`record_first_prod_launch_audit`]).
+///
+/// `rendered_preview` is the template rendered at its `start_value` — the
+/// same "next invoice will be …" string the SPA preview shows — so an
+/// auditor sees exactly what the operator was configuring. Uses the bare
+/// [`NumberingTemplate::render`] (no build-profile `TEST-` prefix) so the
+/// record is stable across dev/prod binaries.
+fn record_numbering_change_audit(
+    db_path: &std::path::Path,
+    tenant: TenantId,
+    binary_hash: aberp_audit_ledger::BinaryHash,
+    operator_login: &str,
+    old_start_value: u64,
+    template: &NumberingTemplate,
+) -> Result<()> {
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    let now = OffsetDateTime::now_utc();
+    let changed_at = now
+        .format(&Rfc3339)
+        .context("format numbering-change timestamp")?;
+    let rendered_preview = template.render(now.year(), template.start_value);
+    let tenant_str = tenant.as_str().to_string();
+    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
+        .context("open audit ledger to record numbering-template change")?;
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    let payload = serde_json::json!({
+        "tenant_id": tenant_str,
+        "old_start_value": old_start_value,
+        "new_start_value": template.start_value,
+        "reset_policy": format!("{:?}", template.reset_policy),
+        "rendered_preview": rendered_preview,
+        "actor": operator_login,
+        "changed_at": changed_at,
+    });
+    let bytes = serde_json::to_vec(&payload).context("encode numbering-change audit payload")?;
+    ledger
+        .append(EventKind::NumberingTemplateChanged, bytes, actor, None)
+        .context("append NumberingTemplateChanged audit entry")?;
+    Ok(())
 }
 
 // ── PR-92 / ADR-0047 — SMTP email delivery routes ────────────────────
@@ -21198,6 +21274,70 @@ mod tests {
         assert_eq!(payload.acknowledged_at, "2026-06-01T08:00:00Z");
         assert_eq!(payload.tenant, "test");
         assert_eq!(acks[0].actor.user_id, "operator-login");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// S394 — the numbering-PUT audit half: `record_numbering_change_audit`
+    /// MUST append exactly one `NumberingTemplateChanged` entry whose JSON
+    /// payload carries the old→new `start_value`, the rendered preview, and
+    /// the operator login as actor. Scratch on-disk DuckDB, no `HOME`
+    /// mutation (the seller.toml-write half is pinned in
+    /// `serve_numbering_route.rs`). Pins item E of the override-floor fix.
+    #[test]
+    fn record_numbering_change_audit_appends_one_entry() {
+        let scratch = std::env::temp_dir().join(format!(
+            "aberp-s394-numbering-{}-{:?}",
+            ulid::Ulid::new(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let db_path = scratch.join("test.duckdb");
+        {
+            let conn = Connection::open(&db_path).expect("open scratch duckdb");
+            aberp_audit_ledger::ensure_schema(&conn).expect("ensure audit schema");
+        }
+
+        let tenant = TenantId::new("test").expect("tenant id");
+        let bh = BinaryHash::from_bytes([0u8; 32]);
+        let template = crate::numbering::NumberingTemplate {
+            segments: vec![
+                crate::numbering::Segment::Literal("ABERP-".to_string()),
+                crate::numbering::Segment::Year {
+                    digits: crate::numbering::YearDigits::Four,
+                },
+                crate::numbering::Segment::Literal("/".to_string()),
+                crate::numbering::Segment::Counter { pad_width: 5 },
+            ],
+            reset_policy: crate::numbering::ResetPolicy::OnYearChange,
+            start_value: 56,
+        };
+        record_numbering_change_audit(&db_path, tenant.clone(), bh, "operator-login", 1, &template)
+            .expect("record numbering-change audit entry");
+
+        let ledger = Ledger::open(&db_path, tenant, bh).expect("reopen ledger");
+        let entries = ledger.entries().expect("read entries");
+        let hits: Vec<_> = entries
+            .iter()
+            .filter(|e| e.kind == EventKind::NumberingTemplateChanged)
+            .collect();
+        assert_eq!(hits.len(), 1, "exactly one numbering-change entry");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&hits[0].payload).expect("payload parses");
+        assert_eq!(payload["old_start_value"], 1, "records the pre-write value");
+        assert_eq!(payload["new_start_value"], 56, "records the new override");
+        assert_eq!(payload["reset_policy"], "OnYearChange");
+        // The rendered preview is the template at the NEW start_value — the
+        // same string the SPA "next invoice will be …" preview shows.
+        assert!(
+            payload["rendered_preview"]
+                .as_str()
+                .expect("preview is a string")
+                .ends_with("/00056"),
+            "preview renders at start_value=56: {}",
+            payload["rendered_preview"]
+        );
+        assert_eq!(hits[0].actor.user_id, "operator-login");
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
