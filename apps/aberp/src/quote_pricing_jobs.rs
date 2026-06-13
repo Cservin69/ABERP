@@ -377,6 +377,66 @@ pub fn insert_fetched_job(
     Ok(rows > 0)
 }
 
+/// S379 / PR-379 — insert a terminal `Failed` row for a quote whose
+/// storefront listing came back WITHOUT any CAD file. There is no Fetched
+/// row to transition (the no-CAD check in
+/// [`crate::quote_pricing_pipeline::PricingPipelineService::enqueue_one`]
+/// runs *before* [`insert_fetched_job`]), so we INSERT directly at
+/// `Failed` with the enqueue-stage failure columns + placeholder CAD
+/// fields (`(missing)`, the legacy no-CAD shape).
+///
+/// `ON CONFLICT (quote_id) DO NOTHING` is the idempotency guard that
+/// closes the S376 phantom-retry loop: once the row exists, every
+/// subsequent 60s enqueue cycle's insert is a no-op, so the daemon SKIPS
+/// the quote_id instead of re-`warn!`-ing it forever. Returns `true` when
+/// a fresh row was inserted, `false` when one already existed.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_failed_enqueue_job(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    customer_email: &str,
+    customer_name: &str,
+    material_grade: &str,
+    quantity: u32,
+    stage: &str,
+    reason: &str,
+    failure_kind: FailureKind,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    ensure_schema(conn)?;
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format fetched_at")?;
+    let safe = sanitize_reason(reason);
+    let rows = conn
+        .execute(
+            "INSERT INTO quote_pricing_jobs (
+                quote_id, tenant_id, state, fetched_at, updated_at,
+                customer_email, customer_name, material_grade, quantity,
+                cad_filename, cad_local_path, attempt_n,
+                error_stage, error_reason, failure_kind
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '(missing)', '(missing)', 0, ?, ?, ?)
+            ON CONFLICT (quote_id) DO NOTHING",
+            params![
+                quote_id,
+                tenant_id,
+                STATE_FAILED,
+                ts,
+                ts,
+                customer_email,
+                customer_name,
+                material_grade,
+                quantity as i64,
+                stage,
+                safe,
+                failure_kind.as_str(),
+            ],
+        )
+        .context("insert failed enqueue row")?;
+    Ok(rows > 0)
+}
+
 /// Outcome of a state-machine transition. Distinguishes the three cases
 /// the daemon needs to react to without panicking:
 ///
@@ -1181,6 +1241,112 @@ mod tests {
         assert_eq!(rows[0].feature_graph_hash.as_deref(), Some("blake3:dead"));
         assert_eq!(rows[0].total_price_eur, Some(42.0));
         assert_eq!(rows[0].quantity, 10);
+    }
+
+    // ── S379 / PR-379 — listing-level no-CAD permanent enqueue failure ──
+
+    /// `insert_failed_enqueue_job` writes a terminal `Failed` row with the
+    /// enqueue-stage failure columns + placeholder CAD fields, and is
+    /// idempotent: the second call (same quote_id) is a no-op — exactly the
+    /// ON CONFLICT guard that stops the S376 phantom-retry loop from
+    /// re-inserting every 60s cycle.
+    #[test]
+    fn s379_insert_failed_enqueue_job_writes_shape_and_is_idempotent() {
+        let conn = open_mem();
+        let first = insert_failed_enqueue_job(
+            &conn,
+            "phantom-1",
+            "T",
+            "phantom@example.com",
+            "Phantom Customer",
+            "6061-T6",
+            2,
+            "enqueue",
+            "no CAD file on listing",
+            FailureKind::Permanent,
+            fixed_ts(),
+        )
+        .expect("first insert");
+        assert!(first, "first call inserts a fresh Failed row");
+
+        let rows = list_jobs(&conn, "T").expect("list");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.state, JobState::Failed);
+        assert_eq!(row.error_stage.as_deref(), Some("enqueue"));
+        assert_eq!(row.error_reason.as_deref(), Some("no CAD file on listing"));
+        assert_eq!(row.failure_kind, Some(FailureKind::Permanent));
+        assert_eq!(row.material_grade, "6061-T6");
+        assert_eq!(row.quantity, 2);
+
+        // Second cycle: same quote_id → no-op, still exactly one row.
+        let second = insert_failed_enqueue_job(
+            &conn,
+            "phantom-1",
+            "T",
+            "phantom@example.com",
+            "Phantom Customer",
+            "6061-T6",
+            2,
+            "enqueue",
+            "no CAD file on listing",
+            FailureKind::Permanent,
+            fixed_ts(),
+        )
+        .expect("second insert");
+        assert!(!second, "second call is an idempotent no-op");
+        assert_eq!(list_jobs(&conn, "T").expect("list2").len(), 1);
+    }
+
+    /// Conservative path: once a no-CAD `Failed` row exists, a later cycle
+    /// where the storefront listing DOES carry a CAD must NOT auto-reset the
+    /// row. `insert_fetched_job`'s ON CONFLICT guard returns `false` and
+    /// leaves the row terminal — the operator must explicitly Retry.
+    #[test]
+    fn s379_existing_failed_row_is_not_auto_reset_by_later_cad() {
+        let conn = open_mem();
+        insert_failed_enqueue_job(
+            &conn,
+            "phantom-2",
+            "T",
+            "phantom@example.com",
+            "Phantom Customer",
+            "6061-T6",
+            1,
+            "enqueue",
+            "no CAD file on listing",
+            FailureKind::Permanent,
+            fixed_ts(),
+        )
+        .expect("seed failed row");
+
+        // Later cycle: storefront now returns a CAD → enqueue's DB write is
+        // `insert_fetched_job`. It must be blocked by the existing row.
+        let inserted = insert_fetched_job(
+            &conn,
+            "phantom-2",
+            "T",
+            "phantom@example.com",
+            "Phantom Customer",
+            "6061-T6",
+            1,
+            "now-present.stl",
+            "/tmp/now-present.stl",
+            fixed_ts(),
+        )
+        .expect("re-enqueue attempt");
+        assert!(!inserted, "pre-existing row blocks re-enqueue");
+
+        let rows = list_jobs(&conn, "T").expect("list");
+        assert_eq!(rows.len(), 1);
+        // Row is untouched — still terminal Failed with the no-CAD reason,
+        // NOT silently reset to Fetched.
+        assert_eq!(rows[0].state, JobState::Failed);
+        assert_eq!(
+            rows[0].error_reason.as_deref(),
+            Some("no CAD file on listing")
+        );
+        assert_eq!(rows[0].failure_kind, Some(FailureKind::Permanent));
     }
 
     #[test]

@@ -288,14 +288,25 @@ impl PricingPipelineService {
         // Pick the first .stl/.step file — v1 is single-CAD-per-quote
         // per the design doc; a multi-CAD quote will need explicit
         // operator routing.
-        let cad = quote
-            .files
-            .iter()
-            .find(|f| {
-                let lower = f.filename.to_lowercase();
-                lower.ends_with(".stl") || lower.ends_with(".step") || lower.ends_with(".stp")
-            })
-            .ok_or_else(|| anyhow!("no CAD file on quote {qid}"))?;
+        let cad = match quote.files.iter().find(|f| {
+            let lower = f.filename.to_lowercase();
+            lower.ends_with(".stl") || lower.ends_with(".step") || lower.ends_with(".stp")
+        }) {
+            Some(c) => c,
+            None => {
+                // S379 — the storefront listing returned this quote with no
+                // CAD file (the pre-S368 redeploy wiped those files and they
+                // are not coming back). The old code `warn!`-ed and bailed
+                // here WITHOUT inserting a row, so the same quote_id re-fired
+                // every 60s cycle forever (S376 phantom-retry loop). Classify
+                // it as a PERMANENT enqueue failure: insert a `Failed` row +
+                // audit pair so the row trips `insert_*`'s ON CONFLICT
+                // idempotency guard and the next cycle SKIPS this quote_id.
+                // Operator must explicitly Retry once the storefront supplies
+                // a CAD again — we never auto-reset (conservative path).
+                return self.enqueue_failed_no_cad(quote).await;
+            }
+        };
 
         // Download to artifact_dir/<id>/<filename>.
         let dest_dir = self.config.artifact_dir.join(qid);
@@ -404,6 +415,82 @@ impl PricingPipelineService {
             }
         }
         Ok(inserted)
+    }
+
+    /// S379 — record a quote whose storefront listing carries no CAD file
+    /// as a PERMANENT enqueue failure. Inserts ONE `Failed` row (idempotent
+    /// via ON CONFLICT) + the `QuotePricingFailed` / `FailureClassified`
+    /// audit pair on the first cycle; later cycles no-op (the row already
+    /// exists), which is exactly what stops the S376 phantom-retry loop.
+    ///
+    /// Always returns `Ok(false)` — a no-CAD quote is NOT an enqueued
+    /// pricing job, so it never bumps the cycle's `enqueued` count and never
+    /// drives the customer-facing `quoting` writeback. The inner `inserted`
+    /// flag only gates the one-time `warn!` so the log isn't spammed every
+    /// cycle.
+    async fn enqueue_failed_no_cad(&self, quote: StorefrontQuote) -> Result<bool> {
+        let qid = quote.id.clone();
+        let material_grade = quote.request.material_preference.clone();
+        let quantity = quote.request.quantity.unwrap_or(1).max(1) as u32;
+        let customer_email = quote.contact.email.clone();
+        let customer_name = quote.contact.name.clone();
+
+        let db_path = self.deps.db_path.clone();
+        let tenant_id = self.deps.tenant.as_str().to_string();
+        let quote_id = qid.clone();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+        // Stable strings the SPA's Failed-row renderer surfaces verbatim.
+        let stage = "enqueue";
+        let reason = "no CAD file on listing";
+
+        let inserted = spawn_blocking(move || -> Result<bool> {
+            let conn = duckdb::Connection::open(&db_path).context("open DB for enqueue-fail")?;
+            audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
+            jobs::ensure_schema(&conn).context("ensure quote_pricing_jobs schema")?;
+            let now = OffsetDateTime::now_utc();
+            let inserted = jobs::insert_failed_enqueue_job(
+                &conn,
+                &quote_id,
+                &tenant_id,
+                &customer_email,
+                &customer_name,
+                &material_grade,
+                quantity,
+                stage,
+                reason,
+                FailureKind::Permanent,
+                now,
+            )?;
+            if !inserted {
+                // Row already present from an earlier cycle — idempotent
+                // skip, no second audit pair.
+                return Ok(false);
+            }
+            let mut conn = conn;
+            append_failure_audit_pair(
+                &mut conn,
+                &tenant_id,
+                binary_hash,
+                &login,
+                &quote_id,
+                stage,
+                reason,
+                FailureKind::Permanent,
+                0,
+            )?;
+            Ok(true)
+        })
+        .await
+        .context("enqueue-fail spawn_blocking join")??;
+
+        if inserted {
+            tracing::warn!(
+                quote_id = %qid,
+                "storefront listing has no CAD file; recorded permanent enqueue failure (operator Retry required)"
+            );
+        }
+        Ok(false)
     }
 
     async fn writeback_quoting_status(&self, quote_id: &str, notes: &str) -> Result<()> {
@@ -2043,6 +2130,40 @@ fn emit_failure(
         );
         return Ok(());
     }
+    append_failure_audit_pair(
+        conn,
+        tenant_id,
+        binary_hash,
+        login,
+        quote_id,
+        stage,
+        reason,
+        failure_kind,
+        attempt_n,
+    )
+}
+
+/// Append the `QuotePricingFailed` + `QuotePricingFailureClassified` audit
+/// pair in one tx so a forensic walker never sees one without the other.
+/// Shared by the state-machine failure path ([`emit_failure`], which
+/// runs `classify_failure` then `set_failed` first) and the enqueue-time
+/// no-CAD failure path
+/// ([`PricingPipelineService::enqueue_failed_no_cad`], S379, which
+/// classifies the listing-level no-CAD as `Permanent` up front and inserts
+/// the Failed row directly). `failure_kind` is passed in explicitly rather
+/// than re-derived so each caller's verdict is authoritative.
+#[allow(clippy::too_many_arguments)]
+fn append_failure_audit_pair(
+    conn: &mut duckdb::Connection,
+    tenant_id: &str,
+    binary_hash: BinaryHash,
+    login: &str,
+    quote_id: &str,
+    stage: &str,
+    reason: &str,
+    failure_kind: FailureKind,
+    attempt_n: u32,
+) -> Result<()> {
     let tx = conn.transaction().context("open failed-audit tx")?;
     let meta = LedgerMeta::new(TenantId::new(tenant_id).context("tenant id")?, binary_hash);
     let actor = Actor::from_local_cli(Ulid::new().to_string(), login);
@@ -4546,5 +4667,129 @@ mod tests {
         let addr = s347_spawn_writeback_mock(None).await;
         let reason = s348_run_poll(&addr, s348_temp_db()).await;
         assert!(reason.contains("timeout"), "got: {reason}");
+    }
+
+    // ── S379 / PR-379 — listing-level no-CAD = permanent enqueue failure ──
+
+    /// Build a service whose `base_url` is never contacted — the no-CAD
+    /// branch returns before any HTTP — pointed at a real temp DB so the
+    /// Failed row + audit pair actually persist.
+    fn s379_no_cad_service(db_path: std::path::PathBuf) -> PricingPipelineService {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(400))
+            .build()
+            .expect("client");
+        PricingPipelineService {
+            config: PricingPipelineConfig {
+                base_url: "http://127.0.0.1:1".to_string(),
+                bearer_token: Zeroizing::new("t0k3n".to_string()),
+                poll_interval: Duration::from_secs(60),
+                artifact_dir: std::env::temp_dir(),
+                python_bin: PathBuf::from("/usr/bin/python3"),
+                default_tolerance: ToleranceRange::Standard,
+            },
+            deps: PricingPipelineDeps {
+                db_path,
+                tenant: TenantId::new("T").expect("tid"),
+                binary_hash: BinaryHash::from_bytes([0u8; 32]),
+                operator_login: "ervin".to_string(),
+            },
+            client,
+        }
+    }
+
+    fn s379_temp_db() -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("aberp-s379-nocad-{}.duckdb", Ulid::new()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// A storefront listing entry that carries no CAD file (the pre-S368
+    /// wiped-files shape that drove the S376 phantom-retry loop).
+    fn s379_quote_no_cad(id: &str) -> StorefrontQuote {
+        StorefrontQuote {
+            id: id.to_string(),
+            contact: StorefrontContact {
+                name: "Phantom Customer".to_string(),
+                email: "phantom@example.com".to_string(),
+            },
+            request: StorefrontRequest {
+                material_preference: "6061-T6".to_string(),
+                quantity: Some(2),
+            },
+            files: vec![],
+        }
+    }
+
+    /// S379 regression: a no-CAD quote enqueues exactly ONE terminal
+    /// `Failed` row + ONE `QuotePricingFailed`/`FailureClassified` audit
+    /// pair on the first cycle, and the SECOND cycle is a complete no-op
+    /// (no new row, no new audit, no re-warn) — closing the S376 loop where
+    /// the same quote_id re-fired every 60s forever.
+    #[tokio::test]
+    async fn s379_no_cad_enqueues_one_failed_row_then_skips() {
+        use aberp_audit_ledger::recent_entries;
+        let db = s379_temp_db();
+        let svc = s379_no_cad_service(db.clone());
+
+        // ── Cycle 1 ──
+        let first = svc
+            .enqueue_one(s379_quote_no_cad("phantom-1"))
+            .await
+            .expect("no-CAD enqueue must not error");
+        assert!(!first, "a no-CAD quote is not an enqueued pricing job");
+
+        let conn = duckdb::Connection::open(&db).expect("reopen");
+        let rows = jobs::list_jobs(&conn, "T").expect("list");
+        assert_eq!(rows.len(), 1, "exactly one Failed row after cycle 1");
+        let row = &rows[0];
+        assert_eq!(row.quote_id, "phantom-1");
+        assert_eq!(row.state, JobState::Failed);
+        assert_eq!(row.error_stage.as_deref(), Some("enqueue"));
+        assert_eq!(row.error_reason.as_deref(), Some("no CAD file on listing"));
+        assert_eq!(row.failure_kind, Some(FailureKind::Permanent));
+
+        let entries = recent_entries(&conn, 20).expect("recent");
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.kind.as_str() == "quote.pricing_failed")
+                .count(),
+            1,
+            "exactly one QuotePricingFailed"
+        );
+        let classified: Vec<_> = entries
+            .iter()
+            .filter(|e| e.kind.as_str() == "quote.pricing_failure_classified")
+            .collect();
+        assert_eq!(classified.len(), 1, "exactly one FailureClassified");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&classified[0].payload).expect("decode");
+        assert_eq!(payload["failure_kind"], "permanent");
+        assert_eq!(payload["last_error"], "no CAD file on listing");
+        drop(conn);
+
+        // ── Cycle 2 — same quote_id, must be a total no-op ──
+        let second = svc
+            .enqueue_one(s379_quote_no_cad("phantom-1"))
+            .await
+            .expect("second no-CAD enqueue must not error");
+        assert!(!second);
+
+        let conn = duckdb::Connection::open(&db).expect("reopen2");
+        assert_eq!(
+            jobs::list_jobs(&conn, "T").expect("list2").len(),
+            1,
+            "still exactly one row — cycle 2 did not re-insert"
+        );
+        let total_audit = recent_entries(&conn, 50).expect("recent2").len();
+        drop(conn);
+        assert_eq!(
+            total_audit, 2,
+            "cycle 2 must not append another audit pair (only cycle 1's failed+classified)"
+        );
+
+        let _ = std::fs::remove_file(&db);
     }
 }
