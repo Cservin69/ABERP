@@ -1,9 +1,12 @@
 # ABERP
 
-A small-business ERP focused on **Hungarian NAV Online Számla v3.0**
-invoicing. Rust backend, Tauri 2 + Svelte 5 desktop UI, append-only
-hash-chained audit ledger. Runs locally on the operator's own machine;
-no SaaS dependency. Single-maintainer, non-commercial, open-source.
+A small-business ERP built around **Hungarian NAV Online Számla v3.0**
+invoicing, now spanning the full shop-floor loop: auto-quoting →
+manufacturing (work orders, QA, dispatch) → invoicing → accounts
+payable → financial statistics. Rust backend, Tauri 2 + Svelte 5
+desktop UI, append-only hash-chained audit ledger. Runs locally on the
+operator's own machine; no SaaS dependency. Single-maintainer,
+non-commercial, open-source.
 
 > **License — PolyForm Noncommercial 1.0.0.** ABERP is free for
 > non-commercial use. See [`LICENSE`](LICENSE) for the full terms. If
@@ -16,9 +19,95 @@ no SaaS dependency. Single-maintainer, non-commercial, open-source.
 
 ## Status
 
-Pre-release pilot. The first production cutover is imminent (PROD_v1.x).
-Real money flows through the pilot; the test path is the default for any
-build that does not pass `--features production`.
+**Current stable: `PROD_v2.27.50`** (cut 2026-06-13). In production —
+real money and live NAV submissions flow through it. The test path
+remains the default for any build that does not pass
+`--features production`; the production NAV endpoint is structurally
+unreachable from a non-production build.
+
+**What's new since the previous milestone:** the full NAV credit-note
+(storno) chain is now end-to-end NAV-accepted, closing a long-standing
+storno blocker. This release lands an XSD-conformance sweep on storno
+and modification XML (NAV rules F1–F4), atomic render-before-commit
+invoice writes (the PDF + audit entry land in the same transaction or
+not at all), a manual `aberp snapshot` / `restore-snapshot` panic-button
+CLI, and a `queryInvoiceCheck` pre-flight that skips invoice numbers the
+NAV test endpoint already claims from a prior cycle. Supporting fixes:
+the storefront-writeback CSRF/Origin-header fix, a NAV submission
+de-duplication gate (closes a double-submit TOCTOU race), and a
+cross-process file lock at every NAV POST site.
+
+> **DuckDB 1.5.3 storage upgrade.** This release bumps the embedded
+> DuckDB to 1.5.3. The on-disk storage format upgrade from 1.5.2 → 1.5.3
+> is **one-way** — once the new binary opens a tenant DB it cannot be
+> reopened by an older build. **Snapshot before upgrading** (see
+> [Updating an existing prod install](#updating-an-existing-prod-install)).
+
+### Upgrade an existing install to `PROD_v2.27.50`
+
+```bash
+cd ~/ABERP
+# 1. Snapshot first — the 1.5.2 → 1.5.3 storage upgrade is one-way.
+#    --db must point at the real tenant DB; the flag defaults to ./aberp.duckdb.
+cargo run -p aberp --release --bin aberp -- \
+  snapshot --tenant prod --db ~/.aberp/prod/aberp.duckdb
+# 2. Switch to the release and launch.
+git fetch origin && git reset --hard origin/PROD_v2.27.50 && \
+  ./run/upgrade_prod.sh PROD_v2.27.50
+```
+
+`upgrade_prod.sh` also takes its own pre-swap tenant snapshot, but taking
+your own with `aberp snapshot` first (binary-validated via
+`PRAGMA verify_external_invariants`) is the belt-and-braces move before a
+one-way storage migration. If an upgrade goes sideways, restore with
+`aberp restore-snapshot` (refuses while a server holds the DB lock).
+
+## Modules & capabilities
+
+What a fresh install actually gives you, as shipped in `PROD_v2.27.50`:
+
+- **NAV invoicing core** — issue, credit-note (storno), and modification
+  invoices against NAV Online Számla v3.0, with runtime `<InvoiceData>`
+  XSD invariant checking, technical annulment, async status polling, and
+  a NAV-as-disaster-recovery restore wizard. MNB exchange-rate lookup for
+  foreign-currency invoices.
+- **Auto-quoting pipeline** — pulls approved quotes from a sister
+  storefront, runs CAD feature extraction (a sandboxed Python extractor
+  behind a Rust wrapper), prices them with a pure-function quote engine,
+  renders an indicative quote PDF, and writes the price back. Pricing-jobs
+  list + per-job detail panel in the SPA; operator material-grade override
+  and accept-on-behalf; a maintainable material catalogue with complexity,
+  tolerance, parameter, and stock-adjustment tunables.
+- **Manufacturing (shop floor)** — append-only inventory ledger, work
+  orders with 1-level BOM and linear routings (consume-on-release,
+  produce-on-complete), a QA inspection queue, and a dispatch board that
+  spawns the Stage-1 invoice draft on ship. A wall-TV "workshop" density
+  dashboard (with a self-contained demo mode for tours).
+- **MES adapters** — an adapter framework plus barcode-scanner, Zebra,
+  MTConnect, and UR-RTDE adapters, each wired into the binary and gated by
+  `ABERP_<TYPE>_ENABLED` env flags (single-instance per type). Configured
+  from the Adapters screen; live adapters surface on the workshop dashboard.
+- **Accounts payable (incoming invoices)** — mirrors supplier invoices
+  from NAV (`queryInvoiceDigest INBOUND`) on a sync daemon, with a
+  three-state operator workflow (Outstanding / Paid / Irrelevant). v1 is
+  mirror + mark; approval/payment/PO-matching are not built yet.
+- **Financial statistics** — a read-only finance dashboard aggregating
+  outgoing invoices, AP, and NAV-mirror rows into revenue / VAT / AR-AP /
+  aging / cashflow with period and date-basis selectors.
+- **Audit & evidence** — every state change lands in a tamper-evident,
+  hash-chained append-only ledger; `aberp-verify` re-verifies a
+  per-invoice export bundle from bytes alone; the `aberp snapshot` /
+  `restore-snapshot` CLI is the DB-rollback panic button.
+- **Email** — quote and invoice email out via an SMTP outbox with a
+  storefront email-relay queue.
+
+> **Defense / compliance scaffolding is foundation-only.** The
+> `aberp-compliance` crate carries trait definitions, mock backends, and
+> reserved audit event-kinds (export control, CUI marking, material
+> traceability, AVL/DPAS, NIST 800-171), but no operator-facing
+> compliance workflow fires them. `aberp-digital-id` boots a mock signer
+> only (a real provider such as DoD CAC is scaffolded, not wired). Do not
+> treat any of this as an available feature.
 
 ## Prerequisites
 
@@ -78,12 +167,12 @@ Short version: each production release is a branch on origin named
 `PROD_vMAJOR.MINOR` or `PROD_vMAJOR.MINOR.PATCH`. On the prod machine:
 
 ```bash
-git clone --branch PROD_v1.0 <origin-url> ABERP-prod
+git clone --branch PROD_v2.27.50 <origin-url> ABERP-prod
 cd ABERP-prod
 ./run/run_prod.sh   # builds with --features production, launches the shell
 ```
 
-`./run/release.sh PROD_v1.0` is the dev-side script that publishes a
+`./run/release.sh PROD_v2.27.50` is the dev-side script that publishes a
 release branch from `main`.
 
 The patch-vs-minor-vs-major rules (when to bump which segment, what
@@ -123,13 +212,27 @@ file in and rebuild.
 
 → **[`docs/CUTOVER_RUNBOOK.md` § Step 9](docs/CUTOVER_RUNBOOK.md)**
 
-Always run `./tools/snapshot-prod.sh` before switching release branches.
-It tarballs `~/.aberp/<tenant>/`, encrypts the keychain entries, AND
-drops `~/.aberp/<tenant>/.upgrade-snapshot.toml` — a small contract
-file the next boot of the new binary compares against the post-upgrade
-`seller.toml`. The binary REFUSES to start if `[seller.smtp]` or
-`[seller.numbering]` drifted, so you don't need to remember to verify
-them manually.
+The canonical one-liner is in the [Status](#upgrade-an-existing-install-to-prod_v22750)
+section above:
+`git fetch origin && git reset --hard origin/<VERSION> && ./run/upgrade_prod.sh <VERSION>`.
+
+Two layers of safety net apply before any branch switch:
+
+1. **Snapshot the tenant DB first.** Run
+   `aberp snapshot --tenant prod --db ~/.aberp/prod/aberp.duckdb`
+   (writes a binary-validated copy to `~/Documents/ABERP-snapshots/`,
+   outside the repo and outside `~/.aberp/`; `--db` defaults to
+   `./aberp.duckdb`, so pass the real path). This is the rollback path
+   for the **one-way** DuckDB 1.5.x storage upgrades — once a newer build
+   opens the DB, an older build can't. Restore with
+   `aberp restore-snapshot` if needed.
+2. **The seller-config drift guard.** `./tools/snapshot-prod.sh` (run by
+   `upgrade_prod.sh`) tarballs `~/.aberp/<tenant>/`, encrypts the keychain
+   entries, AND drops `~/.aberp/<tenant>/.upgrade-snapshot.toml` — a small
+   contract file the next boot of the new binary compares against the
+   post-upgrade `seller.toml`. The binary REFUSES to start if
+   `[seller.smtp]` or `[seller.numbering]` drifted, so you don't need to
+   remember to verify them manually.
 
 ## Project structure
 
@@ -151,8 +254,20 @@ ABERP/
     audit-ledger/      ← tamper-evident append-only ledger (ADR-0008)
     nav-transport/     ← NAV TLS transport + credentials (ADR-0009 §4, ADR-0020)
     nav-xsd-validator/ ← <InvoiceData> v3.0 runtime invariant check (ADR-0022)
+    invoice-pdf/       ← printed-invoice PDF renderer
+    mnb-rates/         ← MNB exchange-rate fetcher (foreign-currency invoices)
     aberp-verify/      ← external-auditor evidence-bundle verifier
-    aberp-quote-intake/ ← sister-service quote-poll daemon (S210 — Stage 2 entry)
+    aberp-quote-intake/ ← sister-storefront quote-poll daemon (S210 — Stage 2 entry)
+    aberp-quote-engine/ ← pure-function quote scoring (auto-quoting)
+    aberp-quote-pdf/   ← indicative-quote PDF renderer
+    aberp-cad-extract-wrapper/ ← Rust shim around the sandboxed Python CAD extractor
+    aberp-inventory/   ← append-only stock-movement ledger + balance cache
+    aberp-work-orders/ ← work orders + 1-level BOM + routings
+    aberp-qa/          ← QA inspection queue
+    aberp-dispatch/    ← dispatch board (ships goods, spawns invoice draft)
+    aberp-mes/         ← MES adapter framework (barcode / Zebra / MTConnect / UR-RTDE)
+    aberp-digital-id/  ← pluggable audit-entry signature provider (foundation)
+    aberp-compliance/  ← export/CUI/traceability scaffolding — foundation only, dormant
   modules/
     billing/           ← NAV invoice issuing (ADR-0009)
   apps/
@@ -184,7 +299,7 @@ that ignore those principles will be sent back.
 
 ## Operator runbook — hülye-biztos cookbook
 
-Field-tested commands. Copy whichever recipe you need. Replace `<VERSION>` with the release name (e.g., `PROD_v2.0`, `PROD_v2.1`, `PROD_v2.0.1`).
+Field-tested commands. Copy whichever recipe you need. Replace `<VERSION>` with the release name (e.g., `PROD_v2.27.50`, `PROD_v2.27.49`).
 
 ### 1. Upgrade prod to a new release (Frissítés új verzióra)
 
@@ -232,8 +347,8 @@ Sanity-check before any `git reset --hard origin/<VERSION>`.
 
 ```bash
 git ls-remote https://github.com/Cservin69/ABERP.git \
-  refs/heads/main refs/heads/PROD_v2.0 refs/heads/PROD_v1.4.1 \
-  refs/tags/PROD_v2.0
+  refs/heads/main refs/heads/PROD_v2.27.50 \
+  refs/tags/PROD_v2.27.50
 ```
 
 ### 6. Restore tenant from snapshot (Visszaállítás biztonsági mentésből)
@@ -254,6 +369,35 @@ for line in $(jq -r '.[] | @base64' /tmp/keychain-prod.json); do echo "$line" | 
 # Relaunch
 cd ~/ABERP && ./run/run_prod.sh
 ```
+
+### 6b. DuckDB snapshot / restore — the panic button (DuckDB pillanatkép)
+
+Distinct from recipe 6. This is the S393 CLI that snapshots **just the
+tenant DuckDB** (binary-validated via `PRAGMA verify_external_invariants`)
+to `~/Documents/ABERP-snapshots/` — outside the repo and outside
+`~/.aberp/`, so a tenant wipe or restore never touches it. **Take one
+before every upgrade**, especially across a one-way DuckDB storage bump
+(e.g. 1.5.2 → 1.5.3). Best run with `aberp serve` stopped.
+
+`--db` defaults to `./aberp.duckdb` on both subcommands, so always pass
+the real tenant DB path (`~/.aberp/prod/aberp.duckdb`) explicitly.
+
+```bash
+cd ~/ABERP
+# Take a snapshot (writes ~/Documents/ABERP-snapshots/prod-<UTC-ts>.duckdb)
+cargo run -p aberp --release --bin aberp -- \
+  snapshot --tenant prod --db ~/.aberp/prod/aberp.duckdb
+# ... if an upgrade goes sideways, stop the app, then restore:
+pgrep -f aberp | xargs -r kill -9 2>/dev/null
+ls -lt ~/Documents/ABERP-snapshots/prod-*.duckdb | head -3
+cargo run -p aberp --release --bin aberp -- restore-snapshot \
+  --tenant prod --db ~/.aberp/prod/aberp.duckdb \
+  --from ~/Documents/ABERP-snapshots/prod-TIMESTAMP.duckdb
+```
+
+`restore-snapshot` refuses while a server still holds the DB lock, and
+refuses a snapshot that fails its own validity check — so it never
+clobbers a working DB with a broken backup.
 
 ### 7. Wipe leftover worktrees in DEV that poison prod check (Dev worktree takarítás)
 
