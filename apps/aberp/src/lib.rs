@@ -144,6 +144,7 @@ pub mod setup_seller_info;
 pub mod shutdown;
 pub mod smtp_config;
 pub mod smtp_credentials;
+pub mod snapshot;
 pub mod storefront_credential;
 pub mod storefront_origin_secret;
 pub mod submission_lock;

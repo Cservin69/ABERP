@@ -212,7 +212,15 @@ rustls-pemfile = "2"
 keyring = "2"
 
 # Embedded database driver, bundled per ADR-0021 Part A, item 10 (closes F1).
-duckdb = { version = "1", features = ["bundled"] }
+# Floor raised to libduckdb 1.5.3 (crate 1.10503.x) in S393 — DEV backend hit
+# a NEW 1.5.2 internal assertion (`dict_offset <= ... FetchStringFromDict`,
+# string_uncompressed.hpp:247), a different storage-read surface from the
+# LoadCheckpoint family S375 closed. 1.5.3 (2026-05-20) carries the 1.5.x
+# bugfix tail. NOTE: the on-disk storage upgrade is ONE-WAY — see the S393
+# snapshot/restore CLI (`aberp snapshot` / `aberp restore-snapshot`) as the
+# pre-upgrade panic button. `libduckdb-sys` is pinned transitively by `duckdb`;
+# Cargo.lock is the exact pin (this line is the floor per the header note).
+duckdb = { version = "1.10503", features = ["bundled"] }
 
 # Date / time — ADR-0021 Part A, item 11 (closes F2).
 time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde", "serde-well-known"] }
