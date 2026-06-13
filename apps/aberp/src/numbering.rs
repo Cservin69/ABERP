@@ -39,12 +39,16 @@
 //! # Gap-free + uniqueness invariants
 //!
 //! - Within a `(series_code, fiscal_year)` bucket the counter
-//!   increments by exactly 1, no gaps. Setting `start_value` > 1 is a
-//!   SETUP/MIGRATION action only (continuing an external sequence such
-//!   as Billingo); after the first invoice burns at `start_value`,
-//!   subsequent invoices burn `start_value + 1, +2, ...` monotonically.
-//!   See the SPA save endpoint for the gate that locks `start_value`
-//!   once an allocation exists.
+//!   increments by exactly 1, no gaps, in steady state. `start_value`
+//!   is the operator-configured FLOOR (S394): the allocator reserves
+//!   `max(next_number, start_value, …)` on every allocation, so setting
+//!   `start_value` to N forces the next invoice to be at least N. Raising
+//!   it above the current counter (e.g. migrating an external sequence
+//!   such as Billingo, or operator-correcting the next number) jumps the
+//!   sequence forward and leaves the skipped range as deliberate gaps;
+//!   leaving it at the default (1) keeps the gap-free, increment-by-1
+//!   behaviour. See `aberp_billing`'s `allocate_in_tx` for the floor and
+//!   `EventKind::NumberingTemplateChanged` for the audit-of-record.
 //! - Uniqueness across history: changing the template can re-render
 //!   historical invoices' display strings (the renderer is recomputed
 //!   from the current template at read time today — PR-90 may stamp
@@ -144,12 +148,16 @@ impl ResetPolicy {
 pub struct NumberingTemplate {
     pub segments: Vec<Segment>,
     pub reset_policy: ResetPolicy,
-    /// First value the counter takes when the bucket
-    /// `(series, fiscal_year)` is first allocated. Set > 1 only as a
-    /// migration step to continue an external sequence (e.g.,
-    /// "start at 1247 to continue my Billingo numbering"). Once any
-    /// invoice has been issued in the current bucket the SPA save
-    /// route locks this field — Hungarian §169 forbids gaps post-issue.
+    /// The operator-configured counter FLOOR. S394 — `allocate_in_tx`
+    /// honours it on every allocation (`max(next_number, start_value,
+    /// …)`), not just the first-INSERT seed, so setting it to N forces the
+    /// next invoice to be at least N. The default (1) leaves the
+    /// increment-by-1, gap-free §169 behaviour intact; raising it above
+    /// the live counter (migrating an external sequence such as Billingo,
+    /// or operator-correcting the next number) jumps the sequence forward
+    /// and leaves the skipped range as deliberate gaps. Each change is
+    /// recorded via [`crate::serve`]'s `EventKind::NumberingTemplateChanged`
+    /// audit-of-record.
     pub start_value: u64,
 }
 

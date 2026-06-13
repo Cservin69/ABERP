@@ -133,14 +133,16 @@ impl BillingStore for InMemoryBillingStore {
             .next_number
             .entry((args.series_id, fiscal_year))
             .or_insert_with(|| args.start_value.max(1));
-        // S392 — honour the NAV pre-flight floor, mirroring the DuckDB
+        // Reserve the largest of three floors, mirroring the DuckDB
         // adapter (ADR-0006 §Conformance — adapter divergence is itself a
-        // bug): reserve `max(next, floor)` and advance the counter past it,
-        // leaving the skipped range as deliberate gaps.
-        let allocated = match args.sequence_floor {
-            Some(floor) if floor > *next => floor,
-            _ => *next,
-        };
+        // bug): the stored counter, S394's operator `start_value` (honoured
+        // on EVERY allocation, not just the first-INSERT seed), and S392's
+        // NAV pre-flight floor. `start_value <= *next` (default-1, steady
+        // state) is a no-op; a jump past `*next` burns the skipped range as
+        // deliberate gaps.
+        let allocated = (*next)
+            .max(args.start_value)
+            .max(args.sequence_floor.unwrap_or(0));
         *next = allocated.checked_add(1).ok_or(BillingError::Invalid(
             "sequence counter overflowed u64::MAX (impossible in practice)",
         ))?;
