@@ -624,7 +624,10 @@ pub async fn poll_once(deps: &EmailOutboxPollDaemonDeps, client: &reqwest::Clien
         match handle_one_entry(deps, client, &snap, &entry).await {
             Ok(EntryOutcome::Sent) => sent_count = sent_count.saturating_add(1),
             Ok(EntryOutcome::SmtpFailed) => failed_count = failed_count.saturating_add(1),
-            Ok(EntryOutcome::AlreadyClaimed) => {}
+            // S391/E — dedup skip (already delivered on a prior attempt):
+            // not a new send. Treated like AlreadyClaimed for the cycle
+            // counters; the durable terminal audit already exists.
+            Ok(EntryOutcome::AlreadyClaimed) | Ok(EntryOutcome::AlreadyDelivered) => {}
             Ok(EntryOutcome::WritebackSentFailed) | Ok(EntryOutcome::WritebackFailedErrored) => {
                 last_error = Some(format!("entry {}: storefront writeback failed", entry.id));
             }
@@ -664,6 +667,13 @@ pub enum EntryOutcome {
     /// Writeback `.../failed` itself errored after SMTP failed — same
     /// shape as the prior; no terminal audit fires.
     WritebackFailedErrored,
+    /// S391/E — this entry already reached a terminal `EmailOutboxSent` in
+    /// OUR audit ledger on a prior attempt, so the SMTP send was SKIPPED to
+    /// avoid double-emailing the customer (the storefront's stale-claim
+    /// sweep returned a crashed-mid-writeback claim to `queued/`, and we
+    /// re-claimed it). We only re-attempt the `/sent` writeback; no new
+    /// SMTP send and no duplicate terminal audit.
+    AlreadyDelivered,
 }
 
 async fn handle_one_entry(
@@ -691,6 +701,38 @@ async fn handle_one_entry_inner(
         // (only successful claims are durable).
         return Ok(EntryOutcome::AlreadyClaimed);
     }
+
+    // S391/E — durable duplicate-send guard, BEFORE any SMTP work. If a
+    // prior attempt already delivered this entry (terminal EmailOutboxSent
+    // in our ledger) the storefront's stale-claim sweep must have returned
+    // a crashed-mid-writeback claim to `queued/`, and we just re-claimed
+    // it. Re-running SMTP would double-email the customer (S382). The
+    // terminal EmailOutboxSent row is durable proof the email already went
+    // out (it fires ONLY after `sender.send()` returned Ok), so skip the
+    // re-send and only re-attempt the `/sent` writeback so the storefront
+    // moves the row out of `claimed/`.
+    if entry_already_delivered(deps, &entry.id).await? {
+        let audit_id = Ulid::new().to_string();
+        match mark_sent(client, snap, &entry.id, &audit_id).await {
+            Ok(()) => {
+                tracing::warn!(
+                    entry_id = %entry.id,
+                    "email-outbox entry already has a terminal EmailOutboxSent; skipped SMTP re-send (S391/E dedup) and re-confirmed the /sent writeback"
+                );
+                return Ok(EntryOutcome::AlreadyDelivered);
+            }
+            Err(e) => {
+                let detail = scrub_for_audit(&format!("writeback /sent (dedup replay): {e:#}"));
+                tracing::warn!(
+                    entry_id = %entry.id,
+                    error = %detail,
+                    "email-outbox dedup-skip /sent writeback failed; storefront stale-claim sweep will recover after CLAIM_TTL"
+                );
+                return Ok(EntryOutcome::WritebackSentFailed);
+            }
+        }
+    }
+
     let recipients = recipients_combined(entry);
     let recipient_hash = hash_recipient_list(&recipients);
     let byte_size = entry_byte_size(entry);
@@ -1151,6 +1193,48 @@ async fn write_audit(deps: &EmailOutboxPollDaemonDeps, kind: EventKind, bytes: V
     }
 }
 
+// ── S391/E duplicate-send dedup ────────────────────────────────────────
+
+/// S391/E — has this storefront queue entry already reached a terminal
+/// `EmailOutboxSent` in OUR audit ledger? Pure over a decoded entry slice
+/// (no clock, no I/O) so the match logic is unit-testable. Matches on the
+/// `queue_row_id` join key (the storefront ULID); a payload that fails to
+/// decode is conservatively treated as "not a match" (a corrupt row never
+/// makes us SKIP a genuine first send).
+fn ledger_has_sent_for(entries: &[aberp_audit_ledger::Entry], queue_row_id: &str) -> bool {
+    entries.iter().any(|e| {
+        e.kind == EventKind::EmailOutboxSent
+            && serde_json::from_slice::<EmailOutboxEntryAuditPayload>(&e.payload)
+                .map(|p| p.queue_row_id == queue_row_id)
+                .unwrap_or(false)
+    })
+}
+
+/// S391/E — open the audit ledger and decide whether `queue_row_id` was
+/// already delivered (see [`ledger_has_sent_for`]). DuckDB reads are
+/// blocking, so this runs on `spawn_blocking` like [`write_audit`]. The
+/// volume is single-digit sends/day, so a full-ledger scan per send is
+/// fine (and the S335 idle throttle keeps the ledger small).
+async fn entry_already_delivered(
+    deps: &EmailOutboxPollDaemonDeps,
+    queue_row_id: &str,
+) -> Result<bool> {
+    let db_path = deps.db_path.clone();
+    let tenant = deps.tenant.clone();
+    let binary_hash = deps.binary_hash;
+    let qid = queue_row_id.to_string();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let ledger = aberp_audit_ledger::Ledger::open(&db_path, tenant, binary_hash)
+            .context("open audit ledger for email-outbox dedup check (S391/E)")?;
+        let entries = ledger
+            .entries()
+            .context("read audit entries for email-outbox dedup check (S391/E)")?;
+        Ok(ledger_has_sent_for(&entries, &qid))
+    })
+    .await
+    .context("email-outbox dedup spawn_blocking join")?
+}
+
 // ── small helpers ─────────────────────────────────────────────────────
 
 fn iso8601_now() -> String {
@@ -1230,7 +1314,68 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aberp_audit_ledger::{Actor, Ledger};
     use std::sync::Mutex;
+
+    /// S391/E — `ledger_has_sent_for` is the durable duplicate-send guard's
+    /// match logic: it returns true ONLY for a terminal `EmailOutboxSent`
+    /// row whose `queue_row_id` matches. A `claimed`-but-not-`sent` entry
+    /// (the in-flight / crashed-mid-send case) and an absent id both return
+    /// false, so the guard never skips a genuine first send.
+    #[test]
+    fn s391e_ledger_has_sent_for_matches_only_terminal_sent_by_queue_id() {
+        let tenant = TenantId::new("t-s391e".to_string()).unwrap();
+        let bh = BinaryHash::from_bytes([5u8; 32]);
+        let actor = Actor::from_local_cli("sess-s391e".to_string(), "test-user");
+        let mut ledger = Ledger::open_in_memory(tenant, bh).unwrap();
+
+        // ENTRY_A: only claimed (no terminal sent). ENTRY_B: sent.
+        let claimed = EmailOutboxEntryAuditPayload::claimed(
+            "priced_ready",
+            "01HENTRYAAAAAAAAAAAAAAAAAA",
+            "rh",
+            "subj",
+            10,
+        );
+        ledger
+            .append(
+                EventKind::EmailOutboxClaimed,
+                claimed.to_bytes(),
+                actor.clone(),
+                None,
+            )
+            .unwrap();
+        let sent = EmailOutboxEntryAuditPayload::sent(
+            "priced_ready",
+            "01HENTRYBBBBBBBBBBBBBBBBBB",
+            "rh",
+            "subj",
+            10,
+            1,
+        );
+        ledger
+            .append(
+                EventKind::EmailOutboxSent,
+                sent.to_bytes(),
+                actor.clone(),
+                None,
+            )
+            .unwrap();
+
+        let entries = ledger.entries().unwrap();
+        assert!(
+            ledger_has_sent_for(&entries, "01HENTRYBBBBBBBBBBBBBBBBBB"),
+            "a terminal EmailOutboxSent for this id must match (skip the re-send)"
+        );
+        assert!(
+            !ledger_has_sent_for(&entries, "01HENTRYAAAAAAAAAAAAAAAAAA"),
+            "claimed-but-not-sent must NOT match — the SMTP send may not have completed"
+        );
+        assert!(
+            !ledger_has_sent_for(&entries, "01HENTRYCCCCCCCCCCCCCCCCCC"),
+            "an absent id must NOT match — first send proceeds normally"
+        );
+    }
 
     /// Serialise the four env-mutating tests in this module — cargo's
     /// default parallel runner would otherwise race two `set_var` /

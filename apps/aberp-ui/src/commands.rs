@@ -1388,6 +1388,19 @@ pub async fn retry_quote_pricing_job(
     forward_post(&state, &path, Value::Null).await
 }
 
+/// S391/F — delete a permanently-Failed pricing job.
+/// `DELETE /api/quote-pricing-jobs/{quote_id}`. The backend refuses (409)
+/// any row not in `Failed` state; the SPA only offers Delete on Failed
+/// rows and confirms before sending.
+#[tauri::command]
+pub async fn delete_quote_pricing_job(
+    state: State<'_, AppState>,
+    quote_id: String,
+) -> Result<Value, String> {
+    let path = format!("/api/quote-pricing-jobs/{quote_id}");
+    forward_delete(&state, &path).await
+}
+
 /// S350 / PR-39 (U5) — operator material-grade override.
 /// `PATCH /api/quote-pricing-jobs/{quote_id}` with body
 /// `{ material_grade }`. The backend validates the grade against the

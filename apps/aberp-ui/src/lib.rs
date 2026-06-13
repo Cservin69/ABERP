@@ -403,6 +403,8 @@ pub fn run() {
             // S352 / PR-41 — operator-facing PDF view/download.
             commands::download_quote_pricing_job_pdf,
             commands::retry_quote_pricing_job,
+            // S391/F — operator delete of a permanently-Failed row.
+            commands::delete_quote_pricing_job,
             // S350 / PR-39 (U5) — operator material-grade override.
             commands::edit_quote_pricing_job_material,
             // S354 / PR-42 (U16) — operator accept-on-behalf.

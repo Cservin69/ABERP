@@ -11,6 +11,7 @@
 
   import { onMount } from "svelte";
   import {
+    deleteQuotePricingJob,
     fetchQuotePipelineStatus,
     listQuotePricingJobs,
     retryQuotePricingJob,
@@ -29,6 +30,12 @@
   let rows: PricingJobRow[] = $state([]);
   let retryBusyQuoteId = $state<string | null>(null);
   let retryError = $state<string | null>(null);
+  // S391/F — Delete a permanently-Failed row. `confirmDeleteQuoteId` holds
+  // the row awaiting the confirmation modal (null = modal closed);
+  // `deleteBusyQuoteId` disables the modal's buttons mid-request.
+  let confirmDeleteQuoteId = $state<string | null>(null);
+  let deleteBusyQuoteId = $state<string | null>(null);
+  let deleteError = $state<string | null>(null);
   // S349 / PR-40 (U1) — selected row drives the detail panel. `null`
   // keeps it closed; a row click sets the quote_id. In-memory Svelte
   // state (never browser storage); the panel closes on Esc / backdrop /
@@ -113,6 +120,33 @@
       retryError = e instanceof Error ? e.message : String(e);
     } finally {
       retryBusyQuoteId = null;
+    }
+  }
+
+  // S391/F — open the confirmation modal for a Failed row.
+  function askDelete(quoteId: string): void {
+    deleteError = null;
+    confirmDeleteQuoteId = quoteId;
+  }
+
+  function cancelDelete(): void {
+    if (deleteBusyQuoteId) return;
+    confirmDeleteQuoteId = null;
+  }
+
+  async function onConfirmDelete(): Promise<void> {
+    const quoteId = confirmDeleteQuoteId;
+    if (!quoteId) return;
+    deleteBusyQuoteId = quoteId;
+    deleteError = null;
+    try {
+      await deleteQuotePricingJob(quoteId);
+      confirmDeleteQuoteId = null;
+      await refresh();
+    } catch (e) {
+      deleteError = e instanceof Error ? e.message : String(e);
+    } finally {
+      deleteBusyQuoteId = null;
     }
   }
 </script>
@@ -317,12 +351,83 @@
                     ? "Újrapróbálás… / Retrying…"
                     : "Újra / Retry"}
                 </button>
+                <!-- S391/F — Delete is only offered on Failed rows; opens a
+                     confirmation modal before the DELETE fires. -->
+                <button
+                  type="button"
+                  class="btn btn--danger"
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    askDelete(row.quote_id);
+                  }}
+                  disabled={deleteBusyQuoteId === row.quote_id}
+                  data-testid={`pricing-jobs-delete-${row.quote_id}`}
+                >Törlés / Delete</button>
               {/if}
             </td>
           </tr>
         {/each}
       </tbody>
     </table>
+  {/if}
+
+  <!-- S391/F — delete confirmation modal. Dark-themed overlay; the
+       operator must confirm before the irreversible DELETE fires. Esc /
+       backdrop cancel. -->
+  {#if confirmDeleteQuoteId}
+    <div
+      class="pricing-jobs__modal-backdrop"
+      role="presentation"
+      onclick={cancelDelete}
+    >
+      <div
+        class="pricing-jobs__modal"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="pricing-jobs-delete-title"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => {
+          if (e.key === "Escape") cancelDelete();
+        }}
+        data-testid="pricing-jobs-delete-modal"
+      >
+        <h3 id="pricing-jobs-delete-title">Sor törlése / Delete row</h3>
+        <p>
+          Biztosan törlöd ezt a sikertelen árazási sort? A művelet nem
+          vonható vissza. / Delete this failed pricing row? This cannot be
+          undone.
+        </p>
+        <p class="pricing-jobs__modal-id">
+          <code>{confirmDeleteQuoteId}</code>
+        </p>
+        {#if deleteError}
+          <p class="pricing-jobs__err" data-testid="pricing-jobs-delete-error">
+            {deleteError}
+          </p>
+        {/if}
+        <div class="pricing-jobs__modal-actions">
+          <button
+            type="button"
+            class="btn btn--secondary"
+            onclick={cancelDelete}
+            disabled={deleteBusyQuoteId !== null}
+            data-testid="pricing-jobs-delete-cancel"
+          >Mégse / Cancel</button>
+          <button
+            type="button"
+            class="btn btn--danger"
+            onclick={() => void onConfirmDelete()}
+            disabled={deleteBusyQuoteId !== null}
+            data-testid="pricing-jobs-delete-confirm"
+          >
+            {deleteBusyQuoteId !== null
+              ? "Törlés… / Deleting…"
+              : "Törlés / Delete"}
+          </button>
+        </div>
+      </div>
+    </div>
   {/if}
 
   <!-- S349 / PR-40 (U1) — row-detail panel. Mounted once; the
@@ -441,5 +546,53 @@
   .chip--running {
     background: #78350f;
     color: #fed7aa;
+  }
+  /* S391/F — Delete button + confirmation modal. Dark-theme tokens with
+     the same hard-coded fallbacks the rest of this panel uses. */
+  .btn--danger {
+    margin-left: 6px;
+    background: var(--color-danger, #7f1d1d);
+    color: #fecaca;
+    border-color: var(--color-danger, #b91c1c);
+  }
+  .btn--danger:hover:not(:disabled) {
+    background: #991b1b;
+  }
+  .pricing-jobs__modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 50;
+  }
+  .pricing-jobs__modal {
+    background: var(--color-surface, #1f2937);
+    color: var(--color-text, #e5e7eb);
+    border: 1px solid var(--color-border, #374151);
+    border-radius: 8px;
+    padding: 20px;
+    max-width: 460px;
+    width: calc(100% - 32px);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  }
+  .pricing-jobs__modal h3 {
+    margin: 0 0 8px;
+    font-size: 16px;
+  }
+  .pricing-jobs__modal p {
+    margin: 8px 0;
+    font-size: 13px;
+  }
+  .pricing-jobs__modal-id {
+    color: var(--color-text-muted, #9ca3af);
+    word-break: break-all;
+  }
+  .pricing-jobs__modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 16px;
   }
 </style>

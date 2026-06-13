@@ -1698,14 +1698,21 @@ impl WritebackOutcome {
         match self {
             WritebackOutcome::Success { .. } => "",
             WritebackOutcome::RoutingMisconfigured { .. } => {
-                "Origin returned HTML where JSON expected. Two known causes: (1) CloudFront route \
-                 missing — `/api/*` behavior not matching this URL path. (2) Storefront returned \
-                 404 (e.g. quote not found, ABERP_SITE_QUOTE_DIR misconfigured) and CloudFront's \
-                 `404→/index.html` rule overrode the response code to 200. Check storefront logs \
-                 for the actual request status; check CloudFront CustomErrorResponses panel."
+                "Az origin HTML-t adott vissza JSON helyett. Két ismert ok / Origin returned HTML \
+                 where JSON expected. Two known causes: (1) hiányzó CloudFront-útvonal — az `/api/*` \
+                 behavior nem illeszkedik erre az URL-re / CloudFront route missing — `/api/*` \
+                 behavior not matching this URL path; (2) a storefront 404-et adott (pl. ajánlat nem \
+                 található, rossz ABERP_SITE_QUOTE_DIR), és a CloudFront `404→/index.html` szabálya \
+                 200-ra írta felül / storefront returned 404 (e.g. quote not found, \
+                 ABERP_SITE_QUOTE_DIR misconfigured) and CloudFront's `404→/index.html` rule \
+                 overrode the code to 200. Nézd a storefront logokat és a CloudFront \
+                 CustomErrorResponses panelt / check storefront logs and the CloudFront \
+                 CustomErrorResponses panel."
             }
             WritebackOutcome::Unauthorized { .. } => {
-                "X-CloudFront-Secret or Bearer mismatch; check ADR-0009 secret rotation"
+                "401 — X-CloudFront-Secret vagy Bearer eltérés; ellenőrizd az ADR-0009 \
+                 titok-rotációt / X-CloudFront-Secret or Bearer mismatch; check ADR-0009 secret \
+                 rotation"
             }
             WritebackOutcome::Forbidden { .. } => {
                 "403 — két ok / two causes: (1) SvelteKit CSRF — hiányzó vagy rossz Origin fejléc / \
@@ -1714,18 +1721,28 @@ impl WritebackOutcome {
                  Bearer failures are 401, not this."
             }
             WritebackOutcome::NonJsonResponse { .. } => {
-                "storefront returned non-JSON; routing or middleware misconfigured"
+                "A storefront nem-JSON választ adott; rossz útvonal vagy middleware / storefront \
+                 returned non-JSON; routing or middleware misconfigured"
             }
             WritebackOutcome::MalformedAppResponse { .. } => {
-                "200 JSON without the expected {status} shape; storefront contract drift"
+                "200-as JSON a várt {status} szerkezet nélkül; storefront szerződés-eltérés / 200 \
+                 JSON without the expected {status} shape; storefront contract drift"
             }
             WritebackOutcome::AppRejected { .. } => {
-                "storefront rejected the writeback (4xx); inspect the body excerpt"
+                "A storefront elutasította a visszaírást (4xx); nézd a törzs-kivonatot / storefront \
+                 rejected the writeback (4xx); inspect the body excerpt"
             }
-            WritebackOutcome::AppErrored { .. } => "storefront 5xx — retryable on the next cycle",
-            WritebackOutcome::Timeout => "writeback timed out — retryable on the next cycle",
+            WritebackOutcome::AppErrored { .. } => {
+                "Storefront 5xx — a következő ciklusban újrapróbálható / storefront 5xx — retryable \
+                 on the next cycle"
+            }
+            WritebackOutcome::Timeout => {
+                "A visszaírás időtúllépett — a következő ciklusban újrapróbálható / writeback timed \
+                 out — retryable on the next cycle"
+            }
             WritebackOutcome::TransportError { .. } => {
-                "connection / DNS / TLS failure — retryable on the next cycle"
+                "Kapcsolat / DNS / TLS hiba — a következő ciklusban újrapróbálható / connection / \
+                 DNS / TLS failure — retryable on the next cycle"
             }
         }
     }

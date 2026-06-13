@@ -251,11 +251,22 @@ pub fn modification_from_inputs(
     // in `issue_storno.rs` for the rationale + the NAV ABORTED ack that
     // forced this change (INVALID_INVOICE_REFERENCE on seller.toml
     // literal drift).
-    let base_nav_xml_path = {
+    // S391/A — alongside the base NAV XML path, fold the TOTAL prior
+    // chain line count (base + every SAVED prior modification's lines)
+    // off the same read-only ledger handle. A modify-after-modify chain
+    // must offset its CREATE lines' `<lineNumberReference>` past every
+    // saved prior modification, not just the base — the MODIFY mirror of
+    // the S384/F5 storno fix. Resolved PRE-tx (the render closure has no
+    // tx handle), same discipline as the storno path.
+    let (base_nav_xml_path, total_prior_chain_line_count) = {
         let ledger = Ledger::open(db, tenant.clone(), binary_hash_bytes)
             .context("open audit ledger for modification precondition check")?;
         check_base_is_modifiable(&ledger, references)?;
-        crate::issue_storno::find_base_nav_xml_path_for_chain(&ledger, references)?
+        let base_path = crate::issue_storno::find_base_nav_xml_path_for_chain(&ledger, references)?;
+        let total =
+            crate::issue_storno::total_prior_chain_line_count(&ledger, &base_path, references)?;
+        (base_path, total)
+        // ledger drops here, releasing the DuckDB read connection
     };
 
     // PR-90 / ADR-0045 §2 — resolve the operator's numbering template
@@ -339,7 +350,8 @@ pub fn modification_from_inputs(
     // base's line numbers — NAV INVOICE_LINE_ALREADY_EXISTS / S370) —
     // the same canonical-record reads issue_storno does pre-tx.
     let base_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path)?;
-    let base_line_count = crate::nav_xml::count_invoice_lines_from_xml(&base_nav_xml_path)?;
+    // S391/A — `total_prior_chain_line_count` (base + SAVED prior mods)
+    // was folded pre-tx above; it is the `<lineNumberReference>` offset.
 
     // S375 — build the modification's NAV parties BEFORE the tx; the
     // render closure captures them by move.
@@ -403,7 +415,10 @@ pub fn modification_from_inputs(
         let modification_reference = ModificationReference {
             base_invoice_number,
             modification_index,
-            base_line_count,
+            // S391/A — total prior chain line count (base + SAVED prior
+            // modifications), not the base-only count, so a modify-after-
+            // modify chain's lines continue past everything NAV holds.
+            base_line_count: total_prior_chain_line_count,
         };
         let xml = nav_xml::render_modification_data_with_number(
             modification,

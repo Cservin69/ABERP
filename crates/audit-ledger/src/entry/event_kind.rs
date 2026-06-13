@@ -1785,6 +1785,27 @@ pub enum EventKind {
     /// F12 four-edit ritual fires once.
     QuotePricingMaterialEdited,
 
+    /// S391/F — operator deletion of a Failed pricing-job row. The
+    /// audit-of-record for an operator removing a permanently-Failed row
+    /// from the Auto-Quoting panel (e.g. the S379 phantom-retry rows that
+    /// can never reach a terminal state). Conservative: the DELETE route
+    /// only accepts rows in `Failed` state, so an in-flight job is never
+    /// removed out from under the daemon. The row is deleted in the SAME
+    /// transaction as this append, so the removal and its audit-of-record
+    /// commit atomically; the forensic record survives the row.
+    ///
+    /// Carries `quote_id`, `tenant_id`, `previous_state` (always
+    /// `failed`), `attempt_n` (the row's final attempt counter),
+    /// `error_stage` / `error_reason` / `failure_kind` (nullable — the
+    /// row's terminal failure context, preserved so a walker sees WHY the
+    /// deleted row had failed), `operator_user_id` (the Bearer-subject
+    /// operator login who deleted it), `actor` (the same login), and
+    /// `idempotency_key` (`quote_pricing_failure_deleted:<quote_id>`).
+    ///
+    /// `quote.*` prefix family. Payload: `serde_json::Value`. Never
+    /// carries NAV XML bytes (app-layer JSON only).
+    QuotePricingFailureDeleted,
+
     /// S354 / PR-42 (U16) — operator accept-on-behalf. The audit-of-record
     /// for marking a quote accepted when the customer accepted
     /// off-channel (phone / e-mail / in person / other) instead of
@@ -2489,6 +2510,7 @@ impl EventKind {
             EventKind::QuotePricingFailureClassified => "quote.pricing_failure_classified",
             EventKind::QuotePricedWritebackOutcome => "quote.priced_writeback_outcome",
             EventKind::QuotePricingMaterialEdited => "quote.material_grade_edited",
+            EventKind::QuotePricingFailureDeleted => "quote.pricing_failure_deleted",
             EventKind::QuotePricingOperatorAccepted => "quote.operator_accepted",
             EventKind::QuotePollOutcome => "quote.poll_outcome",
             EventKind::EmailOutboxFetched => "quote.email_outbox_fetched",
@@ -2621,6 +2643,7 @@ impl EventKind {
             "quote.pricing_failure_classified" => Ok(EventKind::QuotePricingFailureClassified),
             "quote.priced_writeback_outcome" => Ok(EventKind::QuotePricedWritebackOutcome),
             "quote.material_grade_edited" => Ok(EventKind::QuotePricingMaterialEdited),
+            "quote.pricing_failure_deleted" => Ok(EventKind::QuotePricingFailureDeleted),
             "quote.operator_accepted" => Ok(EventKind::QuotePricingOperatorAccepted),
             "quote.poll_outcome" => Ok(EventKind::QuotePollOutcome),
             "quote.email_outbox_fetched" => Ok(EventKind::EmailOutboxFetched),
@@ -2741,6 +2764,7 @@ impl EventKind {
         EventKind::QuotePricingFailureClassified,
         EventKind::QuotePricedWritebackOutcome,
         EventKind::QuotePricingMaterialEdited,
+        EventKind::QuotePricingFailureDeleted,
         EventKind::QuotePricingOperatorAccepted,
         EventKind::QuotePollOutcome,
         EventKind::EmailOutboxFetched,
@@ -2870,6 +2894,7 @@ mod tests {
             EventKind::QuotePricedWritebackOutcome,
             EventKind::QuotePollOutcome,
             EventKind::QuotePricingMaterialEdited,
+            EventKind::QuotePricingFailureDeleted,
             EventKind::QuotePricingOperatorAccepted,
             EventKind::EmailOutboxFetched,
             EventKind::EmailOutboxClaimed,
@@ -2927,7 +2952,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            103,
+            104,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \

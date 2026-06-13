@@ -1395,6 +1395,31 @@ pub(crate) fn saved_prior_modification_lines_for_chain(
     Ok(lines)
 }
 
+/// S391/A — the `<lineNumberReference>` OFFSET for a chain operation's
+/// CREATE-mode lines: the total count of lines NAV already holds on this
+/// chain == the BASE invoice's lines + every SAVED prior modification's
+/// lines. This is the MODIFY-path mirror of the S384/F5 storno offset:
+/// a modify-after-modify chain's full-replace CREATE lines must continue
+/// PAST everything NAV recorded (base + saved mods), else NAV ABORTs with
+/// `INVOICE_LINE_ALREADY_EXISTS` (S370). Pre-S391 the modification path
+/// offset by the base line count only, so a modification stacked on a
+/// SAVED prior modification reused that prior modification's line numbers.
+///
+/// `base_nav_xml_path` is the base invoice's on-disk NAV XML;
+/// `base_invoice_id` is the same chain key
+/// [`saved_prior_modification_lines_for_chain`] folds against. Reuses that
+/// helper so the SAVED-only selection (excludes ABORTED modifications NAV
+/// never registered) is identical to the storno path.
+pub(crate) fn total_prior_chain_line_count(
+    ledger: &Ledger,
+    base_nav_xml_path: &std::path::Path,
+    base_invoice_id: &str,
+) -> Result<usize> {
+    let base_lines = crate::nav_xml::count_invoice_lines_from_xml(base_nav_xml_path)?;
+    let saved_mod_lines = saved_prior_modification_lines_for_chain(ledger, base_invoice_id)?;
+    Ok(base_lines + saved_mod_lines.len())
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Storno command construction — same shape as issue_invoice
 // ──────────────────────────────────────────────────────────────────────
@@ -2186,5 +2211,86 @@ mod tests {
         let folded = saved_prior_modification_lines_for_chain(&ledger, "inv_BASE")
             .expect("empty chain folds to empty");
         assert!(folded.is_empty());
+    }
+
+    /// S391/A headline — `total_prior_chain_line_count` is the MODIFY-path
+    /// `<lineNumberReference>` offset: a modify-after-modify chain offsets
+    /// by base lines PLUS every SAVED prior modification's lines, not the
+    /// base-only count. Pins the regression that issue_modification.rs used
+    /// `base_line_count` (base-only) where a chain stacked on a SAVED prior
+    /// modification needs the combined offset (mirror of S384/F5 storno).
+    #[test]
+    fn total_prior_chain_line_count_includes_saved_modification_lines() {
+        use ulid::Ulid;
+
+        let scratch = std::env::temp_dir().join(format!("aberp-s391-chaincount-{}", Ulid::new()));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let base_path = scratch.join("base.xml");
+        let mod_saved_path = scratch.join("mod_saved.xml");
+        // Base invoice: 1 line. SAVED prior modification: 1 line.
+        std::fs::write(&base_path, minimal_one_line_xml("BASE-LINE", "1", "100")).unwrap();
+        std::fs::write(
+            &mod_saved_path,
+            minimal_one_line_xml("MOD-SAVED-LINE", "2", "500"),
+        )
+        .unwrap();
+
+        let tenant = TenantId::new("t-s391a".to_string()).unwrap();
+        let bh = BinaryHash::from_bytes([7u8; 32]);
+        let actor = Actor::from_local_cli("sess-s391".to_string(), "test-user");
+        let mut ledger = Ledger::open_in_memory(tenant, bh).unwrap();
+
+        // Draft entry resolves the SAVED modification's on-disk nav_xml_path.
+        ledger
+            .append(
+                EventKind::InvoiceDraftCreated,
+                draft_payload_literal_id("inv_mod_saved", mod_saved_path.to_str().unwrap()),
+                actor.clone(),
+                None,
+            )
+            .unwrap();
+        // Chain-link: SAVED modification against inv_BASE at index 1.
+        let payload = audit_payloads::InvoiceModificationIssuedPayload::new(
+            "inv_mod_saved",
+            201,
+            "rsv_inv_mod_saved",
+            IdempotencyKey::new(),
+            "inv_BASE",
+            42,
+            1,
+            "2025-01-01",
+        );
+        ledger
+            .append(
+                EventKind::InvoiceModificationIssued,
+                payload.to_bytes(),
+                actor.clone(),
+                None,
+            )
+            .unwrap();
+        // ACK SAVED so the fold counts it.
+        let ack_payload = audit_payloads::InvoiceAckStatusPayload::new(
+            "inv_mod_saved",
+            "txn_inv_mod_saved",
+            "SAVED",
+            Vec::new(),
+        );
+        ledger
+            .append(
+                EventKind::InvoiceAckStatus,
+                ack_payload.to_bytes(),
+                actor.clone(),
+                None,
+            )
+            .unwrap();
+
+        let total = total_prior_chain_line_count(&ledger, &base_path, "inv_BASE")
+            .expect("chain line count succeeds");
+        assert_eq!(
+            total, 2,
+            "base(1) + SAVED prior modification(1) == 2; pre-S391 base-only offset would be 1"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

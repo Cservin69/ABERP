@@ -867,6 +867,10 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // S350 / PR-39 — operator material-grade edit. App-layer JSON
         // payload, never NAV XML bytes.
         | EventKind::QuotePricingMaterialEdited
+        // S391/F — operator deletion of a Failed pricing-job row. App-layer
+        // JSON payload (quote_id / previous_state / attempt_n / error_*),
+        // never NAV XML bytes.
+        | EventKind::QuotePricingFailureDeleted
         // S354 / PR-42 — operator accept-on-behalf. App-layer JSON
         // payload (channel / note / outcome tag), never NAV XML bytes.
         | EventKind::QuotePricingOperatorAccepted
@@ -948,7 +952,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 103,
+        EventKind::ALL_KINDS_COUNT == 104,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

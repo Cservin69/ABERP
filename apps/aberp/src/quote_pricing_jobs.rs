@@ -867,6 +867,89 @@ pub fn amend_material_grade_in_tx(
     })
 }
 
+/// S391/F — outcome of an operator delete of a Failed pricing-job row.
+/// The serve-layer handler maps each variant to an HTTP status: `Deleted`
+/// → 200, `NotFound` → 404, `NotDeletable` → 409.
+#[derive(Debug, Clone)]
+pub enum DeleteJobOutcome {
+    /// Row removed. Carries the terminal failure context for the audit
+    /// payload (the row is gone, so the audit ledger is the only surviving
+    /// record of why it had failed).
+    Deleted {
+        attempt_n: u32,
+        error_stage: Option<String>,
+        error_reason: Option<String>,
+        failure_kind: Option<String>,
+    },
+    /// No row for (tenant, quote_id) — 404.
+    NotFound,
+    /// Row exists but its current state is not `Failed` — 409. Carries the
+    /// offending state so the operator copy can name it. Conservative: an
+    /// in-flight (or Posted) row is never deleted out from under the
+    /// daemon.
+    NotDeletable { state: JobState },
+}
+
+/// S391/F — operator delete of a permanently-Failed pricing-job row, the
+/// tx-owned core. State-guarded: reads the row's current state + terminal
+/// failure context inside the caller's transaction (one consistent
+/// snapshot — no TOCTOU against a concurrent daemon transition), refuses
+/// (without mutating) when the state is not [`JobState::Failed`], otherwise
+/// DELETEs the row and returns its prior `attempt_n` + error columns for
+/// the audit payload.
+///
+/// **Does NOT commit** — the serve-layer caller appends the
+/// `quote.pricing_failure_deleted` audit row in the SAME transaction and
+/// commits both together (the deletion and its audit-of-record are
+/// atomic). Tenant-scoped like every other writer. Caller guarantees
+/// [`ensure_schema`] has run.
+pub fn delete_failed_job_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    quote_id: &str,
+    tenant_id: &str,
+) -> Result<DeleteJobOutcome> {
+    let current: Option<(String, i64, Option<String>, Option<String>, Option<String>)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT state, attempt_n, error_stage, error_reason, failure_kind
+                    FROM quote_pricing_jobs
+                    WHERE quote_id = ? AND tenant_id = ?",
+            )
+            .context("prepare delete_failed_job read")?;
+        let mut rows = stmt
+            .query(params![quote_id, tenant_id])
+            .context("execute delete_failed_job read")?;
+        match rows.next().context("step delete_failed_job read")? {
+            Some(r) => Some((
+                r.get(0).context("get state")?,
+                r.get(1).context("get attempt_n")?,
+                r.get(2).context("get error_stage")?,
+                r.get(3).context("get error_reason")?,
+                r.get(4).context("get failure_kind")?,
+            )),
+            None => None,
+        }
+    };
+    let Some((state_str, attempt_n, error_stage, error_reason, failure_kind)) = current else {
+        return Ok(DeleteJobOutcome::NotFound);
+    };
+    let state = JobState::parse_str(&state_str)?;
+    if state != JobState::Failed {
+        return Ok(DeleteJobOutcome::NotDeletable { state });
+    }
+    tx.execute(
+        "DELETE FROM quote_pricing_jobs WHERE quote_id = ? AND tenant_id = ? AND state = ?",
+        params![quote_id, tenant_id, STATE_FAILED],
+    )
+    .context("delete_failed_job DELETE")?;
+    Ok(DeleteJobOutcome::Deleted {
+        attempt_n: attempt_n.max(0) as u32,
+        error_stage,
+        error_reason,
+        failure_kind,
+    })
+}
+
 /// S350 / PR-39 (U5) — `&mut Connection` wrapper over
 /// [`amend_material_grade_in_tx`] for unit tests + any non-audit caller:
 /// runs [`ensure_schema`], opens a tx, applies the edit, and commits

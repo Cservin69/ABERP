@@ -365,78 +365,69 @@ pub struct CustomerAddress {
     pub street: String,
 }
 
-/// Storno chain-link reference data for [`render_storno_data`] (PR-10,
-/// ADR-0023). Pinpoints the base invoice and the chain index this
-/// storno asserts. The XML emitter renders these into an
+/// Chain-link reference data for a STORNO or MODIFY operation —
+/// [`render_storno_data`] / [`render_modification_data`] (PR-10 / PR-11,
+/// ADR-0023 / ADR-0024). Pinpoints the base invoice and the chain index
+/// this operation asserts. The XML emitter renders these into an
 /// `<invoiceReference>` block inside `<invoice>` (positioned BEFORE
 /// `<invoiceHead>` per NAV v3.0 schema).
-#[derive(Debug, Clone)]
-pub struct StornoReference {
-    /// Base invoice's NAV-facing number — formatted as `<series>/<5-digit-seq>`
-    /// (e.g. `INV-default/00007`). The caller constructs this from the
-    /// base invoice row's series + sequence_number; see
-    /// `issue_storno::run` step 10.
-    pub base_invoice_number: String,
-    /// `<modificationIndex>` allocated by the chain walker per
-    /// ADR-0023 §4 — starts at 1, increments per chain entry.
-    pub modification_index: u32,
-    /// S369/S384 — the `<lineNumberReference>` OFFSET for the storno's
-    /// CREATE-mode reversal lines: the count of ALL lines NAV already
-    /// holds on this chain (the base PLUS every SAVED prior
-    /// modification). The reversal lines continue PAST this offset so
-    /// they never reuse a line number NAV already recorded on the base OR
-    /// a prior modification — NAV ABORTs with `INVOICE_LINE_ALREADY_EXISTS`
-    /// otherwise (observed in prod, S370).
-    ///
-    /// Pre-S384 this was just the BASE's line count (a base-only storno
-    /// reverses only the base). S384/F5 generalised it: a storno reverses
-    /// base + every saved modification, so the offset is the total prior
-    /// chain line count == the number of reversal lines. The renderer
-    /// loud-checks `base_line_count == reversal_source_lines.len()`.
-    ///
-    /// The caller folds this from each chain member's on-disk NAV XML via
-    /// [`count_invoice_lines_from_xml`] / [`read_invoice_lines_from_xml`]
-    /// — the canonical record of what NAV holds on file — the same
-    /// on-disk-read discipline `base_invoice_number` uses (S184).
-    pub base_line_count: usize,
-}
-
-/// Modification chain-link reference data for
-/// [`render_modification_data`] (PR-11, ADR-0024). The MODIFY-shape
-/// counterpart to [`StornoReference`].
 ///
 /// S381/F1 — in NAV v3.0 the `<invoiceReference>` element
 /// (`InvoiceReferenceType`) has EXACTLY three children
 /// (`originalInvoiceNumber`, `modifyWithoutMaster`, `modificationIndex`);
-/// the `<modificationIssueDate>` this struct used to carry existed only
-/// in v2.0 and is schema-illegal in v3.0, so it was removed. The MODIFY
-/// and STORNO bodies are therefore structurally identical at the
+/// the `<modificationIssueDate>` the MODIFY struct used to carry existed
+/// only in v2.0 and is schema-illegal in v3.0, so it was removed. The
+/// MODIFY and STORNO bodies are therefore structurally identical at the
 /// `<invoiceReference>` level — the wire operation (CREATE/STORNO/MODIFY)
 /// is declared on the SOAP envelope, derived from the audit ledger by
 /// `submission_queue::operation_for_invoice`, NOT sniffed from the body.
-/// (This field-set now matches [`StornoReference`]; the two are kept as
-/// distinct named input types for the two render functions — a future
-/// session may unify them.)
+///
+/// S391/B collapsed the two formerly field-identical structs
+/// (`StornoReference` / `ModificationReference`) into this single type;
+/// the two names survive as [`StornoReference`] / [`ModificationReference`]
+/// aliases so each render function's signature still reads with intent.
 #[derive(Debug, Clone)]
-pub struct ModificationReference {
-    /// Base invoice's NAV-facing number — same shape + caller
-    /// discipline as [`StornoReference::base_invoice_number`].
+pub struct ChainOperationReference {
+    /// Base invoice's NAV-facing number — formatted as `<series>/<5-digit-seq>`
+    /// (e.g. `INV-default/00007`). The caller constructs this from the
+    /// base invoice row's series + sequence_number; see `issue_storno::run`
+    /// / `issue_modification::run`.
     pub base_invoice_number: String,
-    /// `<modificationIndex>` allocated by the widened chain walker
-    /// per ADR-0024 §7 — walks both `InvoiceStornoIssued` AND
-    /// `InvoiceModificationIssued` entries against the same base, so
-    /// the index is globally unique across the chain regardless of
-    /// per-kind order.
+    /// `<modificationIndex>` allocated by the chain walker (ADR-0023 §4 /
+    /// ADR-0024 §7) — starts at 1, increments per chain entry. The MODIFY
+    /// walker walks both `InvoiceStornoIssued` AND `InvoiceModificationIssued`
+    /// entries against the same base, so the index is globally unique
+    /// across the chain regardless of per-kind order.
     pub modification_index: u32,
-    /// S369 — number of `<line>` elements in the BASE invoice. The
-    /// modification's full-replace lines are CREATE operations that
-    /// must continue PAST the base's line numbers in NAV's virtual
-    /// consolidated invoice; reusing `lineNumberReference=1` collides
-    /// with base line 1 and NAV ABORTs with `INVOICE_LINE_ALREADY_EXISTS`.
-    /// Same offset + on-disk-read discipline as
-    /// [`StornoReference::base_line_count`] (S370 / S369).
+    /// S369/S384/S391 — the `<lineNumberReference>` OFFSET for this
+    /// operation's CREATE-mode lines: the count of ALL lines NAV already
+    /// holds on this chain (the base PLUS every SAVED prior modification).
+    /// The new lines continue PAST this offset so they never reuse a line
+    /// number NAV already recorded on the base OR a prior modification —
+    /// NAV ABORTs with `INVOICE_LINE_ALREADY_EXISTS` otherwise (observed in
+    /// prod, S370).
+    ///
+    /// Pre-S384 the storno used only the BASE's line count (a base-only
+    /// storno reverses only the base). S384/F5 generalised the storno
+    /// offset to base + every saved modification; S391/A did the same for
+    /// the MODIFY path (a modify-after-modify chain must offset past every
+    /// saved prior modification, not just the base). The caller folds this
+    /// from each chain member's on-disk NAV XML via
+    /// [`count_invoice_lines_from_xml`] / [`read_invoice_lines_from_xml`]
+    /// (+ [`crate::issue_storno::total_prior_chain_line_count`]) — the
+    /// canonical record of what NAV holds on file — the same on-disk-read
+    /// discipline `base_invoice_number` uses (S184).
     pub base_line_count: usize,
 }
+
+/// STORNO-shape alias of [`ChainOperationReference`] (S391/B). Names the
+/// input to [`render_storno_data`] / [`render_storno_data_with_number`].
+pub type StornoReference = ChainOperationReference;
+
+/// MODIFY-shape alias of [`ChainOperationReference`] (S391/B). Names the
+/// input to [`render_modification_data`] /
+/// [`render_modification_data_with_number`].
+pub type ModificationReference = ChainOperationReference;
 
 const NAV_NS_DATA: &str = "http://schemas.nav.gov.hu/OSA/3.0/data";
 const NAV_NS_BASE: &str = "http://schemas.nav.gov.hu/OSA/3.0/base";

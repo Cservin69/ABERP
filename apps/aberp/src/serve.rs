@@ -3297,9 +3297,16 @@ fn build_router(state: AppState) -> Router {
         // S350 / PR-39 (U5) — PATCH on the same path is the operator
         // material-grade override: body `{ material_grade }`, validated
         // against the catalogue, resets the row to Fetched + audits.
+        //
+        // S391/F — DELETE on the same path removes a permanently-Failed
+        // row (e.g. the S379 phantom-retry rows operators can't otherwise
+        // clear). Conservative: only `Failed` rows are deletable; emits
+        // `quote.pricing_failure_deleted` in the same tx as the removal.
         .route(
             "/api/quote-pricing-jobs/:quote_id",
-            get(handle_get_quote_pricing_job_detail).patch(handle_patch_quote_pricing_job_material),
+            get(handle_get_quote_pricing_job_detail)
+                .patch(handle_patch_quote_pricing_job_material)
+                .delete(handle_delete_quote_pricing_job),
         )
         // S349 / PR-40 (U1) — paginated per-row audit trail feeding the
         // detail panel's status timeline + last-writeback-outcome +
@@ -17677,6 +17684,188 @@ pub fn amend_pricing_job_material_request(
         new_grade: trimmed.to_string(),
         previous_state: previous_state_str,
         new_attempt_n,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// S391/F — operator delete of a Failed pricing-job row
+// ─────────────────────────────────────────────────────────────────────
+
+/// S391/F — success body of an operator delete. Echoes the deleted id +
+/// the row's final attempt counter so the SPA can confirm the removal.
+#[derive(Debug, serde::Serialize)]
+pub struct DeletePricingJobResponse {
+    pub quote_id: String,
+    /// The row's final `attempt_n` at deletion time.
+    pub attempt_n: u32,
+}
+
+/// S391/F — typed library-helper error for the delete route, mapped to an
+/// HTTP status by the handler. `pub` so the integration test can assert the
+/// variant without the HTTPS listener (same posture as
+/// [`MaterialEditRequestError`]).
+#[derive(Debug)]
+pub enum DeletePricingJobRequestError {
+    /// No row for (tenant, quote_id) — 404 (foreign-tenant rows are
+    /// invisible, same convention as the sibling routes).
+    NotFound,
+    /// Row exists but its current state is not `Failed` — 409. Carries the
+    /// offending state's wire string for the operator copy.
+    NotDeletable { state: String },
+    /// Unexpected internal failure — 500.
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for DeletePricingJobRequestError {
+    fn from(e: anyhow::Error) -> Self {
+        DeletePricingJobRequestError::Other(e)
+    }
+}
+
+/// S391/F — `DELETE /api/quote-pricing-jobs/:quote_id`. Bearer-gated like
+/// the list/retry/detail siblings. Removes a permanently-Failed row (the
+/// S379 phantom-retry rows operators can't otherwise clear). 404 when no
+/// row matches; 409 when the row is not in `Failed` state (conservative —
+/// an in-flight or Posted row is never deleted out from under the daemon);
+/// 400 on a malformed quote id.
+async fn handle_delete_quote_pricing_job(
+    AxumPath(quote_id): AxumPath<String>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if !is_quote_id_shape(&quote_id) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "invalid quote_id"})),
+        )
+            .into_response();
+    }
+    let state_for_task = state.clone();
+    let qid = quote_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        delete_pricing_job_request(&state_for_task, &qid, &operator_login)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "delete_pricing_job_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(resp) => (axum::http::StatusCode::OK, axum::Json(resp)).into_response(),
+        Err(DeletePricingJobRequestError::NotFound) => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(error_body(format!(
+                "no pricing job found with quote_id {quote_id}"
+            ))),
+        )
+            .into_response(),
+        Err(DeletePricingJobRequestError::NotDeletable { state: job_state }) => (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "error": "JobNotDeletable",
+                "state": job_state,
+                "message": format!(
+                    "a row in state `{job_state}` cannot be deleted (only Failed rows are deletable)"
+                ),
+            })),
+        )
+            .into_response(),
+        Err(DeletePricingJobRequestError::Other(e)) => {
+            internal_error("delete_pricing_job_request", e)
+        }
+    }
+}
+
+/// S391/F — library helper backing the DELETE route. `pub` so the
+/// integration test can hit it without the HTTPS listener. Applies the
+/// state-guarded delete + the `quote.pricing_failure_deleted` audit row in
+/// ONE transaction (removal and its audit-of-record are atomic), and
+/// returns the echo body. Sync (DuckDB writes are blocking) — the handler
+/// wraps it in `spawn_blocking`.
+pub fn delete_pricing_job_request(
+    state: &AppState,
+    quote_id: &str,
+    operator_login: &str,
+) -> std::result::Result<DeletePricingJobResponse, DeletePricingJobRequestError> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute")?;
+    let mut conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tenant = state.tenant.as_str().to_string();
+
+    crate::quote_pricing_jobs::ensure_schema(&conn).context("ensure quote_pricing_jobs schema")?;
+    aberp_audit_ledger::ensure_schema(&conn)
+        .context("ensure audit-ledger schema for failure-delete audit")?;
+    let tx = conn.transaction().context("open delete transaction")?;
+    let outcome = crate::quote_pricing_jobs::delete_failed_job_in_tx(&tx, quote_id, &tenant)
+        .context("delete_failed_job_in_tx")?;
+    let (attempt_n, error_stage, error_reason, failure_kind) = match outcome {
+        crate::quote_pricing_jobs::DeleteJobOutcome::Deleted {
+            attempt_n,
+            error_stage,
+            error_reason,
+            failure_kind,
+        } => (attempt_n, error_stage, error_reason, failure_kind),
+        crate::quote_pricing_jobs::DeleteJobOutcome::NotFound => {
+            // Nothing written; drop the tx without committing.
+            return Err(DeletePricingJobRequestError::NotFound);
+        }
+        crate::quote_pricing_jobs::DeleteJobOutcome::NotDeletable { state: job_state } => {
+            return Err(DeletePricingJobRequestError::NotDeletable {
+                state: job_state.as_str().to_string(),
+            });
+        }
+    };
+
+    // F12 audit-of-record — rides the SAME tx as the DELETE so the row
+    // removal and its ledger entry commit atomically. `previous_state` is
+    // always `failed` (the only deletable state); the terminal failure
+    // context is preserved so a forensic walker sees WHY the deleted row
+    // had failed even though the row itself is gone.
+    let idempotency_key = format!("quote_pricing_failure_deleted:{quote_id}");
+    let payload = serde_json::json!({
+        "quote_id": quote_id,
+        "tenant_id": tenant,
+        "previous_state": crate::quote_pricing_jobs::STATE_FAILED,
+        "attempt_n": attempt_n,
+        "error_stage": error_stage,
+        "error_reason": error_reason,
+        "failure_kind": failure_kind,
+        "operator_user_id": operator_login,
+        "actor": operator_login,
+        "idempotency_key": idempotency_key,
+    });
+    let bytes = serde_json::to_vec(&payload).context("encode failure-delete audit payload")?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        EventKind::QuotePricingFailureDeleted,
+        bytes,
+        actor,
+        Some(idempotency_key),
+    )
+    .context("append QuotePricingFailureDeleted")?;
+    tx.commit().context("commit delete transaction")?;
+
+    Ok(DeletePricingJobResponse {
+        quote_id: quote_id.to_string(),
+        attempt_n,
     })
 }
 

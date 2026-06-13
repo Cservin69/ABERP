@@ -266,7 +266,16 @@ async fn fallback_to_per_currency_default_persists_snapshot() {
 #[test]
 fn resolve_bank_snapshot_falls_back_to_per_currency_default() {
     let dir = test_dir("resolve-default");
-    std::env::set_var("HOME", &dir);
+    // S391/D — this pin is pure-function (it never spins up issuance), so
+    // it does NOT need the process-global `$HOME`. Earlier it both
+    // `set_var("HOME", &dir)` AND read back via
+    // `seller_toml_path_for_tenant` (which joins `$HOME`). Parallel tests
+    // in this binary mutate `$HOME` to their own scratch dirs, so the
+    // set→read window raced and the read saw another test's dir → no
+    // seller.toml → flake (hit S377 + S381 CI). Fix: write to and read
+    // from THIS test's own TempDir-backed path directly, with zero env
+    // coupling. The path layout mirrors `seller_toml_path_for_tenant`
+    // (`<root>/.aberp/<tenant>/seller.toml`).
     write_seller_toml_two_huf_one_eur(&dir);
 
     // Compose a minimal request — only the currency + bank_account_id
@@ -280,8 +289,7 @@ fn resolve_bank_snapshot_falls_back_to_per_currency_default() {
     // (Direct unit test against the resolver lives in serve.rs's
     // own #[cfg(test)] module; this integration pin exercises the
     // disk-read path.)
-    let path =
-        aberp::setup_seller_info::seller_toml_path_for_tenant(TEST_TENANT).expect("path resolves");
+    let path = dir.join(".aberp").join(TEST_TENANT).join("seller.toml");
     let banks = aberp::seller_banks::read_seller_banks(&path).expect("read banks");
     let default_huf = banks
         .default_bank_for(Currency::Huf)

@@ -997,6 +997,10 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // payload (quote_id / old_grade / new_grade / previous_state /
         // operator_user_id), never NAV XML bytes. Exhaustiveness arm only.
         | EventKind::QuotePricingMaterialEdited
+        // S391/F — operator deletion of a Failed pricing-job row. App-layer
+        // JSON payload (quote_id / previous_state / attempt_n / error_*),
+        // never NAV XML bytes. Exhaustiveness arm only.
+        | EventKind::QuotePricingFailureDeleted
         // S354 / PR-42 — operator accept-on-behalf. App-layer JSON
         // payload (quote_id / channel / note / operator_user_id /
         // outcome tag), never NAV XML bytes. Exhaustiveness arm only.
@@ -1077,7 +1081,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 103,
+        EventKind::ALL_KINDS_COUNT == 104,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

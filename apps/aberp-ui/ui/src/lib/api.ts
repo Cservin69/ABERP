@@ -3181,6 +3181,16 @@ export async function retryQuotePricingJob(
   return invoke("retry_quote_pricing_job", { quoteId });
 }
 
+/** S391/F — delete a permanently-Failed pricing job. `DELETE
+ * /api/quote-pricing-jobs/:quote_id`. The backend refuses (409) any row
+ * not in `Failed` state — the SPA only offers Delete on Failed rows and
+ * confirms first. Returns `{ quote_id, attempt_n }` on success. */
+export async function deleteQuotePricingJob(
+  quoteId: string,
+): Promise<{ quote_id: string; attempt_n: number }> {
+  return invoke("delete_quote_pricing_job", { quoteId });
+}
+
 /** S350 / PR-39 (U5) — success body of the operator material-grade
  * override. Mirrors `serve::PatchPricingJobMaterialResponse`. */
 export interface MaterialEditOutcome {
