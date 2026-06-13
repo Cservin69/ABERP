@@ -340,6 +340,7 @@ fn drive_one_invoice(
             credentials,
             tax_number_8,
             &invoice_xml,
+            invoice.operation,
         ))
         .map_err(classify_nav_error)?;
 
@@ -493,10 +494,14 @@ async fn prepare_for_attempt_audit(
     credentials: &NavCredentials,
     tax_number_8: &str,
     invoice_xml: &[u8],
+    // S381/F1 — the NAV envelope operation, derived from the audit
+    // ledger by `submission_queue::operation_for_invoice` and carried on
+    // `PendingInvoice::operation`. Pre-S381 this was sniffed from the
+    // body via `<modificationIssueDate>`, which is illegal in NAV v3.0.
+    operation: InvoiceOperation,
 ) -> Result<PreparedSubmission, NavTransportError> {
     let transport = NavTransport::new(endpoint)?;
     let token = token_exchange::call(&transport, credentials, tax_number_8).await?;
-    let operation = detect_operation_from_xml(invoice_xml);
     let request_xml = manage_invoice::build_request(
         credentials,
         tax_number_8,
@@ -654,27 +659,6 @@ fn surface_alert_thresholds(pending: &[PendingInvoice]) {
 // ──────────────────────────────────────────────────────────────────────
 // NAV operation classifier + audit-write helpers
 // ──────────────────────────────────────────────────────────────────────
-
-/// Three-way classifier on the body shape. Mirror of
-/// `submit_invoice::detect_operation_from_xml` per ADR-0024 §3.
-/// Non-UTF-8 bodies default to `Create` (the safe direction —
-/// detection failure should not cause NAV to receive an
-/// inconsistent `<operation>`; UTF-8 is enforced by the prior
-/// `validate_invoice_data` step).
-fn detect_operation_from_xml(xml: &[u8]) -> InvoiceOperation {
-    let body = match std::str::from_utf8(xml) {
-        Ok(s) => s,
-        Err(_) => return InvoiceOperation::Create,
-    };
-    if !body.contains("<invoiceReference>") {
-        return InvoiceOperation::Create;
-    }
-    if body.contains("<modificationIssueDate>") {
-        InvoiceOperation::Modify
-    } else {
-        InvoiceOperation::Storno
-    }
-}
 
 /// PR-19 / ADR-0032 §1: TX1 audit-write — open one audit tx, append
 /// the `InvoiceSubmissionAttempt` entry, commit. Mirror of
@@ -888,6 +872,7 @@ mod tests {
             idempotency_key: IdempotencyKey::new(),
             nav_xml_path: Some("/payload/recorded.xml".to_string()),
             issue_date: OffsetDateTime::now_utc(),
+            operation: InvoiceOperation::Create,
         };
         let mut map = HashMap::new();
         map.insert("inv_A".to_string(), "/operator/override.xml".to_string());
@@ -904,6 +889,7 @@ mod tests {
             idempotency_key: IdempotencyKey::new(),
             nav_xml_path: Some("/payload/recorded.xml".to_string()),
             issue_date: OffsetDateTime::now_utc(),
+            operation: InvoiceOperation::Create,
         };
         let map: HashMap<String, String> = HashMap::new();
         let resolved = resolve_xml_path(&invoice, &map).unwrap();
@@ -922,6 +908,7 @@ mod tests {
             idempotency_key: IdempotencyKey::new(),
             nav_xml_path: None,
             issue_date: OffsetDateTime::now_utc(),
+            operation: InvoiceOperation::Create,
         };
         let map: HashMap<String, String> = HashMap::new();
         let err = resolve_xml_path(&invoice, &map).unwrap_err();
@@ -945,40 +932,10 @@ mod tests {
         assert!(parse_tax_number_8("123456789-1-42").is_err());
     }
 
-    /// Operation detection mirrors `submit_invoice`'s three-way
-    /// classifier byte-for-byte. The drain's detector must agree
-    /// with submit-invoice's so the same on-disk XML produces the
-    /// same `<operation>` regardless of which command POSTs it.
-    #[test]
-    fn detect_operation_create_on_plain_invoice() {
-        let xml = b"<?xml version=\"1.0\"?>\
-            <InvoiceData><invoiceNumber>X/00001</invoiceNumber>\
-            <invoiceMain><invoice><invoiceHead/></invoice></invoiceMain></InvoiceData>";
-        assert_eq!(detect_operation_from_xml(xml), InvoiceOperation::Create);
-    }
-
-    #[test]
-    fn detect_operation_storno_when_invoice_reference_present() {
-        let xml = b"<?xml version=\"1.0\"?>\
-            <InvoiceData><invoiceNumber>X/00002</invoiceNumber>\
-            <invoiceMain><invoice>\
-            <invoiceReference><originalInvoiceNumber>X/00001</originalInvoiceNumber>\
-            <modifyWithoutMaster>false</modifyWithoutMaster>\
-            <modificationIndex>1</modificationIndex></invoiceReference>\
-            <invoiceHead/></invoice></invoiceMain></InvoiceData>";
-        assert_eq!(detect_operation_from_xml(xml), InvoiceOperation::Storno);
-    }
-
-    #[test]
-    fn detect_operation_modify_when_modification_issue_date_present() {
-        let xml = b"<?xml version=\"1.0\"?>\
-            <InvoiceData><invoiceNumber>X/00003</invoiceNumber>\
-            <invoiceMain><invoice>\
-            <invoiceReference><originalInvoiceNumber>X/00001</originalInvoiceNumber>\
-            <modificationIssueDate>2026-05-21</modificationIssueDate>\
-            <modifyWithoutMaster>false</modifyWithoutMaster>\
-            <modificationIndex>2</modificationIndex></invoiceReference>\
-            <invoiceHead/></invoice></invoiceMain></InvoiceData>";
-        assert_eq!(detect_operation_from_xml(xml), InvoiceOperation::Modify);
-    }
+    // S381/F1 — the drain's `detect_operation_from_xml` was deleted:
+    // NAV v3.0 STORNO and MODIFY bodies are byte-identical, so the
+    // operation is derived from the audit ledger
+    // (`submission_queue::operation_for_invoice`) and carried on
+    // `PendingInvoice::operation`. The classification logic is now
+    // tested in `submission_queue`'s unit tests.
 }

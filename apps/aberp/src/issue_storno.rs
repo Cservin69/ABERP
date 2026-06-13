@@ -322,13 +322,31 @@ pub fn storno_from_inputs(
     let command = build_storno_command(&input, &series_code)?;
     let idempotency_key = command.idempotency_key;
     let issue_date = OffsetDateTime::now_utc();
-    // PR-84 — STORNO chains default both invoice-date fields to the
-    // server-clock issue date. The storno UX does not yet surface
-    // operator-supplied payment-deadline / delivery-date pickers (out
-    // of scope per the PR-84 brief: "keep PR-84 to the issue path");
-    // preserving the pre-PR-84 wire behaviour (delivery + payment
-    // mirror issue) is the surgical move here. A future PR can widen
-    // the storno UX to surface the pickers as well.
+    // S381/F2 — the storno's `<invoiceDeliveryDate>` MUST equal the
+    // base invoice's delivery date, NOT the storno's own issue date.
+    // Stamping today triggers NAV's `UNINTENDED_CANCELLATION_DELIVERY_DATE`
+    // WARN (the spec calls this "a common error in invoicing programs")
+    // and, worse, asserts the reversal in the wrong VAT period. Read it
+    // from the base's on-disk NAV XML (same canonical-record discipline
+    // as `base_invoice_number` / `base_line_count` above) and parse the
+    // canonical `YYYY-MM-DD` string into a `Date`.
+    let base_delivery_date_str =
+        crate::nav_xml::read_invoice_delivery_date_from_xml(&base_nav_xml_path)?;
+    let base_delivery_date = time::Date::parse(
+        &base_delivery_date_str,
+        time::macros::format_description!("[year]-[month]-[day]"),
+    )
+    .with_context(|| {
+        format!(
+            "parse base invoiceDeliveryDate '{base_delivery_date_str}' \
+             (read from {}) as YYYY-MM-DD for storno (S381/F2)",
+            base_nav_xml_path.display()
+        )
+    })?;
+    // PR-84 — `payment_deadline` keeps the pre-PR-84 behaviour
+    // (mirrors the storno's own issue date); nothing falls due on a
+    // cancellation and the WARN F2 closes is delivery-date-scoped only.
+    // The storno UX does not yet surface operator-supplied date pickers.
     let default_calendar_date = issue_date.date();
     let draft = DraftInvoice {
         id: InvoiceId::new(),
@@ -337,7 +355,7 @@ pub fn storno_from_inputs(
         lines: command.lines,
         issue_date,
         payment_deadline: default_calendar_date,
-        delivery_date: default_calendar_date,
+        delivery_date: base_delivery_date,
     };
     // PR-44γ.1 — currency + rate_metadata are placeholders here; the
     // real values are inherited from the base invoice's stored
@@ -1142,6 +1160,16 @@ fn next_modification_index_in_tx(
     tx: &duckdb::Transaction<'_>,
     base_invoice_id: &str,
 ) -> Result<u32> {
+    // S381/F4 — only chain members whose own NAV submission reached
+    // terminal SAVED occupy a `modificationIndex`. A NAV-ABORTed storno
+    // never registered an index at NAV, so counting it would inflate the
+    // next storno's index past NAV's saved chain length; the
+    // `INCONSISTENT_MODIFICATION_DATA_*_NOT_ZERO*` WARNs only run when
+    // "the chain of previous modifications (modificationIndex) is
+    // complete", so a gap from 1 silently switches off NAV's own
+    // zero-sum verification of the storno. Build the SAVED-confirmed set
+    // and count only chain entries whose own invoice_id is in it.
+    let saved_ids = saved_chain_member_ids_in_tx(tx)?;
     let mut max_index: u32 = 0;
 
     // STORNO entries.
@@ -1164,7 +1192,9 @@ fn next_modification_index_in_tx(
                          — audit ledger appears tampered or schema-drifted"
                     )
                 })?;
-            if payload.base_invoice_id == base_invoice_id && payload.modification_index > max_index
+            if payload.base_invoice_id == base_invoice_id
+                && saved_ids.contains(&payload.storno_invoice_id)
+                && payload.modification_index > max_index
             {
                 max_index = payload.modification_index;
             }
@@ -1191,15 +1221,55 @@ fn next_modification_index_in_tx(
                          — audit ledger appears tampered or schema-drifted"
                 )
                 })?;
-            if payload.base_invoice_id == base_invoice_id && payload.modification_index > max_index
+            if payload.base_invoice_id == base_invoice_id
+                && saved_ids.contains(&payload.modification_invoice_id)
+                && payload.modification_index > max_index
             {
                 max_index = payload.modification_index;
             }
         }
     }
 
-    // First chain entry against a base starts at 1 per NAV's spec.
+    // First SAVED-confirmed chain entry against a base starts at 1 per
+    // NAV's spec.
     Ok(max_index.saturating_add(1))
+}
+
+/// S381/F4 — collect the invoice_ids whose NAV submission reached
+/// terminal SAVED, from `InvoiceAckStatus` entries inside the borrowed
+/// transaction. SAVED is NAV's terminal-positive state (DONE) — once an
+/// invoice is SAVED it stays SAVED — so any `InvoiceAckStatus` payload
+/// with `ack_status == "SAVED"` marks that invoice as a confirmed chain
+/// member. Shared by both `issue_storno::next_modification_index_in_tx`
+/// and `issue_modification::next_modification_index_in_tx` (the two
+/// symmetric walkers per ADR-0024 §7) so the SAVED-filter rule lives in
+/// one place.
+pub(crate) fn saved_chain_member_ids_in_tx(
+    tx: &duckdb::Transaction<'_>,
+) -> Result<std::collections::HashSet<String>> {
+    let mut saved: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stmt = tx
+        .prepare("SELECT seq, payload FROM audit_ledger WHERE kind = ?;")
+        .context("prepare audit_ledger scan for SAVED ack statuses")?;
+    let rows = stmt
+        .query_map([EventKind::InvoiceAckStatus.as_str()], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
+        .context("query audit_ledger for SAVED ack statuses")?;
+    for row in rows {
+        let (seq, payload_bytes) = row.context("read audit_ledger row during SAVED-ack walk")?;
+        let payload: audit_payloads::InvoiceAckStatusPayload =
+            serde_json::from_slice(&payload_bytes).map_err(|e| {
+                anyhow!(
+                    "InvoiceAckStatus audit payload (seq {seq}) failed typed decode: {e} \
+                     — audit ledger appears tampered or schema-drifted"
+                )
+            })?;
+        if payload.ack_status == "SAVED" {
+            saved.insert(payload.invoice_id);
+        }
+    }
+    Ok(saved)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1257,7 +1327,13 @@ mod tests {
     /// schema, then append the given `(base_invoice_id, modification_index)`
     /// entries inside one tx. Returns the Connection; the caller
     /// opens its own tx to invoke `next_modification_index_in_tx`.
-    fn fixture_ledger_with_chain(entries: &[(&str, u32)]) -> Connection {
+    /// S381/F4 — each entry is `(base_invoice_id, modification_index,
+    /// ack_status)`. The fixture appends the `InvoiceStornoIssued`
+    /// chain-link AND an `InvoiceAckStatus` for the storno's OWN id
+    /// (`inv_storno_<i>`) carrying `ack_status`, so the SAVED-filter in
+    /// `next_modification_index_in_tx` counts the entry iff its ack is
+    /// `"SAVED"`.
+    fn fixture_ledger_with_chain(entries: &[(&str, u32, &str)]) -> Connection {
         let tenant = TenantId::new("t1".to_string()).unwrap();
         let bh = BinaryHash::from_bytes([0u8; 32]);
         let actor = Actor::from_local_cli("sess".to_string(), "test-user");
@@ -1267,10 +1343,11 @@ mod tests {
         audit_ledger::ensure_schema(&conn).unwrap();
         {
             let tx = conn.transaction().unwrap();
-            for (i, (base, idx)) in entries.iter().enumerate() {
+            for (i, (base, idx, ack_status)) in entries.iter().enumerate() {
+                let storno_id = format!("inv_storno_{i}");
                 let idem = IdempotencyKey::new();
                 let payload = audit_payloads::InvoiceStornoIssuedPayload::new(
-                    &format!("inv_storno_{i}"),
+                    &storno_id,
                     100 + i as u64,
                     &format!("rsv_storno_{i}"),
                     idem,
@@ -1285,6 +1362,23 @@ mod tests {
                     payload.to_bytes(),
                     actor.clone(),
                     Some(idem.to_canonical_string()),
+                )
+                .unwrap();
+                // S381/F4 — the storno's own NAV ack. SAVED ⇒ counted;
+                // ABORTED ⇒ ignored by the chain-index allocator.
+                let ack = audit_payloads::InvoiceAckStatusPayload::new(
+                    &storno_id,
+                    &format!("txn_{i}"),
+                    ack_status,
+                    Vec::new(),
+                );
+                audit_ledger::append_in_tx(
+                    &tx,
+                    &meta,
+                    EventKind::InvoiceAckStatus,
+                    ack.to_bytes(),
+                    actor.clone(),
+                    None,
                 )
                 .unwrap();
             }
@@ -1303,10 +1397,40 @@ mod tests {
 
     #[test]
     fn next_modification_index_increments_past_max_against_same_base() {
-        let mut conn = fixture_ledger_with_chain(&[("inv_BASE", 1), ("inv_BASE", 2)]);
+        let mut conn =
+            fixture_ledger_with_chain(&[("inv_BASE", 1, "SAVED"), ("inv_BASE", 2, "SAVED")]);
         let tx = conn.transaction().unwrap();
         let idx = next_modification_index_in_tx(&tx, "inv_BASE").unwrap();
         assert_eq!(idx, 3);
+    }
+
+    /// S381/F4 — a NAV-ABORTed prior storno never registered a
+    /// `modificationIndex` at NAV, so the next storno against the same
+    /// base must allocate index 1 (not 2). Counting the ABORTed attempt
+    /// would leave a gap from 1 and silently disable NAV's chain-zero
+    /// verification of the storno.
+    #[test]
+    fn next_modification_index_ignores_aborted_prior_storno() {
+        let mut conn = fixture_ledger_with_chain(&[("inv_BASE", 1, "ABORTED")]);
+        let tx = conn.transaction().unwrap();
+        let idx = next_modification_index_in_tx(&tx, "inv_BASE").unwrap();
+        assert_eq!(
+            idx, 1,
+            "an ABORTed prior storno must not inflate the next modificationIndex (S381/F4)"
+        );
+    }
+
+    /// S381/F4 — only SAVED members count. A SAVED index-1 followed by
+    /// an ABORTed index-2 retry must allocate the NEXT index as 2 (the
+    /// ABORTed attempt is invisible to the allocator), reusing the
+    /// burned-but-unsaved slot.
+    #[test]
+    fn next_modification_index_counts_saved_skips_aborted_mix() {
+        let mut conn =
+            fixture_ledger_with_chain(&[("inv_BASE", 1, "SAVED"), ("inv_BASE", 2, "ABORTED")]);
+        let tx = conn.transaction().unwrap();
+        let idx = next_modification_index_in_tx(&tx, "inv_BASE").unwrap();
+        assert_eq!(idx, 2);
     }
 
     /// CLAUDE.md rule 12: silently mixing chains for different bases
@@ -1314,8 +1438,11 @@ mod tests {
     /// failure mode. The walker must isolate by base_invoice_id.
     #[test]
     fn next_modification_index_ignores_unrelated_base() {
-        let mut conn =
-            fixture_ledger_with_chain(&[("inv_OTHER", 1), ("inv_OTHER", 2), ("inv_OTHER", 3)]);
+        let mut conn = fixture_ledger_with_chain(&[
+            ("inv_OTHER", 1, "SAVED"),
+            ("inv_OTHER", 2, "SAVED"),
+            ("inv_OTHER", 3, "SAVED"),
+        ]);
         let tx = conn.transaction().unwrap();
         let idx = next_modification_index_in_tx(&tx, "inv_BASE").unwrap();
         assert_eq!(
@@ -1327,12 +1454,13 @@ mod tests {
     /// Non-contiguous chain (a gap, however unusual) still allocates
     /// to `max + 1` per ADR-0023 §4. A gap is itself a reconciliation
     /// anomaly that the §4 integrity scan will catch; the allocator
-    /// does NOT re-fill the gap.
+    /// does NOT re-fill the gap. (Both members SAVED so the SAVED-filter
+    /// does not interfere with the gap semantics under test.)
     #[test]
     fn next_modification_index_skips_gaps_uses_max_plus_one() {
         let mut conn = fixture_ledger_with_chain(&[
-            ("inv_BASE", 1),
-            ("inv_BASE", 3), // gap at 2
+            ("inv_BASE", 1, "SAVED"),
+            ("inv_BASE", 3, "SAVED"), // gap at 2
         ]);
         let tx = conn.transaction().unwrap();
         let idx = next_modification_index_in_tx(&tx, "inv_BASE").unwrap();
@@ -1376,8 +1504,25 @@ mod tests {
                 &meta,
                 EventKind::InvoiceModificationIssued,
                 payload.to_bytes(),
-                actor,
+                actor.clone(),
                 Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+            // S381/F4 — the prior MODIFY reached NAV SAVED, so it
+            // occupies index 1 and the next storno must skip past it.
+            let ack = audit_payloads::InvoiceAckStatusPayload::new(
+                "inv_modif_0",
+                "txn_modif_0",
+                "SAVED",
+                Vec::new(),
+            );
+            audit_ledger::append_in_tx(
+                &tx,
+                &meta,
+                EventKind::InvoiceAckStatus,
+                ack.to_bytes(),
+                actor,
+                None,
             )
             .unwrap();
             tx.commit().unwrap();

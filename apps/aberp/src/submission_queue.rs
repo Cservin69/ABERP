@@ -76,7 +76,7 @@ use std::time::Duration;
 
 use aberp_audit_ledger::{BinaryHash, Entry, EventKind, Ledger, TenantId};
 use aberp_billing::IdempotencyKey;
-use aberp_nav_transport::NavTransportError;
+use aberp_nav_transport::{soap::InvoiceOperation, NavTransportError};
 use anyhow::{anyhow, Context, Result};
 use time::OffsetDateTime;
 
@@ -136,6 +136,14 @@ pub struct PendingInvoice {
     /// `InvoiceDraftCreated` audit entry's `time_wall` column.
     /// Drives FIFO ordering and the age-alert threshold.
     pub issue_date: OffsetDateTime,
+    /// S381/F1 — the NAV `manageInvoice` envelope operation for this
+    /// invoice (CREATE / STORNO / MODIFY), derived from the audit
+    /// ledger's chain-link entries at classify time. The drain worker
+    /// passes this straight onto the envelope; pre-S381 the operation
+    /// was sniffed from the XML body via `<modificationIssueDate>`,
+    /// which is illegal in NAV v3.0 (so STORNO and MODIFY bodies are
+    /// now byte-identical and cannot be told apart from the body).
+    pub operation: InvoiceOperation,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -178,6 +186,73 @@ pub fn count_pending(db_path: &Path, tenant: TenantId, binary_hash: BinaryHash) 
 /// tests can drive it with fixtures without round-tripping a real
 /// `Ledger`. The function is loud per CLAUDE.md rule 12 on every
 /// classification failure mode.
+/// S381/F1 — collect the invoice_ids that are STORNO / MODIFY chain
+/// children from the ledger's chain-link entries. In NAV v3.0 a storno
+/// body and a modification body are byte-identical (the v2.0-only
+/// `<modificationIssueDate>` was removed), so the wire operation can no
+/// longer be sniffed from the XML — it is derived from the canonical
+/// audit record. An invoice id appears in at most one set (it is one
+/// invoice's own id); anything in neither set is a plain CREATE.
+///
+/// Decode failures bail loud (CLAUDE.md rule 12) — same posture as
+/// every other ledger walk in this module.
+fn chain_operation_sets(
+    entries: &[Entry],
+) -> Result<(
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+)> {
+    use std::collections::HashSet;
+    let mut storno_ids: HashSet<String> = HashSet::new();
+    let mut modify_ids: HashSet<String> = HashSet::new();
+    for entry in entries {
+        match entry.kind {
+            EventKind::InvoiceStornoIssued => {
+                let payload: audit_payloads::InvoiceStornoIssuedPayload =
+                    serde_json::from_slice(&entry.payload).map_err(|e| {
+                        anyhow!(
+                            "InvoiceStornoIssued audit payload (seq {}) failed typed decode: {e} \
+                             — audit ledger appears tampered or schema-drifted",
+                            entry.seq.as_u64()
+                        )
+                    })?;
+                storno_ids.insert(payload.storno_invoice_id);
+            }
+            EventKind::InvoiceModificationIssued => {
+                let payload: audit_payloads::InvoiceModificationIssuedPayload =
+                    serde_json::from_slice(&entry.payload).map_err(|e| {
+                        anyhow!(
+                            "InvoiceModificationIssued audit payload (seq {}) failed typed decode: \
+                             {e} — audit ledger appears tampered or schema-drifted",
+                            entry.seq.as_u64()
+                        )
+                    })?;
+                modify_ids.insert(payload.modification_invoice_id);
+            }
+            _ => {}
+        }
+    }
+    Ok((storno_ids, modify_ids))
+}
+
+/// S381/F1 — the NAV `manageInvoice` operation for an issued invoice,
+/// derived from the audit ledger chain-link entries. CREATE unless the
+/// id appears as a storno / modification chain child. Replaces the
+/// removed `detect_operation_from_xml` XML-sniffer (the body can no
+/// longer distinguish STORNO from MODIFY in NAV v3.0). Used by the
+/// direct `submit-invoice` path; the drain worker reads the same answer
+/// off `PendingInvoice::operation` (stamped once during classify).
+pub fn operation_for_invoice(entries: &[Entry], invoice_id: &str) -> Result<InvoiceOperation> {
+    let (storno_ids, modify_ids) = chain_operation_sets(entries)?;
+    Ok(if modify_ids.contains(invoice_id) {
+        InvoiceOperation::Modify
+    } else if storno_ids.contains(invoice_id) {
+        InvoiceOperation::Storno
+    } else {
+        InvoiceOperation::Create
+    })
+}
+
 fn classify_pending(entries: &[Entry]) -> Result<Vec<PendingInvoice>> {
     use std::collections::HashSet;
 
@@ -228,6 +303,11 @@ fn classify_pending(entries: &[Entry]) -> Result<Vec<PendingInvoice>> {
         }
     }
 
+    // S381/F1 — pre-pass: which invoice_ids are STORNO / MODIFY chain
+    // children, so each PendingInvoice carries its NAV envelope
+    // operation (the drain worker no longer sniffs it from the XML).
+    let (storno_ids, modify_ids) = chain_operation_sets(entries)?;
+
     // Second pass: classify every InvoiceDraftCreated entry, filter
     // out the excluded ones, build the PendingInvoice list.
     let mut pending: Vec<PendingInvoice> = Vec::new();
@@ -255,11 +335,19 @@ fn classify_pending(entries: &[Entry]) -> Result<Vec<PendingInvoice>> {
                     payload.idempotency_key
                 )
             })?;
+        let operation = if modify_ids.contains(&payload.invoice_id) {
+            InvoiceOperation::Modify
+        } else if storno_ids.contains(&payload.invoice_id) {
+            InvoiceOperation::Storno
+        } else {
+            InvoiceOperation::Create
+        };
         pending.push(PendingInvoice {
             invoice_id: payload.invoice_id,
             idempotency_key,
             nav_xml_path: payload.nav_xml_path,
             issue_date: entry.time_wall,
+            operation,
         });
     }
 
@@ -721,6 +809,129 @@ mod tests {
                 Some(idem.to_canonical_string()),
             )
             .unwrap();
+    }
+
+    fn write_storno_issued(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        storno_id: &str,
+        base_id: &str,
+        modification_index: u32,
+    ) {
+        let idem = IdempotencyKey::new();
+        let payload = audit_payloads::InvoiceStornoIssuedPayload::new(
+            storno_id,
+            7,
+            "rsv_storno",
+            idem,
+            base_id,
+            42,
+            modification_index,
+        );
+        ledger
+            .append(
+                EventKind::InvoiceStornoIssued,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    fn write_modification_issued(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        modification_id: &str,
+        base_id: &str,
+        modification_index: u32,
+    ) {
+        let idem = IdempotencyKey::new();
+        let payload = audit_payloads::InvoiceModificationIssuedPayload::new(
+            modification_id,
+            7,
+            "rsv_modif",
+            idem,
+            base_id,
+            42,
+            modification_index,
+            "2026-05-21",
+        );
+        ledger
+            .append(
+                EventKind::InvoiceModificationIssued,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    /// S381/F1 — an invoice with no chain-link entry is a plain CREATE.
+    #[test]
+    fn operation_for_invoice_create_when_no_chain_entry() {
+        let (mut ledger, actor) = fixture_ledger();
+        write_draft_created(&mut ledger, &actor, "inv_A", IdempotencyKey::new(), None);
+        let entries = ledger.entries().unwrap();
+        assert_eq!(
+            operation_for_invoice(&entries, "inv_A").unwrap(),
+            InvoiceOperation::Create
+        );
+    }
+
+    /// S381/F1 — an invoice whose own id is an `InvoiceStornoIssued`
+    /// chain child is a STORNO (the wire op is no longer sniffable from
+    /// the XML in NAV v3.0).
+    #[test]
+    fn operation_for_invoice_storno_when_storno_issued() {
+        let (mut ledger, actor) = fixture_ledger();
+        write_storno_issued(&mut ledger, &actor, "inv_STORNO", "inv_BASE", 1);
+        let entries = ledger.entries().unwrap();
+        assert_eq!(
+            operation_for_invoice(&entries, "inv_STORNO").unwrap(),
+            InvoiceOperation::Storno
+        );
+        // The BASE itself is still a CREATE.
+        assert_eq!(
+            operation_for_invoice(&entries, "inv_BASE").unwrap(),
+            InvoiceOperation::Create
+        );
+    }
+
+    /// S381/F1 — an invoice whose own id is an `InvoiceModificationIssued`
+    /// chain child is a MODIFY.
+    #[test]
+    fn operation_for_invoice_modify_when_modification_issued() {
+        let (mut ledger, actor) = fixture_ledger();
+        write_modification_issued(&mut ledger, &actor, "inv_MODIF", "inv_BASE", 1);
+        let entries = ledger.entries().unwrap();
+        assert_eq!(
+            operation_for_invoice(&entries, "inv_MODIF").unwrap(),
+            InvoiceOperation::Modify
+        );
+    }
+
+    /// S381/F1 — the drain worker reads the operation off
+    /// `PendingInvoice::operation`; classify_pending must stamp it from
+    /// the chain-link entries. A storno child that is still pending must
+    /// carry `Storno`.
+    #[test]
+    fn pending_carries_operation_from_chain_entries() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_draft_created(
+            &mut ledger,
+            &actor,
+            "inv_STORNO",
+            idem,
+            Some("/x/storno.xml"),
+        );
+        write_storno_issued(&mut ledger, &actor, "inv_STORNO", "inv_BASE", 1);
+        let pending = pending_from_ledger(&ledger).unwrap();
+        let storno = pending
+            .iter()
+            .find(|p| p.invoice_id == "inv_STORNO")
+            .expect("storno child is pending");
+        assert_eq!(storno.operation, InvoiceOperation::Storno);
     }
 
     #[test]

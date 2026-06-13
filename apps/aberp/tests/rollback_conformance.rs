@@ -364,6 +364,86 @@ fn render_fault_before_commit_rolls_back_storno_issuance() {
     let _ = std::fs::remove_file(&path);
 }
 
+#[test]
+fn render_fault_before_commit_rolls_back_modification_issuance() {
+    // S381/E (task_8de31599) — issue_modification.rs was the last
+    // un-ported sibling of the pre-S375 storno bug: its render+write ran
+    // post-commit, so a render/validate/write failure left a committed
+    // modification row + audit chain-link with no XML on disk. This pins
+    // the new contract — the render `Err` arriving before `tx.commit()`
+    // rolls BOTH the billing allocation and the (Reserved + DraftCreated
+    // + ModificationIssued) appends back, like the storno test above.
+    let path = temp_db_path("render-fault-modification");
+    let (mut conn, series) = pre_tx_setup(&path);
+
+    let fault_dir = path.with_extension("faultdir");
+    std::fs::create_dir_all(&fault_dir).expect("create fault dir");
+
+    {
+        let tx = conn.transaction().expect("begin tx");
+        let _outcome = billing::allocate_in_tx(
+            &tx,
+            build_allocate_args(series.id),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("allocate_in_tx Ok");
+        // The modification path's Fresh-branch shape: THREE audit appends
+        // (Reserved + DraftCreated + ModificationIssued).
+        for (kind, k) in [
+            (EventKind::InvoiceSequenceReserved, "seq"),
+            (EventKind::InvoiceDraftCreated, "draft"),
+            (EventKind::InvoiceModificationIssued, "modif"),
+        ] {
+            audit_ledger::append_in_tx(
+                &tx,
+                &ledger_meta(),
+                kind,
+                format!("{{\"k\":\"{k}\"}}").into_bytes(),
+                Actor::test_only(),
+                Some("idem-render-modif".to_string()),
+            )
+            .expect("append Ok");
+        }
+
+        // S375 — render+write fault before commit.
+        let render_result = nav_xml::write_to_path(&fault_dir, b"<InvoiceData/>");
+        assert!(
+            render_result.is_err(),
+            "fault injection: writing modification XML to a directory path must fail"
+        );
+        // No tx.commit(): tx drops → rollback of allocate + all three appends.
+    }
+    drop(conn);
+
+    let (seq_state, reservations, invoices, lines, audit) = row_counts(&path);
+    assert_eq!(
+        seq_state, 0,
+        "seq_state empty after modification render-fault rollback"
+    );
+    assert_eq!(
+        reservations, 0,
+        "reservation empty after modification render-fault rollback"
+    );
+    assert_eq!(
+        invoices, 0,
+        "invoice empty after modification render-fault rollback"
+    );
+    assert_eq!(
+        lines, 0,
+        "invoice_line empty after modification render-fault rollback"
+    );
+    assert_eq!(
+        audit, 0,
+        "audit_ledger empty after modification render-fault rollback — no committed chain-link without XML"
+    );
+
+    let ledger = Ledger::open(&path, tenant(), TEST_BINARY_HASH).expect("re-open ledger");
+    assert_eq!(ledger.verify_chain().expect("verify_chain Ok"), 0);
+
+    let _ = std::fs::remove_dir_all(&fault_dir);
+    let _ = std::fs::remove_file(&path);
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Test 2 — panic-injected mid-issuance
 // ──────────────────────────────────────────────────────────────────────

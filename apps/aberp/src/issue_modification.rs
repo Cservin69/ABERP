@@ -330,53 +330,18 @@ pub fn modification_from_inputs(
         start_value: template.start_value,
     };
 
-    let outcome = run_single_tx(
-        conn,
-        &ledger_meta,
-        allocate_args,
-        idempotency_key,
-        actor,
-        references,
-        modification_date,
-        nav_xml_out.clone(),
-        // PR-97 / ADR-0048 — pass buyer-kind discriminator from the
-        // base's side-stored input.json through to the audit payload.
-        input.customer.vat_status,
-    )?;
+    // S375 — read the BASE invoice's NAV-side identity from its on-disk
+    // XML BEFORE the tx so the render closure (run inside the tx, before
+    // commit) has everything it needs. S184 (`<invoiceNumber>`, immune to
+    // seller.toml numbering-literal drift) + S369 (base line count, so
+    // the modification's full-replace CREATE lines continue PAST the
+    // base's line numbers — NAV INVOICE_LINE_ALREADY_EXISTS / S370) —
+    // the same canonical-record reads issue_storno does pre-tx.
+    let base_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path)?;
+    let base_line_count = crate::nav_xml::count_invoice_lines_from_xml(&base_nav_xml_path)?;
 
-    let modification = outcome.modification;
-    let modification_index = outcome.modification_index;
-    let base_sequence_number = outcome.base_sequence_number;
-    let base_issue_year = outcome.base_issue_year;
-    let was_fresh = outcome.was_fresh;
-    let chain_currency = outcome.chain_currency;
-    let chain_rate_metadata = outcome.chain_rate_metadata;
-    tracing::info!(
-        seq = modification.sequence_number,
-        modification_index,
-        base_sequence_number,
-        fresh = was_fresh,
-        idempotency_key = ?idempotency_key,
-        "modification issued"
-    );
-
-    // Verify the audit chain — success-criterion gate.
-    let ledger = Ledger::open(db, tenant.clone(), binary_hash_bytes)
-        .context("re-open audit ledger after modification commit")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER modification issuance")?;
-    tracing::info!(entries_verified = verified, "audit chain verified");
-
-    // PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    // post-commit.
-    let mirror_path = audit_ledger::mirror_path_for(db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after modification commit")?;
-
-    // Render the modification's <InvoiceData> XML + ADR-0022 runtime
-    // XSD invariant check before writing to disk.
+    // S375 — build the modification's NAV parties BEFORE the tx; the
+    // render closure captures them by move.
     let parties = NavParties {
         supplier: SupplierInfo {
             tax_number: input.supplier.tax_number,
@@ -413,70 +378,120 @@ pub fn modification_from_inputs(
             }),
         },
     };
-    // S184 — read the BASE's `<invoiceNumber>` from its on-disk NAV XML
-    // (canonical record of what NAV holds on file). Re-deriving via
-    // `template.render_for_build(base_year, base_seq)` would drift if
-    // the seller.toml numbering literal was edited between base
-    // issuance and modification emission. See
-    // `crate::nav_xml::read_invoice_number_from_xml` for the failure
-    // mode + NAV ABORTED ack that forced this change. base_issue_year
-    // is now unused for the wire reference; preserved as `_` because the
-    // payload contract still records `base_sequence_number` for
-    // ADR-0024 §7 denormalization.
-    let _base_issue_year = base_issue_year;
-    let _base_sequence_number = base_sequence_number;
-    let base_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path)?;
-    // S369 — read the BASE's line count from the same on-disk XML so the
-    // modification's full-replace CREATE lines continue PAST the base's
-    // line numbers (NAV INVOICE_LINE_ALREADY_EXISTS, S370).
-    let base_line_count = crate::nav_xml::count_invoice_lines_from_xml(&base_nav_xml_path)?;
-    let modification_invoice_number =
-        template.render_for_build(modification.issue_date.year(), modification.sequence_number);
-    let modification_reference = ModificationReference {
-        base_invoice_number,
-        modification_index,
-        modification_issue_date: modification_date.to_string(),
-        base_line_count,
+    let render_series_code = series_code.clone();
+    let render_payment_method = input.payment_method;
+    let render_nav_out = nav_xml_out.clone();
+    // S375 — render+XSD-validate+write the modification's <InvoiceData>
+    // INSIDE the tx, AFTER the three audit appends and BEFORE commit, so
+    // a render/validate/write failure rolls the allocation + appends back
+    // (atomic). `issue_modification.rs` was the last un-ported sibling of
+    // the pre-S375 storno bug (S382/F1 / task_8de31599): pre-S375 this
+    // ran post-commit, so a failure left a committed modification row +
+    // audit chain-link with no XML on disk — a phantom row whose Submit
+    // is broken. The chain-dependent values (modification seq,
+    // modification_index, inherited currency + rate metadata) are passed
+    // in by `run_single_tx` because they are only known inside the tx.
+    // Captures `template` by move — its only remaining use is here.
+    let render_and_write = move |modification: &ReadyInvoice,
+                                 modification_index: u32,
+                                 chain_currency: Currency,
+                                 chain_rate_metadata: Option<&RateMetadata>|
+          -> Result<String> {
+        let modification_invoice_number =
+            template.render_for_build(modification.issue_date.year(), modification.sequence_number);
+        let modification_reference = ModificationReference {
+            base_invoice_number,
+            modification_index,
+            base_line_count,
+        };
+        let xml = nav_xml::render_modification_data_with_number(
+            modification,
+            &render_series_code,
+            &parties,
+            &modification_reference,
+            chain_currency,
+            chain_rate_metadata,
+            // S160 — the modification inherits the base invoice's payment
+            // method, which rides the base's side-stored `input.json`
+            // (defaults to `Transfer` for pre-S160 bases).
+            render_payment_method,
+            Some(&modification_invoice_number),
+        )
+        .context("render NAV modification XML")?;
+        aberp_nav_xsd_validator::validate_invoice_data(&xml).context(
+            "NAV InvoiceData v3.0 invariant check (ADR-0022) failed for rendered modification XML",
+        )?;
+        tracing::info!(
+            bytes = xml.len(),
+            nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
+            "NAV modification InvoiceData XML passed v3.0 invariant check"
+        );
+        nav_xml::write_to_path(&render_nav_out, &xml)?;
+        tracing::info!(
+            path = %render_nav_out.display(),
+            bytes = xml.len(),
+            "NAV modification XML written"
+        );
+        Ok(modification_invoice_number)
     };
-    let xml = nav_xml::render_modification_data_with_number(
-        &modification,
-        &series_code,
-        &parties,
-        &modification_reference,
-        chain_currency,
-        chain_rate_metadata.as_ref(),
-        // S160 — the modification inherits the base invoice's payment
-        // method, which rides the base's side-stored `input.json`
-        // (defaults to `Transfer` for pre-S160 bases).
-        input.payment_method,
-        Some(&modification_invoice_number),
-    )
-    .context("render NAV modification XML")?;
-    aberp_nav_xsd_validator::validate_invoice_data(&xml).context(
-        "NAV InvoiceData v3.0 invariant check (ADR-0022) failed for rendered modification XML",
+
+    // One transaction across base-load + chain-index walk + modification
+    // allocator + three audit appends + (S375) the NAV-XML render+write.
+    // `run_single_tx` runs the render closure before committing and hands
+    // the post-commit Connection back so the verify path below reuses it
+    // (no crash-prone Ledger::open re-open).
+    let (outcome, conn) = run_single_tx(
+        conn,
+        &ledger_meta,
+        allocate_args,
+        idempotency_key,
+        actor,
+        references,
+        modification_date,
+        nav_xml_out.clone(),
+        // PR-97 / ADR-0048 — pass buyer-kind discriminator from the
+        // base's side-stored input.json through to the audit payload.
+        input.customer.vat_status,
+        render_and_write,
     )?;
+
+    let modification = outcome.modification;
+    let modification_index = outcome.modification_index;
     tracing::info!(
-        bytes = xml.len(),
-        nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
-        "NAV modification InvoiceData XML passed v3.0 invariant check"
-    );
-    nav_xml::write_to_path(&nav_xml_out, &xml)?;
-    tracing::info!(
-        path = %nav_xml_out.display(),
-        bytes = xml.len(),
-        "NAV modification XML written"
+        seq = modification.sequence_number,
+        modification_index,
+        base_sequence_number = outcome.base_sequence_number,
+        fresh = outcome.was_fresh,
+        idempotency_key = ?idempotency_key,
+        "modification issued"
     );
 
-    // S174 — surface the SAME render that flowed to NAV (line 408-409
-    // above) on the operator-visible summary. Pre-S174 the summary
-    // composed its own `format!("{}/{:05}", ...)` — silently omitting
-    // the dev TEST- prefix and ignoring any operator-configured
-    // numbering template, so the CLI/SPA/PDF display diverged from the
-    // wire. Same one-liner fix S173 applied to the annulment + observe
-    // paths.
+    // Verify the audit chain — success-criterion gate. S375 — run
+    // `verify_chain` + `sync_mirror` on the SAME post-commit Connection
+    // `run_single_tx` handed back, rather than dropping it and calling
+    // `Ledger::open` (a fresh `Connection::open` that triggers DuckDB
+    // 1.5.x's LoadCheckpoint/ReadIndex ART assertion, S332 / duckdb#23046
+    // — the same crash family S375 closed for invoice + storno). No file
+    // re-open → that crash is unreachable.
+    let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
+    let verified = ledger
+        .verify_chain()
+        .context("audit-ledger chain verification failed AFTER modification issuance")?;
+    tracing::info!(entries_verified = verified, "audit chain verified");
+
+    // PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
+    // post-commit (matches the issue_invoice / issue_storno posture).
+    let mirror_path = audit_ledger::mirror_path_for(db);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after modification commit")?;
+
+    // S174 — surface the SAME render that flowed to NAV on the
+    // operator-visible summary (the render closure built it inside the tx
+    // and returned it on `TxOutcome::modification_invoice_number`).
     Ok(ModificationIssuedSummary {
         invoice_id: modification.id.to_prefixed_string(),
-        invoice_number: modification_invoice_number,
+        invoice_number: outcome.modification_invoice_number,
         modification_index,
         entries_verified: verified,
     })
@@ -707,25 +722,25 @@ struct TxOutcome {
     modification: ReadyInvoice,
     modification_index: u32,
     base_sequence_number: u64,
-    /// PR-89 — calendar year of the BASE invoice's issue date, used so
-    /// `<originalInvoiceNumber>` renders against the base's
-    /// template-Year shape rather than the modification's year. Mirrors
-    /// `issue_storno::TxOutcome::base_issue_year`.
-    base_issue_year: i32,
     was_fresh: bool,
-    /// PR-44γ.1 — currency inherited from base per ADR-0037 §4 C6.
-    chain_currency: Currency,
-    /// PR-44γ.1 — rate metadata inherited from base; `huf_equivalent_total`
-    /// recomputed from the modification's own full-replace gross.
-    /// `None` for HUF.
-    chain_rate_metadata: Option<RateMetadata>,
+    /// S375 — the modification's `<series>/<seq>` NAV number, rendered
+    /// inside the tx by the `render_and_write` closure and returned so
+    /// the caller threads it straight into the operator-facing summary
+    /// (no second template render). The inherited currency + rate
+    /// metadata the closure used are consumed inside the tx and no longer
+    /// cross the commit boundary. Mirrors
+    /// `issue_storno::TxOutcome::storno_invoice_number`.
+    modification_invoice_number: String,
 }
 
 /// One DuckDB transaction across: load base row, walk chain (both
-/// kinds), allocate modification, write three audit entries, commit.
-/// Rollback contract matches `issue_storno::run_single_tx` (drop-on-
-/// error rolls back both halves).
-fn run_single_tx(
+/// kinds), allocate modification, write three audit entries, (S375)
+/// render+validate+write the NAV XML, commit, and hand the post-commit
+/// `Connection` back. Rollback contract matches
+/// `issue_storno::run_single_tx` (drop-on-error rolls back both halves;
+/// a render `Err` arriving before `tx.commit()` rolls everything back).
+#[allow(clippy::too_many_arguments)]
+fn run_single_tx<F>(
     mut conn: Connection,
     ledger_meta: &LedgerMeta,
     mut allocate_args: AllocateArgs,
@@ -739,7 +754,17 @@ fn run_single_tx(
     // modification's `InvoiceDraftCreated` audit payload alongside the
     // bank snapshot via the chainable builders.
     customer_vat_status: crate::nav_xml::CustomerVatStatus,
-) -> Result<TxOutcome> {
+    // S375 — NAV-XML render+validate+write step, run inside the tx AFTER
+    // the three audit appends and BEFORE commit so the modification is
+    // atomic. Receives the chain-dependent values only known inside the
+    // tx (modification seq via `&ReadyInvoice`, modification_index,
+    // inherited currency + rate metadata) and returns the rendered NAV
+    // invoice number.
+    render_and_write: F,
+) -> Result<(TxOutcome, Connection)>
+where
+    F: FnOnce(&ReadyInvoice, u32, Currency, Option<&RateMetadata>) -> Result<String>,
+{
     let tx = conn
         .transaction()
         .context("begin DuckDB transaction (modification: billing + audit-ledger)")?;
@@ -904,17 +929,32 @@ fn run_single_tx(
         tracing::info!("replay path: no new audit entries written (modification idempotency hit)");
     }
 
+    // S375 — render + XSD-validate + write the modification NAV XML
+    // BEFORE commit, on both the Fresh and Replay paths (matches the
+    // pre-S375 unconditional post-commit render). A failure here returns
+    // `Err` so the tx drops un-committed → the allocation + three appends
+    // roll back together and no committed-but-XML-less modification row
+    // survives.
+    let modification_invoice_number = render_and_write(
+        &modification_invoice,
+        modification_index,
+        inherited_currency,
+        inherited_rate_metadata.as_ref(),
+    )
+    .context("render + XSD-validate + write NAV modification XML before commit (S375 atomicity)")?;
+
     tx.commit()
         .context("commit DuckDB transaction (modification: billing + audit-ledger)")?;
-    Ok(TxOutcome {
-        modification: modification_invoice,
-        modification_index,
-        base_sequence_number,
-        base_issue_year: base_invoice.issue_date.year(),
-        was_fresh,
-        chain_currency: inherited_currency,
-        chain_rate_metadata: inherited_rate_metadata,
-    })
+    Ok((
+        TxOutcome {
+            modification: modification_invoice,
+            modification_index,
+            base_sequence_number,
+            was_fresh,
+            modification_invoice_number,
+        },
+        conn,
+    ))
 }
 
 /// Walk `audit_ledger` inside the borrowed transaction for every
@@ -937,6 +977,11 @@ fn next_modification_index_in_tx(
     tx: &duckdb::Transaction<'_>,
     base_invoice_id: &str,
 ) -> Result<u32> {
+    // S381/F4 — count only SAVED-confirmed chain members (symmetric with
+    // `issue_storno::next_modification_index_in_tx`; see that function +
+    // `issue_storno::saved_chain_member_ids_in_tx` for the rationale —
+    // NAV-ABORTed attempts never burned an index).
+    let saved_ids = crate::issue_storno::saved_chain_member_ids_in_tx(tx)?;
     let mut max_index: u32 = 0;
 
     // STORNO entries.
@@ -959,7 +1004,9 @@ fn next_modification_index_in_tx(
                          — audit ledger appears tampered or schema-drifted"
                     )
                 })?;
-            if payload.base_invoice_id == base_invoice_id && payload.modification_index > max_index
+            if payload.base_invoice_id == base_invoice_id
+                && saved_ids.contains(&payload.storno_invoice_id)
+                && payload.modification_index > max_index
             {
                 max_index = payload.modification_index;
             }
@@ -986,7 +1033,9 @@ fn next_modification_index_in_tx(
                          — audit ledger appears tampered or schema-drifted"
                 )
                 })?;
-            if payload.base_invoice_id == base_invoice_id && payload.modification_index > max_index
+            if payload.base_invoice_id == base_invoice_id
+                && saved_ids.contains(&payload.modification_invoice_id)
+                && payload.modification_index > max_index
             {
                 max_index = payload.modification_index;
             }
@@ -1068,10 +1117,15 @@ mod tests {
             let tx = conn.transaction().unwrap();
             for (i, (kind_label, base, idx)) in entries.iter().enumerate() {
                 let idem = IdempotencyKey::new();
-                match *kind_label {
+                // S381/F4 — the chain member's own id; a SAVED ack is
+                // appended below so the SAVED-filter in
+                // `next_modification_index_in_tx` counts it (these
+                // fixtures model members that reached NAV).
+                let own_id = match *kind_label {
                     "S" => {
+                        let own_id = format!("inv_storno_{i}");
                         let payload = audit_payloads::InvoiceStornoIssuedPayload::new(
-                            &format!("inv_storno_{i}"),
+                            &own_id,
                             100 + i as u64,
                             &format!("rsv_storno_{i}"),
                             idem,
@@ -1088,10 +1142,12 @@ mod tests {
                             Some(idem.to_canonical_string()),
                         )
                         .unwrap();
+                        own_id
                     }
                     "M" => {
+                        let own_id = format!("inv_modif_{i}");
                         let payload = audit_payloads::InvoiceModificationIssuedPayload::new(
-                            &format!("inv_modif_{i}"),
+                            &own_id,
                             100 + i as u64,
                             &format!("rsv_modif_{i}"),
                             idem,
@@ -1109,9 +1165,25 @@ mod tests {
                             Some(idem.to_canonical_string()),
                         )
                         .unwrap();
+                        own_id
                     }
                     other => panic!("unknown kind_label {other}"),
-                }
+                };
+                let ack = audit_payloads::InvoiceAckStatusPayload::new(
+                    &own_id,
+                    &format!("txn_{i}"),
+                    "SAVED",
+                    Vec::new(),
+                );
+                audit_ledger::append_in_tx(
+                    &tx,
+                    &meta,
+                    EventKind::InvoiceAckStatus,
+                    ack.to_bytes(),
+                    actor.clone(),
+                    None,
+                )
+                .unwrap();
             }
             tx.commit().unwrap();
         }
@@ -1171,6 +1243,65 @@ mod tests {
         let tx = conn.transaction().unwrap();
         let idx = next_modification_index_in_tx(&tx, "inv_BASE").unwrap();
         assert_eq!(idx, 1);
+    }
+
+    /// S381/F4 — the modification walker also applies the SAVED-filter
+    /// (it calls the same `saved_chain_member_ids_in_tx`). A prior MODIFY
+    /// whose NAV ack is ABORTED must not inflate the next index.
+    #[test]
+    fn next_modification_index_ignores_aborted_prior_modify() {
+        let tenant = TenantId::new("t1".to_string()).unwrap();
+        let bh = BinaryHash::from_bytes([0u8; 32]);
+        let actor = Actor::from_local_cli("sess".to_string(), "test-user");
+        let meta = LedgerMeta::new(tenant, bh);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        audit_ledger::ensure_schema(&conn).unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            let idem = IdempotencyKey::new();
+            let payload = audit_payloads::InvoiceModificationIssuedPayload::new(
+                "inv_modif_aborted",
+                100,
+                "rsv_modif_aborted",
+                idem,
+                "inv_BASE",
+                42,
+                1,
+                "2026-05-21",
+            );
+            audit_ledger::append_in_tx(
+                &tx,
+                &meta,
+                EventKind::InvoiceModificationIssued,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+            let ack = audit_payloads::InvoiceAckStatusPayload::new(
+                "inv_modif_aborted",
+                "txn_aborted",
+                "ABORTED",
+                Vec::new(),
+            );
+            audit_ledger::append_in_tx(
+                &tx,
+                &meta,
+                EventKind::InvoiceAckStatus,
+                ack.to_bytes(),
+                actor,
+                None,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let tx = conn.transaction().unwrap();
+        let idx = next_modification_index_in_tx(&tx, "inv_BASE").unwrap();
+        assert_eq!(
+            idx, 1,
+            "an ABORTed prior modification must not inflate the next modificationIndex (S381/F4)"
+        );
     }
 
     /// Modification of a Finalized base — accepted.

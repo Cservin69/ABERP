@@ -183,13 +183,19 @@ fn storno_xml_carries_negative_line_amounts() {
             .unwrap();
     let body = std::str::from_utf8(&xml).unwrap();
 
-    // The fixture line is quantity=2, unit_price=1000, vat=27%. With
-    // negation: unit_price = -1000, net = 2 * -1000 = -2000,
+    // The fixture line is quantity=2, unit_price=1000, vat=27%. S381/F3
+    // — NAV spec §2.5.1 negates the QUANTITY, not the unit price:
+    // quantity = -2, unit_price = +1000, net = -2 * 1000 = -2000,
     // vat = floor(-2000 * 2700 / 10000) = floor(-540) = -540,
-    // gross = -2000 + -540 = -2540.
+    // gross = -2000 + -540 = -2540. Line totals are unchanged from the
+    // pre-S381 negate-unitPrice shape; only the sign placement moves.
     assert!(
-        body.contains("<unitPrice>-1000</unitPrice>"),
-        "unit_price must be negated: {body}"
+        body.contains("<quantity>-2</quantity>"),
+        "quantity must be negated (S381/F3): {body}"
+    );
+    assert!(
+        body.contains("<unitPrice>1000</unitPrice>"),
+        "unit_price must stay positive (S381/F3): {body}"
     );
     assert!(
         body.contains("<lineNetAmount>-2000</lineNetAmount>"),
@@ -576,6 +582,68 @@ fn read_invoice_number_from_xml_round_trips_across_emit_shapes() {
             );
         }
     }
+}
+
+/// S381/F2 — `read_invoice_delivery_date_from_xml` round-trips the
+/// base's `<invoiceDeliveryDate>` so a storno can copy it instead of
+/// stamping today's date (NAV `UNINTENDED_CANCELLATION_DELIVERY_DATE`
+/// WARN + wrong VAT period). Render a base invoice with a known,
+/// NON-today delivery date, write it, and read it back byte-identical.
+#[test]
+fn read_invoice_delivery_date_from_xml_round_trips() {
+    use ulid::Ulid;
+
+    let scratch_dir = std::env::temp_dir()
+        .join("aberp-s381-f2-delivery-roundtrip")
+        .join(format!("{}", Ulid::new()));
+    std::fs::create_dir_all(&scratch_dir).expect("create scratch dir");
+
+    // A fixed delivery date distinct from today so a "stamp today"
+    // regression cannot coincidentally pass.
+    let delivery = time::Date::from_calendar_date(2025, time::Month::March, 14).unwrap();
+    let mut invoice = build_minimal_storno_invoice();
+    invoice.delivery_date = delivery;
+
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("base invoice renders");
+
+    let path = scratch_dir.join(format!("{}.xml", Ulid::new()));
+    std::fs::write(&path, &xml).expect("write xml");
+
+    let read_back = nav_xml::read_invoice_delivery_date_from_xml(&path)
+        .expect("read invoiceDeliveryDate back");
+    assert_eq!(
+        read_back, "2025-03-14",
+        "storno must be able to copy the base's delivery date verbatim (S381/F2)"
+    );
+}
+
+/// S381/F2 — the helper MUST fail loud when the base XML lacks an
+/// `<invoiceDeliveryDate>` (tampered / foreign body) rather than
+/// silently substituting a date. CLAUDE.md rule 12.
+#[test]
+fn read_invoice_delivery_date_from_xml_loud_fails_on_missing_element() {
+    use ulid::Ulid;
+
+    let scratch_dir = std::env::temp_dir()
+        .join("aberp-s381-f2-delivery-missing")
+        .join(format!("{}", Ulid::new()));
+    std::fs::create_dir_all(&scratch_dir).expect("create scratch dir");
+    let path = scratch_dir.join("no-delivery.xml");
+    std::fs::write(
+        &path,
+        b"<InvoiceData><invoiceNumber>X/00001</invoiceNumber></InvoiceData>",
+    )
+    .expect("write xml");
+
+    let err = nav_xml::read_invoice_delivery_date_from_xml(&path).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("invoiceDeliveryDate"),
+        "missing-element error must name the element: {msg}"
+    );
 }
 
 /// S184 — `read_invoice_number_from_xml` MUST fail loud (not return an

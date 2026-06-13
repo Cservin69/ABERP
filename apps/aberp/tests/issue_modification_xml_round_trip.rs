@@ -7,9 +7,10 @@
 //!   1. `apps/aberp/src/nav_xml.rs::render_modification_data` — the
 //!      emitter.
 //!   2. `crates/nav-xsd-validator/src/validate.rs::walk_invoice` +
-//!      `walk_invoice_reference` — the allowlist (extended in PR-11
-//!      to allow the optional `<modificationIssueDate>` per
-//!      ADR-0024 §2).
+//!      `walk_invoice_reference` — the allowlist (S381/F1 — the v2.0-only
+//!      `<modificationIssueDate>` allowance was removed; the MODIFY
+//!      `<invoiceReference>` now carries exactly the three NAV v3.0
+//!      children, identical to STORNO).
 //!
 //! Divergence between them is the silent-rejection failure mode
 //! `nav_xsd_validator_round_trip.rs`'s preamble names. This file
@@ -93,7 +94,6 @@ fn minimal_modification_reference() -> ModificationReference {
     ModificationReference {
         base_invoice_number: "INV-default/00001".to_string(),
         modification_index: 1,
-        modification_issue_date: "2026-05-21".to_string(),
         // S369 — the minimal fixture full-replaces a single-line base,
         // so base_line_count = 1 and the modification's CREATE line
         // numbers at base_line_count + 1 = 2.
@@ -131,25 +131,23 @@ fn modification_emitter_minimal_invoice_passes_validator() {
     }
 }
 
-/// The MODIFY XML body MUST carry BOTH `<invoiceReference>` AND
-/// `<modificationIssueDate>` — these are the two substrings the
-/// detector `submit_invoice::detect_operation_from_xml` keys on per
-/// ADR-0024 §3 (CLAUDE.md rule 5 — code answers, not LLM). If a
-/// future refactor accidentally drops `<modificationIssueDate>` from
-/// the emitter, `submit-invoice` would default to
-/// `InvoiceOperation::Storno` (wrong operation) and NAV would reject
-/// with `INVOICE_OPERATION_MISMATCH`-shape. This test pins the
-/// detector's coupling to the emitter's structural choices.
+/// S381/F1 — the MODIFY `<invoiceReference>` carries EXACTLY the three
+/// NAV v3.0 children and MUST NOT carry `<modificationIssueDate>` (a
+/// v2.0-only element, illegal in v3.0 — every MODIFY submission carrying
+/// it was a guaranteed schema-fail). STORNO and MODIFY bodies are now
+/// byte-identical at the reference level; the wire operation is derived
+/// from the audit ledger (`submission_queue::operation_for_invoice`),
+/// not sniffed from the body. This test pins the element's ABSENCE so a
+/// future regression re-adding it is caught here.
 #[test]
-fn modification_xml_carries_invoice_reference_and_modification_issue_date() {
+fn modification_xml_omits_modification_issue_date() {
     let modification = build_minimal_modification_invoice();
     let series = SeriesCode::new("INV-default".to_string()).unwrap();
     let parties = minimal_parties();
     let reference = ModificationReference {
         base_invoice_number: "INV-default/00001".to_string(),
         modification_index: 3, // pin a non-1 index to defend against literal-1 elision
-        modification_issue_date: "2026-05-21".to_string(),
-        base_line_count: 1, // S369 — single-line base
+        base_line_count: 1,    // S369 — single-line base
     };
     let xml = nav_xml::render_modification_data(
         &modification,
@@ -167,8 +165,8 @@ fn modification_xml_carries_invoice_reference_and_modification_issue_date() {
         "modification XML must contain <invoiceReference>: {body}"
     );
     assert!(
-        body.contains("<modificationIssueDate>2026-05-21</modificationIssueDate>"),
-        "modification XML must carry <modificationIssueDate> verbatim: {body}"
+        !body.contains("modificationIssueDate"),
+        "modification XML must NOT carry the v2.0-only <modificationIssueDate> (S381/F1): {body}"
     );
     assert!(
         body.contains("<originalInvoiceNumber>INV-default/00001</originalInvoiceNumber>"),
@@ -309,7 +307,6 @@ fn modification_xml_invoice_number_is_the_modifications_own_seq() {
     let reference = ModificationReference {
         base_invoice_number: "INV-default/00007".to_string(), // base's
         modification_index: 1,
-        modification_issue_date: "2026-05-21".to_string(),
         base_line_count: 1, // S369 — single-line base
     };
     let xml = nav_xml::render_modification_data(
@@ -421,7 +418,6 @@ fn modification_xml_original_invoice_number_round_trips_verbatim() {
         let reference = ModificationReference {
             base_invoice_number: (*original_number).to_string(),
             modification_index: 1,
-            modification_issue_date: "2026-05-21".to_string(),
             base_line_count: 1, // S369 — single-line base
         };
         let xml = nav_xml::render_modification_data(
@@ -532,7 +528,6 @@ fn modification_line_number_reference_continues_past_two_line_base() {
     let reference = ModificationReference {
         base_invoice_number: "INV-default/00001".to_string(),
         modification_index: 1,
-        modification_issue_date: "2026-05-21".to_string(),
         base_line_count: 2,
     };
     let xml = nav_xml::render_modification_data(

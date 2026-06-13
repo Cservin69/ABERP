@@ -124,7 +124,6 @@ fn build_modification_reference() -> ModificationReference {
     ModificationReference {
         base_invoice_number: "INV-default/00001".to_string(),
         modification_index: 1,
-        modification_issue_date: "2026-05-22".to_string(),
         base_line_count: 1, // S369 — single-line base fixture
     }
 }
@@ -240,11 +239,13 @@ fn eur_modification_body_carries_inherited_currency_and_rate() {
         body.contains("<lineNetAmount>20.00</lineNetAmount>"),
         "EUR modification line net (full-replace) must be positive: {body}"
     );
-    // <modificationIssueDate> distinguishes MODIFY from STORNO at the
-    // wire (per ADR-0024 §3).
+    // S381/F1 — the MODIFY body must NOT carry the v2.0-only
+    // <modificationIssueDate> (illegal in NAV v3.0); STORNO and MODIFY
+    // bodies are byte-identical at the reference level and the wire
+    // operation is derived from the audit ledger, not the body.
     assert!(
-        body.contains("<modificationIssueDate>2026-05-22</modificationIssueDate>"),
-        "MODIFY shape must carry <modificationIssueDate>: {body}"
+        !body.contains("modificationIssueDate"),
+        "MODIFY shape must NOT carry <modificationIssueDate> (S381/F1): {body}"
     );
 }
 

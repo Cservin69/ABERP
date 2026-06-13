@@ -399,15 +399,20 @@ pub struct StornoReference {
 
 /// Modification chain-link reference data for
 /// [`render_modification_data`] (PR-11, ADR-0024). The MODIFY-shape
-/// counterpart to [`StornoReference`]: same base-invoice + chain-index
-/// pair, PLUS the operator-supplied `<modificationIssueDate>` that
-/// NAV requires for MODIFY but not for STORNO (ADR-0024 §3).
+/// counterpart to [`StornoReference`].
 ///
-/// The XML emitter renders these into the SAME `<invoiceReference>`
-/// block shape as STORNO, with the additional `<modificationIssueDate>`
-/// child positioned between `<originalInvoiceNumber>` and
-/// `<modifyWithoutMaster>` per ADR-0024 §1 conflict 1's chosen
-/// reading of the research-doc grammar.
+/// S381/F1 — in NAV v3.0 the `<invoiceReference>` element
+/// (`InvoiceReferenceType`) has EXACTLY three children
+/// (`originalInvoiceNumber`, `modifyWithoutMaster`, `modificationIndex`);
+/// the `<modificationIssueDate>` this struct used to carry existed only
+/// in v2.0 and is schema-illegal in v3.0, so it was removed. The MODIFY
+/// and STORNO bodies are therefore structurally identical at the
+/// `<invoiceReference>` level — the wire operation (CREATE/STORNO/MODIFY)
+/// is declared on the SOAP envelope, derived from the audit ledger by
+/// `submission_queue::operation_for_invoice`, NOT sniffed from the body.
+/// (This field-set now matches [`StornoReference`]; the two are kept as
+/// distinct named input types for the two render functions — a future
+/// session may unify them.)
 #[derive(Debug, Clone)]
 pub struct ModificationReference {
     /// Base invoice's NAV-facing number — same shape + caller
@@ -419,11 +424,6 @@ pub struct ModificationReference {
     /// the index is globally unique across the chain regardless of
     /// per-kind order.
     pub modification_index: u32,
-    /// `<modificationIssueDate>` operator-supplied date the
-    /// modification was issued, in canonical `YYYY-MM-DD` form
-    /// (validated at the CLI boundary per
-    /// `apps/aberp/src/issue_modification.rs` step 2).
-    pub modification_issue_date: String,
     /// S369 — number of `<line>` elements in the BASE invoice. The
     /// modification's full-replace lines are CREATE operations that
     /// must continue PAST the base's line numbers in NAV's virtual
@@ -666,13 +666,14 @@ fn ensure_rate_metadata_invariant(
 ///
 /// 2. Line and summary amounts are **negated** per NAV's storno
 ///    convention. Negation is done by constructing a parallel
-///    `Vec<LineItem>` with negated `unit_price` (`Huf` wraps `i64`,
-///    so negative is representable); `net_total` /  `vat_amount` /
-///    `gross_total` cascade to negative naturally because the same
-///    multiplications now run against a negative `unit_price`. This
-///    keeps the line-writer logic shared with [`render_invoice_data`]
-///    instead of forking a parallel `write_storno_lines` — CLAUDE.md
-///    rule 2 (no speculative abstractions).
+///    `Vec<LineItem>` with negated `quantity` (S381/F3 — NAV spec
+///    §2.5.1 negates the line quantities, not the unit price);
+///    `net_total` / `vat_amount` / `gross_total` cascade to negative
+///    naturally because the same multiplications now run against a
+///    negative `quantity`. This keeps the line-writer logic shared with
+///    [`render_invoice_data`] instead of forking a parallel
+///    `write_storno_lines` — CLAUDE.md rule 2 (no speculative
+///    abstractions).
 ///
 /// The `invoice` argument carries the STORNO's own sequence number
 /// (the storno is itself an invoice with its own allocator slot per
@@ -787,8 +788,9 @@ pub fn render_storno_data_with_number(
     w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
 
     // <invoiceLines> with negated amounts. Negate by constructing a
-    // parallel Vec with negated unit_price; net/vat/gross cascade
-    // through `LineItem::net_total` etc. unchanged.
+    // parallel Vec with negated quantity (S381/F3 — NAV spec §2.5.1
+    // negates quantities, not unit price); net/vat/gross cascade through
+    // `LineItem::net_total` etc. unchanged.
     let negated_lines: Vec<LineItem> = invoice.lines.iter().map(negate_line).collect();
     // Storno carries <invoiceReference>, so every line MUST carry a
     // <lineModificationReference> (ADR-0049 §NAV emit / NAV
@@ -821,14 +823,13 @@ pub fn render_storno_data_with_number(
 /// Structurally parallel to [`render_storno_data`] with two
 /// differences that follow from ADR-0024 §3 + §4:
 ///
-/// 1. The `<invoiceReference>` block carries the MODIFY-shape
-///    children (an extra `<modificationIssueDate>` between
-///    `<originalInvoiceNumber>` and `<modifyWithoutMaster>` per
-///    ADR-0024 §1 conflict 1). The discriminator for the wire
-///    operation (CREATE vs STORNO vs MODIFY) lives in
-///    `submit_invoice::detect_operation_from_xml` (ADR-0024 §3); the
-///    presence of `<modificationIssueDate>` is what flips the body
-///    from STORNO-shape to MODIFY-shape.
+/// 1. The `<invoiceReference>` block is byte-identical to the STORNO
+///    one (S381/F1 — NAV v3.0 `InvoiceReferenceType` has exactly three
+///    children; the v2.0-only `<modificationIssueDate>` was removed).
+///    The wire operation (CREATE vs STORNO vs MODIFY) is declared on
+///    the SOAP envelope, derived from the audit ledger by
+///    `submission_queue::operation_for_invoice` (NOT sniffed from the
+///    body, which can no longer distinguish STORNO from MODIFY).
 ///
 /// 2. Line and summary amounts are **NOT negated.** The modification
 ///    is a **full-replace** body per ADR-0024 §4 — it carries the
@@ -918,10 +919,20 @@ pub fn render_modification_data_with_number(
     w.write_event(Event::Start(BytesStart::new("invoiceMain")))?;
     w.write_event(Event::Start(BytesStart::new("invoice")))?;
 
-    // <invoiceReference> — MODIFY-shape. Position: direct child of
-    // <invoice>, BEFORE <invoiceHead>, per NAV v3.0 schema (same
-    // position as the STORNO block).
-    write_modification_reference(&mut w, modification_reference)?;
+    // <invoiceReference> — Position: direct child of <invoice>, BEFORE
+    // <invoiceHead>, per NAV v3.0 schema (same position as the STORNO
+    // block). S381/F1 — the MODIFY `<invoiceReference>` is now
+    // byte-identical to the STORNO one (the v2.0-only
+    // `<modificationIssueDate>` was removed), so it reuses
+    // `write_invoice_reference` directly rather than a duplicate writer.
+    write_invoice_reference(
+        &mut w,
+        &StornoReference {
+            base_invoice_number: modification_reference.base_invoice_number.clone(),
+            modification_index: modification_reference.modification_index,
+            base_line_count: modification_reference.base_line_count,
+        },
+    )?;
 
     // <invoiceHead> reuses the standard supplier/customer/detail
     // section writers — same posture as the STORNO emitter; party +
@@ -1036,17 +1047,24 @@ pub fn render_annulment_data(annulment_reference: &AnnulmentReference) -> Result
     Ok(buf)
 }
 
-/// Negate a `LineItem` for storno emission. Quantities stay positive
-/// (S157 — `Decimal`, but the storno convention keeps quantity positive
-/// regardless); the negation lives in `unit_price`, which is `Huf(i64)`
-/// and can be negative. The
-/// cascading `net_total` / `vat_amount` / `gross_total` are all
-/// negative as a result, which matches NAV's storno convention.
+/// Negate a `LineItem` for storno emission. S381/F3 — NAV spec §2.5.1
+/// is explicit that a storno carries the original line items "with
+/// opposite signs for all **quantities**" (so the total quantities tend
+/// to be negative); the `<unitPrice>` stays positive. Pre-S381 the
+/// negation lived in `unit_price` instead — a letter-of-spec divergence
+/// that triggered no coded NAV WARN (arithmetic stays consistent within
+/// the 1%/1-unit tolerance either way) but diverged from what NAV's
+/// analysts/auditors expect to see in the warehouse. The cascading
+/// `net_total` / `vat_amount` / `gross_total` are unchanged in
+/// magnitude and still negative (`(-quantity) × unit_price` equals the
+/// old `quantity × (-unit_price)`), so line/summary totals are
+/// byte-identical; only the `<quantity>`/`<unitPrice>` sign placement
+/// moves.
 fn negate_line(line: &LineItem) -> LineItem {
     LineItem {
         description: line.description.clone(),
-        quantity: line.quantity,
-        unit_price: Huf(line.unit_price.as_i64().saturating_neg()),
+        quantity: -line.quantity,
+        unit_price: line.unit_price,
         vat_rate_basis_points: line.vat_rate_basis_points,
         // PR-82 — preserve the base's per-line `note` verbatim through
         // negation. The note is recipient-facing metadata, NOT part of
@@ -1063,8 +1081,15 @@ fn negate_line(line: &LineItem) -> LineItem {
     }
 }
 
-/// Write the STORNO `<invoiceReference>` chain-link block. PR-10
-/// always emits `modifyWithoutMaster=false`: ADR-0023 §4 names the
+/// Write the `<invoiceReference>` chain-link block for STORNO **and**
+/// MODIFY bodies. S381/F1 — NAV v3.0's `InvoiceReferenceType` has
+/// exactly three children (`originalInvoiceNumber`, `modifyWithoutMaster`,
+/// `modificationIndex`); the v2.0-only `<modificationIssueDate>` was
+/// removed, so the two chain shapes are now byte-identical here and
+/// share this one writer (the separate `write_modification_reference`
+/// was deleted).
+///
+/// Always emits `modifyWithoutMaster=false`: ADR-0023 §4 names the
 /// `queryInvoiceChainDigest` path for migrated-from-Billingo bases
 /// (the case where `modifyWithoutMaster=true` would be the right
 /// value) and explicitly defers it. When the migrated-base path
@@ -1086,51 +1111,6 @@ fn write_invoice_reference(
         w,
         "modificationIndex",
         &storno_reference.modification_index.to_string(),
-    )?;
-    w.write_event(Event::End(BytesEnd::new("invoiceReference")))?;
-    Ok(())
-}
-
-/// Write the MODIFY `<invoiceReference>` chain-link block (PR-11,
-/// ADR-0024). Same shape as [`write_invoice_reference`] PLUS the
-/// MODIFY-required `<modificationIssueDate>` element positioned
-/// between `<originalInvoiceNumber>` and `<modifyWithoutMaster>` per
-/// ADR-0024 §1 conflict 1.
-///
-/// **Not extracted into a shared helper with
-/// [`write_invoice_reference`]** despite the heavy overlap — the two
-/// blocks have different required-child sets (STORNO: three required;
-/// MODIFY: same three plus one MODIFY-only required-by-NAV but
-/// optional-from-validator's perspective). A shared helper taking an
-/// `Option<&str>` for the modification date would couple the two
-/// shapes; CLAUDE.md rule 2 (no speculative abstractions) — keep the
-/// two parallel writers honest. If a third chain-shape ever appears
-/// (it does not today — technical annulment uses a different
-/// endpoint), the trigger to extract is named in ADR-0024 §7.
-///
-/// Same `modifyWithoutMaster=false` pin as STORNO; the migrated-from-
-/// Billingo path that would set this `true` is deferred symmetrically
-/// per ADR-0024 §7 / F23.
-fn write_modification_reference(
-    w: &mut Writer<&mut Vec<u8>>,
-    modification_reference: &ModificationReference,
-) -> Result<()> {
-    w.write_event(Event::Start(BytesStart::new("invoiceReference")))?;
-    text_element(
-        w,
-        "originalInvoiceNumber",
-        &modification_reference.base_invoice_number,
-    )?;
-    text_element(
-        w,
-        "modificationIssueDate",
-        &modification_reference.modification_issue_date,
-    )?;
-    text_element(w, "modifyWithoutMaster", "false")?;
-    text_element(
-        w,
-        "modificationIndex",
-        &modification_reference.modification_index.to_string(),
     )?;
     w.write_event(Event::End(BytesEnd::new("invoiceReference")))?;
     Ok(())
@@ -1847,12 +1827,147 @@ pub fn count_invoice_lines_from_xml(path: &std::path::Path) -> Result<usize> {
     }
 }
 
-/// Write the rendered XML to a file path.
+/// S381/F2 — read the base invoice's `<invoiceDeliveryDate>` from its
+/// on-disk NAV XML so a storno can copy it rather than stamping the
+/// storno's own issue date. NAV's `UNINTENDED_CANCELLATION_DELIVERY_DATE`
+/// WARN (Annex I, ID 11401) fires whenever a cancellation moves the
+/// original invoice's delivery date to the cancelling invoice's issue
+/// date — the spec literally names this "a common error in invoicing
+/// programs". Beyond the WARN, the delivery date drives VAT-period
+/// assignment, so a divergent storno date asserts the reversal in the
+/// wrong period on the regulatory record.
+///
+/// Returns the canonical `YYYY-MM-DD` string verbatim (same on-disk
+/// canonical-record discipline as [`read_invoice_number_from_xml`] —
+/// re-deriving from the in-memory base row would drift). Matches the
+/// FIRST `<invoiceDeliveryDate>` (the base body carries exactly one).
+/// Loud-fails when the file cannot be read, the XML is malformed, or no
+/// `<invoiceDeliveryDate>` element appears (a tampered/foreign base XML).
+pub fn read_invoice_delivery_date_from_xml(path: &std::path::Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "read base NAV XML at {} to extract <invoiceDeliveryDate> for storno (S381/F2)",
+            path.display()
+        )
+    })?;
+    let xml = std::str::from_utf8(&bytes).with_context(|| {
+        format!(
+            "base NAV XML at {} is not valid UTF-8 (S381/F2)",
+            path.display()
+        )
+    })?;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    loop {
+        match reader.read_event().with_context(|| {
+            format!(
+                "parse base NAV XML at {} while seeking <invoiceDeliveryDate> (S381/F2)",
+                path.display()
+            )
+        })? {
+            quick_xml::events::Event::Start(e)
+                if e.name().local_name().as_ref() == b"invoiceDeliveryDate" =>
+            {
+                let text = reader
+                    .read_text(e.to_end().name())
+                    .with_context(|| {
+                        format!(
+                            "read text of <invoiceDeliveryDate> in base NAV XML at {} (S381/F2)",
+                            path.display()
+                        )
+                    })?
+                    .into_owned();
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    return Err(anyhow!(
+                        "base NAV XML at {} has an empty <invoiceDeliveryDate> element (S381/F2)",
+                        path.display()
+                    ));
+                }
+                return Ok(trimmed.to_string());
+            }
+            quick_xml::events::Event::Eof => {
+                return Err(anyhow!(
+                    "base NAV XML at {} has no <invoiceDeliveryDate> element \
+                     (file is tampered, empty, or not a NAV InvoiceData body) (S381/F2)",
+                    path.display()
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Write the rendered XML to a file path **atomically** (S382/F4).
+///
+/// Writes to a same-directory `.<name>.tmp.<pid>-<nanos>-<seq>`, fsyncs
+/// the bytes, then `rename`s onto the final path (a POSIX-atomic,
+/// same-filesystem operation) and fsyncs the parent directory so the
+/// rename is durable. A machine crash can no longer leave a
+/// half-written or page-cache-only NAV XML beside an already-fsync'd DB
+/// row — the file at `path` either does not exist or is the complete
+/// bytes. Pre-S381 this was a naive `File::create` + `write_all`
+/// (truncate-in-place, no fsync), so a crash mid-write recreated the
+/// split-state defect S375 closed on the DB side.
+///
+/// Mirrors the `numbering::write_atomic` / `seller_banks::write_atomic`
+/// pattern already used for `seller.toml`. Every NAV-XML emit site goes
+/// through this one helper (`issue_invoice`, `issue_storno`,
+/// `issue_modification`, `request_technical_annulment`), so the
+/// atomicity guarantee lands at all four sites at once.
 pub fn write_to_path(path: &std::path::Path, xml: &[u8]) -> Result<()> {
-    let mut file = std::fs::File::create(path)
-        .with_context(|| format!("create output XML file at {}", path.display()))?;
-    file.write_all(xml)
-        .with_context(|| format!("write XML to {}", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| anyhow!("NAV XML output path `{}` has no parent dir", path.display()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("NAV XML output path `{}` has no file name", path.display()))?
+        .to_string_lossy();
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(
+        ".{file_name}.tmp.{}-{nanos}-{seq}",
+        std::process::id()
+    ));
+
+    let write_result = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&tmp_path)
+            .with_context(|| format!("create temp XML file at {}", tmp_path.display()))?;
+        file.write_all(xml)
+            .with_context(|| format!("write XML to temp file {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("fsync temp XML file {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, path).with_context(|| {
+            format!(
+                "atomically rename {} -> {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        // Best-effort: do not litter the issued-XML dir with a stale
+        // tempfile when the write or rename failed.
+        let _ = std::fs::remove_file(&tmp_path);
+        return write_result;
+    }
+
+    // Fsync the parent directory so the rename metadata is durable
+    // across a power loss (otherwise it lives only in the dir's page
+    // cache). Best-effort — a dir that cannot be opened/fsynced does not
+    // invalidate the already-renamed, already-fsync'd file.
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
