@@ -612,8 +612,8 @@ fn read_invoice_delivery_date_from_xml_round_trips() {
     let path = scratch_dir.join(format!("{}.xml", Ulid::new()));
     std::fs::write(&path, &xml).expect("write xml");
 
-    let read_back = nav_xml::read_invoice_delivery_date_from_xml(&path)
-        .expect("read invoiceDeliveryDate back");
+    let read_back =
+        nav_xml::read_invoice_delivery_date_from_xml(&path).expect("read invoiceDeliveryDate back");
     assert_eq!(
         read_back, "2025-03-14",
         "storno must be able to copy the base's delivery date verbatim (S381/F2)"
