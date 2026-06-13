@@ -1396,7 +1396,7 @@ pub async fn retry_quote_pricing_job(
 pub async fn delete_quote_pricing_job(
     state: State<'_, AppState>,
     quote_id: String,
-) -> Result<Value, String> {
+) -> Result<(), String> {
     let path = format!("/api/quote-pricing-jobs/{quote_id}");
     forward_delete(&state, &path).await
 }

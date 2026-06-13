@@ -1314,7 +1314,7 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aberp_audit_ledger::{Actor, Ledger};
+    use aberp_audit_ledger::Ledger;
     use std::sync::Mutex;
 
     /// S391/E — `ledger_has_sent_for` is the durable duplicate-send guard's

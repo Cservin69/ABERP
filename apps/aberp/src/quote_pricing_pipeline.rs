@@ -1698,8 +1698,8 @@ impl WritebackOutcome {
         match self {
             WritebackOutcome::Success { .. } => "",
             WritebackOutcome::RoutingMisconfigured { .. } => {
-                "Az origin HTML-t adott vissza JSON helyett. Két ismert ok / Origin returned HTML \
-                 where JSON expected. Two known causes: (1) hiányzó CloudFront-útvonal — az `/api/*` \
+                "Az origin HTML-t adott vissza JSON helyett. Két ismert oka lehet / Origin returned \
+                 HTML where JSON expected. Two known causes: (1) hiányzó CloudFront-útvonal — az `/api/*` \
                  behavior nem illeszkedik erre az URL-re / CloudFront route missing — `/api/*` \
                  behavior not matching this URL path; (2) a storefront 404-et adott (pl. ajánlat nem \
                  található, rossz ABERP_SITE_QUOTE_DIR), és a CloudFront `404→/index.html` szabálya \

@@ -18,14 +18,12 @@ afterEach(() => {
 });
 
 describe("deleteQuotePricingJob shim", () => {
-  it("forwards quoteId and returns the outcome verbatim", async () => {
-    vi.mocked(invoke).mockResolvedValueOnce({ quote_id: "q-1", attempt_n: 3 });
-    const out = await deleteQuotePricingJob("q-1");
+  it("forwards quoteId to the delete command and resolves on success", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(undefined);
+    await expect(deleteQuotePricingJob("q-1")).resolves.toBeUndefined();
     expect(invoke).toHaveBeenCalledWith("delete_quote_pricing_job", {
       quoteId: "q-1",
     });
-    expect(out.quote_id).toBe("q-1");
-    expect(out.attempt_n).toBe(3);
   });
 
   it("rejects when the backend refuses a non-Failed row (409)", async () => {

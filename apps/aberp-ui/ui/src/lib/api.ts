@@ -3184,11 +3184,10 @@ export async function retryQuotePricingJob(
 /** S391/F — delete a permanently-Failed pricing job. `DELETE
  * /api/quote-pricing-jobs/:quote_id`. The backend refuses (409) any row
  * not in `Failed` state — the SPA only offers Delete on Failed rows and
- * confirms first. Returns `{ quote_id, attempt_n }` on success. */
-export async function deleteQuotePricingJob(
-  quoteId: string,
-): Promise<{ quote_id: string; attempt_n: number }> {
-  return invoke("delete_quote_pricing_job", { quoteId });
+ * confirms first. The Tauri forward layer discards the 200 body (mirrors
+ * `deleteQuotingMaterial`); the SPA refreshes the list on resolve. */
+export async function deleteQuotePricingJob(quoteId: string): Promise<void> {
+  await invoke("delete_quote_pricing_job", { quoteId });
 }
 
 /** S350 / PR-39 (U5) — success body of the operator material-grade
