@@ -2414,6 +2414,25 @@ pub enum EventKind {
     /// land in later sessions (mock-first, no firing site exists yet). F12
     /// four-edit ritual fires for this single `incident.*` kind.
     IncidentCyberDetected,
+
+    /// S394 — the operator changed the invoice-numbering template
+    /// (`[seller.numbering]` in seller.toml) via `PUT /api/seller/numbering`.
+    /// The audit-of-record for "who set the next invoice number to what,
+    /// and when". Emitted AFTER the seller.toml write succeeds; one entry
+    /// per save. Most relevant field is `start_value` — the
+    /// operator-configured counter floor that (S394) `allocate_in_tx`
+    /// honours on every allocation, not just the first-INSERT seed. So a
+    /// walker can correlate a sequence jump ("issued 41, then 56") with
+    /// the override that caused it.
+    ///
+    /// Carries `tenant_id`, `old_start_value`, `new_start_value`,
+    /// `reset_policy`, `rendered_preview` (the template rendered at
+    /// `new_start_value`, e.g. `INV-2026/00056`), `actor`, and
+    /// `changed_at`. `system.*` prefix family (config/lifecycle, alongside
+    /// `system.first_prod_launch_acknowledged`); never carries NAV XML
+    /// bytes (app-layer JSON only). F12 four-edit ritual fires for this
+    /// single kind.
+    NumberingTemplateChanged,
 }
 
 impl EventKind {
@@ -2536,6 +2555,7 @@ impl EventKind {
             EventKind::SupplierDpasPrioritySet => "supplier.dpas_priority_set",
             EventKind::SupplierExportScreened => "supplier.export_screened",
             EventKind::IncidentCyberDetected => "incident.cyber_detected",
+            EventKind::NumberingTemplateChanged => "system.numbering_template_changed",
         }
     }
 
@@ -2669,6 +2689,7 @@ impl EventKind {
             "supplier.dpas_priority_set" => Ok(EventKind::SupplierDpasPrioritySet),
             "supplier.export_screened" => Ok(EventKind::SupplierExportScreened),
             "incident.cyber_detected" => Ok(EventKind::IncidentCyberDetected),
+            "system.numbering_template_changed" => Ok(EventKind::NumberingTemplateChanged),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2790,6 +2811,7 @@ impl EventKind {
         EventKind::SupplierDpasPrioritySet,
         EventKind::SupplierExportScreened,
         EventKind::IncidentCyberDetected,
+        EventKind::NumberingTemplateChanged,
     ];
 
     /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
@@ -2919,6 +2941,7 @@ mod tests {
             EventKind::SupplierDpasPrioritySet,
             EventKind::SupplierExportScreened,
             EventKind::IncidentCyberDetected,
+            EventKind::NumberingTemplateChanged,
         ];
         for v in &variants {
             let s = v.as_str();
@@ -2952,7 +2975,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            104,
+            105,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \

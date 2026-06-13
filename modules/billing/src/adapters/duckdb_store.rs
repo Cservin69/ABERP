@@ -421,8 +421,9 @@ fn resolve_bucket(
 
 /// S392 — read the next sequence number [`allocate_in_tx`] would assign
 /// for the `(series, issue_year)` bucket WITHOUT advancing it. Returns
-/// the stored `next_number`, or `start_value.max(1)` when the bucket has
-/// no state row yet (mirrors the seed branch in `allocate_in_tx`).
+/// `max(stored_next_number, start_value)`, or `start_value.max(1)` when
+/// the bucket has no state row yet — mirroring `allocate_in_tx`, which
+/// (S394) floors every allocation by `start_value`, not just the seed.
 ///
 /// The binary's NAV pre-flight (`apps/aberp` `issue_from_parsed`) calls
 /// this to learn which candidate numbers to existence-check against NAV
@@ -444,7 +445,14 @@ pub fn peek_next_number(
     )?;
     let mut rows = stmt.query_map(params![&series_id_str, fiscal_year], |r| r.get::<_, i64>(0))?;
     match rows.next() {
-        Some(r) => Ok(r? as u64),
+        // S394 — floor the stored counter by `start_value` so the NAV
+        // pre-flight probes the number `allocate_in_tx` will actually
+        // reserve (which also maxes against `start_value`). Without this
+        // floor the probe could clear, say, 41 while the allocator jumps
+        // to the operator's `start_value` of 56 — a number NAV never
+        // checked. `start_value <= next_number` (default-1, steady state)
+        // leaves the stored value untouched, byte-identical to pre-S394.
+        Some(r) => Ok((r? as u64).max(start_value)),
         None => Ok(start_value.max(1)),
     }
 }
@@ -557,15 +565,29 @@ pub fn allocate_in_tx(
         }
     };
 
-    // S392 — honour the NAV pre-flight floor: reserve `max(next_number,
-    // floor)` so a fresh local sequence skips past any number NAV's
-    // shared TEST endpoint already holds (the binary computes `floor` via
-    // `queryInvoiceCheck`). `None` (production + the no-skip case) keeps
-    // `allocated == next_number`, byte-identical to the pre-S392 path.
-    let allocated: u64 = match args.sequence_floor {
-        Some(floor) if floor > next_number => floor,
-        _ => next_number,
-    };
+    // The number actually reserved is the largest of three floors:
+    //
+    //   * the stored `next_number` (gap-free steady-state advance),
+    //   * S394 — the operator's `start_value`, honoured on EVERY
+    //     allocation rather than only the first-INSERT seed. Raising
+    //     `[seller.numbering].start_value` above the current counter now
+    //     takes effect immediately (operator mental model: "I set 56 →
+    //     next is 56"; the SPA preview already renders the next number AT
+    //     start_value). When `start_value <= next_number` — the default-1
+    //     case and all steady-state operation — this is a no-op, so the
+    //     §169 gap-free invariant and the pre-S394 byte stream both hold.
+    //   * S392 — the NAV pre-flight floor: the first `queryInvoiceCheck`-
+    //     clear number, so a fresh local sequence skips past any number
+    //     NAV's shared TEST endpoint already holds. `None` (production +
+    //     the no-skip case) contributes 0.
+    //
+    // A jump past `next_number` (operator-raised start_value OR a NAV
+    // skip) burns the skipped range as deliberate gaps — those numbers
+    // were either issued upstream or intentionally vacated by the
+    // operator, so the gap-free invariant is knowingly relaxed here.
+    let allocated: u64 = next_number
+        .max(args.start_value)
+        .max(args.sequence_floor.unwrap_or(0));
 
     // Advance the stored counter to `allocated + 1`. Equivalent to the
     // pre-S392 `next_number + 1` when no floor jump occurred; when the

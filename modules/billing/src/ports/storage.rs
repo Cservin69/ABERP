@@ -88,16 +88,23 @@ pub struct AllocateArgs {
     /// side-stored `input.json` round-trip (the storno's allocator pulls
     /// the field straight off the deserialised `InvoiceInputJson`).
     pub email_recipient_override: Option<String>,
-    /// PR-90 / ADR-0045 §2 — first value the counter takes when the
-    /// `(series_id, fiscal_year)` bucket is first allocated. The binary
-    /// reads this from the operator's `[seller.numbering].start_value`
-    /// template (default 1); the in-process handler defaults to 1. The
-    /// allocator uses it only on the first INSERT into
-    /// `invoice_sequence_state` for the bucket — subsequent allocations
-    /// increment from the stored `next_number` (gap-free invariant per
-    /// ADR-0009 §3). For `ResetPolicy::OnYearChange` each new fiscal
-    /// year is a fresh bucket and re-applies `start_value`; for `Never`
-    /// the seed applies once and the counter runs continuous forever.
+    /// PR-90 / ADR-0045 §2 — the operator-configured counter floor. The
+    /// binary reads this from the operator's `[seller.numbering].start_value`
+    /// template (default 1); the in-process handler defaults to 1.
+    ///
+    /// S394 — applied as a FLOOR on EVERY allocation, not just the
+    /// first-INSERT seed: the allocator reserves
+    /// `max(next_number, start_value, sequence_floor)`. This makes the
+    /// operator's "next number = N" override authoritative — raising
+    /// `start_value` above the current counter jumps the sequence forward
+    /// immediately (burning the skipped range as deliberate gaps), instead
+    /// of being silently ignored once a bucket has any allocation. When
+    /// `start_value <= next_number` (the default-1 case and all
+    /// steady-state operation) it is a no-op, preserving the §169 gap-free
+    /// invariant per ADR-0009 §3 and the pre-S394 byte stream. For
+    /// `ResetPolicy::OnYearChange` each new fiscal year is a fresh bucket
+    /// that seeds at `start_value`; for `Never` the counter runs
+    /// continuous forever with `start_value` as a standing floor.
     pub start_value: u64,
     /// S392 — minimum sequence number the allocator may reserve. `None`
     /// preserves the pre-S392 behaviour (reserve the stored

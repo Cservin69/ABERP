@@ -1059,7 +1059,13 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // cdi_affected / detection_source / …), never NAV XML bytes, and never
         // raw log dumps. `incident.*`-not-`invoice.*` posture; never sweeps a
         // per-OUTGOING-invoice bundle. Exhaustiveness arm only.
-        | EventKind::IncidentCyberDetected => (None, ""),
+        | EventKind::IncidentCyberDetected
+        // S394 — operator changed the `[seller.numbering]` template. App-layer
+        // JSON payload (old/new start_value / reset_policy / rendered_preview /
+        // actor), never NAV XML bytes. `system.*`-not-`invoice.*` posture; a
+        // config-lifecycle row, never swept by a per-OUTGOING-invoice bundle.
+        // Exhaustiveness arm only.
+        | EventKind::NumberingTemplateChanged => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -1081,7 +1087,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 104,
+        EventKind::ALL_KINDS_COUNT == 105,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
