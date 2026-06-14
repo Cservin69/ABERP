@@ -64,6 +64,35 @@
 
 set -euo pipefail
 
+# ---------- pure helper: which of THIS checkout's prod binaries run? --------
+# S400 — emits "  <proc>: <pids...>\n" lines for every aberp-ui / aberp
+# process whose command line is THIS checkout's RELEASE binary; empty output
+# means none. Scoped to "$repo_root/target/release/..." on purpose: the old
+# `pgrep -x <name>` matched the process NAME only, so a dev/test build from
+# ANOTHER checkout (Ervin's ~/Documents/.../ABERP), or this checkout's own
+# target/debug, tripped the refusal even though no prod binary was running
+# (the S399 Class-A false positive). The `( |$)` anchor stops the `aberp`
+# pattern from also swallowing `aberp-ui`'s command line, so the report is
+# exact (one line per real process).
+running_prod_pids() {
+  local repo_root="$1" proc pids out=""
+  for proc in aberp-ui aberp; do
+    if pids="$(pgrep -f "${repo_root}/target/release/${proc}"'( |$)' 2>/dev/null)"; then
+      if [[ -n "$pids" ]]; then
+        out+="  ${proc}: $(echo "$pids" | tr '\n' ' ')\n"
+      fi
+    fi
+  done
+  printf '%b' "$out"
+}
+
+# Test seam: sourcing with ABERP_UPGRADE_PROD_LIB_ONLY=1 loads the pure
+# helpers above without running the upgrade flow. Used by
+# run/tests/upgrade_prod_running_check_test.sh.
+if [[ "${ABERP_UPGRADE_PROD_LIB_ONLY:-0}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 # ---------- self-syntax-check (mirrors run_prod.sh / release.sh) ------------
 if ! bash -n "$0" 2>/dev/null; then
   echo "[fail] $0 failed 'bash -n' syntax check — refusing to run" >&2
@@ -210,21 +239,16 @@ fi
 ok "tenant directory + seller.toml present"
 
 # ---------- preflight 4: refuse if the prod binary is still running --------
-# Don't try to hot-swap a running binary. `pgrep -x` matches the process
-# NAME (not its command line) — picks up `target/release/aberp-ui` and
-# `target/release/aberp` reliably without false positives from us.
-running_pids=""
-for proc in aberp-ui aberp; do
-  if pids=$(pgrep -x "$proc" 2>/dev/null); then
-    if [[ -n "$pids" ]]; then
-      running_pids+="  $proc: $(echo "$pids" | tr '\n' ' ')\n"
-    fi
-  fi
-done
+# Don't try to hot-swap a running binary. We match this checkout's RELEASE
+# binary by command line (`pgrep -f "$REPO_ROOT/target/release/<proc>"`),
+# NOT the bare process name — see running_prod_pids() above. The old
+# `pgrep -x <name>` matched any checkout's aberp-ui/aberp, so a dev/test
+# session elsewhere produced a false "prod is running" refusal (S399/S400).
+running_pids="$(running_prod_pids "$REPO_ROOT")"
 
 if [[ -n "$running_pids" ]]; then
   die "the prod app is still running:
-$(printf '%b' "$running_pids")
+$running_pids
    Stop it FIRST (Ctrl-C in the run_prod.sh terminal where it's running),
    then re-run this script. Do not try to swap a running binary.
 
