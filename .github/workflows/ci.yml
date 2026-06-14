@@ -40,7 +40,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Tauri system dependencies (Linux only)
         # apps/aberp-ui pulls in the Tauri 2 runtime (`wry`, `tao`,
@@ -77,7 +77,7 @@ jobs:
         # macro, which reads `frontendDist=ui/dist` at compile time. Without
         # a pre-built SPA bundle the macro panics and the whole workspace
         # build fails. Node + npm ci + vite build must run BEFORE cargo.
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '20'
           cache: 'npm'
@@ -95,7 +95,7 @@ jobs:
         # aberp_cad_extract` importable, `extract_smoke` /
         # `step_extract_smoke` / `error_paths` / `schema_version` all
         # fail loud with "No module named aberp_cad_extract" (S303).
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
