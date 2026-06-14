@@ -23,7 +23,7 @@ use crate::audit::{
 use crate::config::QuoteIntakeConfig;
 use crate::error::QuoteIntakeError;
 use crate::log_table;
-use crate::mapping::{quote_to_draft_invoice, QUOTE_INVOICED_STATUS};
+use crate::mapping::{quote_to_draft_invoice, QUOTE_PROCESSING_STATUS};
 use crate::payload::Quote;
 use crate::transport::QuoteIntakeTransport;
 
@@ -299,7 +299,7 @@ impl QuoteIntakeService {
         );
         match self
             .transport
-            .writeback_status(&quote.id, QUOTE_INVOICED_STATUS, &writeback_note)
+            .writeback_status(&quote.id, QUOTE_PROCESSING_STATUS, &writeback_note)
             .await
         {
             Ok(()) => {
@@ -369,7 +369,7 @@ impl QuoteIntakeService {
             let note = "ABERP writeback retry";
             match self
                 .transport
-                .writeback_status(quote_id, QUOTE_INVOICED_STATUS, note)
+                .writeback_status(quote_id, QUOTE_PROCESSING_STATUS, note)
                 .await
             {
                 Ok(()) => {

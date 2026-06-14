@@ -113,7 +113,10 @@ async fn happy_path_round_trip() {
     let writebacks: Vec<_> = reqs.iter().filter(|r| r.method == "POST").collect();
     assert!(!writebacks.is_empty());
     for w in &writebacks {
-        assert!(w.body.contains("\"status\":\"invoiced\""), "{:?}", w.body);
+        // S398 — the intake writeback advances the customer portal to
+        // `processing` ("draft staged"), NOT `invoiced`. Writing `invoiced`
+        // here was Bug #3: a not-yet-invoiced quote shown as fiscally invoiced.
+        assert!(w.body.contains("\"status\":\"processing\""), "{:?}", w.body);
         assert!(w.body.contains("inv_"), "{:?}", w.body);
     }
 }
@@ -288,7 +291,7 @@ async fn handle_request(
                 }
             }
         }
-        return canned_response(200, "application/json", r#"{"status":"invoiced"}"#);
+        return canned_response(200, "application/json", r#"{"status":"processing"}"#);
     }
     canned_response(404, "application/json", r#"{"error":"not found"}"#)
 }

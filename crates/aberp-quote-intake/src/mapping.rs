@@ -16,7 +16,20 @@ use crate::payload::Quote;
 
 const DEFAULT_VAT_BP: u16 = 2700;
 const DEFAULT_PAYMENT_DEADLINE_DAYS: i64 = 30;
-pub const QUOTE_INVOICED_STATUS: &str = "invoiced";
+/// Customer-facing storefront status written back when intake stages an
+/// internal DRAFT invoice from an accepted quote.
+///
+/// S398 (Bug #3 — fiscal misrepresentation): this used to be `"invoiced"`,
+/// which flipped the customer portal to "Számlázva / Invoiced" the instant the
+/// daemon auto-staged a *draft* — pre-DEAL, with no fiscal invoice in
+/// existence. Draft staging is automatic; it is NOT a DEAL/operator
+/// confirmation and NOT a fiscal invoice, so the truthful customer-facing state
+/// is `"processing"` ("Feldolgozás alatt / In progress"). The storefront
+/// reserves `"invoiced"` for a real invoice-issuance writeback and its status
+/// state machine only permits `approved → processing`, so a stale `"invoiced"`
+/// build pointed at a post-S398 storefront would be rejected, not silently
+/// mislabel again.
+pub const QUOTE_PROCESSING_STATUS: &str = "processing";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuggestedPartner {
