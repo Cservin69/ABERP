@@ -77,6 +77,11 @@ export type RowQuickAction = Extract<
  * `Submit` and before `Storno` so the operator-most-common flow
  * (Finalized → record payment) sits at a predictable column index.
  *
+ * S397 — `payable` third parameter threads through to `buttonsForState`
+ * so a storno / negative-total row drops the 💰 Pay quick-action (it
+ * cannot be "paid"). Callers pass `isMarkPayable(row)`; the default
+ * `true` preserves the existing per-state table for ordinary invoices.
+ *
  * The output order mirrors the brief's `📄 PDF / ↗ Submit / 💰 Pay /
  * ⊘ Storno` left-to-right placement so the operator's eye finds each
  * glyph at a consistent column index across rows. Pinned by
@@ -84,8 +89,9 @@ export type RowQuickAction = Extract<
 export function quickActionsForState(
   state: InvoiceState,
   paid: boolean = false,
+  payable: boolean = true,
 ): RowQuickAction[] {
-  const detail = buttonsForState(state, paid);
+  const detail = buttonsForState(state, paid, payable);
   const out: RowQuickAction[] = [];
   // Preserve a stable column order regardless of the detail table's
   // emission order. The detail table's per-state order is the

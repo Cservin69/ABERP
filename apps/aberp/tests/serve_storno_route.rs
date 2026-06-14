@@ -39,10 +39,11 @@ use time::OffsetDateTime;
 use ulid::Ulid;
 
 use aberp::audit_payloads::{
-    InvoiceAckStatusPayload, InvoiceDraftCreatedPayload, InvoiceSubmissionAttemptPayload,
-    InvoiceSubmissionResponsePayload,
+    InvoiceAckStatusPayload, InvoiceDraftCreatedPayload, InvoiceStornoIssuedPayload,
+    InvoiceSubmissionAttemptPayload, InvoiceSubmissionResponsePayload, PaymentMethod,
 };
-use aberp::serve::{self, AppState, SubmitRouteError};
+use aberp::serve::{self, AppState, MarkPaidRequest, MarkPaidRouteError, SubmitRouteError};
+use aberp_billing::Currency;
 
 const TEST_TENANT: &str = "serve_storno_route_test";
 
@@ -318,5 +319,85 @@ fn storno_route_returns_not_found_for_unknown_invoice() {
         }
         other => panic!("expected NotFound, got {other:?}"),
     }
+    let _keep = &dir;
+}
+
+/// S397 — write an `InvoiceStornoIssued` chain-link entry naming
+/// `storno_invoice_id` as the storno child of `base_invoice_id`. This
+/// is what flips the child's `is_storno_self` flag in `derive_state_for`,
+/// which the mark-paid gate reads to refuse the credit note.
+fn write_storno_link(
+    ledger: &mut Ledger,
+    actor: &Actor,
+    storno_invoice_id: &str,
+    base_invoice_id: &str,
+    idem: IdempotencyKey,
+) {
+    let payload = InvoiceStornoIssuedPayload::new(
+        storno_invoice_id,
+        99,
+        &Ulid::new().to_string(),
+        idem,
+        base_invoice_id,
+        13,
+        1,
+    );
+    ledger
+        .append(
+            EventKind::InvoiceStornoIssued,
+            payload.to_bytes(),
+            actor.clone(),
+            None,
+        )
+        .expect("append InvoiceStornoIssued");
+}
+
+/// S397 — mark-paid on a storno (credit note) must refuse with the
+/// structured `CannotMarkPaidStorno` verdict, NOT record a payment. A
+/// storno cancels its base and cannot itself be "paid"; the SPA hides
+/// the affordance but the route refuses regardless
+/// ([[trust-code-not-operator]]). The refusal fires BEFORE the audit
+/// append, so no `InvoicePaymentRecorded` row is written.
+///
+/// Fixture: a storno-child invoice driven to `Finalized` (its own
+/// Draft + Attempt + Response + SAVED ack) PLUS an `InvoiceStornoIssued`
+/// chain-link naming it as the storno of an (unrelated) base. The child
+/// passes the `Finalized` precondition, then the storno gate refuses.
+#[test]
+fn mark_paid_route_refuses_storno_child() {
+    let dir = test_dir("mark-paid-storno");
+    let db_path = dir.join("aberp.duckdb");
+
+    // The storno child is itself a fully-issued, NAV-accepted invoice.
+    let storno = fixture_ready_invoice();
+    let storno_id = storno.id.to_prefixed_string();
+    let base_id = "inv_01ARZ3NDEKTSV4RRFFQ69BASE0";
+    let idem = IdempotencyKey::new();
+    let actor = Actor::from_local_cli("sess".to_string(), "test-user");
+
+    {
+        let mut ledger = open_ledger(&db_path);
+        write_draft(&mut ledger, &actor, &storno, idem);
+        write_attempt(&mut ledger, &actor, &storno_id, idem);
+        write_response(&mut ledger, &actor, &storno_id, idem, "TXID-STORNO");
+        write_ack(&mut ledger, &actor, &storno_id, "TXID-STORNO", "SAVED");
+        // The chain-link that makes this child a storno.
+        write_storno_link(&mut ledger, &actor, &storno_id, base_id, idem);
+    }
+
+    let state = build_state(db_path);
+    let body = MarkPaidRequest {
+        paid_at: "2026-06-14".to_string(),
+        amount_minor: 1270,
+        currency: Currency::Huf,
+        method: PaymentMethod::BankTransfer,
+        reference: None,
+    };
+    let err = serve::mark_paid_request(&state, &storno_id, body)
+        .expect_err("mark-paid on a storno must refuse");
+    assert!(
+        matches!(err, MarkPaidRouteError::CannotMarkPaidStorno),
+        "expected CannotMarkPaidStorno, got {err:?}"
+    );
     let _keep = &dir;
 }

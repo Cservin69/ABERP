@@ -31,7 +31,7 @@ import {
   type RowQuickAction,
   type SortKey,
 } from "./invoice-list";
-import { buttonsForState } from "./invoice-actions";
+import { buttonsForState, isMarkPayable } from "./invoice-actions";
 import type { Currency, InvoiceState } from "./api";
 
 // ── buyerColumnDisplay ──────────────────────────────────────────
@@ -267,6 +267,49 @@ describe("quickActionsForState", () => {
       expect(quickActionsForState(state, false).includes("Pay")).toBe(false);
       expect(quickActionsForState(state, true).includes("Pay")).toBe(false);
     }
+  });
+
+  // ── S397 — storno / negative-total Pay-icon suppression ───────────
+
+  it("Pay quick-action is hidden on a Finalized storno row, kept on its base", () => {
+    // Customer-journey shape: an invoice is issued (the base) and then
+    // stornoed (the credit-note child). Both rows reach `Finalized`,
+    // but only the storno child carries `is_storno: true`. The list
+    // must drop the 💰 Pay icon on the storno row (it cannot be paid)
+    // while the ordinary base row keeps it. This mirrors the row
+    // renderer's `quickActionsForState(row.state, paid, isMarkPayable(row))`
+    // call so a regression that re-surfaced Pay on a storno fails here
+    // rather than at operator-survey time.
+    const stornoRow = { is_storno: true, total_gross: 127_000 };
+    const baseRow = { is_storno: false, total_gross: 254_000 };
+
+    const stornoActions = quickActionsForState(
+      "Finalized",
+      false,
+      isMarkPayable(stornoRow),
+    );
+    expect(stornoActions.includes("Pay")).toBe(false);
+    expect(stornoActions).toEqual(["Download", "Storno"]);
+
+    const baseActions = quickActionsForState(
+      "Finalized",
+      false,
+      isMarkPayable(baseRow),
+    );
+    expect(baseActions.includes("Pay")).toBe(true);
+  });
+
+  it("Pay quick-action is hidden on a negative-total Finalized row", () => {
+    // Defence-in-depth counterpart: a negative stored total (signed
+    // credit balance) also drops Pay even when `is_storno` is false.
+    const negativeRow = { is_storno: false, total_gross: -50_000 };
+    expect(
+      quickActionsForState(
+        "Finalized",
+        false,
+        isMarkPayable(negativeRow),
+      ).includes("Pay"),
+    ).toBe(false);
   });
 });
 

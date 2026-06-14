@@ -198,6 +198,7 @@
     detailActionMeta,
     emailButtonState,
     groupButtons,
+    isMarkPayable,
     navSubmitButtonState,
     type DetailActionButton,
   } from "../lib/invoice-actions";
@@ -1170,7 +1171,7 @@
          sourced from `detailActionMeta` so the affordance is identical
          to the row-level quick-action surface. -->
     {#if detail}
-      {@const buttons = buttonsForState(detail.state, detail.payment !== null)}
+      {@const buttons = buttonsForState(detail.state, detail.payment !== null, isMarkPayable(detail))}
       {@const groups = groupButtons(buttons)}
       <!-- Session 162 — audit-driven button states. The post-issue daemon
            (S158 + S161) fires auto-submit + auto-email in the background;

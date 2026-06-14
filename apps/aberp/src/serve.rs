@@ -7937,6 +7937,18 @@ struct AlreadyPaidBody {
     payment: PaymentRecordSummary,
 }
 
+/// S397 — structured `400` refusal body for the two mark-paid
+/// non-payable classes (storno / negative total). Mirrors the
+/// `error`-code-plus-`message` shape of [`AlreadyPaidBody`] so the SPA
+/// can branch on the stable `error` discriminator
+/// (`cannot_mark_paid_storno` / `cannot_mark_paid_negative`) rather
+/// than parsing free text.
+#[derive(Serialize)]
+struct MarkPaidRefusalBody {
+    error: &'static str,
+    message: String,
+}
+
 /// PR-70 / ADR-0039 — `POST /api/invoices/:id/mark-paid` handler.
 ///
 /// 1. Bearer-auth check (post-Ready); 503 in NeedsSetup.
@@ -8035,6 +8047,28 @@ async fn handle_mark_invoice_paid(
         Err(MarkPaidRouteError::InvalidPaidAt(message)) => {
             (StatusCode::BAD_REQUEST, Json(error_body(message))).into_response()
         }
+        Err(MarkPaidRouteError::CannotMarkPaidStorno) => (
+            StatusCode::BAD_REQUEST,
+            Json(MarkPaidRefusalBody {
+                error: "cannot_mark_paid_storno",
+                message: format!(
+                    "invoice {invoice_id} is a storno (credit note); a storno cancels its \
+                     base invoice and cannot itself be marked paid"
+                ),
+            }),
+        )
+            .into_response(),
+        Err(MarkPaidRouteError::CannotMarkPaidNegative { total_gross }) => (
+            StatusCode::BAD_REQUEST,
+            Json(MarkPaidRefusalBody {
+                error: "cannot_mark_paid_negative",
+                message: format!(
+                    "invoice {invoice_id} has a negative total ({total_gross}); a credit \
+                     balance has inverted payment semantics and cannot be marked paid"
+                ),
+            }),
+        )
+            .into_response(),
         Err(MarkPaidRouteError::Other(e)) => internal_error("mark_paid_request", e),
     }
 }
@@ -8315,6 +8349,17 @@ pub enum MarkPaidRouteError {
         body_currency: String,
     },
     InvalidPaidAt(String),
+    /// S397 — the invoice IS a storno (credit note); it cancels its
+    /// base and cannot itself be marked paid. Maps to a structured
+    /// `400 cannot_mark_paid_storno`.
+    CannotMarkPaidStorno,
+    /// S397 — the invoice has a negative stored total; a credit
+    /// balance has inverted payment semantics. Maps to a structured
+    /// `400 cannot_mark_paid_negative`. Carries the offending total so
+    /// the refusal names the value per CLAUDE.md rule 12.
+    CannotMarkPaidNegative {
+        total_gross: i64,
+    },
     Other(anyhow::Error),
 }
 
@@ -8351,6 +8396,36 @@ impl From<SubmitRouteError> for MarkPaidRouteError {
                  fault_message={fault_message:?}) — this surface does not call NAV"
             )),
         }
+    }
+}
+
+/// S397 — operational mark-paid eligibility verdict. A storno (credit
+/// note that nets its base to zero) and any negative-total invoice
+/// cannot be "paid"; the route refuses both classes BEFORE the audit
+/// append so no phantom payment row is written on refusal. Pure so the
+/// decision is unit-testable independent of a live ledger + billing
+/// fixture (CLAUDE.md rule 9).
+#[derive(Debug, PartialEq, Eq)]
+enum MarkPaidEligibility {
+    Eligible,
+    Storno,
+    Negative(i64),
+}
+
+/// S397 — decide mark-paid eligibility from the two refusal signals.
+/// `is_storno_self` comes from the audit-ledger chain walk
+/// (`DerivedStateForInvoice`); `total_gross` is the billing row's
+/// stored gross (always POSITIVE in practice — the `Negative` arm is
+/// defence-in-depth against signed-storage drift / a hand-edited DB).
+/// Storno is checked first so a storno credit note refuses with the
+/// more specific verdict even if its stored total were also negative.
+fn mark_paid_eligibility(is_storno_self: bool, total_gross: Option<i64>) -> MarkPaidEligibility {
+    if is_storno_self {
+        return MarkPaidEligibility::Storno;
+    }
+    match total_gross {
+        Some(g) if g < 0 => MarkPaidEligibility::Negative(g),
+        _ => MarkPaidEligibility::Eligible,
     }
 }
 
@@ -8402,6 +8477,37 @@ pub fn mark_paid_request(
                  payment can be recorded"
             ),
         });
+    }
+
+    // 2b. S397 — refuse mark-paid on a storno (credit note that nets
+    //    its base to zero) OR a negative-total invoice. The SPA already
+    //    hides the affordance (`isMarkPayable`), but the route refuses
+    //    regardless ([[trust-code-not-operator]] / [[hulye-biztos]]) so
+    //    a curl bypass cannot record a phantom payment against a
+    //    reversal. This runs BEFORE the audit append below, so a refusal
+    //    writes no InvoicePaymentRecorded row.
+    //
+    //    The storno verdict is purely ledger-derived (`is_storno_self`),
+    //    so skip the billing read entirely for a storno — its refusal
+    //    must not hinge on a billing-store round-trip. For a non-storno
+    //    we read the billing row's stored gross (positive in practice;
+    //    the negative arm is defence-in-depth against signed-storage
+    //    drift) and let the pure verdict decide.
+    let total_gross = if derived.is_storno_self {
+        None
+    } else {
+        read_invoice_total_gross_minor(&state.db_path, invoice_id).map_err(|e| {
+            MarkPaidRouteError::Other(anyhow!(
+                "read invoice total_gross for mark-paid eligibility gate: {e}"
+            ))
+        })?
+    };
+    match mark_paid_eligibility(derived.is_storno_self, total_gross) {
+        MarkPaidEligibility::Eligible => {}
+        MarkPaidEligibility::Storno => return Err(MarkPaidRouteError::CannotMarkPaidStorno),
+        MarkPaidEligibility::Negative(g) => {
+            return Err(MarkPaidRouteError::CannotMarkPaidNegative { total_gross: g })
+        }
     }
 
     // 3. Currency-match check — defence-in-depth against a curl
@@ -8477,6 +8583,31 @@ fn read_invoice_currency(db_path: &Path, invoice_id: &str) -> Result<Currency> {
     tx.commit()
         .context("commit read transaction for invoice-currency lookup")?;
     Ok(metadata.currency)
+}
+
+/// S397 — read the invoice's stored gross total (minor units: whole
+/// forints for HUF, EUR cents for EUR) from the billing store. Same
+/// scoped-read-tx posture as [`read_invoice_currency`]. `None` when
+/// the id has no allocated billing row yet (a draft) — the mark-paid
+/// gate treats `None` as non-negative (the Finalized precondition has
+/// already excluded drafts by the time this runs). Reuses
+/// `billing::load_ready_invoice_by_id` so the gross read shares the
+/// list/detail read path's source of truth (CLAUDE.md rule 8).
+fn read_invoice_total_gross_minor(db_path: &Path, invoice_id: &str) -> Result<Option<i64>> {
+    let mut conn = Connection::open(db_path).with_context(|| {
+        format!(
+            "open tenant DuckDB at {} for total_gross lookup",
+            db_path.display()
+        )
+    })?;
+    let tx = conn
+        .transaction()
+        .context("begin read transaction for invoice total_gross lookup")?;
+    let pair = billing::load_ready_invoice_by_id(&tx, invoice_id)
+        .with_context(|| format!("load_ready_invoice_by_id for invoice {invoice_id}"))?;
+    tx.commit()
+        .context("commit read transaction for invoice total_gross lookup")?;
+    Ok(pair.and_then(|p| p.0.total_gross()).map(|h| h.as_i64()))
 }
 
 // ── PR-48α / session-68 — partner CRUD ───────────────────────────────
@@ -16347,6 +16478,12 @@ fn poll_terminal_diagnostic(t: &poll_ack::PollAckTerminal) -> Option<String> {
 struct DerivedStateForInvoice {
     state: InvoiceState,
     nav_xml_path: Option<std::path::PathBuf>,
+    /// S397 — `true` iff this invoice IS a storno chain-CHILD (a credit
+    /// note), i.e. some `InvoiceStornoIssued` entry names it as its
+    /// `storno_invoice_id`. Mirrors `InvoiceTrace::is_storno_self`.
+    /// Consumed by the mark-paid refusal gate: a storno nets its base
+    /// to zero and cannot itself be "paid".
+    is_storno_self: bool,
     /// S378 / F44 — NAV `transactionId` from the most-recent
     /// `InvoiceSubmissionResponse` for this invoice, when one exists.
     /// Surfaced to the operator on the dedupe-gate 409 so a refused
@@ -16428,6 +16565,14 @@ fn derive_state_for(
                     _ => {}
                 }
             }
+            // S397 — flag the storno CHILD's own row (mirrors the
+            // `list_invoices` walk at `is_storno_self`) so the mark-paid
+            // gate can refuse a storno credit note. A modification child
+            // is NOT flagged: a módosító számla carries a positive,
+            // payable replacement total.
+            if link.kind == EventKind::InvoiceStornoIssued && link.child_invoice_id == invoice_id {
+                trace.is_storno_self = true;
+            }
         }
     }
 
@@ -16437,6 +16582,7 @@ fn derive_state_for(
         )));
     }
     Ok(DerivedStateForInvoice {
+        is_storno_self: trace.is_storno_self,
         state: trace.derive_state(),
         nav_xml_path,
         transaction_id,
@@ -25069,5 +25215,64 @@ mod tests {
         let (page, total) = paginate_quote_audit_entries(&entries, "qZ", 50, 0);
         assert_eq!(total, 0);
         assert!(page.is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // S397 — mark-paid eligibility gate (storno / negative-total)
+    // ──────────────────────────────────────────────────────────────
+
+    /// An ordinary positive Finalized invoice is eligible — the
+    /// mark-paid affordance is offered. The default positive case so a
+    /// regression that broadened the refusal (and hid Pay on every
+    /// invoice) fails here per CLAUDE.md rule 9.
+    #[test]
+    fn mark_paid_eligibility_positive_invoice_is_eligible() {
+        assert_eq!(
+            mark_paid_eligibility(false, Some(254_000)),
+            MarkPaidEligibility::Eligible,
+        );
+        // A draft (no billing row yet → None gross) is not negative; the
+        // Finalized precondition gates drafts out before this runs, but
+        // the helper must not classify `None` as a refusal.
+        assert_eq!(
+            mark_paid_eligibility(false, None),
+            MarkPaidEligibility::Eligible,
+        );
+        // Zero total is non-negative → eligible (boundary).
+        assert_eq!(
+            mark_paid_eligibility(false, Some(0)),
+            MarkPaidEligibility::Eligible,
+        );
+    }
+
+    /// A storno chain-child refuses with the specific `Storno` verdict —
+    /// it nets its base to zero and cannot be "paid". Storno wins even
+    /// when the stored total were also negative (most-specific verdict).
+    #[test]
+    fn mark_paid_eligibility_storno_refuses() {
+        assert_eq!(
+            mark_paid_eligibility(true, Some(127_000)),
+            MarkPaidEligibility::Storno,
+        );
+        assert_eq!(
+            mark_paid_eligibility(true, Some(-127_000)),
+            MarkPaidEligibility::Storno,
+        );
+    }
+
+    /// A negative stored total refuses with the `Negative` verdict
+    /// carrying the offending value. Defence-in-depth: the wire stores
+    /// gross positive today, so this arm guards against signed-storage
+    /// drift / a hand-edited DB.
+    #[test]
+    fn mark_paid_eligibility_negative_total_refuses() {
+        assert_eq!(
+            mark_paid_eligibility(false, Some(-1)),
+            MarkPaidEligibility::Negative(-1),
+        );
+        assert_eq!(
+            mark_paid_eligibility(false, Some(-50_000)),
+            MarkPaidEligibility::Negative(-50_000),
+        );
     }
 }

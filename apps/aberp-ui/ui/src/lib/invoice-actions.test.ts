@@ -32,6 +32,7 @@ import {
   detailActionMeta,
   emailButtonState,
   groupButtons,
+  isMarkPayable,
   navSubmitButtonState,
   type ActionGroup,
   type DetailActionButton,
@@ -257,6 +258,39 @@ describe("buttonsForState", () => {
       "Email",
       "Download",
     ]);
+  });
+
+  // ── S397 — storno / negative-total Pay suppression ────────────────
+
+  it("Pay button is hidden on a Finalized storno credit note", () => {
+    // A storno cannot be "paid" — it nets its base to zero. The
+    // payable=false gate drops Pay while leaving the chain/export
+    // affordances unchanged (surgical; Storno/Modification stay).
+    expect(buttonsForState("Finalized", false, false)).toEqual([
+      "Storno",
+      "Modification",
+      "Email",
+      "Download",
+    ]);
+  });
+
+  it("isMarkPayable refuses storno and negative-total invoices", () => {
+    // Storno child → not payable regardless of the (wire-positive)
+    // total.
+    expect(isMarkPayable({ is_storno: true, total_gross: 127_000 })).toBe(
+      false,
+    );
+    // Defence-in-depth: a negative stored total → not payable.
+    expect(isMarkPayable({ is_storno: false, total_gross: -1 })).toBe(false);
+    // Ordinary positive invoice → payable.
+    expect(isMarkPayable({ is_storno: false, total_gross: 254_000 })).toBe(
+      true,
+    );
+    // Null total (draft / no billing row) is not negative → payable;
+    // the Finalized precondition gates drafts out elsewhere.
+    expect(isMarkPayable({ is_storno: false, total_gross: null })).toBe(true);
+    // Zero is non-negative → payable (boundary).
+    expect(isMarkPayable({ is_storno: false, total_gross: 0 })).toBe(true);
   });
 
   // ── PR-92 / ADR-0047 — Email button pins ──────────────────────────

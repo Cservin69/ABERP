@@ -81,6 +81,7 @@ export type DetailActionButton =
 export function buttonsForState(
   state: InvoiceState,
   paid: boolean = false,
+  payable: boolean = true,
 ): DetailActionButton[] {
   switch (state) {
     case "Ready":
@@ -138,7 +139,17 @@ export function buttonsForState(
       // PR-92 / ADR-0047 — Email is always available on a Finalized
       // invoice (the printed PDF + the NAV-accepted state mean the
       // operator may resend on demand).
-      if (paid) {
+      // S397 — the "Pay" affordance is also suppressed for
+      // non-payable invoices: a storno (credit note that nets its
+      // base to zero) and any negative-total invoice have inverted
+      // or zero payment semantics, so "mark as paid" is meaningless.
+      // The `payable` gate is computed by `isMarkPayable` from the
+      // invoice's `is_storno` / `total_gross`; the backend route
+      // refuses these regardless (defence-in-depth per the brief),
+      // so hiding the button keeps the UI from offering an action the
+      // API would 400. Storno / Modification stay available on a
+      // Finalized storno-child unchanged (out of scope; surgical).
+      if (paid || !payable) {
         return ["Storno", "Modification", "Email", "Download"];
       }
       return ["Pay", "Storno", "Modification", "Email", "Download"];
@@ -173,6 +184,31 @@ export function buttonsForState(
       // [[hulye-biztos]].
       return ["Delete"];
   }
+}
+
+/** S397 — operational mark-paid eligibility for an invoice row /
+ * detail. A storno (credit note that nets its base to zero) cannot
+ * itself be "paid"; a negative-total invoice has inverted payment
+ * semantics (money flows the other way). Either case makes the
+ * "Mark as paid" affordance semantically wrong, so the SPA suppresses
+ * the Pay button (detail) + 💰 quick-action (list) by threading the
+ * result into `buttonsForState` / `quickActionsForState`'s `payable`
+ * gate. The backend `mark_paid_request` route refuses both classes
+ * with a structured 400 regardless (defence per the brief); this
+ * helper keeps the UI from offering an action the API would reject.
+ *
+ * Note: in this codebase `total_gross` is stored POSITIVE on the wire
+ * even for stornos (negation lives only in the NAV-XML / PDF / screen
+ * formatter), so `is_storno` is the reachable signal today and the
+ * `total_gross < 0` arm is defence-in-depth against any future
+ * signed-storage drift. Pinned by `invoice-actions.test.ts`. */
+export function isMarkPayable(invoice: {
+  is_storno: boolean;
+  total_gross: number | null;
+}): boolean {
+  if (invoice.is_storno) return false;
+  if (invoice.total_gross !== null && invoice.total_gross < 0) return false;
+  return true;
 }
 
 /** PR-80 / session-102 — visual grouping of action bar buttons. Drives

@@ -68,6 +68,9 @@
     type SortDir,
     type SortKey,
   } from "../lib/invoice-list";
+  // S397 — mark-paid eligibility gate (storno / negative-total rows
+  // drop the 💰 Pay quick-action). Shared with InvoiceDetail.
+  import { isMarkPayable } from "../lib/invoice-actions";
   // PR-175 / session-175 — persist sort + filter selection to
   // localStorage so the operator's view survives a reload / app
   // restart. Pure helpers in invoice-list-persistence.ts; this file
@@ -1194,7 +1197,7 @@
         {@const meta = labelMeta(row.state)}
         {@const partnerLabel = buyerColumnDisplay(row.buyer_name)}
         {@const isPartnerMissing = row.buyer_name === null || row.buyer_name.trim().length === 0}
-        {@const actions = quickActionsForState(row.state, row.payment !== null)}
+        {@const actions = quickActionsForState(row.state, row.payment !== null, isMarkPayable(row))}
         {@const isKeyboardFocused = rowIndex === focusedRowIndex}
         {@const pictogram = navStatusPictogram(row.state, row.payment !== null)}
         {@const pictogramBusy = busyPictogramRow === row.invoice_id}
