@@ -336,6 +336,9 @@ impl PricingPipelineService {
         let quantity = quote.request.quantity.unwrap_or(1).max(1) as u32;
         let customer_email = quote.contact.email.clone();
         let customer_name = quote.contact.name.clone();
+        // S401 — carry the buyer's company through to the pricing-jobs row
+        // so the operator panel can show who they're quoting at a glance.
+        let customer_company = quote.contact.company.trim().to_string();
 
         let db_path = self.deps.db_path.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
@@ -356,6 +359,7 @@ impl PricingPipelineService {
                 &tenant_id,
                 &customer_email,
                 &customer_name,
+                &customer_company,
                 &material_grade,
                 quantity,
                 &filename,
@@ -434,6 +438,9 @@ impl PricingPipelineService {
         let quantity = quote.request.quantity.unwrap_or(1).max(1) as u32;
         let customer_email = quote.contact.email.clone();
         let customer_name = quote.contact.name.clone();
+        // S401 — carry company onto the Failed row too, so the operator
+        // panel identifies the buyer even when the listing had no CAD.
+        let customer_company = quote.contact.company.trim().to_string();
 
         let db_path = self.deps.db_path.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
@@ -455,6 +462,7 @@ impl PricingPipelineService {
                 &tenant_id,
                 &customer_email,
                 &customer_name,
+                &customer_company,
                 &material_grade,
                 quantity,
                 stage,
@@ -846,6 +854,9 @@ impl PricingPipelineService {
         let quote_id = row.quote_id.clone();
         let customer_email = row.customer_email.clone();
         let customer_name = row.customer_name.clone();
+        // S401 — the row now carries the buyer's company; feed it into the
+        // quote PDF (was hard-coded "" before this column existed).
+        let customer_company = row.customer_company.clone().unwrap_or_default();
         let qty = row.quantity.max(1);
         let target_tol = self.config.default_tolerance;
 
@@ -874,7 +885,7 @@ impl PricingPipelineService {
                 quote_id: &quote_id,
                 customer_email: &customer_email,
                 customer_name: &customer_name,
-                customer_company: "",
+                customer_company: &customer_company,
                 quantity: qty,
                 notes: "",
                 valid_until_iso: &valid_until,
@@ -2456,6 +2467,12 @@ struct StorefrontQuote {
 struct StorefrontContact {
     name: String,
     email: String,
+    /// S401 — buyer's company. `#[serde(default)]` keeps the daemon
+    /// fail-soft if a storefront build ever omits the field (it
+    /// deserializes to "" rather than failing the whole listing parse);
+    /// the operator panel then shows the company placeholder.
+    #[serde(default)]
+    company: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3770,6 +3787,7 @@ mod tests {
             tenant,
             "ervin@aben.ch",
             "ervin csenger",
+            "Áben Consulting Kft.",
             "unknown",
             1,
             "submission.step",
@@ -4563,6 +4581,35 @@ mod tests {
         assert_eq!(list.quotes.len(), 1);
     }
 
+    /// S401 — the storefront listing carries `contact.company`; the
+    /// daemon's `StorefrontContact` must deserialize it (it was dropped
+    /// before S401). Fails if the `company` field is removed from the
+    /// struct.
+    #[test]
+    fn s401_storefront_contact_deserializes_company() {
+        let r = classify_poll_response(
+            200,
+            Some("application/json"),
+            r#"{"quotes":[{"id":"q1","contact":{"email":"a@b.c","name":"A","company":"Acme Manufacturing Kft."},"request":{"material_preference":"6061-T6","quantity":2},"files":[]}]}"#,
+        );
+        let list = r.expect("valid envelope must parse");
+        assert_eq!(list.quotes[0].contact.company, "Acme Manufacturing Kft.");
+    }
+
+    /// S401 — a listing whose contact omits `company` (older storefront
+    /// build) deserializes to "" via `#[serde(default)]` rather than
+    /// failing the whole parse — the daemon stays fail-soft.
+    #[test]
+    fn s401_storefront_contact_missing_company_defaults_empty() {
+        let r = classify_poll_response(
+            200,
+            Some("application/json"),
+            r#"{"quotes":[{"id":"q1","contact":{"email":"a@b.c","name":"A"},"request":{"material_preference":"6061-T6","quantity":2},"files":[]}]}"#,
+        );
+        let list = r.expect("valid envelope must parse");
+        assert_eq!(list.quotes[0].contact.company, "");
+    }
+
     fn s348_poll_service(
         addr: &std::net::SocketAddr,
         db_path: std::path::PathBuf,
@@ -4730,6 +4777,7 @@ mod tests {
             contact: StorefrontContact {
                 name: "Phantom Customer".to_string(),
                 email: "phantom@example.com".to_string(),
+                company: "Phantom Holdings Kft.".to_string(),
             },
             request: StorefrontRequest {
                 material_preference: "6061-T6".to_string(),

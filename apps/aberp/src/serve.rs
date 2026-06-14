@@ -17307,6 +17307,9 @@ struct PricingJobView {
     updated_at: String,
     customer_email: String,
     customer_name: String,
+    /// S401 — buyer's company. `None` on legacy rows that pre-date the
+    /// column; the operator SPA renders a placeholder in that case.
+    customer_company: Option<String>,
     material_grade: String,
     quantity: u32,
     feature_graph_hash: Option<String>,
@@ -17357,6 +17360,7 @@ async fn handle_list_quote_pricing_jobs(
                 updated_at: r.updated_at,
                 customer_email: r.customer_email,
                 customer_name: r.customer_name,
+                customer_company: r.customer_company,
                 material_grade: r.material_grade,
                 quantity: r.quantity,
                 feature_graph_hash: r.feature_graph_hash,
@@ -17444,6 +17448,8 @@ struct PricingJobDetailView {
     updated_at: String,
     customer_email: String,
     customer_name: String,
+    /// S401 — buyer's company; `None` on legacy rows (SPA placeholder).
+    customer_company: Option<String>,
     material_grade: String,
     quantity: u32,
     feature_graph_hash: Option<String>,
@@ -17541,6 +17547,7 @@ async fn handle_get_quote_pricing_job_detail(
         updated_at: d.row.updated_at,
         customer_email: d.row.customer_email,
         customer_name: d.row.customer_name,
+        customer_company: d.row.customer_company,
         material_grade: d.row.material_grade,
         quantity: d.row.quantity,
         feature_graph_hash: d.row.feature_graph_hash,

@@ -20,6 +20,7 @@
   } from "../lib/api";
   import { formatInvoiceDate } from "../lib/format";
   import { classifyEmptyState } from "../lib/pricing-empty-state";
+  import { customerCell } from "../lib/pricing-customer-cell";
   import { failureKindBadge } from "../lib/pricing-failure-kind";
   import PricingJobDetail from "./PricingJobDetail.svelte";
 
@@ -278,6 +279,13 @@
       </thead>
       <tbody>
         {#each rows as row (row.quote_id)}
+          <!-- S401 — resolve the Customer-cell shape once per row;
+               {@const} must be a direct child of the {#each} block. -->
+          {@const cust = customerCell(
+            row.customer_company,
+            row.customer_name,
+            row.customer_email,
+          )}
           <tr
             data-testid={`pricing-jobs-row-${row.quote_id}`}
             class="pricing-jobs__row"
@@ -299,8 +307,15 @@
               {/if}
             </td>
             <td>
-              <div>{row.customer_name}</div>
-              <div class="pricing-jobs__muted">{row.customer_email}</div>
+              <!-- S401 — company is the operator's primary anchor (who
+                   they're quoting); person + email sit below it muted. -->
+              <div
+                class="pricing-jobs__company"
+                class:pricing-jobs__company--missing={cust.companyMissing}
+                data-testid={`pricing-jobs-company-${row.quote_id}`}
+              >{cust.company}</div>
+              <div class="pricing-jobs__muted">{cust.person}</div>
+              <div class="pricing-jobs__muted">{cust.email}</div>
             </td>
             <td>{row.material_grade}</td>
             <td>{row.quantity}</td>
@@ -507,6 +522,20 @@
   .pricing-jobs__muted {
     color: var(--color-text-muted, #9ca3af);
     font-size: 12px;
+  }
+  /* S401 — buyer's company is the operator's primary anchor: larger,
+     full-weight, full-contrast vs. the muted person/email lines below. */
+  .pricing-jobs__company {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--color-text, #e5e7eb);
+  }
+  /* Legacy / blank-company rows render the placeholder muted + italic so
+     the cell reads as "no company captured", not a bold real name. */
+  .pricing-jobs__company--missing {
+    font-weight: 400;
+    font-style: italic;
+    color: var(--color-text-muted, #9ca3af);
   }
   .pricing-jobs__err-stage {
     font-weight: 600;

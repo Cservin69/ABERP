@@ -51,6 +51,7 @@ fn seed_fetched_row(db_path: &PathBuf, tenant: &str, quote_id: &str) {
         tenant,
         "cust@example.com",
         "Customer Kft.",
+        "Acme Manufacturing Kft.",
         "6061-T6",
         4,
         "bracket.step",

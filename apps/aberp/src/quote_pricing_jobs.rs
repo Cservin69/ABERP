@@ -200,6 +200,11 @@ pub struct PricingJobRow {
     pub updated_at: String,
     pub customer_email: String,
     pub customer_name: String,
+    /// S401 — buyer's company, carried from the storefront quote's
+    /// `contact.company`. `None` on legacy PROD_v2.27.[0-55] rows that
+    /// pre-date this column (rendered as a placeholder by the operator
+    /// SPA); `Some("")` when the buyer left the company field blank.
+    pub customer_company: Option<String>,
     pub material_grade: String,
     pub quantity: u32,
     /// `Some(_)` once Extracting succeeded; carries the blake3 hash
@@ -230,6 +235,7 @@ CREATE TABLE IF NOT EXISTS quote_pricing_jobs (
     updated_at            VARCHAR NOT NULL,
     customer_email        VARCHAR NOT NULL,
     customer_name         VARCHAR NOT NULL,
+    customer_company      VARCHAR,
     material_grade        VARCHAR NOT NULL,
     quantity              INTEGER NOT NULL,
     cad_filename          VARCHAR NOT NULL,
@@ -266,6 +272,12 @@ DROP INDEX IF EXISTS quote_pricing_jobs_tenant_state_idx;
 -- behavior until they're operator-Retry'd (which writes a fresh row at
 -- Fetched + clears the column).
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS failure_kind VARCHAR;
+-- S401 — additive migration for installs carrying the pre-S401 schema
+-- (PROD_v2.27.[0-55]). New nullable column, no DEFAULT per
+-- [[no-sql-specific]]; existing rows read back NULL (the operator SPA
+-- renders a placeholder) until they're re-fetched/retried, which writes
+-- the buyer's company from the storefront listing.
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS customer_company VARCHAR;
 ";
 
 /// Idempotent — call at every writer entry.
@@ -341,6 +353,7 @@ pub fn insert_fetched_job(
     tenant_id: &str,
     customer_email: &str,
     customer_name: &str,
+    customer_company: &str,
     material_grade: &str,
     quantity: u32,
     cad_filename: &str,
@@ -355,9 +368,9 @@ pub fn insert_fetched_job(
         .execute(
             "INSERT INTO quote_pricing_jobs (
                 quote_id, tenant_id, state, fetched_at, updated_at,
-                customer_email, customer_name, material_grade, quantity,
+                customer_email, customer_name, customer_company, material_grade, quantity,
                 cad_filename, cad_local_path, attempt_n
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             ON CONFLICT (quote_id) DO NOTHING",
             params![
                 quote_id,
@@ -367,6 +380,7 @@ pub fn insert_fetched_job(
                 ts,
                 customer_email,
                 customer_name,
+                customer_company,
                 material_grade,
                 quantity as i64,
                 cad_filename,
@@ -397,6 +411,7 @@ pub fn insert_failed_enqueue_job(
     tenant_id: &str,
     customer_email: &str,
     customer_name: &str,
+    customer_company: &str,
     material_grade: &str,
     quantity: u32,
     stage: &str,
@@ -413,10 +428,10 @@ pub fn insert_failed_enqueue_job(
         .execute(
             "INSERT INTO quote_pricing_jobs (
                 quote_id, tenant_id, state, fetched_at, updated_at,
-                customer_email, customer_name, material_grade, quantity,
+                customer_email, customer_name, customer_company, material_grade, quantity,
                 cad_filename, cad_local_path, attempt_n,
                 error_stage, error_reason, failure_kind
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '(missing)', '(missing)', 0, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '(missing)', '(missing)', 0, ?, ?, ?)
             ON CONFLICT (quote_id) DO NOTHING",
             params![
                 quote_id,
@@ -426,6 +441,7 @@ pub fn insert_failed_enqueue_job(
                 ts,
                 customer_email,
                 customer_name,
+                customer_company,
                 material_grade,
                 quantity as i64,
                 stage,
@@ -975,10 +991,13 @@ pub fn list_jobs(conn: &Connection, tenant_id: &str) -> Result<Vec<PricingJobRow
     ensure_schema(conn)?;
     let mut stmt = conn
         .prepare(
+            // S401 — customer_company appended LAST (ordinal 15) so every
+            // existing column ordinal stays put; the read below picks it up
+            // at .get(15).
             "SELECT quote_id, tenant_id, state, fetched_at, updated_at,
                     customer_email, customer_name, material_grade, quantity,
                     feature_graph_hash, total_price_eur, error_stage, error_reason,
-                    attempt_n, failure_kind
+                    attempt_n, failure_kind, customer_company
                 FROM quote_pricing_jobs
                 WHERE tenant_id = ?
                 ORDER BY fetched_at DESC",
@@ -1005,6 +1024,7 @@ pub fn list_jobs(conn: &Connection, tenant_id: &str) -> Result<Vec<PricingJobRow
             updated_at: r.get(4).context("get updated_at")?,
             customer_email: r.get(5).context("get customer_email")?,
             customer_name: r.get(6).context("get customer_name")?,
+            customer_company: r.get(15).ok(),
             material_grade: r.get(7).context("get material_grade")?,
             quantity: qty.max(0) as u32,
             feature_graph_hash: r.get(9).ok(),
@@ -1038,10 +1058,11 @@ pub fn next_actionable_job(conn: &Connection, tenant_id: &str) -> Result<Option<
     ensure_schema(conn)?;
     let mut stmt = conn
         .prepare(
+            // S401 — customer_company appended LAST (ordinal 15); see list_jobs.
             "SELECT quote_id, tenant_id, state, fetched_at, updated_at,
                     customer_email, customer_name, material_grade, quantity,
                     feature_graph_hash, total_price_eur, error_stage, error_reason,
-                    attempt_n, failure_kind
+                    attempt_n, failure_kind, customer_company
                 FROM quote_pricing_jobs
                 WHERE tenant_id = ?
                   AND state IN ('fetched','extracting','pricing','rendering','posting_back')
@@ -1069,6 +1090,7 @@ pub fn next_actionable_job(conn: &Connection, tenant_id: &str) -> Result<Option<
             updated_at: r.get(4).context("get updated_at")?,
             customer_email: r.get(5).context("get customer_email")?,
             customer_name: r.get(6).context("get customer_name")?,
+            customer_company: r.get(15).ok(),
             material_grade: r.get(7).context("get material_grade")?,
             quantity: qty.max(0) as u32,
             feature_graph_hash: r.get(9).ok(),
@@ -1156,12 +1178,14 @@ pub fn get_job_detail(
     ensure_schema(conn)?;
     let mut stmt = conn
         .prepare(
+            // S401 — customer_company appended LAST (ordinal 20) so the
+            // artifact ordinals 15-19 below stay put.
             "SELECT quote_id, tenant_id, state, fetched_at, updated_at,
                     customer_email, customer_name, material_grade, quantity,
                     feature_graph_hash, total_price_eur, error_stage, error_reason,
                     attempt_n, failure_kind,
                     cad_filename, feature_graph_json, breakdown_json, pdf_path,
-                    valid_until_iso
+                    valid_until_iso, customer_company
                 FROM quote_pricing_jobs
                 WHERE quote_id = ? AND tenant_id = ?",
         )
@@ -1188,6 +1212,7 @@ pub fn get_job_detail(
         updated_at: r.get(4).context("get updated_at")?,
         customer_email: r.get(5).context("get customer_email")?,
         customer_name: r.get(6).context("get customer_name")?,
+        customer_company: r.get(20).ok(),
         material_grade: r.get(7).context("get material_grade")?,
         quantity: qty.max(0) as u32,
         feature_graph_hash: r.get(9).ok(),
@@ -1263,6 +1288,7 @@ mod tests {
             "T",
             "alice@example.com",
             "Alice",
+            "",
             "AL_6061_T6",
             10,
             "cube.stl",
@@ -1279,6 +1305,7 @@ mod tests {
             "T",
             "alice@example.com",
             "Alice",
+            "",
             "AL_6061_T6",
             10,
             "cube.stl",
@@ -1326,6 +1353,101 @@ mod tests {
         assert_eq!(rows[0].quantity, 10);
     }
 
+    /// S401 — the buyer's company round-trips insert → list_jobs →
+    /// get_job_detail. This is the data-layer half of the operator-panel
+    /// ask: if company is dropped at the staging layer (as it was before
+    /// S401), this test fails because both reads return None / "".
+    #[test]
+    fn s401_company_round_trips_through_insert_and_reads() {
+        let conn = open_mem();
+        let inserted = insert_fetched_job(
+            &conn,
+            "qco",
+            "T",
+            "ervin@aben.ch",
+            "Ervin Csengeri",
+            "Acme Manufacturing Kft.",
+            "AL_6061_T6",
+            3,
+            "bracket.step",
+            "/tmp/bracket.step",
+            fixed_ts(),
+        )
+        .expect("insert");
+        assert!(inserted);
+
+        let rows = list_jobs(&conn, "T").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].customer_company.as_deref(),
+            Some("Acme Manufacturing Kft."),
+            "list_jobs must carry the staged company"
+        );
+
+        let detail = get_job_detail(&conn, "qco", "T")
+            .expect("detail query")
+            .expect("row present");
+        assert_eq!(
+            detail.row.customer_company.as_deref(),
+            Some("Acme Manufacturing Kft."),
+            "get_job_detail must carry the staged company"
+        );
+    }
+
+    /// S401 — a buyer who left the company field blank stages `""` (not
+    /// NULL); the reads surface `Some("")` so the SPA's placeholder branch
+    /// (empty-after-trim) fires rather than the legacy-NULL branch.
+    #[test]
+    fn s401_blank_company_stages_empty_string_not_null() {
+        let conn = open_mem();
+        insert_fetched_job(
+            &conn,
+            "qblank",
+            "T",
+            "anon@example.com",
+            "Anon Buyer",
+            "",
+            "SS_304",
+            1,
+            "part.step",
+            "/tmp/part.step",
+            fixed_ts(),
+        )
+        .expect("insert");
+        let rows = list_jobs(&conn, "T").expect("list");
+        assert_eq!(rows[0].customer_company.as_deref(), Some(""));
+    }
+
+    /// S401 — a legacy PROD_v2.27.[0-55] row that pre-dates the
+    /// customer_company column reads back `None` (the column is NULL after
+    /// the additive migration). The SPA renders the placeholder for it.
+    /// Simulated by inserting a row WITHOUT the new column.
+    #[test]
+    fn s401_legacy_row_without_company_reads_none() {
+        let conn = open_mem();
+        let ts = fixed_ts()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("ts");
+        // Insert omitting customer_company → column defaults to NULL (the
+        // post-migration state of a pre-S401 row).
+        conn.execute(
+            "INSERT INTO quote_pricing_jobs (
+                quote_id, tenant_id, state, fetched_at, updated_at,
+                customer_email, customer_name, material_grade, quantity,
+                cad_filename, cad_local_path, attempt_n
+            ) VALUES ('qleg', 'T', 'fetched', ?, ?, 'old@example.com',
+                      'Legacy Buyer', 'AL_6061_T6', 5, 'old.step', '/tmp/old.step', 0)",
+            params![ts, ts],
+        )
+        .expect("legacy insert");
+        let rows = list_jobs(&conn, "T").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].customer_company, None,
+            "legacy NULL company must read back as None"
+        );
+    }
+
     // ── S379 / PR-379 — listing-level no-CAD permanent enqueue failure ──
 
     /// `insert_failed_enqueue_job` writes a terminal `Failed` row with the
@@ -1342,6 +1464,7 @@ mod tests {
             "T",
             "phantom@example.com",
             "Phantom Customer",
+            "",
             "6061-T6",
             2,
             "enqueue",
@@ -1369,6 +1492,7 @@ mod tests {
             "T",
             "phantom@example.com",
             "Phantom Customer",
+            "",
             "6061-T6",
             2,
             "enqueue",
@@ -1394,6 +1518,7 @@ mod tests {
             "T",
             "phantom@example.com",
             "Phantom Customer",
+            "",
             "6061-T6",
             1,
             "enqueue",
@@ -1411,6 +1536,7 @@ mod tests {
             "T",
             "phantom@example.com",
             "Phantom Customer",
+            "",
             "6061-T6",
             1,
             "now-present.stl",
@@ -1441,6 +1567,7 @@ mod tests {
             "T",
             "b@x",
             "Bob",
+            "",
             "AL",
             1,
             "p.stl",
@@ -1479,6 +1606,7 @@ mod tests {
             "T",
             "b@x",
             "Bob",
+            "",
             "AL",
             1,
             "p.stl",
@@ -1529,6 +1657,7 @@ mod tests {
             "T",
             "b@x",
             "Bob",
+            "",
             "AL",
             1,
             "p.stl",
@@ -1553,6 +1682,7 @@ mod tests {
             "T",
             "b@x",
             "Bob",
+            "",
             "AL",
             1,
             "p.stl",
@@ -1566,6 +1696,7 @@ mod tests {
             "T",
             "b@x",
             "Bob",
+            "",
             "AL",
             1,
             "p.stl",
@@ -1595,6 +1726,7 @@ mod tests {
             "T",
             "c@x",
             "Carol",
+            "",
             "AL",
             1,
             "p.stl",
@@ -1648,6 +1780,7 @@ mod tests {
             "T",
             "x@y",
             "X",
+            "",
             "AL",
             1,
             "p.stl",
@@ -1688,6 +1821,7 @@ mod tests {
             "T",
             "x@y",
             "X",
+            "",
             "AL",
             1,
             "p.stl",
@@ -1766,6 +1900,7 @@ mod tests {
             prod_tenant,
             "ervin@aben.ch",
             "ervin csenger",
+            "",
             "unknown",
             1,
             "submission.stl",
@@ -2093,6 +2228,7 @@ mod tests {
                 "T",
                 "x@y",
                 "X",
+                "",
                 "AL",
                 1,
                 "p.stl",
@@ -2108,6 +2244,7 @@ mod tests {
             "OTHER",
             "x@y",
             "X",
+            "",
             "AL",
             1,
             "p.stl",
@@ -2252,6 +2389,7 @@ mod tests {
             "T",
             "alice@example.com",
             "Alice",
+            "",
             "AL_6061_T6",
             7,
             "bracket.step",
@@ -2328,6 +2466,7 @@ mod tests {
             "T",
             "b@x",
             "Bob",
+            "",
             "unknown",
             1,
             "part.iges",
@@ -2355,6 +2494,7 @@ mod tests {
             "T",
             "c@x",
             "Cara",
+            "",
             "AL",
             1,
             "p.stl",
@@ -2399,6 +2539,7 @@ mod tests {
             "T",
             "e@x",
             "Eve",
+            "",
             "unknown",
             4,
             "part.step",
@@ -2460,6 +2601,7 @@ mod tests {
             "T",
             "e@x",
             "Eve",
+            "",
             "AL_6061_T6",
             1,
             "p.stl",
@@ -2510,6 +2652,7 @@ mod tests {
             "T",
             "e@x",
             "Eve",
+            "",
             "unknown",
             1,
             "p.stl",

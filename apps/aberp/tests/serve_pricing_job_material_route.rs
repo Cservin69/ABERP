@@ -93,6 +93,7 @@ fn seed_failed_row(db_path: &PathBuf, tenant: &str, quote_id: &str) {
         tenant,
         "cust@example.com",
         "Customer Kft.",
+        "Acme Manufacturing Kft.",
         "unknown",
         4,
         "bracket.step",

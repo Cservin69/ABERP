@@ -3149,6 +3149,10 @@ export interface PricingJobRow {
   updated_at: string;
   customer_email: string;
   customer_name: string;
+  /** S401 — buyer's company, carried from the storefront quote. `null`
+   * on legacy rows that pre-date the column (the operator panel renders
+   * a placeholder); `""` when the buyer left the company field blank. */
+  customer_company: string | null;
   material_grade: string;
   quantity: number;
   feature_graph_hash: string | null;

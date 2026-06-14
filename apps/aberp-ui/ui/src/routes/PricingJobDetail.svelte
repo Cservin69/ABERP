@@ -40,6 +40,7 @@
     type QuotePdfDeps,
   } from "../lib/pricing-job-pdf";
   import { formatInvoiceDate } from "../lib/format";
+  import { customerCell } from "../lib/pricing-customer-cell";
   import { failureKindBadge } from "../lib/pricing-failure-kind";
   import { writebackOutcomeBadge } from "../lib/pricing-failure-kind";
   import {
@@ -437,6 +438,13 @@
         {errorMessage ?? "Hiba / Error"}
       </p>
     {:else if detail}
+      <!-- S401 — resolve the Customer-cell shape once for the branch;
+           {@const} must be a direct child of the {:else if} block. -->
+      {@const cust = customerCell(
+        detail.customer_company,
+        detail.customer_name,
+        detail.customer_email,
+      )}
       <!-- Header: Ref + customer + state badge + Refresh + Close -->
       <header class="qjd__hdr">
         <div>
@@ -493,6 +501,12 @@
         <section class="qjd__sec">
           <h4>Beküldés / Submission</h4>
           <dl class="qjd__dl">
+            <!-- S401 — company first: it's who the operator is quoting. -->
+            <dt>Cég / Company</dt>
+            <dd
+              class:qjd__company-missing={cust.companyMissing}
+              data-testid="pricing-job-detail-company"
+            >{cust.company}</dd>
             <dt>Vevő / Customer</dt>
             <dd>{detail.customer_name}</dd>
             <dt>E-mail</dt>
@@ -1063,6 +1077,11 @@
   .qjd__muted {
     color: var(--color-text-muted, #9ca3af);
     font-size: 12px;
+  }
+  /* S401 — italic muted placeholder when no company was captured. */
+  .qjd__company-missing {
+    font-style: italic;
+    color: var(--color-text-muted, #9ca3af);
   }
   .qjd__hint,
   .qjd__err {
