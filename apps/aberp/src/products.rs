@@ -232,14 +232,18 @@ pub fn validate_product_inputs(inputs: &ProductInputs) -> Result<(), Vec<Validat
 // DuckDB schema + CRUD.
 // ──────────────────────────────────────────────────────────────────────
 
+// S410 / [[no-sql-specific]] — no DB-level CHECK. `unit_kind` and
+// `currency` closed vocab is enforced in Rust: writes go through the
+// `ProductUnit` / `Currency` enums, and reads reject out-of-vocab values
+// via `unit_from_db_columns` / `currency_from_db`.
 const PRODUCTS_SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS products (
     id               VARCHAR NOT NULL PRIMARY KEY,
     tenant_id        VARCHAR NOT NULL,
     name             VARCHAR NOT NULL,
-    unit_kind        VARCHAR NOT NULL CHECK (unit_kind IN ('Nav','Own')),
+    unit_kind        VARCHAR NOT NULL,
     unit_value       VARCHAR NOT NULL,
-    currency         VARCHAR NOT NULL CHECK (currency IN ('HUF','EUR')),
+    currency         VARCHAR NOT NULL,
     unit_price_minor BIGINT  NOT NULL,
     created_at       VARCHAR NOT NULL,
     updated_at       VARCHAR NOT NULL,
@@ -522,6 +526,30 @@ fn row_to_product(row: &duckdb::Row<'_>) -> duckdb::Result<Result<Product>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── S410 / [[no-sql-specific]] — closed-vocab gates live in code ───
+    // The `CHECK (unit_kind IN ('Nav','Own'))` and
+    // `CHECK (currency IN ('HUF','EUR'))` DDL constraints were dropped;
+    // these pin the read-side rejection that replaced them.
+
+    #[test]
+    fn unit_from_db_columns_rejects_out_of_vocab_kind() {
+        assert!(unit_from_db_columns("Nav", "PIECE").is_ok());
+        assert!(unit_from_db_columns("Own", "liter@15C").is_ok());
+        // The dropped CHECK's job, now in code:
+        assert!(unit_from_db_columns("Bogus", "x").is_err());
+        assert!(unit_from_db_columns("nav", "PIECE").is_err());
+    }
+
+    #[test]
+    fn currency_from_db_rejects_out_of_vocab() {
+        assert!(currency_from_db("HUF").is_ok());
+        assert!(currency_from_db("EUR").is_ok());
+        // The dropped CHECK's job, now in code:
+        assert!(currency_from_db("GBP").is_err());
+        assert!(currency_from_db("huf").is_err());
+        assert!(currency_from_db("").is_err());
+    }
 
     // ── NavUnitOfMeasure round-trip ────────────────────────────────────
 

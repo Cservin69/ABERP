@@ -127,14 +127,30 @@ impl BinaryHash {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Contiguous per-tenant 64-bit sequence number — the entry's position in
-/// the chain. Starts at 1; gap-free; the unique index on `seq` in the
-/// `audit_ledger` table (see [`crate::storage`]) is the structural
-/// enforcement per ADR-0008 §"Storage".
+/// the chain. Starts at 1; gap-free. Integrity is carried in Rust + the
+/// hash chain, NOT by the DB: S341 dropped the `UNIQUE(seq)` ART index
+/// (duckdb#23046) and S410 dropped the `CHECK (seq >= 1)` constraint
+/// ([[no-sql-specific]]). The `seq >= 1` floor now lives here, in
+/// [`Sequence::new`] / [`Sequence::FIRST`] / [`Sequence::next`], and a
+/// forged `seq` is caught by `verify_chain`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Sequence(pub u64);
 
 impl Sequence {
     pub const FIRST: Self = Self(1);
+
+    /// Construct a `Sequence` from a raw value, enforcing the `>= 1`
+    /// floor that used to be a DB `CHECK (seq >= 1)` (S410). Returns
+    /// `None` for `0` — the only out-of-range value a 64-bit unsigned
+    /// can carry. Use at decode/import boundaries where the value did
+    /// not come from [`Sequence::FIRST`] / [`Sequence::next`].
+    pub fn new(value: u64) -> Option<Self> {
+        if value >= 1 {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
 
     pub fn next(self) -> Self {
         Self(
@@ -146,5 +162,29 @@ impl Sequence {
 
     pub fn as_u64(self) -> u64 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::Sequence;
+
+    /// S410 / [[no-sql-specific]] — the `CHECK (seq >= 1)` DDL constraint
+    /// was dropped; this pins the `>= 1` floor in code instead.
+    #[test]
+    fn new_enforces_seq_floor() {
+        assert_eq!(
+            Sequence::new(0),
+            None,
+            "seq 0 must be rejected (was CHECK seq >= 1)"
+        );
+        assert_eq!(Sequence::new(1).map(|s| s.as_u64()), Some(1));
+        assert_eq!(Sequence::new(42).map(|s| s.as_u64()), Some(42));
+    }
+
+    #[test]
+    fn first_and_next_stay_at_or_above_one() {
+        assert_eq!(Sequence::FIRST.as_u64(), 1);
+        assert_eq!(Sequence::FIRST.next().as_u64(), 2);
     }
 }

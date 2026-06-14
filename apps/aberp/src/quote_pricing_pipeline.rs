@@ -2323,8 +2323,16 @@ fn convert_complexity(
 ) -> Vec<EngineComplexityRule> {
     locals
         .iter()
-        .map(|r| EngineComplexityRule {
-            id: r.id,
+        .enumerate()
+        .map(|(i, r)| EngineComplexityRule {
+            // S410 / [[no-sql-specific]] — the storage PK is now an
+            // app-minted ULID string (`r.id`), but the engine uses `id`
+            // only as an internal within-run dedup / precedence /
+            // reasoning-log key (`crates/aberp-quote-engine/src/engine.rs`).
+            // The engine domain stays decoupled from storage identity: we
+            // hand it a per-run ordinal. The operator reasoning log line
+            // ("rule#N") is a within-explanation index, not a DB id.
+            id: i as i64,
             feature_type: r.feature_type.clone(),
             size_bucket: r.size_bucket.clone(),
             // Local table uses i64 for SPA-friendly form-handling; engine

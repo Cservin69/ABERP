@@ -9671,7 +9671,7 @@ async fn handle_create_complexity_rule(
 async fn handle_update_complexity_rule(
     headers: HeaderMap,
     State(state): State<AppState>,
-    AxumPath(id): AxumPath<i64>,
+    AxumPath(id): AxumPath<String>,
     Json(inputs): Json<crate::quoting_tunables::ComplexityRuleInputs>,
 ) -> Response {
     let login = match require_ready(&state) {
@@ -9693,7 +9693,7 @@ async fn handle_update_complexity_rule(
                 &meta,
                 &login,
                 state_for_task.tenant.as_str(),
-                id,
+                &id,
                 &inputs,
             )
         },
@@ -9712,7 +9712,7 @@ async fn handle_update_complexity_rule(
 async fn handle_delete_complexity_rule(
     headers: HeaderMap,
     State(state): State<AppState>,
-    AxumPath(id): AxumPath<i64>,
+    AxumPath(id): AxumPath<String>,
 ) -> Response {
     let login = match require_ready(&state) {
         Ok(l) => l,
@@ -9733,7 +9733,7 @@ async fn handle_delete_complexity_rule(
                 &meta,
                 &login,
                 state_for_task.tenant.as_str(),
-                id,
+                &id,
             )
         },
     )
@@ -9966,7 +9966,7 @@ async fn handle_create_stock_adjustment(
 async fn handle_update_stock_adjustment(
     headers: HeaderMap,
     State(state): State<AppState>,
-    AxumPath(id): AxumPath<i64>,
+    AxumPath(id): AxumPath<String>,
     Json(inputs): Json<crate::quoting_tunables::StockAdjustmentInputs>,
 ) -> Response {
     let login = match require_ready(&state) {
@@ -9988,7 +9988,7 @@ async fn handle_update_stock_adjustment(
                 &meta,
                 &login,
                 state_for_task.tenant.as_str(),
-                id,
+                &id,
                 &inputs,
             )
         },
@@ -10007,7 +10007,7 @@ async fn handle_update_stock_adjustment(
 async fn handle_delete_stock_adjustment(
     headers: HeaderMap,
     State(state): State<AppState>,
-    AxumPath(id): AxumPath<i64>,
+    AxumPath(id): AxumPath<String>,
 ) -> Response {
     let login = match require_ready(&state) {
         Ok(l) => l,
@@ -10028,7 +10028,7 @@ async fn handle_delete_stock_adjustment(
                 &meta,
                 &login,
                 state_for_task.tenant.as_str(),
-                id,
+                &id,
             )
         },
     )
@@ -19993,9 +19993,9 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
     // doesn't carry buyer info), `sequence_number: 0` (placeholder),
     // and `fiscal_year` taken from `restore_year`. The `currency`
     // string is parsed via `Currency::iso_code` round-trip
-    // (`HUF`/`EUR`); the DB-level `CHECK (currency IN ('HUF','EUR'))`
-    // on `restored_invoice` makes any other value a schema bug we
-    // surface loudly per CLAUDE.md rule 12.
+    // (`HUF`/`EUR`); the app-layer `parse_digest_currency` gate
+    // (S410 / [[no-sql-specific]] — no DB CHECK) makes any other value a
+    // bug we surface loudly per CLAUDE.md rule 12.
     let restored = restore_outgoing::list_restored(&state.db_path, state.tenant.as_str())
         .context("read restored_invoice mirror for unified list")?;
     for ext in restored {
@@ -20023,9 +20023,10 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
 ///
 /// CLAUDE.md rule 12 — closed-vocab currency is `Currency::iso_code`-
 /// round-tripped; an unknown string loud-fails rather than silently
-/// defaulting (the DuckDB `CHECK (currency IN ('HUF','EUR'))` on
-/// `restored_invoice` makes any other value a schema bug we want to
-/// surface).
+/// defaulting. This match (plus `parse_digest_currency` at the write
+/// boundary) is the authoritative gate — S410 / [[no-sql-specific]]
+/// removed the DuckDB `CHECK (currency IN ('HUF','EUR'))` from
+/// `restored_invoice`.
 fn restored_to_list_item(ext: restore_outgoing::RestoredInvoice) -> Result<InvoiceListItem> {
     let currency = match ext.currency.as_str() {
         "HUF" => Currency::Huf,

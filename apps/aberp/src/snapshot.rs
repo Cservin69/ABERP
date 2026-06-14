@@ -119,24 +119,11 @@ pub fn take_snapshot(db_path: &Path, dest_path: &Path) -> Result<()> {
             .with_context(|| format!("remove stale snapshot WAL {}", dst_wal.display()))?;
     }
 
-    // 2. Fold the copied WAL into the copy via a checkpoint, mutating
-    //    only the snapshot (never the source DB). After this the
-    //    snapshot is a single file with no outstanding WAL.
-    {
-        let conn = Connection::open(dest_path).with_context(|| {
-            format!(
-                "open snapshot copy {} read-write to fold WAL",
-                dest_path.display()
-            )
-        })?;
-        conn.execute_batch("CHECKPOINT;")
-            .with_context(|| format!("checkpoint snapshot copy {}", dest_path.display()))?;
-    }
-    // Best-effort: a clean checkpoint leaves the WAL empty/removed; drop
-    // any lingering empty WAL so the snapshot is a lone file.
-    if dst_wal.exists() {
-        let _ = std::fs::remove_file(&dst_wal);
-    }
+    // 2. Fold the copied WAL into the copy, mutating only the snapshot
+    //    (never the source DB). After this the snapshot is a single file
+    //    with no outstanding WAL. S410 / [[no-sql-specific]] — the
+    //    engine-specific WAL fold is behind the `StorageEngine` port.
+    STORAGE_ENGINE.fold_wal(dest_path)?;
 
     // 3. Validate read-only — loud-fail on any corruption signal.
     validate_snapshot(dest_path)?;
@@ -250,72 +237,128 @@ fn db_held_by_live_process(db_path: &Path) -> Result<bool> {
     }
 }
 
-/// Open `snapshot_path` read-only and run
-/// `PRAGMA verify_external_invariants`. Returns `Ok(())` when the file
-/// is a structurally-valid DuckDB whose external (index/storage)
-/// invariants hold; returns `Err` otherwise.
-///
-/// The read-only open alone already rejects a torn/garbage file (bad
-/// magic, truncated header). `verify_external_invariants` is the
-/// stronger ART/storage consistency check on top. If a given engine
-/// build does not expose that pragma we DON'T fail the snapshot over a
-/// missing diagnostic — the read-only open still proved basic validity
-/// — but we log a warning so the gap is visible.
+/// Validate `snapshot_path`: `Ok(())` when the file is a structurally
+/// valid store whose external (index/storage) invariants hold; `Err`
+/// otherwise. S410 / [[no-sql-specific]] — the engine-specific integrity
+/// check is behind the [`StorageEngine`] port (see [`DuckDbEngine`]);
+/// business code calls this wrapper, never `duckdb::Connection`.
 pub fn validate_snapshot(snapshot_path: &Path) -> Result<()> {
-    let config = Config::default()
-        .access_mode(AccessMode::ReadOnly)
-        .context("build read-only DuckDB config for snapshot validation")?;
-    let conn = Connection::open_with_flags(snapshot_path, config).with_context(|| {
-        format!(
-            "open snapshot {} read-only for validation (a torn/corrupt file fails here)",
-            snapshot_path.display()
-        )
-    })?;
+    STORAGE_ENGINE.verify_integrity(snapshot_path)
+}
 
-    let mut stmt = match conn.prepare("PRAGMA verify_external_invariants") {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.to_lowercase().contains("verify_external_invariants") {
-                // Pragma unavailable in this build — basic read-only
-                // open already validated structure; don't hard-fail.
-                tracing::warn!(
-                    snapshot = %snapshot_path.display(),
-                    error = %msg,
-                    "PRAGMA verify_external_invariants unavailable; relying on the \
-                     read-only open as the validity check"
-                );
-                return Ok(());
+// ──────────────────────────────────────────────────────────────────────
+// Storage engine port (S410 / [[no-sql-specific]])
+// ──────────────────────────────────────────────────────────────────────
+
+/// Engine-specific storage maintenance that the snapshot/restore
+/// subsystem needs. A snapshot tool is inherently tied to the on-disk
+/// file format, so this coupling is *acceptable* — but it is quarantined
+/// behind this port so it is the ONLY place that knows the engine.
+/// Business code calls the trait, never `duckdb::Connection` directly; a
+/// future Postgres/SQLite engine supplies its own impl (`pg_dump` /
+/// `pg_verify`, or a no-op) without touching the snapshot orchestration
+/// in [`take_snapshot`] / [`validate_snapshot`].
+trait StorageEngine {
+    /// Fold any outstanding write-ahead log of the store at `path` into
+    /// the single data file, leaving no side WAL.
+    fn fold_wal(&self, path: &Path) -> Result<()>;
+
+    /// Deep integrity check of the store at `path`. `Ok(())` = clean (or
+    /// the check is unavailable in this build — basic openability already
+    /// validated); `Err` = corruption.
+    fn verify_integrity(&self, path: &Path) -> Result<()>;
+}
+
+/// The only [`StorageEngine`] today. DuckDB-specific operations
+/// (`CHECKPOINT`, `PRAGMA verify_external_invariants`) live here and
+/// nowhere else in business code.
+struct DuckDbEngine;
+
+/// The process-wide storage engine. Swapping engines is a one-line change
+/// here once a second [`StorageEngine`] impl exists.
+const STORAGE_ENGINE: DuckDbEngine = DuckDbEngine;
+
+impl StorageEngine for DuckDbEngine {
+    fn fold_wal(&self, path: &Path) -> Result<()> {
+        {
+            let conn = Connection::open(path).with_context(|| {
+                format!(
+                    "open snapshot copy {} read-write to fold WAL",
+                    path.display()
+                )
+            })?;
+            conn.execute_batch("CHECKPOINT;")
+                .with_context(|| format!("checkpoint snapshot copy {}", path.display()))?;
+        }
+        // Best-effort: a clean checkpoint leaves the WAL empty/removed;
+        // drop any lingering empty WAL so the snapshot is a lone file.
+        let wal = wal_sibling(path);
+        if wal.exists() {
+            let _ = std::fs::remove_file(&wal);
+        }
+        Ok(())
+    }
+
+    fn verify_integrity(&self, path: &Path) -> Result<()> {
+        // The read-only open alone already rejects a torn/garbage file
+        // (bad magic, truncated header). `verify_external_invariants` is
+        // the stronger ART/storage consistency check on top. If a given
+        // engine build does not expose that pragma we DON'T fail over a
+        // missing diagnostic — the read-only open still proved basic
+        // validity — but we log a warning so the gap is visible.
+        let config = Config::default()
+            .access_mode(AccessMode::ReadOnly)
+            .context("build read-only DuckDB config for snapshot validation")?;
+        let conn = Connection::open_with_flags(path, config).with_context(|| {
+            format!(
+                "open snapshot {} read-only for validation (a torn/corrupt file fails here)",
+                path.display()
+            )
+        })?;
+
+        let mut stmt = match conn.prepare("PRAGMA verify_external_invariants") {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.to_lowercase().contains("verify_external_invariants") {
+                    tracing::warn!(
+                        snapshot = %path.display(),
+                        error = %msg,
+                        "PRAGMA verify_external_invariants unavailable; relying on the \
+                         read-only open as the validity check"
+                    );
+                    return Ok(());
+                }
+                return Err(anyhow!(
+                    "snapshot {} is corrupt: verify_external_invariants failed to prepare: {msg}",
+                    path.display()
+                ));
             }
-            return Err(anyhow!(
-                "snapshot {} is corrupt: verify_external_invariants failed to prepare: {msg}",
-                snapshot_path.display()
-            ));
-        }
-    };
+        };
 
-    // The pragma throws on corruption (surfaced at query/step) and/or
-    // returns offending rows. Treat EITHER as corruption.
-    let row_count = (|| -> Result<usize> {
-        let mut rows = stmt.query([])?;
-        let mut n = 0usize;
-        while rows.next()?.is_some() {
-            n += 1;
-        }
-        Ok(n)
-    })();
+        // The pragma throws on corruption (surfaced at query/step) and/or
+        // returns offending rows. Treat EITHER as corruption.
+        let row_count = (|| -> Result<usize> {
+            let mut rows = stmt.query([])?;
+            let mut n = 0usize;
+            while rows.next()?.is_some() {
+                n += 1;
+            }
+            Ok(n)
+        })();
 
-    match row_count {
-        Ok(0) => Ok(()),
-        Ok(n) => Err(anyhow!(
-            "snapshot {} is corrupt: verify_external_invariants reported {n} \
-             invariant violation row(s)",
-            snapshot_path.display()
-        )),
-        Err(e) => Err(anyhow!(
-            "snapshot {} is corrupt: verify_external_invariants raised an error: {e}",
-            snapshot_path.display()
-        )),
+        match row_count {
+            Ok(0) => Ok(()),
+            Ok(n) => Err(anyhow!(
+                "snapshot {} is corrupt: verify_external_invariants reported {n} \
+                 invariant violation row(s)",
+                path.display()
+            )),
+            Err(e) => Err(anyhow!(
+                "snapshot {} is corrupt: verify_external_invariants raised an error: {e}",
+                path.display()
+            )),
+        }
     }
 }
 

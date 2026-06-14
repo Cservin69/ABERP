@@ -44,11 +44,25 @@ use crate::ports::storage::{AllocateArgs, AllocateOutcome, BillingStore};
 // characters. A plain double-quoted Rust string literal would terminate
 // at those quotes, so this const switched to a raw string. The two
 // migration consts below stay as plain strings (no embedded quotes).
+// S410 / [[no-sql-specific]] — no DB-level CHECK constraints. Every
+// closed-vocab and range invariant these tables once encoded as `CHECK`
+// lives in Rust instead, where it is engine-portable and unit-tested:
+//   - `reset_policy`  → `reset_policy_from_str` (rejects out-of-vocab on read);
+//                        only `reset_policy_to_str` ever writes it.
+//   - `status`        → the read-side match in `row_to_reservation`
+//                        (`decode_err` on out-of-vocab); only the enum writes it.
+//   - `next_number≥1` → the allocator floor (`max(next_number, start_value,
+//                        sequence_floor)`, S394); `start_value ≥ 1`.
+//   - `quantity≥0`    → the issuance preflight `LineItemQuantityZero` gate
+//                        (`issue_preflight.rs`, rejects `quantity <= 0`).
+// Dropping the CHECKs also unblocks DuckDB `ALTER COLUMN TYPE` (the S157
+// quantity widen needed an add/backfill/drop/rename ladder *because* of
+// the CHECK — see `MIGRATE_S157_SQL`).
 const CREATE_TABLES_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS invoice_series (
     id           VARCHAR NOT NULL PRIMARY KEY,
     code         VARCHAR NOT NULL UNIQUE,
-    reset_policy VARCHAR NOT NULL CHECK (reset_policy IN ('never','annual_on_fiscal_year')),
+    reset_policy VARCHAR NOT NULL,
     fiscal_year  INTEGER,
     created_at   VARCHAR NOT NULL
 );
@@ -56,7 +70,7 @@ CREATE TABLE IF NOT EXISTS invoice_series (
 CREATE TABLE IF NOT EXISTS invoice_sequence_state (
     series_id   VARCHAR NOT NULL,
     fiscal_year INTEGER NOT NULL,
-    next_number BIGINT  NOT NULL CHECK (next_number >= 1),
+    next_number BIGINT  NOT NULL,
     updated_at  VARCHAR NOT NULL,
     PRIMARY KEY (series_id, fiscal_year)
 );
@@ -67,7 +81,7 @@ CREATE TABLE IF NOT EXISTS invoice_sequence_reservation (
     fiscal_year INTEGER NOT NULL,
     number      BIGINT  NOT NULL,
     invoice_id  VARCHAR NOT NULL UNIQUE,
-    status      VARCHAR NOT NULL CHECK (status IN ('reserved','used','voided')),
+    status      VARCHAR NOT NULL,
     void_reason VARCHAR,
     reserved_at VARCHAR NOT NULL,
     used_at     VARCHAR,
@@ -170,7 +184,7 @@ CREATE TABLE IF NOT EXISTS invoice_line (
     -- DBs created this column as INTEGER; `MIGRATE_S157_SQL` widens them
     -- (DuckDB forbids ALTER COLUMN TYPE on a CHECK-constrained column, so
     -- that path is add/backfill/drop/rename — see the constant below).
-    quantity              DECIMAL(18, 6) NOT NULL CHECK (quantity >= 0),
+    quantity              DECIMAL(18, 6) NOT NULL,
     unit_price            BIGINT  NOT NULL,
     vat_rate_basis_points INTEGER NOT NULL,
     -- PR-82 — buyer-facing per-line note ("Megjegyzés"). Recipient-
@@ -975,6 +989,21 @@ fn reset_policy_from_str(s: &str) -> Option<ResetPolicy> {
     }
 }
 
+/// Map the stored `status` string to [`ReservationStatus`], rejecting any
+/// out-of-vocab value. S410 / [[no-sql-specific]] — this is the
+/// authoritative closed-vocab gate now that the DB-level
+/// `CHECK (status IN ('reserved','used','voided'))` is gone. Writes use
+/// the SQL literals `'reserved'` / `'voided'` directly, so the only way a
+/// bad value reaches here is engine/import drift, which this rejects loudly.
+fn reservation_status_from_str(s: &str) -> Option<ReservationStatus> {
+    match s {
+        "reserved" => Some(ReservationStatus::Reserved),
+        "used" => Some(ReservationStatus::Used),
+        "voided" => Some(ReservationStatus::Voided),
+        _ => None,
+    }
+}
+
 fn row_to_series(row: &duckdb::Row<'_>) -> duckdb::Result<InvoiceSeries> {
     let id_str: String = row.get(0)?;
     let code_str: String = row.get(1)?;
@@ -1011,12 +1040,8 @@ fn row_to_reservation(row: &duckdb::Row<'_>) -> duckdb::Result<SequenceReservati
     let used_at_str: Option<String> = row.get(8)?;
     let voided_at_str: Option<String> = row.get(9)?;
 
-    let status = match status_str.as_str() {
-        "reserved" => ReservationStatus::Reserved,
-        "used" => ReservationStatus::Used,
-        "voided" => ReservationStatus::Voided,
-        _ => return Err(decode_err("unknown reservation.status")),
-    };
+    let status = reservation_status_from_str(&status_str)
+        .ok_or_else(|| decode_err("unknown reservation.status"))?;
     let reserved_at = OffsetDateTime::parse(&reserved_at_str, &Rfc3339)
         .map_err(|_| decode_err("reservation.reserved_at not RFC3339"))?;
     let used_at = match used_at_str {
@@ -1298,4 +1323,47 @@ fn decode_err(msg: &'static str) -> duckdb::Error {
         duckdb::types::Type::Text,
         Box::<dyn std::error::Error + Send + Sync>::from(msg),
     )
+}
+
+#[cfg(test)]
+mod no_sql_specific_tests {
+    //! S410 / [[no-sql-specific]] — the `reset_policy` and `status`
+    //! closed-vocab CHECK constraints were dropped from the DDL; these
+    //! pins prove the invariant still lives in code (the read-side
+    //! parsers reject out-of-vocab values). If someone widens or breaks
+    //! the parser, these fail — the invariant cannot silently regress.
+    use super::*;
+
+    #[test]
+    fn reset_policy_from_str_accepts_vocab_rejects_others() {
+        assert_eq!(reset_policy_from_str("never"), Some(ResetPolicy::Never));
+        assert_eq!(
+            reset_policy_from_str("annual_on_fiscal_year"),
+            Some(ResetPolicy::AnnualOnFiscalYear)
+        );
+        // The dropped CHECK's job, now in code:
+        assert_eq!(reset_policy_from_str("ANNUAL"), None);
+        assert_eq!(reset_policy_from_str("monthly"), None);
+        assert_eq!(reset_policy_from_str(""), None);
+    }
+
+    #[test]
+    fn reservation_status_from_str_accepts_vocab_rejects_others() {
+        assert_eq!(
+            reservation_status_from_str("reserved"),
+            Some(ReservationStatus::Reserved)
+        );
+        assert_eq!(
+            reservation_status_from_str("used"),
+            Some(ReservationStatus::Used)
+        );
+        assert_eq!(
+            reservation_status_from_str("voided"),
+            Some(ReservationStatus::Voided)
+        );
+        // The dropped CHECK's job, now in code:
+        assert_eq!(reservation_status_from_str("Reserved"), None);
+        assert_eq!(reservation_status_from_str("cancelled"), None);
+        assert_eq!(reservation_status_from_str(""), None);
+    }
 }

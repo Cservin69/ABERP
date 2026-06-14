@@ -520,13 +520,17 @@ pub fn validate_partner_inputs(inputs: &PartnerInputs) -> Result<(), Vec<Validat
 // DuckDB schema + CRUD.
 // ──────────────────────────────────────────────────────────────────────
 
+// S410 / [[no-sql-specific]] — no DB-level CHECK on `kind`. The
+// `PartnerKind` closed vocab is enforced in Rust: writes go through
+// `PartnerKind::as_db_str` and reads reject out-of-vocab values via
+// `PartnerKind::from_db_str`.
 const PARTNERS_SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS partners (
     id                    VARCHAR NOT NULL PRIMARY KEY,
     tenant_id             VARCHAR NOT NULL,
     display_name          VARCHAR NOT NULL,
     legal_name            VARCHAR NOT NULL,
-    kind                  VARCHAR NOT NULL CHECK (kind IN ('Customer','Supplier','Both')),
+    kind                  VARCHAR NOT NULL,
     tax_number            VARCHAR,
     eu_vat_number         VARCHAR,
     address_street        VARCHAR,
@@ -1157,6 +1161,26 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    // ── S410 / [[no-sql-specific]] — closed-vocab gate lives in code ───
+    /// The `CHECK (kind IN ('Customer','Supplier','Both'))` DDL constraint
+    /// was dropped; this pins the read-side rejection that replaced it.
+    #[test]
+    fn partner_kind_from_db_str_rejects_out_of_vocab() {
+        assert_eq!(
+            PartnerKind::from_db_str("Customer"),
+            Some(PartnerKind::Customer)
+        );
+        assert_eq!(
+            PartnerKind::from_db_str("Supplier"),
+            Some(PartnerKind::Supplier)
+        );
+        assert_eq!(PartnerKind::from_db_str("Both"), Some(PartnerKind::Both));
+        // The dropped CHECK's job, now in code:
+        assert_eq!(PartnerKind::from_db_str("customer"), None);
+        assert_eq!(PartnerKind::from_db_str("Vendor"), None);
+        assert_eq!(PartnerKind::from_db_str(""), None);
+    }
 
     // ── PartnerKind serde round-trip ──────────────────────────────────
 

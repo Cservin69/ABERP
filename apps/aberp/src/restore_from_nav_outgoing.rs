@@ -186,6 +186,9 @@ impl Default for RestoredInvoiceId {
 // Schema.
 // ──────────────────────────────────────────────────────────────────────
 
+// S410 / [[no-sql-specific]] — no DB-level CHECK on `currency`. The
+// closed vocab is enforced in Rust: `parse_digest_currency` loud-fails
+// on any value outside {HUF, EUR} before a row is ever written.
 const RESTORED_INVOICE_SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS restored_invoice (
     id                          VARCHAR NOT NULL PRIMARY KEY,
@@ -196,7 +199,7 @@ CREATE TABLE IF NOT EXISTS restored_invoice (
     total_net_minor             BIGINT  NOT NULL,
     total_vat_minor             BIGINT  NOT NULL,
     total_gross_minor           BIGINT  NOT NULL,
-    currency                    VARCHAR NOT NULL CHECK (currency IN ('HUF','EUR')),
+    currency                    VARCHAR NOT NULL,
     restore_year                INTEGER NOT NULL,
     created_at                  VARCHAR NOT NULL,
     UNIQUE (tenant_id, source_nav_invoice_number)
@@ -3304,7 +3307,7 @@ mod tests {
                 total_net_minor             BIGINT  NOT NULL,
                 total_vat_minor             BIGINT  NOT NULL,
                 total_gross_minor           BIGINT  NOT NULL,
-                currency                    VARCHAR NOT NULL CHECK (currency IN ('HUF','EUR')),
+                currency                    VARCHAR NOT NULL,
                 restore_year                INTEGER NOT NULL,
                 created_at                  VARCHAR NOT NULL,
                 UNIQUE (tenant_id, source_nav_invoice_number)

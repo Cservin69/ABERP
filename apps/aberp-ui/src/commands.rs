@@ -530,16 +530,17 @@ pub async fn create_complexity_rule(
 #[tauri::command]
 pub async fn update_complexity_rule(
     state: State<'_, AppState>,
-    id: i64,
+    id: String,
     body: Value,
 ) -> Result<Value, String> {
-    let path = format!("/api/quoting-complexity-rules/{id}");
+    // S410 — `id` is now an app-minted prefixed ULID, not an integer.
+    let path = format!("/api/quoting-complexity-rules/{}", urlencode(&id));
     forward_put(&state, &path, body).await
 }
 
 #[tauri::command]
-pub async fn delete_complexity_rule(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    let path = format!("/api/quoting-complexity-rules/{id}");
+pub async fn delete_complexity_rule(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let path = format!("/api/quoting-complexity-rules/{}", urlencode(&id));
     forward_delete(&state, &path).await
 }
 
@@ -587,16 +588,17 @@ pub async fn create_stock_adjustment(
 #[tauri::command]
 pub async fn update_stock_adjustment(
     state: State<'_, AppState>,
-    id: i64,
+    id: String,
     body: Value,
 ) -> Result<Value, String> {
-    let path = format!("/api/quoting-stock-adjustments/{id}");
+    // S410 — `id` is now an app-minted prefixed ULID, not an integer.
+    let path = format!("/api/quoting-stock-adjustments/{}", urlencode(&id));
     forward_put(&state, &path, body).await
 }
 
 #[tauri::command]
-pub async fn delete_stock_adjustment(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    let path = format!("/api/quoting-stock-adjustments/{id}");
+pub async fn delete_stock_adjustment(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let path = format!("/api/quoting-stock-adjustments/{}", urlencode(&id));
     forward_delete(&state, &path).await
 }
 

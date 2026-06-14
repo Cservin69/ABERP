@@ -1689,7 +1689,9 @@ export const TOLERANCE_RANGES: readonly ToleranceRange[] = [
 ] as const;
 
 export interface ComplexityRule {
-  id: number;
+  // S410 / [[no-sql-specific]] — app-minted prefixed ULID (`qcr_…`),
+  // not a DB-sequence integer.
+  id: string;
   feature_type: FeatureType;
   size_bucket: SizeBucket;
   count_min: number;
@@ -1752,7 +1754,9 @@ export interface QuotingParametersInput {
 }
 
 export interface StockAdjustment {
-  id: number;
+  // S410 / [[no-sql-specific]] — app-minted prefixed ULID (`qsa_…`),
+  // not a DB-sequence integer.
+  id: string;
   grade: string;
   stock_status: StockStatus;
   price_adjustment_pct: number;
@@ -1777,12 +1781,12 @@ export async function createComplexityRule(
   return invoke<ComplexityRule>("create_complexity_rule", { body });
 }
 export async function updateComplexityRule(
-  id: number,
+  id: string,
   body: ComplexityRuleInput,
 ): Promise<ComplexityRule> {
   return invoke<ComplexityRule>("update_complexity_rule", { id, body });
 }
-export async function deleteComplexityRule(id: number): Promise<void> {
+export async function deleteComplexityRule(id: string): Promise<void> {
   await invoke<void>("delete_complexity_rule", { id });
 }
 
@@ -1818,12 +1822,12 @@ export async function createStockAdjustment(
   return invoke<StockAdjustment>("create_stock_adjustment", { body });
 }
 export async function updateStockAdjustment(
-  id: number,
+  id: string,
   body: StockAdjustmentInput,
 ): Promise<StockAdjustment> {
   return invoke<StockAdjustment>("update_stock_adjustment", { id, body });
 }
-export async function deleteStockAdjustment(id: number): Promise<void> {
+export async function deleteStockAdjustment(id: string): Promise<void> {
   await invoke<void>("delete_stock_adjustment", { id });
 }
 

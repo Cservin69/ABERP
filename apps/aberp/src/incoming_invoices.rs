@@ -65,7 +65,7 @@
 //!     serial writers (concurrent writers produce
 //!     `tamper detected at seq=1` mismatches). Both failure modes
 //!     are pinned by tests below
-//!     ([`duckdb_unique_constraint_does_not_fire_across_two_connections_documented_quirk`],
+//!     ([`app_layer_dedup_is_authoritative_even_though_db_unique_does_not_fire`],
 //!     [`concurrent_ingest_holds_no_error_one_row_id_consistent`]).
 //!     The serializer eliminates BOTH races (UNIQUE + audit-chain)
 //!     at the source: only one ingest at a time, regardless of
@@ -374,6 +374,11 @@ impl From<anyhow::Error> for IngestError {
 // Schema.
 // ──────────────────────────────────────────────────────────────────────
 
+// S410 / [[no-sql-specific]] — no DB-level CHECK on `currency` /
+// `local_status`. The closed vocab is enforced in Rust:
+// `validate_ingestion_input` rejects out-of-vocab `currency`, only the
+// `IncomingInvoiceStatus` enum ever writes `local_status`, and the read
+// path rejects out-of-vocab values via `IncomingInvoiceStatus::from_storage_str`.
 const AP_INVOICE_SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS ap_invoice (
     id                   VARCHAR NOT NULL PRIMARY KEY,
@@ -388,8 +393,8 @@ CREATE TABLE IF NOT EXISTS ap_invoice (
     total_net_minor      BIGINT  NOT NULL,
     total_vat_minor      BIGINT  NOT NULL,
     total_gross_minor    BIGINT  NOT NULL,
-    currency             VARCHAR NOT NULL CHECK (currency IN ('HUF','EUR')),
-    local_status         VARCHAR NOT NULL CHECK (local_status IN ('Outstanding','Paid','Irrelevant')),
+    currency             VARCHAR NOT NULL,
+    local_status         VARCHAR NOT NULL,
     irrelevant_reason    VARCHAR,
     nav_xml_path         VARCHAR,
     created_at           VARCHAR NOT NULL,
@@ -476,8 +481,17 @@ pub fn ingest_incoming_invoice(
     ensure_schema(&conn).context("ensure ap_invoice schema (ingestion)")?;
     audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema (ingestion)")?;
 
-    // Idempotency check FIRST so we never write the artifact file or
-    // the audit entry for a row that already exists.
+    // S410 / [[no-sql-specific]] — THE authoritative dedup gate.
+    // This pre-insert probe, run while `INGEST_SERIALIZER` is held for
+    // the entire critical section (find → insert → audit), is what
+    // guarantees at-most-one row per `(tenant, supplier_tax,
+    // nav_invoice_number)`. It does NOT depend on the DB firing a UNIQUE
+    // violation — the app-level mutex + this probe are the gate, so the
+    // dedup is portable to any engine (including ones where UNIQUE does
+    // not fire across connections — see the
+    // `duckdb_unique_does_not_fire_*` test below). Running it FIRST also
+    // means we never write the artifact file or the audit entry for a row
+    // that already exists.
     if let Some(existing_id) = find_existing_id(
         &conn,
         tenant.as_str(),
@@ -525,13 +539,18 @@ pub fn ingest_incoming_invoice(
     // a row. Mirrors the outgoing-invoice billing+audit posture per
     // ADR-0008 / ADR-0009 §3 step 6.
     //
-    // S186 — the INSERT arm catches the UNIQUE-violation race
-    // window: two concurrent callers can both pass the upfront
-    // `find_existing_id` check, both reach this INSERT, and one
-    // trips `(tenant_id, supplier_tax_number, nav_invoice_number)`'s
-    // UNIQUE constraint. Pre-S186 that surfaced as a 500 to the
-    // caller; now it falls back to a re-lookup + `AlreadyExists`,
-    // matching the idempotency contract the daemon depends on.
+    // S410 — the UNIQUE-violation catch below is a BACKSTOP, not the
+    // primary dedup gate. The authoritative gate is the `find_existing_id`
+    // probe above, held under `INGEST_SERIALIZER` (see its comment). On
+    // the engines we target, a UNIQUE violation here is therefore
+    // unreachable in a single-process model. The catch is retained for
+    // defence-in-depth (e.g. a hypothetical cross-process writer): if the
+    // INSERT ever trips the `(tenant_id, supplier_tax_number,
+    // nav_invoice_number)` UNIQUE, we re-look-up and return
+    // `AlreadyExists` rather than surfacing a 500 — preserving the
+    // idempotency contract the daemon depends on. (Pre-S186 a racing
+    // caller surfaced a 500; the mutex closed that race, and this catch
+    // remains the belt to its suspenders.)
     let tx = conn
         .transaction()
         .context("begin DuckDB transaction (ap_invoice ingest)")?;
@@ -1099,6 +1118,22 @@ pub(crate) fn is_canonical_iso_date(s: &str) -> bool {
 mod tests {
     use super::*;
     use aberp_audit_ledger::BinaryHash;
+
+    /// S410 / [[no-sql-specific]] — the
+    /// `CHECK (local_status IN ('Outstanding','Paid','Irrelevant'))` DDL
+    /// constraint was dropped; this pins the read-side rejection that
+    /// replaced it. (The `currency` CHECK's replacement is pinned by
+    /// `validate_rejects_unknown_currency` below.)
+    #[test]
+    fn incoming_status_from_storage_str_rejects_out_of_vocab() {
+        assert!(IncomingInvoiceStatus::from_storage_str("Outstanding").is_ok());
+        assert!(IncomingInvoiceStatus::from_storage_str("Paid").is_ok());
+        assert!(IncomingInvoiceStatus::from_storage_str("Irrelevant").is_ok());
+        // The dropped CHECK's job, now in code:
+        assert!(IncomingInvoiceStatus::from_storage_str("outstanding").is_err());
+        assert!(IncomingInvoiceStatus::from_storage_str("Settled").is_err());
+        assert!(IncomingInvoiceStatus::from_storage_str("").is_err());
+    }
 
     /// Per-test tempdir under the system temp root. Mirrors the
     /// pattern in `apps/aberp/tests/seller_banks_round_trip.rs` —
@@ -1670,33 +1705,37 @@ mod tests {
         );
     }
 
-    /// S186 — document a DuckDB quirk this PR works around:
-    /// `Connection::open(path)` × 2 within ONE process do NOT
-    /// coordinate on the table's `UNIQUE` constraint. Two
-    /// independent inserts of the SAME
-    /// `(tenant, supplier_tax, nav_invoice_number)` triple from
-    /// separate handles both succeed and leave TWO rows in the
-    /// table. PR-182 review §S177 assumed UNIQUE would fire and
-    /// proposed catching the violation; the investigation that
-    /// surfaced this quirk drove the actual fix to a process-wide
-    /// [`INGEST_SERIALIZER`] mutex.
+    /// S410 / [[no-sql-specific]] — the APP LAYER is the authoritative
+    /// dedup gate, NOT the DB's `UNIQUE`. This test asserts that
+    /// `ingest_incoming_invoice` dedups a repeated
+    /// `(tenant, supplier_tax, nav_invoice_number)` to exactly one row
+    /// **even though** the raw DB `UNIQUE` provably does not fire across
+    /// two `Connection::open` handles in the same process.
     ///
-    /// The pin is preserved as a defence: a future duckdb-rs /
-    /// bundled-DuckDB upgrade that DOES enforce UNIQUE across
-    /// in-process connections would flip this test, prompting a
-    /// reconsideration of whether the mutex is still load-bearing.
-    /// A reviewer hitting that diff should also re-evaluate the
-    /// `is_duplicate_key_violation` helper's role.
+    /// Part 1 establishes the rationale (the DB cannot be trusted as the
+    /// gate): two manual connections both INSERT the same key and BOTH
+    /// succeed. Part 2 asserts the behaviour that replaced reliance on
+    /// that constraint: the real ingest path (`find_existing_id` probe
+    /// under [`INGEST_SERIALIZER`]) returns `AlreadyExists` and leaves a
+    /// single row — engine-independent, exactly what
+    /// [[no-sql-specific]] requires.
+    ///
+    /// Pre-S410 this test merely *documented the quirk* (asserted the
+    /// raw double-INSERT succeeds). It now asserts the app-layer gate,
+    /// so it fails if dedup ever silently starts depending on the engine.
     #[test]
-    fn duckdb_unique_constraint_does_not_fire_across_two_connections_documented_quirk() {
-        let dir = ScopedTempDir::new("dup-key-cross-conn");
-        let db_path = dir.path().join("tenant.duckdb");
+    fn app_layer_dedup_is_authoritative_even_though_db_unique_does_not_fire() {
+        // ── Part 1: the DB UNIQUE does NOT fire cross-connection. ──
+        // (This is *why* the app layer must be authoritative; it is a
+        // demonstration of the engine's limitation, not the dedup gate.)
+        let raw_dir = ScopedTempDir::new("dup-key-cross-conn-raw");
+        let raw_db = raw_dir.path().join("tenant.duckdb");
         {
-            let conn = Connection::open(&db_path).unwrap();
+            let conn = Connection::open(&raw_db).unwrap();
             ensure_schema(&conn).unwrap();
         }
-        let conn1 = Connection::open(&db_path).unwrap();
-        let conn2 = Connection::open(&db_path).unwrap();
+        let conn1 = Connection::open(&raw_db).unwrap();
+        let conn2 = Connection::open(&raw_db).unwrap();
         let insert_sql = "INSERT INTO ap_invoice (
                 id, tenant_id, supplier_tax_number, supplier_name, supplier_address,
                 nav_invoice_number, issue_date, delivery_date, payment_deadline,
@@ -1707,25 +1746,63 @@ mod tests {
                        0, 0, 0, 'HUF',
                        'Outstanding', NULL, NULL, '2026-05-30T00:00:00Z',
                        '2026-05-30T00:00:00Z');";
-        // First insert succeeds (any DuckDB, expected).
         conn1
             .execute(insert_sql, duckdb::params!["apinv_first"])
-            .expect("first insert (conn 1) must succeed");
-        // Second insert with the same key from a SEPARATE connection
-        // — also succeeds today, surfacing the quirk this PR's
-        // mutex defends against. If a future DuckDB upgrade flips
-        // this to a UNIQUE violation, the assertion below will
-        // fail loudly and the mutex's rationale can be revisited.
-        let second_result = conn2.execute(insert_sql, duckdb::params!["apinv_second"]);
+            .expect("first raw insert must succeed");
+        let second_raw = conn2.execute(insert_sql, duckdb::params!["apinv_second"]);
         assert!(
-            second_result.is_ok(),
-            "QUIRK: same-process cross-connection INSERT with the same UNIQUE \
-             key currently succeeds in DuckDB {}; if this assertion flips, \
-             revisit `INGEST_SERIALIZER`'s rationale",
-            second_result
-                .err()
-                .map(|e| format!("{e:?}"))
-                .unwrap_or_default(),
+            second_raw.is_ok(),
+            "precondition: DuckDB UNIQUE does not fire cross-connection, so the \
+             app layer must be the gate; if this flips, the app-layer assertion \
+             below is what still guarantees correctness"
+        );
+
+        // ── Part 2: the app-layer ingest path IS authoritative. ──
+        let dir = ScopedTempDir::new("dup-key-app-layer");
+        let db_path = dir.path().join("tenant.duckdb");
+        let artifacts_dir = dir.path().join("ap-artifacts");
+        let tenant = fixture_tenant();
+        let bh = fixture_binary_hash();
+
+        let first = ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "op",
+            &artifacts_dir,
+            fixture_input(),
+        )
+        .expect("first ingest");
+        let first_id = match first {
+            IngestOutcome::Created { id } => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        // A SECOND ingest of the SAME key (a fresh `Connection::open`
+        // inside the call — the very scenario Part 1 proves the DB does
+        // not guard) must dedup via the probe, NOT insert a duplicate.
+        let second = ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "op",
+            &artifacts_dir,
+            fixture_input(),
+        )
+        .expect("second ingest");
+        match second {
+            IngestOutcome::AlreadyExists { id } => assert_eq!(
+                id, first_id,
+                "app-layer dedup must echo the surviving row id"
+            ),
+            other => panic!("expected AlreadyExists (app-layer gate), got {other:?}"),
+        }
+
+        let rows = list_incoming(&db_path, tenant.as_str(), None, 100, 0).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "app-layer probe must keep exactly one row despite the DB UNIQUE not firing"
         );
     }
 

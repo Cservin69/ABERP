@@ -240,7 +240,9 @@ pub struct ComplexityRuleInputs {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ComplexityRule {
-    pub id: i64,
+    /// App-minted prefixed ULID (`qcr_…`). S410 / [[no-sql-specific]] —
+    /// was a DB-sequence `BIGINT`; the PK is now minted in Rust.
+    pub id: String,
     pub feature_type: String,
     pub size_bucket: String,
     pub count_min: i64,
@@ -320,7 +322,9 @@ pub struct StockAdjustmentInputs {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StockAdjustment {
-    pub id: i64,
+    /// App-minted prefixed ULID (`qsa_…`). S410 / [[no-sql-specific]] —
+    /// was a DB-sequence `BIGINT`; the PK is now minted in Rust.
+    pub id: String,
     pub grade: String,
     pub stock_status: String,
     pub price_adjustment_pct: f64,
@@ -377,10 +381,15 @@ impl From<anyhow::Error> for TunableWriteError {
 
 // ── Schema ──────────────────────────────────────────────────────────────
 
+// S410 / [[no-sql-specific]] — no `CREATE SEQUENCE` / `DEFAULT nextval()`.
+// `CREATE SEQUENCE` is a DuckDB/Postgres-only object with no portable
+// equivalent (SQLite / Elasticsearch have none); it was the only
+// engine-minted identity in the codebase. The PK is now an app-minted
+// prefixed ULID (`qcr_…`), like every other table (`inv_…`, `mvt_…`,
+// `dsp_…`), generated in `create_complexity_rule`.
 const COMPLEXITY_RULES_SCHEMA_SQL: &str = "
-CREATE SEQUENCE IF NOT EXISTS quoting_complexity_rules_id_seq;
 CREATE TABLE IF NOT EXISTS quoting_complexity_rules (
-    id                    BIGINT  NOT NULL PRIMARY KEY DEFAULT nextval('quoting_complexity_rules_id_seq'),
+    id                    VARCHAR NOT NULL PRIMARY KEY,
     tenant_id             VARCHAR NOT NULL,
     feature_type          VARCHAR NOT NULL,
     size_bucket           VARCHAR NOT NULL,
@@ -423,10 +432,11 @@ CREATE TABLE IF NOT EXISTS quoting_parameters (
 );
 ";
 
+// S410 / [[no-sql-specific]] — see `COMPLEXITY_RULES_SCHEMA_SQL` above.
+// App-minted prefixed ULID (`qsa_…`), no `CREATE SEQUENCE` / `nextval`.
 const STOCK_ADJUSTMENTS_SCHEMA_SQL: &str = "
-CREATE SEQUENCE IF NOT EXISTS quoting_stock_adjustments_id_seq;
 CREATE TABLE IF NOT EXISTS quoting_stock_adjustments (
-    id                    BIGINT  NOT NULL PRIMARY KEY DEFAULT nextval('quoting_stock_adjustments_id_seq'),
+    id                    VARCHAR NOT NULL PRIMARY KEY,
     tenant_id             VARCHAR NOT NULL,
     grade                 VARCHAR NOT NULL,
     stock_status          VARCHAR NOT NULL,
@@ -678,13 +688,18 @@ pub fn create_complexity_rule(
         .transaction()
         .context("begin create_complexity_rule tx")
         .map_err(TunableWriteError::Other)?;
+    // S410 / [[no-sql-specific]] — app-mint the PK (prefixed ULID), no
+    // DB sequence. ULID is globally unique, so no read-back-by-natural-key
+    // round-trip is needed to learn the id.
+    let id = format!("qcr_{}", Ulid::new());
     tx.execute(
         "INSERT INTO quoting_complexity_rules (
-            tenant_id, feature_type, size_bucket, count_min, count_max,
+            id, tenant_id, feature_type, size_bucket, count_min, count_max,
             base_time_minutes, multiplier, setup_penalty_minutes,
             notes, updated_at, updated_by_actor
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
         params![
+            &id,
             tenant,
             &ft,
             &sb,
@@ -700,16 +715,7 @@ pub fn create_complexity_rule(
     )
     .context("INSERT quoting_complexity_rules")
     .map_err(TunableWriteError::Other)?;
-    let id: i64 = tx
-        .query_row(
-            "SELECT id FROM quoting_complexity_rules
-             WHERE tenant_id = ? AND feature_type = ? AND size_bucket = ? AND count_min = ?;",
-            params![tenant, &ft, &sb, inputs.count_min],
-            |r| r.get(0),
-        )
-        .context("read back complexity_rule id")
-        .map_err(TunableWriteError::Other)?;
-    let row = read_complexity_rule_in_tx(&tx, tenant, id).map_err(TunableWriteError::Other)?;
+    let row = read_complexity_rule_in_tx(&tx, tenant, &id).map_err(TunableWriteError::Other)?;
     append_tunable_change(
         &tx,
         meta,
@@ -736,7 +742,7 @@ pub fn update_complexity_rule(
     meta: &LedgerMeta,
     actor_login: &str,
     tenant: &str,
-    id: i64,
+    id: &str,
     inputs: &ComplexityRuleInputs,
 ) -> Result<ComplexityRule, TunableWriteError> {
     if let Err(e) = validate_complexity_rule(inputs) {
@@ -828,7 +834,7 @@ pub fn delete_complexity_rule(
     meta: &LedgerMeta,
     actor_login: &str,
     tenant: &str,
-    id: i64,
+    id: &str,
 ) -> Result<(), TunableWriteError> {
     let tx = conn
         .transaction()
@@ -1258,12 +1264,16 @@ pub fn create_stock_adjustment(
         .transaction()
         .context("begin create_stock_adjustment tx")
         .map_err(TunableWriteError::Other)?;
+    // S410 / [[no-sql-specific]] — app-mint the PK (prefixed ULID), no
+    // DB sequence; ULID uniqueness removes the read-back-by-natural-key.
+    let id = format!("qsa_{}", Ulid::new());
     tx.execute(
         "INSERT INTO quoting_stock_adjustments (
-            tenant_id, grade, stock_status, price_adjustment_pct,
+            id, tenant_id, grade, stock_status, price_adjustment_pct,
             notes, updated_at, updated_by_actor
-         ) VALUES (?, ?, ?, ?, ?, ?, ?);",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
         params![
+            &id,
             tenant,
             &grade,
             status,
@@ -1275,16 +1285,7 @@ pub fn create_stock_adjustment(
     )
     .context("INSERT quoting_stock_adjustments")
     .map_err(TunableWriteError::Other)?;
-    let id: i64 = tx
-        .query_row(
-            "SELECT id FROM quoting_stock_adjustments
-             WHERE tenant_id = ? AND grade = ? AND stock_status = ?;",
-            params![tenant, &grade, status],
-            |r| r.get(0),
-        )
-        .context("read back stock_adjustment id")
-        .map_err(TunableWriteError::Other)?;
-    let row = read_stock_adjustment_in_tx(&tx, tenant, id).map_err(TunableWriteError::Other)?;
+    let row = read_stock_adjustment_in_tx(&tx, tenant, &id).map_err(TunableWriteError::Other)?;
     append_tunable_change(
         &tx,
         meta,
@@ -1310,7 +1311,7 @@ pub fn update_stock_adjustment(
     meta: &LedgerMeta,
     actor_login: &str,
     tenant: &str,
-    id: i64,
+    id: &str,
     inputs: &StockAdjustmentInputs,
 ) -> Result<StockAdjustment, TunableWriteError> {
     if let Err(e) = validate_stock_adjustment(inputs) {
@@ -1398,7 +1399,7 @@ pub fn delete_stock_adjustment(
     meta: &LedgerMeta,
     actor_login: &str,
     tenant: &str,
-    id: i64,
+    id: &str,
 ) -> Result<(), TunableWriteError> {
     let tx = conn
         .transaction()
@@ -1475,7 +1476,7 @@ fn row_to_complexity_rule(row: &duckdb::Row<'_>) -> duckdb::Result<ComplexityRul
 fn read_complexity_rule_in_tx(
     tx: &duckdb::Transaction<'_>,
     tenant: &str,
-    id: i64,
+    id: &str,
 ) -> Result<ComplexityRule> {
     read_complexity_rule_in_tx_opt(tx, tenant, id)?
         .with_context(|| format!("complexity_rule row vanished mid-tx for id {id}"))
@@ -1484,7 +1485,7 @@ fn read_complexity_rule_in_tx(
 fn read_complexity_rule_in_tx_opt(
     tx: &duckdb::Transaction<'_>,
     tenant: &str,
-    id: i64,
+    id: &str,
 ) -> Result<Option<ComplexityRule>> {
     let mut stmt = tx.prepare(
         "SELECT id, feature_type, size_bucket, count_min, count_max,
@@ -1577,7 +1578,7 @@ fn row_to_stock_adjustment(row: &duckdb::Row<'_>) -> duckdb::Result<StockAdjustm
 fn read_stock_adjustment_in_tx(
     tx: &duckdb::Transaction<'_>,
     tenant: &str,
-    id: i64,
+    id: &str,
 ) -> Result<StockAdjustment> {
     read_stock_adjustment_in_tx_opt(tx, tenant, id)?
         .with_context(|| format!("stock_adjustment row vanished mid-tx for id {id}"))
@@ -1586,7 +1587,7 @@ fn read_stock_adjustment_in_tx(
 fn read_stock_adjustment_in_tx_opt(
     tx: &duckdb::Transaction<'_>,
     tenant: &str,
-    id: i64,
+    id: &str,
 ) -> Result<Option<StockAdjustment>> {
     let mut stmt = tx.prepare(
         "SELECT id, grade, stock_status, price_adjustment_pct,
@@ -1728,7 +1729,8 @@ mod tests {
         };
         let created = create_complexity_rule(&mut c, &m, "ervin", TENANT, &r).expect("create");
         assert_eq!(created.feature_type, "hole");
-        assert!(created.id > 0);
+        // S410 — app-minted prefixed ULID, not a positive integer.
+        assert!(created.id.starts_with("qcr_"));
 
         // Duplicate composite key → Conflict.
         let dup = create_complexity_rule(&mut c, &m, "ervin", TENANT, &r);
@@ -1739,12 +1741,12 @@ mod tests {
         updated_inputs.base_time_minutes = 0.7;
         updated_inputs.multiplier = 1.2;
         let updated =
-            update_complexity_rule(&mut c, &m, "ervin", TENANT, created.id, &updated_inputs)
+            update_complexity_rule(&mut c, &m, "ervin", TENANT, &created.id, &updated_inputs)
                 .expect("update");
         assert!((updated.base_time_minutes - 0.7).abs() < 1e-9);
 
         // Delete.
-        delete_complexity_rule(&mut c, &m, "ervin", TENANT, created.id).expect("delete");
+        delete_complexity_rule(&mut c, &m, "ervin", TENANT, &created.id).expect("delete");
         assert!(list_complexity_rules(&c, TENANT).expect("list").is_empty());
 
         assert_eq!(count_audit(&c, "quote.complexity_rules_changed"), 3);
@@ -1853,6 +1855,8 @@ mod tests {
         let created =
             create_stock_adjustment(&mut c, &m, "ervin", TENANT, &inputs).expect("create");
         assert_eq!(created.grade, "6061-T6");
+        // S410 — app-minted prefixed ULID, not a positive integer.
+        assert!(created.id.starts_with("qsa_"));
 
         // Unknown grade → Validation error.
         let ghost = StockAdjustmentInputs {
@@ -1872,14 +1876,91 @@ mod tests {
         let mut updated_inputs = inputs.clone();
         updated_inputs.price_adjustment_pct = -0.10;
         let updated =
-            update_stock_adjustment(&mut c, &m, "ervin", TENANT, created.id, &updated_inputs)
+            update_stock_adjustment(&mut c, &m, "ervin", TENANT, &created.id, &updated_inputs)
                 .expect("update");
         assert!((updated.price_adjustment_pct + 0.10).abs() < 1e-9);
 
-        delete_stock_adjustment(&mut c, &m, "ervin", TENANT, created.id).expect("delete");
+        delete_stock_adjustment(&mut c, &m, "ervin", TENANT, &created.id).expect("delete");
         assert!(list_stock_adjustments(&c, TENANT).expect("list").is_empty());
 
         assert_eq!(count_audit(&c, "quote.stock_adjustments_changed"), 3);
+    }
+
+    /// S410 / [[no-sql-specific]] — the PK used to be a DuckDB
+    /// `CREATE SEQUENCE` + `nextval()` (engine-serialized identity). It
+    /// is now an app-minted prefixed ULID. This pins the property that
+    /// replaced the sequence: ids are globally unique even when inserts
+    /// run concurrently. Each thread runs the real `create_*` insert
+    /// path against its own in-memory DB (so the test is deterministic,
+    /// not subject to DuckDB write-write timing); uniqueness across them
+    /// is purely the app-layer ULID guarantee the sequence used to
+    /// provide. If someone reintroduces a per-DB counter, two threads
+    /// would mint `qcr_…1` and this fails.
+    #[test]
+    fn app_minted_ids_are_unique_under_concurrent_insert() {
+        use std::collections::HashSet;
+
+        let inputs = ComplexityRuleInputs {
+            feature_type: "hole".to_string(),
+            size_bucket: "S".to_string(),
+            count_min: 1,
+            count_max: Some(10),
+            base_time_minutes: 0.5,
+            multiplier: 1.0,
+            setup_penalty_minutes: 0.0,
+            notes: None,
+        };
+        let stock = StockAdjustmentInputs {
+            grade: "6061-T6".to_string(),
+            stock_status: "in_stock".to_string(),
+            price_adjustment_pct: -0.05,
+            notes: None,
+        };
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let ci = inputs.clone();
+            let si = stock.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut c = conn();
+                // 6061-T6 material must exist for the stock-adjustment FK gate.
+                crate::quoting_materials::create_material(
+                    &mut c,
+                    &meta(),
+                    "ervin",
+                    TENANT,
+                    &crate::quoting_materials::MaterialInputs {
+                        grade: "6061-T6".to_string(),
+                        display_name: "Aluminium".to_string(),
+                        density_g_cm3: 2.7,
+                        cost_per_kg_eur: 6.0,
+                        machinability_index: 1.0,
+                        carbide_life_multiplier: 1.0,
+                        stock_status: "in_stock".to_string(),
+                        lead_time_default_days: 0,
+                        quote_multiplier: 1.0,
+                        notes: None,
+                    },
+                )
+                .expect("seed material");
+                let cr = create_complexity_rule(&mut c, &meta(), "ervin", TENANT, &ci)
+                    .expect("create complexity rule");
+                let sa = create_stock_adjustment(&mut c, &meta(), "ervin", TENANT, &si)
+                    .expect("create stock adjustment");
+                (cr.id, sa.id)
+            }));
+        }
+
+        let mut ids: HashSet<String> = HashSet::new();
+        for h in handles {
+            let (cr_id, sa_id) = h.join().expect("thread panicked");
+            assert!(cr_id.starts_with("qcr_"), "complexity id prefix: {cr_id}");
+            assert!(sa_id.starts_with("qsa_"), "stock id prefix: {sa_id}");
+            assert!(ids.insert(cr_id), "duplicate complexity-rule id minted");
+            assert!(ids.insert(sa_id), "duplicate stock-adjustment id minted");
+        }
+        // 16 threads × 2 rows, all distinct.
+        assert_eq!(ids.len(), 32, "all app-minted ids must be unique");
     }
 
     #[test]

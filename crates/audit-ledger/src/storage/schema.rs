@@ -1,7 +1,20 @@
 //! DuckDB schema for the audit-ledger table.
 //!
 //! Single table, one row per entry. Per ADR-0019, no foreign keys.
-//! `CHECK(seq >= 1)` rejects garbage at the schema boundary.
+//!
+//! # No DB-level `CHECK` (S410 — [[no-sql-specific]])
+//!
+//! This table used to carry `CHECK (seq >= 1)` and `CHECK (time_mono >= 0)`.
+//! They were the same class of invariant the S341 `UNIQUE`-drop below
+//! addressed — schema-encoded constraints that do not survive an engine
+//! swap — yet they outlived that cleanup. They are now DROPPED. The
+//! invariants live in Rust: `seq` is minted only via
+//! [`crate::entry::Sequence::FIRST`] / [`crate::entry::Sequence::next`]
+//! (both `≥ 1` by construction; [`crate::entry::Sequence::new`] rejects
+//! `0`), and `time_mono` is an app-supplied monotonic reading that is
+//! `≥ 0` by construction. Both columns are covered by the tamper-evident
+//! hash chain (`verify_chain`), which detects any forged/garbage value
+//! regardless of what the engine would have enforced.
 //!
 //! # No `UNIQUE` constraints (S341 — duckdb#23046 / S332)
 //!
@@ -42,10 +55,10 @@
 pub const CREATE_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS audit_ledger (
     id              VARCHAR     NOT NULL,
-    seq             BIGINT      NOT NULL CHECK (seq >= 1),
+    seq             BIGINT      NOT NULL,
     prev_hash       BLOB        NOT NULL,
     time_wall       VARCHAR     NOT NULL,
-    time_mono       BIGINT      NOT NULL CHECK (time_mono >= 0),
+    time_mono       BIGINT      NOT NULL,
     actor           VARCHAR     NOT NULL,
     binary_hash     BLOB        NOT NULL,
     tenant_id       VARCHAR     NOT NULL,
