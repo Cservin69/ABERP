@@ -21,7 +21,7 @@ from typing import List
 from pydantic import BaseModel, ConfigDict, Field
 
 
-SCHEMA_VERSION: int = 1
+SCHEMA_VERSION: int = 2
 
 
 class FeatureType(str, Enum):
@@ -76,6 +76,10 @@ class FeatureGraph(BaseModel):
     )
     bounding_box_mm: List[float] = Field(min_length=3, max_length=3)
     volume_mm3: float = Field(ge=0.0)
+    # Schema v2 (S418): total surface area in mm², drives finishing-pass
+    # machining time in the engine (report §5.2). STL = Σ ½‖(v1−v0)×
+    # (v2−v0)‖ over triangles; STEP = ``BRepGProp.SurfaceProperties``.
+    surface_area_mm2: float = Field(ge=0.0)
     material_grade: str = Field(min_length=1)
     features: List[Feature]
 

@@ -184,12 +184,22 @@ pub struct FeatureGraph {
     /// the wire. The wrapper refuses graphs with an unknown version.
     #[serde(rename = "_schema_version")]
     pub schema_version: u32,
-    /// XYZ bounding-box extent in millimetres. Used by downstream
-    /// surfacing on the PDF, not in the v1 scoring math (volume
-    /// drives material cost).
+    /// XYZ bounding-box extent in millimetres. S418: now a first-class
+    /// scoring input — material is billed on the stock block
+    /// `bbox × (1 + scrap_factor)` (report §6.4) and roughing time is
+    /// driven by `stock − part` removed volume (report §5.1).
     pub bounding_box_mm: [f64; 3],
     /// Solid volume in mm³ (after extraction, before scrap).
     pub volume_mm3: f64,
+    /// Total surface area in mm² (schema v2, S418). Drives the
+    /// finishing-pass machining time (report §5.2). STL: Σ ½‖(v1−v0)×
+    /// (v2−v0)‖ over triangles; STEP: `BRepGProp::SurfaceProperties`.
+    /// `#[serde(default)]` keeps the engine fail-soft on a v1 graph or
+    /// a corrupt extractor: a non-positive value falls back to the
+    /// bounding-box surface area `2(xy+yz+zx)` inside the engine
+    /// (report §5.4) rather than zeroing finishing time.
+    #[serde(default)]
+    pub surface_area_mm2: f64,
     /// Material grade as it appears in `quoting_materials.grade`
     /// (S266) — e.g. `6061-T6`. The engine errors with
     /// [`crate::QuoteError::MaterialNotInCatalogue`] if no row matches.
@@ -214,6 +224,8 @@ pub struct FeatureGraph {
 impl FeatureGraph {
     /// The schema version this build of the engine understands. The
     /// wrapper (S270) compares this against the value in the JSON
-    /// and refuses unknown versions loud.
-    pub const SCHEMA_VERSION: u32 = 1;
+    /// and refuses unknown versions loud. **v2 (S418)** added
+    /// `surface_area_mm2`; the Python `SCHEMA_VERSION` and the
+    /// wrapper's `EXPECTED_SCHEMA_VERSION` bump in lockstep.
+    pub const SCHEMA_VERSION: u32 = 2;
 }

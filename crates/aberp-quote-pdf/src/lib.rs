@@ -20,7 +20,7 @@
 //!
 //! A4, paginated. Header band with ABERP wordmark + "Indicative
 //! Quote". Customer block. Part summary (material grade, qty, bbox,
-//! volume). Price-breakdown table (material / labor / setup /
+//! volume). Price-breakdown table (material / machining / CAD-CAM / setup /
 //! overhead / margin / TOTAL). The FULL reasoning_log (S404 — every
 //! line, flowing onto continuation pages, never truncated).
 //! Addendum-1 visibility band: "Routing: 5-axis machine" if
@@ -124,6 +124,19 @@ const DANGER_RED: Color = (0.75, 0.0, 0.0);
 /// stay in sync with it. Mirrors the invoice's ELADÓ name + ADÓSZÁM.
 const SELLER_LEGAL_NAME: &str = "Áben Consulting KFT.";
 const SELLER_TAX_NUMBER: &str = "24904362-2-41";
+
+/// S418 — Incoterm note under the price total (report §1.4). EXW = the
+/// price covers the manufactured part(s), made available + packed at
+/// our facility, ready for collection; loading, transport, insurance,
+/// export/import clearance, duties and any taxes beyond Hungarian VAT
+/// are the buyer's. Condensed to one PDF line each (the full §1.4
+/// paragraph does not fit the content width at font 8); the storefront
+/// + customer email carry the long form. Baked as literals — same
+/// single-tenant posture as the seller identity above.
+const EXW_NOTE_EN: &str =
+    "Prices EXW (Ex Works, Incoterms 2020), Hungary - transport, customs and taxes beyond Hungarian VAT are the buyer's.";
+const EXW_NOTE_HU: &str =
+    "Az árak EXW (gyári átvétel, Incoterms 2020), Magyarország - a szállítás, a vám és az áfán felüli adók a vevőt terhelik.";
 
 /// What the renderer needs to produce one indicative quote PDF.
 #[derive(Debug, Clone)]
@@ -438,7 +451,11 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Vec<Operation>> {
     let b = inputs.breakdown;
     push_money_row(&mut ops, y, "Material", b.material_cost);
     y -= 14;
-    push_money_row(&mut ops, y, "Labor", b.labor_cost);
+    // S418 — "Labor" → "Machining" (geometry-driven), plus the new
+    // one-time CAD-CAM design line.
+    push_money_row(&mut ops, y, "Machining", b.machining_cost);
+    y -= 14;
+    push_money_row(&mut ops, y, "CAD-CAM (design)", b.cad_cam_cost);
     y -= 14;
     push_money_row(&mut ops, y, "Setup", b.setup_cost);
     y -= 14;
@@ -451,7 +468,14 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Vec<Operation>> {
     // banner. Every other rule in this document stays silver.
     push_rule_gold(&mut ops, MARGIN_LEFT, MARGIN_RIGHT, y + 6);
     push_money_row_bold(&mut ops, y, "TOTAL (EUR)", b.total_price);
-    y -= 28;
+    y -= 16;
+    // S418 — Incoterm note directly under the total (report §1.4). The
+    // price covers the manufactured part(s) ready for collection at our
+    // facility; everything past the gate is the buyer's.
+    push_text_c(&mut ops, MARGIN_LEFT, y, "F1", 8, MUTED, EXW_NOTE_EN);
+    y -= 11;
+    push_text_c(&mut ops, MARGIN_LEFT, y, "F1", 8, MUTED, EXW_NOTE_HU);
+    y -= 24;
 
     // ── Reasoning log (FULL — every line, no cap) ──────────────────
     //
@@ -779,9 +803,10 @@ mod tests {
 
     fn fake_graph(requires_5_axis: bool, thin_wall: bool) -> FeatureGraph {
         FeatureGraph {
-            schema_version: 1,
+            schema_version: 2,
             bounding_box_mm: [50.0, 30.0, 20.0],
             volume_mm3: 12345.6,
+            surface_area_mm2: 6200.0,
             material_grade: "AL_6061_T6".to_string(),
             features: vec![Feature {
                 feature_type: FeatureType::Hole,
@@ -796,7 +821,8 @@ mod tests {
     fn fake_breakdown() -> QuoteBreakdown {
         QuoteBreakdown {
             material_cost: 1.23,
-            labor_cost: 9.87,
+            machining_cost: 9.87,
+            cad_cam_cost: 2.10,
             setup_cost: 4.56,
             overhead: 1.50,
             margin: 3.84,

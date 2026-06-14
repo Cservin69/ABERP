@@ -18,7 +18,7 @@ function mat(over: Partial<QuotingMaterial>): QuotingMaterial {
     display_name: "X",
     density_g_cm3: 1,
     cost_per_kg_eur: 1,
-    machinability_index: 1,
+    machining_difficulty: 1,
     carbide_life_multiplier: 1,
     stock_status: "in_stock",
     lead_time_default_days: 0,

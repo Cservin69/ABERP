@@ -28,7 +28,8 @@ def test_cli_emits_valid_feature_graph_json(cube_stl_path: Path):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     # Addendum 1: both booleans present in the wire output, typed bool.
-    assert payload["_schema_version"] == 1
+    assert payload["_schema_version"] == 2
+    assert "surface_area_mm2" in payload
     assert "requires_5_axis" in payload
     assert "thin_wall_present" in payload
     assert isinstance(payload["requires_5_axis"], bool)
@@ -65,9 +66,10 @@ def test_cli_step_extension_routes_to_step_extractor():
     if ocp_available:
         assert result.returncode == 0, result.stderr
         payload = json.loads(result.stdout)
-        assert payload["_schema_version"] == 1
+        assert payload["_schema_version"] == 2
         assert payload["bounding_box_mm"] == [20.0, 20.0, 20.0]
         assert payload["volume_mm3"] == pytest.approx(8000.0, abs=1e-3)
+        assert payload["surface_area_mm2"] == pytest.approx(2400.0, abs=1e-2)
     else:
         assert result.returncode == 2
         err = json.loads(result.stderr)

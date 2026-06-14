@@ -24,9 +24,10 @@ from aberp_cad_extract.feature_graph import (
 
 def _valid_payload() -> dict:
     return {
-        "_schema_version": 1,
+        "_schema_version": 2,
         "bounding_box_mm": [50.0, 30.0, 20.0],
         "volume_mm3": 25_000.0,
+        "surface_area_mm2": 6200.0,
         "material_grade": "6061-T6",
         "features": [
             {"feature_type": "hole", "count": 4, "representative_size_mm": 6.0},
@@ -44,7 +45,7 @@ def test_valid_payload_round_trips_through_wire_aliases():
     # Wire-name preservation: '_schema_version', NOT 'schema_version'.
     assert "_schema_version" in canonical
     assert "schema_version" not in canonical
-    assert canonical["_schema_version"] == 1
+    assert canonical["_schema_version"] == 2
     # All addendum-1 booleans present and typed.
     assert canonical["requires_5_axis"] is False
     assert canonical["thin_wall_present"] is False
@@ -54,10 +55,11 @@ def test_valid_payload_round_trips_through_wire_aliases():
 
 
 def test_schema_version_constant_matches_default():
-    assert SCHEMA_VERSION == 1
+    assert SCHEMA_VERSION == 2
     fg = FeatureGraph(
         bounding_box_mm=[10.0, 10.0, 10.0],
         volume_mm3=1000.0,
+        surface_area_mm2=600.0,
         material_grade="6061-T6",
         features=[],
         requires_5_axis=False,
@@ -137,6 +139,23 @@ def test_extra_field_rejected():
 def test_negative_volume_rejected():
     payload = _valid_payload()
     payload["volume_mm3"] = -1.0
+    with pytest.raises(ValidationError):
+        FeatureGraph.model_validate(payload)
+
+
+def test_missing_surface_area_fails_validation():
+    # Schema v2 (S418) — surface_area_mm2 is a required field; omitting
+    # it must fail loud, mirroring the Rust-side contract.
+    payload = _valid_payload()
+    del payload["surface_area_mm2"]
+    with pytest.raises(ValidationError) as exc:
+        FeatureGraph.model_validate(payload)
+    assert "surface_area_mm2" in str(exc.value)
+
+
+def test_negative_surface_area_rejected():
+    payload = _valid_payload()
+    payload["surface_area_mm2"] = -1.0
     with pytest.raises(ValidationError):
         FeatureGraph.model_validate(payload)
 

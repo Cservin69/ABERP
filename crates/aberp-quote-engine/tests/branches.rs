@@ -25,7 +25,7 @@ fn baseline_no_thin_wall_standard_tol() {
     .expect("baseline quote should succeed");
 
     assert!(r.material_cost > 0.0);
-    assert!(r.labor_cost > 0.0);
+    assert!(r.machining_cost > 0.0);
     assert!(r.total_price > 0.0);
     assert!(!r.route_to_5_axis);
     assert!(
@@ -91,13 +91,13 @@ fn thin_wall_present_precision_tol_applies_bump() {
     )
     .unwrap();
 
-    // Precision labor incorporates: tolerance_mult (1.9 vs 1.0),
+    // Precision machining incorporates: tolerance_mult (1.9 vs 1.0),
     // inspection minutes (1.5 vs 0.0 per feature), AND the
     // THIN_WALL_TIGHT_TOL_BUMP=1.15. Just assert "precision > std"
     // and the bump line appears in the log.
     assert!(
-        r_prec.labor_cost > r_std.labor_cost,
-        "Precision labor must exceed Standard"
+        r_prec.machining_cost > r_std.machining_cost,
+        "Precision machining must exceed Standard"
     );
     assert!(r_prec
         .reasoning_log

@@ -95,7 +95,7 @@ pub use aberp_quote_engine::FeatureGraph;
 /// accepts. Bump in the same diff as the Python extractor when the
 /// schema evolves; [`ExtractError::SchemaVersionMismatch`] surfaces a
 /// mismatch loud rather than silently mis-parsing fields.
-pub const EXPECTED_SCHEMA_VERSION: u32 = 1;
+pub const EXPECTED_SCHEMA_VERSION: u32 = 2;
 
 /// Default subprocess timeout. The operator-click-to-quote flow
 /// targets 1–2 seconds end-to-end; 30 seconds is the "something is

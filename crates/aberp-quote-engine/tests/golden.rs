@@ -18,30 +18,34 @@ fn round4(v: f64) -> f64 {
 #[test]
 fn fixed_input_produces_locked_numeric_output_at_4dp() {
     // Setup is `simple_feature_graph` + `default_*` fixtures with
-    // qty=10 + Standard tolerance.
+    // qty=10 + Standard tolerance, under the S418 geometry model
+    // (report §5/§8 day-1 params; surface_area_mm2=0 → bbox fallback).
     //
     // Hand-derivation (matches the algorithm in `src/engine.rs`):
-    //   scrap_volume    = 25000 * 1.08            = 27000
-    //   mass_kg         = 27000 * 2.70 / 1e6      = 0.0729
-    //   material_cost   = 0.0729 * 8.0            = 0.5832
-    //   (no stock adj, not exotic)
+    //   bbox 50×30×20 = 30000 mm³; stock = 30000 * 1.15 = 34500
+    //   mass_kg       = 34500 * 2.70 / 1e6        = 0.09315
+    //   material_cost = 0.09315 * 8.0             = 0.7452
+    //   (no stock adj, 6061 not exotic)
     //
-    //   features:
-    //     Hole/XS/count=4: 2.0 * 4 * 1.0 = 8 min, rule#2  setup=5
-    //     Pocket/S/count=1: 2.0 * 1 * 1.0 = 2 min, rule#7 setup=5
-    //   machining_minutes = 10
-    //   unique-rule setup_penalty = 5 + 5 = 10 min
-    //   inspection_minutes = 0 (Standard tol)
+    //   removed_cm3   = (34500 - 25000)/1000      = 9.5
+    //   roughing_min  = 9.5 * 1.0 / 8.0           = 1.1875
+    //   bbox_area     = 2*(1500+600+1000)         = 6200 mm² = 62 cm²
+    //   finishing_min = 62 * 0.08 * 1.0           = 4.96
+    //   feature time  = Hole(2*4) + Pocket(2*1)   = 10
+    //   machining_minutes = 1.1875 + 4.96 + 10    = 16.1475
+    //   inspection    = 0 (Standard tol)
+    //   machining_cost = 16.1475 * 1.6667 * 1.0   = 26.91303825
     //
-    //   labor_cost = (10 / 1.2 + 0) * 1.50 * 1.0  = 12.5
-    //   (no thin-wall bump; quote_multiplier=1)
+    //   setup_minutes = 20 + 0 + (5+5 rule)       = 30
+    //   setup_cost    = 30 * 1.6667 / 10          = 5.0001  (qty 10 ≥ 5)
     //
-    //   setup_cost = 10 * 1.50 / 10               = 1.5     (qty=10 >= threshold=5)
+    //   cad_cam: base 1.0 (fill 0.833 ≥0.60, no flags, soft material)
+    //   cad_cam_cost  = 1.0 * 100 / 10            = 10.0
     //
-    //   subtotal   = 0.5832 + 12.5 + 1.5          = 14.5832
-    //   overhead   = 14.5832 * 0.20               = 2.91664
-    //   margin     = (14.5832 + 2.91664) * 0.35   = 6.124944
-    //   total      = 23.624784
+    //   subtotal = 0.7452 + 26.91303825 + 5.0001 + 10.0 = 42.65833825
+    //   overhead = * 0.20                          = 8.5316677
+    //   margin   = (subtotal+overhead) * 0.35      = 17.9165021
+    //   total    = 69.1065080
     //   actual margin/total ≈ 0.2593 (> 0.10 floor)
 
     let materials = vec![default_material("6061-T6")];
@@ -58,13 +62,14 @@ fn fixed_input_produces_locked_numeric_output_at_4dp() {
     )
     .expect("golden quote must succeed");
 
-    assert_eq!(round4(r.material_cost), 0.5832, "material_cost");
-    assert_eq!(round4(r.labor_cost), 12.5000, "labor_cost");
-    assert_eq!(round4(r.setup_cost), 1.5000, "setup_cost");
-    assert_eq!(round4(r.overhead), 2.9166, "overhead");
-    assert_eq!(round4(r.margin), 6.1249, "margin");
-    assert_eq!(round4(r.total_price), 23.6248, "total_price");
-    assert_eq!(round4(r.machining_minutes), 10.0000, "machining_minutes");
+    assert_eq!(round4(r.material_cost), 0.7452, "material_cost");
+    assert_eq!(round4(r.machining_cost), 26.9130, "machining_cost");
+    assert_eq!(round4(r.cad_cam_cost), 10.0000, "cad_cam_cost");
+    assert_eq!(round4(r.setup_cost), 5.0001, "setup_cost");
+    assert_eq!(round4(r.overhead), 8.5317, "overhead");
+    assert_eq!(round4(r.margin), 17.9165, "margin");
+    assert_eq!(round4(r.total_price), 69.1065, "total_price");
+    assert_eq!(round4(r.machining_minutes), 16.1475, "machining_minutes");
     assert_eq!(round4(r.inspection_minutes), 0.0000, "inspection_minutes");
     assert!(!r.route_to_5_axis);
 }

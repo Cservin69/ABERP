@@ -806,7 +806,8 @@ impl PricingPipelineService {
                         engine_version: breakdown.engine_version.clone(),
                         total_price_eur: breakdown.total_price,
                         material_cost_eur: breakdown.material_cost,
-                        labor_cost_eur: breakdown.labor_cost,
+                        machining_cost_eur: breakdown.machining_cost,
+                        cad_cam_cost_eur: breakdown.cad_cam_cost,
                         setup_cost_eur: breakdown.setup_cost,
                         overhead_eur: breakdown.overhead,
                         margin_eur: breakdown.margin,
@@ -2302,7 +2303,7 @@ fn convert_materials(locals: &[crate::quoting_materials::Material]) -> Result<Ve
                 grade: m.grade.clone(),
                 density_g_cm3: m.density_g_cm3,
                 cost_per_kg_eur: m.cost_per_kg_eur,
-                machinability_index: m.machinability_index,
+                machining_difficulty: m.machining_difficulty,
                 quote_multiplier: m.quote_multiplier,
                 stock_status: parse_stock_status(&m.stock_status)?,
             })
@@ -2375,24 +2376,14 @@ fn convert_stock_adjustments(
         .collect()
 }
 
-/// Hard-coded `machining_rate_eur_per_minute` until the local
-/// `quoting_parameters` table grows the column.
-///
-/// **Gap:** the S267 `quoting_parameters` singleton (CRUD'd from
-/// Settings → Quoting Parameters) does NOT yet carry a `machining_rate`
-/// field, but the engine's S268 [`QuotingParameters`] requires one.
-/// Documented pushback: this PR ships the producer-side bridge with a
-/// flat 1.0 EUR/min default — pricing is wrong-but-monotonic until the
-/// column lands. The right follow-up is a one-row migration on
-/// `quoting_parameters` + the matching SPA form field; out of scope here
-/// because the schema-edit + SPA edit + audit kind broaden the PR
-/// beyond producer-pipeline plumbing.
-const DEFAULT_MACHINING_RATE_EUR_PER_MIN: f64 = 1.0;
-
+/// S418 — the pre-S418 hardcoded `machining_rate` (1.0) is gone; the
+/// rate and all six geometry-model knobs now ride the local
+/// `quoting_parameters` singleton (operator-tunable from Settings →
+/// Quoting Parameters) and convert straight through.
 fn convert_parameters(local: &crate::quoting_tunables::QuotingParameters) -> QuotingParameters {
     QuotingParameters {
         scrap_factor: local.scrap_factor,
-        machining_rate_eur_per_minute: DEFAULT_MACHINING_RATE_EUR_PER_MIN,
+        machining_rate_eur_per_minute: local.machining_rate_eur_per_minute,
         // Local table uses i64; engine expects u32. Clamp negative +
         // saturate; the SPA enforces ≥ 1 already (per S267 validation).
         setup_amortization_threshold: local.setup_amortization_threshold.clamp(0, u32::MAX as i64)
@@ -2401,6 +2392,12 @@ fn convert_parameters(local: &crate::quoting_tunables::QuotingParameters) -> Quo
         profit_margin_base: local.profit_margin_base,
         min_margin: local.min_margin,
         exotic_material_tax: local.exotic_material_tax,
+        cad_cam_rate_eur_per_hour: local.cad_cam_rate_eur_per_hour,
+        cad_cam_base_hours: local.cad_cam_base_hours,
+        mrr_rough_ref_cm3_per_min: local.mrr_rough_ref_cm3_per_min,
+        t_finish_min_per_cm2: local.t_finish_min_per_cm2,
+        setup_base_min: local.setup_base_min,
+        setup_5axis_min: local.setup_5axis_min,
     }
 }
 
@@ -2535,7 +2532,12 @@ struct QuotePricingPricedPayload {
     engine_version: String,
     total_price_eur: f64,
     material_cost_eur: f64,
-    labor_cost_eur: f64,
+    /// S418 — renamed from `labor_cost_eur` (the line is now the
+    /// geometry-driven machining cost). Pre-S418 audit rows keep the
+    /// old key; the ledger is append-only history.
+    machining_cost_eur: f64,
+    /// S418 — new amortised CAD-CAM design cost line.
+    cad_cam_cost_eur: f64,
     setup_cost_eur: f64,
     overhead_eur: f64,
     margin_eur: f64,

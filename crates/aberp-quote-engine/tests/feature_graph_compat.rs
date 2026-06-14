@@ -4,7 +4,7 @@
 //! FeatureGraph JSON. This test loads a fixture that file generated
 //! and deserializes it through the Rust struct WITHOUT data loss.
 //!
-//! The fixture lives at `tests/fixtures/feature_graph_python_v1.json`
+//! The fixture lives at `tests/fixtures/feature_graph_python_v2.json`
 //! and was emitted by the Python `FeatureGraph.to_canonical_dict()`
 //! + `json.dumps`. If the Python or Rust side renames a field, this
 //! test (and the Python-side schema-lock test) MUST be updated in
@@ -20,16 +20,17 @@
 
 use aberp_quote_engine::{FeatureGraph, FeatureType};
 
-const PYTHON_FIXTURE: &str = include_str!("fixtures/feature_graph_python_v1.json");
+const PYTHON_FIXTURE: &str = include_str!("fixtures/feature_graph_python_v2.json");
 
 #[test]
-fn python_v1_fixture_deserializes_into_rust_feature_graph() {
+fn python_v2_fixture_deserializes_into_rust_feature_graph() {
     let parsed: FeatureGraph = serde_json::from_str(PYTHON_FIXTURE)
         .expect("Python-produced fixture must deserialize into Rust FeatureGraph");
 
     assert_eq!(parsed.schema_version, FeatureGraph::SCHEMA_VERSION);
     assert_eq!(parsed.bounding_box_mm, [50.0, 30.0, 20.0]);
     assert_eq!(parsed.volume_mm3, 25_000.0);
+    assert_eq!(parsed.surface_area_mm2, 6200.0);
     assert_eq!(parsed.material_grade, "6061-T6");
     assert_eq!(parsed.features.len(), 2);
     assert_eq!(parsed.features[0].feature_type, FeatureType::Hole);

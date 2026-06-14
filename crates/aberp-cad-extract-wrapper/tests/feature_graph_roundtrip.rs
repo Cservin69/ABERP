@@ -1,6 +1,6 @@
 //! Pin the wrapper-side parse of the same canonical Python-produced
 //! JSON fixture the quote-engine's compat test exercises
-//! (`crates/aberp-quote-engine/tests/fixtures/feature_graph_python_v1.json`,
+//! (`crates/aberp-quote-engine/tests/fixtures/feature_graph_python_v2.json`,
 //! pinned by `feature_graph_compat.rs`).
 //!
 //! Both crates parse the SAME bytes into the SAME struct; this test
@@ -16,7 +16,7 @@ use aberp_quote_engine::FeatureType;
 /// engine crate's `tests/fixtures/` keeps a single on-disk source
 /// of truth.
 const PYTHON_FIXTURE: &str =
-    include_str!("../../aberp-quote-engine/tests/fixtures/feature_graph_python_v1.json");
+    include_str!("../../aberp-quote-engine/tests/fixtures/feature_graph_python_v2.json");
 
 #[test]
 fn engine_fixture_deserializes_byte_identical_via_wrapper_re_export() {
@@ -26,6 +26,7 @@ fn engine_fixture_deserializes_byte_identical_via_wrapper_re_export() {
     assert_eq!(graph.schema_version, EXPECTED_SCHEMA_VERSION);
     assert_eq!(graph.bounding_box_mm, [50.0, 30.0, 20.0]);
     assert_eq!(graph.volume_mm3, 25_000.0);
+    assert_eq!(graph.surface_area_mm2, 6200.0);
     assert_eq!(graph.material_grade, "6061-T6");
     assert_eq!(graph.features.len(), 2);
     assert_eq!(graph.features[0].feature_type, FeatureType::Hole);

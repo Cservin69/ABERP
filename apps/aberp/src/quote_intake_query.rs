@@ -824,7 +824,7 @@ mod tests {
                 display_name            VARCHAR NOT NULL,
                 density_g_cm3           DOUBLE  NOT NULL,
                 cost_per_kg_eur         DOUBLE  NOT NULL,
-                machinability_index     DOUBLE  NOT NULL DEFAULT 1.0,
+                machining_difficulty    DOUBLE  NOT NULL DEFAULT 1.0,
                 carbide_life_multiplier DOUBLE  NOT NULL DEFAULT 1.0,
                 stock_status            VARCHAR NOT NULL,
                 lead_time_default_days  INTEGER NOT NULL,

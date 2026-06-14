@@ -63,6 +63,7 @@ fn missing_complexity_rule_for_feature_errors_loud() {
         schema_version: FeatureGraph::SCHEMA_VERSION,
         bounding_box_mm: [10.0, 10.0, 10.0],
         volume_mm3: 1000.0,
+        surface_area_mm2: 600.0,
         material_grade: "6061-T6".to_string(),
         features: vec![Feature {
             feature_type: FeatureType::Engraving,

@@ -3,7 +3,7 @@
 //!
 //! A per-tenant catalogue of stock material grades. Each row carries the
 //! physics (`density_g_cm3`), the money (`cost_per_kg_eur`), the
-//! machining cost factors (`machinability_index`, `carbide_life_multiplier`),
+//! machining cost factors (`machining_difficulty`, `carbide_life_multiplier`),
 //! the sourcing posture (`stock_status` + `lead_time_default_days`), and an
 //! operator override knob (`quote_multiplier`) that the future quote engine
 //! reads from a catalogue snapshot. The engine itself is out of scope here
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS quoting_materials (
     display_name            VARCHAR NOT NULL,
     density_g_cm3           DOUBLE  NOT NULL,
     cost_per_kg_eur         DOUBLE  NOT NULL,
-    machinability_index     DOUBLE  NOT NULL DEFAULT 1.0,
+    machining_difficulty    DOUBLE  NOT NULL DEFAULT 1.0,
     carbide_life_multiplier DOUBLE  NOT NULL DEFAULT 1.0,
     stock_status            VARCHAR NOT NULL,
     lead_time_default_days  INTEGER NOT NULL,
@@ -106,6 +106,45 @@ ALTER TABLE quoting_materials
 ALTER TABLE quoting_materials
     ADD COLUMN IF NOT EXISTS cert_attached_at VARCHAR;
 ";
+
+/// S418 — the auto-quote pricing-model overhaul. The pre-S418
+/// `machinability_index` column held semantically **inverted** seed
+/// values (Inconel 5.0 read by the engine as "5× faster to cut"), a
+/// latent landmine that turning on machining time would have detonated
+/// (report §6.1). It is replaced by `machining_difficulty` — a correct
+/// per-material time **multiplier** (>1 = slower) that the geometry
+/// engine multiplies by.
+///
+/// **Replay-safe per the DEFAULT-on-replay trap** pinned on
+/// [`QUOTING_MATERIALS_SCHEMA_SQL`]: the ADD carries NO `DEFAULT` (so a
+/// replay never clobbers an operator's tuned value), the backfill
+/// ([`backfill_machining_difficulty`]) only writes rows still NULL, and
+/// the DROP is `IF EXISTS` (a no-op once gone). On a fresh table the
+/// `CREATE TABLE` already has `machining_difficulty NOT NULL DEFAULT
+/// 1.0` and no `machinability_index`, so every statement here no-ops.
+const S418_MIGRATION_ADD_SQL: &str = "
+ALTER TABLE quoting_materials
+    ADD COLUMN IF NOT EXISTS machining_difficulty DOUBLE;
+";
+
+const S418_MIGRATION_DROP_SQL: &str = "
+ALTER TABLE quoting_materials
+    DROP COLUMN IF EXISTS machinability_index;
+";
+
+/// Day-1 `machining_difficulty` seed (report §6.3), keyed by the seed
+/// grade. Used both by the fresh-table seed and the migration backfill
+/// so the two paths can never diverge. 6061-T6 = 1.0 reference.
+const MACHINING_DIFFICULTY_SEED: &[(&str, f64)] = &[
+    ("PEEK", 0.8),
+    ("6061-T6", 1.0),
+    ("7075-T651", 1.2),
+    ("304", 2.0),
+    ("316", 2.2),
+    ("MONEL_650", 3.0),
+    ("Ti-6Al-4V", 3.5),
+    ("Inconel 718", 5.0),
+];
 
 // ── Closed-vocab stock status ───────────────────────────────────────────
 
@@ -176,7 +215,7 @@ pub struct MaterialInputs {
     #[serde(default)]
     pub cost_per_kg_eur: f64,
     #[serde(default = "one")]
-    pub machinability_index: f64,
+    pub machining_difficulty: f64,
     #[serde(default = "one")]
     pub carbide_life_multiplier: f64,
     #[serde(default)]
@@ -200,7 +239,7 @@ pub struct Material {
     pub display_name: String,
     pub density_g_cm3: f64,
     pub cost_per_kg_eur: f64,
-    pub machinability_index: f64,
+    pub machining_difficulty: f64,
     pub carbide_life_multiplier: f64,
     pub stock_status: String,
     pub lead_time_default_days: i64,
@@ -259,8 +298,8 @@ pub fn validate_material_inputs(inputs: &MaterialInputs) -> Result<(), Vec<Valid
     // explicit CHECK set; flagged in the PR report as conservative.)
     check_positive(
         &mut errors,
-        "machinability_index",
-        inputs.machinability_index,
+        "machining_difficulty",
+        inputs.machining_difficulty,
     );
     check_positive(
         &mut errors,
@@ -330,6 +369,34 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     // with NULL (no lot/heat/cert captured yet — the "not yet traced" state).
     conn.execute_batch(S357_MIGRATION_SQL)
         .context("apply S357 quoting_materials traceability migration")?;
+    // S418 — machinability_index → machining_difficulty. Order matters:
+    // ADD the new column, backfill known grades (replay-safe, NULL-only),
+    // THEN drop the inverted old column. On a fresh table all three
+    // no-op (see the migration-const doc).
+    conn.execute_batch(S418_MIGRATION_ADD_SQL)
+        .context("apply S418 add machining_difficulty column")?;
+    backfill_machining_difficulty(conn).context("backfill S418 machining_difficulty")?;
+    conn.execute_batch(S418_MIGRATION_DROP_SQL)
+        .context("apply S418 drop machinability_index column")?;
+    Ok(())
+}
+
+/// Set `machining_difficulty` for the known seed grades on any row that
+/// has not got one yet (the migrated-but-not-backfilled NULL state).
+/// Replay-safe: the `IS NULL` guard means an operator-tuned value is
+/// never overwritten, and a grade not in the seed table keeps NULL —
+/// the app-layer reader ([`row_to_material`]) coerces NULL → 1.0
+/// (the 6061-T6 reference), so no row is ever left without a difficulty.
+fn backfill_machining_difficulty(conn: &Connection) -> Result<()> {
+    for (grade, difficulty) in MACHINING_DIFFICULTY_SEED {
+        conn.execute(
+            "UPDATE quoting_materials
+                SET machining_difficulty = ?
+              WHERE grade = ? AND machining_difficulty IS NULL;",
+            params![difficulty, grade],
+        )
+        .with_context(|| format!("backfill machining_difficulty for {grade}"))?;
+    }
     Ok(())
 }
 
@@ -339,10 +406,11 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 ///
 /// The numbers are reasonable engineering *starting points* the operator
 /// tunes — NOT authoritative. Densities are standard handbook values;
-/// `machinability_index` is relative to a free-cutting baseline of 1.0
-/// (aluminium easier, stainless/titanium/superalloy progressively harder);
-/// costs are rough €/kg order-of-magnitude. Seeds are NOT pushed any
-/// differently from operator rows — they are ordinary editable data.
+/// `machining_difficulty` is a per-material time multiplier relative to
+/// 6061-T6 = 1.0 (aluminium fast, stainless/titanium/superalloy
+/// progressively slower — report §6.3); costs are rough €/kg
+/// order-of-magnitude. Seeds are NOT pushed any differently from
+/// operator rows — they are ordinary editable data.
 pub fn seed_if_empty(conn: &mut Connection, tenant: &str) -> Result<()> {
     ensure_schema(conn)?;
     let count: i64 = conn
@@ -352,15 +420,17 @@ pub fn seed_if_empty(conn: &mut Connection, tenant: &str) -> Result<()> {
         return Ok(());
     }
 
-    // (grade, display_name, density, cost€/kg, machinability, carbide,
-    //  stock_status, lead_days, quote_multiplier)
+    // (grade, display_name, density, cost€/kg, machining_difficulty,
+    //  carbide, stock_status, lead_days, quote_multiplier). Per-kg rates
+    // KEPT at the pre-S418 values (task spec); only `machining_difficulty`
+    // is re-seeded (report §6.3) — see [`MACHINING_DIFFICULTY_SEED`].
     let seeds: &[(&str, &str, f64, f64, f64, f64, StockStatus, i64, f64)] = &[
         (
             "6061-T6",
             "Aluminium 6061-T6",
             2.70,
             6.0,
-            0.7,
+            1.0,
             1.0,
             StockStatus::InStock,
             0,
@@ -371,7 +441,7 @@ pub fn seed_if_empty(conn: &mut Connection, tenant: &str) -> Result<()> {
             "Aluminium 7075-T651",
             2.81,
             9.0,
-            0.9,
+            1.2,
             1.1,
             StockStatus::InStock,
             0,
@@ -382,7 +452,7 @@ pub fn seed_if_empty(conn: &mut Connection, tenant: &str) -> Result<()> {
             "Stainless steel 304",
             8.00,
             4.0,
-            1.6,
+            2.0,
             1.8,
             StockStatus::InStock,
             0,
@@ -393,7 +463,7 @@ pub fn seed_if_empty(conn: &mut Connection, tenant: &str) -> Result<()> {
             "Stainless steel 316",
             8.00,
             6.0,
-            1.8,
+            2.2,
             2.0,
             StockStatus::Source1_2d,
             2,
@@ -426,7 +496,7 @@ pub fn seed_if_empty(conn: &mut Connection, tenant: &str) -> Result<()> {
             "PEEK (polyether ether ketone)",
             1.30,
             90.0,
-            0.9,
+            0.8,
             1.0,
             StockStatus::Source1_2d,
             2,
@@ -447,11 +517,11 @@ pub fn seed_if_empty(conn: &mut Connection, tenant: &str) -> Result<()> {
 
     let now = now_rfc3339()?;
     let tx = conn.transaction().context("begin seed tx")?;
-    for (grade, name, density, cost, mach, carbide, status, lead, qmult) in seeds {
+    for (grade, name, density, cost, difficulty, carbide, status, lead, qmult) in seeds {
         tx.execute(
             "INSERT INTO quoting_materials (
                 grade, tenant_id, display_name, density_g_cm3, cost_per_kg_eur,
-                machinability_index, carbide_life_multiplier, stock_status,
+                machining_difficulty, carbide_life_multiplier, stock_status,
                 lead_time_default_days, quote_multiplier, notes, updated_at, updated_by_actor
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'boot');",
             params![
@@ -460,7 +530,7 @@ pub fn seed_if_empty(conn: &mut Connection, tenant: &str) -> Result<()> {
                 name,
                 density,
                 cost,
-                mach,
+                difficulty,
                 carbide,
                 status.as_db_str(),
                 lead,
@@ -482,7 +552,7 @@ pub fn list_materials(conn: &Connection, tenant: &str) -> Result<Vec<Material>> 
     let mut stmt = conn
         .prepare(
             "SELECT grade, display_name, density_g_cm3, cost_per_kg_eur,
-                    machinability_index, carbide_life_multiplier, stock_status,
+                    machining_difficulty, carbide_life_multiplier, stock_status,
                     lead_time_default_days, quote_multiplier, notes,
                     updated_at, updated_by_actor
              FROM quoting_materials
@@ -498,6 +568,29 @@ pub fn list_materials(conn: &Connection, tenant: &str) -> Result<Vec<Material>> 
         out.push(r.context("read quoting_materials row")?);
     }
     Ok(out)
+}
+
+/// Boot-time catalogue invariant ([[trust-code-not-operator]], S418):
+/// every material the engine could price MUST carry a sane
+/// `machining_difficulty` (finite, > 0). The model multiplies machining
+/// minutes by it, so a 0/negative/NaN value would silently mis-price
+/// (the exact class of bug the inverted `machinability_index` was) — so
+/// the daemon REFUSES TO START rather than serve quotes off a corrupt
+/// catalogue (fail loud, rule 12). In normal operation this always
+/// passes: the SPA validation rejects bad input, the migration
+/// backfills, and the reader coalesces NULL → 1.0.
+pub fn validate_catalogue_machining_difficulty(conn: &Connection, tenant: &str) -> Result<()> {
+    for m in list_materials(conn, tenant)? {
+        if !m.machining_difficulty.is_finite() || m.machining_difficulty <= 0.0 {
+            anyhow::bail!(
+                "quoting_materials grade `{}` has invalid machining_difficulty {} \
+                 (must be finite and > 0) — refusing to start (S418 catalogue invariant)",
+                m.grade,
+                m.machining_difficulty,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The storefront push projection (public fields only), ordered by grade.
@@ -570,7 +663,7 @@ pub fn create_material(
     tx.execute(
         "INSERT INTO quoting_materials (
             grade, tenant_id, display_name, density_g_cm3, cost_per_kg_eur,
-            machinability_index, carbide_life_multiplier, stock_status,
+            machining_difficulty, carbide_life_multiplier, stock_status,
             lead_time_default_days, quote_multiplier, notes, updated_at, updated_by_actor
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
         params![
@@ -579,7 +672,7 @@ pub fn create_material(
             inputs.display_name.trim(),
             inputs.density_g_cm3,
             inputs.cost_per_kg_eur,
-            inputs.machinability_index,
+            inputs.machining_difficulty,
             inputs.carbide_life_multiplier,
             status,
             inputs.lead_time_default_days,
@@ -631,7 +724,7 @@ pub fn update_material(
                 display_name            = ?,
                 density_g_cm3           = ?,
                 cost_per_kg_eur         = ?,
-                machinability_index     = ?,
+                machining_difficulty    = ?,
                 carbide_life_multiplier = ?,
                 stock_status            = ?,
                 lead_time_default_days  = ?,
@@ -644,7 +737,7 @@ pub fn update_material(
                 inputs.display_name.trim(),
                 inputs.density_g_cm3,
                 inputs.cost_per_kg_eur,
-                inputs.machinability_index,
+                inputs.machining_difficulty,
                 inputs.carbide_life_multiplier,
                 status,
                 inputs.lead_time_default_days,
@@ -771,7 +864,7 @@ fn read_material_in_tx_opt(
 ) -> Result<Option<Material>> {
     let mut stmt = tx.prepare(
         "SELECT grade, display_name, density_g_cm3, cost_per_kg_eur,
-                machinability_index, carbide_life_multiplier, stock_status,
+                machining_difficulty, carbide_life_multiplier, stock_status,
                 lead_time_default_days, quote_multiplier, notes,
                 updated_at, updated_by_actor
          FROM quoting_materials
@@ -790,7 +883,9 @@ fn row_to_material(row: &duckdb::Row<'_>) -> duckdb::Result<Material> {
         display_name: row.get(1)?,
         density_g_cm3: row.get(2)?,
         cost_per_kg_eur: row.get(3)?,
-        machinability_index: row.get(4)?,
+        // NULL-safe (report §6.4 / S418 migration): a migrated row for a
+        // grade not in the difficulty seed reads NULL → 1.0 baseline.
+        machining_difficulty: row.get::<_, Option<f64>>(4)?.unwrap_or(1.0),
         carbide_life_multiplier: row.get(5)?,
         stock_status: row.get(6)?,
         lead_time_default_days: row.get(7)?,
@@ -843,7 +938,7 @@ mod tests {
             display_name: format!("Display {grade}"),
             density_g_cm3: 2.7,
             cost_per_kg_eur: 6.0,
-            machinability_index: 1.0,
+            machining_difficulty: 1.0,
             carbide_life_multiplier: 1.0,
             stock_status: "in_stock".to_string(),
             lead_time_default_days: 0,
@@ -888,8 +983,8 @@ mod tests {
 
         // NaN/Inf are rejected (fail loud)
         let mut i = valid_inputs("X");
-        i.machinability_index = f64::NAN;
-        assert!(field_errored(&i, "machinability_index"));
+        i.machining_difficulty = f64::NAN;
+        assert!(field_errored(&i, "machining_difficulty"));
         let mut i = valid_inputs("X");
         i.quote_multiplier = 0.0;
         assert!(field_errored(&i, "quote_multiplier"));
@@ -982,7 +1077,7 @@ mod tests {
         assert!(!json.contains("cost_per_kg"));
         assert!(!json.contains("quote_multiplier"));
         assert!(!json.contains("density"));
-        assert!(!json.contains("machinability"));
+        assert!(!json.contains("machining_difficulty"));
     }
 
     /// S338 — the storefront `/api/catalogue/materials` receiver validates
@@ -1170,6 +1265,79 @@ mod tests {
             |r| r.get(0),
         )
         .expect("count audit")
+    }
+
+    /// S418 — the `machinability_index → machining_difficulty` swap.
+    /// Builds a *pre-S418* table (old inverted column, no new column),
+    /// seeds an Inconel row whose old index was 5.0 ("5× faster" — the
+    /// landmine), runs the migration, and asserts: the old column is
+    /// gone, the known grade is backfilled to its correct difficulty
+    /// (5.0 = hardest), and a grade NOT in the seed reads the 1.0
+    /// baseline (NULL-coerce). A migration that forgot to drop, or
+    /// carried the old value across, fails here (CLAUDE.md #9).
+    #[test]
+    fn s418_migration_swaps_machinability_for_difficulty() {
+        let c = Connection::open_in_memory().expect("open in-memory");
+        audit_ensure_schema(&c).expect("audit schema");
+        // Pre-S418 schema (the machinability_index era).
+        c.execute_batch(
+            "CREATE TABLE quoting_materials (
+                grade VARCHAR NOT NULL PRIMARY KEY, tenant_id VARCHAR NOT NULL,
+                display_name VARCHAR NOT NULL, density_g_cm3 DOUBLE NOT NULL,
+                cost_per_kg_eur DOUBLE NOT NULL,
+                machinability_index DOUBLE NOT NULL DEFAULT 1.0,
+                carbide_life_multiplier DOUBLE NOT NULL DEFAULT 1.0,
+                stock_status VARCHAR NOT NULL, lead_time_default_days INTEGER NOT NULL,
+                quote_multiplier DOUBLE NOT NULL DEFAULT 1.0, notes VARCHAR,
+                updated_at VARCHAR NOT NULL, updated_by_actor VARCHAR NOT NULL
+            );",
+        )
+        .expect("pre-S418 table");
+        for (grade, idx) in [("Inconel 718", 5.0_f64), ("CUSTOM-ALLOY", 0.7_f64)] {
+            c.execute(
+                "INSERT INTO quoting_materials VALUES (?, 't', ?, 8.0, 50.0, ?, 6.0,
+                    'special_order', 21, 1.0, NULL, 'now', 'boot');",
+                params![grade, grade, idx],
+            )
+            .expect("seed pre-S418 row");
+        }
+
+        // Run the migration (ensure_schema applies S418).
+        ensure_schema(&c).expect("S418 migration");
+
+        // Old inverted column is gone.
+        let old_cols: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM information_schema.columns
+                 WHERE table_name = 'quoting_materials'
+                   AND column_name = 'machinability_index';",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count old column");
+        assert_eq!(old_cols, 0, "machinability_index must be dropped");
+
+        // Known grade backfilled to the correct difficulty; custom → 1.0.
+        let rows = list_materials(&c, "t").expect("list");
+        let inconel = rows.iter().find(|m| m.grade == "Inconel 718").unwrap();
+        assert_eq!(
+            inconel.machining_difficulty, 5.0,
+            "Inconel backfilled to hardest (5.0), not the old inverted index"
+        );
+        let custom = rows.iter().find(|m| m.grade == "CUSTOM-ALLOY").unwrap();
+        assert_eq!(
+            custom.machining_difficulty, 1.0,
+            "a grade not in the seed reads the 1.0 baseline (NULL-coerce)"
+        );
+
+        // Idempotent — re-running does not error and does not clobber.
+        ensure_schema(&c).expect("re-run S418 migration");
+        let inconel2 = list_materials(&c, "t")
+            .expect("list2")
+            .into_iter()
+            .find(|m| m.grade == "Inconel 718")
+            .unwrap();
+        assert_eq!(inconel2.machining_difficulty, 5.0, "replay preserved value");
     }
 
     /// S357 / PR-44 (ADR-0074) — the additive traceability migration is

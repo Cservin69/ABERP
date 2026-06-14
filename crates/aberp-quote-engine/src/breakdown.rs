@@ -19,13 +19,29 @@ pub struct QuoteBreakdown {
     /// adjustment and exotic-material tax folded in. Step 1–2 + 10
     /// + 11 of the engine algorithm.
     pub material_cost: f64,
-    /// EUR. (machining_minutes + inspection_minutes) ×
-    /// machining_rate × tolerance_multiplier × material multipliers,
-    /// with the thin-wall + tight-tolerance bump (see
-    /// [`crate::THIN_WALL_TIGHT_TOL_BUMP`]) applied at step 7.
-    pub labor_cost: f64,
-    /// EUR. The amortised / per-part share of the rules' setup
-    /// penalty (step 9).
+    /// EUR. The machining line — (machining_minutes +
+    /// inspection_minutes) × machining_rate × tolerance_multiplier ×
+    /// material multipliers, with the thin-wall + tight-tolerance bump
+    /// (see [`crate::THIN_WALL_TIGHT_TOL_BUMP`]) applied. Where
+    /// `machining_minutes` is the geometry-driven roughing + finishing
+    /// total (report §5).
+    ///
+    /// **Wire key stays `labor_cost`** via `#[serde(rename)]`: the
+    /// persisted `breakdown_json` and the audit payload are an
+    /// immutable history, and the storefront stores the blob opaquely
+    /// (`quote-store.ts` "never inspects breakdown_json"). The Rust
+    /// field renamed to `machining_cost` (S418 vocabulary), the bytes
+    /// on the wire did not — no migration, no storefront break.
+    #[serde(rename = "labor_cost")]
+    pub machining_cost: f64,
+    /// EUR. The amortised per-part share of the one-time CAD-CAM
+    /// programming / fixturing cost — `cad_cam_hours × rate ÷ qty`
+    /// (report §4). Always amortised: programming is done once for the
+    /// batch. New in S418 (no prior wire key).
+    pub cad_cam_cost: f64,
+    /// EUR. The amortised / per-part share of the setup minutes
+    /// (`setup_base + 5-axis extra + fired-rule penalties`), report
+    /// §5.5.
     pub setup_cost: f64,
     /// EUR. `subtotal × overhead_factor` (step 13).
     pub overhead: f64,
@@ -33,10 +49,11 @@ pub struct QuoteBreakdown {
     pub margin: f64,
     /// EUR. subtotal + overhead + margin (step 15).
     pub total_price: f64,
-    /// Minutes — the unamortised total of (base_time × count × multiplier)
-    /// across every matched complexity rule, before material
-    /// machinability and tolerance multiplier are folded into the
-    /// labour cost.
+    /// Minutes of machining per part — the geometry-driven roughing +
+    /// finishing total (report §5.2), plus any feature-graph rule time
+    /// (0 today: STL/STEP v1 emit no features). Difficulty is folded
+    /// into the roughing/finishing terms; tolerance + thin-wall
+    /// multipliers are applied to the cost, not these minutes.
     pub machining_minutes: f64,
     /// Minutes — `inspection_minutes_per_feature × feature_count`,
     /// where feature_count is the total number of `Feature` entries

@@ -1561,7 +1561,7 @@ export interface QuotingMaterial {
   display_name: string;
   density_g_cm3: number;
   cost_per_kg_eur: number;
-  machinability_index: number;
+  machining_difficulty: number;
   carbide_life_multiplier: number;
   stock_status: StockStatus;
   lead_time_default_days: number;
@@ -1577,7 +1577,7 @@ export interface QuotingMaterialInput {
   display_name: string;
   density_g_cm3: number;
   cost_per_kg_eur: number;
-  machinability_index: number;
+  machining_difficulty: number;
   carbide_life_multiplier: number;
   stock_status: StockStatus;
   lead_time_default_days: number;
@@ -1738,6 +1738,14 @@ export interface QuotingParameters {
   setup_amortization_threshold: number;
   min_margin: number;
   exotic_material_tax: number;
+  // S418 geometry-model knobs (report §8.1).
+  machining_rate_eur_per_minute: number;
+  cad_cam_rate_eur_per_hour: number;
+  cad_cam_base_hours: number;
+  mrr_rough_ref_cm3_per_min: number;
+  t_finish_min_per_cm2: number;
+  setup_base_min: number;
+  setup_5axis_min: number;
   notes: string | null;
   updated_at: string;
   updated_by_actor: string;
@@ -1750,6 +1758,14 @@ export interface QuotingParametersInput {
   setup_amortization_threshold: number;
   min_margin: number;
   exotic_material_tax: number;
+  // S418 geometry-model knobs (report §8.1).
+  machining_rate_eur_per_minute: number;
+  cad_cam_rate_eur_per_hour: number;
+  cad_cam_base_hours: number;
+  mrr_rough_ref_cm3_per_min: number;
+  t_finish_min_per_cm2: number;
+  setup_base_min: number;
+  setup_5axis_min: number;
   notes: string | null;
 }
 
@@ -3305,7 +3321,12 @@ export function parseMaterialEditError(e: unknown): MaterialEditError {
  * render — the detail panel only shows the fields it recognises. */
 export interface PricingBreakdownView {
   material_cost?: number;
+  /** S418 — the machining line. Wire key stays `labor_cost` (the
+   * engine's serde rename keeps the persisted blob stable); the SPA
+   * labels it "Megmunkálás / Machining". */
   labor_cost?: number;
+  /** S418 — amortised one-time CAD-CAM design cost line. */
+  cad_cam_cost?: number;
   setup_cost?: number;
   overhead?: number;
   margin?: number;
@@ -3324,6 +3345,8 @@ export interface FeatureGraphView {
   _schema_version?: number;
   bounding_box_mm?: [number, number, number];
   volume_mm3?: number;
+  /** S418 schema v2 — total surface area (mm²), drives finishing time. */
+  surface_area_mm2?: number;
   material_grade?: string;
   features?: Array<{
     feature_type: string;

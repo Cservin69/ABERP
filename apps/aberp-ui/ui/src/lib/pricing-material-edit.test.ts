@@ -41,7 +41,7 @@ function material(grade: string, displayName = ""): QuotingMaterial {
     display_name: displayName,
     density_g_cm3: 2.7,
     cost_per_kg_eur: 5,
-    machinability_index: 1,
+    machining_difficulty: 1,
     carbide_life_multiplier: 1,
     stock_status: "in_stock",
     lead_time_default_days: 3,

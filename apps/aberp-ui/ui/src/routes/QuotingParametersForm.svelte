@@ -19,12 +19,19 @@
   let errorMessage = $state<string | null>(null);
   let current = $state<QuotingParameters | null>(null);
   let draft = $state<QuotingParametersInput>({
-    scrap_factor: 0.08,
+    scrap_factor: 0.15,
     profit_margin_base: 0.35,
     overhead_factor: 0.20,
     setup_amortization_threshold: 5,
     min_margin: 0.10,
     exotic_material_tax: 0.05,
+    machining_rate_eur_per_minute: 1.6667,
+    cad_cam_rate_eur_per_hour: 100,
+    cad_cam_base_hours: 1.0,
+    mrr_rough_ref_cm3_per_min: 8.0,
+    t_finish_min_per_cm2: 0.08,
+    setup_base_min: 20,
+    setup_5axis_min: 25,
     notes: null,
   });
 
@@ -52,6 +59,13 @@
         setup_amortization_threshold: p.setup_amortization_threshold,
         min_margin: p.min_margin,
         exotic_material_tax: p.exotic_material_tax,
+        machining_rate_eur_per_minute: p.machining_rate_eur_per_minute,
+        cad_cam_rate_eur_per_hour: p.cad_cam_rate_eur_per_hour,
+        cad_cam_base_hours: p.cad_cam_base_hours,
+        mrr_rough_ref_cm3_per_min: p.mrr_rough_ref_cm3_per_min,
+        t_finish_min_per_cm2: p.t_finish_min_per_cm2,
+        setup_base_min: p.setup_base_min,
+        setup_5axis_min: p.setup_5axis_min,
         notes: p.notes,
       };
       loadState = "ready";
@@ -136,7 +150,7 @@
           disabled={demo}
           bind:value={draft.scrap_factor}
         />
-        <small>Az anyagra szorozzuk, fémforgács-veszteség / Multiplied on stock for chip waste.</small>
+        <small>Tömb-ráhagyás a befoglaló méret körül; anyag + nagyolás alapja / Stock oversize around the bbox (material + roughing basis).</small>
       </label>
       <label>
         <span>Alap fedezet / Profit margin base ({pct(draft.profit_margin_base)})</span>
@@ -196,6 +210,83 @@
           bind:value={draft.exotic_material_tax}
         />
         <small>Inconel/Monel-típusú anyagokra rakott pótdíj / Surcharge on exotic-class materials.</small>
+      </label>
+      <label>
+        <span>Megmunkálási óradíj / Machining rate (EUR/perc)</span>
+        <input
+          type="number"
+          step="0.0001"
+          min="0"
+          disabled={demo}
+          bind:value={draft.machining_rate_eur_per_minute}
+        />
+        <small>1.6667 = 100 EUR/gépóra / 100 EUR per machine-hour.</small>
+      </label>
+      <label>
+        <span>CAD-CAM óradíj / CAD-CAM rate (EUR/óra)</span>
+        <input
+          type="number"
+          step="1"
+          min="0"
+          disabled={demo}
+          bind:value={draft.cad_cam_rate_eur_per_hour}
+        />
+        <small>Egyszeri tervezés/programozás, darabszámra osztva / One-time programming, amortised over qty.</small>
+      </label>
+      <label>
+        <span>CAD-CAM alap-óra / CAD-CAM base hours</span>
+        <input
+          type="number"
+          step="0.5"
+          min="0"
+          disabled={demo}
+          bind:value={draft.cad_cam_base_hours}
+        />
+        <small>Minden alkatrész minimum programozási ideje / Floor on the design-hour estimate.</small>
+      </label>
+      <label>
+        <span>Nagyolási MRR / Roughing MRR (cm³/perc)</span>
+        <input
+          type="number"
+          step="0.5"
+          min="0"
+          disabled={demo}
+          bind:value={draft.mrr_rough_ref_cm3_per_min}
+        />
+        <small>Referencia 1.0 nehézségnél; ezt osztjuk az anyag-nehézséggel / Ref at difficulty 1.0.</small>
+      </label>
+      <label>
+        <span>Simítási idő / Finishing time (perc/cm²)</span>
+        <input
+          type="number"
+          step="0.01"
+          min="0"
+          disabled={demo}
+          bind:value={draft.t_finish_min_per_cm2}
+        />
+        <small>Felületre vetített simítási idő / Per cm² of surface area.</small>
+      </label>
+      <label>
+        <span>Alap setup / Setup base (perc)</span>
+        <input
+          type="number"
+          step="1"
+          min="0"
+          disabled={demo}
+          bind:value={draft.setup_base_min}
+        />
+        <small>Befogás + szerszámcsere + bemérés / Fixturing + tool-load + tryout per job.</small>
+      </label>
+      <label>
+        <span>5-tengelyes setup-pótlék / 5-axis setup add (perc)</span>
+        <input
+          type="number"
+          step="1"
+          min="0"
+          disabled={demo}
+          bind:value={draft.setup_5axis_min}
+        />
+        <small>5-tengelyes útvonalnál hozzáadva / Added when the part routes to 5-axis.</small>
       </label>
       <label class="qt-grid__notes">
         <span>Jegyzet / Notes</span>

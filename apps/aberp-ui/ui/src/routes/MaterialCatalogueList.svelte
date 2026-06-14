@@ -275,7 +275,7 @@
     <table class="mat-table" data-testid="material-table">
       <thead>
         <tr>
-          {#each [["grade", "Grade"], ["display_name", "Megnevezés / Name"], ["density_g_cm3", "Sűrűség / Density"], ["cost_per_kg_eur", "€/kg"], ["machinability_index", "Megm. / Mach."], ["carbide_life_multiplier", "Karbid / Carbide"], ["stock_status", "Készlet / Stock"], ["lead_time_default_days", "Szállítás / Lead"], ["quote_multiplier", "Szorzó / Mult."], ["updated_at", "Módosítva / Updated"]] as [key, label] (key)}
+          {#each [["grade", "Grade"], ["display_name", "Megnevezés / Name"], ["density_g_cm3", "Sűrűség / Density"], ["cost_per_kg_eur", "€/kg"], ["machining_difficulty", "Nehézség / Diff."], ["carbide_life_multiplier", "Karbid / Carbide"], ["stock_status", "Készlet / Stock"], ["lead_time_default_days", "Szállítás / Lead"], ["quote_multiplier", "Szorzó / Mult."], ["updated_at", "Módosítva / Updated"]] as [key, label] (key)}
             <th
               scope="col"
               aria-sort={sort.key === key
@@ -307,7 +307,7 @@
             <td>{row.display_name}</td>
             <td class="num">{fmt2(row.density_g_cm3)}</td>
             <td class="num">{fmt2(row.cost_per_kg_eur)}</td>
-            <td class="num">{row.machinability_index}</td>
+            <td class="num">{row.machining_difficulty}</td>
             <td class="num">{row.carbide_life_multiplier}</td>
             <td>
               <span

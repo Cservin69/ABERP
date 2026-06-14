@@ -291,6 +291,21 @@ pub struct QuotingParametersInputs {
     pub min_margin: f64,
     #[serde(default = "default_exotic_material_tax")]
     pub exotic_material_tax: f64,
+    // S418 geometry-model knobs (report §8.1).
+    #[serde(default = "default_machining_rate")]
+    pub machining_rate_eur_per_minute: f64,
+    #[serde(default = "default_cad_cam_rate")]
+    pub cad_cam_rate_eur_per_hour: f64,
+    #[serde(default = "default_cad_cam_base_hours")]
+    pub cad_cam_base_hours: f64,
+    #[serde(default = "default_mrr_rough_ref")]
+    pub mrr_rough_ref_cm3_per_min: f64,
+    #[serde(default = "default_t_finish")]
+    pub t_finish_min_per_cm2: f64,
+    #[serde(default = "default_setup_base_min")]
+    pub setup_base_min: f64,
+    #[serde(default = "default_setup_5axis_min")]
+    pub setup_5axis_min: f64,
     #[serde(default)]
     pub notes: Option<String>,
 }
@@ -303,6 +318,14 @@ pub struct QuotingParameters {
     pub setup_amortization_threshold: i64,
     pub min_margin: f64,
     pub exotic_material_tax: f64,
+    /// S418 — geometry-model knobs (report §8.1).
+    pub machining_rate_eur_per_minute: f64,
+    pub cad_cam_rate_eur_per_hour: f64,
+    pub cad_cam_base_hours: f64,
+    pub mrr_rough_ref_cm3_per_min: f64,
+    pub t_finish_min_per_cm2: f64,
+    pub setup_base_min: f64,
+    pub setup_5axis_min: f64,
     pub notes: Option<String>,
     pub updated_at: String,
     pub updated_by_actor: String,
@@ -337,7 +360,9 @@ fn one() -> f64 {
     1.0
 }
 fn default_scrap_factor() -> f64 {
-    0.08
+    // S418 — repurposed as the stock-oversize fraction (report §6.4);
+    // day-1 0.15 (was 0.08 material-scrap).
+    0.15
 }
 fn default_profit_margin_base() -> f64 {
     0.35
@@ -353,6 +378,28 @@ fn default_min_margin() -> f64 {
 }
 fn default_exotic_material_tax() -> f64 {
     0.05
+}
+// S418 geometry-model knob defaults (report §8.1).
+fn default_machining_rate() -> f64 {
+    1.6667 // 100 EUR/machine-hour
+}
+fn default_cad_cam_rate() -> f64 {
+    100.0
+}
+fn default_cad_cam_base_hours() -> f64 {
+    1.0
+}
+fn default_mrr_rough_ref() -> f64 {
+    8.0
+}
+fn default_t_finish() -> f64 {
+    0.08
+}
+fn default_setup_base_min() -> f64 {
+    20.0
+}
+fn default_setup_5axis_min() -> f64 {
+    25.0
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq, Clone)]
@@ -418,18 +465,46 @@ CREATE TABLE IF NOT EXISTS quoting_tolerance_multipliers (
 
 const PARAMETERS_SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS quoting_parameters (
-    id                           INTEGER NOT NULL PRIMARY KEY,
-    tenant_id                    VARCHAR NOT NULL,
-    scrap_factor                 DOUBLE  NOT NULL DEFAULT 0.08,
-    profit_margin_base           DOUBLE  NOT NULL DEFAULT 0.35,
-    overhead_factor              DOUBLE  NOT NULL DEFAULT 0.20,
-    setup_amortization_threshold INTEGER NOT NULL DEFAULT 5,
-    min_margin                   DOUBLE  NOT NULL DEFAULT 0.10,
-    exotic_material_tax          DOUBLE  NOT NULL DEFAULT 0.05,
-    notes                        VARCHAR,
-    updated_at                   VARCHAR NOT NULL,
-    updated_by_actor             VARCHAR NOT NULL
+    id                            INTEGER NOT NULL PRIMARY KEY,
+    tenant_id                     VARCHAR NOT NULL,
+    scrap_factor                  DOUBLE  NOT NULL DEFAULT 0.15,
+    profit_margin_base            DOUBLE  NOT NULL DEFAULT 0.35,
+    overhead_factor               DOUBLE  NOT NULL DEFAULT 0.20,
+    setup_amortization_threshold  INTEGER NOT NULL DEFAULT 5,
+    min_margin                    DOUBLE  NOT NULL DEFAULT 0.10,
+    exotic_material_tax           DOUBLE  NOT NULL DEFAULT 0.05,
+    machining_rate_eur_per_minute DOUBLE  NOT NULL DEFAULT 1.6667,
+    cad_cam_rate_eur_per_hour     DOUBLE  NOT NULL DEFAULT 100.0,
+    cad_cam_base_hours            DOUBLE  NOT NULL DEFAULT 1.0,
+    mrr_rough_ref_cm3_per_min     DOUBLE  NOT NULL DEFAULT 8.0,
+    t_finish_min_per_cm2          DOUBLE  NOT NULL DEFAULT 0.08,
+    setup_base_min                DOUBLE  NOT NULL DEFAULT 20.0,
+    setup_5axis_min               DOUBLE  NOT NULL DEFAULT 25.0,
+    notes                         VARCHAR,
+    updated_at                    VARCHAR NOT NULL,
+    updated_by_actor              VARCHAR NOT NULL
 );
+";
+
+/// S418 — promote the geometry-model knobs onto the parameters
+/// singleton. The pre-S418 pipeline hardcoded the machining rate (1.0)
+/// and had no CAD-CAM / MRR / finishing / setup knobs at all; the
+/// geometry model (report §5) needs them operator-tunable.
+///
+/// **Replay-safe per the DEFAULT-on-replay trap** (see
+/// `quoting_materials::QUOTING_MATERIALS_SCHEMA_SQL`): the ADDs carry NO
+/// `DEFAULT` (a replay can never clobber a tuned value); the backfill
+/// ([`backfill_s418_parameters`]) writes only columns still NULL. The
+/// fresh-install `CREATE TABLE` already has these columns + defaults, so
+/// every ALTER here no-ops on a new tenant.
+const S418_PARAMETERS_ADD_SQL: &str = "
+ALTER TABLE quoting_parameters ADD COLUMN IF NOT EXISTS machining_rate_eur_per_minute DOUBLE;
+ALTER TABLE quoting_parameters ADD COLUMN IF NOT EXISTS cad_cam_rate_eur_per_hour DOUBLE;
+ALTER TABLE quoting_parameters ADD COLUMN IF NOT EXISTS cad_cam_base_hours DOUBLE;
+ALTER TABLE quoting_parameters ADD COLUMN IF NOT EXISTS mrr_rough_ref_cm3_per_min DOUBLE;
+ALTER TABLE quoting_parameters ADD COLUMN IF NOT EXISTS t_finish_min_per_cm2 DOUBLE;
+ALTER TABLE quoting_parameters ADD COLUMN IF NOT EXISTS setup_base_min DOUBLE;
+ALTER TABLE quoting_parameters ADD COLUMN IF NOT EXISTS setup_5axis_min DOUBLE;
 ";
 
 // S410 / [[no-sql-specific]] — see `COMPLEXITY_RULES_SCHEMA_SQL` above.
@@ -462,10 +537,51 @@ pub fn ensure_schema(conn: &mut Connection, tenant: &str) -> Result<()> {
         .context("ensure quoting_tolerance_multipliers schema")?;
     conn.execute_batch(PARAMETERS_SCHEMA_SQL)
         .context("ensure quoting_parameters schema")?;
+    conn.execute_batch(S418_PARAMETERS_ADD_SQL)
+        .context("apply S418 quoting_parameters knob columns")?;
+    backfill_s418_parameters(conn).context("backfill S418 quoting_parameters knobs")?;
     conn.execute_batch(STOCK_ADJUSTMENTS_SCHEMA_SQL)
         .context("ensure quoting_stock_adjustments schema")?;
     seed_tolerance_if_empty(conn, tenant)?;
     seed_parameters_if_empty(conn, tenant)?;
+    Ok(())
+}
+
+/// Backfill the S418 geometry-model knobs onto any pre-S418 parameters
+/// row (the migrated-but-NULL state). Replay-safe: each `IS NULL` guard
+/// means an operator-tuned value is never overwritten.
+///
+/// `scrap_factor` is special: it pre-existed (default 0.08, material
+/// scrap) and is repurposed as the stock-oversize fraction (day-1
+/// 0.15). The guarded bump `WHERE scrap_factor = 0.08` migrates the
+/// untouched old default to the new one. KNOWN CAVEAT (flagged in the
+/// S418 report): an operator who *deliberately* re-enters exactly 0.08
+/// would be re-bumped to 0.15 on the next boot — acceptable because
+/// nobody sets a stock-oversize margin to the old material-scrap value.
+fn backfill_s418_parameters(conn: &Connection) -> Result<()> {
+    let knobs: &[(&str, f64)] = &[
+        ("machining_rate_eur_per_minute", default_machining_rate()),
+        ("cad_cam_rate_eur_per_hour", default_cad_cam_rate()),
+        ("cad_cam_base_hours", default_cad_cam_base_hours()),
+        ("mrr_rough_ref_cm3_per_min", default_mrr_rough_ref()),
+        ("t_finish_min_per_cm2", default_t_finish()),
+        ("setup_base_min", default_setup_base_min()),
+        ("setup_5axis_min", default_setup_5axis_min()),
+    ];
+    for (col, val) in knobs {
+        conn.execute(
+            &format!("UPDATE quoting_parameters SET {col} = ? WHERE {col} IS NULL;"),
+            params![val],
+        )
+        .with_context(|| format!("backfill quoting_parameters.{col}"))?;
+    }
+    // Repurpose the old material-scrap default to the new stock-oversize
+    // default (one-time; see fn doc for the caveat).
+    conn.execute(
+        "UPDATE quoting_parameters SET scrap_factor = ? WHERE scrap_factor = 0.08;",
+        params![default_scrap_factor()],
+    )
+    .context("migrate quoting_parameters.scrap_factor 0.08 → stock-oversize default")?;
     Ok(())
 }
 
@@ -522,8 +638,10 @@ fn seed_parameters_if_empty(conn: &mut Connection, tenant: &str) -> Result<()> {
         "INSERT INTO quoting_parameters (
             id, tenant_id, scrap_factor, profit_margin_base, overhead_factor,
             setup_amortization_threshold, min_margin, exotic_material_tax,
+            machining_rate_eur_per_minute, cad_cam_rate_eur_per_hour, cad_cam_base_hours,
+            mrr_rough_ref_cm3_per_min, t_finish_min_per_cm2, setup_base_min, setup_5axis_min,
             notes, updated_at, updated_by_actor
-         ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'boot');",
+         ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'boot');",
         params![
             tenant,
             default_scrap_factor(),
@@ -532,6 +650,13 @@ fn seed_parameters_if_empty(conn: &mut Connection, tenant: &str) -> Result<()> {
             default_setup_amortization_threshold(),
             default_min_margin(),
             default_exotic_material_tax(),
+            default_machining_rate(),
+            default_cad_cam_rate(),
+            default_cad_cam_base_hours(),
+            default_mrr_rough_ref(),
+            default_t_finish(),
+            default_setup_base_min(),
+            default_setup_5axis_min(),
             &now,
         ],
     )
@@ -1030,6 +1155,34 @@ pub fn validate_parameters(inputs: &QuotingParametersInputs) -> Result<(), Vec<V
     }
     check_non_negative(&mut errs, "min_margin", inputs.min_margin);
     check_non_negative(&mut errs, "exotic_material_tax", inputs.exotic_material_tax);
+    // S418 geometry-model knobs. Rates/divisors must be strictly
+    // positive (a zero rate zeroes the line; a zero MRR divides by
+    // zero); base hours / setup minutes only non-negative (0 = "no
+    // floor / no setup", a legitimate operator choice). `check_positive`
+    // also rejects NaN/Inf (fail loud).
+    check_positive(
+        &mut errs,
+        "machining_rate_eur_per_minute",
+        inputs.machining_rate_eur_per_minute,
+    );
+    check_positive(
+        &mut errs,
+        "cad_cam_rate_eur_per_hour",
+        inputs.cad_cam_rate_eur_per_hour,
+    );
+    check_positive(
+        &mut errs,
+        "mrr_rough_ref_cm3_per_min",
+        inputs.mrr_rough_ref_cm3_per_min,
+    );
+    check_non_negative(&mut errs, "cad_cam_base_hours", inputs.cad_cam_base_hours);
+    check_non_negative(
+        &mut errs,
+        "t_finish_min_per_cm2",
+        inputs.t_finish_min_per_cm2,
+    );
+    check_non_negative(&mut errs, "setup_base_min", inputs.setup_base_min);
+    check_non_negative(&mut errs, "setup_5axis_min", inputs.setup_5axis_min);
     // min_margin must not exceed profit_margin_base — otherwise the
     // floor is above the base and every quote would be rejected.
     if inputs.min_margin.is_finite()
@@ -1056,6 +1209,8 @@ pub fn get_parameters(conn: &Connection, tenant: &str) -> Result<QuotingParamete
         .prepare(
             "SELECT scrap_factor, profit_margin_base, overhead_factor,
                     setup_amortization_threshold, min_margin, exotic_material_tax,
+                    machining_rate_eur_per_minute, cad_cam_rate_eur_per_hour, cad_cam_base_hours,
+                    mrr_rough_ref_cm3_per_min, t_finish_min_per_cm2, setup_base_min, setup_5axis_min,
                     notes, updated_at, updated_by_actor
              FROM quoting_parameters
              WHERE tenant_id = ? AND id = 1;",
@@ -1091,15 +1246,22 @@ pub fn update_parameters(
     let changed = tx
         .execute(
             "UPDATE quoting_parameters SET
-                scrap_factor                 = ?,
-                profit_margin_base           = ?,
-                overhead_factor              = ?,
-                setup_amortization_threshold = ?,
-                min_margin                   = ?,
-                exotic_material_tax          = ?,
-                notes                        = ?,
-                updated_at                   = ?,
-                updated_by_actor             = ?
+                scrap_factor                  = ?,
+                profit_margin_base            = ?,
+                overhead_factor               = ?,
+                setup_amortization_threshold  = ?,
+                min_margin                    = ?,
+                exotic_material_tax           = ?,
+                machining_rate_eur_per_minute = ?,
+                cad_cam_rate_eur_per_hour     = ?,
+                cad_cam_base_hours            = ?,
+                mrr_rough_ref_cm3_per_min     = ?,
+                t_finish_min_per_cm2          = ?,
+                setup_base_min                = ?,
+                setup_5axis_min               = ?,
+                notes                         = ?,
+                updated_at                    = ?,
+                updated_by_actor              = ?
              WHERE tenant_id = ? AND id = 1;",
             params![
                 inputs.scrap_factor,
@@ -1108,6 +1270,13 @@ pub fn update_parameters(
                 inputs.setup_amortization_threshold,
                 inputs.min_margin,
                 inputs.exotic_material_tax,
+                inputs.machining_rate_eur_per_minute,
+                inputs.cad_cam_rate_eur_per_hour,
+                inputs.cad_cam_base_hours,
+                inputs.mrr_rough_ref_cm3_per_min,
+                inputs.t_finish_min_per_cm2,
+                inputs.setup_base_min,
+                inputs.setup_5axis_min,
                 notes.as_deref(),
                 &now,
                 actor_login,
@@ -1533,6 +1702,9 @@ fn read_tolerance_multiplier_in_tx(
 }
 
 fn row_to_parameters(row: &duckdb::Row<'_>) -> duckdb::Result<QuotingParameters> {
+    // S418 knobs are NULL-safe: a row migrated but not yet backfilled
+    // reads the day-1 default rather than erroring (defence-in-depth;
+    // the backfill in `ensure_schema` fills them first in practice).
     Ok(QuotingParameters {
         scrap_factor: row.get(0)?,
         profit_margin_base: row.get(1)?,
@@ -1540,9 +1712,30 @@ fn row_to_parameters(row: &duckdb::Row<'_>) -> duckdb::Result<QuotingParameters>
         setup_amortization_threshold: row.get(3)?,
         min_margin: row.get(4)?,
         exotic_material_tax: row.get(5)?,
-        notes: row.get(6)?,
-        updated_at: row.get(7)?,
-        updated_by_actor: row.get(8)?,
+        machining_rate_eur_per_minute: row
+            .get::<_, Option<f64>>(6)?
+            .unwrap_or_else(default_machining_rate),
+        cad_cam_rate_eur_per_hour: row
+            .get::<_, Option<f64>>(7)?
+            .unwrap_or_else(default_cad_cam_rate),
+        cad_cam_base_hours: row
+            .get::<_, Option<f64>>(8)?
+            .unwrap_or_else(default_cad_cam_base_hours),
+        mrr_rough_ref_cm3_per_min: row
+            .get::<_, Option<f64>>(9)?
+            .unwrap_or_else(default_mrr_rough_ref),
+        t_finish_min_per_cm2: row
+            .get::<_, Option<f64>>(10)?
+            .unwrap_or_else(default_t_finish),
+        setup_base_min: row
+            .get::<_, Option<f64>>(11)?
+            .unwrap_or_else(default_setup_base_min),
+        setup_5axis_min: row
+            .get::<_, Option<f64>>(12)?
+            .unwrap_or_else(default_setup_5axis_min),
+        notes: row.get(13)?,
+        updated_at: row.get(14)?,
+        updated_by_actor: row.get(15)?,
     })
 }
 
@@ -1550,6 +1743,8 @@ fn read_parameters_in_tx(tx: &duckdb::Transaction<'_>, tenant: &str) -> Result<Q
     let mut stmt = tx.prepare(
         "SELECT scrap_factor, profit_margin_base, overhead_factor,
                 setup_amortization_threshold, min_margin, exotic_material_tax,
+                machining_rate_eur_per_minute, cad_cam_rate_eur_per_hour, cad_cam_base_hours,
+                mrr_rough_ref_cm3_per_min, t_finish_min_per_cm2, setup_base_min, setup_5axis_min,
                 notes, updated_at, updated_by_actor
          FROM quoting_parameters
          WHERE tenant_id = ? AND id = 1;",
@@ -1789,8 +1984,13 @@ mod tests {
         let mut c = conn();
         let m = meta();
         let p = get_parameters(&c, TENANT).expect("seeded");
-        assert!((p.scrap_factor - 0.08).abs() < 1e-9);
+        assert!((p.scrap_factor - 0.15).abs() < 1e-9); // S418 stock-oversize default
         assert!((p.profit_margin_base - 0.35).abs() < 1e-9);
+        // S418 geometry-model knobs seeded at their day-1 defaults.
+        assert!((p.machining_rate_eur_per_minute - 1.6667).abs() < 1e-9);
+        assert!((p.cad_cam_rate_eur_per_hour - 100.0).abs() < 1e-9);
+        assert!((p.mrr_rough_ref_cm3_per_min - 8.0).abs() < 1e-9);
+        assert!((p.setup_base_min - 20.0).abs() < 1e-9);
 
         let inputs = QuotingParametersInputs {
             scrap_factor: 0.10,
@@ -1799,11 +1999,22 @@ mod tests {
             setup_amortization_threshold: 8,
             min_margin: 0.12,
             exotic_material_tax: 0.06,
+            machining_rate_eur_per_minute: 2.0,
+            cad_cam_rate_eur_per_hour: 120.0,
+            cad_cam_base_hours: 1.5,
+            mrr_rough_ref_cm3_per_min: 10.0,
+            t_finish_min_per_cm2: 0.1,
+            setup_base_min: 25.0,
+            setup_5axis_min: 30.0,
             notes: Some("tuned 2026-06-06".to_string()),
         };
         let updated = update_parameters(&mut c, &m, "ervin", TENANT, &inputs).expect("update");
         assert!((updated.scrap_factor - 0.10).abs() < 1e-9);
         assert_eq!(updated.setup_amortization_threshold, 8);
+        // S418 knobs round-trip through the write + read.
+        assert!((updated.machining_rate_eur_per_minute - 2.0).abs() < 1e-9);
+        assert!((updated.cad_cam_rate_eur_per_hour - 120.0).abs() < 1e-9);
+        assert!((updated.setup_5axis_min - 30.0).abs() < 1e-9);
 
         // min_margin > profit_margin_base → Validation error.
         let bad = QuotingParametersInputs {
@@ -1813,6 +2024,13 @@ mod tests {
             setup_amortization_threshold: 5,
             min_margin: 0.20,
             exotic_material_tax: 0.05,
+            machining_rate_eur_per_minute: 1.6667,
+            cad_cam_rate_eur_per_hour: 100.0,
+            cad_cam_base_hours: 1.0,
+            mrr_rough_ref_cm3_per_min: 8.0,
+            t_finish_min_per_cm2: 0.08,
+            setup_base_min: 20.0,
+            setup_5axis_min: 25.0,
             notes: None,
         };
         let err = update_parameters(&mut c, &m, "ervin", TENANT, &bad);
@@ -1836,7 +2054,7 @@ mod tests {
                 display_name: "Aluminium".to_string(),
                 density_g_cm3: 2.7,
                 cost_per_kg_eur: 6.0,
-                machinability_index: 1.0,
+                machining_difficulty: 1.0,
                 carbide_life_multiplier: 1.0,
                 stock_status: "in_stock".to_string(),
                 lead_time_default_days: 0,
@@ -1934,7 +2152,7 @@ mod tests {
                         display_name: "Aluminium".to_string(),
                         density_g_cm3: 2.7,
                         cost_per_kg_eur: 6.0,
-                        machinability_index: 1.0,
+                        machining_difficulty: 1.0,
                         carbide_life_multiplier: 1.0,
                         stock_status: "in_stock".to_string(),
                         lead_time_default_days: 0,
@@ -1978,7 +2196,7 @@ mod tests {
                 display_name: "X".to_string(),
                 density_g_cm3: 1.0,
                 cost_per_kg_eur: 1.0,
-                machinability_index: 1.0,
+                machining_difficulty: 1.0,
                 carbide_life_multiplier: 1.0,
                 stock_status: "in_stock".to_string(),
                 lead_time_default_days: 0,

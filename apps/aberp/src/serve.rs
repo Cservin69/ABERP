@@ -769,6 +769,12 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         })?;
         crate::quoting_materials::seed_if_empty(&mut conn, tenant.as_str())
             .context("ensure + seed quoting_materials at serve boot")?;
+        // S418 [[trust-code-not-operator]] — refuse to start if any
+        // catalogue grade carries an invalid machining_difficulty (the
+        // model multiplies machining minutes by it). Runs after the
+        // seed/migration so it validates the post-migration catalogue.
+        crate::quoting_materials::validate_catalogue_machining_difficulty(&conn, tenant.as_str())
+            .context("validate quoting_materials machining_difficulty at serve boot")?;
     }
 
     // S267 / PR-256 — pin the four quoting tunables schemas at boot

@@ -32,7 +32,7 @@
   let displayName = $state(seed?.display_name ?? "");
   let density = $state<number | null>(seed?.density_g_cm3 ?? null);
   let cost = $state<number | null>(seed?.cost_per_kg_eur ?? null);
-  let machinability = $state<number>(seed?.machinability_index ?? 1.0);
+  let machiningDifficulty = $state<number>(seed?.machining_difficulty ?? 1.0);
   let carbide = $state<number>(seed?.carbide_life_multiplier ?? 1.0);
   let stockStatus = $state<StockStatus>(seed?.stock_status ?? "in_stock");
   let leadDays = $state<number | null>(seed?.lead_time_default_days ?? 0);
@@ -75,7 +75,7 @@
     if (!Number.isInteger(l) || l < 0)
       return "A szállítási idő nem-negatív egész / Lead time must be a non-negative integer.";
     for (const [name, v] of [
-      ["megmunkálhatóság / machinability", machinability],
+      ["megmunkálási nehézség / machining difficulty", machiningDifficulty],
       ["karbid-szorzó / carbide multiplier", carbide],
       ["ár-szorzó / quote multiplier", quoteMultiplier],
     ] as const) {
@@ -99,7 +99,7 @@
       display_name: displayName.trim(),
       density_g_cm3: Number(density),
       cost_per_kg_eur: Number(cost),
-      machinability_index: Number(machinability),
+      machining_difficulty: Number(machiningDifficulty),
       carbide_life_multiplier: Number(carbide),
       stock_status: stockStatus,
       lead_time_default_days: Number(leadDays),
@@ -198,15 +198,15 @@
 
       <div class="field-row">
         <label class="field field--grow">
-          <span class="field__label">Megmunkálhatóság / Machinability</span>
+          <span class="field__label">Megmunkálási nehézség / Machining difficulty</span>
           <input
             type="number"
             step="0.1"
-            bind:value={machinability}
+            bind:value={machiningDifficulty}
             disabled={busy}
-            data-testid="material-form-machinability"
+            data-testid="material-form-machining-difficulty"
           />
-          <span class="field__hint">1.0 = szabadon forgácsolható / free-cutting baseline</span>
+          <span class="field__hint">1.0 = 6061-T6 referencia; nagyobb = lassabb / harder = slower</span>
         </label>
         <label class="field field--grow">
           <span class="field__label">Karbid-szorzó / Carbide life mult.</span>

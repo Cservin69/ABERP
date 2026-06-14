@@ -1,9 +1,12 @@
-//! The scoring function — design doc §10's 16-step deterministic
-//! algorithm.
+//! The scoring function — the deterministic, geometry-driven pricing
+//! algorithm (S418 overhaul of the original design-doc §10 scorer).
 //!
 //! Every step appends one line to `reasoning_log`. Reading the log
 //! top-to-bottom reconstructs the price exactly. There is no hidden
-//! contribution.
+//! contribution. The pipeline: material on stock volume → geometry
+//! machining time (roughing + finishing, scaled by `machining_difficulty`)
+//! → inspection → machining cost → setup → CAD-CAM design → overhead →
+//! margin → min-margin gate.
 
 use crate::breakdown::QuoteBreakdown;
 use crate::catalogue::{
@@ -13,14 +16,61 @@ use crate::error::QuoteError;
 use crate::feature_graph::{FeatureGraph, SizeBucket, ToleranceRange};
 use crate::ENGINE_VERSION;
 
-/// Labor multiplier applied when the part has a thin wall AND the
-/// target tolerance is `Tight` or higher. Design doc §10 step 7.
-/// Pinned as a constant here so the golden test catches any drift.
+/// Machining-cost multiplier applied when the part has a thin wall AND
+/// the target tolerance is `Tight` or higher. Pinned as a constant here
+/// so the golden test catches any drift.
 ///
-/// `TODO(S271+)`: when the wiring layer adds machining rate per
-/// machine class, this constant migrates to the `quoting_parameters`
-/// row alongside the rate.
+/// `TODO`: when a future cut adds a per-machine-class rate split, this
+/// could migrate to the `quoting_parameters` row alongside the rate.
 pub const THIN_WALL_TIGHT_TOL_BUMP: f64 = 1.15;
+
+// ── CAD-CAM complexity-matrix weights (report §4.2) ──────────────────
+//
+// `cad_cam_hours = clamp(1, base + Σ signal·weight, 5)`. The base hour
+// is an operator-tunable parameter (`cad_cam_base_hours`); the signal
+// weights below are pinned engine constants — the golden test catches
+// any drift, and they encode a calibration decision (report §7) that is
+// a code change, not a per-tenant knob.
+
+/// 5-axis routing ⇒ programming-complexity premium (report §4.2).
+const CAD_CAM_5AXIS_HOURS: f64 = 1.5;
+/// Deep concavity (`fill_ratio < 0.30`) ⇒ heavy 3D pocketing strategy.
+const CAD_CAM_LOW_FILL_HOURS: f64 = 1.0;
+/// Moderate pocketing (`0.30 ≤ fill_ratio < 0.60`).
+const CAD_CAM_MED_FILL_HOURS: f64 = 0.5;
+/// Thin walls ⇒ workholding + deflection planning.
+const CAD_CAM_THIN_WALL_HOURS: f64 = 0.5;
+/// Large envelope (`max(bbox) ≥ 200 mm`) ⇒ multi-setup fixturing.
+const CAD_CAM_LARGE_ENVELOPE_HOURS: f64 = 0.5;
+/// Hard material ⇒ tool-strategy iteration / sim time.
+const CAD_CAM_HARD_MATERIAL_HOURS: f64 = 0.5;
+/// Upper clamp on the auto-derived CAD-CAM hours (report §4.1).
+const CAD_CAM_MAX_HOURS: f64 = 5.0;
+
+/// `fill_ratio` below this ⇒ low-fill (deep-pocket) CAM signal.
+const LOW_FILL_RATIO: f64 = 0.30;
+/// `fill_ratio` below this (and ≥ [`LOW_FILL_RATIO`]) ⇒ medium-fill.
+const MED_FILL_RATIO: f64 = 0.60;
+/// `max(bbox)` at or above this (mm) ⇒ large-envelope CAM signal.
+const LARGE_ENVELOPE_MM: f64 = 200.0;
+
+/// `machining_difficulty` at or above this classifies a grade as a
+/// "hard material" for the CAD-CAM matrix. The report §4.2 names the
+/// set {Ti, Inconel, Monel, superalloy}; under the S418 difficulty
+/// seed those are exactly the grades with difficulty ≥ 3.0 (Monel 3.0,
+/// Ti 3.5, Inconel 5.0). Using the difficulty column — not the
+/// `exotic_material_tax` substring set (Inconel/Titanium only) — is a
+/// deliberate deviation from the report's word "exotic": it captures
+/// Monel, which the tax substrings miss, matching the report's *named
+/// set* exactly. Flagged in the S418 commit message.
+const HARD_MATERIAL_DIFFICULTY_THRESHOLD: f64 = 3.0;
+
+/// Fallback reference roughing rate (cm³/min) used only if a corrupt
+/// snapshot hands the engine a non-positive `mrr_rough_ref` — keeps the
+/// output finite (the property test requires it). The boot-time
+/// catalogue validation (`quote_pricing_pipeline`) refuses such a
+/// snapshot loud before any quote runs; this is defence-in-depth.
+const MRR_ROUGH_REF_FALLBACK: f64 = 8.0;
 
 /// Substrings that, when contained in `Material::grade` (case-
 /// insensitive), classify the material as exotic and trigger the
@@ -108,19 +158,26 @@ pub fn quote(
         schema = feature_graph.schema_version,
     ));
 
-    // ── Step 1–2: material volume + scrap + base material cost ────
-    let scrap_volume = feature_graph.volume_mm3 * (1.0 + parameters.scrap_factor);
+    // ── Step 1–2: stock block + base material cost (report §6.4) ──
+    // A CNC shop buys a block sized to the bounding box (+ oversize) and
+    // cuts most of it to chips, so material is billed on the STOCK
+    // volume, not the finished-part volume. `scrap_factor` is the
+    // stock-oversize margin. The same `stock_volume` drives roughing
+    // removal below (one stock definition, report §5.1).
+    let [bx, by, bz] = feature_graph.bounding_box_mm;
+    let bbox_volume = bx * by * bz;
+    let stock_volume = bbox_volume * (1.0 + parameters.scrap_factor);
     log.push(format!(
-        "[material] volume_mm3={vol:.4} * (1 + scrap_factor={sc:.4}) = scrap_volume_mm3={sv:.4}",
-        vol = feature_graph.volume_mm3,
+        "[material] bbox {bx:.3}×{by:.3}×{bz:.3} = bbox_volume_mm3={bv:.4} * (1 + scrap_factor={sc:.4}) = stock_volume_mm3={sv:.4}",
+        bv = bbox_volume,
         sc = parameters.scrap_factor,
-        sv = scrap_volume,
+        sv = stock_volume,
     ));
-    // mass_kg = volume_mm3 × (g/cm3) × 1e-6     (mm3→cm3: /1000, g→kg: /1000)
-    let mass_kg = scrap_volume * material.density_g_cm3 / 1_000_000.0;
+    // mass_kg = stock_volume_mm3 × (g/cm3) × 1e-6   (mm3→cm3: /1000, g→kg: /1000)
+    let mass_kg = stock_volume * material.density_g_cm3 / 1_000_000.0;
     let mut material_cost = mass_kg * material.cost_per_kg_eur;
     log.push(format!(
-        "[material] mass_kg=scrap_volume * density_g_cm3={d:.4} / 1e6 = {m:.6}; * cost_per_kg_eur={cpk:.4} = base_material_cost={mc:.4} EUR",
+        "[material] mass_kg=stock_volume * density_g_cm3={d:.4} / 1e6 = {m:.6}; * cost_per_kg_eur={cpk:.4} = base_material_cost={mc:.4} EUR",
         d = material.density_g_cm3,
         m = mass_kg,
         cpk = material.cost_per_kg_eur,
@@ -174,7 +231,11 @@ pub fn quote(
     // deterministic iteration in the log line below.
     let mut fired_setup_penalties: std::collections::BTreeMap<i64, f64> =
         std::collections::BTreeMap::new();
-    let mut machining_minutes: f64 = 0.0;
+    // Feature-graph machining time. 0 today: STL is a triangle soup with
+    // no topology, and STEP v1 emits an empty `features[]` (report §3).
+    // Kept additive so a future feature-mining cut layers rule time on
+    // top of the geometry model below without a re-wire.
+    let mut feature_machining_minutes: f64 = 0.0;
 
     for (idx, feature) in feature_graph.features.iter().enumerate() {
         let bucket = SizeBucket::bucket(feature.representative_size_mm);
@@ -191,7 +252,7 @@ pub fn quote(
         })?;
 
         let time_for_feature = rule.base_time_minutes * (feature.count as f64) * rule.multiplier;
-        machining_minutes += time_for_feature;
+        feature_machining_minutes += time_for_feature;
         log.push(format!(
             "[feature {i}] {ft}/{sb}/count={c} (size={sz:.3}mm) → rule#{rid} base={base:.3}min * count={c} * mult={mul:.3} = {t:.4} min",
             i = idx,
@@ -213,12 +274,62 @@ pub fn quote(
         n = fired_setup_penalties.len(),
         tsp = total_setup_penalty,
     ));
+    // ── Step 3: geometry-driven machining time (report §5) ────────
+    // Roughing: bulk removal, volume-driven. Finishing: surface
+    // passes, area-driven. `machining_difficulty` MULTIPLIES both
+    // (6061-T6 1.0 ⇒ fast, Inconel 5.0 ⇒ 5× slower). The pre-S418
+    // `machinability_index` DIVISOR is deleted: its seed was inverted
+    // and would have priced Inconel as the cheapest metal (report §6.1).
+    let removed_volume_cm3 = (stock_volume - feature_graph.volume_mm3).max(0.0) / 1000.0;
+    let mrr_ref = if parameters.mrr_rough_ref_cm3_per_min > 0.0 {
+        parameters.mrr_rough_ref_cm3_per_min
+    } else {
+        MRR_ROUGH_REF_FALLBACK
+    };
+    let roughing_min = removed_volume_cm3 * material.machining_difficulty / mrr_ref;
     log.push(format!(
-        "[machining] sum machining_minutes={mm:.4}",
-        mm = machining_minutes
+        "[machining] removed_volume_cm3 = (stock {sv:.4} - part {pv:.4})/1000 max 0 = {rv:.4}; roughing_min = {rv:.4} * difficulty={diff:.4} / MRR_ref={mrr:.4} = {rm:.4} min",
+        sv = stock_volume,
+        pv = feature_graph.volume_mm3,
+        rv = removed_volume_cm3,
+        diff = material.machining_difficulty,
+        mrr = mrr_ref,
+        rm = roughing_min,
     ));
 
-    // ── Step 5: inspection_minutes ────────────────────────────────
+    // Surface area: real value from the v2 extractor; fall back to the
+    // bounding-box surface area 2(xy+yz+zx) on a v1/corrupt graph
+    // (report §5.4) — a monotone floor, never zero finishing time.
+    let surface_area_cm2 = if feature_graph.surface_area_mm2 > 0.0 {
+        feature_graph.surface_area_mm2 / 100.0
+    } else {
+        let bbox_area = 2.0 * (bx * by + by * bz + bx * bz);
+        log.push(format!(
+            "[machining] surface_area_mm2 absent/≤0 → bbox-area fallback 2*({bx:.3}*{by:.3}+{by:.3}*{bz:.3}+{bx:.3}*{bz:.3}) = {a:.4} mm²",
+            a = bbox_area,
+        ));
+        bbox_area / 100.0
+    };
+    let finishing_min =
+        surface_area_cm2 * parameters.t_finish_min_per_cm2 * material.machining_difficulty;
+    log.push(format!(
+        "[machining] finishing_min = surface_area_cm2={a:.4} * t_finish={tf:.4} * difficulty={diff:.4} = {fm:.4} min",
+        a = surface_area_cm2,
+        tf = parameters.t_finish_min_per_cm2,
+        diff = material.machining_difficulty,
+        fm = finishing_min,
+    ));
+
+    let machining_minutes = roughing_min + finishing_min + feature_machining_minutes;
+    log.push(format!(
+        "[machining] machining_minutes = roughing {rm:.4} + finishing {fm:.4} + feature {fmm:.4} = {mm:.4} min",
+        rm = roughing_min,
+        fm = finishing_min,
+        fmm = feature_machining_minutes,
+        mm = machining_minutes,
+    ));
+
+    // ── Step 4: inspection_minutes ────────────────────────────────
     // Per-feature-row count (NOT sum of `feature.count`) — one
     // inspection setup per drawing callout, not per hole.
     let feature_row_count = feature_graph.features.len() as f64;
@@ -230,104 +341,185 @@ pub fn quote(
         im = inspection_minutes,
     ));
 
-    // ── Step 6: labor cost ────────────────────────────────────────
-    // machinability_index acts as a divisor: harder material (idx<1)
-    // ⇒ more time, easier (idx>1) ⇒ less time. Guard divide-by-zero
-    // by treating ≤0 as 1.0 (an operator who types 0 gets the
-    // baseline rather than NaN; documented in catalogue.rs).
-    let safe_mi = if material.machinability_index > 0.0 {
-        material.machinability_index
-    } else {
-        1.0
-    };
-    let total_minutes = machining_minutes / safe_mi + inspection_minutes;
-    let mut labor_cost =
-        total_minutes * parameters.machining_rate_eur_per_minute * tolerance.multiplier;
+    // ── Step 5: machining cost (report §5.3) ──────────────────────
+    let billable_minutes = machining_minutes + inspection_minutes;
+    let mut machining_cost =
+        billable_minutes * parameters.machining_rate_eur_per_minute * tolerance.multiplier;
     log.push(format!(
-        "[labor] (machining_minutes={mm:.4} / machinability_index={mi:.4} + inspection_minutes={im:.4}) = total_minutes={tm:.4}; * rate={r:.4} EUR/min * tolerance_mult={tmu:.4} = labor_cost={lc:.4} EUR",
+        "[machining] (machining_minutes={mm:.4} + inspection_minutes={im:.4}) = billable={bm:.4} min; * rate={r:.4} EUR/min * tolerance_mult={tmu:.4} = machining_cost={mc:.4} EUR",
         mm = machining_minutes,
-        mi = safe_mi,
         im = inspection_minutes,
-        tm = total_minutes,
+        bm = billable_minutes,
         r = parameters.machining_rate_eur_per_minute,
         tmu = tolerance.multiplier,
-        lc = labor_cost,
+        mc = machining_cost,
     ));
 
-    // ── Step 7: thin-wall + tight-tolerance bump ──────────────────
+    // ── Step 6: thin-wall + tight-tolerance bump ──────────────────
     if feature_graph.thin_wall_present && target_tolerance >= ToleranceRange::Tight {
-        let before = labor_cost;
-        labor_cost *= THIN_WALL_TIGHT_TOL_BUMP;
+        let before = machining_cost;
+        machining_cost *= THIN_WALL_TIGHT_TOL_BUMP;
         log.push(format!(
-            "[labor] thin_wall_present && tolerance>=Tight → * THIN_WALL_TIGHT_TOL_BUMP={b:.4}: {bef:.4} → {aft:.4} EUR",
+            "[machining] thin_wall_present && tolerance>=Tight → * THIN_WALL_TIGHT_TOL_BUMP={b:.4}: {bef:.4} → {aft:.4} EUR",
             b = THIN_WALL_TIGHT_TOL_BUMP,
             bef = before,
-            aft = labor_cost,
+            aft = machining_cost,
         ));
     } else {
         log.push(format!(
-            "[labor] thin_wall_present={tw} && tolerance>=Tight={tt} — no bump",
+            "[machining] thin_wall_present={tw} && tolerance>=Tight={tt} — no bump",
             tw = feature_graph.thin_wall_present,
             tt = target_tolerance >= ToleranceRange::Tight,
         ));
     }
 
-    // ── Step 8: 5-axis routing flag ───────────────────────────────
+    // ── Step 7: 5-axis routing flag ───────────────────────────────
+    // Drives the setup-minutes 5-axis adder (step 9) + the CAD-CAM
+    // complexity premium (step 10). No separate machine-rate split
+    // day-1 (report §8.1).
     let route_to_5_axis = feature_graph.requires_5_axis;
     log.push(format!(
-        "[routing] route_to_5_axis={r5} (no v1 upcharge — flagged for S270+ machine-rate split)",
+        "[routing] route_to_5_axis={r5} (drives setup 5-axis adder + CAD-CAM premium; no day-1 machine-rate split)",
         r5 = route_to_5_axis,
     ));
 
     // Operator-knob: per-material `quote_multiplier` is a final
-    // labor-side override. Folded in here so the SPA's per-material
+    // machining-side override. Folded in here so the SPA's per-material
     // override knob has a visible effect without polluting margin %.
     if (material.quote_multiplier - 1.0).abs() > f64::EPSILON {
-        let before = labor_cost;
-        labor_cost *= material.quote_multiplier;
+        let before = machining_cost;
+        machining_cost *= material.quote_multiplier;
         log.push(format!(
-            "[labor] material.quote_multiplier={qm:.4}: {b:.4} → {a:.4} EUR",
+            "[machining] material.quote_multiplier={qm:.4}: {b:.4} → {a:.4} EUR",
             qm = material.quote_multiplier,
             b = before,
-            a = labor_cost,
+            a = machining_cost,
         ));
     }
 
-    // ── Step 9: setup cost amortisation ───────────────────────────
+    // ── Step 8: setup cost (report §5.5) ──────────────────────────
+    // Fixed base + a 5-axis adder + any fired-rule setup penalties
+    // (0 today, no features), then amortised over qty at/above the
+    // threshold.
+    let setup_minutes = parameters.setup_base_min
+        + if route_to_5_axis {
+            parameters.setup_5axis_min
+        } else {
+            0.0
+        }
+        + total_setup_penalty;
+    log.push(format!(
+        "[setup] setup_minutes = base={base:.4} + 5axis={fivx:.4} + rule_penalty={tsp:.4} = {sm:.4} min",
+        base = parameters.setup_base_min,
+        fivx = if route_to_5_axis {
+            parameters.setup_5axis_min
+        } else {
+            0.0
+        },
+        tsp = total_setup_penalty,
+        sm = setup_minutes,
+    ));
     let setup_cost = if quantity >= parameters.setup_amortization_threshold {
-        let v = total_setup_penalty * parameters.machining_rate_eur_per_minute / (quantity as f64);
+        let v = setup_minutes * parameters.machining_rate_eur_per_minute / (quantity as f64);
         log.push(format!(
-            "[setup] qty={q} >= threshold={th} → setup_cost = total_setup_penalty={tsp:.4} min * rate={r:.4} / qty = {v:.4} EUR/part",
+            "[setup] qty={q} >= threshold={th} → setup_cost = setup_minutes={sm:.4} min * rate={r:.4} / qty = {v:.4} EUR/part",
             q = quantity,
             th = parameters.setup_amortization_threshold,
-            tsp = total_setup_penalty,
+            sm = setup_minutes,
             r = parameters.machining_rate_eur_per_minute,
             v = v,
         ));
         v
     } else {
-        let v = total_setup_penalty * parameters.machining_rate_eur_per_minute;
+        let v = setup_minutes * parameters.machining_rate_eur_per_minute;
         log.push(format!(
-            "[setup] qty={q} < threshold={th} → setup_cost = total_setup_penalty={tsp:.4} min * rate={r:.4} = {v:.4} EUR/part (unamortised)",
+            "[setup] qty={q} < threshold={th} → setup_cost = setup_minutes={sm:.4} min * rate={r:.4} = {v:.4} EUR/part (unamortised)",
             q = quantity,
             th = parameters.setup_amortization_threshold,
-            tsp = total_setup_penalty,
+            sm = setup_minutes,
             r = parameters.machining_rate_eur_per_minute,
             v = v,
         ));
         v
     };
 
-    // ── Step 12–15: subtotal → overhead → margin → total ─────────
-    let subtotal = material_cost + labor_cost + setup_cost;
+    // ── Step 9: CAD-CAM design cost (report §4) ───────────────────
+    // One-time programming / fixturing, auto-derived from geometry
+    // signals, amortised across the whole batch. clamp(base, base+Σ,
+    // MAX): the operator-tunable base IS the effective floor (so
+    // lowering it lowers one-off quotes, report §4.2), MAX caps it.
+    let fill_ratio = if bbox_volume > 0.0 {
+        feature_graph.volume_mm3 / bbox_volume
+    } else {
+        1.0
+    };
+    let max_bbox = bx.max(by).max(bz);
+    let hard_material = material.machining_difficulty >= HARD_MATERIAL_DIFFICULTY_THRESHOLD;
+    let mut cad_cam_hours = parameters.cad_cam_base_hours;
+    let mut cam_signals: Vec<String> = vec![format!("base={:.2}", parameters.cad_cam_base_hours)];
+    if route_to_5_axis {
+        cad_cam_hours += CAD_CAM_5AXIS_HOURS;
+        cam_signals.push(format!("5axis+{CAD_CAM_5AXIS_HOURS:.2}"));
+    }
+    if fill_ratio < LOW_FILL_RATIO {
+        cad_cam_hours += CAD_CAM_LOW_FILL_HOURS;
+        cam_signals.push(format!(
+            "low_fill(<{LOW_FILL_RATIO:.2})+{CAD_CAM_LOW_FILL_HOURS:.2}"
+        ));
+    } else if fill_ratio < MED_FILL_RATIO {
+        cad_cam_hours += CAD_CAM_MED_FILL_HOURS;
+        cam_signals.push(format!(
+            "med_fill(<{MED_FILL_RATIO:.2})+{CAD_CAM_MED_FILL_HOURS:.2}"
+        ));
+    }
+    if feature_graph.thin_wall_present {
+        cad_cam_hours += CAD_CAM_THIN_WALL_HOURS;
+        cam_signals.push(format!("thin_wall+{CAD_CAM_THIN_WALL_HOURS:.2}"));
+    }
+    if max_bbox >= LARGE_ENVELOPE_MM {
+        cad_cam_hours += CAD_CAM_LARGE_ENVELOPE_HOURS;
+        cam_signals.push(format!(
+            "large_env(>={LARGE_ENVELOPE_MM:.0}mm)+{CAD_CAM_LARGE_ENVELOPE_HOURS:.2}"
+        ));
+    }
+    if hard_material {
+        cad_cam_hours += CAD_CAM_HARD_MATERIAL_HOURS;
+        cam_signals.push(format!(
+            "hard_material(diff>={HARD_MATERIAL_DIFFICULTY_THRESHOLD:.1})+{CAD_CAM_HARD_MATERIAL_HOURS:.2}"
+        ));
+    }
+    let cad_cam_hours_raw = cad_cam_hours;
+    let cad_cam_hours = cad_cam_hours.clamp(0.0, CAD_CAM_MAX_HOURS);
+    log.push(format!(
+        "[cad_cam] fill_ratio={fr:.4}, max_bbox={mb:.3}mm, hard_material={hm}; hours = {sigs} = {raw:.4} → clamp(0,{max:.1}) = {h:.4} h",
+        fr = fill_ratio,
+        mb = max_bbox,
+        hm = hard_material,
+        sigs = cam_signals.join(" + "),
+        raw = cad_cam_hours_raw,
+        max = CAD_CAM_MAX_HOURS,
+        h = cad_cam_hours,
+    ));
+    let cad_cam_cost = cad_cam_hours * parameters.cad_cam_rate_eur_per_hour / (quantity as f64);
+    log.push(format!(
+        "[cad_cam] cad_cam_cost = hours={h:.4} * rate={r:.4} EUR/h / qty={q} = {c:.4} EUR/part (amortised)",
+        h = cad_cam_hours,
+        r = parameters.cad_cam_rate_eur_per_hour,
+        q = quantity,
+        c = cad_cam_cost,
+    ));
+
+    // ── Step 10–13: subtotal → overhead → margin → total ─────────
+    let subtotal = material_cost + machining_cost + setup_cost + cad_cam_cost;
     let overhead = subtotal * parameters.overhead_factor;
     let margin = (subtotal + overhead) * parameters.profit_margin_base;
     let total_price = subtotal + overhead + margin;
     log.push(format!(
-        "[totals] material={m:.4} + labor={l:.4} + setup={s:.4} = subtotal={st:.4} EUR",
+        "[totals] material={m:.4} + machining={mc:.4} + setup={s:.4} + cad_cam={cc:.4} = subtotal={st:.4} EUR",
         m = material_cost,
-        l = labor_cost,
+        mc = machining_cost,
         s = setup_cost,
+        cc = cad_cam_cost,
         st = subtotal,
     ));
     log.push(format!(
@@ -366,7 +558,8 @@ pub fn quote(
 
     Ok(QuoteBreakdown {
         material_cost,
-        labor_cost,
+        machining_cost,
+        cad_cam_cost,
         setup_cost,
         overhead,
         margin,

@@ -19,6 +19,8 @@ def test_cube_bounding_box_and_volume(cube_stl_path: Path):
     assert bz == pytest.approx(20.0, abs=1e-3)
     # 20**3 = 8000 mm^3
     assert fg.volume_mm3 == pytest.approx(8_000.0, abs=1e-3)
+    # Surface area of a 20 mm cube = 6 * 20**2 = 2400 mm² (schema v2).
+    assert fg.surface_area_mm2 == pytest.approx(2_400.0, abs=1e-3)
     assert fg.material_grade == "6061-T6"
     # v1 STL path emits empty feature list — see extractor docstring.
     assert fg.features == []
@@ -47,7 +49,8 @@ def test_canonical_dict_uses_wire_field_names(cube_stl_path: Path):
     fg = extract_stl(cube_stl_path, material_grade="6061-T6")
     out = fg.to_canonical_dict()
     assert "_schema_version" in out
-    assert out["_schema_version"] == 1
+    assert out["_schema_version"] == 2
+    assert "surface_area_mm2" in out
     # Addendum 1: both booleans surfaced in the JSON, never optional.
     assert "requires_5_axis" in out
     assert "thin_wall_present" in out

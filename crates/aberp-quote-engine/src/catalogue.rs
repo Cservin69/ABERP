@@ -54,9 +54,15 @@ pub struct Material {
     pub density_g_cm3: f64,
     /// EUR per kilogram.
     pub cost_per_kg_eur: f64,
-    /// >1 = easier than baseline (faster), <1 = harder (slower). Used
-    /// as a divisor on machining minutes.
-    pub machinability_index: f64,
+    /// Physically-correct per-material time **multiplier** (>1 = harder/
+    /// slower to cut, <1 = softer/faster). 6061-T6 = 1.0 reference;
+    /// PEEK ≈ 0.8, Ti-6Al-4V ≈ 3.5, Inconel 718 ≈ 5.0. The S418
+    /// geometry model multiplies roughing + finishing minutes by this
+    /// (see `engine.rs` §5). REPLACES the pre-S418 `machinability_index`
+    /// divisor, whose seed values were semantically inverted (Inconel
+    /// 5.0 read as "5× faster") — see the report §6.1. The inverted
+    /// field is deleted (rule 13), not kept alongside (rule 7).
+    pub machining_difficulty: f64,
     /// Operator override knob on top of all other multipliers.
     pub quote_multiplier: f64,
     /// Drives the [`StockAdjustment`] lookup.
@@ -94,23 +100,26 @@ pub struct ComplexityRule {
 pub struct ToleranceMultiplier {
     /// Matches [`crate::ToleranceRange::as_db_str`].
     pub tolerance_range: String,
-    /// Applied to `labor_cost` (engine step 6).
+    /// Applied to the machining cost (engine step 5).
     pub multiplier: f64,
     /// Added to `inspection_minutes` once per feature in the graph.
     pub inspection_minutes_per_feature: f64,
 }
 
-/// The singleton `quoting_parameters` row (S267) — the engine's
-/// global knobs. The mapping from the live DB row to this struct is
-/// the wiring layer's job (S271).
+/// The singleton `quoting_parameters` row (S267, extended S418) — the
+/// engine's global knobs. The mapping from the live DB row to this
+/// struct is the wiring layer's job (S271 / `quote_pricing_pipeline`).
 ///
-/// **One v1 knob that does NOT have a DB column yet:**
-/// [`Self::machining_rate_eur_per_minute`]. The S267 table omits it;
-/// the design doc §7 names a future `quoting_machines.hourly_rate`
-/// split. For now S271 either adds a column or hardcodes a constant.
+/// S418 promoted the geometry-driven machining model (report §5/§8):
+/// the rate moved off the pipeline hardcode into the DB, and six new
+/// knobs (`cad_cam_*`, `mrr_rough_ref_*`, `t_finish_*`, `setup_*_min`)
+/// landed so the operator tunes the whole model from Settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuotingParameters {
-    /// E.g. 0.08 = 8% material over-allowance.
+    /// Stock-oversize fraction (S418 repurpose): the machined part is
+    /// cut from a block sized `bbox × (1 + scrap_factor)`. Drives BOTH
+    /// the material billing (on stock volume, report §6.4) and the
+    /// roughing-removal volume (report §5.1). E.g. 0.15 = 15% oversize.
     pub scrap_factor: f64,
     /// E.g. 0.35 = 35% margin on (subtotal + overhead).
     pub profit_margin_base: f64,
@@ -127,8 +136,28 @@ pub struct QuotingParameters {
     /// matches an exotic substring (Inconel / Titanium for v1).
     pub exotic_material_tax: f64,
     /// EUR per minute of machine + operator time. Engine multiplies
-    /// (machining + inspection) minutes by this.
+    /// (machining + inspection) minutes by this. Day-1 = 1.6667
+    /// (= 100 EUR/machine-hour, report §8.1).
     pub machining_rate_eur_per_minute: f64,
+    /// EUR per hour of CAD-CAM programming / fixturing. Day-1 = 100.
+    /// The one-time design cost (report §4) is amortised across qty.
+    pub cad_cam_rate_eur_per_hour: f64,
+    /// Floor of the CAD-CAM hour estimate (report §4.1 `base`). Day-1
+    /// = 1.0 — every part costs at least one programming hour.
+    pub cad_cam_base_hours: f64,
+    /// Reference roughing material-removal rate at difficulty 1.0, in
+    /// cm³/min (report §5.2). Effective rate = this ÷ machining
+    /// difficulty. Day-1 = 8.0.
+    pub mrr_rough_ref_cm3_per_min: f64,
+    /// Finishing-pass time per cm² of surface area, at difficulty 1.0,
+    /// in min/cm² (report §5.2). Day-1 = 0.08.
+    pub t_finish_min_per_cm2: f64,
+    /// Fixed per-job setup minutes (fixturing + tool-load + tryout),
+    /// report §5.5. Day-1 = 20.
+    pub setup_base_min: f64,
+    /// Extra setup minutes when the part routes to a 5-axis machine
+    /// (report §5.5). Day-1 = 25.
+    pub setup_5axis_min: f64,
 }
 
 /// A row from `quoting_stock_adjustments` (S267) — ±% price tweak

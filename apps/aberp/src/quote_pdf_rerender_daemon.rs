@@ -1134,9 +1134,10 @@ mod tests {
 
     fn sample_graph_json() -> String {
         let g = FeatureGraph {
-            schema_version: 1,
+            schema_version: 2,
             bounding_box_mm: [50.0, 30.0, 20.0],
             volume_mm3: 12345.6,
+            surface_area_mm2: 6200.0,
             material_grade: "AL_6061_T6".to_string(),
             features: vec![Feature {
                 feature_type: FeatureType::Hole,
@@ -1152,7 +1153,8 @@ mod tests {
     fn sample_breakdown_json() -> String {
         let b = QuoteBreakdown {
             material_cost: 1.23,
-            labor_cost: 9.87,
+            machining_cost: 9.87,
+            cad_cam_cost: 2.10,
             setup_cost: 4.56,
             overhead: 1.50,
             margin: 3.84,

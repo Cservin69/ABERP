@@ -61,7 +61,7 @@ export type SortKey =
   | "display_name"
   | "density_g_cm3"
   | "cost_per_kg_eur"
-  | "machinability_index"
+  | "machining_difficulty"
   | "carbide_life_multiplier"
   | "stock_status"
   | "lead_time_default_days"
@@ -86,7 +86,7 @@ export function toggleSort(prev: SortState, key: SortKey): SortState {
 const NUMERIC_KEYS: ReadonlySet<SortKey> = new Set<SortKey>([
   "density_g_cm3",
   "cost_per_kg_eur",
-  "machinability_index",
+  "machining_difficulty",
   "carbide_life_multiplier",
   "lead_time_default_days",
   "quote_multiplier",

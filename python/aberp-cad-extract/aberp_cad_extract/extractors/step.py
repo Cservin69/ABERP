@@ -183,12 +183,20 @@ def extract_step(
         # the absolute value here keeps the wire honest.
         volume = -volume
 
+    # Schema v2 (S418) — total surface area via OCCT. ``Mass()`` on a
+    # ``SurfaceProperties`` GProp is the area (the "mass" of a surface
+    # density-1 shell), in mm². Always non-negative.
+    surf_props = GProp_GProps()
+    BRepGProp.SurfaceProperties_s(shape, surf_props)
+    surface_area = abs(float(surf_props.Mass()))
+
     summary = MeshSummary(bounding_box_mm=extent, volume_mm3=volume)
 
     return FeatureGraph(
         schema_version=SCHEMA_VERSION,
         bounding_box_mm=list(extent),
         volume_mm3=volume,
+        surface_area_mm2=surface_area,
         material_grade=material_grade,
         features=features or [],
         requires_5_axis=infer_requires_5_axis(summary),

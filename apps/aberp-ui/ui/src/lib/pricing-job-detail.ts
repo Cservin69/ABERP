@@ -142,7 +142,9 @@ export function breakdownRows(
   if (!breakdown) return [];
   const lines: Array<[keyof PricingBreakdownView, string]> = [
     ["material_cost", "Anyagköltség / Material"],
-    ["labor_cost", "Munkadíj / Labor"],
+    // S418 — wire key stays `labor_cost`; label is now "Megmunkálás".
+    ["labor_cost", "Megmunkálás / Machining"],
+    ["cad_cam_cost", "Tervezés (CAD-CAM) / CAD-CAM"],
     ["setup_cost", "Beállítás / Setup"],
     ["overhead", "Rezsi / Overhead"],
     ["margin", "Árrés / Margin"],

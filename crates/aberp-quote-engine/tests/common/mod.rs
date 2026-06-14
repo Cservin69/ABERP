@@ -14,7 +14,7 @@ pub fn default_material(grade: &str) -> Material {
         grade: grade.to_string(),
         density_g_cm3: 2.70, // ~6061-T6
         cost_per_kg_eur: 8.0,
-        machinability_index: 1.2,
+        machining_difficulty: 1.0, // 6061-T6 reference (S418)
         quote_multiplier: 1.0,
         stock_status: StockStatus::InStock,
     }
@@ -25,21 +25,30 @@ pub fn exotic_material(grade: &str) -> Material {
         grade: grade.to_string(),
         density_g_cm3: 8.19, // Inconel 718
         cost_per_kg_eur: 65.0,
-        machinability_index: 0.3,
+        machining_difficulty: 5.0, // Inconel 718 — hardest (S418)
         quote_multiplier: 1.0,
         stock_status: StockStatus::SpecialOrder,
     }
 }
 
+/// S418 day-1 parameter set (report §8.1). The engine tests use the
+/// real production knobs so the golden, branch, and benchmark tests
+/// all exercise the shipped model — one source of truth.
 pub fn default_parameters() -> QuotingParameters {
     QuotingParameters {
-        scrap_factor: 0.08,
+        scrap_factor: 0.15, // stock-oversize (repurposed, report §6.4)
         profit_margin_base: 0.35,
         overhead_factor: 0.20,
         setup_amortization_threshold: 5,
         min_margin: 0.10,
         exotic_material_tax: 0.05,
-        machining_rate_eur_per_minute: 1.50, // ~90 EUR/hr
+        machining_rate_eur_per_minute: 1.6667, // 100 EUR/machine-hour
+        cad_cam_rate_eur_per_hour: 100.0,
+        cad_cam_base_hours: 1.0,
+        mrr_rough_ref_cm3_per_min: 8.0,
+        t_finish_min_per_cm2: 0.08,
+        setup_base_min: 20.0,
+        setup_5axis_min: 25.0,
     }
 }
 
@@ -117,6 +126,10 @@ pub fn simple_feature_graph(grade: &str) -> FeatureGraph {
         schema_version: FeatureGraph::SCHEMA_VERSION,
         bounding_box_mm: [50.0, 30.0, 20.0],
         volume_mm3: 25_000.0,
+        // Left 0.0 so tests exercise the engine's bbox-area fallback
+        // (report §5.4). The benchmark/property tests that need a real
+        // area set it explicitly.
+        surface_area_mm2: 0.0,
         material_grade: grade.to_string(),
         features: vec![
             Feature {

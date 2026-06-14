@@ -97,7 +97,8 @@ fn engine_never_panics_across_varied_inputs() {
                 // Every monetary field is finite and non-negative.
                 for (name, v) in [
                     ("material_cost", b.material_cost),
-                    ("labor_cost", b.labor_cost),
+                    ("machining_cost", b.machining_cost),
+                    ("cad_cam_cost", b.cad_cam_cost),
                     ("setup_cost", b.setup_cost),
                     ("overhead", b.overhead),
                     ("margin", b.margin),

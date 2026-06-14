@@ -42,6 +42,22 @@ def _bounding_box_mm(triangles: np.ndarray) -> tuple[float, float, float]:
     return float(extent[0]), float(extent[1]), float(extent[2])
 
 
+def _surface_area_mm2(triangles: np.ndarray) -> float:
+    """Total mesh surface area, in mm² (schema v2, S418).
+
+    Each triangle's area is ``½‖(v1−v0)×(v2−v0)‖``; summed over the
+    whole mesh this is the part's surface area. Unlike the volume sum
+    this needs no closed/oriented mesh — area is sign-independent — so
+    it is robust on the same triangle-soup STL the volume reads.
+    """
+    v0 = triangles[:, 0, :]
+    v1 = triangles[:, 1, :]
+    v2 = triangles[:, 2, :]
+    cross = np.cross(v1 - v0, v2 - v0)
+    tri_areas = 0.5 * np.linalg.norm(cross, axis=1)
+    return float(tri_areas.sum())
+
+
 def _signed_tetrahedra_volume_mm3(triangles: np.ndarray) -> float:
     """Closed-mesh volume via signed-tetrahedra summation.
 
@@ -86,12 +102,14 @@ def extract_stl(
 
     bbox = _bounding_box_mm(triangles)
     volume = _signed_tetrahedra_volume_mm3(triangles)
+    surface_area = _surface_area_mm2(triangles)
     summary = MeshSummary(bounding_box_mm=bbox, volume_mm3=volume)
 
     return FeatureGraph(
         schema_version=SCHEMA_VERSION,
         bounding_box_mm=list(bbox),
         volume_mm3=volume,
+        surface_area_mm2=surface_area,
         material_grade=material_grade,
         features=features or [],
         requires_5_axis=infer_requires_5_axis(summary),

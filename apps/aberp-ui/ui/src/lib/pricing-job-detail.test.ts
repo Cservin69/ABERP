@@ -136,6 +136,7 @@ describe("breakdownRows", () => {
     const bd: PricingBreakdownView = {
       material_cost: 10,
       labor_cost: 20,
+      cad_cam_cost: 8,
       setup_cost: 5,
       overhead: 3,
       margin: 7,
@@ -143,9 +144,13 @@ describe("breakdownRows", () => {
       machining_minutes: 12,
     };
     const rows = breakdownRows(bd);
-    expect(rows.map((r) => r.value)).toEqual([10, 20, 5, 3, 7, 45]);
+    expect(rows.map((r) => r.value)).toEqual([10, 20, 8, 5, 3, 7, 45]);
     expect(rows[0].label).toContain("Material");
-    expect(rows[5].label).toContain("Total");
+    // S418 — the labor_cost wire key now labels as "Machining"; the new
+    // CAD-CAM line sits between it and Setup.
+    expect(rows[1].label).toContain("Machining");
+    expect(rows[2].label).toContain("CAD-CAM");
+    expect(rows[6].label).toContain("Total");
   });
 
   it("omits a line that is absent rather than rendering 0.00", () => {

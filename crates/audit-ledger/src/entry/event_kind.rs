@@ -1480,7 +1480,8 @@ pub enum EventKind {
     /// Emitted when `aberp_quote_engine::quote()` returned `Ok(_)` and
     /// the row moved `Pricing → Rendering`. Carries `quote_id`,
     /// `tenant_id`, `engine_version`, `total_price_eur`,
-    /// `material_cost_eur`, `labor_cost_eur`, `setup_cost_eur`,
+    /// `material_cost_eur`, `machining_cost_eur` (pre-S418 rows:
+    /// `labor_cost_eur`), `cad_cam_cost_eur` (S418+), `setup_cost_eur`,
     /// `overhead_eur`, `margin_eur` — every number on the breakdown
     /// (NOT the reasoning_log, which would bloat the ledger; the log
     /// is persisted on the job row's `breakdown_json` column).

@@ -30,6 +30,8 @@ def test_cube_bounding_box_and_volume(step_cube_path: Path):
     assert bz == pytest.approx(20.0, abs=1e-3)
     # 20^3 = 8000 mm^3
     assert fg.volume_mm3 == pytest.approx(8_000.0, abs=1e-3)
+    # Surface area of a 20 mm cube = 6 * 20^2 = 2400 mm² (schema v2).
+    assert fg.surface_area_mm2 == pytest.approx(2_400.0, abs=1e-2)
     assert fg.material_grade == "6061-T6"
     # v1 STEP path returns empty feature list — BREP feature mining is a
     # follow-on cut, same posture as the STL extractor.
@@ -54,7 +56,8 @@ def test_thin_plate_flags_thin_wall(step_thin_plate_path: Path):
 def test_canonical_dict_uses_wire_field_names(step_cube_path: Path):
     fg = extract_step(step_cube_path, material_grade="6061-T6")
     out = fg.to_canonical_dict()
-    assert out["_schema_version"] == 1
+    assert out["_schema_version"] == 2
+    assert "surface_area_mm2" in out
     assert "requires_5_axis" in out
     assert "thin_wall_present" in out
     assert isinstance(out["requires_5_axis"], bool)
