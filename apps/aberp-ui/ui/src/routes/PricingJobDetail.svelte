@@ -127,6 +127,9 @@
       acceptToast = null;
       void load(quoteId);
     } else {
+      // Close the inline PDF viewer first so its `close` handler revokes
+      // the blob URL (closing the parent alone would orphan it).
+      if (pdfViewerEl?.open) pdfViewerEl.close();
       if (dialogEl.open) dialogEl.close();
       detail = null;
       auditEvents = [];
@@ -195,17 +198,26 @@
   // S352 / PR-41 — View/Download the rendered quote PDF. The browser
   // can't set `<a href>` to an authenticated endpoint (it wouldn't send
   // the Bearer), so we fetch the bytes via the Tauri command seam (which
-  // injects the Bearer), wrap them in a `Blob`, and open/download the
+  // injects the Bearer), wrap them in a `Blob`, and view/download the
   // object URL. Logic lives in `runQuotePdfAction` (pure, unit-tested);
   // the real browser seams are supplied here.
   let pdfBusy = $state(false);
   let pdfError = $state<string | null>(null);
 
+  // S402 — View renders the PDF inline in an `<iframe>` modal. The prior
+  // `window.open(blobUrl)` was a silent no-op in the Tauri webview
+  // (WKWebView on macOS / WebView2 on Windows block popups), so the
+  // operator only ever saw Download work — "View … not working only the
+  // download." `pdfViewUrl` holds the blob URL while the viewer modal is
+  // open; the modal owns its lifetime and revokes it on close.
+  let pdfViewerEl: HTMLDialogElement | null = $state(null);
+  let pdfViewUrl = $state<string | null>(null);
+
   const pdfDeps: QuotePdfDeps = {
     download: (id) => downloadQuotePricingJobPdf(id),
     createObjectURL: (blob) => URL.createObjectURL(blob),
-    openInNewTab: (url) => {
-      window.open(url, "_blank", "noopener,noreferrer");
+    showInline: (url) => {
+      pdfViewUrl = url;
     },
     triggerDownload: (url, filename) => {
       const anchor = document.createElement("a");
@@ -215,13 +227,37 @@
       anchor.click();
       document.body.removeChild(anchor);
     },
-    // Revoke after a delay so a new tab / save dialog has consumed the
-    // URL. The PDF is loaded into the tab synchronously on open, so the
-    // delayed revoke is cleanup, not correctness.
+    // Revoke after a delay so the save dialog has consumed the URL. Used
+    // on the Download path only; the View URL is revoked by the viewer
+    // modal's `close` handler.
     scheduleRevoke: (url) => {
       setTimeout(() => URL.revokeObjectURL(url), 60_000);
     },
   };
+
+  // Open the inline PDF viewer on a non-null blob URL; close on null.
+  // Guards the double-`showModal` InvalidStateError per the same
+  // precedent as the parent dialog above.
+  $effect(() => {
+    if (!pdfViewerEl) return;
+    if (pdfViewUrl !== null) {
+      if (!pdfViewerEl.open) pdfViewerEl.showModal();
+    } else {
+      if (pdfViewerEl.open) pdfViewerEl.close();
+    }
+  });
+
+  // Fires on Esc, backdrop click, and programmatic `.close()`. Revoke the
+  // blob URL here (the one place every close path funnels through) so we
+  // never leak it and never yank it from a still-open iframe.
+  function handlePdfViewerClose() {
+    if (pdfViewUrl) URL.revokeObjectURL(pdfViewUrl);
+    pdfViewUrl = null;
+  }
+
+  function handlePdfViewerClick(e: MouseEvent) {
+    if (e.target === pdfViewerEl) pdfViewerEl?.close();
+  }
 
   async function onPdfAction(action: QuotePdfAction): Promise<void> {
     if (!quoteId) return;
@@ -604,8 +640,10 @@
               {#if detail.pdf_available}
                 <span class="chip chip--ok">Elkészült / Rendered</span>
                 <!-- S352 / PR-41 — View/Download the rendered PDF.
-                     Authenticated fetch → blob → open/download (the
-                     Bearer can't ride an `<a href>`). -->
+                     Authenticated fetch → blob → view/download (the
+                     Bearer can't ride an `<a href>`). S402 — View now
+                     renders inline in an `<iframe>` modal (window.open
+                     is a no-op in the Tauri webview). -->
                 <span class="qjd__pdf-actions">
                   <button
                     type="button"
@@ -613,7 +651,7 @@
                     disabled={pdfBusy}
                     onclick={() => void onPdfAction("view")}
                     data-testid="pricing-job-pdf-view-btn"
-                    >Megnyitás / View</button
+                    >👁 Megnyitás / Open</button
                   >
                   <button
                     type="button"
@@ -621,7 +659,7 @@
                     disabled={pdfBusy}
                     onclick={() => void onPdfAction("download")}
                     data-testid="pricing-job-pdf-download-btn"
-                    >Letöltés / Download</button
+                    >⬇ Letöltés / Download</button
                   >
                 </span>
               {:else}
@@ -966,6 +1004,40 @@
   </div>
 </dialog>
 
+<!-- S402 — inline PDF viewer. A second top-layer `<dialog>` stacked above
+     the detail panel so the operator sees the rendered quote without
+     leaving the panel. Esc + backdrop click + the ✕ all fire the native
+     `close` event → `handlePdfViewerClose` (revokes the blob URL). -->
+<dialog
+  bind:this={pdfViewerEl}
+  class="qjd-pdf"
+  onclose={handlePdfViewerClose}
+  onclick={handlePdfViewerClick}
+  aria-label="Ajánlat PDF előnézet / Quote PDF preview"
+  data-testid="pricing-job-pdf-viewer"
+>
+  {#if pdfViewUrl}
+    <div class="qjd-pdf__panel">
+      <header class="qjd-pdf__hdr">
+        <span class="qjd-pdf__title">Ajánlat PDF / Quote PDF</span>
+        <button
+          type="button"
+          class="qjd__close"
+          onclick={() => pdfViewerEl?.close()}
+          aria-label="Bezárás / Close"
+          data-testid="pricing-job-pdf-viewer-close">✕</button
+        >
+      </header>
+      <iframe
+        class="qjd-pdf__frame"
+        src={pdfViewUrl}
+        title="Ajánlat PDF / Quote PDF"
+        data-testid="pricing-job-pdf-iframe"
+      ></iframe>
+    </div>
+  {/if}
+</dialog>
+
 <style>
   .qjd {
     border: none;
@@ -977,6 +1049,49 @@
   }
   .qjd::backdrop {
     background: rgba(0, 0, 0, 0.55);
+  }
+  /* S402 — inline PDF viewer. Larger than the detail panel so the A4
+     quote is legible; same dark surface tokens as the rest of the file. */
+  .qjd-pdf {
+    border: none;
+    padding: 0;
+    background: transparent;
+    width: 90vw;
+    max-width: 900px;
+    height: 90vh;
+    color: var(--color-text, #e5e7eb);
+  }
+  .qjd-pdf::backdrop {
+    background: rgba(0, 0, 0, 0.7);
+  }
+  .qjd-pdf__panel {
+    background: var(--color-surface, #1f2937);
+    border: 1px solid var(--color-border, #374151);
+    border-radius: 8px;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .qjd-pdf__hdr {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--color-border, #374151);
+  }
+  .qjd-pdf__title {
+    font-size: 13px;
+    color: var(--color-text-muted, #9ca3af);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .qjd-pdf__frame {
+    flex: 1;
+    width: 100%;
+    border: none;
+    background: #525659; /* PDF viewer chrome reads on a neutral grey */
   }
   .qjd__panel {
     background: var(--color-surface, #1f2937);

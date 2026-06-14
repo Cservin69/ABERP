@@ -18,7 +18,7 @@ function makeDeps(
 ): QuotePdfDeps & {
   download: ReturnType<typeof vi.fn>;
   createObjectURL: ReturnType<typeof vi.fn>;
-  openInNewTab: ReturnType<typeof vi.fn>;
+  showInline: ReturnType<typeof vi.fn>;
   triggerDownload: ReturnType<typeof vi.fn>;
   scheduleRevoke: ReturnType<typeof vi.fn>;
 } {
@@ -28,7 +28,7 @@ function makeDeps(
   return {
     download: vi.fn(async () => blob),
     createObjectURL: vi.fn(() => "blob:fake-url"),
-    openInNewTab: vi.fn(),
+    showInline: vi.fn(),
     triggerDownload: vi.fn(),
     scheduleRevoke: vi.fn(),
     ...overrides,
@@ -48,21 +48,29 @@ describe("quotePdfFilename", () => {
 });
 
 describe("runQuotePdfAction — view", () => {
-  it("fetches the blob, mints a URL, opens a new tab, and schedules revoke", async () => {
+  it("fetches the blob, mints a URL, and shows it inline (no new tab)", async () => {
     const deps = makeDeps();
     await runQuotePdfAction(deps, REF, "view");
 
     expect(deps.download).toHaveBeenCalledWith(REF);
     expect(deps.createObjectURL).toHaveBeenCalledTimes(1);
-    expect(deps.openInNewTab).toHaveBeenCalledWith("blob:fake-url");
-    expect(deps.scheduleRevoke).toHaveBeenCalledWith("blob:fake-url");
+    expect(deps.showInline).toHaveBeenCalledWith("blob:fake-url");
     // View must NOT trigger a download anchor.
     expect(deps.triggerDownload).not.toHaveBeenCalled();
+  });
+
+  it("does NOT schedule a revoke (the modal owns the URL lifetime)", async () => {
+    // S402 — regression guard: a timer-based revoke would yank the blob
+    // URL out from under an open iframe modal. The modal revokes on close.
+    const deps = makeDeps();
+    await runQuotePdfAction(deps, REF, "view");
+
+    expect(deps.scheduleRevoke).not.toHaveBeenCalled();
   });
 });
 
 describe("runQuotePdfAction — download", () => {
-  it("triggers a download under the ref-based filename, not a new tab", async () => {
+  it("triggers a download under the ref-based filename, not inline", async () => {
     const deps = makeDeps();
     await runQuotePdfAction(deps, REF, "download");
 
@@ -71,13 +79,14 @@ describe("runQuotePdfAction — download", () => {
       "blob:fake-url",
       `quote-${REF}.pdf`,
     );
+    // Download is fire-and-forget; the URL is revoked on a timer.
     expect(deps.scheduleRevoke).toHaveBeenCalledWith("blob:fake-url");
-    expect(deps.openInNewTab).not.toHaveBeenCalled();
+    expect(deps.showInline).not.toHaveBeenCalled();
   });
 });
 
 describe("runQuotePdfAction — backend error", () => {
-  it("propagates the rejection and never mints a URL or opens a tab", async () => {
+  it("propagates the rejection and never mints a URL or shows a modal", async () => {
     const deps = makeDeps({
       download: vi.fn(async () => {
         throw new Error(
@@ -89,9 +98,9 @@ describe("runQuotePdfAction — backend error", () => {
     await expect(runQuotePdfAction(deps, REF, "view")).rejects.toThrow(
       /PdfNotRendered/,
     );
-    // A failed fetch must not leak a blob URL or open a blank tab.
+    // A failed fetch must not leak a blob URL or show a blank modal.
     expect(deps.createObjectURL).not.toHaveBeenCalled();
-    expect(deps.openInNewTab).not.toHaveBeenCalled();
+    expect(deps.showInline).not.toHaveBeenCalled();
     expect(deps.triggerDownload).not.toHaveBeenCalled();
     expect(deps.scheduleRevoke).not.toHaveBeenCalled();
   });
