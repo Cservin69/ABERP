@@ -22,6 +22,20 @@
   import { classifyEmptyState } from "../lib/pricing-empty-state";
   import { customerCell } from "../lib/pricing-customer-cell";
   import { failureKindBadge } from "../lib/pricing-failure-kind";
+  // S411 — sort + filter helpers (ports the PR-94 invoice-list pattern).
+  // All sorting + filtering is client-side over the already-fetched list
+  // ([[no-sql-specific]]); the helpers are pure + vitest-pinned in
+  // `pricing-jobs-list.test.ts`.
+  import {
+    EMPTY_PRICING_FILTER,
+    filterJobs,
+    isPricingFilterEmpty,
+    sortJobs,
+    type PricingFilterSpec,
+    type PricingSortKey,
+    type PricingStateFacet,
+    type SortDir,
+  } from "../lib/pricing-jobs-list";
   import PricingJobDetail from "./PricingJobDetail.svelte";
 
   type LoadState = "idle" | "loading" | "ready" | "error";
@@ -46,6 +60,56 @@
   // jobs list so the empty-state copy can differentiate dormant /
   // active / errored. Null until first fetch returns.
   let pipelineStatus = $state<PipelinePythonStatus | null>(null);
+
+  // S411 — sort + filter state. TRANSIENT (not persisted): a pricing
+  // queue is short-lived work-in-flight, not a long-lived ledger view
+  // the operator returns to (unlike the invoice list's PR-175 prefs), so
+  // each open starts at the operator-default view. Default sort = newest
+  // first (the freshest failures + just-priced rows surface at the top).
+  let filter: PricingFilterSpec = $state({ ...EMPTY_PRICING_FILTER });
+  let sort: { key: PricingSortKey; dir: SortDir } = $state({
+    key: "updated_at",
+    dir: "desc",
+  });
+
+  // S411 — filter → sort composition. Mirrors `InvoiceList.svelte`'s
+  // `visibleRows` derivation: facet + needle AND-filter, then a stable
+  // per-column sort. Both helpers return new arrays so `rows` stays the
+  // source of truth.
+  let visibleRows = $derived(sortJobs(filterJobs(rows, filter), sort.key, sort.dir));
+
+  // S411 — closed-vocab state chips. Only the three REACHABLE pricing
+  // states get a chip (see `pricing-jobs-list.ts` docblock for why
+  // Refused / Archived from the brief are dead controls on this tab).
+  // "Mind / All" resets the facet; "Sikertelen / Failed" is the
+  // attention bucket ([[hulye-biztos]] — one click to "what needs me").
+  const STATE_CHIPS: { facet: PricingStateFacet; label: string }[] = [
+    { facet: "All", label: "Mind / All" },
+    { facet: "pending", label: "Folyamatban / Pending" },
+    { facet: "posted", label: "Elküldve / Posted" },
+    { facet: "failed", label: "Sikertelen / Failed" },
+  ];
+
+  // S411 — three-click sort cycle on a column header: a different column
+  // jumps to (clicked, asc); same column toggles asc → desc → back to
+  // the (updated_at, desc) default. Glyph ▲ / ▼ is the load-bearing
+  // categorical signal per ADR-0017 (not colour alone).
+  function onSortClick(key: PricingSortKey): void {
+    if (sort.key !== key) {
+      sort = { key, dir: "asc" };
+      return;
+    }
+    if (sort.dir === "asc") {
+      sort = { key, dir: "desc" };
+      return;
+    }
+    sort = { key: "updated_at", dir: "desc" };
+  }
+
+  function sortIndicator(key: PricingSortKey): string {
+    if (sort.key !== key) return "";
+    return sort.dir === "asc" ? "▲" : "▼";
+  }
 
   onMount(() => {
     void refresh();
@@ -170,6 +234,44 @@
     >Frissítés / Refresh</button>
   </header>
 
+  <!-- S411 — sort + filter controls. Only rendered once the table has
+       rows to act on; the daemon-dormant / empty-active cards below own
+       the no-rows surfaces. Search matches Ref / customer name / company
+       / material; the chips facet by reachable pipeline state. -->
+  {#if loadState === "ready" && rows.length > 0}
+    <div class="pricing-jobs__controls">
+      <label class="pricing-jobs__search">
+        <span class="pricing-jobs__search-lbl">Keresés / Search</span>
+        <input
+          type="search"
+          value={filter.search}
+          oninput={(e) =>
+            (filter = {
+              ...filter,
+              search: (e.currentTarget as HTMLInputElement).value,
+            })}
+          placeholder="Ref, vevő, cég, anyag… / Ref, customer, company, material…"
+          autocomplete="off"
+          spellcheck="false"
+          aria-label="Keresés ajánlatok között / Search pricing jobs"
+          data-testid="pricing-jobs-search"
+        />
+      </label>
+      <div class="pricing-jobs__chips" role="group" aria-label="Állapot szűrő / State filter">
+        {#each STATE_CHIPS as chip (chip.facet)}
+          <button
+            type="button"
+            class="pricing-jobs__chip-btn"
+            class:pricing-jobs__chip-btn--active={filter.state === chip.facet}
+            aria-pressed={filter.state === chip.facet}
+            onclick={() => (filter = { ...filter, state: chip.facet })}
+            data-testid={`pricing-jobs-chip-${chip.facet}`}
+          >{chip.label}</button>
+        {/each}
+      </div>
+    </div>
+  {/if}
+
   {#if pipelineStatus && pipelineStatus.recent_panic_count > 0}
     <!-- S286 / PR-268 — AMBER daemon-health banner. Persists above the
          table when the supervisor caught any Rust-side panics in the
@@ -267,18 +369,107 @@
       <thead>
         <tr>
           <th>Ref / Ref</th>
-          <th>Vevő / Customer</th>
+          <!-- S411 — sortable headers (Customer / State / Price /
+               Updated). The button carries the click + the ▲/▼ glyph;
+               `aria-sort` announces the active column to screen readers.
+               Material / Qty / Error stay plain (no natural ordering the
+               brief named). -->
+          <th
+            aria-sort={sort.key === "customer"
+              ? sort.dir === "asc"
+                ? "ascending"
+                : "descending"
+              : "none"}
+          >
+            <button
+              type="button"
+              class="pricing-jobs__sort"
+              onclick={() => onSortClick("customer")}
+              data-testid="pricing-jobs-sort-customer"
+            >
+              <span>Vevő / Customer</span>
+              <span class="pricing-jobs__sort-ind" aria-hidden="true">{sortIndicator("customer")}</span>
+            </button>
+          </th>
           <th>Anyag / Material</th>
           <th>Db / Qty</th>
-          <th>Állapot / State</th>
-          <th>Ár / Price (EUR)</th>
+          <th
+            aria-sort={sort.key === "state"
+              ? sort.dir === "asc"
+                ? "ascending"
+                : "descending"
+              : "none"}
+          >
+            <button
+              type="button"
+              class="pricing-jobs__sort"
+              onclick={() => onSortClick("state")}
+              data-testid="pricing-jobs-sort-state"
+            >
+              <span>Állapot / State</span>
+              <span class="pricing-jobs__sort-ind" aria-hidden="true">{sortIndicator("state")}</span>
+            </button>
+          </th>
+          <th
+            aria-sort={sort.key === "price"
+              ? sort.dir === "asc"
+                ? "ascending"
+                : "descending"
+              : "none"}
+          >
+            <button
+              type="button"
+              class="pricing-jobs__sort"
+              onclick={() => onSortClick("price")}
+              data-testid="pricing-jobs-sort-price"
+            >
+              <span>Ár / Price (EUR)</span>
+              <span class="pricing-jobs__sort-ind" aria-hidden="true">{sortIndicator("price")}</span>
+            </button>
+          </th>
           <th>Hiba / Error</th>
-          <th>Frissítve / Updated</th>
+          <th
+            aria-sort={sort.key === "updated_at"
+              ? sort.dir === "asc"
+                ? "ascending"
+                : "descending"
+              : "none"}
+          >
+            <button
+              type="button"
+              class="pricing-jobs__sort"
+              onclick={() => onSortClick("updated_at")}
+              data-testid="pricing-jobs-sort-updated"
+            >
+              <span>Frissítve / Updated</span>
+              <span class="pricing-jobs__sort-ind" aria-hidden="true">{sortIndicator("updated_at")}</span>
+            </button>
+          </th>
           <th></th>
         </tr>
       </thead>
       <tbody>
-        {#each rows as row (row.quote_id)}
+        <!-- S411 — facet-aware empty state: rows exist but none match the
+             active filter. The "Clear filters" button resets the search +
+             facet in one click; surfaced only when a filter is engaged
+             (CLAUDE.md rule 12 — no no-op affordance). colspan spans all
+             9 columns. -->
+        {#if visibleRows.length === 0}
+          <tr class="pricing-jobs__empty-row" data-testid="pricing-jobs-empty-filtered">
+            <td colspan="9">
+              Nincs a szűrőnek megfelelő sor. / No rows match the current filter.
+              {#if !isPricingFilterEmpty(filter)}
+                <button
+                  type="button"
+                  class="btn btn--secondary pricing-jobs__clear"
+                  onclick={() => (filter = { ...EMPTY_PRICING_FILTER })}
+                  data-testid="pricing-jobs-clear-filter"
+                >Szűrők törlése / Clear filters</button>
+              {/if}
+            </td>
+          </tr>
+        {/if}
+        {#each visibleRows as row (row.quote_id)}
           <!-- S401 — resolve the Customer-cell shape once per row;
                {@const} must be a direct child of the {#each} block. -->
           {@const cust = customerCell(
@@ -507,6 +698,97 @@
   .pricing-jobs__tbl th {
     font-weight: 600;
     color: var(--color-text-muted, #9ca3af);
+  }
+  /* S411 — sort + filter controls bar. */
+  .pricing-jobs__controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  .pricing-jobs__search {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1 1 280px;
+    min-width: 220px;
+  }
+  .pricing-jobs__search-lbl {
+    font-size: 11px;
+    color: var(--color-text-muted, #9ca3af);
+  }
+  .pricing-jobs__search input {
+    background: var(--color-surface, #1f2937);
+    color: var(--color-text, #e5e7eb);
+    border: 1px solid var(--color-border, #374151);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+  }
+  .pricing-jobs__search input:focus-visible {
+    outline: 2px solid var(--color-accent, #60a5fa);
+    outline-offset: -1px;
+  }
+  .pricing-jobs__chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .pricing-jobs__chip-btn {
+    padding: 5px 12px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    background: var(--color-surface, #1f2937);
+    color: var(--color-text-muted, #9ca3af);
+    border: 1px solid var(--color-border, #374151);
+  }
+  .pricing-jobs__chip-btn:hover:not(.pricing-jobs__chip-btn--active) {
+    background: var(--color-surface-2, #243042);
+    color: var(--color-text, #e5e7eb);
+  }
+  .pricing-jobs__chip-btn--active {
+    background: var(--color-accent, #2563eb);
+    border-color: var(--color-accent, #2563eb);
+    color: #f8fafc;
+  }
+  /* S411 — sortable column-header button. Quiet chrome (no border /
+     background) so the header reads as a label until hovered; the ▲/▼
+     glyph is the active-sort signal. */
+  .pricing-jobs__sort {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 600;
+    color: var(--color-text-muted, #9ca3af);
+  }
+  .pricing-jobs__sort:hover {
+    color: var(--color-text, #e5e7eb);
+  }
+  .pricing-jobs__sort:focus-visible {
+    outline: 2px solid var(--color-accent, #60a5fa);
+    outline-offset: 2px;
+  }
+  .pricing-jobs__sort-ind {
+    font-size: 10px;
+    color: var(--color-accent, #60a5fa);
+    min-width: 8px;
+  }
+  .pricing-jobs__empty-row td {
+    color: var(--color-text-muted, #9ca3af);
+    font-style: italic;
+  }
+  .pricing-jobs__clear {
+    margin-left: 10px;
+    font-style: normal;
   }
   /* S349 / PR-40 (U1) — clickable rows open the detail panel. */
   .pricing-jobs__row {
