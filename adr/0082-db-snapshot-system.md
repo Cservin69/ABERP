@@ -1,4 +1,4 @@
-# ADR-0081 — Periodic, validated, logical DuckDB snapshot system (`aberp-snapshot`).
+# ADR-0082 — Periodic, validated, logical DuckDB snapshot system (`aberp-snapshot`).
 
 - **Status:** Accepted
 - **Date:** 2026-06-15

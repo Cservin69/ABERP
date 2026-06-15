@@ -297,6 +297,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aberp-snapshot"
+version = "0.0.0"
+dependencies = [
+ "aberp-audit-ledger",
+ "duckdb",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "time",
+ "tracing",
+]
+
+[[package]]
 name = "aberp-ui"
 version = "0.0.0"
 dependencies = [

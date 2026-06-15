@@ -1,6 +1,6 @@
 [package]
 name = "aberp-snapshot"
-description = "Periodic, validated, logical DuckDB snapshot + retention + restore (ADR-0081)."
+description = "Periodic, validated, logical DuckDB snapshot + retention + restore (ADR-0082)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,7 @@ publish.workspace = true
 # `anyhow` in libs). The snapshot mechanism is inherently DuckDB-specific
 # (EXPORT/IMPORT DATABASE) so `duckdb` is a direct dep; `aberp-audit-ledger`
 # is used read-only to re-verify the hash chain inside a snapshot during
-# validation (ADR-0008 / ADR-0081 §Validation).
+# validation (ADR-0008 / ADR-0082 §Validation).
 [dependencies]
 aberp-audit-ledger = { path = "../audit-ledger" }
 duckdb = { workspace = true }

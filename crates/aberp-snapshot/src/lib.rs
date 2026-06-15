@@ -1,4 +1,4 @@
-//! Periodic, validated, logical DuckDB snapshot subsystem (ADR-0081).
+//! Periodic, validated, logical DuckDB snapshot subsystem (ADR-0082).
 //!
 //! # Why this exists
 //!
@@ -85,9 +85,6 @@ pub enum SnapshotError {
 
     #[error("snapshot metadata at {path} is unreadable: {detail}")]
     BadMeta { path: PathBuf, detail: String },
-
-    #[error("invalid tenant id {0:?}")]
-    BadTenant(String),
 }
 
 impl SnapshotError {

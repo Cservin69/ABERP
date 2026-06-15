@@ -13,7 +13,7 @@ use crate::store::SnapshotRecord;
 use crate::{Result, SnapshotError};
 
 /// How many snapshots to retain across three overlapping windows. A
-/// snapshot kept by *any* window survives. Defaults from ADR-0081:
+/// snapshot kept by *any* window survives. Defaults from ADR-0082:
 /// 24 last-N (4 days at the 4h cadence) + 30 daily + 52 weekly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {

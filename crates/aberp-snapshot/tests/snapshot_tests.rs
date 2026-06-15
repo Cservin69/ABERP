@@ -1,4 +1,4 @@
-//! Integration tests for the snapshot subsystem (ADR-0081).
+//! Integration tests for the snapshot subsystem (ADR-0082).
 //!
 //! Covers the brief's required cases: retention math, validation
 //! success/fail flow, restore refuses-prod-overwrite, and snapshot
