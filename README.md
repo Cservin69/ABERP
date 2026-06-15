@@ -19,11 +19,16 @@ non-commercial, open-source.
 
 ## Status
 
-**Current stable: `PROD_v2.27.67`** (cut 2026-06-15). In production —
+**Current stable: `PROD_v2.27.68`** (cut 2026-06-15). In production —
 real money and live NAV submissions flow through it. The test path
 remains the default for any build that does not pass
 `--features production`; the production NAV endpoint is structurally
 unreachable from a non-production build.
+
+**Latest fix (`PROD_v2.27.68`):** the prod provisioning step now installs
+the CAD pipeline virtualenv with `.[step]`, so STEP file uploads are
+priced out of the box — earlier prod boxes silently failed to process
+STEP geometry. Upgrade straight to `PROD_v2.27.68`.
 
 **What's new since the previous milestone:** the full NAV credit-note
 (storno) chain is now end-to-end NAV-accepted, closing a long-standing
@@ -43,7 +48,7 @@ cross-process file lock at every NAV POST site.
 > reopened by an older build. **Snapshot before upgrading** (see
 > [Updating an existing prod install](#updating-an-existing-prod-install)).
 
-### Upgrade an existing install to `PROD_v2.27.67`
+### Upgrade an existing install to `PROD_v2.27.68`
 
 ```bash
 cd ~/ABERP
