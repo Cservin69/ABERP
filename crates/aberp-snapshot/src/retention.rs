@@ -68,10 +68,13 @@ pub fn plan_retention(
 
     // Newest first, by seq (monotonic with creation).
     let mut by_seq_desc: Vec<&SnapshotRecord> = records.iter().collect();
-    by_seq_desc.sort_by(|a, b| b.meta.seq.cmp(&a.meta.seq));
+    by_seq_desc.sort_by_key(|r| std::cmp::Reverse(r.meta.seq));
 
-    let valid_desc: Vec<&SnapshotRecord> =
-        by_seq_desc.iter().copied().filter(|r| r.meta.valid).collect();
+    let valid_desc: Vec<&SnapshotRecord> = by_seq_desc
+        .iter()
+        .copied()
+        .filter(|r| r.meta.valid)
+        .collect();
 
     // Last-resort floor: never let the store go empty. If nothing is valid,
     // keep the single newest snapshot so there is *something* to inspect.

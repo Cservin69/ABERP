@@ -125,7 +125,11 @@ fn take_snapshot_validates_and_round_trips() {
     let now = datetime!(2026-06-15 14:30:00 UTC);
     let rec = take_snapshot(&db, &store, "prod", now).expect("snapshot ok");
 
-    assert!(rec.meta.valid, "fresh snapshot must validate: {:?}", rec.meta);
+    assert!(
+        rec.meta.valid,
+        "fresh snapshot must validate: {:?}",
+        rec.meta
+    );
     assert_eq!(rec.meta.invoice_count, 3);
     assert_eq!(rec.meta.audit_count, 5);
     assert_eq!(rec.meta.chain_len, 5);
@@ -238,7 +242,10 @@ fn ensure_restore_allowed_refuses_without_confirm() {
 #[test]
 fn ensure_restore_allowed_refuses_aberp_home_even_with_confirm() {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let prod = PathBuf::from(home).join(".aberp").join("prod").join("aberp.duckdb");
+    let prod = PathBuf::from(home)
+        .join(".aberp")
+        .join("prod")
+        .join("aberp.duckdb");
     let err = ensure_restore_allowed(&prod, true).expect_err("prod path → refuse");
     assert!(err.to_string().contains(".aberp"));
 

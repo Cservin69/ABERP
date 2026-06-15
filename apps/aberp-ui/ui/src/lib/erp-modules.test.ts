@@ -365,11 +365,13 @@ describe("modulesInArea + defaultRouteForArea", () => {
     // the operational area after statistics per the registry order.
     // S424 / session-424 — "audit" joins the operational area after
     // production per the registry order.
+    // S426 / ADR-0082 — "snapshots" joins after audit.
     expect(op.map((m) => m.id)).toEqual([
       "invoicing",
       "statistics",
       "production",
       "audit",
+      "snapshots",
     ]);
     // S267 / PR-256 — new `quoting` module joins maintenance after Settings.
     // S281 / PR-266 — new `email-relay` module joins after Quoting.

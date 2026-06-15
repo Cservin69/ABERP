@@ -75,7 +75,9 @@ pub fn validate_export(export_dir: &Path, tenant: &str) -> ValidationReport {
     };
 
     if let Err(e) = conn.execute_batch(&format!("IMPORT DATABASE {};", sql_quote(export_dir))) {
-        return fail(format!("IMPORT DATABASE failed (corrupt/incomplete export): {e}"));
+        return fail(format!(
+            "IMPORT DATABASE failed (corrupt/incomplete export): {e}"
+        ));
     }
 
     // invoice: informational, table may be absent on a fresh tenant.
@@ -84,11 +86,11 @@ pub fn validate_export(export_dir: &Path, tenant: &str) -> ValidationReport {
         .unwrap_or(-1);
 
     // audit_ledger: hard gate — must be present.
-    let audit_count: i64 = match conn.query_row("SELECT count(*) FROM audit_ledger", [], |r| r.get(0))
-    {
-        Ok(n) => n,
-        Err(e) => return fail(format!("audit_ledger unreadable in snapshot: {e}")),
-    };
+    let audit_count: i64 =
+        match conn.query_row("SELECT count(*) FROM audit_ledger", [], |r| r.get(0)) {
+            Ok(n) => n,
+            Err(e) => return fail(format!("audit_ledger unreadable in snapshot: {e}")),
+        };
 
     // Verify the hash chain on the imported connection WITHOUT re-opening a
     // file (S375). Binary hash is irrelevant to chain verification (which
@@ -192,8 +194,7 @@ pub fn take_snapshot(
 
     // Atomic finalize: the snapshot only becomes visible to listing/seq
     // derivation once it is whole.
-    std::fs::rename(&partial_dir, &final_dir)
-        .map_err(|e| SnapshotError::io(&final_dir, e))?;
+    std::fs::rename(&partial_dir, &final_dir).map_err(|e| SnapshotError::io(&final_dir, e))?;
 
     Ok(SnapshotRecord {
         dir: final_dir,

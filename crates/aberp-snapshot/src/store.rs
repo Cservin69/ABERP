@@ -174,7 +174,7 @@ pub fn list_snapshots(store_dir: &Path) -> Result<Vec<SnapshotRecord>> {
             ),
         }
     }
-    out.sort_by(|a, b| b.meta.seq.cmp(&a.meta.seq));
+    out.sort_by_key(|r| std::cmp::Reverse(r.meta.seq));
     Ok(out)
 }
 

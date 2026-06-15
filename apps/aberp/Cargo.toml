@@ -249,6 +249,13 @@ zeroize = { workspace = true }
 # above — production code paths cannot reach `Actor::test_only`. F15.
 aberp-audit-ledger = { path = "../../crates/audit-ledger", features = ["test-support"] }
 
+# S426 / ADR-0082 — the snapshot e2e/emission test seeds a DuckDB (invoice
+# table + audit chain) and reads snapshot records back, exercising the
+# crate API directly alongside `aberp::snapshot`'s audit emission.
+aberp-snapshot = { path = "../../crates/aberp-snapshot" }
+duckdb = { workspace = true }
+time = { workspace = true }
+
 # S161 — the NAV poll-daemon timer pins (`poll_ack.rs` two-phase
 # schedule tests) use tokio's `#[tokio::test(start_paused = true)]`
 # virtual clock so the 1/2/4/8/16/30/60 + 60s schedule is asserted

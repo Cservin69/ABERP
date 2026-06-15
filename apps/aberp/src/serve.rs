@@ -21150,7 +21150,10 @@ struct SnapshotRestoreResponse {
     target: String,
 }
 
-fn snapshot_item(r: &aberp_snapshot::SnapshotRecord, now: time::OffsetDateTime) -> SnapshotListItem {
+fn snapshot_item(
+    r: &aberp_snapshot::SnapshotRecord,
+    now: time::OffsetDateTime,
+) -> SnapshotListItem {
     SnapshotListItem {
         seq: r.meta.seq,
         created_at: crate::snapshot::rfc3339(r.meta.created_at),
@@ -21181,7 +21184,10 @@ fn list_snapshots_request(state: &AppState) -> Result<SnapshotsListResponse> {
 
 fn snapshot_now_request(state: &AppState) -> Result<SnapshotNowResponse> {
     let store_dir = crate::snapshot::resolve_store(state.tenant.as_str(), None)?;
-    let binary_hash = state.binary_hash.wait().context("binary hash for snapshot")?;
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("binary hash for snapshot")?;
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login_for_audit(state));
     let policy = crate::snapshot::policy_from_env();
     let rec = crate::snapshot::run_cycle(
@@ -21203,7 +21209,10 @@ fn snapshot_restore_request(
 ) -> Result<SnapshotRestoreResponse> {
     let target = std::path::PathBuf::from(&body.to);
     let store_dir = crate::snapshot::resolve_store(state.tenant.as_str(), None)?;
-    let binary_hash = state.binary_hash.wait().context("binary hash for restore")?;
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("binary hash for restore")?;
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login_for_audit(state));
     let rec = crate::snapshot::restore_and_emit(
         &state.db_path,

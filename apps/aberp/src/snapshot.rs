@@ -217,7 +217,8 @@ pub fn run_cycle(
     actor: Actor,
     policy: &RetentionPolicy,
 ) -> Result<SnapshotRecord> {
-    let rec = take_and_emit(db_path, store_dir, tenant, binary_hash.clone(), actor.clone())?;
+    // `BinaryHash` is `Copy`; `Actor` is cloned for the second emit.
+    let rec = take_and_emit(db_path, store_dir, tenant, binary_hash, actor.clone())?;
     if let Err(e) = retention_and_emit(db_path, store_dir, tenant, binary_hash, actor, policy) {
         // A retention hiccup must not fail the cycle — the fresh snapshot is
         // the valuable output; stale extras are harmless.
@@ -394,12 +395,13 @@ pub async fn run_supervised(deps: SnapshotDaemonDeps, cancel: CancellationToken)
         let db = deps.db_path.clone();
         let store = deps.store_dir.clone();
         let tenant = deps.tenant.clone();
-        let bh = deps.binary_hash.clone();
+        let bh = deps.binary_hash; // BinaryHash is Copy
         let policy = deps.policy;
         let actor = cli_actor("system:snapshot-daemon");
-        let outcome =
-            tokio::task::spawn_blocking(move || run_cycle(&db, &store, &tenant, bh, actor, &policy))
-                .await;
+        let outcome = tokio::task::spawn_blocking(move || {
+            run_cycle(&db, &store, &tenant, bh, actor, &policy)
+        })
+        .await;
         match outcome {
             Ok(Ok(_rec)) => {}
             Ok(Err(e)) => {

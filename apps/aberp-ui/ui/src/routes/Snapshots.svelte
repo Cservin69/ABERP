@@ -22,7 +22,6 @@
     restoreTargetWarning,
     sortSnapshots,
     summarizeSnapshots,
-    type SnapshotItem,
     type SnapshotSortKey,
     type SnapshotStatusFacet,
     type SortDir,
@@ -33,7 +32,6 @@
   let loadState = $state<LoadState>("idle");
   let errorMessage = $state<string | null>(null);
   let data = $state<SnapshotsListResponse | null>(null);
-  let now = $state(new Date());
 
   let statusFacet = $state<SnapshotStatusFacet>("all");
   let sort = $state<{ key: SnapshotSortKey; dir: SortDir }>({ key: "seq", dir: "desc" });
@@ -74,7 +72,6 @@
     errorMessage = null;
     try {
       data = await listSnapshots();
-      now = new Date();
       loadState = "ready";
     } catch (e) {
       errorMessage = e instanceof Error ? e.message : String(e);
