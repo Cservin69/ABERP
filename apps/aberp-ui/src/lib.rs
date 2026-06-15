@@ -268,6 +268,10 @@ pub fn run() {
             // S424 / session-424 — cross-domain audit-events screen.
             commands::list_audit_events,
             commands::get_audit_event,
+            // S426 / ADR-0082 — Snapshots tab.
+            commands::list_snapshots,
+            commands::snapshot_now,
+            commands::restore_snapshot,
             commands::download_invoice_pdf,
             commands::issue_invoice,
             commands::submit_invoice_to_nav,

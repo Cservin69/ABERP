@@ -122,6 +122,33 @@ pub async fn get_audit_event(state: State<'_, AppState>, seq: u64) -> Result<Val
     forward_get(&state, &path, true).await
 }
 
+/// S426 / ADR-0082 — `GET /api/snapshots` — list managed DB snapshots
+/// (seq / timestamp / size / validation / age) for the Snapshots tab.
+#[tauri::command]
+pub async fn list_snapshots(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/snapshots", true).await
+}
+
+/// S426 / ADR-0082 — `POST /api/snapshots/now` — take one validated
+/// snapshot immediately and apply retention.
+#[tauri::command]
+pub async fn snapshot_now(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_post(&state, "/api/snapshots/now", serde_json::json!({})).await
+}
+
+/// S426 / ADR-0082 — `POST /api/snapshots/restore` — guarded restore. The
+/// backend refuses (400) without `confirm` or onto any live `~/.aberp` DB.
+#[tauri::command]
+pub async fn restore_snapshot(
+    state: State<'_, AppState>,
+    selector: String,
+    to: String,
+    confirm: bool,
+) -> Result<Value, String> {
+    let body = serde_json::json!({ "selector": selector, "to": to, "confirm": confirm });
+    forward_post(&state, "/api/snapshots/restore", body).await
+}
+
 /// PR-44ε.UI / session-58 — `GET /invoices/<id>/pdf`; returns the
 /// raw PDF bytes for the SPA's "Download PDF" button on the invoice
 /// detail modal. Unlike the other commands here, the response body

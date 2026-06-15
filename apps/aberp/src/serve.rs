@@ -2081,6 +2081,53 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             );
         }
 
+        // S426 / ADR-0082 — periodic, validated, logical DB-snapshot daemon
+        // (`EXPORT DATABASE` every 4h → validate → retention). Every error
+        // here is logged-and-skipped, NEVER fatal: a snapshot subsystem
+        // problem must not block prod startup. Kill switch:
+        // `ABERP_SNAPSHOT_DISABLE=1`.
+        if crate::snapshot::is_disabled() {
+            tracing::info!(
+                env = crate::snapshot::POLL_DISABLE_ENV,
+                "snapshot daemon disabled by env (S426 / ADR-0082)"
+            );
+        } else {
+            match recovery_state.binary_hash.wait() {
+                Ok(snap_binary_hash) => {
+                    match crate::snapshot::resolve_store(recovery_state.tenant.as_str(), None) {
+                        Ok(snap_store_dir) => {
+                            let snap_deps = crate::snapshot::SnapshotDaemonDeps {
+                                db_path: (*recovery_state.db_path).clone(),
+                                tenant: recovery_state.tenant.clone(),
+                                binary_hash: snap_binary_hash,
+                                store_dir: snap_store_dir,
+                                interval: crate::snapshot::interval_from_env(),
+                                policy: crate::snapshot::policy_from_env(),
+                            };
+                            let snap_interval_secs = snap_deps.interval.as_secs();
+                            let snap_token = coordinator.token.clone();
+                            let snap_handle = tokio::spawn(async move {
+                                crate::snapshot::run_supervised(snap_deps, snap_token).await;
+                            });
+                            coordinator.register("snapshot", snap_handle);
+                            tracing::info!(
+                                interval_secs = snap_interval_secs,
+                                "spawned snapshot daemon (S426 / ADR-0082)"
+                            );
+                        }
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            "snapshot store dir unresolved; snapshot daemon NOT spawned (boot continues)"
+                        ),
+                    }
+                }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "binary hash unavailable; snapshot daemon NOT spawned (boot continues)"
+                ),
+            }
+        }
+
         let config = RustlsConfig::from_der(rustls_config.0, rustls_config.1)
             .await
             .context("build axum-server RustlsConfig")?;
@@ -2887,6 +2934,11 @@ fn build_router(state: AppState) -> Router {
         // on row-expand via `/api/audit-events/:seq`.
         .route("/api/audit-events", get(handle_audit_events))
         .route("/api/audit-events/:seq", get(handle_audit_event_detail))
+        // S426 / ADR-0082 — operator Snapshots tab. List managed snapshots,
+        // trigger one now, and run a guarded restore.
+        .route("/api/snapshots", get(handle_list_snapshots))
+        .route("/api/snapshots/now", post(handle_snapshot_now))
+        .route("/api/snapshots/restore", post(handle_snapshot_restore))
         // PR-46α / session-62 — first-run setup route. Accepts the
         // four NAV credential artifacts and writes them to the OS
         // keychain. In `NeedsSetup` mode it bypasses bearer-auth (the
@@ -21042,6 +21094,195 @@ async fn handle_audit_event_detail(
         Ok(Err(e)) => internal_error("audit_event_detail_request", e),
         Err(join_err) => internal_error(
             "audit_event_detail_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S426 / ADR-0082 — Snapshots tab handlers
+// ──────────────────────────────────────────────────────────────────────
+
+/// One snapshot row in the operator UI. Mirrors `aberp_snapshot::SnapshotMeta`
+/// plus pre-rendered human strings so the SPA stays dumb.
+#[derive(Serialize)]
+struct SnapshotListItem {
+    seq: u64,
+    created_at: String,
+    byte_size: u64,
+    size_human: String,
+    valid: bool,
+    invoice_count: i64,
+    audit_count: i64,
+    chain_len: u64,
+    age_human: String,
+    validation_error: Option<String>,
+    dir: String,
+}
+
+/// `GET /api/snapshots` response.
+#[derive(Serialize)]
+struct SnapshotsListResponse {
+    store_dir: String,
+    daemon_disabled: bool,
+    interval_secs: u64,
+    snapshots: Vec<SnapshotListItem>,
+}
+
+/// `POST /api/snapshots/now` response.
+#[derive(Serialize)]
+struct SnapshotNowResponse {
+    created: SnapshotListItem,
+}
+
+/// `POST /api/snapshots/restore` request body.
+#[derive(Deserialize)]
+struct SnapshotRestoreBody {
+    selector: String,
+    to: String,
+    confirm: bool,
+}
+
+/// `POST /api/snapshots/restore` response.
+#[derive(Serialize)]
+struct SnapshotRestoreResponse {
+    restored_seq: u64,
+    target: String,
+}
+
+fn snapshot_item(r: &aberp_snapshot::SnapshotRecord, now: time::OffsetDateTime) -> SnapshotListItem {
+    SnapshotListItem {
+        seq: r.meta.seq,
+        created_at: crate::snapshot::rfc3339(r.meta.created_at),
+        byte_size: r.meta.byte_size,
+        size_human: crate::snapshot::human_size(r.meta.byte_size),
+        valid: r.meta.valid,
+        invoice_count: r.meta.invoice_count,
+        audit_count: r.meta.audit_count,
+        chain_len: r.meta.chain_len,
+        age_human: crate::snapshot::human_age(r.age(now)),
+        validation_error: r.meta.validation_error.clone(),
+        dir: r.dir.display().to_string(),
+    }
+}
+
+fn list_snapshots_request(state: &AppState) -> Result<SnapshotsListResponse> {
+    let store_dir = crate::snapshot::resolve_store(state.tenant.as_str(), None)?;
+    let records =
+        aberp_snapshot::list_snapshots(&store_dir).map_err(|e| anyhow!("list snapshots: {e}"))?;
+    let now = time::OffsetDateTime::now_utc();
+    Ok(SnapshotsListResponse {
+        store_dir: store_dir.display().to_string(),
+        daemon_disabled: crate::snapshot::is_disabled(),
+        interval_secs: crate::snapshot::interval_from_env().as_secs(),
+        snapshots: records.iter().map(|r| snapshot_item(r, now)).collect(),
+    })
+}
+
+fn snapshot_now_request(state: &AppState) -> Result<SnapshotNowResponse> {
+    let store_dir = crate::snapshot::resolve_store(state.tenant.as_str(), None)?;
+    let binary_hash = state.binary_hash.wait().context("binary hash for snapshot")?;
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login_for_audit(state));
+    let policy = crate::snapshot::policy_from_env();
+    let rec = crate::snapshot::run_cycle(
+        &state.db_path,
+        &store_dir,
+        &state.tenant,
+        binary_hash,
+        actor,
+        &policy,
+    )?;
+    Ok(SnapshotNowResponse {
+        created: snapshot_item(&rec, time::OffsetDateTime::now_utc()),
+    })
+}
+
+fn snapshot_restore_request(
+    state: &AppState,
+    body: &SnapshotRestoreBody,
+) -> Result<SnapshotRestoreResponse> {
+    let target = std::path::PathBuf::from(&body.to);
+    let store_dir = crate::snapshot::resolve_store(state.tenant.as_str(), None)?;
+    let binary_hash = state.binary_hash.wait().context("binary hash for restore")?;
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login_for_audit(state));
+    let rec = crate::snapshot::restore_and_emit(
+        &state.db_path,
+        &store_dir,
+        &body.selector,
+        &target,
+        &state.tenant,
+        binary_hash,
+        actor,
+    )?;
+    Ok(SnapshotRestoreResponse {
+        restored_seq: rec.meta.seq,
+        target: body.to.clone(),
+    })
+}
+
+/// `GET /api/snapshots` — list managed snapshots.
+async fn handle_list_snapshots(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let s = state.clone();
+    match tokio::task::spawn_blocking(move || list_snapshots_request(&s)).await {
+        Ok(Ok(resp)) => Json(resp).into_response(),
+        Ok(Err(e)) => internal_error("list_snapshots_request", e),
+        Err(join_err) => internal_error(
+            "list_snapshots_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+/// `POST /api/snapshots/now` — take one validated snapshot now.
+async fn handle_snapshot_now(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let s = state.clone();
+    match tokio::task::spawn_blocking(move || snapshot_now_request(&s)).await {
+        Ok(Ok(resp)) => Json(resp).into_response(),
+        Ok(Err(e)) => internal_error("snapshot_now_request", e),
+        Err(join_err) => internal_error(
+            "snapshot_now_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+/// `POST /api/snapshots/restore` — guarded restore. The prod-overwrite /
+/// no-confirm refusal is checked up front and returned as a 400 (operator-
+/// correctable) rather than a 500 ([[trust-code-not-operator]]).
+async fn handle_snapshot_restore(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<SnapshotRestoreBody>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    // Guard BEFORE any work — a refused restore never even looks at the store.
+    let target = std::path::PathBuf::from(&body.to);
+    if let Err(e) = aberp_snapshot::ensure_restore_allowed(&target, body.confirm) {
+        return (StatusCode::BAD_REQUEST, Json(error_body(format!("{e}")))).into_response();
+    }
+    let s = state.clone();
+    match tokio::task::spawn_blocking(move || snapshot_restore_request(&s, &body)).await {
+        Ok(Ok(resp)) => Json(resp).into_response(),
+        Ok(Err(e)) => internal_error("snapshot_restore_request", e),
+        Err(join_err) => internal_error(
+            "snapshot_restore_request:join",
             anyhow!("blocking task panicked: {join_err}"),
         ),
     }

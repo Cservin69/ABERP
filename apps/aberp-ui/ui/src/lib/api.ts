@@ -19,6 +19,9 @@ import { getMockDashboard } from "./workshop-mock-data";
 // module (it's what the sort/filter helpers operate on); api.ts reuses
 // it for the wire response type so the row is defined once.
 import type { AuditEventRow } from "./audit-events-list";
+// S426 — the snapshot row shape is owned by the pure helper module; api.ts
+// reuses it for the wire response type so the row is defined once.
+import type { SnapshotItem } from "./snapshots-list";
 
 /** PR-44ε / session-53 — typed wire mirror for the `aberp_billing::Currency`
  * enum per ADR-0037 §3. Two variants today (HUF + EUR); third-currency
@@ -594,6 +597,51 @@ export async function listAuditEvents(
 /** `GET /api/audit-events/:seq` — the single FULL entry for row-expand. */
 export async function getAuditEvent(seq: number): Promise<AuditEventDetail> {
   return invoke<AuditEventDetail>("get_audit_event", { seq });
+}
+
+// ── S426 / ADR-0082 — DB snapshot tab ──────────────────────────────────
+
+/** `GET /api/snapshots` response — `serve::SnapshotsListResponse`. */
+export interface SnapshotsListResponse {
+  store_dir: string;
+  daemon_disabled: boolean;
+  interval_secs: number;
+  snapshots: SnapshotItem[];
+}
+
+/** `POST /api/snapshots/now` response. */
+export interface SnapshotNowResponse {
+  created: SnapshotItem;
+}
+
+/** `POST /api/snapshots/restore` response. */
+export interface SnapshotRestoreResponse {
+  restored_seq: number;
+  target: string;
+}
+
+/** `GET /api/snapshots` — list managed snapshots (newest first). */
+export async function listSnapshots(): Promise<SnapshotsListResponse> {
+  return invoke<SnapshotsListResponse>("list_snapshots");
+}
+
+/** `POST /api/snapshots/now` — take one validated snapshot immediately. */
+export async function snapshotNow(): Promise<SnapshotNowResponse> {
+  return invoke<SnapshotNowResponse>("snapshot_now");
+}
+
+/** `POST /api/snapshots/restore` — guarded restore. The backend refuses
+ * (rejected promise) without `confirm` or onto any live `~/.aberp` DB. */
+export async function restoreSnapshot(
+  selector: string,
+  to: string,
+  confirm: boolean,
+): Promise<SnapshotRestoreResponse> {
+  return invoke<SnapshotRestoreResponse>("restore_snapshot", {
+    selector,
+    to,
+    confirm,
+  });
 }
 
 /** PR-44ε.UI / session-58 — download the printed-invoice PDF as a

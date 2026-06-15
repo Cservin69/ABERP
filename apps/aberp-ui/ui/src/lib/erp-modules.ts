@@ -45,6 +45,9 @@ export type ErpModuleId =
   // area (daily-useful forensic tool); its single route is the whole-
   // ledger filterable view.
   | "audit"
+  // S426 / ADR-0082 — DB snapshot + restore operations. Operational area
+  // (high-stakes recovery tool); list + snapshot-now + guarded restore.
+  | "snapshots"
   | "master-data"
   | "settings"
   // S267 / PR-256 — auto-quoting engine tunables. Maintenance-area
@@ -185,6 +188,18 @@ export const MODULES: ErpModule[] = [
     label_en: "Audit log",
     glyph: "⛓",
     routes: [{ id: "audit-events", label: "Tevékenységi napló / Activity log" }],
+  },
+  // S426 / ADR-0082 — DB snapshot + restore. Operational area, after the
+  // audit log: a high-stakes recovery surface (the 2026-06-11 ART
+  // corruption defence). List of validated logical snapshots + a
+  // snapshot-now button + a guarded restore wizard.
+  {
+    id: "snapshots",
+    area: "operational",
+    label_hu: "Pillanatképek",
+    label_en: "Snapshots",
+    glyph: "🛟",
+    routes: [{ id: "snapshots", label: "Adatbázis pillanatképek / DB snapshots" }],
   },
   {
     id: "master-data",

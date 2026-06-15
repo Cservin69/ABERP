@@ -63,7 +63,11 @@ export type AppRoute =
   // domain, paginated + filtered"). Operational area (a daily-useful
   // forensic tool — "what happened to quote X / what did I do today" in
   // one click, [[hulye-biztos]]), distinct from the per-invoice timeline.
-  | "audit-events";
+  | "audit-events"
+  // S426 / ADR-0082 — DB snapshot + restore operations screen. Operational
+  // area; list of validated logical snapshots + snapshot-now + guarded
+  // restore wizard (the 2026-06-11 ART corruption defence).
+  | "snapshots";
 
 /** Default route the SPA falls back to on first paint (or on a hash
  * with an unknown slug). The Invoices list was the only screen
@@ -139,6 +143,8 @@ export function parseRoute(hash: string): AppRoute {
       return "email-relay-queue";
     case "audit-events":
       return "audit-events";
+    case "snapshots":
+      return "snapshots";
     default:
       return DEFAULT_ROUTE;
   }

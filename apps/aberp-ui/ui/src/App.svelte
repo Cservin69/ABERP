@@ -70,6 +70,8 @@
   import PricingJobsList from "./routes/PricingJobsList.svelte";
   // S424 / session-424 — cross-domain audit-activity log.
   import AuditEvents from "./routes/AuditEvents.svelte";
+  // S426 / ADR-0082 — DB snapshot + restore operations.
+  import Snapshots from "./routes/Snapshots.svelte";
   import IssueInvoice from "./routes/IssueInvoice.svelte";
   import MaintenanceDashboard from "./routes/MaintenanceDashboard.svelte";
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
@@ -690,6 +692,8 @@
           <EmailRelayQueueList />
         {:else if route === "audit-events"}
           <AuditEvents />
+        {:else if route === "snapshots"}
+          <Snapshots />
         {:else if route === "invoices-new"}
           <!-- PR-87 / session-112 — full-page issuance route. The
                IssueInvoice form was a `<dialog>` modal mounted inside

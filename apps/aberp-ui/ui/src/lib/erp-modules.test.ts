@@ -174,6 +174,9 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   // S424 / session-424 — audit-activity log (operational, daily-useful
   // forensic tool).
   "audit-events": "operational",
+  // S426 / ADR-0082 — DB snapshot + restore (operational, high-stakes
+  // recovery tool).
+  snapshots: "operational",
 };
 
 // Closed-vocab set of accepted status kinds on a maintenance tile.
