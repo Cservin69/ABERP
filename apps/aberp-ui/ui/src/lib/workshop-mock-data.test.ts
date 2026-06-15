@@ -121,8 +121,9 @@ describe("workshop-mock-data — shape pin", () => {
 describe("workshop-mock-data — S246 / PR-239 density rows", () => {
   it("work_order_rows has exactly 5 rows spanning the snake_case state vocab", () => {
     const b = getMockDashboard();
-    expect(b.work_order_rows.length).toBe(5);
-    const states = new Set(b.work_order_rows.map((r) => r.state));
+    const rows = b.work_order_rows!;
+    expect(rows.length).toBe(5);
+    const states = new Set(rows.map((r) => r.state));
     // Each state is one of the documented snake_case wire forms.
     for (const s of states) {
       expect([
@@ -135,7 +136,7 @@ describe("workshop-mock-data — S246 / PR-239 density rows", () => {
       ]).toContain(s);
     }
     // WO numbers follow the `WO-YYYY-NNNNN` shape.
-    for (const r of b.work_order_rows) {
+    for (const r of rows) {
       expect(r.wo_number).toMatch(/^WO-\d{4}-\d{5}$/);
       expect(r.product_name).not.toBe("");
     }
@@ -143,8 +144,9 @@ describe("workshop-mock-data — S246 / PR-239 density rows", () => {
 
   it("low_stock_rows has exactly 3 rows with bin-location grid codes", () => {
     const b = getMockDashboard();
-    expect(b.low_stock_rows.length).toBe(3);
-    for (const r of b.low_stock_rows) {
+    const rows = b.low_stock_rows!;
+    expect(rows.length).toBe(3);
+    for (const r of rows) {
       expect(r.bin_location).toMatch(/^[A-Z]-\d{2}-\d$/);
       // stock < min by construction — this is the low-stock list.
       expect(Number(r.stock_qty)).toBeLessThan(Number(r.min_stock));
@@ -154,10 +156,11 @@ describe("workshop-mock-data — S246 / PR-239 density rows", () => {
   it("pending_qa_rows has exactly 7 rows oldest-first", () => {
     const now = new Date("2026-06-04T12:00:00.000Z");
     const b = getMockDashboard(now);
-    expect(b.pending_qa_rows.length).toBe(7);
-    for (let i = 1; i < b.pending_qa_rows.length; i++) {
-      const prev = new Date(b.pending_qa_rows[i - 1].created_at_iso8601).getTime();
-      const cur = new Date(b.pending_qa_rows[i].created_at_iso8601).getTime();
+    const rows = b.pending_qa_rows!;
+    expect(rows.length).toBe(7);
+    for (let i = 1; i < rows.length; i++) {
+      const prev = new Date(rows[i - 1].created_at_iso8601).getTime();
+      const cur = new Date(rows[i].created_at_iso8601).getTime();
       // Oldest first per ADR-0063 §8 — created_at is ascending.
       expect(prev).toBeLessThanOrEqual(cur);
     }
@@ -165,12 +168,11 @@ describe("workshop-mock-data — S246 / PR-239 density rows", () => {
 
   it("eligible_dispatch_rows has exactly 4 rows oldest-first", () => {
     const b = getMockDashboard(new Date("2026-06-04T12:00:00.000Z"));
-    expect(b.eligible_dispatch_rows.length).toBe(4);
-    for (let i = 1; i < b.eligible_dispatch_rows.length; i++) {
-      const prev = new Date(
-        b.eligible_dispatch_rows[i - 1].completed_at_iso8601,
-      ).getTime();
-      const cur = new Date(b.eligible_dispatch_rows[i].completed_at_iso8601).getTime();
+    const rows = b.eligible_dispatch_rows!;
+    expect(rows.length).toBe(4);
+    for (let i = 1; i < rows.length; i++) {
+      const prev = new Date(rows[i - 1].completed_at_iso8601).getTime();
+      const cur = new Date(rows[i].completed_at_iso8601).getTime();
       // Older WOs head the list per ADR-0064.
       expect(prev).toBeLessThanOrEqual(cur);
     }
@@ -178,31 +180,33 @@ describe("workshop-mock-data — S246 / PR-239 density rows", () => {
 
   it("pending_dispatch_rows has exactly 2 rows newest-first with partner names", () => {
     const b = getMockDashboard(new Date("2026-06-04T12:00:00.000Z"));
-    expect(b.pending_dispatch_rows.length).toBe(2);
-    const a = new Date(b.pending_dispatch_rows[0].created_at_iso8601).getTime();
-    const c = new Date(b.pending_dispatch_rows[1].created_at_iso8601).getTime();
+    const rows = b.pending_dispatch_rows!;
+    expect(rows.length).toBe(2);
+    const a = new Date(rows[0].created_at_iso8601).getTime();
+    const c = new Date(rows[1].created_at_iso8601).getTime();
     // Newest first per ADR-0064 §7 — created_at is descending.
     expect(a).toBeGreaterThanOrEqual(c);
-    for (const r of b.pending_dispatch_rows) {
+    for (const r of rows) {
       expect(r.partner_name).not.toBe("");
     }
   });
 
   it("today_invoice_rows has exactly 5 rows + total=8 (so '+3 more' surfaces)", () => {
     const b = getMockDashboard();
-    expect(b.today_invoice_rows.length).toBe(5);
+    const rows = b.today_invoice_rows!;
+    expect(rows.length).toBe(5);
     expect(b.today_invoice_total).toBe(8);
-    expect(b.today_invoice_total).toBeGreaterThan(b.today_invoice_rows.length);
+    expect(b.today_invoice_total).toBeGreaterThan(rows.length);
     // Sequence-number descending — newest issuance heads the list.
-    for (let i = 1; i < b.today_invoice_rows.length; i++) {
-      expect(b.today_invoice_rows[i].sequence_number).toBeLessThan(
-        b.today_invoice_rows[i - 1].sequence_number,
+    for (let i = 1; i < rows.length; i++) {
+      expect(rows[i].sequence_number).toBeLessThan(
+        rows[i - 1].sequence_number,
       );
     }
     // Currency split — at least one EUR row so the formatter
     // dual-symbol path renders in demo.
-    const huf = b.today_invoice_rows.filter((r) => r.currency === "HUF").length;
-    const eur = b.today_invoice_rows.filter((r) => r.currency === "EUR").length;
+    const huf = rows.filter((r) => r.currency === "HUF").length;
+    const eur = rows.filter((r) => r.currency === "EUR").length;
     expect(huf).toBeGreaterThan(0);
     expect(eur).toBeGreaterThan(0);
   });

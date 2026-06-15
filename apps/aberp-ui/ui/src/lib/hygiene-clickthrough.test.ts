@@ -246,10 +246,8 @@ function frow(
   },
 ): InvoiceListItem {
   return {
-    invoice_id: overrides.invoice_id,
     sequence_number: 1,
     fiscal_year: 2026,
-    state: overrides.state,
     total_gross: 100,
     has_chain_children: false,
     is_storno: false,

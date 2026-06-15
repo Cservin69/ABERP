@@ -303,7 +303,6 @@ function buildLowStockRows(): LowStockItemRow[] {
  *  names use HU manufacturing vocab (`Marás`, `Festés`, …). */
 function buildPendingQaRows(now: Date): PendingQaRow[] {
   const base = now.getTime();
-  const HR = 60 * MIN_MS;
   // [minutesAgo, woNumber, opName]
   const script: Array<[number, string, string]> = [
     [4.2 * 60, "WO-2026-00410", "Marás"],

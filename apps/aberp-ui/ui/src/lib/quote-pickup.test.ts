@@ -42,6 +42,16 @@ function row(over: Partial<QuoteIntakeRow> = {}): QuoteIntakeRow {
     picked_up_drf_id: null,
     intake_state: "staged",
     intake_error: null,
+    customer_email: null,
+    material_grade: null,
+    quantity_canonical: null,
+    total_price_eur: null,
+    valid_until: null,
+    stock_status_at_accept: null,
+    stock_alert: false,
+    deal_issued_at: null,
+    deal_sales_order_id: null,
+    deal_work_order_id: null,
     ...over,
   };
 }
