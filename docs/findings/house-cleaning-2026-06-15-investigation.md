@@ -79,6 +79,19 @@ pricing-doc refresh is ever wanted, that is a separate documentation session,
 not a blocker on this preservation.) The cherry-picks are trivially revertable
 if S420 disagrees, but the affirmative decision here is KEEP.
 
+> **🔴 S421 UPDATE — this KEEP was OVERSTATED (S420 disagreed, correctly).**
+> The staleness audit above checked only the S417/S418 pricing *math* surface;
+> it never checked the **S413/S416 operator-surface removal**. `quote-workflow.md`
+> §5.3 documented a **live operator Accept-on-behalf button** + `quote.operator_accepted`
+> writeback that was REMOVED in S413/S416 (S354-deprecated; proof
+> `PricingJobDetail.svelte:26-30`, `serve.rs:18144`). Landing it verbatim ships a
+> doc contradicting PROD_v2.27.66. **S421 corrected the doc** (commit `60f9bf4`):
+> excised §5.3's Accept bullet, added the S398 `processing` storefront state and
+> the S403 operator **Refuse** path to §1/§5.6, and re-anchored the header to
+> PROD_v2.27.66. The KEEP now reads "KEEP **after** the S421 one-section refresh."
+> `defense-workflow.md` was re-checked and needs **no** edit — it is an explicit
+> "foundation laid, no firing site" snapshot referencing no live operator surface.
+
 **🚩 DISPATCH ACTION (origin mutations — sequenced AFTER the S419 cut, because
 this session may not push origin per [[origin-clean-topology]]).** This is a
 firm ACT decision with exact commands, not a deferral:
@@ -177,6 +190,21 @@ works, not that the test is inert.
 per-checkout. A dev who has run the documented `pip install -e
 python/aberp-cad-extract` once gets passing tests automatically — no env var to
 remember. A fresh checkout with no venv still fails loud (correct).
+
+> **🟡 S421 UPDATE — "mirror that order" was incomplete (S420 flagged it).**
+> The S419 fix mirrored the daemon's venv *paths* but DROPPED the daemon's
+> `&& check_module_importable` gate at each candidate (daemon
+> `quote_pricing_pipeline.rs:2916,2922` vs harness `tests/common/mod.rs:44,47`),
+> so a canonical venv that exists but lacks the module would be selected here
+> while the daemon falls through to a working alt/system python — a false test
+> failure prod never hits. The "2 passed" verification above only exercised the
+> happy canonical path, never the broken-canonical fallthrough. **S421 added the
+> importable gate** (commit `7ebc61f`): each candidate is now gated on
+> `is_file() && module_importable(..)` (a faithful copy of the daemon's
+> `check_module_importable`), resolution is factored into a testable
+> `resolve_test_python(repo_root)`, and a new `tests/python_resolution.rs`
+> proves a present-but-broken canonical is skipped. Now true parity, not just
+> path parity.
 
 ---
 
@@ -334,3 +362,56 @@ Group A):**
 
 **Dedicated-session-needed:** none. Every backlog item reached a decision in
 this session.
+
+---
+
+## Cut-time gate prerequisites (S421 — gate-venv dependency)
+
+The "Gate status" green above is **venv-dependent**: the two CAD smoke tests
+(`extract_smoke` STL + `step_extract_smoke` STEP) pass with `ABERP_TEST_PYTHON`
+UNSET **only because a provisioned venv exists in the checkout** the gate runs
+in. The S420 review flagged this: a "green at `1e2595a`" verdict can RED in a
+**different** checkout — the canonical venv `python/aberp-cad-extract/.venv` is
+gitignored, so every fresh worktree (and the cut's isolated gate worktree)
+starts with **no venv**. With no venv, the harness falls through to a system
+`python3` that lacks `aberp_cad_extract` (and OCP), and both CAD tests fail
+loud — a false RED for a tree that is actually green.
+
+**The cut session (PROD_v2.27.67) MUST, in whatever checkout it runs `cargo
+test`, do ONE of:**
+
+1. **Provision a venv (preferred — honors [[trust-code-not-operator]], no env
+   var).** Run the new stand-alone provisioner FIRST, then the gates with
+   `ABERP_TEST_PYTHON` unset:
+   ```sh
+   ./run/provision_pipeline_venv.sh           # idempotent; ~63 MB OCP wheel on first run
+   cargo test --workspace                      # harness auto-discovers the venv
+   ```
+   `run/provision_pipeline_venv.sh` (S421) creates
+   `python/aberp-cad-extract/.venv` and `pip install -e '.[step]'`s the package
+   (the pyproject says "Production installs (and CI) MUST install with
+   `.[step]`"), then fail-loud-verifies both `aberp_cad_extract` AND `OCP`
+   import. It is a deliberate, cross-referenced near-duplicate of
+   `upgrade_prod.sh`'s inline `provision_pipeline_venv` (S282) — kept separate
+   because that script `exec`s into prod and can't be run just to prep a gate.
+   This is the [[trust-code-not-operator]]-aligned path: the harness's S421
+   importable gate then resolves the venv with nothing to remember.
+
+2. **Point `ABERP_TEST_PYTHON` at an existing venv** (e.g. the main checkout's,
+   which `upgrade_prod.sh` keeps provisioned — verified to import the module):
+   ```sh
+   ABERP_TEST_PYTHON=/path/to/ABERP/python/aberp-cad-extract/.venv/bin/python \
+     cargo test --workspace
+   ```
+   Faster (no wheel download) but relies on an env var — acceptable for
+   automation, less aligned with [[trust-code-not-operator]] than option 1.
+
+Without one of these, expect exactly **2 CAD py-smoke failures** in the cut
+gate — those are the gate-venv prerequisite, NOT a regression.
+
+> **🚩 Flag (out of scope for S421, pre-existing):** `upgrade_prod.sh`'s
+> `provision_pipeline_venv` installs `pip install -e "$pkg_dir"` WITHOUT the
+> `[step]` extra (line ~407), yet the pyproject says production MUST install
+> `.[step]` or STEP submissions fall through to the NotImplementedError stub.
+> So a prod box provisioned solely by `upgrade_prod.sh` may not extract STEP
+> files. Not touched here (surgical); flagged for a dedicated fix.
