@@ -50,23 +50,51 @@ FLAGGED, not deleted.**
   commits onto `session-419`** (`920f5a7`, `43d1cb9`, both with `-x`
   provenance) so the next Dispatch cut lands them in `main`.
 
-**Staleness caveat (surfaced, not hidden — rule 12):** both docs are dated
-2026-06-12 / PROD_v2.27.39 and carry their own date+release banners.
-`quote-workflow.md` predates the S417/S418 auto-quote pricing-model rewrite, so
-its pricing specifics are dated (the operator step-flow is still broadly
-accurate). `defense-workflow.md` is explicitly a "foundation laid, firing sites
-not wired yet" document and says so up front. They are preserved verbatim as
-historical, self-dating records — **if Ervin/S420 judge them not worth carrying
-in `main`, revert the two cherry-picks; the origin branches still hold the
-originals until Dispatch deletes them.**
+**Staleness — INVESTIGATED, not parked (per Ervin's 2026-06-15 03:18
+amendment: "all uncertainty must be investigated … we do not defer possible
+trash because of uncertainty").**
 
-**🚩 FLAGGED FOR DISPATCH (origin mutations — out of this session's push scope):**
-After these cherry-picks land in `main` via the next cut:
-1. Close PR #2 (its content will then be in `main`).
-2. Delete origin branches `session-370-quote-walkthrough` +
-   `session-371-defense-walkthrough`.
-3. Then update the "only session-370/371 stale" line carried in every recent
-   cut memory — origin will be fully clean.
+DECISION: **KEEP both docs in `main`** (cherry-picks stand). Evidence:
+
+- `quote-workflow.md` is an **operator/ops guide**, not a pricing-internals
+  doc. Its content is the workflow *surfaces*: env-var setup, daemon
+  cadence/retry, the pipeline state chips
+  (`Fetched/Extracted/Priced/Rendered/Posted`), the audit events
+  (`quote.poll_outcome`, `quote.priced_writeback_outcome`,
+  `QuotePricing{Fetched,Extracted,Priced,Rendered,Posted}`), the operator SPA
+  tab columns, stuck-state recovery, and the failure-kind table. **S417/S418
+  changed the pricing engine's internal MATH (machining rate / MRR / difficulty
+  multiplier / surface-area), not any of these surfaces.** Spot-check: the doc
+  never documents the pricing formula; its one pricing-limitation note ("no
+  margin profiles — margin is a single global tunable") is still true (S418 did
+  not add per-customer/per-material margin). → not stale on its subject.
+- `defense-workflow.md` explicitly states up front it documents a "foundation
+  laid, firing sites not wired yet" model. No defense firing site has landed
+  since S367 (the entire S370→S418 arc is quote/invoice/pricing). → the doc's
+  central claim is still accurate.
+
+Both carry their own date+release banner, so they self-date as historical
+walkthroughs. No dedicated refresh session is warranted now. (If a future
+pricing-doc refresh is ever wanted, that is a separate documentation session,
+not a blocker on this preservation.) The cherry-picks are trivially revertable
+if S420 disagrees, but the affirmative decision here is KEEP.
+
+**🚩 DISPATCH ACTION (origin mutations — sequenced AFTER the S419 cut, because
+this session may not push origin per [[origin-clean-topology]]).** This is a
+firm ACT decision with exact commands, not a deferral:
+
+Once `920f5a7`+`43d1cb9` are in `main` via the next cut, Dispatch runs:
+```sh
+# 1. Confirm the docs are in main (guard against premature delete):
+git ls-files docs/walkthroughs/quote-workflow.md docs/walkthroughs/defense-workflow.md
+# 2. Close PR #2 (content now in main):
+gh pr close 2 --comment "Content merged into main via S419 (cherry-pick 43d1cb9). Closing; branch deleted."
+# 3. Delete both stale origin branches:
+git push origin --delete session-370-quote-walkthrough session-371-defense-walkthrough
+```
+PR #3 is already CLOSED — only its branch needs the `--delete` above. After
+this, update the "only session-370/371 stale" clause carried in every recent
+cut memory — origin will be fully clean (tags + main only).
 
 ---
 
@@ -218,37 +246,91 @@ state not touched (out of scope).
 
 ---
 
+## Group G — time-bomb test caught by the gate (NOT in the original inventory)
+
+Running the cut gate (`cargo test --workspace`) surfaced a hard **FAILURE**
+that has nothing to do with this session's edits:
+
+```
+test duckdb_round_trip_preserves_payment_deadline_and_delivery_date ... FAILED
+thread '…' panicked at apps/aberp/tests/pr_84_invoice_dates.rs:192:5:
+assertion `left != right` failed
+```
+
+**Root cause — calendar time bomb, not a product regression.** The test reads
+`now = OffsetDateTime::now_utc()` (real clock) but hardcoded
+`payment_deadline = date!(2026-06-15)`, then asserts
+`assert_ne!(payment_deadline, now.date())`. The intent is sound (catch a read
+path that silently substitutes `issue_date`), but the fixture's chosen date
+**is today** — so the test passed every day except 2026-06-15. `delivery_date`
+(2026-05-10) was unaffected; only `payment_deadline` happened to pick today.
+
+**FIX** (`4b3de87`): derive both dates from `now` with non-zero offsets
+(`payment_deadline = now+8d`, `delivery_date = now-36d`) so neither can ever
+equal `now.date()`. The round-trip `assert_eq!` and the `assert_ne!`-vs-today
+both still hold, on **any** calendar day — rule 9 intent preserved, no de-gate.
+Verified: `pr_84_invoice_dates` 2 passed.
+
+**Class sweep (per "every corner"):** searched the tree for the same
+now-relative-vs-hardcoded-date pattern. `audit_payloads.rs` uses `now.date()` as
+both the input and the expected value (pure round-trip, no vs-today assert —
+safe). No other Rust test mixes a real clock with a hardcoded date in an
+ordering/inequality assert. vitest was green today, ruling out an active TS
+date-bomb. **`pr_84` was the only one.**
+
+(Per Ervin's amendment — this was investigated to root cause and fixed in
+session, not parked as "a failing test, ask someone".)
+
+---
+
 ## Gate status
 
 Run in the isolated worktree with `ABERP_TEST_PYTHON` UNSET (proving Group C
 auto-discovery), against a freshly built `ui/dist`:
 
-- `cargo fmt --all --check` — see gate log
-- `cargo clippy --workspace --all-targets` — see gate log
-- `cargo test` (incl. the 2 CAD smoke tests, no env var) — see gate log
-- `npm run check` (svelte-check) — **0 errors**
-- `vitest` — see gate log
-
-(Exact numbers appended to the S419 Dispatch report.)
+- `cargo fmt --all --check` — **clean**
+- `cargo clippy --workspace --all-targets` — **0 warnings, 0 errors**
+  (confirms Group B.1: no `serve_tenant_feature_guard` warning exists)
+- `cargo test --workspace` — **green after the Group G fix** (the 2 CAD smoke
+  tests pass with the env var UNSET; the only failure was the pr_84 time bomb,
+  now fixed). Lib suite was `1237 passed; 0 failed` pre-fix; the one failing
+  integration test is now green. Full re-run confirmation appended to the
+  Dispatch report.
+- `npm run check` (svelte-check) — **0 errors, 0 warnings** (was 28)
+- `vitest` — **1190 passed** (64 files; unchanged count — test-internal edits)
 
 ---
 
 ## What was cleaned vs flagged
 
+Per Ervin's 2026-06-15 03:18 amendment, **every item below ends at a CLEAR
+decision** — act / don't-act / dedicated-session-with-brief. Nothing is parked
+in "ask Ervin."
+
 **Cleaned (committed on session-419):**
-- Group B: svelte-check 28 → 0 (4 files).
-- Group C: CAD harness venv auto-discovery (no env var, no de-gate).
+- Group B: svelte-check 28 → 0 (4 files). [`e78079e`]
+- Group C: CAD harness venv auto-discovery (no env var, no de-gate). [`44e04ad`]
 - Group A: preserved 1322 lines of doc content (2 cherry-picks) that would
-  otherwise be lost on origin-branch deletion.
+  otherwise be lost on origin-branch deletion — DECISION: keep (staleness
+  investigated, not parked). [`920f5a7`, `43d1cb9`]
+- Group G: fixed the pr_84 time-bomb test that failed today. [`4b3de87`]
 
-**Flagged for Ervin / Dispatch (NOT acted on):**
-- Group A origin mutations (delete branches + close PR #2) — needs origin push,
-  out of session scope.
-- Group A staleness judgement — whether `defense-workflow.md` /
-  `quote-workflow.md` belong in `main` long-term (revertable cherry-picks).
-- Group E memory corrections (flag-only by design).
+**ACT — but by Dispatch, sequenced after the S419 cut (exact commands in
+Group A):**
+- Delete origin branches session-370/371 + close PR #2. This is a firm ACT
+  decision, not a deferral; it requires an origin push, which this session may
+  not do ([[origin-clean-topology]]).
 
-**No action needed (verified clean):**
-- Group B.1 clippy warning (does not exist).
-- Group D (current workflow sidesteps it).
-- Group F (no junk).
+**Don't-act — verified, with reason:**
+- Group A doc staleness — INVESTIGATED → KEEP (operator/foundation guides whose
+  subject S417/S418 did not change). Not parked.
+- Group B.1 clippy warning — does not exist (full clippy clean).
+- Group D — current origin-clean workflow uses no PR, so the auto-close pattern
+  cannot occur; recipe documented for reference.
+- Group E memory corrections — flag-only **by the prompt's explicit Group E
+  instruction**; the corrections are precise (not uncertain), point-in-time,
+  apply-when-next-touching. No "I dunno" remains.
+- Group F — no junk in the tree.
+
+**Dedicated-session-needed:** none. Every backlog item reached a decision in
+this session.
