@@ -19,7 +19,7 @@ non-commercial, open-source.
 
 ## Status
 
-**Current stable: `PROD_v2.27.50`** (cut 2026-06-13). In production —
+**Current stable: `PROD_v2.27.67`** (cut 2026-06-15). In production —
 real money and live NAV submissions flow through it. The test path
 remains the default for any build that does not pass
 `--features production`; the production NAV endpoint is structurally
@@ -43,7 +43,7 @@ cross-process file lock at every NAV POST site.
 > reopened by an older build. **Snapshot before upgrading** (see
 > [Updating an existing prod install](#updating-an-existing-prod-install)).
 
-### Upgrade an existing install to `PROD_v2.27.50`
+### Upgrade an existing install to `PROD_v2.27.67`
 
 ```bash
 cd ~/ABERP
