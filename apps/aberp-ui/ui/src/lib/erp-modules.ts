@@ -48,6 +48,9 @@ export type ErpModuleId =
   // S426 / ADR-0082 — DB snapshot + restore operations. Operational area
   // (high-stakes recovery tool); list + snapshot-now + guarded restore.
   | "snapshots"
+  // S429 — closed-loop calibration. Operational area; read-only per-family
+  // coefficient + samples + skips ([[trust-code-not-operator]]).
+  | "calibration"
   | "master-data"
   | "settings"
   // S267 / PR-256 — auto-quoting engine tunables. Maintenance-area
@@ -200,6 +203,16 @@ export const MODULES: ErpModule[] = [
     label_en: "Snapshots",
     glyph: "🛟",
     routes: [{ id: "snapshots", label: "Adatbázis pillanatképek / DB snapshots" }],
+  },
+  // S429 — read-only closed-loop calibration. Operational area; per-family
+  // coefficient + samples chart + recent skips. Computed, never tuned.
+  {
+    id: "calibration",
+    area: "operational",
+    label_hu: "Kalibráció",
+    label_en: "Calibration",
+    glyph: "🎯",
+    routes: [{ id: "calibration", label: "Árazási kalibráció / Pricing calibration" }],
   },
   {
     id: "master-data",

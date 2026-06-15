@@ -102,6 +102,7 @@
 #![warn(missing_docs)]
 
 mod breakdown;
+mod calibration;
 mod capacity;
 mod catalogue;
 mod engine;
@@ -109,6 +110,11 @@ mod error;
 mod feature_graph;
 
 pub use breakdown::QuoteBreakdown;
+pub use calibration::{
+    coefficient, CalibrationSample, CalibrationTable, CALIBRATION_DEFAULT_COEFFICIENT,
+    CALIBRATION_MAX_COEFFICIENT, CALIBRATION_MIN_COEFFICIENT, CALIBRATION_MIN_SAMPLES,
+    CALIBRATION_WINDOW,
+};
 pub use capacity::{
     lead_time_days, LeadTimeEstimate, MachineCapacity, MachineFamily, FALLBACK_BUFFER_PCT,
     FALLBACK_DAILY_HOURS,
@@ -116,7 +122,7 @@ pub use capacity::{
 pub use catalogue::{
     ComplexityRule, Material, QuotingParameters, StockAdjustment, StockStatus, ToleranceMultiplier,
 };
-pub use engine::{is_exotic_material, quote, THIN_WALL_TIGHT_TOL_BUMP};
+pub use engine::{is_exotic_material, quote, quote_with_calibration, THIN_WALL_TIGHT_TOL_BUMP};
 pub use error::QuoteError;
 pub use feature_graph::{Feature, FeatureGraph, FeatureType, SizeBucket, ToleranceRange};
 

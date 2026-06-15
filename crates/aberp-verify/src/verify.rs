@@ -1100,7 +1100,12 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::QuoteMarginBelowFloor
         | EventKind::QuoteUsingGlobalMargin
         | EventKind::QuoteMarginOverridden
-        | EventKind::QuoteMarginFloorOverridden => (None, ""),
+        | EventKind::QuoteMarginFloorOverridden
+        // S429 — calibration audit rows: app-layer JSON, never NAV XML.
+        | EventKind::QuoteCalibrationSampleRecorded
+        | EventKind::QuoteCalibrationSampleSkipped
+        | EventKind::QuoteCalibrationApplied
+        | EventKind::QuoteCalibrationCoefficientShifted => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -1122,7 +1127,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 123,
+        EventKind::ALL_KINDS_COUNT == 127,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

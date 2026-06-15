@@ -169,6 +169,7 @@ fn happy_path_create_release_start_complete_writes_all_expected_movements_and_au
                 },
             ],
             idempotency_key: "create-1".to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -190,6 +191,7 @@ fn happy_path_create_release_start_complete_writes_all_expected_movements_and_au
             reason: None,
             source_event_id: None,
             idempotency_key: "transition-release".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -214,6 +216,7 @@ fn happy_path_create_release_start_complete_writes_all_expected_movements_and_au
             reason: None,
             source_event_id: None,
             idempotency_key: "transition-start".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -278,6 +281,7 @@ fn happy_path_create_release_start_complete_writes_all_expected_movements_and_au
             reason: None,
             source_event_id: None,
             idempotency_key: "transition-complete".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -373,6 +377,7 @@ fn cancel_from_released_does_not_auto_reverse_inventory() {
                 est_cost_huf: None,
             }],
             idempotency_key: "create-2".to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -387,6 +392,7 @@ fn cancel_from_released_does_not_auto_reverse_inventory() {
             reason: None,
             source_event_id: None,
             idempotency_key: "release-2".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -408,6 +414,7 @@ fn cancel_from_released_does_not_auto_reverse_inventory() {
             reason: Some("customer pulled out".to_string()),
             source_event_id: None,
             idempotency_key: "cancel-2".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -462,6 +469,7 @@ fn cancel_from_created_emits_no_stock_movements() {
                 est_cost_huf: None,
             }],
             idempotency_key: "create-3".to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -480,6 +488,7 @@ fn cancel_from_created_emits_no_stock_movements() {
             reason: Some("operator changed mind".to_string()),
             source_event_id: None,
             idempotency_key: "cancel-3".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -523,6 +532,7 @@ fn release_refuses_loud_when_product_has_no_active_bom() {
                 est_cost_huf: None,
             }],
             idempotency_key: "create-4".to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -538,6 +548,7 @@ fn release_refuses_loud_when_product_has_no_active_bom() {
             reason: None,
             source_event_id: None,
             idempotency_key: "release-4".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap_err();
@@ -590,6 +601,7 @@ fn release_with_insufficient_stock_succeeds_with_warning() {
                 est_cost_huf: None,
             }],
             idempotency_key: "create-5".to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -605,6 +617,7 @@ fn release_with_insufficient_stock_succeeds_with_warning() {
             reason: None,
             source_event_id: None,
             idempotency_key: "release-5".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -667,6 +680,7 @@ fn adapter_driven_transition_preserves_source_event_id_on_audit_entry() {
                 est_cost_huf: None,
             }],
             idempotency_key: "create-6".to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -697,6 +711,7 @@ fn adapter_driven_transition_preserves_source_event_id_on_audit_entry() {
             reason: None,
             source_event_id: Some("evt_01HADAPTER123".to_string()),
             idempotency_key: "release-6".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -747,6 +762,7 @@ fn illegal_transition_created_to_complete_is_refused_loud() {
                 est_cost_huf: None,
             }],
             idempotency_key: "create-7".to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -762,6 +778,7 @@ fn illegal_transition_created_to_complete_is_refused_loud() {
             reason: None,
             source_event_id: None,
             idempotency_key: "bad-7".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap_err();
@@ -867,6 +884,7 @@ fn list_routing_ops_returns_sequence_order() {
                 },
             ],
             idempotency_key: "create-8".to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -952,6 +970,7 @@ fn count_work_orders_by_state_groups_correctly() {
                     est_cost_huf: None,
                 }],
                 idempotency_key: "cnt-1".to_string(),
+                source_quote_id: None,
             },
         )
         .unwrap();
@@ -975,6 +994,7 @@ fn count_work_orders_by_state_groups_correctly() {
                     est_cost_huf: None,
                 }],
                 idempotency_key: "cnt-2".to_string(),
+                source_quote_id: None,
             },
         )
         .unwrap();
@@ -992,6 +1012,7 @@ fn count_work_orders_by_state_groups_correctly() {
                 reason: None,
                 source_event_id: None,
                 idempotency_key: "rel-2".to_string(),
+                actual_machining_minutes: None,
             },
         )
         .unwrap();
@@ -1015,6 +1036,7 @@ fn count_work_orders_by_state_groups_correctly() {
                     est_cost_huf: None,
                 }],
                 idempotency_key: "cnt-3".to_string(),
+                source_quote_id: None,
             },
         )
         .unwrap();
@@ -1032,6 +1054,7 @@ fn count_work_orders_by_state_groups_correctly() {
                 reason: Some("test-cancel".to_string()),
                 source_event_id: None,
                 idempotency_key: "cancel-3".to_string(),
+                actual_machining_minutes: None,
             },
         )
         .unwrap();
@@ -1087,6 +1110,7 @@ fn count_work_orders_by_state_is_tenant_scoped() {
                 est_cost_huf: None,
             }],
             idempotency_key: "own-1".to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();

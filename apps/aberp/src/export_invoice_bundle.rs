@@ -962,7 +962,12 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::QuoteMarginBelowFloor
         | EventKind::QuoteUsingGlobalMargin
         | EventKind::QuoteMarginOverridden
-        | EventKind::QuoteMarginFloorOverridden => None,
+        | EventKind::QuoteMarginFloorOverridden
+        // S429 — calibration audit rows: app-layer JSON, never NAV XML.
+        | EventKind::QuoteCalibrationSampleRecorded
+        | EventKind::QuoteCalibrationSampleSkipped
+        | EventKind::QuoteCalibrationApplied
+        | EventKind::QuoteCalibrationCoefficientShifted => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -992,7 +997,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 123,
+        EventKind::ALL_KINDS_COUNT == 127,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

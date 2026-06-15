@@ -9,6 +9,7 @@
 //! margin → min-margin gate.
 
 use crate::breakdown::QuoteBreakdown;
+use crate::capacity::MachineFamily;
 use crate::catalogue::{
     ComplexityRule, Material, QuotingParameters, StockAdjustment, ToleranceMultiplier,
 };
@@ -108,6 +109,39 @@ pub fn quote(
     parameters: &QuotingParameters,
     quantity: u32,
     target_tolerance: ToleranceRange,
+) -> Result<QuoteBreakdown, QuoteError> {
+    quote_with_calibration(
+        feature_graph,
+        materials,
+        complexity_rules,
+        tolerance_multipliers,
+        stock_adjustments,
+        parameters,
+        quantity,
+        target_tolerance,
+        &crate::calibration::CalibrationTable::neutral(),
+    )
+}
+
+/// S429 — [`quote`] with a closed-loop calibration table applied.
+///
+/// Identical to [`quote`] except the routed machine family's coefficient (from
+/// `calibration`) scales the geometry-driven `machining_minutes` before it is
+/// costed — and therefore the machining cost, subtotal, overhead, margin,
+/// total, and lead-time projection all stay internally consistent. With a
+/// neutral table the output is byte-identical to [`quote`] (no extra reasoning
+/// line, coefficient `1.0`). Still pure.
+#[allow(clippy::too_many_arguments)]
+pub fn quote_with_calibration(
+    feature_graph: &FeatureGraph,
+    materials: &[Material],
+    complexity_rules: &[ComplexityRule],
+    tolerance_multipliers: &[ToleranceMultiplier],
+    stock_adjustments: &[StockAdjustment],
+    parameters: &QuotingParameters,
+    quantity: u32,
+    target_tolerance: ToleranceRange,
+    calibration: &crate::calibration::CalibrationTable,
 ) -> Result<QuoteBreakdown, QuoteError> {
     // ── Pre-flight validation ─────────────────────────────────────
     if quantity == 0 {
@@ -320,14 +354,38 @@ pub fn quote(
         fm = finishing_min,
     ));
 
-    let machining_minutes = roughing_min + finishing_min + feature_machining_minutes;
+    let machining_minutes_base = roughing_min + finishing_min + feature_machining_minutes;
     log.push(format!(
         "[machining] machining_minutes = roughing {rm:.4} + finishing {fm:.4} + feature {fmm:.4} = {mm:.4} min",
         rm = roughing_min,
         fm = finishing_min,
         fmm = feature_machining_minutes,
-        mm = machining_minutes,
+        mm = machining_minutes_base,
     ));
+
+    // ── S429: closed-loop calibration ─────────────────────────────
+    // Scale the geometry estimate by the routed family's learned
+    // coefficient (mean actual/estimated from past jobs). Applied here —
+    // before cost — so machining_cost, subtotal, overhead, margin, total
+    // and the lead-time projection all stay consistent. Neutral (1.0)
+    // tables add no line and leave the value untouched: pre-calibration
+    // pricing is byte-identical.
+    let calibration_family = MachineFamily::for_route(feature_graph.requires_5_axis);
+    let calibration_coefficient = calibration.coefficient(calibration_family);
+    let machining_minutes = if (calibration_coefficient - 1.0).abs() > f64::EPSILON {
+        let adjusted = machining_minutes_base * calibration_coefficient;
+        log.push(format!(
+            "[calibration] family={fam} coefficient={c:.4}x (set {hash}): machining_minutes {base:.4} -> {adj:.4} min",
+            fam = calibration_family.as_db_str(),
+            c = calibration_coefficient,
+            hash = calibration.set_hash(),
+            base = machining_minutes_base,
+            adj = adjusted,
+        ));
+        adjusted
+    } else {
+        machining_minutes_base
+    };
 
     // ── Step 4: inspection_minutes ────────────────────────────────
     // Per-feature-row count (NOT sum of `feature.count`) — one
@@ -567,6 +625,7 @@ pub fn quote(
         machining_minutes,
         inspection_minutes,
         route_to_5_axis,
+        calibration_coefficient,
         engine_version: ENGINE_VERSION.to_string(),
         reasoning_log: log,
     })

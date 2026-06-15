@@ -170,6 +170,7 @@ fn seed_one_op_wo_with_pending_qa(db_path: &PathBuf) -> String {
                 est_cost_huf: None,
             }],
             idempotency_key: "create-sid-1".to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -185,6 +186,7 @@ fn seed_one_op_wo_with_pending_qa(db_path: &PathBuf) -> String {
             reason: None,
             source_event_id: None,
             idempotency_key: "release-sid-1".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -200,6 +202,7 @@ fn seed_one_op_wo_with_pending_qa(db_path: &PathBuf) -> String {
             reason: None,
             source_event_id: None,
             idempotency_key: "start-sid-1".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();

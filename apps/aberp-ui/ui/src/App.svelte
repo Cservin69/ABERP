@@ -72,6 +72,7 @@
   import AuditEvents from "./routes/AuditEvents.svelte";
   // S426 / ADR-0082 — DB snapshot + restore operations.
   import Snapshots from "./routes/Snapshots.svelte";
+  import Calibration from "./routes/Calibration.svelte";
   import IssueInvoice from "./routes/IssueInvoice.svelte";
   import MaintenanceDashboard from "./routes/MaintenanceDashboard.svelte";
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
@@ -700,6 +701,8 @@
           <AuditEvents />
         {:else if route === "snapshots"}
           <Snapshots />
+        {:else if route === "calibration"}
+          <Calibration />
         {:else if route === "invoices-new"}
           <!-- PR-87 / session-112 — full-page issuance route. The
                IssueInvoice form was a `<dialog>` modal mounted inside

@@ -235,6 +235,7 @@ fn create_completed_wo(conn: &mut Connection, meta: &LedgerMeta, wo_number: &str
                 est_cost_huf: None,
             }],
             idempotency_key: format!("create-{wo_number}"),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -252,6 +253,7 @@ fn create_completed_wo(conn: &mut Connection, meta: &LedgerMeta, wo_number: &str
             reason: None,
             source_event_id: None,
             idempotency_key: format!("release-{wo_number}"),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -268,6 +270,7 @@ fn create_completed_wo(conn: &mut Connection, meta: &LedgerMeta, wo_number: &str
             reason: None,
             source_event_id: None,
             idempotency_key: format!("start-{wo_number}"),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -323,6 +326,7 @@ fn create_completed_wo(conn: &mut Connection, meta: &LedgerMeta, wo_number: &str
             reason: None,
             source_event_id: None,
             idempotency_key: format!("complete-{wo_number}"),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -468,6 +472,7 @@ fn create_dispatch_refuses_ineligible_wo() {
                 est_cost_huf: None,
             }],
             idempotency_key: "create-inelig".to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -1195,6 +1200,7 @@ fn wo_in_active_state_is_not_eligible() {
                 est_cost_huf: None,
             }],
             idempotency_key: "create-active".to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -1211,6 +1217,7 @@ fn wo_in_active_state_is_not_eligible() {
             reason: None,
             source_event_id: None,
             idempotency_key: "release-active".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();

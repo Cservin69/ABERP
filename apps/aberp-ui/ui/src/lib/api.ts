@@ -22,6 +22,7 @@ import type { AuditEventRow } from "./audit-events-list";
 // S426 — the snapshot row shape is owned by the pure helper module; api.ts
 // reuses it for the wire response type so the row is defined once.
 import type { SnapshotItem } from "./snapshots-list";
+import type { CalibrationOverview } from "./calibration";
 
 /** PR-44ε / session-53 — typed wire mirror for the `aberp_billing::Currency`
  * enum per ADR-0037 §3. Two variants today (HUF + EUR); third-currency
@@ -597,6 +598,13 @@ export async function listAuditEvents(
 /** `GET /api/audit-events/:seq` — the single FULL entry for row-expand. */
 export async function getAuditEvent(seq: number): Promise<AuditEventDetail> {
   return invoke<AuditEventDetail>("get_audit_event", { seq });
+}
+
+// ── S429 — closed-loop calibration tab ─────────────────────────────────
+
+/** `GET /api/calibration` — read-only Calibration page model. */
+export async function getCalibration(): Promise<CalibrationOverview> {
+  return invoke<CalibrationOverview>("get_calibration");
 }
 
 // ── S426 / ADR-0082 — DB snapshot tab ──────────────────────────────────

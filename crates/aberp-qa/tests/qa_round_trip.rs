@@ -182,6 +182,7 @@ fn create_and_release_wo_with_2_ops(
                 },
             ],
             idempotency_key: "create-qa-1".to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -198,6 +199,7 @@ fn create_and_release_wo_with_2_ops(
             reason: None,
             source_event_id: None,
             idempotency_key: "release-qa-1".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -731,6 +733,7 @@ fn wo_completion_eligible_requires_all_ops_passed() {
             reason: None,
             source_event_id: None,
             idempotency_key: "wo-start".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -747,6 +750,7 @@ fn wo_completion_eligible_requires_all_ops_passed() {
             reason: None,
             source_event_id: None,
             idempotency_key: "wo-complete-bad-2".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap_err();
@@ -803,6 +807,7 @@ fn wo_completion_eligible_requires_all_ops_passed() {
             reason: None,
             source_event_id: None,
             idempotency_key: "wo-complete-good".to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -1160,6 +1165,7 @@ fn cancel_wo(conn: &mut Connection, meta: &LedgerMeta, wo_id: &str, idem: &str) 
             reason: Some("cancelled mid-prod".to_string()),
             source_event_id: None,
             idempotency_key: idem.to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();

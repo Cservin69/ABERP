@@ -2935,6 +2935,8 @@ fn build_router(state: AppState) -> Router {
         // on row-expand via `/api/audit-events/:seq`.
         .route("/api/audit-events", get(handle_audit_events))
         .route("/api/audit-events/:seq", get(handle_audit_event_detail))
+        // S429 — read-only closed-loop calibration page.
+        .route("/api/calibration", get(handle_get_calibration))
         // S426 / ADR-0082 — operator Snapshots tab. List managed snapshots,
         // trigger one now, and run a guarded restore.
         .route("/api/snapshots", get(handle_list_snapshots))
@@ -9166,6 +9168,35 @@ pub fn list_machines_request(
     )?)
 }
 
+// GET /api/calibration — S429 read-only Calibration page model.
+async fn handle_get_calibration(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || calibration_overview_request(&state_for_task)).await;
+    match result {
+        Ok(Ok(overview)) => Json(overview).into_response(),
+        Ok(Err(e)) => internal_error("calibration_overview_request", e),
+        Err(join_err) => internal_error(
+            "calibration_overview_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn calibration_overview_request(
+    state: &AppState,
+) -> anyhow::Result<crate::quote_calibration::CalibrationOverview> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    crate::quote_calibration::calibration_overview(&conn, state.tenant.as_str())
+}
+
 // GET /api/machines/:id
 async fn handle_get_machine(
     headers: HeaderMap,
@@ -12239,6 +12270,10 @@ pub struct CreateWorkOrderBody {
     pub notes: Option<String>,
     pub routing_ops: Vec<CreateRoutingOpBody>,
     pub idempotency_key: String,
+    /// S429 — optional originating auto-quote id (`quote_pricing_jobs.quote_id`)
+    /// when this WO is created off a quote. `None` for a plain operator WO.
+    #[serde(default)]
+    pub source_quote_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -12354,6 +12389,7 @@ pub fn create_work_order_request(
         notes: body.notes,
         routing_ops,
         idempotency_key: body.idempotency_key,
+        source_quote_id: body.source_quote_id,
     };
     let (wo, routing_ops) =
         aberp_work_orders::create_work_order(&tx, &ctx, inputs).map_err(map_wo_err)?;
@@ -12456,6 +12492,11 @@ pub struct TransitionWorkOrderBody {
     #[serde(default)]
     pub source_event_id: Option<String>,
     pub idempotency_key: String,
+    /// S429 — operator-recorded actual machining minutes (total over the
+    /// batch). Only honoured on the `complete` action; drives the closed-loop
+    /// calibration sample. `None` = no time tracking → calibration skips.
+    #[serde(default)]
+    pub actual_machining_minutes: Option<f64>,
 }
 
 /// Response for a successful transition.
@@ -12546,6 +12587,7 @@ pub fn transition_work_order_request(
         // a source_event_id.
         source_event_id: None,
         idempotency_key: body.idempotency_key,
+        actual_machining_minutes: body.actual_machining_minutes,
     };
     if body.source_event_id.is_some() {
         return Err(WorkOrderRouteError::BadInput(
@@ -12558,6 +12600,32 @@ pub fn transition_work_order_request(
         aberp_work_orders::transition_work_order(&tx, &ctx, wo_id, inputs).map_err(map_wo_err)?;
     tx.commit()
         .context("commit work-order transition transaction")?;
+
+    // S429 — closed-loop calibration hook. Runs AFTER the Complete commit (the
+    // crate can't reach quote_pricing_jobs). Observational: a failure is logged
+    // loud but never unwinds the already-committed Complete. Fires only when the
+    // WO actually landed in Completed.
+    if matches!(
+        outcome.wo.state,
+        aberp_work_orders::WorkOrderState::Completed
+    ) {
+        if let Err(e) = crate::quote_calibration::record_calibration_for_completed_wo(
+            &state.db_path,
+            &state.tenant,
+            binary_hash,
+            operator_login,
+            &outcome.wo.wo_id,
+            outcome.wo.source_quote_id.as_deref(),
+            outcome.wo.actual_machining_minutes,
+        ) {
+            tracing::error!(
+                wo_id = %outcome.wo.wo_id,
+                error = %format!("{e:#}"),
+                "calibration sample hook failed after WO Complete (non-fatal)"
+            );
+        }
+    }
+
     sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
     Ok(TransitionWorkOrderResponse {
         work_order: outcome.wo,
@@ -26622,6 +26690,8 @@ mod tests {
             cancelled_at: None,
             hold_reason: None,
             notes: None,
+            source_quote_id: None,
+            actual_machining_minutes: None,
         };
 
         // 1. Only created_at set — that's the floor.

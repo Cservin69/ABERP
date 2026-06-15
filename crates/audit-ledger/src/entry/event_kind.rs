@@ -2567,6 +2567,33 @@ pub enum EventKind {
     /// %, floor %, and the operator's reason. `quote.*` family; app-layer
     /// JSON only.
     QuoteMarginFloorOverridden,
+
+    /// S429 — a closed-loop calibration sample was recorded when a work
+    /// order linked to an auto-quote was Completed with a recorded actual
+    /// machining time. Payload (`QuoteCalibrationSampleRecordedPayload`)
+    /// carries the sample id, quote id, wo id, machine family, and the
+    /// estimated vs actual minutes. `quote.*` family; app-layer JSON only.
+    QuoteCalibrationSampleRecorded,
+
+    /// S429 — a work order linked to an auto-quote was Completed but had no
+    /// recorded actual machining time (no MES signal), so no calibration
+    /// sample could be emitted. Surfaced so operators can see which WOs lost
+    /// calibration signal. Payload (`QuoteCalibrationSampleSkippedPayload`)
+    /// carries the quote id, wo id, and the skip reason. `quote.*` family.
+    QuoteCalibrationSampleSkipped,
+
+    /// S429 — a quote was priced with a calibration coefficient set applied
+    /// to the engine's per-family estimated machining minutes. Payload
+    /// (`QuoteCalibrationAppliedPayload`) carries the quote id, the routed
+    /// machine family, the applied coefficient, and the coefficient-set hash
+    /// (reproducibility). `quote.*` family; app-layer JSON only.
+    QuoteCalibrationApplied,
+
+    /// S429 — a newly recorded calibration sample shifted a machine family's
+    /// computed coefficient (the loop learned). Payload
+    /// (`QuoteCalibrationCoefficientShiftedPayload`) carries the family and
+    /// the previous vs new coefficient. `quote.*` family; app-layer JSON only.
+    QuoteCalibrationCoefficientShifted,
 }
 
 impl EventKind {
@@ -2708,6 +2735,12 @@ impl EventKind {
             EventKind::QuoteUsingGlobalMargin => "quote.using_global_margin",
             EventKind::QuoteMarginOverridden => "quote.margin_overridden",
             EventKind::QuoteMarginFloorOverridden => "quote.margin_floor_overridden",
+            EventKind::QuoteCalibrationSampleRecorded => "quote.calibration_sample_recorded",
+            EventKind::QuoteCalibrationSampleSkipped => "quote.calibration_sample_skipped",
+            EventKind::QuoteCalibrationApplied => "quote.calibration_applied",
+            EventKind::QuoteCalibrationCoefficientShifted => {
+                "quote.calibration_coefficient_shifted"
+            }
         }
     }
 
@@ -2860,6 +2893,12 @@ impl EventKind {
             "quote.using_global_margin" => Ok(EventKind::QuoteUsingGlobalMargin),
             "quote.margin_overridden" => Ok(EventKind::QuoteMarginOverridden),
             "quote.margin_floor_overridden" => Ok(EventKind::QuoteMarginFloorOverridden),
+            "quote.calibration_sample_recorded" => Ok(EventKind::QuoteCalibrationSampleRecorded),
+            "quote.calibration_sample_skipped" => Ok(EventKind::QuoteCalibrationSampleSkipped),
+            "quote.calibration_applied" => Ok(EventKind::QuoteCalibrationApplied),
+            "quote.calibration_coefficient_shifted" => {
+                Ok(EventKind::QuoteCalibrationCoefficientShifted)
+            }
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -3000,6 +3039,10 @@ impl EventKind {
         EventKind::QuoteUsingGlobalMargin,
         EventKind::QuoteMarginOverridden,
         EventKind::QuoteMarginFloorOverridden,
+        EventKind::QuoteCalibrationSampleRecorded,
+        EventKind::QuoteCalibrationSampleSkipped,
+        EventKind::QuoteCalibrationApplied,
+        EventKind::QuoteCalibrationCoefficientShifted,
     ];
 
     /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
@@ -3148,6 +3191,10 @@ mod tests {
             EventKind::QuoteUsingGlobalMargin,
             EventKind::QuoteMarginOverridden,
             EventKind::QuoteMarginFloorOverridden,
+            EventKind::QuoteCalibrationSampleRecorded,
+            EventKind::QuoteCalibrationSampleSkipped,
+            EventKind::QuoteCalibrationApplied,
+            EventKind::QuoteCalibrationCoefficientShifted,
         ];
         for v in &variants {
             let s = v.as_str();
@@ -3181,7 +3228,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            123,
+            127,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \

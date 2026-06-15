@@ -203,6 +203,7 @@ fn create_and_release_3_op_wo(
                 },
             ],
             idempotency_key: create_key.to_string(),
+            source_quote_id: None,
         },
     )
     .unwrap();
@@ -218,6 +219,7 @@ fn create_and_release_3_op_wo(
             reason: None,
             source_event_id: None,
             idempotency_key: release_key.to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -238,6 +240,7 @@ fn create_and_release_3_op_wo(
             reason: None,
             source_event_id: None,
             idempotency_key: format!("{release_key}:start"),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -860,6 +863,7 @@ fn cancel_wo(conn: &mut Connection, meta: &LedgerMeta, wo_id: &str, idem: &str) 
             reason: Some("test cancel".to_string()),
             source_event_id: None,
             idempotency_key: idem.to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();
@@ -878,6 +882,7 @@ fn hold_wo(conn: &mut Connection, meta: &LedgerMeta, wo_id: &str, idem: &str) {
             reason: Some("test hold".to_string()),
             source_event_id: None,
             idempotency_key: idem.to_string(),
+            actual_machining_minutes: None,
         },
     )
     .unwrap();

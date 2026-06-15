@@ -5779,3 +5779,81 @@ impl QuoteMarginFloorOverriddenPayload {
         serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
     }
 }
+
+/// Payload for [`aberp_audit_ledger::EventKind::QuoteCalibrationSampleRecorded`].
+///
+/// S429 — written when a WO linked to an auto-quote Completed with a recorded
+/// actual machining time. The `estimated_minutes` is the engine's PRE-coefficient
+/// base projection (total over the batch) for the routed family; the ratio
+/// `actual / estimated` is the empirical coefficient the trimmed mean averages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuoteCalibrationSampleRecordedPayload {
+    pub sample_id: String,
+    pub quote_id: String,
+    pub work_order_id: String,
+    /// Machine-family db-string (`MachineFamily::as_db_str`).
+    pub machine_family: String,
+    pub estimated_minutes: f64,
+    pub actual_minutes: f64,
+}
+
+impl QuoteCalibrationSampleRecordedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::QuoteCalibrationSampleSkipped`].
+///
+/// S429 — a WO linked to an auto-quote Completed but had no recorded actual
+/// machining time (no MES signal), so no sample could be emitted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuoteCalibrationSampleSkippedPayload {
+    pub quote_id: String,
+    pub work_order_id: String,
+    pub reason: String,
+}
+
+impl QuoteCalibrationSampleSkippedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::QuoteCalibrationApplied`].
+///
+/// S429 — emitted at quote-create when a calibration coefficient set scaled the
+/// engine's per-family estimated minutes. `coefficient_set_hash` makes the
+/// pricing reproducible (which coefficients were in force).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuoteCalibrationAppliedPayload {
+    pub quote_id: String,
+    /// Routed machine-family db-string the coefficient applied to.
+    pub machine_family: String,
+    pub coefficient: f64,
+    pub coefficient_set_hash: String,
+}
+
+impl QuoteCalibrationAppliedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::QuoteCalibrationCoefficientShifted`].
+///
+/// S429 — a newly recorded sample changed a family's computed coefficient
+/// (the loop learned). Carries the family and the previous vs new coefficient.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuoteCalibrationCoefficientShiftedPayload {
+    /// Machine-family db-string (`MachineFamily::as_db_str`).
+    pub machine_family: String,
+    pub previous_coefficient: f64,
+    pub new_coefficient: f64,
+}
+
+impl QuoteCalibrationCoefficientShiftedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}

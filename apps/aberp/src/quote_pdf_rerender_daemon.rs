@@ -1168,6 +1168,7 @@ mod tests {
             machining_minutes: 11.25,
             inspection_minutes: 2.0,
             route_to_5_axis: false,
+            calibration_coefficient: 1.0,
             engine_version: "aberp-quote-engine@0.0.0".to_string(),
             reasoning_log: vec!["[totals] total_price = 21.00 EUR".to_string()],
         };

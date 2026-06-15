@@ -45,7 +45,10 @@ use crate::types::{RoutingOpAction, RoutingOpState, WoAction, WorkOrderState};
 /// products has the parent table in place.
 pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(include_str!("../migrations/V001__work_orders.sql"))
-        .context("ensure work-orders schema")
+        .context("ensure work-orders schema")?;
+    // S429 — additive calibration-link columns on work_orders.
+    conn.execute_batch(include_str!("../migrations/V002__calibration_link.sql"))
+        .context("ensure work-orders calibration-link schema")
 }
 
 // ── BOM (ADR-0062 §1, §6) ───────────────────────────────────────────
@@ -222,7 +225,9 @@ pub fn replace_bom_for_product(
 // ── Work order (ADR-0062 §1, §3, §5) ────────────────────────────────
 
 /// One row from `work_orders`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// `Eq` dropped in S429: `actual_machining_minutes: Option<f64>` makes the
+// struct only `PartialEq` (f64 has no total order).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkOrder {
     /// `wo_<ULID>`.
     pub wo_id: String,
@@ -238,6 +243,13 @@ pub struct WorkOrder {
     pub cancelled_at: Option<String>,
     pub hold_reason: Option<String>,
     pub notes: Option<String>,
+    /// S429 — the auto-quote (`quote_pricing_jobs.quote_id`) this WO
+    /// originated from, or `None` for an operator-authored WO. Drives the
+    /// closed-loop calibration sample on Complete.
+    pub source_quote_id: Option<String>,
+    /// S429 — MES/operator-recorded actual machining minutes (total over the
+    /// batch), set at Complete. `None` = no time tracking → calibration skip.
+    pub actual_machining_minutes: Option<f64>,
 }
 
 /// One row from `routings`.
@@ -277,6 +289,9 @@ pub struct CreateWorkOrderInputs {
     pub notes: Option<String>,
     pub routing_ops: Vec<RoutingOpInput>,
     pub idempotency_key: String,
+    /// S429 — optional originating auto-quote id. `None` for a plain
+    /// operator-authored WO.
+    pub source_quote_id: Option<String>,
 }
 
 /// DoS bound per [[trust-code-not-operator]] — the POST create route
@@ -385,8 +400,9 @@ pub fn create_work_order(
         "INSERT INTO work_orders (
             wo_id, tenant_id, wo_number, product_id, qty_target,
             state, created_at, released_at, started_at, completed_at,
-            cancelled_at, hold_reason, notes
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?);",
+            cancelled_at, hold_reason, notes,
+            source_quote_id, actual_machining_minutes
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL);",
         params![
             &wo_id,
             ctx.tenant,
@@ -396,6 +412,7 @@ pub fn create_work_order(
             WorkOrderState::Created.as_str(),
             &now,
             inputs.notes.as_deref(),
+            inputs.source_quote_id.as_deref(),
         ],
     )
     .map_err(|e| WorkOrderError::Storage(anyhow!("INSERT work_orders: {e}")))?;
@@ -471,6 +488,8 @@ pub fn create_work_order(
         cancelled_at: None,
         hold_reason: None,
         notes: inputs.notes,
+        source_quote_id: inputs.source_quote_id,
+        actual_machining_minutes: None,
     };
     Ok((wo, routing_ops_out))
 }
@@ -498,6 +517,11 @@ pub struct TransitionInputs {
     /// transitions, `Some(ULID)` for adapter-driven transitions.
     pub source_event_id: Option<String>,
     pub idempotency_key: String,
+    /// S429 — MES/operator-recorded actual machining minutes. Only honoured on
+    /// the `Complete` action (ignored otherwise); stamps
+    /// `work_orders.actual_machining_minutes` so the calibration hook can emit
+    /// a sample. `None` on Complete = no time tracking → the hook skips.
+    pub actual_machining_minutes: Option<f64>,
 }
 
 /// Transition a WO state per ADR-0062 §3. SPA buttons and future
@@ -713,6 +737,14 @@ pub fn transition_work_order(
     // OnHold-destination transitions; for everything else we clear it.
     let clear_hold_reason = !matches!(new_state, WorkOrderState::OnHold);
 
+    // S429 — record actual machining minutes only on Complete; COALESCE keeps
+    // any prior value on non-Complete transitions (and on a None Complete).
+    let actual_machining_minutes_set = if matches!(new_state, WorkOrderState::Completed) {
+        inputs.actual_machining_minutes
+    } else {
+        None
+    };
+
     tx.execute(
         "UPDATE work_orders SET
             state         = ?,
@@ -723,7 +755,8 @@ pub fn transition_work_order(
             completed_at  = COALESCE(completed_at, ?),
             cancelled_at  = COALESCE(cancelled_at, ?),
             hold_reason   = CASE WHEN ? THEN NULL
-                                 ELSE COALESCE(?, hold_reason) END
+                                 ELSE COALESCE(?, hold_reason) END,
+            actual_machining_minutes = COALESCE(?, actual_machining_minutes)
          WHERE tenant_id = ? AND wo_id = ?;",
         params![
             new_state.as_str(),
@@ -740,6 +773,7 @@ pub fn transition_work_order(
             cancelled_at.as_deref(),
             clear_hold_reason,
             hold_reason.as_deref(),
+            actual_machining_minutes_set,
             ctx.tenant,
             wo_id,
         ],
@@ -828,6 +862,8 @@ fn read_wo_inner(
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
+            Option<f64>,
         )>,
     >,
     tenant: &str,
@@ -836,7 +872,8 @@ fn read_wo_inner(
     let row = query_one(
         "SELECT wo_id, wo_number, product_id, CAST(qty_target AS VARCHAR),
                 state, created_at, released_at, started_at,
-                completed_at, cancelled_at, hold_reason, notes
+                completed_at, cancelled_at, hold_reason, notes,
+                source_quote_id, actual_machining_minutes
          FROM work_orders WHERE tenant_id = ? AND wo_id = ? LIMIT 1;",
         &[&tenant, &wo_id],
     )
@@ -856,6 +893,8 @@ fn read_wo_inner(
             cancelled_at,
             hold_reason,
             notes,
+            source_quote_id,
+            actual_machining_minutes,
         )) => Ok(Some(WorkOrder {
             wo_id,
             wo_number,
@@ -871,6 +910,8 @@ fn read_wo_inner(
             cancelled_at,
             hold_reason,
             notes,
+            source_quote_id,
+            actual_machining_minutes,
         })),
     }
 }
@@ -893,6 +934,8 @@ impl WorkOrderReader for Connection {
                         row.get(9)?,
                         row.get(10)?,
                         row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
                     ))
                 })
                 .map(Some)
@@ -925,6 +968,8 @@ impl WorkOrderReader for Transaction<'_> {
                         row.get(9)?,
                         row.get(10)?,
                         row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
                     ))
                 })
                 .map(Some)
@@ -951,7 +996,8 @@ pub fn list_work_orders(
     let mut sql = String::from(
         "SELECT wo_id, wo_number, product_id, CAST(qty_target AS VARCHAR),
                 state, created_at, released_at, started_at,
-                completed_at, cancelled_at, hold_reason, notes
+                completed_at, cancelled_at, hold_reason, notes,
+                source_quote_id, actual_machining_minutes
          FROM work_orders WHERE tenant_id = ?",
     );
     if state_filter.is_some() {
@@ -1044,6 +1090,8 @@ fn row_to_wo(row: &duckdb::Row<'_>) -> duckdb::Result<anyhow::Result<WorkOrder>>
     let cancelled_at: Option<String> = row.get(9)?;
     let hold_reason: Option<String> = row.get(10)?;
     let notes: Option<String> = row.get(11)?;
+    let source_quote_id: Option<String> = row.get(12)?;
+    let actual_machining_minutes: Option<f64> = row.get(13)?;
 
     let parse = || -> anyhow::Result<WorkOrder> {
         Ok(WorkOrder {
@@ -1061,6 +1109,8 @@ fn row_to_wo(row: &duckdb::Row<'_>) -> duckdb::Result<anyhow::Result<WorkOrder>>
             cancelled_at,
             hold_reason,
             notes,
+            source_quote_id,
+            actual_machining_minutes,
         })
     };
     Ok(parse())
@@ -1721,6 +1771,9 @@ pub fn try_auto_complete_wo(
             reason: Some("auto-completed: all QA inspections passed".to_string()),
             source_event_id,
             idempotency_key: format!("{}:wo-auto-complete", idempotency_seed),
+            // Auto-complete (QA-driven) carries no operator-entered actual
+            // time; the calibration hook skips a sample for these.
+            actual_machining_minutes: None,
         },
     )?;
     Ok(AutoCompleteOutcome::Completed(wo_id.to_string()))

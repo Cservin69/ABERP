@@ -129,6 +129,13 @@ pub async fn list_snapshots(state: State<'_, AppState>) -> Result<Value, String>
     forward_get(&state, "/api/snapshots", true).await
 }
 
+/// S429 — `GET /api/calibration` — read-only closed-loop calibration page model
+/// (per-family coefficient + recent samples + recent skips).
+#[tauri::command]
+pub async fn get_calibration(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/calibration", true).await
+}
+
 /// S426 / ADR-0082 — `POST /api/snapshots/now` — take one validated
 /// snapshot immediately and apply retention.
 #[tauri::command]

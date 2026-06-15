@@ -268,6 +268,8 @@ pub fn run() {
             // S424 / session-424 — cross-domain audit-events screen.
             commands::list_audit_events,
             commands::get_audit_event,
+            // S429 — Calibration tab.
+            commands::get_calibration,
             // S426 / ADR-0082 — Snapshots tab.
             commands::list_snapshots,
             commands::snapshot_now,

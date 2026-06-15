@@ -797,7 +797,14 @@ impl PricingPipelineService {
             );
             margin_policy.apply(&mut engine_params);
 
-            match engine::quote(
+            // S429 — materialize the closed-loop calibration table fresh on
+            // every quote-create (cheap query over the samples) and feed it to
+            // the engine so the routed family's machining estimate is scaled by
+            // what past jobs actually took.
+            let cal_table = crate::quote_calibration::materialize_table(&conn, &tenant_id_string)
+                .context("materialize calibration table")?;
+
+            match engine::quote_with_calibration(
                 &graph,
                 &engine_materials,
                 &engine_complexity,
@@ -806,6 +813,7 @@ impl PricingPipelineService {
                 &engine_params,
                 qty,
                 target_tol,
+                &cal_table,
             ) {
                 Ok(breakdown) => {
                     let json = serde_json::to_string(&breakdown).context("encode breakdown")?;
@@ -957,6 +965,31 @@ impl PricingPipelineService {
                         Some(payload.idempotency_key.clone()),
                     )
                     .context("append priced")?;
+
+                    // S429 — record which calibration coefficient was applied,
+                    // with the set hash, for reproducibility. Emitted only when
+                    // a coefficient actually moved the price (non-neutral); a
+                    // neutral set is the identity and carries no provenance.
+                    if (breakdown.calibration_coefficient - 1.0).abs() > f64::EPSILON {
+                        let cal_family =
+                            aberp_quote_engine::MachineFamily::for_route(breakdown.route_to_5_axis);
+                        let cal_actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+                        let cal_payload = crate::audit_payloads::QuoteCalibrationAppliedPayload {
+                            quote_id: quote_id.clone(),
+                            machine_family: cal_family.as_db_str().to_string(),
+                            coefficient: breakdown.calibration_coefficient,
+                            coefficient_set_hash: cal_table.set_hash(),
+                        };
+                        append_in_tx(
+                            &tx,
+                            &meta,
+                            EventKind::QuoteCalibrationApplied,
+                            cal_payload.to_bytes(),
+                            cal_actor,
+                            Some(format!("quote_calibration_applied:{quote_id}")),
+                        )
+                        .context("append calibration applied")?;
+                    }
 
                     // S428 — margin-policy provenance + floor breach.
                     if matches!(

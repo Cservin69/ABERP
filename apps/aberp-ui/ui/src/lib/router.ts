@@ -72,7 +72,11 @@ export type AppRoute =
   // S426 / ADR-0082 — DB snapshot + restore operations screen. Operational
   // area; list of validated logical snapshots + snapshot-now + guarded
   // restore wizard (the 2026-06-11 ART corruption defence).
-  | "snapshots";
+  | "snapshots"
+  // S429 — read-only closed-loop calibration page. Per-family coefficient +
+  // recent samples chart + recent skips. Computed, never operator-tuned
+  // ([[trust-code-not-operator]]).
+  | "calibration";
 
 /** Default route the SPA falls back to on first paint (or on a hash
  * with an unknown slug). The Invoices list was the only screen
@@ -154,6 +158,8 @@ export function parseRoute(hash: string): AppRoute {
       return "audit-events";
     case "snapshots":
       return "snapshots";
+    case "calibration":
+      return "calibration";
     default:
       return DEFAULT_ROUTE;
   }

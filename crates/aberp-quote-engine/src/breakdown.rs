@@ -65,6 +65,15 @@ pub struct QuoteBreakdown {
     /// class; the v1 engine does not bill differently for 5-axis
     /// (design doc note — machine-rate split is S270+ work).
     pub route_to_5_axis: bool,
+    /// S429 — the closed-loop calibration coefficient applied to the routed
+    /// family's `machining_minutes` (and therefore to the machining cost). A
+    /// neutral price has `1.0`. The sample emitter recovers the engine's
+    /// pre-coefficient base via `machining_minutes / calibration_coefficient`.
+    ///
+    /// `#[serde(default = ...)]` so `breakdown_json` blobs persisted before
+    /// S429 deserialize as a neutral `1.0` rather than failing.
+    #[serde(default = "default_calibration_coefficient")]
+    pub calibration_coefficient: f64,
     /// Stamp the engine version that produced this breakdown — lets
     /// future "re-quoted by engine vX.Y vs persisted by vA.B" audits
     /// be cleanly forensic.
@@ -73,4 +82,10 @@ pub struct QuoteBreakdown {
     /// the trust signal per `[[trust-code-not-operator]]` — same
     /// inputs ⇒ byte-identical log.
     pub reasoning_log: Vec<String>,
+}
+
+/// Serde default for [`QuoteBreakdown::calibration_coefficient`] — pre-S429
+/// persisted breakdowns predate the field and price as neutral.
+fn default_calibration_coefficient() -> f64 {
+    1.0
 }
