@@ -141,6 +141,15 @@ fn duckdb_round_trip_preserves_payment_deadline_and_delivery_date() {
     store.create_series(&series).expect("create series");
 
     let now = OffsetDateTime::now_utc();
+    // Derive the two operator-chosen dates from `now` with non-zero
+    // offsets so they can NEVER coincide with `now.date()`. The
+    // assert_ne! pins below check the read path doesn't silently
+    // substitute issue_date — a HARDCODED fixture date is a time bomb:
+    // PR-84's original `date!(2026-06-15)` collided with the real
+    // calendar day on 2026-06-15, tripping `assert_ne!(deadline, today)`.
+    // Deriving from `now` makes this calendar-independent forever.
+    let payment_deadline = now.date() + time::Duration::days(8);
+    let delivery_date = now.date() - time::Duration::days(36);
     let invoice_id = InvoiceId::new();
     let draft = DraftInvoice {
         id: invoice_id,
@@ -155,8 +164,8 @@ fn duckdb_round_trip_preserves_payment_deadline_and_delivery_date() {
             unit: None,
         }],
         issue_date: now,
-        payment_deadline: date!(2026 - 06 - 15),
-        delivery_date: date!(2026 - 05 - 10),
+        payment_deadline,
+        delivery_date,
     };
 
     let outcome = store
@@ -187,8 +196,8 @@ fn duckdb_round_trip_preserves_payment_deadline_and_delivery_date() {
     // a regression that silently substituted issue_date in the read
     // path's NULL fallback, which would surface as the wrong dates
     // here).
-    assert_eq!(invoice.payment_deadline, date!(2026 - 06 - 15));
-    assert_eq!(invoice.delivery_date, date!(2026 - 05 - 10));
+    assert_eq!(invoice.payment_deadline, payment_deadline);
+    assert_eq!(invoice.delivery_date, delivery_date);
     assert_ne!(invoice.payment_deadline, now.date());
     assert_ne!(invoice.delivery_date, now.date());
 }
