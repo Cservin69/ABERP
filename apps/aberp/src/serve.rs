@@ -3365,7 +3365,13 @@ fn build_digital_id_provider() -> Arc<dyn aberp_digital_id::DigitalIdProvider> {
 /// ≤ 50 requests/min even with every slot saturated.
 pub const NAV_POLL_DAEMON_CONCURRENCY: usize = 50;
 
-fn build_router(state: AppState) -> Router {
+/// Assemble the axum `Router` over an [`AppState`]. `pub` so integration
+/// tests can serve the real route table in-process (e.g. the S435
+/// Portable-line `/health` smoke serves this over plain HTTP against a
+/// demo, NAV-off `AppState` — exercising the exact handler the binary
+/// serves without the OS-keychain dependency a full subprocess boot
+/// carries).
+pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(handle_health))
         // S166 / prod-prep PR #2 — the operator's one-time consent to
