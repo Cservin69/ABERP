@@ -35,6 +35,7 @@
     listComplexityRules,
     listEmailRelayQueue,
     listAvlVendors,
+    listTenants,
     listInventoryBalances,
     listLowStockProducts,
     listMachines,
@@ -203,6 +204,12 @@
         const rows = await listAvlVendors();
         const n = rows.length;
         return n === 1 ? "1 vendor" : `${n} vendors`;
+      }
+      case "TenantCount": {
+        // S433 — count of registered tenants (Active + Demo + Archived).
+        const resp = await listTenants();
+        const n = resp.tenants.length;
+        return n === 1 ? "1 tenant" : `${n} tenants`;
       }
       case "BankAccountCount": {
         // Two independent reads — the seller-info legal_name + the

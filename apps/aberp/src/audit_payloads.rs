@@ -5979,3 +5979,91 @@ impl SupplierExportScreenedPayload {
         serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
     }
 }
+
+/// S433 — payload for [`aberp_audit_ledger::EventKind::TenantCreated`].
+/// Written into the NEW tenant's ledger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantCreatedPayload {
+    pub slug: String,
+    pub display_name: String,
+    /// RFC-3339 UTC creation stamp (mirrors the registry row).
+    pub created_at: String,
+    pub creator_login: String,
+}
+
+impl TenantCreatedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// S433 — payload for
+/// [`aberp_audit_ledger::EventKind::TenantSwitchRequested`]. Written into
+/// the currently-running tenant's ledger when the operator clicks Switch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantSwitchRequestedPayload {
+    pub from_slug: String,
+    pub to_slug: String,
+    pub operator_login: String,
+}
+
+impl TenantSwitchRequestedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// S433 — payload for [`aberp_audit_ledger::EventKind::TenantSwitched`].
+/// Written into the NEW tenant's ledger on the boot that consumed the
+/// `next_tenant` hint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantSwitchedPayload {
+    pub from_slug: String,
+    pub to_slug: String,
+}
+
+impl TenantSwitchedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// S433 — payload for [`aberp_audit_ledger::EventKind::TenantArchived`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantArchivedPayload {
+    pub slug: String,
+    pub operator_login: String,
+}
+
+impl TenantArchivedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// S433 — payload for [`aberp_audit_ledger::EventKind::TenantRestored`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantRestoredPayload {
+    pub slug: String,
+    pub operator_login: String,
+}
+
+impl TenantRestoredPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// S433 — payload for [`aberp_audit_ledger::EventKind::TenantDemoSeeded`].
+/// Written into the bundled demo tenant's own ledger on fresh install.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantDemoSeededPayload {
+    pub slug: String,
+    pub display_name: String,
+}
+
+impl TenantDemoSeededPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}

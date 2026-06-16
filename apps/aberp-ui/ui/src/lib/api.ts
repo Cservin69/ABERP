@@ -4754,3 +4754,61 @@ function normalizeWorkshopDashboard(p: WorkshopDashboard): WorkshopDashboard {
 // can call into the normaliser without standing up the Tauri invoke
 // shim. Per CLAUDE.md rule 12 — the normaliser is the public contract.
 export const __testHelpers = { normalizeWorkshopDashboard };
+
+// ── S433 — multi-tenant CRUD + switcher ──────────────────────────────
+
+/** S433 — tenant lifecycle state. Mirrors
+ * `aberp::tenant_registry::TenantState`'s storage tokens. `demo` is the
+ * bundled safety-net tenant seeded on fresh install (bootable, never
+ * archivable). */
+export type TenantState = "active" | "archived" | "demo";
+
+/** S433 — one tenant row as the SPA sees it. Mirrors
+ * `aberp::serve::TenantView`'s `#[derive(Serialize)]`. */
+export interface TenantRow {
+  slug: string;
+  display_name: string;
+  state: TenantState;
+  created_at: string;
+  /** True for the tenant this binary booted with. */
+  running: boolean;
+}
+
+/** S433 — `GET /api/tenants` response. Mirrors
+ * `aberp::serve::TenantListResponse`. */
+export interface TenantListResponse {
+  tenants: TenantRow[];
+  running_slug: string;
+}
+
+/** S433 — `GET /api/tenants`. */
+export async function listTenants(): Promise<TenantListResponse> {
+  return invoke<TenantListResponse>("list_tenants");
+}
+
+/** S433 — `POST /api/tenants`. Returns the refreshed list. */
+export async function createTenant(
+  slug: string,
+  displayName: string,
+): Promise<TenantListResponse> {
+  return invoke<TenantListResponse>("create_tenant", {
+    body: { slug, display_name: displayName },
+  });
+}
+
+/** S433 — `POST /api/tenants/:slug/switch`. The backend writes the
+ * switch hint + acks; the Tauri shell then drains + re-spawns the
+ * backend so the next boot comes up as `slug`. */
+export async function switchTenant(slug: string): Promise<unknown> {
+  return invoke<unknown>("switch_tenant", { slug });
+}
+
+/** S433 — `POST /api/tenants/:slug/archive`. Returns the refreshed list. */
+export async function archiveTenant(slug: string): Promise<TenantListResponse> {
+  return invoke<TenantListResponse>("archive_tenant", { slug });
+}
+
+/** S433 — `POST /api/tenants/:slug/restore`. Returns the refreshed list. */
+export async function restoreTenant(slug: string): Promise<TenantListResponse> {
+  return invoke<TenantListResponse>("restore_tenant", { slug });
+}

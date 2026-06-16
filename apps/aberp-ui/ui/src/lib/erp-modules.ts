@@ -260,6 +260,10 @@ export const MODULES: ErpModule[] = [
     glyph: "◌",
     routes: [
       { id: "tenant", label: "Tenant settings" },
+      // S433 — multi-tenant admin (list / add / switch / archive /
+      // restore). Sits beside the singular running-tenant identity
+      // settings.
+      { id: "tenants", label: "Tenants" },
       { id: "nav-credentials", label: "NAV credentials" },
       // S257 / PR-246 — MES adapter management (Settings → Adapters).
       // Maintenance-area route under Settings; operator-managed adapter
@@ -478,7 +482,10 @@ export type MaintenanceTileStatusKind =
   // states). Surfaced as "N queued / sent / failed" in the chip; zero
   // is the most common state when no storefront relay traffic has
   // flowed.
-  | "EmailRelayQueueCount";
+  | "EmailRelayQueueCount"
+  // S433 — count of registered tenants (Active + Demo + Archived). The
+  // tile's chip surfaces "N tenants".
+  | "TenantCount";
 
 /** One tile on the maintenance landing dashboard. The dashboard
  * renders the tiles grouped under their sub-area headers (today:
@@ -558,6 +565,16 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Azonosság, bankszámlák, megjelenés",
     description_en: "Identity, bank accounts, branding",
     statusKind: "BankAccountCount",
+  },
+  {
+    // S433 — multi-tenant admin (list / add / switch / archive / restore).
+    moduleId: "settings",
+    route: "tenants",
+    label_hu: "Bérlők",
+    label_en: "Tenants",
+    description_hu: "Bérlők kezelése és váltás",
+    description_en: "Manage tenants & switch",
+    statusKind: "TenantCount",
   },
   {
     moduleId: "settings",

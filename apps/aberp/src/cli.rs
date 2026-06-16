@@ -891,7 +891,7 @@ pub struct MarkAbandonedArgs {
     pub force_despite_nav_exists: bool,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 pub struct ServeArgs {
     /// Path to the tenant DuckDB file (the same one the CLI
     /// subcommands operate on). The serve routes are read-only;

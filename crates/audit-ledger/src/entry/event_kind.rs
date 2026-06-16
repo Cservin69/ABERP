@@ -2701,6 +2701,44 @@ pub enum EventKind {
     /// (`CadBlobLegacyPlaintextReadPayload`) carries the blob id and
     /// requester. `cad.*` family; app-layer JSON only.
     CadBlobLegacyPlaintextRead,
+
+    /// S433 — a new tenant was provisioned via the Tenants admin screen.
+    /// Lands in the NEW tenant's audit ledger (per-tenant chain
+    /// isolation), not the caller's. Payload (`TenantCreatedPayload`)
+    /// carries the slug, display name, and creator login. `tenant.*`
+    /// family; app-layer JSON only — never NAV XML.
+    TenantCreated,
+
+    /// S433 — an operator requested a tenant switch. Fired in the
+    /// CURRENTLY-RUNNING tenant's ledger (the switch originates there);
+    /// the actual switch happens on the next boot. Payload
+    /// (`TenantSwitchRequestedPayload`) carries the from/to slugs.
+    /// `tenant.*` family; app-layer JSON only.
+    TenantSwitchRequested,
+
+    /// S433 — a boot consumed a `next_tenant` hint and came up as a
+    /// different tenant than `--tenant` named. Lands in the NEW tenant's
+    /// ledger. Payload (`TenantSwitchedPayload`) carries the from/to
+    /// slugs. `tenant.*` family; app-layer JSON only.
+    TenantSwitched,
+
+    /// S433 — a tenant was soft-deleted (state → Archived) via the admin
+    /// screen. Fired in the running tenant's ledger. Payload
+    /// (`TenantArchivedPayload`) carries the slug + actor.
+    /// `tenant.*` family; app-layer JSON only.
+    TenantArchived,
+
+    /// S433 — an Archived tenant was restored to Active. Fired in the
+    /// running tenant's ledger. Payload (`TenantRestoredPayload`) carries
+    /// the slug + actor. `tenant.*` family; app-layer JSON only.
+    TenantRestored,
+
+    /// S433 — the bundled `demo` tenant was seeded on a fresh install
+    /// (no tenants.toml + no per-tenant DuckDB present). Fires once, into
+    /// the NEW demo tenant's own ledger. Payload (`TenantDemoSeededPayload`)
+    /// carries the demo slug + display name. `tenant.*` family; app-layer
+    /// JSON only — never NAV XML.
+    TenantDemoSeeded,
 }
 
 impl EventKind {
@@ -2859,6 +2897,12 @@ impl EventKind {
             EventKind::CadBlobKeyProvisioned => "cad.blob_key_provisioned",
             EventKind::CadBlobRead => "cad.blob_read",
             EventKind::CadBlobLegacyPlaintextRead => "cad.blob_legacy_plaintext_read",
+            EventKind::TenantCreated => "tenant.created",
+            EventKind::TenantSwitchRequested => "tenant.switch_requested",
+            EventKind::TenantSwitched => "tenant.switched",
+            EventKind::TenantArchived => "tenant.archived",
+            EventKind::TenantRestored => "tenant.restored",
+            EventKind::TenantDemoSeeded => "tenant.demo_seeded",
         }
     }
 
@@ -3028,6 +3072,12 @@ impl EventKind {
             "cad.blob_key_provisioned" => Ok(EventKind::CadBlobKeyProvisioned),
             "cad.blob_read" => Ok(EventKind::CadBlobRead),
             "cad.blob_legacy_plaintext_read" => Ok(EventKind::CadBlobLegacyPlaintextRead),
+            "tenant.created" => Ok(EventKind::TenantCreated),
+            "tenant.switch_requested" => Ok(EventKind::TenantSwitchRequested),
+            "tenant.switched" => Ok(EventKind::TenantSwitched),
+            "tenant.archived" => Ok(EventKind::TenantArchived),
+            "tenant.restored" => Ok(EventKind::TenantRestored),
+            "tenant.demo_seeded" => Ok(EventKind::TenantDemoSeeded),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -3183,6 +3233,12 @@ impl EventKind {
         EventKind::CadBlobKeyProvisioned,
         EventKind::CadBlobRead,
         EventKind::CadBlobLegacyPlaintextRead,
+        EventKind::TenantCreated,
+        EventKind::TenantSwitchRequested,
+        EventKind::TenantSwitched,
+        EventKind::TenantArchived,
+        EventKind::TenantRestored,
+        EventKind::TenantDemoSeeded,
     ];
 
     /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
@@ -3346,6 +3402,12 @@ mod tests {
             EventKind::CadBlobKeyProvisioned,
             EventKind::CadBlobRead,
             EventKind::CadBlobLegacyPlaintextRead,
+            EventKind::TenantCreated,
+            EventKind::TenantSwitchRequested,
+            EventKind::TenantSwitched,
+            EventKind::TenantArchived,
+            EventKind::TenantRestored,
+            EventKind::TenantDemoSeeded,
         ];
         for v in &variants {
             let s = v.as_str();
@@ -3379,7 +3441,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            138,
+            144,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \

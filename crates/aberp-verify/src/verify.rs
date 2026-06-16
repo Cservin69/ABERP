@@ -1123,7 +1123,13 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // S430 — CAD-blob crypto/read-audit rows: app-layer JSON, never NAV XML.
         | EventKind::CadBlobKeyProvisioned
         | EventKind::CadBlobRead
-        | EventKind::CadBlobLegacyPlaintextRead => (None, ""),
+        | EventKind::CadBlobLegacyPlaintextRead
+        | EventKind::TenantCreated
+        | EventKind::TenantSwitchRequested
+        | EventKind::TenantSwitched
+        | EventKind::TenantArchived
+        | EventKind::TenantRestored
+        | EventKind::TenantDemoSeeded => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -1145,7 +1151,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 138,
+        EventKind::ALL_KINDS_COUNT == 144,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

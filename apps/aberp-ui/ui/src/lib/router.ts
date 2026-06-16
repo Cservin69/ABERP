@@ -82,7 +82,12 @@ export type AppRoute =
   // S432 — material-traceability chain-of-custody report. Operational
   // area; operator lookup by material id / heat lot (quotes, work orders,
   // invoices placeholder).
-  | "material-traceability";
+  | "material-traceability"
+  // S433 — multi-tenant admin (Settings area). List every tenant from
+  // tenants.toml + add / switch (restart-based) / archive / restore.
+  // Distinct from the singular `tenant` route, which is the running
+  // tenant's seller-identity settings.
+  | "tenants";
 
 /** Default route the SPA falls back to on first paint (or on a hash
  * with an unknown slug). The Invoices list was the only screen
@@ -170,6 +175,8 @@ export function parseRoute(hash: string): AppRoute {
       return "calibration";
     case "material-traceability":
       return "material-traceability";
+    case "tenants":
+      return "tenants";
     default:
       return DEFAULT_ROUTE;
   }

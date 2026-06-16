@@ -165,4 +165,5 @@ pub mod submission_lock;
 pub mod submission_queue;
 pub mod submit_annulment;
 pub mod submit_invoice;
+pub mod tenant_registry;
 pub mod upgrade_snapshot;

@@ -114,6 +114,8 @@
   // S225 / PR-221 — financial-statistics dashboard.
   import StatisticsPage from "./routes/StatisticsPage.svelte";
   import TenantSettings from "./routes/TenantSettings.svelte";
+  // S433 — multi-tenant admin (list / add / switch / archive / restore).
+  import TenantsList from "./routes/TenantsList.svelte";
   // PR-179 / session-179 — Outgoing / Incoming tab persistence on the
   // Invoices page. The tab is a top-level segmented control inside the
   // `invoices` route; the selection survives reloads via localStorage
@@ -659,6 +661,8 @@
           <TenantSettings
             isProductionBuild={healthInfo?.is_production_build ?? false}
           />
+        {:else if route === "tenants"}
+          <TenantsList />
         {:else if route === "nav-credentials"}
           <NavCredentialsSettings />
         {:else if route === "partners"}

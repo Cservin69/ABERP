@@ -73,6 +73,8 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "email-relay-queue",
   // S424 / session-424 — cross-domain audit-activity log.
   "audit-events",
+  // S433 — multi-tenant admin (Settings area).
+  "tenants",
 ];
 
 // PR-79 / session 102 — closed set of AREA-landing routes. These are
@@ -116,6 +118,8 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   // the at-a-glance view by default.
   workshop: "production",
   tenant: "settings",
+  // S433 — multi-tenant admin, settings-grouped.
+  tenants: "settings",
   "nav-credentials": "settings",
   // S257 / PR-246 — MES adapter management, settings-grouped.
   adapters: "settings",
@@ -196,6 +200,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   // S432 — material traceability (operational, operator chain-of-custody
   // lookup; no dashboard tile).
   "material-traceability": "operational",
+  // S433 — multi-tenant admin (maintenance area, under Settings).
+  tenants: "maintenance",
 };
 
 // Closed-vocab set of accepted status kinds on a maintenance tile.
@@ -230,6 +236,8 @@ const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   "InventoryBalanceCount",
   // S281 / PR-266 — storefront email-relay queue tile.
   "EmailRelayQueueCount",
+  // S433 — multi-tenant admin tile.
+  "TenantCount",
 ]);
 
 // Every area must have a stable bilingual label and at least one

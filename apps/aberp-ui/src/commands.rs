@@ -725,6 +725,57 @@ pub async fn avl_po_check(state: State<'_, AppState>, body: Value) -> Result<Val
     forward_post(&state, "/api/avl-po-check", body).await
 }
 
+// ── S433 — multi-tenant CRUD + switcher ──────────────────────────────
+
+/// `GET /api/tenants` — every tenant + the running indicator.
+#[tauri::command]
+pub async fn list_tenants(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/tenants", true).await
+}
+
+/// `POST /api/tenants` — provision a new tenant. Body is
+/// `{slug, display_name}`.
+#[tauri::command]
+pub async fn create_tenant(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/tenants", body).await
+}
+
+/// `POST /api/tenants/:slug/switch` — request a restart-based switch.
+/// The backend writes the `next_tenant` hint + a `TenantSwitchRequested`
+/// audit row and acks; we then gracefully drain + re-spawn the backend so
+/// the next boot consumes the hint and comes up as `slug`
+/// ([[trust-code-not-operator]] — restart, never live swap). The re-spawn
+/// runs on the Tauri runtime so this command returns the ack immediately
+/// and the SPA can show a "switching…" state.
+#[tauri::command]
+pub async fn switch_tenant(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    slug: String,
+) -> Result<Value, String> {
+    let path = format!("/api/tenants/{slug}/switch");
+    let ack = forward_post(&state, &path, Value::Null).await?;
+    tauri::async_runtime::spawn(async move {
+        crate::restart_backend_after_switch(app).await;
+    });
+    Ok(ack)
+}
+
+/// `POST /api/tenants/:slug/archive` — soft-delete (backend refuses the
+/// running tenant + the only-Active tenant).
+#[tauri::command]
+pub async fn archive_tenant(state: State<'_, AppState>, slug: String) -> Result<Value, String> {
+    let path = format!("/api/tenants/{slug}/archive");
+    forward_post(&state, &path, Value::Null).await
+}
+
+/// `POST /api/tenants/:slug/restore` — flip Archived → Active.
+#[tauri::command]
+pub async fn restore_tenant(state: State<'_, AppState>, slug: String) -> Result<Value, String> {
+    let path = format!("/api/tenants/{slug}/restore");
+    forward_post(&state, &path, Value::Null).await
+}
+
 // ── S257 / PR-246 — Settings → Adapters CRUD ─────────────────────────
 
 /// `GET /api/adapters` — list persisted adapters joined with live

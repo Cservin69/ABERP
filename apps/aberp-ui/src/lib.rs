@@ -317,6 +317,12 @@ pub fn run() {
             commands::set_avl_vendor_status,
             commands::screen_avl_vendor,
             commands::avl_po_check,
+            // S433 — multi-tenant CRUD + switcher.
+            commands::list_tenants,
+            commands::create_tenant,
+            commands::switch_tenant,
+            commands::archive_tenant,
+            commands::restore_tenant,
             // S257 / PR-246 — Settings → Adapters CRUD.
             commands::list_adapters,
             commands::create_adapter,
@@ -527,9 +533,11 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     }
 }
 
-/// PR-209 / S213 — send SIGTERM to the backend subprocess, wait the
-/// drain budget, then exit the Tauri shell cleanly.
-async fn drain_backend_then_exit(app_handle: tauri::AppHandle) {
+/// PR-209 / S213 — send SIGTERM to the backend subprocess and wait the
+/// drain budget. Shared by the window-close path (then exits the shell)
+/// and the S433 tenant-switch path (then re-spawns the backend so the
+/// next boot consumes the `next_tenant` hint).
+async fn sigterm_backend_then_drain(app_handle: &tauri::AppHandle) {
     let state = app_handle.state::<AppState>();
     let backend_guard = state.backend.lock().await;
     let pid_opt: Option<u32> = if let Some(backend) = backend_guard.as_ref() {
@@ -549,7 +557,7 @@ async fn drain_backend_then_exit(app_handle: tauri::AppHandle) {
             // the signal `aberp serve` listens for in its
             // `tokio::signal::unix` handler (see
             // `apps/aberp/src/serve.rs` PR-209 wiring).
-            tracing::info!(pid, "Tauri close: sending SIGTERM to aberp serve");
+            tracing::info!(pid, "draining backend: sending SIGTERM to aberp serve");
             let kill_result = std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .status();
@@ -565,14 +573,14 @@ async fn drain_backend_then_exit(app_handle: tauri::AppHandle) {
         {
             tracing::info!(
                 pid,
-                "Tauri close on non-unix platform: relying on Child::drop \
+                "draining backend on non-unix platform: relying on Child::drop \
                  (SIGKILL-equivalent)"
             );
         }
     } else {
         tracing::warn!(
-            "Tauri close: no backend PID known (backend never started or already \
-             exited); shell will exit immediately"
+            "draining backend: no backend PID known (backend never started or already \
+             exited)"
         );
     }
 
@@ -583,9 +591,41 @@ async fn drain_backend_then_exit(app_handle: tauri::AppHandle) {
     // `shutdown_timeout_from_env` so a future env-var tweak doesn't
     // require a Tauri-side change.
     tokio::time::sleep(Duration::from_secs(6)).await;
+}
 
+/// PR-209 / S213 — drain the backend, then exit the Tauri shell cleanly.
+async fn drain_backend_then_exit(app_handle: tauri::AppHandle) {
+    sigterm_backend_then_drain(&app_handle).await;
     tracing::info!("Tauri close: drain budget elapsed; exiting shell");
     app_handle.exit(0);
+}
+
+/// S433 — gracefully restart the backend subprocess after a tenant-switch
+/// request. The current backend already wrote the `next_tenant` hint;
+/// here we SIGTERM + drain it (in-flight requests finish, DuckDB syncs,
+/// daemons close), then re-spawn via [`boot_backend`]. The fresh boot
+/// consumes the hint and comes up as the switched-to tenant — emitting
+/// `TenantSwitched` in that tenant's ledger. Restart-based, never a live
+/// in-process swap ([[trust-code-not-operator]]).
+pub async fn restart_backend_after_switch(app_handle: tauri::AppHandle) {
+    sigterm_backend_then_drain(&app_handle).await;
+    // Drop the stale BackendHandle so a failed re-spawn can't leave the
+    // SPA talking to a dead backend's pinned client.
+    {
+        let state = app_handle.state::<AppState>();
+        *state.backend.lock().await = None;
+    }
+    tracing::info!("tenant switch: re-spawning backend to consume next_tenant hint");
+    if let Err(e) = boot_backend(&app_handle).await {
+        let message = format!("{e:#}");
+        tracing::error!(error = %message, "backend re-spawn after tenant switch failed");
+        let state = app_handle.state::<AppState>();
+        let mut guard = state.boot_state.lock().expect("boot_state mutex poisoned");
+        *guard = BootState {
+            status: BootStatus::Failed,
+            error: Some(message),
+        };
+    }
 }
 
 /// PR-215 / S217 — wait for any of {SIGINT, SIGTERM, SIGHUP} on Unix

@@ -408,7 +408,200 @@ pub(crate) fn sanity_check_environment(
     report
 }
 
+/// S433 — consume the one-shot `~/.aberp/next_tenant` switch hint and, if
+/// present + valid, build a `ServeArgs` with `--tenant` + `--db`
+/// overridden to the switched-to tenant. Returns the (possibly cloned)
+/// args plus `Some(from_slug)` when a switch was honored (so the boot can
+/// record `TenantSwitched` in the new tenant's ledger).
+///
+/// The hint is ALWAYS consumed (deleted) on read — honor-once. An invalid
+/// hint (unknown / Archived tenant, unresolvable db path) is logged loud
+/// and ignored, falling back to the CLI `--tenant`: a corrupt hint can
+/// never strand the operator on a tenant that won't boot.
+fn resolve_effective_serve_args(args: &ServeArgs) -> (ServeArgs, Option<String>) {
+    let hint = match crate::tenant_registry::consume_next_tenant_hint() {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = ?e, "could not read tenant switch hint; continuing with --tenant");
+            None
+        }
+    };
+    let Some(target) = hint else {
+        return (args.clone(), None);
+    };
+    if target == args.tenant {
+        return (args.clone(), None);
+    }
+    let bootable = matches!(
+        crate::tenant_registry::read_registry(),
+        Ok(reg) if reg.is_bootable(&target)
+    );
+    if !bootable {
+        tracing::warn!(
+            target = %target,
+            "tenant switch hint names an unknown or archived tenant; ignored (keeping --tenant)"
+        );
+        return (args.clone(), None);
+    }
+    let db = match crate::tenant_registry::tenant_db_path(&target) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = ?e, "cannot resolve switched-to tenant db path; keeping --tenant");
+            return (args.clone(), None);
+        }
+    };
+    tracing::warn!(
+        from = %args.tenant,
+        to = %target,
+        db = %db.display(),
+        "tenant switch hint honored: overriding --tenant + --db for this boot only"
+    );
+    let mut eff = args.clone();
+    let from = std::mem::replace(&mut eff.tenant, target);
+    eff.db = db;
+    (eff, Some(from))
+}
+
+/// S433 — make sure the boot tenant has a row in `tenants.toml`. Existing
+/// single-tenant deployments predate the registry, so the first boot of
+/// this version self-heals by appending the running tenant (Active).
+/// Idempotent; the display name defaults to the slug (renamable later is
+/// out of scope).
+fn ensure_boot_tenant_registered(slug: &str) -> Result<()> {
+    let path = crate::tenant_registry::registry_path()?;
+    let mut reg = crate::tenant_registry::TenantRegistry::read_from(&path)?;
+    if reg.find(slug).is_some() {
+        return Ok(());
+    }
+    reg.add(slug, slug, time::OffsetDateTime::now_utc())
+        .map_err(|e| anyhow!("seed boot tenant into registry: {e}"))?;
+    reg.write_to(&path)?;
+    tracing::info!(tenant = %slug, "seeded boot tenant into tenants.toml registry");
+    Ok(())
+}
+
+/// S433 — seed the bundled `demo` tenant on a fresh install: append it to
+/// the registry (state `Demo`), provision its keychain session token +
+/// fresh ledger DB, and fire `TenantDemoSeeded` in the demo tenant's own
+/// ledger. Idempotent (a present `demo` slug short-circuits). Best-effort.
+///
+/// NOTE (S433 / NAV-off follow-up): this seeds demo as a switchable
+/// registry citizen; it does NOT yet make the binary BOOT into demo by
+/// default, nor seed sample partners/products/quotes. Both wait on the
+/// "NAV submission off" toggle — without it the demo tenant boots into the
+/// NeedsSetup wizard (no NAV creds), so booting-into-demo would just move
+/// the wall. See the NAV-off readiness assessment in the session report.
+fn bootstrap_demo_tenant(binary_hash: &BinaryHashHandle) -> Result<()> {
+    use crate::tenant_registry;
+    let path = tenant_registry::registry_path()?;
+    let mut reg = tenant_registry::TenantRegistry::read_from(&path)?;
+    if reg.find(tenant_registry::DEMO_SLUG).is_some() {
+        return Ok(());
+    }
+    let now = time::OffsetDateTime::now_utc();
+    // Provision the demo DB + keychain token + the TenantDemoSeeded row
+    // BEFORE the registry write, so a registry row never points at a
+    // half-provisioned tenant (mirrors create_tenant_request).
+    let db = tenant_registry::tenant_db_path(tenant_registry::DEMO_SLUG)?;
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create demo tenant dir {}", parent.display()))?;
+    }
+    load_or_create_session_token(tenant_registry::DEMO_SLUG)
+        .context("provision session token for demo tenant")?;
+    let bh = binary_hash
+        .wait()
+        .map_err(|e| anyhow!("binary hash unavailable for demo seed audit: {e}"))?;
+    let demo_tenant = TenantId::new(tenant_registry::DEMO_SLUG.to_string())
+        .ok_or_else(|| anyhow!("demo slug is not a valid tenant id"))?;
+    let payload = audit_payloads::TenantDemoSeededPayload {
+        slug: tenant_registry::DEMO_SLUG.to_string(),
+        display_name: tenant_registry::DEMO_DISPLAY_NAME.to_string(),
+    };
+    tenant_registry::emit_tenant_event(
+        &db,
+        demo_tenant,
+        bh,
+        "system-demo-seed",
+        EventKind::TenantDemoSeeded,
+        payload.to_bytes(),
+    )
+    .context("record TenantDemoSeeded in demo tenant ledger")?;
+    reg.add_demo(now)
+        .map_err(|e| anyhow!("seed demo tenant: {e}"))?;
+    reg.write_to(&path)?;
+    tracing::info!("seeded bundled demo tenant into tenants.toml registry");
+    Ok(())
+}
+
+/// S433 — boot-time registry self-heal + fresh-install demo seed +
+/// post-switch audit. Best-effort: a registry/audit hiccup must never
+/// block boot ([[hulye-biztos]]).
+fn record_tenant_boot(
+    args: &ServeArgs,
+    switched_from: Option<&str>,
+    binary_hash: &BinaryHashHandle,
+    tenant: &TenantId,
+    fresh_install: bool,
+) {
+    if let Err(e) = ensure_boot_tenant_registered(&args.tenant) {
+        tracing::warn!(
+            error = ?e,
+            "could not self-heal tenant registry at boot (Tenants screen may omit the running tenant)"
+        );
+    }
+    if fresh_install {
+        if let Err(e) = bootstrap_demo_tenant(binary_hash) {
+            tracing::warn!(error = ?e, "could not seed bundled demo tenant on fresh install");
+        }
+    }
+    let Some(from) = switched_from else {
+        return;
+    };
+    match binary_hash.wait() {
+        Ok(bh) => {
+            let payload = audit_payloads::TenantSwitchedPayload {
+                from_slug: from.to_string(),
+                to_slug: args.tenant.clone(),
+            };
+            if let Err(e) = crate::tenant_registry::emit_tenant_event(
+                &args.db,
+                tenant.clone(),
+                bh,
+                "tenant-switch",
+                EventKind::TenantSwitched,
+                payload.to_bytes(),
+            ) {
+                tracing::warn!(error = ?e, "could not record TenantSwitched audit in switched-to tenant ledger");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "binary hash unavailable; skipping TenantSwitched audit")
+        }
+    }
+}
+
 pub fn run(args: &ServeArgs) -> Result<()> {
+    // S433 — honor-once tenant switch. The Tenants admin screen writes a
+    // one-shot `~/.aberp/next_tenant` hint and restarts the binary; this
+    // boot consumes it (read + delete) and overrides BOTH `--tenant` and
+    // `--db` to the switched-to tenant's canonical
+    // `~/.aberp/<slug>/aberp.duckdb`. The override is one boot only —
+    // the hint is deleted on read, so a bare `aberp serve --tenant X`
+    // emergency relaunch sees no hint and runs as X (CLI path stays
+    // additive). A hint pointing at an unknown/Archived tenant is
+    // refused + logged loud (rule 12) rather than stranding the operator
+    // on a tenant that can't boot — [[trust-code-not-operator]].
+    let (effective, switched_from) = resolve_effective_serve_args(args);
+    let args = &effective;
+
+    // S433 — detect a fresh install (no tenants.toml + no per-tenant DB)
+    // BEFORE any DB/registry write below turns it non-fresh. Drives the
+    // bundled demo-tenant seed in `record_tenant_boot`. Backward-compat:
+    // an install already in flight carries a tenant DB → not fresh → no
+    // demo injection.
+    let fresh_install = crate::tenant_registry::is_fresh_install_default().unwrap_or(false);
+
     // S165 / deliverable #5 — hülye-biztos cross-stream guard. Runs
     // FIRST, before the binary-hash thread, keychain, or DB are touched,
     // so a mismatched launch dies instantly with a remediation hint.
@@ -943,6 +1136,18 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             .context("reconcile audit-ledger mirror with DB at serve boot")?;
         tracing::info!(?action, "audit-ledger mirror reconciled at boot");
     }
+
+    // S433 — self-heal the tenant registry with the running tenant and,
+    // if this boot consumed a switch hint, record TenantSwitched in the
+    // switched-to tenant's own ledger. Best-effort (never blocks boot).
+    tracing::info!("boot step: reconciling tenant registry + recording any tenant switch");
+    record_tenant_boot(
+        args,
+        switched_from.as_deref(),
+        &binary_hash_handle,
+        &tenant,
+        fresh_install,
+    );
 
     // 2. Resolve / generate the loopback cert + key.
     tracing::info!("boot step: preparing serve-artifacts directory");
@@ -3135,6 +3340,19 @@ fn build_router(state: AppState) -> Router {
             post(handle_avl_vendor_screen),
         )
         .route("/api/avl-po-check", post(handle_avl_po_check))
+        // S433 — multi-tenant CRUD + switcher. List + create on the
+        // collection; switch / archive / restore as resource sub-actions.
+        // Ready-only + bearer-gated; emits the `tenant.*` family. Switch
+        // writes the `next_tenant` hint and relies on the Tauri shell's
+        // restart-on-ack to consume it (switch-via-restart, never live
+        // in-process swap — [[trust-code-not-operator]]).
+        .route(
+            "/api/tenants",
+            get(handle_list_tenants).post(handle_create_tenant),
+        )
+        .route("/api/tenants/:slug/switch", post(handle_switch_tenant))
+        .route("/api/tenants/:slug/archive", post(handle_archive_tenant))
+        .route("/api/tenants/:slug/restore", post(handle_restore_tenant))
         // S257 / PR-246 — Settings → Adapters CRUD. List + create on the
         // collection; update (hot restart) + delete on the resource.
         // Ready-only + bearer-gated; the `:id` is the server-minted
@@ -3681,6 +3899,397 @@ fn needs_seller_config_response() -> Response {
         })),
     )
         .into_response()
+}
+
+// ── S433 — multi-tenant CRUD + switcher ──────────────────────────────
+
+/// One tenant as the SPA sees it: registry row + the `running` flag
+/// (true for the tenant this binary booted with).
+#[derive(Debug, Serialize)]
+struct TenantView {
+    slug: String,
+    display_name: String,
+    /// `"active"` | `"archived"`.
+    state: String,
+    created_at: String,
+    running: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TenantListResponse {
+    tenants: Vec<TenantView>,
+    /// Slug of the currently-running tenant (the switch/archive guards
+    /// key off this; the SPA renders the running indicator from it).
+    running_slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTenantRequest {
+    slug: String,
+    display_name: String,
+}
+
+/// Route-layer error → HTTP status mapping for the tenant endpoints.
+enum TenantRouteError {
+    /// Maps a registry invariant error to its HTTP status.
+    Registry(crate::tenant_registry::TenantRegistryError),
+    /// Operator asked to switch to the tenant already running.
+    AlreadyRunning(String),
+    Internal(anyhow::Error),
+}
+
+impl From<anyhow::Error> for TenantRouteError {
+    fn from(e: anyhow::Error) -> Self {
+        TenantRouteError::Internal(e)
+    }
+}
+
+impl From<crate::tenant_registry::TenantRegistryError> for TenantRouteError {
+    fn from(e: crate::tenant_registry::TenantRegistryError) -> Self {
+        TenantRouteError::Registry(e)
+    }
+}
+
+fn build_tenant_list(
+    reg: &crate::tenant_registry::TenantRegistry,
+    running_slug: &str,
+) -> TenantListResponse {
+    let tenants = reg
+        .tenants
+        .iter()
+        .map(|t| TenantView {
+            slug: t.slug.clone(),
+            display_name: t.display_name.clone(),
+            state: t.state.as_token().to_string(),
+            created_at: t.created_at.clone(),
+            running: t.slug == running_slug,
+        })
+        .collect();
+    TenantListResponse {
+        tenants,
+        running_slug: running_slug.to_string(),
+    }
+}
+
+// GET /api/tenants — list every tenant from the registry + running flag.
+async fn handle_list_tenants(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let running = state.tenant.as_str().to_string();
+    let result = tokio::task::spawn_blocking(crate::tenant_registry::read_registry).await;
+    match result {
+        Ok(Ok(reg)) => Json(build_tenant_list(&reg, &running)).into_response(),
+        Ok(Err(e)) => internal_error("list_tenants", e),
+        Err(join_err) => internal_error(
+            "list_tenants:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// POST /api/tenants — provision a new tenant (registry row + per-tenant
+// dir + keychain session token + fresh ledger DB with a TenantCreated
+// row in the NEW tenant's chain).
+async fn handle_create_tenant(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<CreateTenantRequest>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let running = state.tenant.as_str().to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        create_tenant_request(&req, &operator_login, binary_hash, &running)
+    })
+    .await;
+    match result {
+        Ok(Ok(list)) => (StatusCode::CREATED, Json(list)).into_response(),
+        Ok(Err(e)) => tenant_error("create_tenant", e),
+        Err(join_err) => internal_error(
+            "create_tenant:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+fn create_tenant_request(
+    req: &CreateTenantRequest,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+    running_slug: &str,
+) -> std::result::Result<TenantListResponse, TenantRouteError> {
+    use time::format_description::well_known::Rfc3339;
+    let now = time::OffsetDateTime::now_utc();
+    let created_at = now
+        .format(&Rfc3339)
+        .map_err(|e| TenantRouteError::Internal(anyhow!("format created_at: {e}")))?;
+
+    let path = crate::tenant_registry::registry_path()?;
+    let mut reg = crate::tenant_registry::TenantRegistry::read_from(&path)?;
+    // Validate slug + display name + uniqueness up front via the registry's
+    // own invariants (a dry `add` would mutate; validate then provision).
+    crate::tenant_registry::validate_slug(&req.slug)?;
+    if reg.find(&req.slug).is_some() {
+        return Err(TenantRouteError::Registry(
+            crate::tenant_registry::TenantRegistryError::SlugTaken(req.slug.clone()),
+        ));
+    }
+
+    // Provision artifacts BEFORE writing the registry, so a registry row
+    // never points at a half-provisioned tenant. 1) per-tenant dir, 2)
+    // keychain session token (the "keychain blob"), 3) fresh ledger DB
+    // with the TenantCreated row in the NEW tenant's own chain.
+    let db = crate::tenant_registry::tenant_db_path(&req.slug)?;
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create tenant dir {}", parent.display()))?;
+    }
+    load_or_create_session_token(&req.slug).context("provision session token for new tenant")?;
+    let new_tenant = TenantId::new(req.slug.clone())
+        .ok_or_else(|| anyhow!("slug {:?} is not a valid tenant id", req.slug))?;
+    let payload = audit_payloads::TenantCreatedPayload {
+        slug: req.slug.clone(),
+        display_name: req.display_name.clone(),
+        created_at: created_at.clone(),
+        creator_login: operator_login.to_string(),
+    };
+    crate::tenant_registry::emit_tenant_event(
+        &db,
+        new_tenant,
+        binary_hash,
+        operator_login,
+        EventKind::TenantCreated,
+        payload.to_bytes(),
+    )
+    .context("record TenantCreated in new tenant ledger")?;
+
+    // Commit the registry row last.
+    reg.add(&req.slug, &req.display_name, now)?;
+    reg.write_to(&path)?;
+    Ok(build_tenant_list(&reg, running_slug))
+}
+
+// POST /api/tenants/:slug/switch — request a restart-based switch.
+async fn handle_switch_tenant(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        switch_tenant_request(&state_for_task, &slug, &operator_login, binary_hash)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"switch_requested": true})),
+        )
+            .into_response(),
+        Ok(Err(e)) => tenant_error("switch_tenant", e),
+        Err(join_err) => internal_error(
+            "switch_tenant:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+fn switch_tenant_request(
+    state: &AppState,
+    slug: &str,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<(), TenantRouteError> {
+    let running = state.tenant.as_str();
+    if slug == running {
+        return Err(TenantRouteError::AlreadyRunning(slug.to_string()));
+    }
+    let reg = crate::tenant_registry::read_registry()?;
+    if !reg.is_bootable(slug) {
+        // Unknown or archived → can't switch there (Demo + Active are ok).
+        return Err(TenantRouteError::Registry(
+            crate::tenant_registry::TenantRegistryError::NotFound(slug.to_string()),
+        ));
+    }
+    // Record the request in the CURRENTLY-RUNNING tenant's ledger (the
+    // switch originates here; TenantSwitched lands in the new tenant on
+    // the next boot).
+    let payload = audit_payloads::TenantSwitchRequestedPayload {
+        from_slug: running.to_string(),
+        to_slug: slug.to_string(),
+        operator_login: operator_login.to_string(),
+    };
+    crate::tenant_registry::emit_tenant_event(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        EventKind::TenantSwitchRequested,
+        payload.to_bytes(),
+    )
+    .context("record TenantSwitchRequested")?;
+    crate::tenant_registry::write_next_tenant_hint(slug)
+        .context("write next_tenant switch hint")?;
+    Ok(())
+}
+
+// POST /api/tenants/:slug/archive — soft-delete (refuses running + only-active).
+async fn handle_archive_tenant(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Response {
+    tenant_state_transition(headers, state, slug, TenantTransition::Archive).await
+}
+
+// POST /api/tenants/:slug/restore — flip Archived → Active.
+async fn handle_restore_tenant(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Response {
+    tenant_state_transition(headers, state, slug, TenantTransition::Restore).await
+}
+
+#[derive(Clone, Copy)]
+enum TenantTransition {
+    Archive,
+    Restore,
+}
+
+async fn tenant_state_transition(
+    headers: HeaderMap,
+    state: AppState,
+    slug: String,
+    transition: TenantTransition,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        transition_tenant_request(
+            &state_for_task,
+            &slug,
+            &operator_login,
+            binary_hash,
+            transition,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(list)) => Json(list).into_response(),
+        Ok(Err(e)) => tenant_error("transition_tenant", e),
+        Err(join_err) => internal_error(
+            "transition_tenant:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+fn transition_tenant_request(
+    state: &AppState,
+    slug: &str,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+    transition: TenantTransition,
+) -> std::result::Result<TenantListResponse, TenantRouteError> {
+    let running = state.tenant.as_str().to_string();
+    let path = crate::tenant_registry::registry_path()?;
+    let mut reg = crate::tenant_registry::TenantRegistry::read_from(&path)?;
+    let kind = match transition {
+        TenantTransition::Archive => {
+            reg.archive(slug, &running)?;
+            EventKind::TenantArchived
+        }
+        TenantTransition::Restore => {
+            reg.restore(slug)?;
+            EventKind::TenantRestored
+        }
+    };
+    reg.write_to(&path)?;
+    // Both events are registry-admin actions by the running operator →
+    // recorded in the running tenant's ledger.
+    let payload = match transition {
+        TenantTransition::Archive => audit_payloads::TenantArchivedPayload {
+            slug: slug.to_string(),
+            operator_login: operator_login.to_string(),
+        }
+        .to_bytes(),
+        TenantTransition::Restore => audit_payloads::TenantRestoredPayload {
+            slug: slug.to_string(),
+            operator_login: operator_login.to_string(),
+        }
+        .to_bytes(),
+    };
+    crate::tenant_registry::emit_tenant_event(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        kind,
+        payload,
+    )
+    .context("record tenant state-transition audit")?;
+    Ok(build_tenant_list(&reg, &running))
+}
+
+/// Map a [`TenantRouteError`] to its HTTP response. The registry
+/// invariants ([[trust-code-not-operator]]) decide the status: bad input
+/// → 400, missing → 404, conflicting state (taken slug, archive-running,
+/// archive-only-active, already-running) → 409.
+fn tenant_error(label: &'static str, e: TenantRouteError) -> Response {
+    use crate::tenant_registry::TenantRegistryError as RErr;
+    let (status, msg) = match e {
+        TenantRouteError::Registry(re) => match re {
+            RErr::InvalidSlug(_) | RErr::InvalidDisplayName => {
+                (StatusCode::BAD_REQUEST, re.to_string())
+            }
+            RErr::NotFound(_) => (StatusCode::NOT_FOUND, re.to_string()),
+            RErr::SlugTaken(_)
+            | RErr::CannotArchiveRunning(_)
+            | RErr::CannotArchiveOnlyActive(_)
+            | RErr::CannotArchiveDemo(_) => (StatusCode::CONFLICT, re.to_string()),
+        },
+        TenantRouteError::AlreadyRunning(slug) => (
+            StatusCode::CONFLICT,
+            format!("tenant {slug:?} is already running"),
+        ),
+        TenantRouteError::Internal(err) => return internal_error(label, err),
+    };
+    (status, Json(error_body(msg))).into_response()
 }
 
 /// PR-46α / session-62 — precondition gate for every Ready-only
