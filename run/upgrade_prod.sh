@@ -100,7 +100,11 @@ if ! bash -n "$0" 2>/dev/null; then
   exit 2
 fi
 
-readonly VERSION_RE='^PROD_v[0-9]+\.[0-9]+(\.[0-9]+)?$'
+# Accepts the classic line (PROD_vX.Y[.Z]) plus the S433+ product lines
+# PROD_Defense_vX.Y[.Z] / PROD_Portable_vX.Y[.Z] (the optional
+# `(Defense|Portable)_` infix). The old `^PROD_v...` regex rejected
+# `PROD_Portable_v0.1.0`, blocking the first Portable-line upgrade.
+readonly VERSION_RE='^PROD_(Defense_|Portable_)?v[0-9]+\.[0-9]+(\.[0-9]+)?$'
 readonly DEV_SENTINEL_PATH_SUBSTR="/Documents/Claude/Projects/"
 
 # ---------- colour helpers (no-op when stdout is not a terminal) ------------
@@ -157,8 +161,8 @@ if [[ -z "$version" ]]; then
 fi
 
 if [[ ! "$version" =~ $VERSION_RE ]]; then
-  die "version '$version' does not match $VERSION_RE — expected e.g. PROD_v1.5 or PROD_v1.5.1
-HU: A '$version' nem felel meg a $VERSION_RE mintának — pl. PROD_v1.5 vagy PROD_v1.5.1"
+  die "version '$version' does not match $VERSION_RE — expected e.g. PROD_v1.5, PROD_v1.5.1, or PROD_Portable_v0.1.0
+HU: A '$version' nem felel meg a $VERSION_RE mintának — pl. PROD_v1.5, PROD_v1.5.1 vagy PROD_Portable_v0.1.0"
 fi
 
 # Resolve script + repo paths.
