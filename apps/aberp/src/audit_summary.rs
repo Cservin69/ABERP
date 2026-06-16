@@ -46,6 +46,7 @@ const SUBJECT_KEYS: &[&str] = &[
     "dispatch_id",
     "inspection_id",
     "adapter_id",
+    "vendor_id",
     "partner_id",
     "nav_invoice_number",
 ];

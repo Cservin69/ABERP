@@ -1,7 +1,8 @@
 //! Unit tests for the S345 AVL / DPAS types.
 
 use super::{
-    ApprovedSupplierEntry, DpasPriority, DpasRating, ExportScreeningStatus, PartnerRef,
+    parse_categories, render_categories, ApprovalCategory, ApprovedStatus, ApprovedSupplierEntry,
+    AvlScreeningResult, DpasPriority, DpasRating, ExportScreeningStatus, PartnerRef,
     ProgramSymbolError, QualLevel,
 };
 
@@ -172,4 +173,120 @@ fn s361_export_screening_status_tokens_match_brief_vocab_and_reject_unknown() {
     assert!(ExportScreeningStatus::from_storage_str("CLEAR").is_err());
     assert!(ExportScreeningStatus::from_storage_str("denied").is_err());
     assert!(ExportScreeningStatus::from_storage_str("").is_err());
+}
+
+// ── S431 — AVL CRUD lifecycle types ──────────────────────────────────────
+
+#[test]
+fn s431_approved_status_round_trips_every_variant() {
+    for st in [
+        ApprovedStatus::Pending,
+        ApprovedStatus::Approved,
+        ApprovedStatus::Conditional,
+        ApprovedStatus::Suspended,
+        ApprovedStatus::Revoked,
+    ] {
+        let s = st.as_str();
+        assert_eq!(
+            ApprovedStatus::from_storage_str(s).expect("round-trip"),
+            st,
+            "round-trip mismatch for {s}"
+        );
+    }
+    assert_eq!(ApprovedStatus::default(), ApprovedStatus::Pending);
+    // A mis-parse to Approved would un-block a suspended/revoked vendor's PO.
+    assert!(ApprovedStatus::from_storage_str("APPROVED").is_err());
+    assert!(ApprovedStatus::from_storage_str("").is_err());
+}
+
+#[test]
+fn s431_only_suspended_and_revoked_block_po() {
+    assert!(!ApprovedStatus::Pending.blocks_po());
+    assert!(!ApprovedStatus::Approved.blocks_po());
+    assert!(!ApprovedStatus::Conditional.blocks_po());
+    assert!(ApprovedStatus::Suspended.blocks_po());
+    assert!(ApprovedStatus::Revoked.blocks_po());
+}
+
+#[test]
+fn s431_status_transitions_pending_to_approved_valid_revoked_terminal() {
+    // Brief invariant: Pending → Approved is valid.
+    assert!(ApprovedStatus::Pending.can_transition_to(ApprovedStatus::Approved));
+    // Any non-revoked source may move to any status, including straight to Revoked.
+    assert!(ApprovedStatus::Approved.can_transition_to(ApprovedStatus::Suspended));
+    assert!(ApprovedStatus::Suspended.can_transition_to(ApprovedStatus::Approved));
+    assert!(ApprovedStatus::Conditional.can_transition_to(ApprovedStatus::Revoked));
+    // Brief invariant: Revoked → Approved is INVALID (terminal until manual override).
+    assert!(!ApprovedStatus::Revoked.can_transition_to(ApprovedStatus::Approved));
+    assert!(!ApprovedStatus::Revoked.can_transition_to(ApprovedStatus::Pending));
+    assert!(!ApprovedStatus::Revoked.can_transition_to(ApprovedStatus::Conditional));
+    // The only allowed normal transition out of Revoked is the no-op.
+    assert!(ApprovedStatus::Revoked.can_transition_to(ApprovedStatus::Revoked));
+}
+
+#[test]
+fn s431_approval_category_round_trips_and_multi_select_render_parse() {
+    for c in [
+        ApprovalCategory::General,
+        ApprovalCategory::Itar,
+        ApprovalCategory::Ear99,
+        ApprovalCategory::Aerospace,
+        ApprovalCategory::Defense,
+        ApprovalCategory::Nuclear,
+    ] {
+        let s = c.as_str();
+        assert_eq!(
+            ApprovalCategory::from_storage_str(s).expect("round-trip"),
+            c,
+            "round-trip mismatch for {s}"
+        );
+    }
+    // Multi-select comma-join round-trip.
+    let cats = vec![
+        ApprovalCategory::Itar,
+        ApprovalCategory::Defense,
+        ApprovalCategory::Aerospace,
+    ];
+    let joined = render_categories(&cats);
+    assert_eq!(joined, "itar,defense,aerospace");
+    assert_eq!(parse_categories(&joined).expect("parse"), cats);
+    // Empty set ⇄ empty string (not an error).
+    assert_eq!(render_categories(&[]), "");
+    assert!(parse_categories("").expect("empty ok").is_empty());
+    assert!(parse_categories("   ").expect("ws ok").is_empty());
+    // Whitespace around tokens tolerated.
+    assert_eq!(
+        parse_categories(" itar , ear99 ").expect("trim"),
+        vec![ApprovalCategory::Itar, ApprovalCategory::Ear99]
+    );
+    // Any unknown token fails loud — never silently dropped.
+    assert!(parse_categories("itar,bogus").is_err());
+}
+
+#[test]
+fn s431_avl_screening_result_round_trips_every_variant() {
+    for r in [
+        AvlScreeningResult::Pass,
+        AvlScreeningResult::Conditional,
+        AvlScreeningResult::Fail,
+        AvlScreeningResult::SkippedNoIntegration,
+    ] {
+        let s = r.as_str();
+        assert_eq!(
+            AvlScreeningResult::from_storage_str(s).expect("round-trip"),
+            r,
+            "round-trip mismatch for {s}"
+        );
+    }
+    // The mock-screening default (no real OFAC/SDN integration yet).
+    assert_eq!(
+        AvlScreeningResult::default(),
+        AvlScreeningResult::SkippedNoIntegration
+    );
+    assert_eq!(
+        AvlScreeningResult::SkippedNoIntegration.as_str(),
+        "skipped_no_integration"
+    );
+    assert!(AvlScreeningResult::from_storage_str("PASS").is_err());
+    assert!(AvlScreeningResult::from_storage_str("").is_err());
 }

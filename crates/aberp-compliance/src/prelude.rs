@@ -21,7 +21,8 @@
 //! who authorized, not the acting subject — and is deliberately left as-is.)
 
 pub use crate::avl::{
-    ApprovedSupplierEntry, DpasPriority, DpasRating, ExportScreeningStatus, PartnerRef,
+    parse_categories, render_categories, ApprovalCategory, ApprovedStatus, ApprovedSupplierEntry,
+    AvlScreeningResult, DpasPriority, DpasRating, ExportScreeningStatus, PartnerRef,
     ProgramSymbolError, QualLevel,
 };
 pub use crate::cui::{CuiCategory, CuiMarking, DisseminationControl};

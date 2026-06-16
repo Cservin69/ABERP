@@ -228,6 +228,8 @@ export const MODULES: ErpModule[] = [
       { id: "machines", label: "Machines" },
       // S428 — customer-type margin profiles.
       { id: "margin-profiles", label: "Margin profiles" },
+      // S431 — Approved Vendor List (defense supplier approval).
+      { id: "avl-vendors", label: "Approved vendors" },
     ],
   },
   {
@@ -422,6 +424,8 @@ export type MaintenanceTileStatusKind =
   | "MachineCount"
   // S428 — count of active (non-archived) margin profiles.
   | "MarginProfileCount"
+  // S431 — count of AVL vendors.
+  | "AvlVendorCount"
   | "BankAccountCount"
   | "NavCredStatus"
   // S180 / PR-180 — count of already-restored invoices in the
@@ -515,6 +519,16 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Vevőtípusonkénti cél- és minimum árrés",
     description_en: "Target + floor margin per customer type",
     statusKind: "MarginProfileCount",
+  },
+  // S431 — Approved Vendor List tile.
+  {
+    moduleId: "master-data",
+    route: "avl-vendors",
+    label_hu: "Jóváhagyott beszállítók",
+    label_en: "Approved vendors",
+    description_hu: "Beszállítói jóváhagyás, kategória, szűrés, PO-zár",
+    description_en: "Vendor approval, categories, screening, PO gate",
+    statusKind: "AvlVendorCount",
   },
   {
     moduleId: "settings",

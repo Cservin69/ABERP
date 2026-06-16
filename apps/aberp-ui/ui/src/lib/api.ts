@@ -1808,6 +1808,128 @@ export async function overrideQuoteMargin(
   });
 }
 
+// ── S431 — Approved Vendor List (AVL) ────────────────────────────────
+
+/** S431 — AVL approval lifecycle status. Mirrors
+ * `aberp_compliance::avl::ApprovedStatus` storage tokens. */
+export type ApprovedStatus =
+  | "pending"
+  | "approved"
+  | "conditional"
+  | "suspended"
+  | "revoked";
+
+/** S431 — AVL approval category (multi-select). Mirrors
+ * `aberp_compliance::avl::ApprovalCategory` storage tokens. */
+export type ApprovalCategory =
+  | "general"
+  | "itar"
+  | "ear99"
+  | "aerospace"
+  | "defense"
+  | "nuclear";
+
+/** S431 — "Screen vendor" result. Mirrors
+ * `aberp_compliance::avl::AvlScreeningResult` storage tokens. */
+export type AvlScreeningResult =
+  | "pass"
+  | "conditional"
+  | "fail"
+  | "skipped_no_integration";
+
+/** S431 — one AVL vendor row. Mirrors `aberp::avl_vendors::AvlVendor`'s
+ * `#[derive(Serialize)]`. */
+export interface AvlVendor {
+  /** `avl_<26-char-ULID>`. */
+  id: string;
+  partner_id: string;
+  approved_status: ApprovedStatus;
+  approval_categories: ApprovalCategory[];
+  approved_until_utc: string | null;
+  screening_notes: string;
+  reviewer_login: string;
+  reviewed_at_utc: string | null;
+  revoked_reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** S431 — request body for create (`POST /api/avl-vendors`). */
+export interface VendorInputs {
+  partner_id: string;
+  approved_status: ApprovedStatus;
+  approval_categories: ApprovalCategory[];
+  approved_until_utc: string | null;
+  screening_notes: string;
+}
+
+/** S431 — request body for edit (`PUT /api/avl-vendors/:id`). */
+export interface VendorEditInputs {
+  approval_categories: ApprovalCategory[];
+  approved_until_utc: string | null;
+  screening_notes: string;
+}
+
+/** S431 — `GET /api/avl-vendors`. */
+export async function listAvlVendors(): Promise<AvlVendor[]> {
+  return invoke<AvlVendor[]>("list_avl_vendors");
+}
+
+/** S431 — `GET /api/avl-vendors/:id`. */
+export async function getAvlVendor(vendorId: string): Promise<AvlVendor> {
+  return invoke<AvlVendor>("get_avl_vendor", { vendorId });
+}
+
+/** S431 — `POST /api/avl-vendors`. */
+export async function createAvlVendor(body: VendorInputs): Promise<AvlVendor> {
+  return invoke<AvlVendor>("create_avl_vendor", { body });
+}
+
+/** S431 — `PUT /api/avl-vendors/:id`. */
+export async function updateAvlVendor(
+  vendorId: string,
+  body: VendorEditInputs,
+): Promise<AvlVendor> {
+  return invoke<AvlVendor>("update_avl_vendor", { vendorId, body });
+}
+
+/** S431 — `POST /api/avl-vendors/:id/status`. Change status; `force: true`
+ * is the manual override (e.g. reactivating a revoked vendor). `reason` is
+ * required when `newStatus === "revoked"`. */
+export async function setAvlVendorStatus(
+  vendorId: string,
+  newStatus: ApprovedStatus,
+  reason: string | null = null,
+  force = false,
+): Promise<AvlVendor> {
+  return invoke<AvlVendor>("set_avl_vendor_status", {
+    vendorId,
+    body: { new_status: newStatus, reason, force },
+  });
+}
+
+/** S431 — `POST /api/avl-vendors/:id/screen`. Records a (mock) screening +
+ * fires `supplier.export_screened`. */
+export async function screenAvlVendor(
+  vendorId: string,
+  categoriesScreened: ApprovalCategory[],
+  screeningResult: AvlScreeningResult,
+): Promise<AvlVendor> {
+  return invoke<AvlVendor>("screen_avl_vendor", {
+    vendorId,
+    body: {
+      categories_screened: categoriesScreened,
+      screening_result: screeningResult,
+    },
+  });
+}
+
+/** S431 — `POST /api/avl-po-check`. The refuse-at-point-of-use PO gate; a
+ * suspended/revoked vendor rejects (409). */
+export async function avlPoCheck(partnerId: string): Promise<void> {
+  await invoke<unknown>("avl_po_check", { body: { partner_id: partnerId } });
+}
+
 // ── S257 / PR-246 — Settings → Adapters CRUD ─────────────────────────
 
 /** Closed-vocab MES adapter kinds. Wire strings match each adapter's

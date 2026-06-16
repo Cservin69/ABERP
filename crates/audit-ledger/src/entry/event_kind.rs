@@ -2385,6 +2385,60 @@ pub enum EventKind {
     /// [`Self::SupplierDpasPrioritySet`].
     SupplierExportScreened,
 
+    /// S431 (ADR-0084) — a vendor was added to the Approved Vendor List (AVL).
+    /// The CREATE half of the AVL CRUD surface (the first firing site for the
+    /// `supplier.*` family, which S361 shipped kind-only). `supplier.*` prefix
+    /// family — same AVL/vendor-approval glob as the DPAS / screening kinds.
+    ///
+    /// Payload (`serde_json::Value`, app-layer JSON — never NAV XML):
+    /// `vendor_id` (the `avl_<ULID>` AVL row), `partner_id` (the referenced
+    /// partner), `approved_status` ([`aberp_compliance::avl::ApprovedStatus`]
+    /// token), `approval_categories` (string array of
+    /// [`aberp_compliance::avl::ApprovalCategory`] tokens), and `reviewer_login`
+    /// (who added it — the accountability anchor).
+    AvlVendorAdded,
+
+    /// S431 (ADR-0084) — an AVL vendor's approval status changed (e.g.
+    /// Pending → Approved, Approved → Suspended). The status state-machine is
+    /// enforced in code ([`aberp_compliance::avl::ApprovedStatus::can_transition_to`]),
+    /// not via SQL CHECK. `supplier.*` prefix family.
+    ///
+    /// Payload (`serde_json::Value`): `vendor_id`, `partner_id`, `old_status`,
+    /// `new_status` (both `ApprovedStatus` tokens), `reviewer_login`. A move to
+    /// `Revoked` instead fires [`Self::AvlVendorRevoked`] (which carries the
+    /// reason).
+    AvlVendorStatusChanged,
+
+    /// S431 (ADR-0084) — an AVL vendor was revoked (archive-not-delete: the row
+    /// stays, status becomes `Revoked` with a reason). The terminal status; a
+    /// revoked vendor blocks any new PO ([`Self::PoBlockedByVendorStatus`]) and
+    /// cannot be reactivated except via an explicit manual override.
+    /// `supplier.*` prefix family.
+    ///
+    /// Payload (`serde_json::Value`): `vendor_id`, `partner_id`,
+    /// `revoked_reason`, `reviewer_login`.
+    AvlVendorRevoked,
+
+    /// S431 (ADR-0084) — an AVL vendor's `approved_until_utc` re-screening
+    /// window lapsed; emitted once per non-revoked overdue vendor at serve boot
+    /// (the re-screening reminder). `supplier.*` prefix family.
+    ///
+    /// Payload (`serde_json::Value`): `vendor_id`, `partner_id`,
+    /// `approved_until_utc` (the lapsed RFC-3339 deadline), `decision_time_utc`
+    /// (the boot-scan stamp).
+    AvlScreeningOverdue,
+
+    /// S431 (ADR-0084) — a new-PO attempt referencing a `Suspended` / `Revoked`
+    /// AVL vendor was refused at the point of use ([[trust-code-not-operator]] —
+    /// the gate is in code, not operator discipline). Connects to the still-
+    /// Proposed ADR-0068 PO work: the AVL gate refuses today via the partner /
+    /// intake paths even before a full PO surface ships. `supplier.*` prefix
+    /// family (keeps the AVL surface globbable; no near-empty `po.*` family).
+    ///
+    /// Payload (`serde_json::Value`): `vendor_id`, `partner_id`,
+    /// `vendor_status` (the blocking `ApprovedStatus` token), `attempted_at_utc`.
+    PoBlockedByVendorStatus,
+
     /// S362 / PR-49 (ADR-0079) — a cyber incident affecting (or potentially
     /// affecting) a covered defense information system was detected. FIRST and
     /// only member of the new `incident.*` prefix family — the thirteenth — the
@@ -2737,6 +2791,11 @@ impl EventKind {
             EventKind::CuiAccessEvent => "cui.access_event",
             EventKind::SupplierDpasPrioritySet => "supplier.dpas_priority_set",
             EventKind::SupplierExportScreened => "supplier.export_screened",
+            EventKind::AvlVendorAdded => "supplier.avl_vendor_added",
+            EventKind::AvlVendorStatusChanged => "supplier.avl_vendor_status_changed",
+            EventKind::AvlVendorRevoked => "supplier.avl_vendor_revoked",
+            EventKind::AvlScreeningOverdue => "supplier.avl_screening_overdue",
+            EventKind::PoBlockedByVendorStatus => "supplier.po_blocked_by_vendor_status",
             EventKind::IncidentCyberDetected => "incident.cyber_detected",
             EventKind::NumberingTemplateChanged => "system.numbering_template_changed",
             EventKind::SnapshotCreated => "snapshot.created",
@@ -2898,6 +2957,11 @@ impl EventKind {
             "cui.access_event" => Ok(EventKind::CuiAccessEvent),
             "supplier.dpas_priority_set" => Ok(EventKind::SupplierDpasPrioritySet),
             "supplier.export_screened" => Ok(EventKind::SupplierExportScreened),
+            "supplier.avl_vendor_added" => Ok(EventKind::AvlVendorAdded),
+            "supplier.avl_vendor_status_changed" => Ok(EventKind::AvlVendorStatusChanged),
+            "supplier.avl_vendor_revoked" => Ok(EventKind::AvlVendorRevoked),
+            "supplier.avl_screening_overdue" => Ok(EventKind::AvlScreeningOverdue),
+            "supplier.po_blocked_by_vendor_status" => Ok(EventKind::PoBlockedByVendorStatus),
             "incident.cyber_detected" => Ok(EventKind::IncidentCyberDetected),
             "system.numbering_template_changed" => Ok(EventKind::NumberingTemplateChanged),
             "snapshot.created" => Ok(EventKind::SnapshotCreated),
@@ -3047,6 +3111,11 @@ impl EventKind {
         EventKind::CuiAccessEvent,
         EventKind::SupplierDpasPrioritySet,
         EventKind::SupplierExportScreened,
+        EventKind::AvlVendorAdded,
+        EventKind::AvlVendorStatusChanged,
+        EventKind::AvlVendorRevoked,
+        EventKind::AvlScreeningOverdue,
+        EventKind::PoBlockedByVendorStatus,
         EventKind::IncidentCyberDetected,
         EventKind::NumberingTemplateChanged,
         EventKind::SnapshotCreated,
@@ -3202,6 +3271,11 @@ mod tests {
             EventKind::CuiAccessEvent,
             EventKind::SupplierDpasPrioritySet,
             EventKind::SupplierExportScreened,
+            EventKind::AvlVendorAdded,
+            EventKind::AvlVendorStatusChanged,
+            EventKind::AvlVendorRevoked,
+            EventKind::AvlScreeningOverdue,
+            EventKind::PoBlockedByVendorStatus,
             EventKind::IncidentCyberDetected,
             EventKind::NumberingTemplateChanged,
             EventKind::SnapshotCreated,
@@ -3261,7 +3335,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            130,
+            135,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
@@ -6221,6 +6295,38 @@ mod tests {
             k,
             "round-trip mismatch for {s}"
         );
+    }
+
+    #[test]
+    fn s431_avl_supplier_kinds_round_trip_and_use_supplier_prefix() {
+        // S431 — the five new AVL CRUD / gate kinds extend the `supplier.*`
+        // family (vendor-approval surface stays globbable as `supplier.*`).
+        let cases = [
+            (EventKind::AvlVendorAdded, "supplier.avl_vendor_added"),
+            (
+                EventKind::AvlVendorStatusChanged,
+                "supplier.avl_vendor_status_changed",
+            ),
+            (EventKind::AvlVendorRevoked, "supplier.avl_vendor_revoked"),
+            (
+                EventKind::AvlScreeningOverdue,
+                "supplier.avl_screening_overdue",
+            ),
+            (
+                EventKind::PoBlockedByVendorStatus,
+                "supplier.po_blocked_by_vendor_status",
+            ),
+        ];
+        for (k, expected) in cases {
+            let s = k.as_str();
+            assert_eq!(s, expected);
+            assert!(s.starts_with("supplier."), "{s} must start with supplier.");
+            assert_eq!(
+                EventKind::from_storage_str(s).expect("round-trip"),
+                k,
+                "round-trip mismatch for {s}"
+            );
+        }
     }
 
     /// S361 — the two `supplier.*` kinds share the new prefix family, carry NO

@@ -240,6 +240,198 @@ impl QualLevel {
     }
 }
 
+/// S431 — the operator-facing approval lifecycle of an AVL vendor entry.
+///
+/// Distinct from [`QualLevel`] (the S345 bid/deliver scaffold, never wired):
+/// this is the five-state approval lifecycle the AVL CRUD surface drives, with
+/// `Revoked` as the terminal archive state (archive-not-delete) and `Suspended`
+/// / `Revoked` as the two PO-blocking states ([`ApprovedStatus::blocks_po`]).
+///
+/// Round-trip-proven via [`ApprovedStatus::as_str`] /
+/// [`ApprovedStatus::from_storage_str`] — the canonical tokens the
+/// `avl_vendors.approved_status` column and the AVL audit payloads carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ApprovedStatus {
+    /// Newly added, not yet reviewed/approved. May not deliver; does NOT block
+    /// a PO on its own (only `Suspended` / `Revoked` block).
+    #[default]
+    Pending,
+    /// Fully approved to transact.
+    Approved,
+    /// Approved with conditions (e.g. limited categories / heightened review).
+    Conditional,
+    /// Temporarily suspended — blocks any new PO until resolved.
+    Suspended,
+    /// Revoked (terminal archive state) — blocks any new PO. Carries a
+    /// `revoked_reason`. Cannot transition back to an active status except via
+    /// an explicit manual override.
+    Revoked,
+}
+
+impl ApprovedStatus {
+    /// Canonical storage / audit-payload token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovedStatus::Pending => "pending",
+            ApprovedStatus::Approved => "approved",
+            ApprovedStatus::Conditional => "conditional",
+            ApprovedStatus::Suspended => "suspended",
+            ApprovedStatus::Revoked => "revoked",
+        }
+    }
+
+    /// Parse the storage token. Fail loud on an unknown string (CLAUDE.md rule
+    /// 12) — a silent fallback to `Approved` would be the worst-class bug (it
+    /// would un-block a suspended/revoked vendor's PO).
+    pub fn from_storage_str(s: &str) -> Result<Self, &'static str> {
+        match s {
+            "pending" => Ok(ApprovedStatus::Pending),
+            "approved" => Ok(ApprovedStatus::Approved),
+            "conditional" => Ok(ApprovedStatus::Conditional),
+            "suspended" => Ok(ApprovedStatus::Suspended),
+            "revoked" => Ok(ApprovedStatus::Revoked),
+            _ => Err("unknown ApprovedStatus storage string"),
+        }
+    }
+
+    /// `true` if a new PO referencing a vendor in this status must be refused
+    /// ([[trust-code-not-operator]] — the gate is in code). Only `Suspended`
+    /// and `Revoked` block.
+    pub fn blocks_po(self) -> bool {
+        matches!(self, ApprovedStatus::Suspended | ApprovedStatus::Revoked)
+    }
+
+    /// `true` if a normal (non-override) transition from `self` to `next` is
+    /// allowed. `Revoked` is terminal: the only allowed normal transition out
+    /// of it is the no-op `Revoked → Revoked`; reactivating a revoked vendor
+    /// requires an explicit manual override (the `force` path on the status
+    /// route), never a silent state change. Every non-revoked source may move
+    /// to any status (including straight to `Revoked`).
+    pub fn can_transition_to(self, next: ApprovedStatus) -> bool {
+        match self {
+            ApprovedStatus::Revoked => next == ApprovedStatus::Revoked,
+            _ => true,
+        }
+    }
+}
+
+/// S431 — an AVL approval category (multi-select). A vendor may be approved for
+/// several categories at once; the `avl_vendors.approval_categories` column
+/// stores the comma-joined storage tokens (see [`render_categories`] /
+/// [`parse_categories`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApprovalCategory {
+    /// General commercial supply (no special controls).
+    General,
+    /// ITAR-controlled (22 CFR 120-130 / USML).
+    Itar,
+    /// EAR99 (EAR, not on the CCL).
+    Ear99,
+    /// Aerospace (AS9100 supply chain).
+    Aerospace,
+    /// Defense (DoD / DFARS supply).
+    Defense,
+    /// Nuclear (10 CFR / NRC-controlled).
+    Nuclear,
+}
+
+impl ApprovalCategory {
+    /// Canonical storage / audit-payload token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalCategory::General => "general",
+            ApprovalCategory::Itar => "itar",
+            ApprovalCategory::Ear99 => "ear99",
+            ApprovalCategory::Aerospace => "aerospace",
+            ApprovalCategory::Defense => "defense",
+            ApprovalCategory::Nuclear => "nuclear",
+        }
+    }
+
+    /// Parse a single storage token. Fail loud on unknown (CLAUDE.md rule 12).
+    pub fn from_storage_str(s: &str) -> Result<Self, &'static str> {
+        match s {
+            "general" => Ok(ApprovalCategory::General),
+            "itar" => Ok(ApprovalCategory::Itar),
+            "ear99" => Ok(ApprovalCategory::Ear99),
+            "aerospace" => Ok(ApprovalCategory::Aerospace),
+            "defense" => Ok(ApprovalCategory::Defense),
+            "nuclear" => Ok(ApprovalCategory::Nuclear),
+            _ => Err("unknown ApprovalCategory storage string"),
+        }
+    }
+}
+
+/// Render a category set to the comma-joined storage string (stable order =
+/// input order; the caller dedupes/validates first). Empty slice → empty
+/// string.
+pub fn render_categories(cats: &[ApprovalCategory]) -> String {
+    cats.iter()
+        .map(|c| c.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Parse the comma-joined storage string back into a category vec. An empty /
+/// whitespace string is the empty set (not an error). Any unknown token fails
+/// loud (CLAUDE.md rule 12) rather than being silently dropped.
+pub fn parse_categories(s: &str) -> Result<Vec<ApprovalCategory>, &'static str> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    trimmed
+        .split(',')
+        .map(|tok| ApprovalCategory::from_storage_str(tok.trim()))
+        .collect()
+}
+
+/// S431 — the outcome of a "Screen vendor" action (the `supplier.export_screened`
+/// firing's `screening_result`). The mock screening (no real OFAC/SDN/Export-Denied
+/// integration yet) returns [`AvlScreeningResult::SkippedNoIntegration`]; an
+/// operator may record any of the four manually.
+///
+/// Distinct from [`ExportScreeningStatus`] (the S361 stored denial-list outcome
+/// vocab `clear/hit/inconclusive`) and from
+/// [`crate::export_control::ScreeningResult`] (the typed adjudication): this is
+/// the AVL screening-action result vocab the S431 modal produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AvlScreeningResult {
+    /// Cleared — no adverse finding.
+    Pass,
+    /// Cleared with conditions (manual review noted).
+    Conditional,
+    /// Failed — an adverse finding; the vendor must not transact.
+    Fail,
+    /// No screening integration is wired yet, so no real determination was
+    /// made (the mock-screening default).
+    #[default]
+    SkippedNoIntegration,
+}
+
+impl AvlScreeningResult {
+    /// Canonical storage / audit-payload token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AvlScreeningResult::Pass => "pass",
+            AvlScreeningResult::Conditional => "conditional",
+            AvlScreeningResult::Fail => "fail",
+            AvlScreeningResult::SkippedNoIntegration => "skipped_no_integration",
+        }
+    }
+
+    /// Parse the storage token. Fail loud on unknown (CLAUDE.md rule 12).
+    pub fn from_storage_str(s: &str) -> Result<Self, &'static str> {
+        match s {
+            "pass" => Ok(AvlScreeningResult::Pass),
+            "conditional" => Ok(AvlScreeningResult::Conditional),
+            "fail" => Ok(AvlScreeningResult::Fail),
+            "skipped_no_integration" => Ok(AvlScreeningResult::SkippedNoIntegration),
+            _ => Err("unknown AvlScreeningResult storage string"),
+        }
+    }
+}
+
 /// An entry on the Approved Vendor List.
 ///
 /// The qualification + DPAS + screening fields are the compliance overlay on

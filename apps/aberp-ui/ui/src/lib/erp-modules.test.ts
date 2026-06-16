@@ -100,6 +100,10 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   products: "master-data",
   // S427 — quoting-machine master data.
   machines: "master-data",
+  // S428 — customer-type margin profiles.
+  "margin-profiles": "master-data",
+  // S431 — Approved Vendor List.
+  "avl-vendors": "master-data",
   // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Production module.
   "work-orders": "production",
   // S233 / PR-229 / ADR-0063 — QA queue route lives in the same module.
@@ -153,6 +157,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   machines: "maintenance",
   // S428 — customer-type margin profiles (maintenance area).
   "margin-profiles": "maintenance",
+  // S431 — Approved Vendor List (maintenance area).
+  "avl-vendors": "maintenance",
   // S232 / PR-228 / ADR-0062 — Production is operational (daily-driver
   // shop-floor workflow). S233 added QA queue alongside.
   "work-orders": "operational",
@@ -202,6 +208,8 @@ const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   "MachineCount",
   // S428 — customer-type margin profiles tile.
   "MarginProfileCount",
+  // S431 — Approved Vendor List tile.
+  "AvlVendorCount",
   "BankAccountCount",
   "NavCredStatus",
   // S180 / PR-180 — NAV-as-DR restore wizard tile.

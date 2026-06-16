@@ -37,6 +37,8 @@ export type AppRoute =
   | "machines"
   // S428 — customer-type margin profiles (Master Data area).
   | "margin-profiles"
+  // S431 — Approved Vendor List (Master Data area).
+  | "avl-vendors"
   | "work-orders"
   | "qa"
   | "dispatch"
@@ -126,6 +128,8 @@ export function parseRoute(hash: string): AppRoute {
       return "machines";
     case "margin-profiles":
       return "margin-profiles";
+    case "avl-vendors":
+      return "avl-vendors";
     case "work-orders":
       return "work-orders";
     case "qa":

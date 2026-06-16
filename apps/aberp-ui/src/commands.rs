@@ -655,6 +655,76 @@ pub async fn override_quote_margin(
     forward_post(&state, &path, body).await
 }
 
+// ── S431 — Approved Vendor List (AVL) master data + screening + PO-gate ──
+//
+// Mirrors the machine CRUD bridge. `vendor_id` is the server-minted
+// `avl_<ULID>`; reuse [`validate_partner_id`] for its generic id-shape check.
+
+/// `GET /api/avl-vendors` — the AVL master-data list.
+#[tauri::command]
+pub async fn list_avl_vendors(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/avl-vendors", true).await
+}
+
+/// `GET /api/avl-vendors/:id` — single vendor for the edit form.
+#[tauri::command]
+pub async fn get_avl_vendor(
+    state: State<'_, AppState>,
+    vendor_id: String,
+) -> Result<Value, String> {
+    validate_partner_id(&vendor_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/avl-vendors/{vendor_id}");
+    forward_get(&state, &path, true).await
+}
+
+/// `POST /api/avl-vendors` — create from the form inputs.
+#[tauri::command]
+pub async fn create_avl_vendor(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/avl-vendors", body).await
+}
+
+/// `PUT /api/avl-vendors/:id` — edit categories / until / notes.
+#[tauri::command]
+pub async fn update_avl_vendor(
+    state: State<'_, AppState>,
+    vendor_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_partner_id(&vendor_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/avl-vendors/{vendor_id}");
+    forward_put(&state, &path, body).await
+}
+
+/// `POST /api/avl-vendors/:id/status` — change approval status (or revoke).
+#[tauri::command]
+pub async fn set_avl_vendor_status(
+    state: State<'_, AppState>,
+    vendor_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_partner_id(&vendor_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/avl-vendors/{vendor_id}/status");
+    forward_post(&state, &path, body).await
+}
+
+/// `POST /api/avl-vendors/:id/screen` — record a (mock) screening.
+#[tauri::command]
+pub async fn screen_avl_vendor(
+    state: State<'_, AppState>,
+    vendor_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_partner_id(&vendor_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/avl-vendors/{vendor_id}/screen");
+    forward_post(&state, &path, body).await
+}
+
+/// `POST /api/avl-po-check` — the refuse-at-point-of-use PO gate.
+#[tauri::command]
+pub async fn avl_po_check(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/avl-po-check", body).await
+}
+
 // ── S257 / PR-246 — Settings → Adapters CRUD ─────────────────────────
 
 /// `GET /api/adapters` — list persisted adapters joined with live

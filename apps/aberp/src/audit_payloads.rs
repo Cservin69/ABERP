@@ -5857,3 +5857,125 @@ impl QuoteCalibrationCoefficientShiftedPayload {
         serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// S431 — Approved Vendor List (AVL) CRUD + screening + PO-gate.
+// `supplier.*` family payloads. App-layer JSON only, never NAV XML bytes.
+// `vendor_id` is the `avl_<ULID>` AVL row; `partner_id` is the referenced
+// partner — both carried so the audit screen can subject-match either.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::AvlVendorAdded`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AvlVendorAddedPayload {
+    pub vendor_id: String,
+    pub partner_id: String,
+    /// `ApprovedStatus` storage token.
+    pub approved_status: String,
+    /// `ApprovalCategory` storage tokens.
+    pub approval_categories: Vec<String>,
+    pub reviewer_login: String,
+}
+
+impl AvlVendorAddedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::AvlVendorStatusChanged`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AvlVendorStatusChangedPayload {
+    pub vendor_id: String,
+    pub partner_id: String,
+    /// Previous `ApprovedStatus` storage token.
+    pub old_status: String,
+    /// New `ApprovedStatus` storage token.
+    pub new_status: String,
+    pub reviewer_login: String,
+}
+
+impl AvlVendorStatusChangedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::AvlVendorRevoked`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AvlVendorRevokedPayload {
+    pub vendor_id: String,
+    pub partner_id: String,
+    pub revoked_reason: String,
+    pub reviewer_login: String,
+}
+
+impl AvlVendorRevokedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::AvlScreeningOverdue`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AvlScreeningOverduePayload {
+    pub vendor_id: String,
+    pub partner_id: String,
+    /// The lapsed RFC-3339 `approved_until_utc` deadline.
+    pub approved_until_utc: String,
+    /// The boot-scan stamp (RFC-3339 UTC).
+    pub decision_time_utc: String,
+}
+
+impl AvlScreeningOverduePayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::PoBlockedByVendorStatus`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoBlockedByVendorStatusPayload {
+    pub vendor_id: String,
+    pub partner_id: String,
+    /// The blocking `ApprovedStatus` storage token (`suspended` / `revoked`).
+    pub vendor_status: String,
+    /// RFC-3339 UTC stamp of the refused PO attempt.
+    pub attempted_at_utc: String,
+}
+
+impl PoBlockedByVendorStatusPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::SupplierExportScreened`] as
+/// fired by the S431 "Screen vendor" action.
+///
+/// NOTE (rule 7 — surfaced, not blended): the S361 doc-comment described a
+/// `{partner_id, screening_result: clear/hit/inconclusive, screening_source,
+/// …}` shape for this never-fired kind. S431 is the first firing site and the
+/// brief pins a different, AVL-screening-action vocab: `categories_screened` +
+/// `screening_result` from [`aberp_compliance::avl::AvlScreeningResult`]
+/// (`pass`/`conditional`/`fail`/`skipped_no_integration`). The payload is
+/// untyped (`serde_json`) at the ledger, so the kind is reused; this struct is
+/// the canonical shape the firing site writes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupplierExportScreenedPayload {
+    pub vendor_id: String,
+    pub partner_id: String,
+    /// `ApprovalCategory` storage tokens that were screened.
+    pub categories_screened: Vec<String>,
+    /// `AvlScreeningResult` storage token.
+    pub screening_result: String,
+    pub reviewer_login: String,
+    /// RFC-3339 UTC decision stamp.
+    pub decision_time_utc: String,
+}
+
+impl SupplierExportScreenedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}

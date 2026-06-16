@@ -1997,6 +1997,59 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             );
         }
 
+        // S431 — AVL re-screening reminder. One-shot at boot: fire
+        // `supplier.avl_screening_overdue` once per non-revoked vendor whose
+        // `approved_until_utc` has lapsed. Non-fatal — a reminder scan must
+        // never block boot ([[hulye-biztos]]); errors are logged, not `?`-ed.
+        {
+            let operator_login = match recovery_state.boot_state.read() {
+                Ok(guard) => match &*guard {
+                    ServeBootState::Ready { operator_login } => operator_login.clone(),
+                    ServeBootState::NeedsSellerConfig { operator_login } => operator_login.clone(),
+                    _ => "boot".to_string(),
+                },
+                Err(_) => "boot".to_string(),
+            };
+            match recovery_state.binary_hash.wait() {
+                Ok(binary_hash) => {
+                    let db_path = (*recovery_state.db_path).clone();
+                    let tenant = recovery_state.tenant.clone();
+                    let scan = tokio::task::spawn_blocking(move || {
+                        crate::avl_vendors::fire_overdue_screening_reminders(
+                            &db_path,
+                            tenant,
+                            binary_hash,
+                            &operator_login,
+                            time::OffsetDateTime::now_utc(),
+                        )
+                    })
+                    .await;
+                    match scan {
+                        Ok(Ok(n)) if n > 0 => tracing::warn!(
+                            overdue = n,
+                            "S431: {n} AVL vendor(s) overdue for re-screening — \
+                             supplier.avl_screening_overdue fired"
+                        ),
+                        Ok(Ok(_)) => {
+                            tracing::info!("S431: no AVL vendors overdue for re-screening")
+                        }
+                        Ok(Err(e)) => tracing::error!(
+                            error = ?e,
+                            "S431: AVL re-screening reminder scan failed (non-fatal)"
+                        ),
+                        Err(join_err) => tracing::error!(
+                            error = %join_err,
+                            "S431: AVL re-screening reminder scan panicked (non-fatal)"
+                        ),
+                    }
+                }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "S431: binary hash unavailable for AVL re-screening scan (non-fatal)"
+                ),
+            }
+        }
+
         // S307 / PR-276 — spawn the email-outbox poll daemon (ADR-0009).
         // Polls the storefront's `/api/internal/email-queue` outbound and
         // delivers via the same SMTP creds the S281 drain uses. The kill
@@ -3059,6 +3112,29 @@ fn build_router(state: AppState) -> Router {
                 .put(handle_update_margin_profile)
                 .delete(handle_archive_margin_profile),
         )
+        // S431 — Approved Vendor List (AVL). List + create on the
+        // collection; get + edit (categories/until/notes) on the resource;
+        // status-change + screen as resource sub-actions; po-check is the
+        // refuse-at-point-of-use gate. Ready-only + bearer-gated; emits the
+        // `supplier.*` AVL family. `avl-po-check` is a distinct top-level
+        // path (no `:id` capture collision).
+        .route(
+            "/api/avl-vendors",
+            get(handle_list_avl_vendors).post(handle_create_avl_vendor),
+        )
+        .route(
+            "/api/avl-vendors/:id",
+            get(handle_get_avl_vendor).put(handle_update_avl_vendor),
+        )
+        .route(
+            "/api/avl-vendors/:id/status",
+            post(handle_avl_vendor_status),
+        )
+        .route(
+            "/api/avl-vendors/:id/screen",
+            post(handle_avl_vendor_screen),
+        )
+        .route("/api/avl-po-check", post(handle_avl_po_check))
         // S257 / PR-246 — Settings → Adapters CRUD. List + create on the
         // collection; update (hot restart) + delete on the resource.
         // Ready-only + bearer-gated; the `:id` is the server-minted
@@ -9472,6 +9548,581 @@ pub fn archive_machine_request(
         payload.to_bytes(),
     )?;
     Ok(())
+}
+
+// ── S431 — Approved Vendor List (AVL) routes ────────────────────────────
+//
+// Mirrors the machine CRUD surface (Ready-only + bearer-gated; pub library
+// helpers so integration tests skip the HTTPS listener). Mutations fire the
+// `supplier.*` AVL family, so the create/status/screen/po-check helpers take
+// the resolved `operator_login` + `binary_hash`. Plain edits
+// (categories/until/notes) fire no event (no `AvlVendorEdited` kind), so the
+// update helper takes neither.
+
+/// Route-level error for the AVL endpoints.
+#[derive(Debug)]
+pub enum VendorRouteError {
+    Validation(Vec<crate::avl_vendors::ValidationError>),
+    NotFound,
+    /// 409 — an invalid status transition, a missing revoke reason, or a
+    /// PO-gate block. Carries the operator-facing message.
+    Conflict(String),
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for VendorRouteError {
+    fn from(e: anyhow::Error) -> Self {
+        VendorRouteError::Other(e)
+    }
+}
+
+#[derive(Serialize)]
+struct VendorValidationBody {
+    error: &'static str,
+    fields: Vec<crate::avl_vendors::ValidationError>,
+}
+
+fn vendor_validation_response(errors: Vec<crate::avl_vendors::ValidationError>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(VendorValidationBody {
+            error: "validation_failed",
+            fields: errors,
+        }),
+    )
+        .into_response()
+}
+
+fn vendor_not_found_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(error_body("AVL vendor not found".to_string())),
+    )
+        .into_response()
+}
+
+fn vendor_other_or_internal(ctx: &'static str, e: VendorRouteError) -> Response {
+    match e {
+        VendorRouteError::Other(e) => internal_error(ctx, e),
+        VendorRouteError::NotFound => vendor_not_found_response(),
+        VendorRouteError::Validation(errs) => vendor_validation_response(errs),
+        VendorRouteError::Conflict(msg) => {
+            (StatusCode::CONFLICT, Json(error_body(msg))).into_response()
+        }
+    }
+}
+
+// GET /api/avl-vendors
+async fn handle_list_avl_vendors(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || list_avl_vendors_request(&state_for_task)).await;
+    match result {
+        Ok(Ok(vendors)) => Json(vendors).into_response(),
+        Ok(Err(e)) => vendor_other_or_internal("list_avl_vendors_request", e),
+        Err(join_err) => internal_error(
+            "list_avl_vendors_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn list_avl_vendors_request(
+    state: &AppState,
+) -> std::result::Result<Vec<crate::avl_vendors::AvlVendor>, VendorRouteError> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    Ok(crate::avl_vendors::list_vendors(
+        &conn,
+        state.tenant.as_str(),
+    )?)
+}
+
+// GET /api/avl-vendors/:id
+async fn handle_get_avl_vendor(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match get_avl_vendor_request(&state, &id) {
+        Ok(v) => Json(v).into_response(),
+        Err(VendorRouteError::NotFound) => vendor_not_found_response(),
+        Err(e) => vendor_other_or_internal("get_avl_vendor_request", e),
+    }
+}
+
+pub fn get_avl_vendor_request(
+    state: &AppState,
+    id: &str,
+) -> std::result::Result<crate::avl_vendors::AvlVendor, VendorRouteError> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    match crate::avl_vendors::get_vendor(&conn, state.tenant.as_str(), id)? {
+        Some(v) => Ok(v),
+        None => Err(VendorRouteError::NotFound),
+    }
+}
+
+// POST /api/avl-vendors
+async fn handle_create_avl_vendor(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<crate::avl_vendors::VendorInputs>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        create_avl_vendor_request(&state_for_task, &inputs, &operator_login, binary_hash)
+    })
+    .await;
+    match result {
+        Ok(Ok(v)) => (StatusCode::CREATED, Json(v)).into_response(),
+        Ok(Err(VendorRouteError::Validation(errs))) => vendor_validation_response(errs),
+        Ok(Err(e)) => vendor_other_or_internal("create_avl_vendor_request", e),
+        Err(join_err) => internal_error(
+            "create_avl_vendor_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn create_avl_vendor_request(
+    state: &AppState,
+    inputs: &crate::avl_vendors::VendorInputs,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<crate::avl_vendors::AvlVendor, VendorRouteError> {
+    if let Err(errors) = crate::avl_vendors::validate_vendor_inputs(inputs) {
+        return Err(VendorRouteError::Validation(errors));
+    }
+    // Scope the write connection (DuckDB single-writer; see create_machine_request).
+    let vendor = {
+        let conn = Connection::open(&*state.db_path)
+            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        crate::avl_vendors::create_vendor(&conn, state.tenant.as_str(), inputs, operator_login)?
+    };
+    let payload = crate::audit_payloads::AvlVendorAddedPayload {
+        vendor_id: vendor.id.clone(),
+        partner_id: vendor.partner_id.clone(),
+        approved_status: vendor.approved_status.clone(),
+        approval_categories: vendor.approval_categories.clone(),
+        reviewer_login: operator_login.to_string(),
+    };
+    crate::avl_vendors::append_vendor_event(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        EventKind::AvlVendorAdded,
+        payload.to_bytes(),
+    )?;
+    Ok(vendor)
+}
+
+// PUT /api/avl-vendors/:id — edit categories/until/notes (no audit event).
+async fn handle_update_avl_vendor(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(inputs): Json<crate::avl_vendors::VendorEditInputs>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        update_avl_vendor_request(&state_for_task, &id, &inputs, &operator_login)
+    })
+    .await;
+    match result {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(VendorRouteError::Validation(errs))) => vendor_validation_response(errs),
+        Ok(Err(VendorRouteError::NotFound)) => vendor_not_found_response(),
+        Ok(Err(e)) => vendor_other_or_internal("update_avl_vendor_request", e),
+        Err(join_err) => internal_error(
+            "update_avl_vendor_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn update_avl_vendor_request(
+    state: &AppState,
+    id: &str,
+    inputs: &crate::avl_vendors::VendorEditInputs,
+    operator_login: &str,
+) -> std::result::Result<crate::avl_vendors::AvlVendor, VendorRouteError> {
+    if let Err(errors) = crate::avl_vendors::validate_vendor_edit(inputs) {
+        return Err(VendorRouteError::Validation(errors));
+    }
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    match crate::avl_vendors::update_vendor(
+        &conn,
+        state.tenant.as_str(),
+        id,
+        inputs,
+        operator_login,
+    )? {
+        Some(v) => Ok(v),
+        None => Err(VendorRouteError::NotFound),
+    }
+}
+
+// POST /api/avl-vendors/:id/status — change approval status.
+async fn handle_avl_vendor_status(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(inputs): Json<crate::avl_vendors::VendorStatusInputs>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        set_avl_vendor_status_request(&state_for_task, &id, &inputs, &operator_login, binary_hash)
+    })
+    .await;
+    match result {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(VendorRouteError::Validation(errs))) => vendor_validation_response(errs),
+        Ok(Err(VendorRouteError::NotFound)) => vendor_not_found_response(),
+        Ok(Err(e)) => vendor_other_or_internal("set_avl_vendor_status_request", e),
+        Err(join_err) => internal_error(
+            "set_avl_vendor_status_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn set_avl_vendor_status_request(
+    state: &AppState,
+    id: &str,
+    inputs: &crate::avl_vendors::VendorStatusInputs,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<crate::avl_vendors::AvlVendor, VendorRouteError> {
+    use aberp_compliance::avl::ApprovedStatus;
+    let new_status = ApprovedStatus::from_storage_str(inputs.new_status.trim()).map_err(|_| {
+        VendorRouteError::Validation(vec![crate::avl_vendors::ValidationError {
+            field: "new_status",
+            message: format!(
+                "Ismeretlen státusz: {:?}. / Unknown approval status.",
+                inputs.new_status
+            ),
+        }])
+    })?;
+    // Scope the write connection (DuckDB single-writer).
+    let change = {
+        let conn = Connection::open(&*state.db_path)
+            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        match crate::avl_vendors::set_vendor_status(
+            &conn,
+            state.tenant.as_str(),
+            id,
+            new_status,
+            inputs.reason.as_deref(),
+            inputs.force,
+        ) {
+            Ok(c) => c,
+            Err(crate::avl_vendors::StatusChangeError::NotFound) => {
+                return Err(VendorRouteError::NotFound)
+            }
+            Err(crate::avl_vendors::StatusChangeError::InvalidTransition { from, to }) => {
+                return Err(VendorRouteError::Conflict(format!(
+                    "Érvénytelen státuszváltás {} → {} (kézi felülbírálás szükséges). / \
+                     Invalid status transition {} → {}; manual override required.",
+                    from.as_str(),
+                    to.as_str(),
+                    from.as_str(),
+                    to.as_str()
+                )))
+            }
+            Err(crate::avl_vendors::StatusChangeError::MissingRevokeReason) => {
+                return Err(VendorRouteError::Validation(vec![
+                    crate::avl_vendors::ValidationError {
+                        field: "reason",
+                        message: "A visszavonás indoka kötelező. / A revoke reason is required."
+                            .to_string(),
+                    },
+                ]))
+            }
+            Err(crate::avl_vendors::StatusChangeError::Other(e)) => {
+                return Err(VendorRouteError::Other(e))
+            }
+        }
+    };
+    // Revoke → AvlVendorRevoked (carries reason); any other change →
+    // AvlVendorStatusChanged.
+    if new_status == ApprovedStatus::Revoked {
+        let payload = crate::audit_payloads::AvlVendorRevokedPayload {
+            vendor_id: change.vendor.id.clone(),
+            partner_id: change.vendor.partner_id.clone(),
+            revoked_reason: change.vendor.revoked_reason.clone().unwrap_or_default(),
+            reviewer_login: operator_login.to_string(),
+        };
+        crate::avl_vendors::append_vendor_event(
+            &state.db_path,
+            state.tenant.clone(),
+            binary_hash,
+            operator_login,
+            EventKind::AvlVendorRevoked,
+            payload.to_bytes(),
+        )?;
+    } else {
+        let payload = crate::audit_payloads::AvlVendorStatusChangedPayload {
+            vendor_id: change.vendor.id.clone(),
+            partner_id: change.vendor.partner_id.clone(),
+            old_status: change.old_status.as_str().to_string(),
+            new_status: new_status.as_str().to_string(),
+            reviewer_login: operator_login.to_string(),
+        };
+        crate::avl_vendors::append_vendor_event(
+            &state.db_path,
+            state.tenant.clone(),
+            binary_hash,
+            operator_login,
+            EventKind::AvlVendorStatusChanged,
+            payload.to_bytes(),
+        )?;
+    }
+    Ok(change.vendor)
+}
+
+// POST /api/avl-vendors/:id/screen — record a (mock) screening + fire
+// supplier.export_screened.
+async fn handle_avl_vendor_screen(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(inputs): Json<crate::avl_vendors::ScreenVendorInputs>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        screen_avl_vendor_request(&state_for_task, &id, &inputs, &operator_login, binary_hash)
+    })
+    .await;
+    match result {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(VendorRouteError::Validation(errs))) => vendor_validation_response(errs),
+        Ok(Err(VendorRouteError::NotFound)) => vendor_not_found_response(),
+        Ok(Err(e)) => vendor_other_or_internal("screen_avl_vendor_request", e),
+        Err(join_err) => internal_error(
+            "screen_avl_vendor_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn screen_avl_vendor_request(
+    state: &AppState,
+    id: &str,
+    inputs: &crate::avl_vendors::ScreenVendorInputs,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<crate::avl_vendors::AvlVendor, VendorRouteError> {
+    use aberp_compliance::avl::{ApprovalCategory, AvlScreeningResult};
+    // Validate the screening vocab in code (no SQL CHECK).
+    let mut errors = Vec::new();
+    for c in &inputs.categories_screened {
+        if ApprovalCategory::from_storage_str(c.trim()).is_err() {
+            errors.push(crate::avl_vendors::ValidationError {
+                field: "categories_screened",
+                message: format!("Ismeretlen kategória: {c:?}. / Unknown category."),
+            });
+        }
+    }
+    let result_token = match AvlScreeningResult::from_storage_str(inputs.screening_result.trim()) {
+        Ok(r) => r,
+        Err(_) => {
+            errors.push(crate::avl_vendors::ValidationError {
+                field: "screening_result",
+                message: format!(
+                    "Ismeretlen szűrési eredmény: {:?}. / Unknown screening result.",
+                    inputs.screening_result
+                ),
+            });
+            AvlScreeningResult::default()
+        }
+    };
+    if !errors.is_empty() {
+        return Err(VendorRouteError::Validation(errors));
+    }
+
+    // Scope the write connection (DuckDB single-writer).
+    let vendor = {
+        let conn = Connection::open(&*state.db_path)
+            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        match crate::avl_vendors::record_screening(
+            &conn,
+            state.tenant.as_str(),
+            id,
+            operator_login,
+        )? {
+            Some(v) => v,
+            None => return Err(VendorRouteError::NotFound),
+        }
+    };
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format screening decision stamp")?;
+    let payload = crate::audit_payloads::SupplierExportScreenedPayload {
+        vendor_id: vendor.id.clone(),
+        partner_id: vendor.partner_id.clone(),
+        categories_screened: inputs
+            .categories_screened
+            .iter()
+            .map(|c| c.trim().to_string())
+            .collect(),
+        screening_result: result_token.as_str().to_string(),
+        reviewer_login: operator_login.to_string(),
+        decision_time_utc: now,
+    };
+    crate::avl_vendors::append_vendor_event(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        EventKind::SupplierExportScreened,
+        payload.to_bytes(),
+    )?;
+    Ok(vendor)
+}
+
+/// Request body for the PO-eligibility gate.
+#[derive(Deserialize)]
+struct PoCheckInputs {
+    partner_id: String,
+}
+
+/// POST /api/avl-po-check — the refuse-at-point-of-use PO gate. 200 if a PO
+/// referencing the partner may proceed (no AVL entry, or a non-blocking
+/// status); 409 + `PoBlockedByVendorStatus` audit if the vendor is Suspended /
+/// Revoked.
+async fn handle_avl_po_check(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<PoCheckInputs>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let partner_id = inputs.partner_id;
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        avl_po_check_request(&state_for_task, &partner_id, &operator_login, binary_hash)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"eligible": true}))).into_response(),
+        Ok(Err(e)) => vendor_other_or_internal("avl_po_check_request", e),
+        Err(join_err) => internal_error(
+            "avl_po_check_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+/// The PO gate ([[trust-code-not-operator]]): `Ok(())` if the PO may proceed,
+/// `Err(Conflict)` (after firing `PoBlockedByVendorStatus`) if it must be
+/// refused. A future PO-create path calls this before writing the PO.
+pub fn avl_po_check_request(
+    state: &AppState,
+    partner_id: &str,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<(), VendorRouteError> {
+    let eligibility = {
+        let conn = Connection::open(&*state.db_path)
+            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        crate::avl_vendors::po_eligibility(&conn, state.tenant.as_str(), partner_id)?
+    };
+    match eligibility {
+        crate::avl_vendors::PoEligibility::NoEntry
+        | crate::avl_vendors::PoEligibility::Eligible => Ok(()),
+        crate::avl_vendors::PoEligibility::Blocked { vendor, status } => {
+            let now = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .context("format PO-block stamp")?;
+            let payload = crate::audit_payloads::PoBlockedByVendorStatusPayload {
+                vendor_id: vendor.id.clone(),
+                partner_id: vendor.partner_id.clone(),
+                vendor_status: status.as_str().to_string(),
+                attempted_at_utc: now,
+            };
+            crate::avl_vendors::append_vendor_event(
+                &state.db_path,
+                state.tenant.clone(),
+                binary_hash,
+                operator_login,
+                EventKind::PoBlockedByVendorStatus,
+                payload.to_bytes(),
+            )?;
+            let label = match status {
+                aberp_compliance::avl::ApprovedStatus::Suspended => "Suspended / felfüggesztve",
+                _ => "Revoked / visszavonva",
+            };
+            Err(VendorRouteError::Conflict(format!(
+                "A(z) {} beszállító státusza {label}; rendezze a szűrést a megrendelés előtt. / \
+                 Vendor {} is {label}; resolve screening before issuing PO.",
+                vendor.partner_id, vendor.partner_id
+            )))
+        }
+    }
 }
 
 // ── S428 — margin-profile routes ───────────────────────────────────────

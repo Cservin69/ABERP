@@ -309,6 +309,14 @@ pub fn run() {
             commands::archive_margin_profile,
             commands::set_quote_buyer_partner,
             commands::override_quote_margin,
+            // S431 — Approved Vendor List (AVL) master data.
+            commands::list_avl_vendors,
+            commands::get_avl_vendor,
+            commands::create_avl_vendor,
+            commands::update_avl_vendor,
+            commands::set_avl_vendor_status,
+            commands::screen_avl_vendor,
+            commands::avl_po_check,
             // S257 / PR-246 — Settings → Adapters CRUD.
             commands::list_adapters,
             commands::create_adapter,

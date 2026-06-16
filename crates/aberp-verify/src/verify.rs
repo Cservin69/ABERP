@@ -1057,6 +1057,16 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // per-OUTGOING-invoice bundle. Exhaustiveness arm only.
         | EventKind::SupplierDpasPrioritySet
         | EventKind::SupplierExportScreened
+        // S431 (ADR-0084) — supplier.* AVL CRUD + vendor-status PO-gate family.
+        // Vendor id / partner id / status tokens / category tokens / reviewer
+        // login / overdue + block stamps; app-layer JSON payloads, never NAV XML
+        // bytes. `supplier.*`-not-`invoice.*` posture; never sweeps a
+        // per-OUTGOING-invoice bundle. Exhaustiveness arm only.
+        | EventKind::AvlVendorAdded
+        | EventKind::AvlVendorStatusChanged
+        | EventKind::AvlVendorRevoked
+        | EventKind::AvlScreeningOverdue
+        | EventKind::PoBlockedByVendorStatus
         // S362 / PR-49 — incident.* cyber-incident-reporting family (ADR-0079).
         // Cyber-incident-detected record (DFARS 252.204-7012(c)(1) 72-hour
         // clock); app-layer JSON payloads (detected_at_ms / severity /
@@ -1131,7 +1141,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 130,
+        EventKind::ALL_KINDS_COUNT == 135,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1573,6 +1583,11 @@ mod tests {
         assert_family_no_nav(&[
             EventKind::SupplierDpasPrioritySet,
             EventKind::SupplierExportScreened,
+            EventKind::AvlVendorAdded,
+            EventKind::AvlVendorStatusChanged,
+            EventKind::AvlVendorRevoked,
+            EventKind::AvlScreeningOverdue,
+            EventKind::PoBlockedByVendorStatus,
         ]);
     }
 

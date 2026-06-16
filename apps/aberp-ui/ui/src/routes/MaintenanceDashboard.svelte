@@ -34,6 +34,7 @@
     listAdapters,
     listComplexityRules,
     listEmailRelayQueue,
+    listAvlVendors,
     listInventoryBalances,
     listLowStockProducts,
     listMachines,
@@ -196,6 +197,12 @@
         const rows = await listMarginProfiles();
         const n = rows.length;
         return n === 1 ? "1 profile" : `${n} profiles`;
+      }
+      case "AvlVendorCount": {
+        // S431 — count of AVL vendors (incl. revoked, which stay listed).
+        const rows = await listAvlVendors();
+        const n = rows.length;
+        return n === 1 ? "1 vendor" : `${n} vendors`;
       }
       case "BankAccountCount": {
         // Two independent reads — the seller-info legal_name + the

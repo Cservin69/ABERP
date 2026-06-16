@@ -919,6 +919,16 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // per-OUTGOING-invoice export bundle by glob.
         | EventKind::SupplierDpasPrioritySet
         | EventKind::SupplierExportScreened
+        // S431 (ADR-0084) — supplier.* AVL CRUD + vendor-status PO-gate family.
+        // Vendor id / partner id / status + category tokens / reviewer login;
+        // app-layer JSON payloads, never NAV XML bytes. `supplier.*`-not-
+        // `invoice.*` posture; never sweeps a per-OUTGOING-invoice export bundle
+        // by glob.
+        | EventKind::AvlVendorAdded
+        | EventKind::AvlVendorStatusChanged
+        | EventKind::AvlVendorRevoked
+        | EventKind::AvlScreeningOverdue
+        | EventKind::PoBlockedByVendorStatus
         // S362 / PR-49 — incident.* cyber-incident-reporting family (ADR-0079).
         // Cyber-incident-detected record (DFARS 252.204-7012(c)(1) 72-hour
         // clock); app-layer JSON payloads (detected_at_ms / severity /
@@ -1001,7 +1011,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 130,
+        EventKind::ALL_KINDS_COUNT == 135,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1791,6 +1801,11 @@ mod tests {
         for kind in [
             EventKind::SupplierDpasPrioritySet,
             EventKind::SupplierExportScreened,
+            EventKind::AvlVendorAdded,
+            EventKind::AvlVendorStatusChanged,
+            EventKind::AvlVendorRevoked,
+            EventKind::AvlScreeningOverdue,
+            EventKind::PoBlockedByVendorStatus,
         ] {
             let (mut ledger, actor, _bh) = fixture_ledger();
             ledger

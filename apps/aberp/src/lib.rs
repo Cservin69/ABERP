@@ -24,6 +24,7 @@ pub mod ap_sync;
 pub mod audit_payloads;
 pub mod audit_query;
 pub mod audit_summary;
+pub mod avl_vendors;
 pub mod binary_hash;
 pub mod branding_config;
 pub mod build_profile;
