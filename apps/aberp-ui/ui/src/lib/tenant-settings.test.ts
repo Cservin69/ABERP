@@ -8,7 +8,11 @@
 import { describe, expect, it } from "vitest";
 
 import type { SellerInfoResponse } from "./api";
-import { formFromSellerInfo } from "./tenant-settings";
+import {
+  formFromSellerInfo,
+  hoursToSeconds,
+  secondsToHours,
+} from "./tenant-settings";
 
 describe("formFromSellerInfo", () => {
   it("maps every populated field one-to-one", () => {
@@ -71,5 +75,29 @@ describe("formFromSellerInfo", () => {
     expect(form.iban).toBe("");
     expect(form.bankName).toBe("");
     expect(form.swiftBic).toBe("");
+  });
+});
+
+describe("QC calibration window seconds↔hours", () => {
+  it("converts seconds to hours (24h default round-trips)", () => {
+    expect(secondsToHours(86400)).toBe(24);
+    expect(secondsToHours(3600)).toBe(1);
+    expect(hoursToSeconds(24)).toBe(86400);
+  });
+
+  it("rounds fractional hours to whole seconds on write", () => {
+    // 0.5h → 1800s; the input may carry a decimal so the write must
+    // not strand a non-integer second count.
+    expect(hoursToSeconds(0.5)).toBe(1800);
+  });
+
+  it("refuses non-positive / non-finite hours (returns null)", () => {
+    // A regression here would let the operator persist a 0/negative
+    // window, which the backend would treat as "never stale" or worse
+    // ([[hulye-biztos]]); the control must refuse the save instead.
+    expect(hoursToSeconds(0)).toBeNull();
+    expect(hoursToSeconds(-4)).toBeNull();
+    expect(hoursToSeconds(Number.NaN)).toBeNull();
+    expect(hoursToSeconds(Number.POSITIVE_INFINITY)).toBeNull();
   });
 });

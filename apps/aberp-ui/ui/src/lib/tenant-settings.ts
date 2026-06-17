@@ -32,3 +32,22 @@ export function formFromSellerInfo(
     swiftBic: response.bank.swift_bic ?? "",
   };
 }
+
+// S443 — QC stale-calibration window is stored per-tenant in seconds but
+// surfaced to the operator in whole-ish hours on the TenantsList page.
+// Keep the seconds↔hours conversion pure so the row control + its
+// validation can be pinned without mounting the Svelte component.
+
+/** S443 — seconds → hours for display (e.g. 86400 → 24). */
+export function secondsToHours(seconds: number): number {
+  return seconds / 3600;
+}
+
+/** S443 — hours → seconds for the write. Returns `null` for any value
+ * that isn't a finite number > 0 (blank/0/negative/NaN), so the caller
+ * can refuse the save rather than persist a nonsensical window
+ * ([[hulye-biztos]]). */
+export function hoursToSeconds(hours: number): number | null {
+  if (!Number.isFinite(hours) || hours <= 0) return null;
+  return Math.round(hours * 3600);
+}

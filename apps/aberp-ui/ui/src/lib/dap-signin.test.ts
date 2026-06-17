@@ -12,6 +12,7 @@ function row(overrides: Partial<TenantRow> = {}): TenantRow {
     running: true,
     nav_enabled: true,
     dap_enabled: false,
+    qc_calibration_stale_window_seconds: 86400,
     ...overrides,
   };
 }

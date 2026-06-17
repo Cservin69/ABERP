@@ -7,11 +7,14 @@
   // Dark-theme tokens per [[spa-dark-theme-default]].
 
   import {
+    listQcInspections,
     materialTraceability,
     partTraceability,
     type MaterialTraceReport,
     type PartTraceReport,
+    type QcInspection,
   } from "../lib/api";
+  import { verdictChipClass, verdictLabel } from "../lib/verdict";
 
   type Mode = "material_id" | "heat_lot";
   type LoadState = "idle" | "loading" | "ready" | "error";
@@ -56,6 +59,36 @@
   function onPartSubmit(event: Event): void {
     event.preventDefault();
     void tracePart();
+  }
+
+  // S443 — Inspection history (by part UID). Its own search state.
+  let inspNeedle = $state("");
+  let inspLoadState = $state<LoadState>("idle");
+  let inspError = $state<string | null>(null);
+  let inspections = $state<QcInspection[] | null>(null);
+
+  let canTraceInsp = $derived(
+    inspNeedle.trim().length > 0 && inspLoadState !== "loading",
+  );
+
+  async function traceInspections(): Promise<void> {
+    const value = inspNeedle.trim();
+    if (value.length === 0) return;
+    inspLoadState = "loading";
+    inspError = null;
+    try {
+      const resp = await listQcInspections({ partUid: value });
+      inspections = resp.inspections;
+      inspLoadState = "ready";
+    } catch (e) {
+      inspError = e instanceof Error ? e.message : String(e);
+      inspLoadState = "error";
+    }
+  }
+
+  function onInspSubmit(event: Event): void {
+    event.preventDefault();
+    void traceInspections();
   }
 
   function dash(s: string | null | undefined): string {
@@ -317,6 +350,87 @@
       {/if}
     </section>
   {/if}
+
+  <!-- S443 — Inspection history (by part UID), under the same tab. -->
+  <header class="mt-subhead">
+    <h2 class="mt-subhead__title">
+      Ellenőrzési előzmények / Inspection history
+    </h2>
+    <span class="mt-page__hint">
+      Part UID alapján minden rögzített QC ellenőrzés. / Every recorded QC
+      inspection for a part UID.
+    </span>
+  </header>
+
+  <form class="mt-search" onsubmit={onInspSubmit}>
+    <input
+      class="mt-search__input"
+      type="text"
+      bind:value={inspNeedle}
+      data-testid="insp-trace-input"
+      placeholder="dp-… part UID"
+      autocomplete="off"
+    />
+    <button type="submit" class="mt-search__btn" disabled={!canTraceInsp}>
+      {inspLoadState === "loading" ? "Trace…" : "Trace / Lekérdez"}
+    </button>
+  </form>
+
+  {#if inspLoadState === "error"}
+    <div class="mt-error" role="alert">
+      <strong>Lekérdezés sikertelen. / Trace failed.</strong>
+      <p>{inspError}</p>
+    </div>
+  {:else if inspLoadState === "ready" && inspections !== null}
+    <section class="mt-block">
+      <h2 class="mt-block__title">Inspections / Ellenőrzések</h2>
+      {#if inspections.length === 0}
+        <p class="mt-empty">
+          Nincs találat. / No inspection found for
+          <strong>{inspNeedle.trim()}</strong>.
+        </p>
+      {:else}
+        <table class="mt-table">
+          <thead>
+            <tr>
+              <th class="mt-table__th">Date</th>
+              <th class="mt-table__th">Feature</th>
+              <th class="mt-table__th">Actual</th>
+              <th class="mt-table__th">Deviation</th>
+              <th class="mt-table__th">Verdict</th>
+              <th class="mt-table__th">NCR</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each inspections as qci (qci.qci_id)}
+              <tr class="mt-table__row">
+                <td class="mt-table__td mt-table__td--mono">{qci.measured_at_utc}</td>
+                <td class="mt-table__td">{qci.feature_name}</td>
+                <td class="mt-table__td mt-table__td--mono">
+                  {qci.actual_value} {qci.units}
+                </td>
+                <td class="mt-table__td mt-table__td--mono">{qci.deviation}</td>
+                <td class="mt-table__td">
+                  <span class={verdictChipClass(qci.verdict)}>
+                    {verdictLabel(qci.verdict)}
+                  </span>
+                </td>
+                <td class="mt-table__td mt-table__td--mono">
+                  {#if qci.auto_ncr_id !== null}
+                    <a href="#/quality-ncrs" title={qci.auto_ncr_id}>
+                      {qci.auto_ncr_id}
+                    </a>
+                  {:else}
+                    {dash(null)}
+                  {/if}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+    </section>
+  {/if}
 </section>
 
 <style>
@@ -508,5 +622,33 @@
   .mt-list__item {
     color: var(--color-text-primary);
     font-size: var(--type-size-sm);
+  }
+  /* S443 — verdict chip (shared mapping via verdictChipClass). */
+  .mt-table__td a {
+    color: var(--color-signal-negative);
+  }
+  .verdict-chip {
+    display: inline-block;
+    padding: 0 var(--space-2);
+    border-radius: 12px;
+    border: 1px solid var(--color-surface-divider);
+    font-size: var(--type-size-xs);
+    font-weight: 500;
+  }
+  .verdict-chip--pass {
+    color: var(--color-signal-positive);
+    border-color: var(--color-signal-positive);
+  }
+  .verdict-chip--warning {
+    color: var(--color-signal-warning);
+    border-color: var(--color-signal-warning);
+  }
+  .verdict-chip--critical {
+    color: var(--color-signal-negative);
+    border-color: var(--color-signal-negative);
+  }
+  .verdict-chip--stale {
+    color: var(--color-signal-muted);
+    border-color: var(--color-signal-muted);
   }
 </style>

@@ -1393,6 +1393,117 @@ pub async fn quality_alert(state: State<'_, AppState>) -> Result<Value, String> 
     forward_get(&state, "/api/quality-alert", true).await
 }
 
+// ── S443 (ADR-0092) — QC inspection plans + inspections ──────────────
+
+/// S443 — `GET /api/inspection-plans` (plan master-data list).
+#[tauri::command]
+pub async fn list_inspection_plans(
+    state: State<'_, AppState>,
+    product_id: Option<String>,
+    include_archived: Option<bool>,
+) -> Result<Value, String> {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(p) = product_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        params.push(format!("product_id={}", urlencode(p)));
+    }
+    if include_archived.unwrap_or(false) {
+        params.push("include_archived=true".to_string());
+    }
+    let path = if params.is_empty() {
+        "/api/inspection-plans".to_string()
+    } else {
+        format!("/api/inspection-plans?{}", params.join("&"))
+    };
+    forward_get(&state, &path, true).await
+}
+
+/// S443 — `POST /api/inspection-plans` (create plan).
+#[tauri::command]
+pub async fn create_inspection_plan(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/inspection-plans", body).await
+}
+
+/// S443 — `PUT /api/inspection-plans/:id` (edit plan).
+#[tauri::command]
+pub async fn update_inspection_plan(
+    state: State<'_, AppState>,
+    plan_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    forward_put(&state, &format!("/api/inspection-plans/{plan_id}"), body).await
+}
+
+/// S443 — `POST /api/inspection-plans/:id/archive` (archive-not-delete).
+#[tauri::command]
+pub async fn archive_inspection_plan(
+    state: State<'_, AppState>,
+    plan_id: String,
+) -> Result<Value, String> {
+    forward_post(
+        &state,
+        &format!("/api/inspection-plans/{plan_id}/archive"),
+        Value::Object(Default::default()),
+    )
+    .await
+}
+
+/// S443 — `POST /api/qc-inspections` (record an inspection; verdict computed
+/// server-side, auto-NCR on out-of-tolerance).
+#[tauri::command]
+pub async fn record_qc_inspection(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/qc-inspections", body).await
+}
+
+/// S443 — `GET /api/qc-inspections?wo_id=&part_uid=` (per-WO or per-part list).
+#[tauri::command]
+pub async fn list_qc_inspections(
+    state: State<'_, AppState>,
+    wo_id: Option<String>,
+    part_uid: Option<String>,
+) -> Result<Value, String> {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(w) = wo_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(format!("wo_id={}", urlencode(w)));
+    }
+    if let Some(p) = part_uid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(format!("part_uid={}", urlencode(p)));
+    }
+    let path = format!("/api/qc-inspections?{}", params.join("&"));
+    forward_get(&state, &path, true).await
+}
+
+/// S443 — `GET /api/qc-stale-calibration` (dashboard stale-probe feed).
+#[tauri::command]
+pub async fn qc_stale_calibration(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/qc-stale-calibration", true).await
+}
+
+/// S443 — `POST /api/tenants/:slug/qc-calibration-window` (set the per-tenant
+/// calibration-stale window in seconds). Body `{ "seconds": u64 }`.
+#[tauri::command]
+pub async fn set_qc_calibration_window(
+    state: State<'_, AppState>,
+    slug: String,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(
+        &state,
+        &format!("/api/tenants/{slug}/qc-calibration-window"),
+        body,
+    )
+    .await
+}
+
 /// S440 — `GET /api/purchase-orders` (PO list). Optional filter facets are
 /// URL-encoded; an absent/blank facet is omitted. The backend scans in Rust.
 #[tauri::command]

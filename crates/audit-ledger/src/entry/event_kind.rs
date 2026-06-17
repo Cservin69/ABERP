@@ -3054,6 +3054,50 @@ pub enum EventKind {
     ///
     /// Payload (`serde_json::Value`): `session_id`, `closed_at_utc`.
     ServiceSessionClosed,
+
+    /// S443 (ADR-0092) — one QC inspection row written (any verdict, incl.
+    /// `calibration_stale`). The dimensional-measurement twin of the
+    /// routing-op `QaInspectionDecided` decision. `qc.*` family. NON-NAV.
+    ///
+    /// Payload (`serde_json::Value`): `qci_id`, `wo_id`, `part_uid`,
+    /// `feature_name`, `actual`, `deviation`, `verdict`, `source`.
+    QcInspectionRecorded,
+
+    /// S443 (ADR-0092) — convenience/queryability twin fired when the verdict
+    /// is `pass` (so a pass-rate query needn't parse payloads — mirrors the
+    /// `ncr.*` split rationale). `qc.*` family. NON-NAV.
+    ///
+    /// Payload (`serde_json::Value`): `qci_id`, `wo_id`, `feature_name`.
+    QcInspectionPassed,
+
+    /// S443 (ADR-0092) — fired on a `minor`/`major`/`critical` verdict.
+    /// `qc.*` family. NON-NAV.
+    ///
+    /// Payload (`serde_json::Value`): `qci_id`, `wo_id`, `feature_name`,
+    /// `verdict`, `deviation`.
+    QcInspectionFailed,
+
+    /// S443 (ADR-0092) — fired when an out-of-tolerance inspection auto-spawned
+    /// an S439 NCR. The audit cross-link between the inspection and the NCR.
+    /// `qc.*` family. NON-NAV.
+    ///
+    /// Payload (`serde_json::Value`): `qci_id`, `ncr_id`, `verdict`.
+    QcAutoNcrCreated,
+
+    /// S443 (ADR-0092) — a measurement was taken with a stale-calibration probe.
+    /// The row is recorded but NO NCR is created (a probe that may be lying must
+    /// not manufacture a false defect; ISO 9001 §7.1.5.2). `qc.*` family. NON-NAV.
+    ///
+    /// Payload (`serde_json::Value`): `qci_id`, `probe_serial`,
+    /// `last_calibration_at_utc`, `stale_by_seconds`.
+    QcProbeCalibrationStaleWarning,
+
+    /// S443 (ADR-0092) — a probe event could not be turned into an inspection
+    /// (units mismatch, missing/unparseable value, or a probe fault). Fails
+    /// loud, never silent. `qc.*` family. NON-NAV.
+    ///
+    /// Payload (`serde_json::Value`): `reason`, `raw_excerpt`.
+    QcProbeIngestionFailed,
 }
 
 impl EventKind {
@@ -3255,6 +3299,12 @@ impl EventKind {
             EventKind::ServiceSessionOpened => "auth.service_session_opened",
             EventKind::ServiceSessionEndorsed => "auth.service_session_endorsed",
             EventKind::ServiceSessionClosed => "auth.service_session_closed",
+            EventKind::QcInspectionRecorded => "qc.inspection_recorded",
+            EventKind::QcInspectionPassed => "qc.inspection_passed",
+            EventKind::QcInspectionFailed => "qc.inspection_failed",
+            EventKind::QcAutoNcrCreated => "qc.auto_ncr_created",
+            EventKind::QcProbeCalibrationStaleWarning => "qc.probe_calibration_stale_warning",
+            EventKind::QcProbeIngestionFailed => "qc.probe_ingestion_failed",
         }
     }
 
@@ -3467,6 +3517,13 @@ impl EventKind {
             "auth.service_session_opened" => Ok(EventKind::ServiceSessionOpened),
             "auth.service_session_endorsed" => Ok(EventKind::ServiceSessionEndorsed),
             "auth.service_session_closed" => Ok(EventKind::ServiceSessionClosed),
+            // S443 (ADR-0092) — QC probe/manual inspection → auto-NCR.
+            "qc.inspection_recorded" => Ok(EventKind::QcInspectionRecorded),
+            "qc.inspection_passed" => Ok(EventKind::QcInspectionPassed),
+            "qc.inspection_failed" => Ok(EventKind::QcInspectionFailed),
+            "qc.auto_ncr_created" => Ok(EventKind::QcAutoNcrCreated),
+            "qc.probe_calibration_stale_warning" => Ok(EventKind::QcProbeCalibrationStaleWarning),
+            "qc.probe_ingestion_failed" => Ok(EventKind::QcProbeIngestionFailed),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -3665,6 +3722,13 @@ impl EventKind {
         EventKind::ServiceSessionOpened,
         EventKind::ServiceSessionEndorsed,
         EventKind::ServiceSessionClosed,
+        // S443 (ADR-0092) — QC probe/manual inspection → auto-NCR.
+        EventKind::QcInspectionRecorded,
+        EventKind::QcInspectionPassed,
+        EventKind::QcInspectionFailed,
+        EventKind::QcAutoNcrCreated,
+        EventKind::QcProbeCalibrationStaleWarning,
+        EventKind::QcProbeIngestionFailed,
     ];
 
     /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
@@ -3871,6 +3935,13 @@ mod tests {
             EventKind::ServiceSessionOpened,
             EventKind::ServiceSessionEndorsed,
             EventKind::ServiceSessionClosed,
+            // S443 (ADR-0092) — QC probe/manual inspection → auto-NCR.
+            EventKind::QcInspectionRecorded,
+            EventKind::QcInspectionPassed,
+            EventKind::QcInspectionFailed,
+            EventKind::QcAutoNcrCreated,
+            EventKind::QcProbeCalibrationStaleWarning,
+            EventKind::QcProbeIngestionFailed,
         ];
         for v in &variants {
             let s = v.as_str();
@@ -3904,7 +3975,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            180,
+            186,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
@@ -6551,6 +6622,39 @@ mod tests {
             assert!(seen.insert(s), "duplicate storage string {s}");
         }
         assert_eq!(seen.len(), 12, "twelve distinct DÁP/QES audit-chain kinds");
+    }
+
+    /// S443 (ADR-0092) — the six QC inspection kinds round-trip, carry the new
+    /// `qc.*` prefix, and are distinct from one another.
+    #[test]
+    fn s443_qc_inspection_kinds_round_trip_and_use_qc_prefix() {
+        let new = [
+            (EventKind::QcInspectionRecorded, "qc.inspection_recorded"),
+            (EventKind::QcInspectionPassed, "qc.inspection_passed"),
+            (EventKind::QcInspectionFailed, "qc.inspection_failed"),
+            (EventKind::QcAutoNcrCreated, "qc.auto_ncr_created"),
+            (
+                EventKind::QcProbeCalibrationStaleWarning,
+                "qc.probe_calibration_stale_warning",
+            ),
+            (
+                EventKind::QcProbeIngestionFailed,
+                "qc.probe_ingestion_failed",
+            ),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (k, expected) in new {
+            let s = k.as_str();
+            assert_eq!(s, expected, "as_str mismatch for {k:?}");
+            assert!(s.starts_with("qc."), "{s} must start with qc.");
+            assert_eq!(
+                EventKind::from_storage_str(s).expect("round-trip"),
+                k,
+                "round-trip mismatch for {s}"
+            );
+            assert!(seen.insert(s), "duplicate storage string {s}");
+        }
+        assert_eq!(seen.len(), 6, "six distinct QC inspection kinds");
     }
 
     // ── S358 / PR-45 (ADR-0075) — part.* per-unit serialization family ──────

@@ -82,6 +82,7 @@
   import PartnersList from "./routes/PartnersList.svelte";
   import ProductsList from "./routes/ProductsList.svelte";
   import MachinesList from "./routes/MachinesList.svelte";
+  import InspectionPlansList from "./routes/InspectionPlansList.svelte";
   import MarginProfilesList from "./routes/MarginProfilesList.svelte";
   import AvlVendorsList from "./routes/AvlVendorsList.svelte";
   // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Work Orders v1.
@@ -136,7 +137,12 @@
   // S256 / PR-245 — quote-arrival surfacing: sidebar/tab badge (DB-truth
   // un-picked count) + in-app toast (live arrivals past the catch-up
   // boundary) + optional native notification + chime.
-  import { getQuoteIntakeNotifications, qualityAlert } from "./lib/api";
+  import {
+    getQuoteIntakeNotifications,
+    qcStaleCalibration,
+    qualityAlert,
+    type QcInspection,
+  } from "./lib/api";
   import QuoteArrivalToast from "./lib/QuoteArrivalToast.svelte";
   import {
     arrivalToastMessage,
@@ -281,9 +287,32 @@
     }
   }
 
+  // S443 — dashboard stale-calibration banner. Probes whose last
+  // calibration is past the per-tenant window; grey/warning (NOT red)
+  // because it's a "recalibrate soon" signal, not a hard failure.
+  let staleCalibrations: QcInspection[] = $state([]);
+
+  async function loadStaleCalibration() {
+    try {
+      const resp = await qcStaleCalibration();
+      staleCalibrations = resp.stale;
+    } catch {
+      // ignore — a stale-calibration probe must never break the shell.
+    }
+  }
+
+  /** S443 — whole days between a probe's last calibration and now. */
+  function daysSince(iso: string | null): number {
+    if (iso === null) return 0;
+    const then = new Date(iso).getTime();
+    if (Number.isNaN(then)) return 0;
+    return Math.max(0, Math.floor((Date.now() - then) / 86_400_000));
+  }
+
   onMount(() => {
     void pollBoot();
     void loadQualityAlert();
+    void loadStaleCalibration();
     // 300ms cadence: fast enough that the loading-pane log line
     // looks like it's updating in near-real-time during cold boot,
     // slow enough that we're not hammering Tauri with invokes.
@@ -675,6 +704,23 @@
             </p>
           </section>
         {/if}
+        {#if staleCalibrations.length > 0}
+          <section class="banner banner--stale-cal" role="status">
+            <strong>
+              {staleCalibrations.length} szonda kalibrációja lejárt — kalibrálja újra
+              / {staleCalibrations.length} probe(s) with stale calibration —
+              recalibrate
+            </strong>
+            <ul class="banner-list">
+              {#each staleCalibrations.slice(0, 5) as s (s.qci_id)}
+                <li>
+                  <span class="mono">{s.probe_serial ?? "(no serial)"}</span>
+                  — {daysSince(s.last_calibration_at_utc)} nap / days
+                </li>
+              {/each}
+            </ul>
+          </section>
+        {/if}
         {#if healthState === "error"}
           <section class="banner" role="alert">
             <strong>Backend is not responding.</strong>
@@ -700,6 +746,8 @@
           <ProductsList />
         {:else if route === "machines"}
           <MachinesList />
+        {:else if route === "inspection-plans"}
+          <InspectionPlansList />
         {:else if route === "margin-profiles"}
           <MarginProfilesList />
         {:else if route === "avl-vendors"}
@@ -1274,6 +1322,28 @@
 
   .banner--escalated strong {
     color: var(--color-signal-negative);
+  }
+
+  /* S443 — stale-calibration banner. Grey/warning, NOT red: a
+     "recalibrate soon" signal, not a hard failure. */
+  .banner--stale-cal {
+    border-left-color: var(--color-signal-warning);
+  }
+
+  .banner--stale-cal strong {
+    color: var(--color-signal-warning);
+  }
+
+  .banner-list {
+    margin: var(--space-2) 0 0 0;
+    padding-left: var(--space-4);
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-xs);
+  }
+
+  .banner-list .mono {
+    font-family: var(--type-family-mono);
+    color: var(--color-text-strong);
   }
 
   .banner-detail {

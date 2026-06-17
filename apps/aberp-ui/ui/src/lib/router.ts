@@ -35,6 +35,8 @@ export type AppRoute =
   // S427 — quoting-machine master data (Master Data area, alongside
   // partners + products).
   | "machines"
+  // S443 / ADR-0092 — QC inspection plans (Master Data area).
+  | "inspection-plans"
   // S428 — customer-type margin profiles (Master Data area).
   | "margin-profiles"
   // S431 — Approved Vendor List (Master Data area).
@@ -141,6 +143,8 @@ export function parseRoute(hash: string): AppRoute {
       return "products";
     case "machines":
       return "machines";
+    case "inspection-plans":
+      return "inspection-plans";
     case "margin-profiles":
       return "margin-profiles";
     case "avl-vendors":

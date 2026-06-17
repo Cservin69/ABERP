@@ -38,6 +38,7 @@
     listTenants,
     listInventoryBalances,
     listLowStockProducts,
+    listInspectionPlans,
     listMachines,
     listMarginProfiles,
     listPartners,
@@ -192,6 +193,12 @@
         const rows = await listMachines();
         const n = rows.length;
         return n === 1 ? "1 machine" : `${n} machines`;
+      }
+      case "InspectionPlanCount": {
+        // S443 / ADR-0092 — count of active (non-archived) inspection plans.
+        const rows = await listInspectionPlans();
+        const n = rows.plans.length;
+        return n === 1 ? "1 plan" : `${n} plans`;
       }
       case "MarginProfileCount": {
         // S428 — count of active (non-archived) margin profiles.

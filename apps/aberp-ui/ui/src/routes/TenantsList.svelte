@@ -24,11 +24,13 @@
     listTenants,
     restoreTenant,
     setHideDemo,
+    setQcCalibrationWindow,
     switchTenant,
     toggleTenantNav,
     type TenantRow,
   } from "../lib/api";
   import { buttonStateFor, orderTenants, visibleTenants } from "../lib/tenants-list";
+  import { hoursToSeconds, secondsToHours } from "../lib/tenant-settings";
   import { dapButtonState, dapLoginSummary } from "../lib/dap-signin";
 
   type LoadState = "loading" | "ready" | "error";
@@ -43,6 +45,10 @@
   let hasRealTenant = $state(false);
   // S441 — inline confirmation line after a mock DÁP sign-in.
   let dapMessage = $state<string | null>(null);
+  // S443 — per-tenant QC stale-calibration window, edited in hours and
+  // keyed by slug so each row's input is independent. Seeded from the
+  // tenant rows on every load (converting the stored seconds → hours).
+  let qcWindowHours = $state<Record<string, number>>({});
 
   // Add-tenant inline form.
   let showAdd = $state(false);
@@ -55,12 +61,23 @@
     newSlug.trim().length > 0 && newDisplayName.trim().length > 0 && busySlug === null,
   );
 
+  // S443 — (re)seed the per-row hours inputs from the freshly loaded
+  // rows, converting the stored seconds → hours for display.
+  function seedQcWindows(tenants: TenantRow[]): void {
+    const next: Record<string, number> = {};
+    for (const t of tenants) {
+      next[t.slug] = secondsToHours(t.qc_calibration_stale_window_seconds);
+    }
+    qcWindowHours = next;
+  }
+
   async function load(): Promise<void> {
     loadState = "loading";
     errorMessage = null;
     try {
       const resp = await listTenants();
       rows = resp.tenants;
+      seedQcWindows(resp.tenants);
       hideDemo = resp.hide_demo;
       hasRealTenant = resp.has_real_tenant;
       loadState = "ready";
@@ -197,6 +214,29 @@
     }
   }
 
+  // S443 — save a tenant's QC stale-calibration window. The operator
+  // edits whole-ish hours; we validate hours > 0 (refuse blank/0/neg via
+  // the pure `hoursToSeconds`), write seconds, then reload so the row
+  // reflects the persisted value. Mirrors the onToggleNav guard/try/catch.
+  async function onSaveQcWindow(row: TenantRow): Promise<void> {
+    if (busySlug !== null || switching !== null) return;
+    const seconds = hoursToSeconds(qcWindowHours[row.slug]);
+    if (seconds === null) {
+      errorMessage = `Kalibráció-elavulás / Calibration stale window for ${row.slug} must be greater than 0 hours.`;
+      return;
+    }
+    busySlug = row.slug;
+    errorMessage = null;
+    try {
+      await setQcCalibrationWindow(row.slug, seconds);
+      await load();
+    } catch (e) {
+      errorMessage = e instanceof Error ? e.message : String(e);
+    } finally {
+      busySlug = null;
+    }
+  }
+
   // S434 — toggle the hide-demo preference.
   async function onToggleHideDemo(): Promise<void> {
     const next = !hideDemo;
@@ -322,6 +362,9 @@
           <th class="tn-th">Slug</th>
           <th class="tn-th">State</th>
           <th class="tn-th">NAV sync</th>
+          <th class="tn-th" title="QC stale-calibration window, in hours">
+            Kalibráció-elavulás (óra) / Calibration stale (h)
+          </th>
           <th class="tn-th">Created</th>
           <th class="tn-th tn-th--actions">Actions</th>
         </tr>
@@ -370,6 +413,29 @@
                 <span class="tn-toggle__knob"></span>
                 <span class="tn-toggle__label">{row.nav_enabled ? "ON" : "OFF"}</span>
               </button>
+            </td>
+            <td class="tn-td">
+              <div class="tn-qcwin">
+                <input
+                  class="tn-qcwin__input"
+                  type="number"
+                  min="0.1"
+                  step="0.1"
+                  inputmode="decimal"
+                  aria-label="Kalibráció-elavulás óra / Calibration stale hours for {row.slug}"
+                  bind:value={qcWindowHours[row.slug]}
+                  disabled={busySlug !== null || switching !== null}
+                />
+                <button
+                  class="tn-btn"
+                  type="button"
+                  disabled={busySlug !== null || switching !== null}
+                  title="Save the QC stale-calibration window (takes effect immediately)"
+                  onclick={() => void onSaveQcWindow(row)}
+                >
+                  {busySlug === row.slug ? "…" : "Save"}
+                </button>
+              </div>
             </td>
             <td class="tn-td">{fmtDate(row.created_at)}</td>
             <td class="tn-td tn-td--actions">
@@ -619,6 +685,27 @@
     gap: var(--space-2);
     font-size: var(--type-size-sm);
     color: var(--color-text-secondary);
+  }
+  /* S443 — compact per-row QC stale-calibration window (hours + Save). */
+  .tn-qcwin {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .tn-qcwin__input {
+    width: 4.5rem;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 3px;
+    background: var(--color-surface-base);
+    color: var(--color-text-strong);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    font-variant-numeric: tabular-nums;
+  }
+  .tn-qcwin__input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
   .tn-btn {
     padding: var(--space-1) var(--space-3);

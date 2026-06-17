@@ -75,6 +75,9 @@ pub mod material_traceability;
 pub mod part_marking;
 // S439 (ADR-0090) — defense quality management: NCR + CAPA workflow.
 pub mod quality;
+// S443 (ADR-0092) — QC dimensional inspection orchestrator (verdict +
+// auto-NCR; manual entry today, probe sources stubbed).
+pub mod qc_inspection;
 // S229 / PR-225 — Stage 3 manufacturing-adapter framework boot wiring.
 // Reads `ABERP_BARCODE_SCANNER_*` env vars and spawns the barcode
 // scanner adapter + per-adapter ledger-writer task. Default-off.

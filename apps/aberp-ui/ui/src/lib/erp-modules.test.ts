@@ -52,6 +52,8 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "products",
   // S427 — quoting-machine master data.
   "machines",
+  // S443 / ADR-0092 — QC inspection plans.
+  "inspection-plans",
   "work-orders",
   "qa",
   "dispatch",
@@ -102,6 +104,8 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   products: "master-data",
   // S427 — quoting-machine master data.
   machines: "master-data",
+  // S443 / ADR-0092 — QC inspection plans.
+  "inspection-plans": "master-data",
   // S428 — customer-type margin profiles.
   "margin-profiles": "master-data",
   // S431 — Approved Vendor List.
@@ -159,6 +163,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   products: "maintenance",
   // S427 — quoting-machine master data (maintenance area).
   machines: "maintenance",
+  // S443 / ADR-0092 — QC inspection plans (maintenance area).
+  "inspection-plans": "maintenance",
   // S428 — customer-type margin profiles (maintenance area).
   "margin-profiles": "maintenance",
   // S431 — Approved Vendor List (maintenance area).
@@ -219,6 +225,8 @@ const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   "ProductCount",
   // S427 — quoting-machine master data tile.
   "MachineCount",
+  // S443 / ADR-0092 — QC inspection plans tile.
+  "InspectionPlanCount",
   // S428 — customer-type margin profiles tile.
   "MarginProfileCount",
   // S431 — Approved Vendor List tile.

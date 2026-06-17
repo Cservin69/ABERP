@@ -1041,7 +1041,15 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::TimestampAnchorDelayed
         | EventKind::ServiceSessionOpened
         | EventKind::ServiceSessionEndorsed
-        | EventKind::ServiceSessionClosed => None,
+        | EventKind::ServiceSessionClosed
+        // S443 (ADR-0092) — QC inspection / probe ingestion kinds carry no
+        // NAV invoice bytes (quality/manufacturing, not the §169 path).
+        | EventKind::QcInspectionRecorded
+        | EventKind::QcInspectionPassed
+        | EventKind::QcInspectionFailed
+        | EventKind::QcAutoNcrCreated
+        | EventKind::QcProbeCalibrationStaleWarning
+        | EventKind::QcProbeIngestionFailed => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -1071,7 +1079,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 180,
+        EventKind::ALL_KINDS_COUNT == 186,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1887,6 +1895,34 @@ mod tests {
                 .append(
                     kind.clone(),
                     br#"{"session_id":"ses_x"}"#.to_vec(),
+                    actor,
+                    None,
+                )
+                .unwrap();
+            let entries = ledger.entries().unwrap();
+            let nav = extract_nav_xml(&entries[0]).unwrap();
+            assert!(nav.is_none(), "{} must produce no nav/ file", kind.as_str());
+        }
+    }
+
+    /// S443 (ADR-0092) — the six QC inspection kinds (`qc.*`) carry app-layer
+    /// JSON, never NAV XML, so they never produce a `nav/` file in a
+    /// per-OUTGOING-invoice export bundle.
+    #[test]
+    fn extract_nav_xml_returns_none_for_qc_inspection_kinds() {
+        for kind in [
+            EventKind::QcInspectionRecorded,
+            EventKind::QcInspectionPassed,
+            EventKind::QcInspectionFailed,
+            EventKind::QcAutoNcrCreated,
+            EventKind::QcProbeCalibrationStaleWarning,
+            EventKind::QcProbeIngestionFailed,
+        ] {
+            let (mut ledger, actor, _bh) = fixture_ledger();
+            ledger
+                .append(
+                    kind.clone(),
+                    br#"{"qci_id":"qci_01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#.to_vec(),
                     actor,
                     None,
                 )

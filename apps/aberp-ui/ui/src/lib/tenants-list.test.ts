@@ -19,6 +19,7 @@ const ROWS: TenantRow[] = [
     running: true,
     nav_enabled: true,
     dap_enabled: false,
+    qc_calibration_stale_window_seconds: 86400,
   },
   {
     slug: "test",
@@ -28,6 +29,7 @@ const ROWS: TenantRow[] = [
     running: false,
     nav_enabled: true,
     dap_enabled: false,
+    qc_calibration_stale_window_seconds: 86400,
   },
   {
     slug: "old",
@@ -37,6 +39,7 @@ const ROWS: TenantRow[] = [
     running: false,
     nav_enabled: true,
     dap_enabled: false,
+    qc_calibration_stale_window_seconds: 86400,
   },
 ];
 
@@ -79,6 +82,7 @@ describe("buttonStateFor", () => {
         running: false,
         nav_enabled: false,
         dap_enabled: false,
+        qc_calibration_stale_window_seconds: 86400,
       },
     ];
     const demo = withDemo[withDemo.length - 1];
@@ -122,6 +126,7 @@ describe("visibleTenants (S434 hide-demo)", () => {
       running: false,
       nav_enabled: false,
       dap_enabled: false,
+      qc_calibration_stale_window_seconds: 86400,
     },
   ];
 

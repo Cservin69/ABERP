@@ -119,6 +119,15 @@ pub struct TenantEntry {
     /// S441 (ADR-0087) — heartbeat anchor cadence in seconds (default 900 =
     /// 15 min). Only consulted when `dap_enabled`. Missing key → 900.
     pub audit_anchor_heartbeat_seconds: u64,
+
+    /// S443 (ADR-0092) — the per-tenant QC probe calibration-stale window in
+    /// seconds (default 86400 = 24h). A probe whose last calibration is older
+    /// than this records its measurement with `calibration_stale` and raises a
+    /// warning instead of an NCR. Operators can tighten it (e.g. 28800 = 8h
+    /// per-shift) or relax it (e.g. 604800 = 7d for low-volume work).
+    /// BACKWARD COMPAT: a row written before S443 carries no key →
+    /// [`PartialEntry::finish`] defaults the MISSING field to 86400.
+    pub qc_calibration_stale_window_seconds: u64,
 }
 
 /// Typed errors for the state-transition invariants. Routes map these to
@@ -245,6 +254,7 @@ impl TenantRegistry {
             // S441 — DÁP/QES audit chain is OPT-IN per tenant (Defense line).
             dap_enabled: false,
             audit_anchor_heartbeat_seconds: 900,
+            qc_calibration_stale_window_seconds: 86400,
         };
         self.tenants.push(entry.clone());
         Ok(entry)
@@ -269,6 +279,7 @@ impl TenantRegistry {
             // S441 — demo never runs the DÁP/QES audit chain.
             dap_enabled: false,
             audit_anchor_heartbeat_seconds: 900,
+            qc_calibration_stale_window_seconds: 86400,
         };
         self.tenants.push(entry.clone());
         Ok(entry)
@@ -290,6 +301,23 @@ impl TenantRegistry {
             .ok_or_else(|| TenantRegistryError::NotFound(slug.to_string()))?;
         let old = t.nav_enabled;
         t.nav_enabled = enabled;
+        Ok(old)
+    }
+
+    /// S443 — set a tenant's QC calibration-stale window (seconds). Returns
+    /// the PRIOR value. Errors if the slug is absent.
+    pub fn set_qc_calibration_stale_window_seconds(
+        &mut self,
+        slug: &str,
+        seconds: u64,
+    ) -> Result<u64, TenantRegistryError> {
+        let t = self
+            .tenants
+            .iter_mut()
+            .find(|t| t.slug == slug)
+            .ok_or_else(|| TenantRegistryError::NotFound(slug.to_string()))?;
+        let old = t.qc_calibration_stale_window_seconds;
+        t.qc_calibration_stale_window_seconds = seconds;
         Ok(old)
     }
 
@@ -382,6 +410,13 @@ impl TenantRegistry {
                     t.audit_anchor_heartbeat_seconds
                 ));
             }
+            // S443 — omit when at the 24h default (byte-identical to pre-S443).
+            if t.qc_calibration_stale_window_seconds != 86400 {
+                out.push_str(&format!(
+                    "qc_calibration_stale_window_seconds = {}\n",
+                    t.qc_calibration_stale_window_seconds
+                ));
+            }
         }
         out
     }
@@ -459,6 +494,16 @@ impl TenantRegistry {
                             )
                         })?)
                 }
+                // S443 — QC probe calibration-stale window (bare integer secs).
+                "qc_calibration_stale_window_seconds" => {
+                    p.qc_calibration_stale_window_seconds =
+                        Some(val_raw.trim().parse::<u64>().with_context(|| {
+                            format!(
+                                "tenants.toml line {} qc_calibration_stale_window_seconds",
+                                lineno + 1
+                            )
+                        })?)
+                }
                 "slug" | "display_name" | "state" | "created_at" => {
                     let val = unquote(val_raw)
                         .with_context(|| format!("tenants.toml line {} value", lineno + 1))?;
@@ -512,6 +557,7 @@ struct PartialEntry {
     nav_enabled: Option<bool>,
     dap_enabled: Option<bool>,
     audit_anchor_heartbeat_seconds: Option<u64>,
+    qc_calibration_stale_window_seconds: Option<u64>,
 }
 
 impl PartialEntry {
@@ -543,6 +589,10 @@ impl PartialEntry {
             // unsigned chain (false) + the 15-min default.
             dap_enabled: self.dap_enabled.unwrap_or(false),
             audit_anchor_heartbeat_seconds: self.audit_anchor_heartbeat_seconds.unwrap_or(900),
+            // S443 BACKWARD COMPAT: a pre-S443 row has no key → 24h default.
+            qc_calibration_stale_window_seconds: self
+                .qc_calibration_stale_window_seconds
+                .unwrap_or(86400),
         })
     }
 }

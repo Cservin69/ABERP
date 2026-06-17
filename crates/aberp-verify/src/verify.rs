@@ -1182,7 +1182,15 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::TimestampAnchorDelayed
         | EventKind::ServiceSessionOpened
         | EventKind::ServiceSessionEndorsed
-        | EventKind::ServiceSessionClosed => (None, ""),
+        | EventKind::ServiceSessionClosed
+        // S443 (ADR-0092) — QC inspection / probe ingestion kinds carry no
+        // NAV invoice bytes (quality/manufacturing, not the §169 path).
+        | EventKind::QcInspectionRecorded
+        | EventKind::QcInspectionPassed
+        | EventKind::QcInspectionFailed
+        | EventKind::QcAutoNcrCreated
+        | EventKind::QcProbeCalibrationStaleWarning
+        | EventKind::QcProbeIngestionFailed => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -1204,7 +1212,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 180,
+        EventKind::ALL_KINDS_COUNT == 186,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1682,6 +1690,20 @@ mod tests {
             EventKind::ServiceSessionOpened,
             EventKind::ServiceSessionEndorsed,
             EventKind::ServiceSessionClosed,
+        ]);
+    }
+
+    // S443 (ADR-0092) — the six QC inspection kinds carry app-layer JSON, no
+    // NAV XML bytes.
+    #[test]
+    fn qc_inspection_no_nav_bytes() {
+        assert_family_no_nav(&[
+            EventKind::QcInspectionRecorded,
+            EventKind::QcInspectionPassed,
+            EventKind::QcInspectionFailed,
+            EventKind::QcAutoNcrCreated,
+            EventKind::QcProbeCalibrationStaleWarning,
+            EventKind::QcProbeIngestionFailed,
         ]);
     }
 

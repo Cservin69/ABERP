@@ -275,6 +275,8 @@ export const MODULES: ErpModule[] = [
       // S427 — quoting-machine master data (name, family, envelope,
       // capacity). Lives beside partners + products in Master Data.
       { id: "machines", label: "Machines" },
+      // S443 / ADR-0092 — QC inspection plans (feature × nominal × tol).
+      { id: "inspection-plans", label: "Inspection plans" },
       // S428 — customer-type margin profiles.
       { id: "margin-profiles", label: "Margin profiles" },
       // S431 — Approved Vendor List (defense supplier approval).
@@ -475,6 +477,8 @@ export type MaintenanceTileStatusKind =
   | "ProductCount"
   // S427 — count of active (non-archived) quoting machines.
   | "MachineCount"
+  // S443 / ADR-0092 — count of active (non-archived) QC inspection plans.
+  | "InspectionPlanCount"
   // S428 — count of active (non-archived) margin profiles.
   | "MarginProfileCount"
   // S431 — count of AVL vendors.
@@ -565,6 +569,16 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Géppark: család, befoglaló méret, kapacitás",
     description_en: "Machine park: family, envelope, capacity",
     statusKind: "MachineCount",
+  },
+  // S443 / ADR-0092 — QC inspection plans tile.
+  {
+    moduleId: "master-data",
+    route: "inspection-plans",
+    label_hu: "Ellenőrzési tervek",
+    label_en: "Inspection plans",
+    description_hu: "Jellemző × névleges × tűrés ellenőrzési tervek",
+    description_en: "Feature × nominal × tolerance inspection plans",
+    statusKind: "InspectionPlanCount",
   },
   // S428 — customer-type margin profiles tile.
   {

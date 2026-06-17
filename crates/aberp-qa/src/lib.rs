@@ -46,6 +46,7 @@
 
 mod audit;
 mod error;
+pub mod qc;
 mod repository;
 mod state;
 mod types;
@@ -54,9 +55,29 @@ pub use audit::{QaInspectionCreatedPayload, QaInspectionDecidedPayload};
 pub use error::QaError;
 pub use repository::{
     all_live_inspections_passed_for_wo, auto_create_inspection_for_op_completion,
-    count_qa_inspections_by_state, decide_qa, ensure_schema, get_qa_inspection,
-    list_live_inspections_for_wo, list_qa_inspections, AutoCreateInspectionInputs, DecideQaInputs,
-    QaDecisionOutcome, QaInspection, QaStateCounts, QaWriteContext,
+    count_qa_inspections_by_state, decide_qa, get_qa_inspection, list_live_inspections_for_wo,
+    list_qa_inspections, AutoCreateInspectionInputs, DecideQaInputs, QaDecisionOutcome,
+    QaInspection, QaStateCounts, QaWriteContext,
 };
 pub use state::{next_qa_state, QaStateError};
 pub use types::{QaDecision, QaState};
+
+// S443 / ADR-0092 — QC dimensional-inspection surface (re-exported flat).
+pub use qc::{
+    archive_plan as archive_inspection_plan, compute_verdict,
+    create_plan as create_inspection_plan, ensure_qc_schema, get_plan as get_inspection_plan,
+    link_auto_ncr, list_inspections_for_part, list_inspections_for_wo,
+    list_plans as list_inspection_plans, list_recent_stale_calibration, record_ingestion_failure,
+    record_inspection, update_plan as update_inspection_plan, InspectionPlan, MockProbeSource,
+    MtconnectProbeSource, NewInspectionPlan, ProbeCursor, ProbeError, ProbeIngestionSource,
+    QcError, QcInspection, QcSource, QcWriteContext, RawProbeEvent, RecordInspectionInputs,
+    RecordedInspection, RenishawCentralSource, Verdict,
+};
+
+/// Apply both QA (`V001`) and QC (`V002`) schemas. Idempotent. Extended
+/// in S443 to also create the QC tables so they exist wherever the QA
+/// queue does (one boot call, no new wiring at the call site).
+pub fn ensure_schema(conn: &duckdb::Connection) -> anyhow::Result<()> {
+    repository::ensure_schema(conn)?;
+    qc::ensure_qc_schema(conn)
+}

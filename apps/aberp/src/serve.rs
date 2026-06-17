@@ -975,8 +975,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 }
                 Ok(upgrade_snapshot::Outcome::Matches) => {
                     use time::format_description::well_known::Rfc3339;
-                    use time::OffsetDateTime;
-                    let ts = OffsetDateTime::now_utc()
+                    let ts = time::OffsetDateTime::now_utc()
                         .format(&Rfc3339)
                         .unwrap_or_else(|_| "verified".to_string());
                     // Sanitize the timestamp for use in a filename: keep
@@ -1006,8 +1005,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 }
                 Ok(upgrade_snapshot::Outcome::Mismatch { deltas }) => {
                     use time::format_description::well_known::Rfc3339;
-                    use time::OffsetDateTime;
-                    let detected_at = OffsetDateTime::now_utc()
+                    let detected_at = time::OffsetDateTime::now_utc()
                         .format(&Rfc3339)
                         .unwrap_or_else(|_| "unknown".to_string());
                     // Best-effort audit append BEFORE the exit so the
@@ -3731,6 +3729,34 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/capas/:id/review", post(handle_review_capa))
         .route("/api/capas/:id/close", post(handle_close_capa))
         .route("/api/quality-alert", get(handle_quality_alert))
+        // S443 (ADR-0092) — QC dimensional inspection. Inspection-plan
+        // master data (CRUD + archive) + record-inspection (verdict in
+        // code → auto-NCR on out-of-tolerance) + per-WO/part lists + the
+        // stale-calibration dashboard feed. Fires the qc.* family.
+        .route(
+            "/api/inspection-plans",
+            get(handle_list_inspection_plans).post(handle_create_inspection_plan),
+        )
+        .route(
+            "/api/inspection-plans/:id",
+            axum::routing::put(handle_update_inspection_plan),
+        )
+        .route(
+            "/api/inspection-plans/:id/archive",
+            post(handle_archive_inspection_plan),
+        )
+        .route(
+            "/api/qc-inspections",
+            get(handle_list_qc_inspections).post(handle_record_qc_inspection),
+        )
+        .route(
+            "/api/qc-stale-calibration",
+            get(handle_qc_stale_calibration),
+        )
+        .route(
+            "/api/tenants/:slug/qc-calibration-window",
+            post(handle_set_qc_calibration_window),
+        )
         // S440 (ADR-0068) — purchase orders. List + create (AVL-gated) +
         // detail + transition (issue/cancel/close) + receive. Fires the po.*
         // family; receiving auto-creates NCRs (S439) on failed inspection.
@@ -4225,6 +4251,9 @@ struct TenantView {
     /// S441 — the per-tenant DÁP/QES audit-chain flag. The SPA shows the
     /// "Sign in with DÁP" button on the tenant row only when this is true.
     dap_enabled: bool,
+    /// S443 (ADR-0092) — per-tenant QC probe calibration-stale window
+    /// (seconds; default 86400 = 24h). The SPA renders/edits it on the row.
+    qc_calibration_stale_window_seconds: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -4283,6 +4312,7 @@ fn build_tenant_list(
             running: t.slug == running_slug,
             nav_enabled: t.nav_enabled,
             dap_enabled: t.dap_enabled,
+            qc_calibration_stale_window_seconds: t.qc_calibration_stale_window_seconds,
         })
         .collect();
     TenantListResponse {
@@ -5728,10 +5758,9 @@ async fn handle_acknowledge_first_prod_launch(
 /// touchfile, then append the audit entry. Returns the RFC3339 stamp.
 fn acknowledge_first_prod_launch(state: &AppState, operator_login: &str) -> Result<String> {
     use time::format_description::well_known::Rfc3339;
-    use time::OffsetDateTime;
 
     let tenant = state.tenant.as_str();
-    let acknowledged_at = OffsetDateTime::now_utc()
+    let acknowledged_at = time::OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .context("format first-launch acknowledgement timestamp")?;
 
@@ -19215,9 +19244,8 @@ fn record_numbering_change_audit(
     template: &NumberingTemplate,
 ) -> Result<()> {
     use time::format_description::well_known::Rfc3339;
-    use time::OffsetDateTime;
 
-    let now = OffsetDateTime::now_utc();
+    let now = time::OffsetDateTime::now_utc();
     let changed_at = now
         .format(&Rfc3339)
         .context("format numbering-change timestamp")?;
@@ -22100,9 +22128,8 @@ fn count_recent_daemon_panics(
     window_minutes: i64,
 ) -> Result<DaemonPanicTelemetry> {
     use aberp_audit_ledger::ensure_schema as audit_ensure_schema;
-    use time::OffsetDateTime;
     audit_ensure_schema(conn).context("ensure audit-ledger schema")?;
-    let cutoff = OffsetDateTime::now_utc() - time::Duration::minutes(window_minutes);
+    let cutoff = time::OffsetDateTime::now_utc() - time::Duration::minutes(window_minutes);
     let cutoff_str = cutoff
         .format(&time::format_description::well_known::Rfc3339)
         .context("format cutoff for panic count")?;
@@ -23404,6 +23431,470 @@ async fn handle_quality_alert(headers: HeaderMap, State(state): State<AppState>)
         .into_response(),
         Ok(Err(e)) => internal_error("quality_alert", e),
         Err(j) => internal_error("quality_alert:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+// ── S443 (ADR-0092) — QC inspection plans + inspections ──────────────
+
+/// Resolve the running tenant's QC calibration-stale window (seconds),
+/// defaulting to 24h if the registry can't be read (a single-tenant
+/// install without `tenants.toml` keeps the default).
+fn qc_stale_window_seconds(state: &AppState) -> u64 {
+    crate::tenant_registry::registry_path()
+        .and_then(|p| crate::tenant_registry::TenantRegistry::read_from(&p))
+        .ok()
+        .and_then(|reg| {
+            reg.find(state.tenant.as_str())
+                .map(|t| t.qc_calibration_stale_window_seconds)
+        })
+        .unwrap_or(86400)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct InspectionPlanListQuery {
+    product_id: Option<String>,
+    #[serde(default)]
+    include_archived: bool,
+}
+
+async fn handle_list_inspection_plans(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(q): Query<InspectionPlanListQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<aberp_qa::InspectionPlan>> {
+        let conn = Connection::open(&*state_for_task.db_path)?;
+        aberp_qa::list_inspection_plans(
+            &conn,
+            state_for_task.tenant.as_str(),
+            q.product_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+            q.include_archived,
+        )
+        .map_err(|e| anyhow!("{e}"))
+    })
+    .await;
+    match result {
+        Ok(Ok(plans)) => Json(serde_json::json!({ "plans": plans })).into_response(),
+        Ok(Err(e)) => internal_error("list_inspection_plans", e),
+        Err(j) => internal_error(
+            "list_inspection_plans:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct InspectionPlanBody {
+    product_id: String,
+    feature_name: String,
+    nominal_value: f64,
+    upper_tol: f64,
+    lower_tol: f64,
+    units: String,
+    #[serde(default)]
+    optional_probe_cycle_id: Option<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn qc_validation_response(e: aberp_qa::QcError) -> Response {
+    match e {
+        aberp_qa::QcError::Validation(m) => {
+            (StatusCode::BAD_REQUEST, Json(error_body(m))).into_response()
+        }
+        aberp_qa::QcError::UnitsMismatch { .. } => {
+            (StatusCode::BAD_REQUEST, Json(error_body(e.to_string()))).into_response()
+        }
+        aberp_qa::QcError::NotFound => {
+            (StatusCode::NOT_FOUND, Json(error_body("not found".into()))).into_response()
+        }
+        aberp_qa::QcError::Storage(err) => internal_error("qc_plan", err),
+    }
+}
+
+async fn handle_create_inspection_plan(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<InspectionPlanBody>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<aberp_qa::InspectionPlan, aberp_qa::QcError> {
+            let conn = Connection::open(&*state_for_task.db_path)
+                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
+            aberp_qa::create_inspection_plan(
+                &conn,
+                state_for_task.tenant.as_str(),
+                aberp_qa::NewInspectionPlan {
+                    product_id: body.product_id,
+                    feature_name: body.feature_name,
+                    nominal_value: body.nominal_value,
+                    upper_tol: body.upper_tol,
+                    lower_tol: body.lower_tol,
+                    units: body.units,
+                    optional_probe_cycle_id: body.optional_probe_cycle_id,
+                    enabled: body.enabled,
+                },
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(plan)) => (StatusCode::CREATED, Json(plan)).into_response(),
+        Ok(Err(e)) => qc_validation_response(e),
+        Err(j) => internal_error(
+            "create_inspection_plan:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+async fn handle_update_inspection_plan(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(plan_id): AxumPath<String>,
+    Json(body): Json<InspectionPlanBody>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<aberp_qa::InspectionPlan, aberp_qa::QcError> {
+            let conn = Connection::open(&*state_for_task.db_path)
+                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
+            aberp_qa::update_inspection_plan(
+                &conn,
+                state_for_task.tenant.as_str(),
+                &plan_id,
+                aberp_qa::NewInspectionPlan {
+                    product_id: body.product_id,
+                    feature_name: body.feature_name,
+                    nominal_value: body.nominal_value,
+                    upper_tol: body.upper_tol,
+                    lower_tol: body.lower_tol,
+                    units: body.units,
+                    optional_probe_cycle_id: body.optional_probe_cycle_id,
+                    enabled: body.enabled,
+                },
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(plan)) => Json(plan).into_response(),
+        Ok(Err(e)) => qc_validation_response(e),
+        Err(j) => internal_error(
+            "update_inspection_plan:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+async fn handle_archive_inspection_plan(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(plan_id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> std::result::Result<(), aberp_qa::QcError> {
+            let conn = Connection::open(&*state_for_task.db_path)
+                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
+            aberp_qa::archive_inspection_plan(&conn, state_for_task.tenant.as_str(), &plan_id)
+        })
+        .await;
+    match result {
+        Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(Err(e)) => qc_validation_response(e),
+        Err(j) => internal_error(
+            "archive_inspection_plan:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QcInspectionListQuery {
+    wo_id: Option<String>,
+    part_uid: Option<String>,
+}
+
+async fn handle_list_qc_inspections(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(q): Query<QcInspectionListQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let wo_id = q
+        .wo_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let part_uid = q
+        .part_uid
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if wo_id.is_none() && part_uid.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body("wo_id or part_uid is required".into())),
+        )
+            .into_response();
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<aberp_qa::QcInspection>> {
+        let conn = Connection::open(&*state_for_task.db_path)?;
+        let tenant = state_for_task.tenant.as_str();
+        let rows = match (&part_uid, &wo_id) {
+            (Some(p), _) => aberp_qa::list_inspections_for_part(&conn, tenant, p),
+            (None, Some(w)) => aberp_qa::list_inspections_for_wo(&conn, tenant, w),
+            (None, None) => Ok(Vec::new()),
+        }
+        .map_err(|e| anyhow!("{e}"))?;
+        Ok(rows)
+    })
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({ "inspections": rows })).into_response(),
+        Ok(Err(e)) => internal_error("list_qc_inspections", e),
+        Err(j) => internal_error(
+            "list_qc_inspections:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RecordQcInspectionBody {
+    plan_id: String,
+    actual_value: f64,
+    #[serde(default)]
+    units: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    probe_serial: Option<String>,
+    #[serde(default)]
+    last_calibration_at: Option<String>,
+    #[serde(default)]
+    wo_id: Option<String>,
+    #[serde(default)]
+    part_uid: Option<String>,
+}
+
+async fn handle_record_qc_inspection(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<RecordQcInspectionBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let source = match body.source.as_deref() {
+        Some(s) => match aberp_qa::QcSource::from_storage_str(s.trim()) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body(format!("unknown source {s}"))),
+                )
+                    .into_response()
+            }
+        },
+        None => aberp_qa::QcSource::Manual,
+    };
+    let stale_window = qc_stale_window_seconds(&state);
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<crate::qc_inspection::InspectionResult, crate::qc_inspection::QcRecordError>
+        {
+            // Resolve the part's heat lot from its mark (snapshot at marking
+            // time) so the auto-NCR cites the actual lot, not a re-derived one.
+            let heat_lot = match (&body.wo_id, &body.part_uid) {
+                (Some(wo), Some(part)) => {
+                    let conn = Connection::open(&*state_for_task.db_path)
+                        .map_err(|e| crate::qc_inspection::QcRecordError::Other(anyhow!("open DuckDB: {e}")))?;
+                    crate::part_marking::list_part_marks(&conn, state_for_task.tenant.as_str(), wo)
+                        .map_err(crate::qc_inspection::QcRecordError::Other)?
+                        .into_iter()
+                        .find(|m| &m.part_uid == part)
+                        .and_then(|m| m.heat_lot_reference)
+                }
+                _ => None,
+            };
+            let now = time::OffsetDateTime::now_utc();
+            crate::qc_inspection::record_manual_inspection(
+                &state_for_task.db_path,
+                state_for_task.tenant.clone(),
+                binary_hash,
+                &operator,
+                now,
+                stale_window,
+                crate::qc_inspection::ManualInspectionRequest {
+                    plan_id: body.plan_id,
+                    actual_value: body.actual_value,
+                    source,
+                    units: body.units,
+                    source_event_id: None,
+                    probe_serial: body.probe_serial,
+                    last_calibration_at: body.last_calibration_at,
+                    wo_id: body.wo_id,
+                    part_uid: body.part_uid,
+                    heat_lot,
+                },
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(res)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "inspection": res.inspection,
+                "auto_ncr": res.auto_ncr,
+            })),
+        )
+            .into_response(),
+        Ok(Err(e)) => match e {
+            crate::qc_inspection::QcRecordError::PlanNotFound => {
+                (StatusCode::NOT_FOUND, Json(error_body(e.to_string()))).into_response()
+            }
+            crate::qc_inspection::QcRecordError::Validation(_)
+            | crate::qc_inspection::QcRecordError::BadCalibrationTimestamp(_) => {
+                (StatusCode::BAD_REQUEST, Json(error_body(e.to_string()))).into_response()
+            }
+            crate::qc_inspection::QcRecordError::Other(err) => {
+                internal_error("record_qc_inspection", err)
+            }
+        },
+        Err(j) => internal_error(
+            "record_qc_inspection:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+async fn handle_qc_stale_calibration(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<aberp_qa::QcInspection>> {
+        let conn = Connection::open(&*state_for_task.db_path)?;
+        // Last 30 days.
+        aberp_qa::list_recent_stale_calibration(
+            &conn,
+            state_for_task.tenant.as_str(),
+            time::OffsetDateTime::now_utc(),
+            30 * 24 * 3600,
+        )
+        .map_err(|e| anyhow!("{e}"))
+    })
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({ "stale": rows })).into_response(),
+        Ok(Err(e)) => internal_error("qc_stale_calibration", e),
+        Err(j) => internal_error(
+            "qc_stale_calibration:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetQcCalibrationWindowBody {
+    seconds: u64,
+}
+
+async fn handle_set_qc_calibration_window(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    Json(body): Json<SetQcCalibrationWindowBody>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if body.seconds == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body("seconds must be greater than zero".into())),
+        )
+            .into_response();
+    }
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let path = crate::tenant_registry::registry_path()?;
+        let mut reg = crate::tenant_registry::TenantRegistry::read_from(&path)?;
+        reg.set_qc_calibration_stale_window_seconds(&slug, body.seconds)
+            .map_err(|e| anyhow!("{e}"))?;
+        reg.write_to(&path)?;
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {
+            Json(serde_json::json!({ "ok": true, "seconds": body.seconds })).into_response()
+        }
+        Ok(Err(e)) => internal_error("set_qc_calibration_window", e),
+        Err(j) => internal_error(
+            "set_qc_calibration_window:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
     }
 }
 
@@ -27124,9 +27615,8 @@ mod tests {
         use aberp_billing::{
             Currency, CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
         };
-        use time::OffsetDateTime;
 
-        let now = OffsetDateTime::now_utc();
+        let now = time::OffsetDateTime::now_utc();
         let invoice = ReadyInvoice {
             id: InvoiceId::new(),
             series_id: SeriesId::new(),

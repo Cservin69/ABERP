@@ -29,15 +29,19 @@
     transitionRoutingOp,
     transitionWorkOrder,
     listProducts,
+    listQcInspections,
     type Product,
     type QaInspection,
+    type QcInspection,
     type RoutingOp,
     type WorkOrder,
     type WorkOrderDetailResponse,
     type WorkOrderState,
     type WoAction,
   } from "../lib/api";
+  import { verdictChipClass, verdictLabel } from "../lib/verdict";
   import MarkPartsModal from "./MarkPartsModal.svelte";
+  import RecordInspectionModal from "./RecordInspectionModal.svelte";
 
   const STATE_FACETS: { state: WorkOrderState | null; hu: string; en: string }[] =
     [
@@ -73,6 +77,25 @@
   async function onPartsMarked(): Promise<void> {
     showMarkModal = false;
     if (detail !== null) await openDetail(detail.work_order.wo_id);
+  }
+
+  // S443 — QC inspection modal + per-WO recorded inspections.
+  let showRecordModal = $state(false);
+  let inspections: QcInspection[] = $state([]);
+
+  async function loadInspections(woId: string): Promise<void> {
+    try {
+      const resp = await listQcInspections({ woId });
+      inspections = resp.inspections;
+    } catch {
+      // Non-fatal: the WO detail still renders without the QC list.
+      inspections = [];
+    }
+  }
+
+  async function onInspectionRecorded(): Promise<void> {
+    showRecordModal = false;
+    if (detail !== null) await loadInspections(detail.work_order.wo_id);
   }
 
   // Create-WO modal state.
@@ -123,10 +146,13 @@
         live[qa.routing_op_id] = qa;
       }
       qaByOp = live;
+      // S443 — load recorded QC inspections for this WO.
+      await loadInspections(detail.work_order.wo_id);
     } catch (e) {
       detailError = String(e);
       detail = null;
       qaByOp = {};
+      inspections = [];
     } finally {
       detailLoading = false;
     }
@@ -447,6 +473,58 @@
         </section>
       {/if}
 
+      <section class="wo-inspections" data-testid="wo-inspections">
+        <div class="wo-inspections__head">
+          <h4>Ellenőrzések / Inspections</h4>
+          <button
+            type="button"
+            class="wo-inspections__record"
+            data-testid="record-inspection-button"
+            onclick={() => (showRecordModal = true)}
+          >
+            + Ellenőrzés rögzítése / Record inspection
+          </button>
+        </div>
+        {#if inspections.length === 0}
+          <span class="wo-inspections__hint">no inspections recorded</span>
+        {:else}
+          <table>
+            <thead>
+              <tr>
+                <th>Jellemző / Feature</th>
+                <th>Mért / Actual</th>
+                <th>Eltérés / Deviation</th>
+                <th>Verdikt / Verdict</th>
+                <th>NCR</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each inspections as qci (qci.qci_id)}
+                <tr>
+                  <td>{qci.feature_name}</td>
+                  <td class="mono">{qci.actual_value} {qci.units}</td>
+                  <td class="mono">{qci.deviation}</td>
+                  <td>
+                    <span class={verdictChipClass(qci.verdict)}>
+                      {verdictLabel(qci.verdict)}
+                    </span>
+                  </td>
+                  <td class="mono">
+                    {#if qci.auto_ncr_id !== null}
+                      <a href="#/quality-ncrs" title={qci.auto_ncr_id}>
+                        {qci.auto_ncr_id}
+                      </a>
+                    {:else}
+                      —
+                    {/if}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        {/if}
+      </section>
+
       <section class="wo-routing">
         <h4>Műveletek / Routing operations</h4>
         <table>
@@ -529,6 +607,16 @@
       expectedUnits={detail.part_units_expected}
       onMarked={onPartsMarked}
       onClose={() => (showMarkModal = false)}
+    />
+  {/if}
+
+  {#if showRecordModal && detail !== null}
+    <RecordInspectionModal
+      woId={detail.work_order.wo_id}
+      productId={detail.work_order.product_id}
+      partMarks={detail.part_marks}
+      onRecorded={onInspectionRecorded}
+      onClose={() => (showRecordModal = false)}
     />
   {/if}
 
@@ -900,12 +988,14 @@
   }
 
   .wo-routing,
-  .wo-bom {
+  .wo-bom,
+  .wo-inspections {
     margin-top: var(--space-4);
   }
 
   .wo-routing h4,
-  .wo-bom h4 {
+  .wo-bom h4,
+  .wo-inspections h4 {
     margin: 0 0 var(--space-2) 0;
     font-size: var(--type-size-sm);
     font-weight: 600;
@@ -913,7 +1003,8 @@
   }
 
   .wo-routing table,
-  .wo-bom table {
+  .wo-bom table,
+  .wo-inspections table {
     width: 100%;
     border-collapse: collapse;
     background: var(--color-surface-sunken);
@@ -921,7 +1012,8 @@
   }
 
   .wo-routing th,
-  .wo-bom th {
+  .wo-bom th,
+  .wo-inspections th {
     padding: var(--space-2) var(--space-3);
     border-bottom: 1px solid var(--color-surface-divider);
     text-align: left;
@@ -930,11 +1022,70 @@
   }
 
   .wo-routing td,
-  .wo-bom td {
+  .wo-bom td,
+  .wo-inspections td {
     padding: var(--space-2) var(--space-3);
     border-bottom: 1px solid var(--color-surface-divider);
     text-align: left;
     color: var(--color-text-primary);
+  }
+
+  /* S443 — QC inspections section + verdict chip. */
+  .wo-inspections__head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+
+  .wo-inspections__record {
+    background: var(--color-signal-positive, var(--color-text-strong));
+    color: var(--color-surface-base, white);
+    border: 0;
+    border-radius: 4px;
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--type-size-sm);
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .wo-inspections__hint {
+    color: var(--color-text-muted);
+    font-size: var(--type-size-sm);
+  }
+
+  .wo-inspections td.mono {
+    font-family: var(--type-family-mono);
+    color: var(--color-text-strong);
+  }
+
+  .wo-inspections td.mono a {
+    color: var(--color-signal-negative);
+  }
+
+  .verdict-chip {
+    display: inline-block;
+    padding: 0 var(--space-2);
+    border-radius: 12px;
+    border: 1px solid var(--color-surface-divider);
+    font-size: var(--type-size-xs);
+    font-weight: 500;
+  }
+  .verdict-chip--pass {
+    color: var(--color-signal-positive);
+    border-color: var(--color-signal-positive);
+  }
+  .verdict-chip--warning {
+    color: var(--color-signal-warning);
+    border-color: var(--color-signal-warning);
+  }
+  .verdict-chip--critical {
+    color: var(--color-signal-negative);
+    border-color: var(--color-signal-negative);
+  }
+  .verdict-chip--stale {
+    color: var(--color-signal-muted);
+    border-color: var(--color-signal-muted);
   }
 
   /* S233 / PR-229 — per-op QA chip + Complete button. Same dark-token

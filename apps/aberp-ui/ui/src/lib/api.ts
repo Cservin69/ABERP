@@ -5025,6 +5025,10 @@ export interface TenantRow {
   /** S441 — per-tenant DÁP/QES audit-chain flag. `true` → the row shows the
    * "Sign in with DÁP" button (structural stub). */
   dap_enabled: boolean;
+  /** S443 — per-tenant QC stale-calibration window, in seconds (default
+   * 86400 = 24h). The row exposes an editable hours control that writes
+   * this back via `setQcCalibrationWindow`. */
+  qc_calibration_stale_window_seconds: number;
 }
 
 /** S433 — `GET /api/tenants` response. Mirrors
@@ -5264,4 +5268,177 @@ export async function receivePurchaseOrder(
   body: NewReceiptInput,
 ): Promise<PurchaseOrder> {
   return invoke<PurchaseOrder>("receive_purchase_order", { poId, body });
+}
+
+// ── S443 / ADR-0092 — QC inspections (inspection plans + recorded results) ──
+
+/** S443 — closed-vocab inspection verdict. Mirrors the Rust
+ * `qc::Verdict` enum. `pass` → in tolerance; `minor` / `major` →
+ * out-of-tolerance severities; `critical` → severe deviation; and
+ * `calibration_stale` → the measuring probe's last calibration is
+ * past the per-tenant window so the value is not trusted. The SPA
+ * dispatches the chip colour on this via `verdictChipClass`. */
+export type Verdict =
+  | "pass"
+  | "minor"
+  | "major"
+  | "critical"
+  | "calibration_stale";
+
+/** S443 — closed-vocab measurement source. `manual` → operator keyed
+ * the value; `probe` → on-machine touch probe; `cmm` → coordinate
+ * measuring machine; `other` → any future ingest path. */
+export type QcSource = "manual" | "probe" | "cmm" | "other";
+
+/** S443 — one inspection-plan row (master data). Mirrors the Rust
+ * `qc::InspectionPlan` serialize shape. A plan binds a measurable
+ * feature on a product to a nominal value + symmetric-or-asymmetric
+ * tolerance band; recording an inspection against it computes the
+ * deviation + verdict. `archived_at` is non-null only for
+ * soft-deleted plans (the list hides them by default). */
+export interface InspectionPlan {
+  /** Prefixed-ULID plan id. */
+  plan_id: string;
+  product_id: string;
+  feature_name: string;
+  nominal_value: number;
+  upper_tol: number;
+  lower_tol: number;
+  units: string;
+  /** Optional probe-cycle id binding this plan to an on-machine
+   * cycle; `null` for manually-measured features. */
+  optional_probe_cycle_id: string | null;
+  enabled: boolean;
+  created_at: string;
+  archived_at: string | null;
+}
+
+/** S443 — one recorded QC inspection. Mirrors the Rust
+ * `qc::QcInspection` serialize shape. The plan's nominal + tolerances
+ * are denormalised onto the row at record time so a later plan edit
+ * never rewrites history; `deviation` + `verdict` are computed
+ * server-side. `auto_ncr_id` is non-null when an out-of-tolerance
+ * verdict auto-created an NCR (S439). */
+export interface QcInspection {
+  qci_id: string;
+  measured_at_utc: string;
+  source: QcSource;
+  source_event_id: string | null;
+  inspection_plan_id: string;
+  feature_name: string;
+  nominal_value: number;
+  upper_tol: number;
+  lower_tol: number;
+  units: string;
+  actual_value: number;
+  deviation: number;
+  verdict: Verdict;
+  probe_serial: string | null;
+  last_calibration_at_utc: string | null;
+  calibration_stale_at_event: boolean;
+  auto_ncr_id: string | null;
+  linked_part_uid: string | null;
+  linked_heat_lot: string | null;
+  linked_wo_id: string | null;
+  recorded_by: string;
+  created_at: string;
+}
+
+/** S443 — request body for `create_inspection_plan` /
+ * `update_inspection_plan`. */
+export interface InspectionPlanInputs {
+  product_id: string;
+  feature_name: string;
+  nominal_value: number;
+  upper_tol: number;
+  lower_tol: number;
+  units: string;
+  optional_probe_cycle_id?: string | null;
+  enabled: boolean;
+}
+
+/** S443 — request body for `record_qc_inspection`. */
+export interface RecordQcInspectionBody {
+  plan_id: string;
+  actual_value: number;
+  units?: string;
+  source?: QcSource;
+  probe_serial?: string | null;
+  last_calibration_at?: string | null;
+  wo_id?: string | null;
+  part_uid?: string | null;
+}
+
+/** S443 — `GET /api/inspection-plans` (active plans, optionally
+ * filtered to one product / including archived). */
+export async function listInspectionPlans(params?: {
+  productId?: string;
+  includeArchived?: boolean;
+}): Promise<{ plans: InspectionPlan[] }> {
+  return invoke<{ plans: InspectionPlan[] }>("list_inspection_plans", {
+    productId: params?.productId ?? null,
+    includeArchived: params?.includeArchived ?? null,
+  });
+}
+
+/** S443 — `POST /api/inspection-plans`. */
+export async function createInspectionPlan(
+  body: InspectionPlanInputs,
+): Promise<InspectionPlan> {
+  return invoke<InspectionPlan>("create_inspection_plan", { body });
+}
+
+/** S443 — `PUT /api/inspection-plans/:id`. */
+export async function updateInspectionPlan(
+  planId: string,
+  body: InspectionPlanInputs,
+): Promise<InspectionPlan> {
+  return invoke<InspectionPlan>("update_inspection_plan", { planId, body });
+}
+
+/** S443 — `DELETE /api/inspection-plans/:id` (soft-delete / archive). */
+export async function archiveInspectionPlan(
+  planId: string,
+): Promise<{ ok: true }> {
+  return invoke<{ ok: true }>("archive_inspection_plan", { planId });
+}
+
+/** S443 — `POST /api/qc-inspections` (record a measurement; an out-of-
+ * tolerance verdict may auto-create an NCR, returned in `auto_ncr`). */
+export async function recordQcInspection(
+  body: RecordQcInspectionBody,
+): Promise<{ inspection: QcInspection; auto_ncr: unknown | null }> {
+  return invoke<{ inspection: QcInspection; auto_ncr: unknown | null }>(
+    "record_qc_inspection",
+    { body },
+  );
+}
+
+/** S443 — `GET /api/qc-inspections` (filter by WO and/or part UID). */
+export async function listQcInspections(params?: {
+  woId?: string;
+  partUid?: string;
+}): Promise<{ inspections: QcInspection[] }> {
+  return invoke<{ inspections: QcInspection[] }>("list_qc_inspections", {
+    woId: params?.woId ?? null,
+    partUid: params?.partUid ?? null,
+  });
+}
+
+/** S443 — `GET /api/qc-inspections/stale-calibration` (probes whose
+ * last calibration is past the per-tenant window). */
+export async function qcStaleCalibration(): Promise<{ stale: QcInspection[] }> {
+  return invoke<{ stale: QcInspection[] }>("qc_stale_calibration", {});
+}
+
+/** S443 — `PUT /api/tenants/:slug/qc-calibration-window` (set the
+ * per-tenant stale-calibration window, in seconds). */
+export async function setQcCalibrationWindow(
+  slug: string,
+  seconds: number,
+): Promise<{ ok: boolean; seconds: number }> {
+  return invoke<{ ok: boolean; seconds: number }>("set_qc_calibration_window", {
+    slug,
+    body: { seconds },
+  });
 }
