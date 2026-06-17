@@ -187,6 +187,11 @@ mod tests {
             payload: b"payload-bytes".to_vec(),
             idempotency_key: Some("idem-1".to_string()),
             entry_hash: EntryHash::from_bytes([0u8; 32]),
+            // S441 — session-signing fields are EXCLUDED from the canonical
+            // preimage; their value here is irrelevant to the hash.
+            session_id: None,
+            session_pubkey: None,
+            event_sig: None,
         }
     }
 
@@ -196,6 +201,23 @@ mod tests {
         let a = canonical_bytes_for_hashing(&e);
         let b = canonical_bytes_for_hashing(&e);
         assert_eq!(a, b, "two encodings of the same entry must match");
+    }
+
+    // S441 / ADR-0087 acceptance #2 — the three session-signing fields are
+    // EXCLUDED from the canonical preimage, so setting them leaves
+    // `entry_hash` byte-identical (every legacy entry still verifies).
+    #[test]
+    fn session_fields_do_not_change_the_canonical_encoding() {
+        let plain = fixture();
+        let mut signed = plain.clone();
+        signed.session_id = Some("ses_01J0000000000000000000000Z".to_string());
+        signed.session_pubkey = Some("ab".repeat(32));
+        signed.event_sig = Some("cd".repeat(64));
+        assert_eq!(
+            canonical_bytes_for_hashing(&plain),
+            canonical_bytes_for_hashing(&signed),
+            "session fields must NOT enter the entry_hash preimage"
+        );
     }
 
     #[test]

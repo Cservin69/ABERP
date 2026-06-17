@@ -45,9 +45,13 @@ use time::OffsetDateTime;
 use ulid::Ulid;
 
 use crate::chain::compute::{compute_entry_hash, next_prev_hash, next_seq};
+use crate::chain::genesis::genesis_hash;
 use crate::chain::verify::verify_chain;
 use crate::entry::{Actor, BinaryHash, Entry, EntryHash, EntryId, EventKind, Sequence, TenantId};
 use crate::error::{AppendError, VerifyError};
+use crate::session::anchors::{self, Anchor, AnchorKind};
+use crate::session::tsa::TimestampAuthority;
+use crate::session::SessionContext;
 
 /// Process-wide serializer for the full audit-write critical section
 /// (`begin tx → read head → insert → commit`).
@@ -227,6 +231,81 @@ impl Ledger {
         Ok(id)
     }
 
+    /// S441 / ADR-0087 — append a SIGNED entry under a session. Mirrors
+    /// [`Ledger::append`] but routes through the signing chokepoint
+    /// ([`append_in_tx_signed`]); `session = None` is byte-identical to
+    /// [`Ledger::append`] (the back-compat unsigned path).
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_signed(
+        &mut self,
+        kind: EventKind,
+        subject: &str,
+        payload: Vec<u8>,
+        actor: Actor,
+        idempotency_key: Option<String>,
+        session: Option<&SessionContext>,
+    ) -> Result<EntryId, AppendError> {
+        let _guard = AUDIT_APPEND_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tx = self.conn.transaction()?;
+        let id = append_in_tx_signed(
+            &tx,
+            &self.meta,
+            kind,
+            subject,
+            payload,
+            actor,
+            idempotency_key,
+            session,
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// The current chain head `entry_hash` as hex, or the tenant genesis
+    /// hash hex if the chain is empty. The value an anchor commits to.
+    pub fn chain_head_hash_hex(&self) -> Result<String, AppendError> {
+        let mut stmt = self.conn.prepare(schema::SELECT_HEAD)?;
+        let mut rows = stmt.query_map([], row_to_entry)?;
+        let head_hash = match rows.next() {
+            Some(r) => r?.entry_hash,
+            None => genesis_hash(&self.meta.tenant_id),
+        };
+        Ok(hex::encode(head_hash.as_bytes()))
+    }
+
+    /// S441 / ADR-0087 — take a qualified-timestamp anchor over the current
+    /// chain head. Never blocks on the TSA (a network failure queues a
+    /// `pending` row — see [`anchors::take_anchor`]).
+    pub fn take_anchor(
+        &self,
+        tsa: &dyn TimestampAuthority,
+        session_id: &str,
+        kind: AnchorKind,
+    ) -> Result<Anchor, AppendError> {
+        let head_hex = self.chain_head_hash_hex()?;
+        anchors::take_anchor(
+            &self.conn,
+            tsa,
+            self.meta.tenant_id.as_str(),
+            session_id,
+            kind,
+            &head_hex,
+        )
+    }
+
+    /// All anchor rows for this tenant in `created_at` order.
+    pub fn anchors(&self) -> Result<Vec<Anchor>, AppendError> {
+        anchors::anchors_for_tenant(&self.conn, self.meta.tenant_id.as_str())
+    }
+
+    /// Session ids opened but never cleanly closed — the orphan sessions
+    /// ADR-0087 crash recovery closes on boot.
+    pub fn open_sessions_without_close(&self) -> Result<Vec<String>, AppendError> {
+        anchors::open_sessions_without_close(&self.conn, self.meta.tenant_id.as_str())
+    }
+
     /// Read every entry in seq order.
     pub fn entries(&self) -> Result<Vec<Entry>, AppendError> {
         let mut stmt = self.conn.prepare(schema::SELECT_ALL)?;
@@ -295,8 +374,55 @@ impl Ledger {
 /// metadata read that returns "no UNIQUE" and the function is a no-op.
 pub fn ensure_schema(conn: &Connection) -> Result<(), AppendError> {
     conn.execute_batch(schema::CREATE_TABLE)?;
+    // S441 / ADR-0087 — add the three nullable session-signing columns to
+    // existing tenant DBs BEFORE the unique-ART migration runs (that
+    // migration does a 15-column SELECT_ALL, so the columns must be present
+    // first; a fresh DB already has them from CREATE_TABLE).
+    migrate_add_session_columns_if_absent(conn)?;
     migrate_drop_unique_art_if_present(conn)?;
+    // S441 / ADR-0087 — the qualified-timestamp anchors table. Additive,
+    // no PK/UNIQUE (duckdb#23046, like audit_ledger). Idempotent.
+    conn.execute_batch(crate::session::anchors::CREATE_ANCHORS_TABLE)?;
     Ok(())
+}
+
+/// S441 / ADR-0087 — additively add `session_id`, `session_pubkey`,
+/// `event_sig` to an existing `audit_ledger` table. All nullable, no
+/// `DEFAULT` (the DuckDB replay-clobber trap, S434/S341 lineage). Detected
+/// via `duckdb_columns()` so the `ALTER` runs at most once; idempotent.
+///
+/// Additive + nullable means every legacy row reads back `None` for the
+/// three fields, and because they are excluded from the `entry_hash`
+/// canonical preimage, every legacy `entry_hash` stays byte-identical —
+/// `verify_chain` over a migrated DB is unaffected.
+fn migrate_add_session_columns_if_absent(conn: &Connection) -> Result<(), AppendError> {
+    if audit_ledger_has_column(conn, "session_id")? {
+        return Ok(());
+    }
+    // Each column added separately so a partially-migrated DB (only some
+    // columns present) converges. `ADD COLUMN` defaults to NULLABLE.
+    for col in ["session_id", "session_pubkey", "event_sig"] {
+        if !audit_ledger_has_column(conn, col)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE audit_ledger ADD COLUMN {col} VARCHAR;"
+            ))?;
+        }
+    }
+    tracing::warn!(
+        "migrated audit_ledger: added session_id/session_pubkey/event_sig columns (S441/ADR-0087)"
+    );
+    Ok(())
+}
+
+/// `true` iff `audit_ledger` carries a column named `col`. Metadata read
+/// (`duckdb_columns()`), safe against any ART state.
+fn audit_ledger_has_column(conn: &Connection, col: &str) -> Result<bool, AppendError> {
+    let mut stmt = conn.prepare(
+        "SELECT count(*) FROM duckdb_columns() \
+         WHERE table_name = 'audit_ledger' AND column_name = ?",
+    )?;
+    let n: i64 = stmt.query_row(params![col], |r| r.get(0))?;
+    Ok(n > 0)
 }
 
 /// Transparent, one-time migration off the legacy `audit_ledger` schema
@@ -490,6 +616,34 @@ pub fn append_in_tx(
     actor: Actor,
     idempotency_key: Option<String>,
 ) -> Result<EntryId, AppendError> {
+    // Legacy / unsigned append: route through the one chokepoint with no
+    // session (session_id/session_pubkey/event_sig left NULL — back-compat
+    // for the ~109 existing audit writers, ADR-0087).
+    append_in_tx_signed(tx, meta, kind, "", payload, actor, idempotency_key, None)
+}
+
+/// S441 / ADR-0087 — the audit-write CHOKEPOINT. Every audit row is built
+/// and inserted here (the legacy [`append_in_tx`] delegates with no
+/// session). When `session.is_some()`, the entry is SIGNED: `event_sig` =
+/// Ed25519 over `prev_hash || kind || subject || SHA-256(payload)`, and
+/// `session_id` + `session_pubkey` are persisted. When `session.is_none()`,
+/// the three columns stay NULL (legacy behaviour).
+///
+/// The signature is an INDEPENDENT layer — it is NOT folded into
+/// `entry_hash` (whose canonical preimage is unchanged), so signed and
+/// legacy entries share one tamper-evidence hash chain and one hash
+/// computation. See ADR-0087 §"Why the signature is a separate layer".
+#[allow(clippy::too_many_arguments)]
+pub fn append_in_tx_signed(
+    tx: &duckdb::Transaction<'_>,
+    meta: &LedgerMeta,
+    kind: EventKind,
+    subject: &str,
+    payload: Vec<u8>,
+    actor: Actor,
+    idempotency_key: Option<String>,
+    session: Option<&SessionContext>,
+) -> Result<EntryId, AppendError> {
     // Resolve the chain head inside the tx so the seq/prev_hash we
     // compute reflect any sibling appends that already landed earlier
     // in the same tx (e.g., the binary appends two entries per
@@ -502,8 +656,25 @@ pub fn append_in_tx(
     let time_wall = OffsetDateTime::now_utc();
     let time_mono = meta.process_start.elapsed().as_nanos() as u64;
 
+    // Sign BEFORE building the entry: the preimage covers prev_hash, so the
+    // signature chains to the link structure even though it stays out of
+    // the entry_hash canonical map.
+    let (session_id, session_pubkey, event_sig) = match session {
+        Some(s) => {
+            let preimage = crate::session::event_sig_preimage(&prev_hash, &kind, subject, &payload);
+            let sig = s.sign(&preimage);
+            (
+                Some(s.session_id.clone()),
+                Some(s.pubkey_hex()),
+                Some(hex::encode(sig)),
+            )
+        }
+        None => (None, None, None),
+    };
+
     // Build the entry with a zero entry_hash, then compute the real
-    // hash from the canonical bytes, then patch the field.
+    // hash from the canonical bytes (which EXCLUDE the three session
+    // fields), then patch the field.
     let mut entry = Entry {
         id: EntryId::new(),
         seq,
@@ -517,6 +688,9 @@ pub fn append_in_tx(
         payload,
         idempotency_key,
         entry_hash: EntryHash::from_bytes([0u8; 32]),
+        session_id,
+        session_pubkey,
+        event_sig,
     };
     entry.entry_hash = compute_entry_hash(&entry);
 
@@ -557,6 +731,9 @@ fn insert_entry_verbatim(conn: &Connection, entry: &Entry) -> Result<(), AppendE
             entry.payload.as_slice(),
             entry.idempotency_key.as_deref(),
             entry.entry_hash.as_bytes().as_slice(),
+            entry.session_id.as_deref(),
+            entry.session_pubkey.as_deref(),
+            entry.event_sig.as_deref(),
         ],
     )?;
 
@@ -632,6 +809,11 @@ fn row_to_entry(row: &duckdb::Row<'_>) -> duckdb::Result<Entry> {
     let payload: Vec<u8> = row.get(9)?;
     let idempotency_key: Option<String> = row.get(10)?;
     let entry_hash_blob: Vec<u8> = row.get(11)?;
+    // S441 / ADR-0087 — nullable session-signing columns (NULL for legacy
+    // + unsigned rows).
+    let session_id: Option<String> = row.get(12)?;
+    let session_pubkey: Option<String> = row.get(13)?;
+    let event_sig: Option<String> = row.get(14)?;
 
     // Decode the prefixed ULID. Returning a duckdb-shaped error keeps
     // query_map's signature happy; loud failure via the `?` in the caller.
@@ -671,6 +853,9 @@ fn row_to_entry(row: &duckdb::Row<'_>) -> duckdb::Result<Entry> {
         payload,
         idempotency_key,
         entry_hash: EntryHash::from_bytes(entry_hash),
+        session_id,
+        session_pubkey,
+        event_sig,
     })
 }
 
@@ -712,6 +897,10 @@ mod migration_tests {
     /// The legacy schema this migration exists to retire: identical to
     /// the current [`schema::CREATE_TABLE`] except for the two inline
     /// `UNIQUE` constraints (the ART indexes duckdb#23046 corrupts).
+    // The unique-ART migration always runs AFTER the session-column
+    // migration in `ensure_schema`, so by the time it sees a legacy table
+    // the 15 columns are present. This fixture carries them + the UNIQUE
+    // constraints it exists to retire.
     const OLD_DDL_WITH_UNIQUE: &str = "
 CREATE TABLE IF NOT EXISTS audit_ledger (
     id              VARCHAR     NOT NULL,
@@ -726,6 +915,9 @@ CREATE TABLE IF NOT EXISTS audit_ledger (
     payload         BLOB        NOT NULL,
     idempotency_key VARCHAR,
     entry_hash      BLOB        NOT NULL,
+    session_id      VARCHAR,
+    session_pubkey  VARCHAR,
+    event_sig       VARCHAR,
     UNIQUE (seq),
     UNIQUE (id)
 );

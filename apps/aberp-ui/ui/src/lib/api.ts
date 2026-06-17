@@ -5022,6 +5022,9 @@ export interface TenantRow {
   /** S434 — per-tenant NAV-synchron flag. `false` → "LOCAL ONLY" badge +
    * the toggle reads "off". */
   nav_enabled: boolean;
+  /** S441 — per-tenant DÁP/QES audit-chain flag. `true` → the row shows the
+   * "Sign in with DÁP" button (structural stub). */
+  dap_enabled: boolean;
 }
 
 /** S433 — `GET /api/tenants` response. Mirrors
@@ -5039,6 +5042,21 @@ export interface TenantListResponse {
 /** S433 — `GET /api/tenants`. */
 export async function listTenants(): Promise<TenantListResponse> {
   return invoke<TenantListResponse>("list_tenants");
+}
+
+/** S441 — a synthetic DÁP identity from the mock transport (structural
+ * stub). The real overlay (OidcDapTransport) lands with szeusz.gov.hu RP
+ * creds. */
+export interface DapMockIdentity {
+  subject: string;
+  display_name: string;
+  attested_at_utc: string;
+  mock: boolean;
+}
+
+/** S441 — `POST /api/dap/mock-login`. Synthesises a test DÁP login. */
+export async function dapMockLogin(): Promise<DapMockIdentity> {
+  return invoke<DapMockIdentity>("dap_mock_login");
 }
 
 /** S433 — `POST /api/tenants`. Returns the refreshed list. */

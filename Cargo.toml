@@ -166,6 +166,18 @@ aes = "0.8"
 # bit nonce and the 256-bit key. License: MIT/Apache-2.0 dual (RustCrypto).
 aes-gcm = { version = "0.10", features = ["getrandom"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
+# S441 / ADR-0087 — Ed25519 software session-signing key for the
+# timestamp-anchored audit chain. Generated in process memory at session
+# open, never persisted (operator sessions) / keychain-persisted (service
+# sessions, ADR-0088). `ed25519-dalek` is the RustCrypto Ed25519 impl
+# (MIT/Apache-2.0); we mint the 32-byte secret seed from `getrandom` and
+# build the key via `SigningKey::from_bytes`, so no `rand` dep is pulled.
+ed25519-dalek = "2"
+getrandom = "0.2"
+# S441 / ADR-0087 — HMAC-SHA256 for the deterministic MockTimestampAuthority
+# (RFC-3161-shaped test double). Pairs with the existing `sha2` pin; the
+# real NETLOCK RFC-3161 client is stubbed (`todo!`) pending onboarding.
+hmac = "0.12"
 
 # S279 / PR-265 — blake3 for the priced-writeback idempotency key. The
 # storefront's ADR-0004 contract mandates a `blake3:[0-9a-f]+` hash on

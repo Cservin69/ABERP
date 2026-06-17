@@ -270,6 +270,13 @@ pub fn reconstruct_entry(line: &ChainJsonlLine) -> Result<Entry> {
         payload,
         idempotency_key: line.idempotency_key.clone(),
         entry_hash,
+        // S441 — the export bundle's chain.jsonl reconstructs the hash-chain
+        // fields only; the session-signing columns are not part of the
+        // bundle format and play no role in `entry_hash` (excluded from the
+        // canonical preimage). Decoded entries read None.
+        session_id: None,
+        session_pubkey: None,
+        event_sig: None,
     })
 }
 

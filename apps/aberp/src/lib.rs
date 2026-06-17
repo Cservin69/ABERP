@@ -134,6 +134,9 @@ pub mod quote_calibration;
 pub mod quote_pricing_pipeline;
 // S430 / ADR-0083 — AES-256-GCM CAD-blob encryption-at-rest + read-audit.
 pub mod cad_blob;
+// S441 / ADR-0087 + ADR-0088 — DÁP/QES timestamp-anchored audit-chain boot
+// wiring (service session + crash recovery + heartbeat actor).
+pub mod audit_dap_boot;
 // S325 / PR-25 — EVE addendum-2 customer-facing stock-alert banner
 // producer: in-memory re-render queue + the daemon that drains it and
 // re-POSTs `priced.pdf` with `stock_alert:true` to the storefront.

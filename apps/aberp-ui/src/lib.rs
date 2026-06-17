@@ -325,6 +325,8 @@ pub fn run() {
             commands::restore_tenant,
             commands::toggle_tenant_nav,
             commands::set_hide_demo,
+            // S441 — DÁP "Sign in" structural stub.
+            commands::dap_mock_login,
             // S257 / PR-246 — Settings → Adapters CRUD.
             commands::list_adapters,
             commands::create_adapter,

@@ -250,6 +250,9 @@ mod tests {
             payload: serde_json::to_vec(&payload).unwrap(),
             idempotency_key: None,
             entry_hash: EntryHash::from_bytes([0u8; 32]),
+            session_id: None,
+            session_pubkey: None,
+            event_sig: None,
         }
     }
 

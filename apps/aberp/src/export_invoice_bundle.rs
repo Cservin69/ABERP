@@ -1026,7 +1026,22 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::PoReceived
         | EventKind::PoClosed
         | EventKind::PoCancelled
-        | EventKind::PoIncomingInspectionFailed => None,
+        | EventKind::PoIncomingInspectionFailed
+        // S441 (ADR-0086/0087/0088) — DÁP/QES audit-chain rows (auth.* /
+        // audit.*): app-layer JSON, never NAV XML. Session/anchor lifecycle,
+        // never swept by a per-OUTGOING-invoice export bundle glob.
+        | EventKind::DapLoginInitiated
+        | EventKind::DapLoginCompleted
+        | EventKind::DapLoginFailed
+        | EventKind::DapLoginFallback
+        | EventKind::SessionOpened
+        | EventKind::SessionClosed
+        | EventKind::SessionCrashRecovered
+        | EventKind::TimestampAnchorTaken
+        | EventKind::TimestampAnchorDelayed
+        | EventKind::ServiceSessionOpened
+        | EventKind::ServiceSessionEndorsed
+        | EventKind::ServiceSessionClosed => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -1056,7 +1071,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 168,
+        EventKind::ALL_KINDS_COUNT == 180,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1838,6 +1853,40 @@ mod tests {
                 .append(
                     kind.clone(),
                     br#"{"po_id":"po_01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#.to_vec(),
+                    actor,
+                    None,
+                )
+                .unwrap();
+            let entries = ledger.entries().unwrap();
+            let nav = extract_nav_xml(&entries[0]).unwrap();
+            assert!(nav.is_none(), "{} must produce no nav/ file", kind.as_str());
+        }
+    }
+
+    /// S441 (ADR-0086/0087/0088) — the twelve DÁP/QES audit-chain kinds
+    /// (`auth.*` / `audit.*`) carry app-layer JSON, never NAV XML, so they
+    /// never produce a `nav/` file in a per-OUTGOING-invoice export bundle.
+    #[test]
+    fn extract_nav_xml_returns_none_for_dap_audit_chain_kinds() {
+        for kind in [
+            EventKind::DapLoginInitiated,
+            EventKind::DapLoginCompleted,
+            EventKind::DapLoginFailed,
+            EventKind::DapLoginFallback,
+            EventKind::SessionOpened,
+            EventKind::SessionClosed,
+            EventKind::SessionCrashRecovered,
+            EventKind::TimestampAnchorTaken,
+            EventKind::TimestampAnchorDelayed,
+            EventKind::ServiceSessionOpened,
+            EventKind::ServiceSessionEndorsed,
+            EventKind::ServiceSessionClosed,
+        ] {
+            let (mut ledger, actor, _bh) = fixture_ledger();
+            ledger
+                .append(
+                    kind.clone(),
+                    br#"{"session_id":"ses_x"}"#.to_vec(),
                     actor,
                     None,
                 )

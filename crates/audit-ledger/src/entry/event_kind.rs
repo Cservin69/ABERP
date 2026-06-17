@@ -2963,6 +2963,97 @@ pub enum EventKind {
     /// `vendor_partner_id`, `ncr_id`, `inspection_notes`, `operator_user_id`,
     /// `at_utc`. `po.*` family.
     PoIncomingInspectionFailed,
+
+    // ─── S441 — DÁP/QES timestamp-anchored audit chain (auth.* family) ───
+    // ADR-0086 (DÁP eAzonosítás login), ADR-0087 (session keys + NETLOCK
+    // qualified-timestamp anchoring), ADR-0088 (service-session identity).
+    // STRUCTURAL FLOOR: trait surfaces + mocks; real DÁP/NETLOCK stubbed
+    // `todo!`. App-layer JSON payloads only — NEVER NAV XML.
+    /// S441 (ADR-0086) — a DÁP eAzonosítás login was initiated (loopback
+    /// bound, OpenID4VP request object built, QR/deep-link shown). `auth.*`.
+    ///
+    /// Payload (`serde_json::Value`): `tenant`, `callback_port`, `dap_env`,
+    /// `flow_id`.
+    DapLoginInitiated,
+
+    /// S441 (ADR-0086) — a DÁP presentation validated; the operator was
+    /// established. `auth.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `tenant`, `operator_dap_subject`,
+    /// `flow_id`, `login_at_utc`.
+    DapLoginCompleted,
+
+    /// S441 (ADR-0086) — a DÁP flow failed before an operator was
+    /// established; login is refused (no session opens). `auth.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `tenant`, `flow_id`, `error_class`,
+    /// `dap_env`.
+    DapLoginFailed,
+
+    /// S441 (ADR-0086) — the code-gated emergency local-admin bypass was
+    /// used (only when `dap_bypass_allowed = true`); the session opens with
+    /// `identity_source = "local_admin_fallback"`. `auth.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `tenant`, `operator`, `reason`,
+    /// `bypass_authorised_by`.
+    DapLoginFallback,
+
+    /// S441 (ADR-0087) — a session key was generated and the login anchor
+    /// taken (an operator or service session opened). `auth.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `session_id`, `session_pubkey`,
+    /// `operator_dap_subject`, `identity_source`, `opened_at_utc`.
+    SessionOpened,
+
+    /// S441 (ADR-0087) — a clean logout; the logout anchor was taken.
+    /// `auth.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `session_id`, `closed_at_utc`.
+    SessionClosed,
+
+    /// S441 (ADR-0087) — boot found a session opened in a prior run with no
+    /// clean logout; signed by the new boot session's key + re-anchored.
+    /// `auth.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `orphan_session_id`,
+    /// `recovered_by_session`, `recovered_at_utc`.
+    SessionCrashRecovered,
+
+    /// S441 (ADR-0087) — a login/heartbeat/logout/recovery qualified-
+    /// timestamp anchor succeeded. `audit.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `session_id`, `anchor_id`,
+    /// `anchor_kind`, `tsa_status`, `chain_head_hash`.
+    TimestampAnchorTaken,
+
+    /// S441 (ADR-0087) — a TSA request failed and the anchor was queued
+    /// `pending` (the audit write path NEVER blocks on the TSA). `audit.*`.
+    ///
+    /// Payload (`serde_json::Value`): `session_id`, `anchor_id`,
+    /// `anchor_kind`, `tsa_status`, `chain_head_hash`.
+    TimestampAnchorDelayed,
+
+    /// S441 (ADR-0088) — the per-tenant service session opened at binary
+    /// startup (service key loaded, login anchor taken), BEFORE any daemon
+    /// can fire. `auth.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `session_id`, `service_pubkey`,
+    /// `opened_at_utc`.
+    ServiceSessionOpened,
+
+    /// S441 (ADR-0088) — the first operator login endorsed the service key,
+    /// linking it to the DÁP-attested operator (the human root of trust for
+    /// daemon writes). `auth.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `service_pubkey`,
+    /// `operator_dap_subject`, `endorsed_at_utc`.
+    ServiceSessionEndorsed,
+
+    /// S441 (ADR-0088) — the service session closed at graceful shutdown.
+    /// `auth.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `session_id`, `closed_at_utc`.
+    ServiceSessionClosed,
 }
 
 impl EventKind {
@@ -3151,6 +3242,19 @@ impl EventKind {
             EventKind::PoClosed => "po.closed",
             EventKind::PoCancelled => "po.cancelled",
             EventKind::PoIncomingInspectionFailed => "po.incoming_inspection_failed",
+            // S441 — DÁP/QES timestamp-anchored audit chain (auth.* / audit.*).
+            EventKind::DapLoginInitiated => "auth.dap_login_initiated",
+            EventKind::DapLoginCompleted => "auth.dap_login_completed",
+            EventKind::DapLoginFailed => "auth.dap_login_failed",
+            EventKind::DapLoginFallback => "auth.dap_login_fallback",
+            EventKind::SessionOpened => "auth.session_opened",
+            EventKind::SessionClosed => "auth.session_closed",
+            EventKind::SessionCrashRecovered => "auth.session_crash_recovered",
+            EventKind::TimestampAnchorTaken => "audit.timestamp_anchor_taken",
+            EventKind::TimestampAnchorDelayed => "audit.timestamp_anchor_delayed",
+            EventKind::ServiceSessionOpened => "auth.service_session_opened",
+            EventKind::ServiceSessionEndorsed => "auth.service_session_endorsed",
+            EventKind::ServiceSessionClosed => "auth.service_session_closed",
         }
     }
 
@@ -3350,6 +3454,19 @@ impl EventKind {
             "po.closed" => Ok(EventKind::PoClosed),
             "po.cancelled" => Ok(EventKind::PoCancelled),
             "po.incoming_inspection_failed" => Ok(EventKind::PoIncomingInspectionFailed),
+            // S441 — DÁP/QES timestamp-anchored audit chain.
+            "auth.dap_login_initiated" => Ok(EventKind::DapLoginInitiated),
+            "auth.dap_login_completed" => Ok(EventKind::DapLoginCompleted),
+            "auth.dap_login_failed" => Ok(EventKind::DapLoginFailed),
+            "auth.dap_login_fallback" => Ok(EventKind::DapLoginFallback),
+            "auth.session_opened" => Ok(EventKind::SessionOpened),
+            "auth.session_closed" => Ok(EventKind::SessionClosed),
+            "auth.session_crash_recovered" => Ok(EventKind::SessionCrashRecovered),
+            "audit.timestamp_anchor_taken" => Ok(EventKind::TimestampAnchorTaken),
+            "audit.timestamp_anchor_delayed" => Ok(EventKind::TimestampAnchorDelayed),
+            "auth.service_session_opened" => Ok(EventKind::ServiceSessionOpened),
+            "auth.service_session_endorsed" => Ok(EventKind::ServiceSessionEndorsed),
+            "auth.service_session_closed" => Ok(EventKind::ServiceSessionClosed),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -3535,6 +3652,19 @@ impl EventKind {
         EventKind::PoClosed,
         EventKind::PoCancelled,
         EventKind::PoIncomingInspectionFailed,
+        // S441 — DÁP/QES timestamp-anchored audit chain.
+        EventKind::DapLoginInitiated,
+        EventKind::DapLoginCompleted,
+        EventKind::DapLoginFailed,
+        EventKind::DapLoginFallback,
+        EventKind::SessionOpened,
+        EventKind::SessionClosed,
+        EventKind::SessionCrashRecovered,
+        EventKind::TimestampAnchorTaken,
+        EventKind::TimestampAnchorDelayed,
+        EventKind::ServiceSessionOpened,
+        EventKind::ServiceSessionEndorsed,
+        EventKind::ServiceSessionClosed,
     ];
 
     /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
@@ -3728,6 +3858,19 @@ mod tests {
             EventKind::PoClosed,
             EventKind::PoCancelled,
             EventKind::PoIncomingInspectionFailed,
+            // S441 — DÁP/QES timestamp-anchored audit chain.
+            EventKind::DapLoginInitiated,
+            EventKind::DapLoginCompleted,
+            EventKind::DapLoginFailed,
+            EventKind::DapLoginFallback,
+            EventKind::SessionOpened,
+            EventKind::SessionClosed,
+            EventKind::SessionCrashRecovered,
+            EventKind::TimestampAnchorTaken,
+            EventKind::TimestampAnchorDelayed,
+            EventKind::ServiceSessionOpened,
+            EventKind::ServiceSessionEndorsed,
+            EventKind::ServiceSessionClosed,
         ];
         for v in &variants {
             let s = v.as_str();
@@ -3761,7 +3904,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            168,
+            180,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
@@ -6353,6 +6496,61 @@ mod tests {
             assert!(seen.insert(s), "duplicate storage string {s}");
         }
         assert_eq!(seen.len(), 9, "nine distinct purchase-order kinds");
+    }
+
+    /// S441 (ADR-0086/0087/0088) — the twelve DÁP/QES audit-chain kinds
+    /// round-trip and carry the `auth.*` / `audit.*` prefixes. App-layer
+    /// JSON only (no NAV XML — pinned in both NAV-leakage gates).
+    #[test]
+    fn s441_dap_audit_chain_kinds_round_trip_and_use_auth_audit_prefix() {
+        let new = [
+            (EventKind::DapLoginInitiated, "auth.dap_login_initiated"),
+            (EventKind::DapLoginCompleted, "auth.dap_login_completed"),
+            (EventKind::DapLoginFailed, "auth.dap_login_failed"),
+            (EventKind::DapLoginFallback, "auth.dap_login_fallback"),
+            (EventKind::SessionOpened, "auth.session_opened"),
+            (EventKind::SessionClosed, "auth.session_closed"),
+            (
+                EventKind::SessionCrashRecovered,
+                "auth.session_crash_recovered",
+            ),
+            (
+                EventKind::TimestampAnchorTaken,
+                "audit.timestamp_anchor_taken",
+            ),
+            (
+                EventKind::TimestampAnchorDelayed,
+                "audit.timestamp_anchor_delayed",
+            ),
+            (
+                EventKind::ServiceSessionOpened,
+                "auth.service_session_opened",
+            ),
+            (
+                EventKind::ServiceSessionEndorsed,
+                "auth.service_session_endorsed",
+            ),
+            (
+                EventKind::ServiceSessionClosed,
+                "auth.service_session_closed",
+            ),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (k, expected) in new {
+            let s = k.as_str();
+            assert_eq!(s, expected, "as_str mismatch for {k:?}");
+            assert!(
+                s.starts_with("auth.") || s.starts_with("audit."),
+                "{s} must be in the auth.* or audit.* family"
+            );
+            assert_eq!(
+                EventKind::from_storage_str(s).expect("round-trip"),
+                k,
+                "round-trip mismatch for {s}"
+            );
+            assert!(seen.insert(s), "duplicate storage string {s}");
+        }
+        assert_eq!(seen.len(), 12, "twelve distinct DÁP/QES audit-chain kinds");
     }
 
     // ── S358 / PR-45 (ADR-0075) — part.* per-unit serialization family ──────

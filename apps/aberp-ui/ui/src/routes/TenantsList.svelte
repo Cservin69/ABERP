@@ -20,6 +20,7 @@
   import {
     archiveTenant,
     createTenant,
+    dapMockLogin,
     listTenants,
     restoreTenant,
     setHideDemo,
@@ -28,6 +29,7 @@
     type TenantRow,
   } from "../lib/api";
   import { buttonStateFor, orderTenants, visibleTenants } from "../lib/tenants-list";
+  import { dapButtonState, dapLoginSummary } from "../lib/dap-signin";
 
   type LoadState = "loading" | "ready" | "error";
 
@@ -39,6 +41,8 @@
   // S434 — operator hide-demo preference + whether a real tenant exists.
   let hideDemo = $state(false);
   let hasRealTenant = $state(false);
+  // S441 — inline confirmation line after a mock DÁP sign-in.
+  let dapMessage = $state<string | null>(null);
 
   // Add-tenant inline form.
   let showAdd = $state(false);
@@ -112,6 +116,23 @@
       switching = row.display_name;
     } catch (e) {
       errorMessage = e instanceof Error ? e.message : String(e);
+      busySlug = null;
+    }
+  }
+
+  // S441 — DÁP "Sign in" structural stub. Calls the mock transport
+  // server-side and shows the synthetic identity. The real operator-login
+  // overlay (OidcDapTransport) replaces this when RP creds arrive.
+  async function onDapSignIn(row: TenantRow): Promise<void> {
+    busySlug = row.slug;
+    errorMessage = null;
+    dapMessage = null;
+    try {
+      const id = await dapMockLogin();
+      dapMessage = dapLoginSummary(id);
+    } catch (e) {
+      errorMessage = e instanceof Error ? e.message : String(e);
+    } finally {
       busySlug = null;
     }
   }
@@ -278,6 +299,12 @@
         {errorMessage}
       </div>
     {/if}
+    {#if dapMessage}
+      <div class="tn-banner">
+        <strong>DÁP (mock):</strong>
+        {dapMessage}
+      </div>
+    {/if}
     {#if hasRealTenant}
       <label class="tn-hidedemo">
         <input
@@ -354,6 +381,17 @@
               >
                 {busySlug === row.slug ? "…" : "Switch"}
               </button>
+              {#if dapButtonState(row).show}
+                <button
+                  class="tn-btn"
+                  type="button"
+                  disabled={busySlug !== null || switching !== null}
+                  title="S441 structural stub — runs the mock DÁP transport"
+                  onclick={() => void onDapSignIn(row)}
+                >
+                  {dapButtonState(row).label}
+                </button>
+              {/if}
               {#if row.state === "active"}
                 <button
                   class="tn-btn tn-btn--danger"

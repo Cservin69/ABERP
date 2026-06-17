@@ -52,6 +52,14 @@
 /// order for review clarity. The canonical CBOR encoding does NOT use
 /// this order — it uses [`crate::canonical`]'s RFC 8949 §4.2.1 order —
 /// so changes to this DDL never affect the hash chain.
+/// `CREATE TABLE IF NOT EXISTS` DDL for the audit-ledger table.
+///
+/// The last three columns (`session_id`, `session_pubkey`, `event_sig`)
+/// are S441 / ADR-0087 additions — all NULLABLE (no `DEFAULT`, the DuckDB
+/// replay-clobber trap). They are EXCLUDED from the `entry_hash` canonical
+/// preimage, so adding them leaves every legacy `entry_hash` byte-identical
+/// (`crate::canonical` is untouched). Existing tenant DBs gain the columns
+/// via [`crate::storage::migrate_add_session_columns_if_absent`] at boot.
 pub const CREATE_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS audit_ledger (
     id              VARCHAR     NOT NULL,
@@ -65,7 +73,10 @@ CREATE TABLE IF NOT EXISTS audit_ledger (
     kind            VARCHAR     NOT NULL,
     payload         BLOB        NOT NULL,
     idempotency_key VARCHAR,
-    entry_hash      BLOB        NOT NULL
+    entry_hash      BLOB        NOT NULL,
+    session_id      VARCHAR,
+    session_pubkey  VARCHAR,
+    event_sig       VARCHAR
 );
 ";
 
@@ -73,14 +84,16 @@ CREATE TABLE IF NOT EXISTS audit_ledger (
 pub const INSERT: &str = "
 INSERT INTO audit_ledger
     (id, seq, prev_hash, time_wall, time_mono, actor,
-     binary_hash, tenant_id, kind, payload, idempotency_key, entry_hash)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+     binary_hash, tenant_id, kind, payload, idempotency_key, entry_hash,
+     session_id, session_pubkey, event_sig)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 ";
 
 /// SQL to read all rows in seq order.
 pub const SELECT_ALL: &str = "
 SELECT id, seq, prev_hash, time_wall, time_mono, actor,
-       binary_hash, tenant_id, kind, payload, idempotency_key, entry_hash
+       binary_hash, tenant_id, kind, payload, idempotency_key, entry_hash,
+       session_id, session_pubkey, event_sig
 FROM audit_ledger
 ORDER BY seq ASC;
 ";
@@ -89,7 +102,8 @@ ORDER BY seq ASC;
 /// compute `prev_hash` and `seq` for the new row.
 pub const SELECT_HEAD: &str = "
 SELECT id, seq, prev_hash, time_wall, time_mono, actor,
-       binary_hash, tenant_id, kind, payload, idempotency_key, entry_hash
+       binary_hash, tenant_id, kind, payload, idempotency_key, entry_hash,
+       session_id, session_pubkey, event_sig
 FROM audit_ledger
 ORDER BY seq DESC
 LIMIT 1;
@@ -101,7 +115,8 @@ LIMIT 1;
 /// DuckDB file IS the tenant scope per ADR-0002).
 pub const SELECT_RECENT: &str = "
 SELECT id, seq, prev_hash, time_wall, time_mono, actor,
-       binary_hash, tenant_id, kind, payload, idempotency_key, entry_hash
+       binary_hash, tenant_id, kind, payload, idempotency_key, entry_hash,
+       session_id, session_pubkey, event_sig
 FROM audit_ledger
 ORDER BY seq DESC
 LIMIT ?;

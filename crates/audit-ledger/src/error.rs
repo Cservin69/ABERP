@@ -86,6 +86,24 @@ pub enum AppendError {
     /// permissions / FS readiness and re-run.
     #[error("audit-ledger mirror I/O error: {0}")]
     MirrorIo(#[source] std::io::Error),
+
+    /// S441 / ADR-0087 — a non-network timestamp-authority failure while
+    /// taking an anchor. A *network* TSA failure NEVER reaches this
+    /// variant: it queues a `pending` anchor instead (`take_anchor` never
+    /// blocks the audit chain on the TSA). This surfaces only a genuine
+    /// authority rejection.
+    #[error("timestamp authority error: {0}")]
+    Tsa(String),
+
+    /// S441 / ADR-0087 — an `audit_ledger_anchors` insert affected an
+    /// unexpected row count.
+    #[error("anchor write error: {0}")]
+    Anchor(String),
+
+    /// S441 / ADR-0087 — minting a session signing key from the OS CSPRNG
+    /// failed at session open.
+    #[error("session crypto error: {0}")]
+    Crypto(String),
 }
 
 /// Errors returned by [`crate::chain::verify_chain`]. Each variant names
@@ -109,4 +127,22 @@ pub enum VerifyError {
     /// it was written.
     #[error("tamper detected at seq={seq} (entry_hash mismatch)")]
     TamperedAt { seq: u64 },
+
+    /// S441 / ADR-0087 — a signed entry's `event_sig` did not verify
+    /// against its `session_pubkey` over the signing preimage. The entry
+    /// was altered, or its signature forged, after signing.
+    #[error("invalid session signature at seq={seq}")]
+    SignatureInvalid { seq: u64 },
+
+    /// S441 / ADR-0087 — the anti-strip membership rule: an entry whose
+    /// `session_id` belongs to an anchored session carries no `event_sig`.
+    /// A stripped signature inside a signed session range is a failure.
+    #[error("missing signature at seq={seq} inside an anchored session")]
+    SignatureMissingInSignedSession { seq: u64 },
+
+    /// S441 / ADR-0087 — an anchor's qualified-timestamp token did not
+    /// verify against its reconstructed payload (the chain head it claims
+    /// to commit to was altered, or the token was forged).
+    #[error("invalid timestamp anchor {anchor_id}")]
+    AnchorTampered { anchor_id: String },
 }

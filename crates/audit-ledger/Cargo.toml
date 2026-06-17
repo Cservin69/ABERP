@@ -29,6 +29,15 @@ time = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 
+# S441 / ADR-0087 + ADR-0088 — timestamp-anchored audit chain. Ed25519
+# session signatures (`ed25519-dalek`), the OS-CSPRNG seed for fresh
+# in-memory session keys (`getrandom`), and HMAC-SHA256 for the
+# deterministic MockTimestampAuthority (`hmac`, paired with `sha2`).
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
+hmac = { workspace = true }
+zeroize = { workspace = true }
+
 # PR-17 (ADR-0030) — audit-ledger mirror file. `base64` encodes payload
 # bytes inside the JSON-Lines mirror lines (same shape `bundle/chain.jsonl`
 # uses; ADR-0030 §1). `hex` encodes the 32-byte hashes (entry_hash,

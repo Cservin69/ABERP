@@ -733,6 +733,13 @@ pub async fn list_tenants(state: State<'_, AppState>) -> Result<Value, String> {
     forward_get(&state, "/api/tenants", true).await
 }
 
+/// `POST /api/dap/mock-login` — S441 structural stub. Runs the mock DÁP
+/// transport server-side and returns a synthetic identity.
+#[tauri::command]
+pub async fn dap_mock_login(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_post(&state, "/api/dap/mock-login", serde_json::json!({})).await
+}
+
 /// `POST /api/tenants` — provision a new tenant. Body is
 /// `{slug, display_name}`.
 #[tauri::command]

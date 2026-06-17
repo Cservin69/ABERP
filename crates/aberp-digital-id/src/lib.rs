@@ -44,12 +44,19 @@
 #![warn(missing_debug_implementations)]
 
 mod cac;
+// S441 / ADR-0086 — the DÁP eAzonosítás OpenID4VP transport seam (structural
+// floor: trait + mock + `todo!` OIDC stub). See [`dap_transport`].
+mod dap_transport;
 mod identity;
 mod mock;
 mod provider;
 mod signature;
 
 pub use cac::{UsDodCacProvider, CAC_ALGORITHM, CAC_DEFAULT_EDIPI, CAC_ISSUER};
+pub use dap_transport::{
+    CallbackResponse, DapChallenge, DapError, DapIdentity, DapLoginContext, DapTransport,
+    MockDapTransport, OidcDapTransport,
+};
 pub use identity::DigitalId;
 pub use mock::{MockProvider, MOCK_ALGORITHM, MOCK_OPERATOR_ID, MOCK_TEST_KEY};
 pub use provider::{DigitalIdProvider, ProviderError};

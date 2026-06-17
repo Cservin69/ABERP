@@ -1167,7 +1167,22 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::PoReceived
         | EventKind::PoClosed
         | EventKind::PoCancelled
-        | EventKind::PoIncomingInspectionFailed => (None, ""),
+        | EventKind::PoIncomingInspectionFailed
+        // S441 (ADR-0086/0087/0088) — DÁP/QES audit-chain rows (auth.* /
+        // audit.*) carry app-layer JSON (session ids, pubkeys, anchor
+        // metadata), NEVER NAV XML bytes. Exhaustiveness arm only.
+        | EventKind::DapLoginInitiated
+        | EventKind::DapLoginCompleted
+        | EventKind::DapLoginFailed
+        | EventKind::DapLoginFallback
+        | EventKind::SessionOpened
+        | EventKind::SessionClosed
+        | EventKind::SessionCrashRecovered
+        | EventKind::TimestampAnchorTaken
+        | EventKind::TimestampAnchorDelayed
+        | EventKind::ServiceSessionOpened
+        | EventKind::ServiceSessionEndorsed
+        | EventKind::ServiceSessionClosed => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -1189,7 +1204,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 168,
+        EventKind::ALL_KINDS_COUNT == 180,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1647,6 +1662,26 @@ mod tests {
             EventKind::PoClosed,
             EventKind::PoCancelled,
             EventKind::PoIncomingInspectionFailed,
+        ]);
+    }
+
+    // S441 — the twelve DÁP/QES audit-chain kinds carry app-layer JSON, no
+    // NAV XML bytes (ADR-0086/0087/0088).
+    #[test]
+    fn dap_audit_chain_no_nav_bytes() {
+        assert_family_no_nav(&[
+            EventKind::DapLoginInitiated,
+            EventKind::DapLoginCompleted,
+            EventKind::DapLoginFailed,
+            EventKind::DapLoginFallback,
+            EventKind::SessionOpened,
+            EventKind::SessionClosed,
+            EventKind::SessionCrashRecovered,
+            EventKind::TimestampAnchorTaken,
+            EventKind::TimestampAnchorDelayed,
+            EventKind::ServiceSessionOpened,
+            EventKind::ServiceSessionEndorsed,
+            EventKind::ServiceSessionClosed,
         ]);
     }
 

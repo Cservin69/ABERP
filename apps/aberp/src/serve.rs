@@ -2656,6 +2656,29 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             }
         }
 
+        // S441 / ADR-0087 + ADR-0088 — DÁP/QES timestamp-anchored audit
+        // chain. Gated on the tenant's `dap_enabled` flag (default false →
+        // existing unsigned chain, no behaviour change). On opt-in: open the
+        // service session BEFORE serving, run crash recovery, spawn the
+        // heartbeat actor. Keychain + TSA only touched on this opt-in path.
+        match crate::tenant_registry::tenant_dap_config(recovery_state.tenant.as_str()) {
+            Ok((true, heartbeat_secs)) => {
+                if let Err(e) =
+                    spawn_dap_audit_chain(&recovery_state, &mut coordinator, heartbeat_secs)
+                {
+                    tracing::error!(
+                        error = %e,
+                        "DÁP audit chain boot FAILED; serving continues on the unsigned chain (S441)"
+                    );
+                }
+            }
+            Ok((false, _)) => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not read dap_enabled; assuming OFF (unsigned chain) — S441"
+            ),
+        }
+
         let config = RustlsConfig::from_der(rustls_config.0, rustls_config.1)
             .await
             .context("build axum-server RustlsConfig")?;
@@ -3600,6 +3623,10 @@ pub fn build_router(state: AppState) -> Router {
             post(handle_toggle_tenant_nav),
         )
         .route("/api/tenants/hide-demo", post(handle_set_hide_demo))
+        // S441 — DÁP "Sign in" stub. Runs MockDapTransport server-side and
+        // returns a synthetic identity; the real operator-login overlay
+        // (OidcDapTransport) lands when szeusz.gov.hu RP creds arrive.
+        .route("/api/dap/mock-login", post(handle_dap_mock_login))
         // S257 / PR-246 — Settings → Adapters CRUD. List + create on the
         // collection; update (hot restart) + delete on the resource.
         // Ready-only + bearer-gated; the `:id` is the server-minted
@@ -4195,6 +4222,9 @@ struct TenantView {
     /// S434 — the per-tenant NAV-synchron flag. The SPA renders the toggle
     /// + the "LOCAL ONLY" badge from this.
     nav_enabled: bool,
+    /// S441 — the per-tenant DÁP/QES audit-chain flag. The SPA shows the
+    /// "Sign in with DÁP" button on the tenant row only when this is true.
+    dap_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -4252,6 +4282,7 @@ fn build_tenant_list(
             created_at: t.created_at.clone(),
             running: t.slug == running_slug,
             nav_enabled: t.nav_enabled,
+            dap_enabled: t.dap_enabled,
         })
         .collect();
     TenantListResponse {
@@ -4260,6 +4291,44 @@ fn build_tenant_list(
         hide_demo: reg.hide_demo,
         has_real_tenant: reg.has_real_tenant(),
     }
+}
+
+// POST /api/dap/mock-login — S441 structural stub. Runs the deterministic
+// MockDapTransport server-side (initiate + complete) and returns the
+// synthetic DÁP identity. The real operator-login overlay (OidcDapTransport,
+// `todo!`) lands when szeusz.gov.hu RP creds arrive (ADR-0086).
+async fn handle_dap_mock_login(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    use aberp_digital_id::{CallbackResponse, DapLoginContext, DapTransport, MockDapTransport};
+    let transport = MockDapTransport::with_test_operator();
+    let ctx = DapLoginContext {
+        tenant: state.tenant.as_str().to_string(),
+        dap_env: "mock".to_string(),
+        callback_port: 0,
+    };
+    let challenge = match transport.initiate_login(&ctx) {
+        Ok(c) => c,
+        Err(e) => return internal_error("dap_mock_login:initiate", anyhow!("{e}")),
+    };
+    let identity = match transport.complete_login(&CallbackResponse {
+        flow_id: challenge.flow_id,
+        raw_presentation: b"synthetic".to_vec(),
+    }) {
+        Ok(id) => id,
+        Err(e) => return internal_error("dap_mock_login:complete", anyhow!("{e}")),
+    };
+    Json(serde_json::json!({
+        "subject": identity.subject,
+        "display_name": identity.display_name,
+        "attested_at_utc": identity.attested_at_utc,
+        "mock": true,
+    }))
+    .into_response()
 }
 
 // GET /api/tenants — list every tenant from the registry + running flag.
@@ -25517,6 +25586,58 @@ struct AuditEventDetailView {
     payload: serde_json::Value,
 }
 
+/// S441 / ADR-0087 + ADR-0088 — boot the per-tenant DÁP/QES audit chain:
+/// open the service session (+ crash recovery) and spawn the heartbeat
+/// actor. Called from `run()` only when the tenant's `dap_enabled` is true,
+/// so the keychain + TSA are never touched on the default (unsigned) path.
+fn spawn_dap_audit_chain(
+    recovery_state: &AppState,
+    coordinator: &mut ShutdownCoordinator,
+    heartbeat_secs: u64,
+) -> Result<()> {
+    let binary_hash = recovery_state
+        .binary_hash
+        .wait()
+        .map_err(|e| anyhow!("binary hash unavailable for DÁP audit boot: {e}"))?;
+    let tenant = recovery_state.tenant.clone();
+    let db_path = (*recovery_state.db_path).clone();
+
+    let service_key = crate::audit_dap_boot::load_or_provision_service_key(tenant.as_str())?;
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), "system:audit-service");
+
+    // Open the service session BEFORE serving (ADR-0088: no daemon precedes
+    // its session open) on a short-lived ledger handle, then drop it.
+    let mut ledger = aberp_audit_ledger::Ledger::open(&db_path, tenant.clone(), binary_hash)
+        .map_err(|e| anyhow!("open ledger for DÁP service session: {e}"))?;
+    let tsa = aberp_audit_ledger::session::tsa::MockTimestampAuthority::new();
+    let service = crate::audit_dap_boot::open_service_session_and_recover(
+        &mut ledger,
+        &tsa,
+        actor.clone(),
+        service_key,
+    )?;
+    drop(ledger);
+
+    let deps = crate::audit_dap_boot::HeartbeatDeps {
+        db_path,
+        tenant,
+        binary_hash,
+        actor,
+        service,
+        interval: std::time::Duration::from_secs(heartbeat_secs.max(1)),
+    };
+    let token = coordinator.token.clone();
+    let handle = tokio::spawn(async move {
+        crate::audit_dap_boot::run_heartbeat_supervised(deps, token).await;
+    });
+    coordinator.register("audit-heartbeat", handle);
+    tracing::info!(
+        heartbeat_secs,
+        "DÁP/QES audit chain booted: service session opened + heartbeat actor spawned (S441)"
+    );
+    Ok(())
+}
+
 /// Map a `verify_chain` failure to `(first_divergence_seq, reason)`.
 fn verify_error_divergence(e: &LedgerVerifyError) -> (Option<u64>, String) {
     match e {
@@ -25526,6 +25647,18 @@ fn verify_error_divergence(e: &LedgerVerifyError) -> (Option<u64>, String) {
         }
         LedgerVerifyError::Chain(VerifyError::ChainBroken { seq }) => (Some(*seq), e.to_string()),
         LedgerVerifyError::Chain(VerifyError::TamperedAt { seq }) => (Some(*seq), e.to_string()),
+        // S441 / ADR-0087 — signature + anchor divergences. The base
+        // `verify_chain` (which this `LedgerVerifyError` wraps) never
+        // returns these; they surface only through `verify_chain_signed`.
+        // Mapped here for exhaustiveness so the base-chain operator path
+        // stays loud (CLAUDE.md rule 12).
+        LedgerVerifyError::Chain(VerifyError::SignatureInvalid { seq }) => {
+            (Some(*seq), e.to_string())
+        }
+        LedgerVerifyError::Chain(VerifyError::SignatureMissingInSignedSession { seq }) => {
+            (Some(*seq), e.to_string())
+        }
+        LedgerVerifyError::Chain(VerifyError::AnchorTampered { .. }) => (None, e.to_string()),
     }
 }
 
@@ -31010,6 +31143,9 @@ mod tests {
             payload: serde_json::to_vec(&serde_json::json!({"invoice_id":"INV-1"})).unwrap(),
             idempotency_key: None,
             entry_hash: aberp_audit_ledger::EntryHash::from_bytes([9u8; 32]),
+            session_id: None,
+            session_pubkey: None,
+            event_sig: None,
         };
         let row = audit_event_row_of(&entry);
         assert!(!row.hash_ok);

@@ -41,4 +41,19 @@ pub struct Entry {
     pub payload: Vec<u8>,
     pub idempotency_key: Option<String>,
     pub entry_hash: EntryHash,
+
+    // ─── S441 / ADR-0087 — timestamp-anchored audit chain ───────────────
+    // Additive, nullable, and DELIBERATELY EXCLUDED from the `entry_hash`
+    // preimage (`crate::canonical` is unchanged). Adding them to the
+    // canonical map would change every legacy entry's hash; instead
+    // `event_sig` is an independent signature layer over
+    // `prev_hash || kind || subject || SHA-256(payload)`. Legacy + unsigned
+    // entries leave all three `None`.
+    /// Groups all entries written under one login/service session (ULID).
+    pub session_id: Option<String>,
+    /// The session's Ed25519 public key (hex) — denormalised onto every
+    /// entry for O(1) signature verification without a join.
+    pub session_pubkey: Option<String>,
+    /// Ed25519 signature (hex) over the signing preimage.
+    pub event_sig: Option<String>,
 }

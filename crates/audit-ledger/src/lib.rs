@@ -39,6 +39,10 @@ mod chain;
 mod entry;
 mod error;
 mod mirror;
+// S441 / ADR-0086 + ADR-0087 + ADR-0088 — session signing, qualified-
+// timestamp anchoring, and the session lifecycle (structural floor; real
+// DÁP/NETLOCK stubbed `todo!`). See [`session`].
+pub mod session;
 mod signer;
 mod storage;
 
@@ -52,9 +56,11 @@ pub use mirror::{
 // payloads (foundation only; no event populates it yet). See [`signer`].
 pub use signer::{DigitalIdRef, Signed};
 pub use storage::{
-    append_in_tx, append_reopen, ensure_schema, recent_entries, Ledger, LedgerMeta,
-    LedgerVerifyError,
+    append_in_tx, append_in_tx_signed, append_reopen, ensure_schema, recent_entries, Ledger,
+    LedgerMeta, LedgerVerifyError,
 };
+// S441 — the extended-verification verdict + entrypoint live in `chain`.
+pub use chain::verify::{verify_chain_signed, ChainVerdict};
 
 // PR-22 / ADR-0035 §8 — additive `pub use` re-exports of the chain
 // primitives that `aberp-verify` needs to re-verify a per-invoice

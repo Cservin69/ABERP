@@ -709,6 +709,14 @@ fn row_to_entry_for_mirror(row: &duckdb::Row<'_>) -> duckdb::Result<Entry> {
         payload,
         idempotency_key,
         entry_hash: EntryHash::from_bytes(entry_hash),
+        // S441 — the ADR-0030 mirror is a hash-chain DIVERGENCE detector and
+        // does not carry the session-signing columns; mirror-decoded entries
+        // read None. The `entry_hash` still matches the DB (the session
+        // fields are excluded from the canonical preimage), so mirror
+        // consistency checks are unaffected.
+        session_id: None,
+        session_pubkey: None,
+        event_sig: None,
     })
 }
 

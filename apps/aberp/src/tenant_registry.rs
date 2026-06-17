@@ -106,6 +106,19 @@ pub struct TenantEntry {
     /// current NAV behaviour. Only the bundled demo tenant defaults
     /// `false` (see [`TenantRegistry::add_demo`]).
     pub nav_enabled: bool,
+
+    /// S441 (ADR-0086/0087/0088) — the per-tenant DÁP/QES audit-chain
+    /// switch. `false` (default) keeps the existing unsigned hash chain.
+    /// `true` (Defense operators) opens a signed, NETLOCK-timestamp-anchored
+    /// audit chain: a service session at boot, operator login via DÁP, and
+    /// heartbeat anchors. BACKWARD COMPAT: a row written before S441 carries
+    /// no `dap_enabled` key; [`PartialEntry::finish`] defaults the MISSING
+    /// field to `false` (existing installs keep their unsigned chain).
+    pub dap_enabled: bool,
+
+    /// S441 (ADR-0087) — heartbeat anchor cadence in seconds (default 900 =
+    /// 15 min). Only consulted when `dap_enabled`. Missing key → 900.
+    pub audit_anchor_heartbeat_seconds: u64,
 }
 
 /// Typed errors for the state-transition invariants. Routes map these to
@@ -229,6 +242,9 @@ impl TenantRegistry {
             // operator flips it off from the Tenants screen for an
             // international tenant.
             nav_enabled: true,
+            // S441 — DÁP/QES audit chain is OPT-IN per tenant (Defense line).
+            dap_enabled: false,
+            audit_anchor_heartbeat_seconds: 900,
         };
         self.tenants.push(entry.clone());
         Ok(entry)
@@ -250,6 +266,9 @@ impl TenantRegistry {
             // S434 — demo is the NAV-off sandbox: an international operator
             // can drive it end-to-end without any Hungarian NAV setup.
             nav_enabled: false,
+            // S441 — demo never runs the DÁP/QES audit chain.
+            dap_enabled: false,
+            audit_anchor_heartbeat_seconds: 900,
         };
         self.tenants.push(entry.clone());
         Ok(entry)
@@ -351,6 +370,18 @@ impl TenantRegistry {
             // S434 — bare bool token (no quotes): a fixed-vocab `true`/
             // `false` the line walker parses without the string unquoter.
             out.push_str(&format!("nav_enabled = {}\n", t.nav_enabled));
+            // S441 — omit the DÁP keys when at their defaults so a
+            // non-Defense registry stays byte-identical to the S434 form
+            // (the parser defaults missing keys to false / 900).
+            if t.dap_enabled {
+                out.push_str("dap_enabled = true\n");
+            }
+            if t.audit_anchor_heartbeat_seconds != 900 {
+                out.push_str(&format!(
+                    "audit_anchor_heartbeat_seconds = {}\n",
+                    t.audit_anchor_heartbeat_seconds
+                ));
+            }
         }
         out
     }
@@ -412,6 +443,22 @@ impl TenantRegistry {
                             format!("tenants.toml line {} nav_enabled", lineno + 1)
                         })?)
                 }
+                // S441 — DÁP/QES audit-chain keys. Bare bool / bare integer.
+                "dap_enabled" => {
+                    p.dap_enabled =
+                        Some(parse_bool(val_raw).with_context(|| {
+                            format!("tenants.toml line {} dap_enabled", lineno + 1)
+                        })?)
+                }
+                "audit_anchor_heartbeat_seconds" => {
+                    p.audit_anchor_heartbeat_seconds =
+                        Some(val_raw.trim().parse::<u64>().with_context(|| {
+                            format!(
+                                "tenants.toml line {} audit_anchor_heartbeat_seconds",
+                                lineno + 1
+                            )
+                        })?)
+                }
                 "slug" | "display_name" | "state" | "created_at" => {
                     let val = unquote(val_raw)
                         .with_context(|| format!("tenants.toml line {} value", lineno + 1))?;
@@ -463,6 +510,8 @@ struct PartialEntry {
     state: Option<String>,
     created_at: Option<String>,
     nav_enabled: Option<bool>,
+    dap_enabled: Option<bool>,
+    audit_anchor_heartbeat_seconds: Option<u64>,
 }
 
 impl PartialEntry {
@@ -490,6 +539,10 @@ impl PartialEntry {
             // instead of erroring loud — a pre-S434 row has no
             // `nav_enabled` key and MUST keep its current NAV-on behaviour.
             nav_enabled: self.nav_enabled.unwrap_or(true),
+            // S441 BACKWARD COMPAT: a pre-S441 row has no DÁP keys → the
+            // unsigned chain (false) + the 15-min default.
+            dap_enabled: self.dap_enabled.unwrap_or(false),
+            audit_anchor_heartbeat_seconds: self.audit_anchor_heartbeat_seconds.unwrap_or(900),
         })
     }
 }
@@ -627,6 +680,18 @@ pub fn tenant_nav_enabled(slug: &str) -> Result<bool> {
     Ok(match reg.find(slug) {
         Some(entry) => entry.nav_enabled,
         None => slug != DEMO_SLUG,
+    })
+}
+
+/// S441 — resolve a tenant's DÁP/QES audit-chain config for the BOOT
+/// decision: `(dap_enabled, audit_anchor_heartbeat_seconds)`. A missing row
+/// (or a pre-S441 row) → `(false, 900)`: the unsigned chain, exactly as
+/// before. The caller logs a read/parse error and treats it as `(false, …)`.
+pub fn tenant_dap_config(slug: &str) -> Result<(bool, u64)> {
+    let reg = read_registry()?;
+    Ok(match reg.find(slug) {
+        Some(entry) => (entry.dap_enabled, entry.audit_anchor_heartbeat_seconds),
+        None => (false, 900),
     })
 }
 
@@ -930,6 +995,50 @@ mod tests {
         assert_eq!(r, back);
         assert!(back.find("hu").unwrap().nav_enabled);
         assert!(!back.find("demo").unwrap().nav_enabled);
+    }
+
+    #[test]
+    fn s441_dap_config_round_trips_and_defaults() {
+        // New tenants default to dap-off + 900s heartbeat; an opted-in
+        // Defense tenant round-trips through TOML byte-for-byte at the
+        // value level.
+        let mut r = TenantRegistry::default();
+        r.add("prod", "Prod", dt("2026-06-17T00:00:00Z")).unwrap();
+        // default: off + 900.
+        assert!(!r.find("prod").unwrap().dap_enabled);
+        assert_eq!(r.find("prod").unwrap().audit_anchor_heartbeat_seconds, 900);
+        // Opt the tenant in with a custom cadence.
+        {
+            let t = r.tenants.iter_mut().find(|t| t.slug == "prod").unwrap();
+            t.dap_enabled = true;
+            t.audit_anchor_heartbeat_seconds = 1800;
+        }
+        let back = TenantRegistry::parse_toml(&r.to_toml()).unwrap();
+        assert_eq!(r, back, "DÁP config survives a TOML round-trip");
+        assert!(back.find("prod").unwrap().dap_enabled);
+        assert_eq!(
+            back.find("prod").unwrap().audit_anchor_heartbeat_seconds,
+            1800
+        );
+    }
+
+    #[test]
+    fn pre_s441_row_without_dap_keys_defaults_off() {
+        // BACKWARD COMPAT: a tenants.toml written before S441 (no dap_enabled
+        // / audit_anchor_heartbeat_seconds keys) parses to the unsigned
+        // chain (false) + the 15-min default.
+        let legacy = "\
+[[tenant]]
+slug = \"prod\"
+display_name = \"Prod\"
+state = \"active\"
+created_at = \"2026-06-16T00:00:00Z\"
+nav_enabled = true
+";
+        let reg = TenantRegistry::parse_toml(legacy).unwrap();
+        let prod = reg.find("prod").unwrap();
+        assert!(!prod.dap_enabled, "missing dap_enabled defaults to false");
+        assert_eq!(prod.audit_anchor_heartbeat_seconds, 900);
     }
 
     #[test]

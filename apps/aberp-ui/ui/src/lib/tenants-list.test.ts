@@ -18,6 +18,7 @@ const ROWS: TenantRow[] = [
     created_at: "2026-06-16T04:46:00Z",
     running: true,
     nav_enabled: true,
+    dap_enabled: false,
   },
   {
     slug: "test",
@@ -26,6 +27,7 @@ const ROWS: TenantRow[] = [
     created_at: "2026-06-16T04:47:00Z",
     running: false,
     nav_enabled: true,
+    dap_enabled: false,
   },
   {
     slug: "old",
@@ -34,6 +36,7 @@ const ROWS: TenantRow[] = [
     created_at: "2026-01-01T00:00:00Z",
     running: false,
     nav_enabled: true,
+    dap_enabled: false,
   },
 ];
 
@@ -75,6 +78,7 @@ describe("buttonStateFor", () => {
         created_at: "2026-06-16T00:00:00Z",
         running: false,
         nav_enabled: false,
+        dap_enabled: false,
       },
     ];
     const demo = withDemo[withDemo.length - 1];
@@ -117,6 +121,7 @@ describe("visibleTenants (S434 hide-demo)", () => {
       created_at: "2026-06-16T00:00:00Z",
       running: false,
       nav_enabled: false,
+      dap_enabled: false,
     },
   ];
 
