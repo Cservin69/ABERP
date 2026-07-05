@@ -1,0 +1,63 @@
+# ADR-0099 (PROD SAFE lane) — FROZEN runtime independent-opener census.
+# Ported from the editions ADR-0098 C2 mechanism (CHECK 10i) to the PROD tree.
+# Format: <count> <path>.
+#
+# The gate (tools/cut_gate_opener_census.sh, CHECK P1) re-derives each file's
+# RUNTIME opener count via the shared comment/string/cfg(test)-aware scanner
+# (tools/adr0098_opener_scan.awk: Connection::open(_with_flags)? / Ledger::open /
+# DuckDbBillingStore::open / Database::open / append_reopen; open_in_memory &
+# from_connection excluded) and FAILS if any file EXCEEDS its frozen count, or if
+# a NEW opener-bearing file appears that is not listed here.
+#
+# THIS IS THE PRE-H3 CENSUS. Every opener below is CURRENTLY ALLOWED. The gate
+# does NOT (yet) require zero openers or a shared Handle — that is the durability
+# work (H1 "mirror preserve-and-refuse" + H3 "shared Handle"), a FOLLOW-UP prod
+# session. This gate's sole job right now is to FREEZE the census so the opener
+# surface cannot silently GROW while durability lands. NO seam exclusions:
+# pre-durability there is no aberp-db Handle, so every runtime opener is a frozen
+# residual (contrast editions, which excluded the Handle/snapshot seams).
+#
+# Scope: apps/aberp/src + modules + crates, minus */tests/*. Machine-derived from
+# frozen prod commit f7519b4 (tag PROD_v2.27.76). Re-derive: see cut_gate_opener_census.sh.
+3 apps/aberp/src/ap_sync.rs
+2 apps/aberp/src/avl_vendors.rs
+2 apps/aberp/src/catalogue_push.rs
+8 apps/aberp/src/drain_pending_retries.rs
+6 apps/aberp/src/drain_submission_queue.rs
+2 apps/aberp/src/email_invoice.rs
+2 apps/aberp/src/email_outbox_poll_daemon.rs
+7 apps/aberp/src/email_relay_daemon.rs
+1 apps/aberp/src/export_invoice_bundle.rs
+9 apps/aberp/src/incoming_invoices.rs
+1 apps/aberp/src/issue_invoice.rs
+2 apps/aberp/src/issue_modification.rs
+2 apps/aberp/src/issue_storno.rs
+4 apps/aberp/src/mark_abandoned.rs
+3 apps/aberp/src/mark_invoice_paid.rs
+1 apps/aberp/src/material_inventory.rs
+1 apps/aberp/src/mes_manager.rs
+4 apps/aberp/src/observe_receiver_confirmation.rs
+5 apps/aberp/src/poll_ack.rs
+3 apps/aberp/src/poll_annulment_ack.rs
+3 apps/aberp/src/print_invoice.rs
+2 apps/aberp/src/quote_calibration.rs
+3 apps/aberp/src/quote_pdf_rerender_daemon.rs
+12 apps/aberp/src/quote_pricing_pipeline.rs
+1 apps/aberp/src/quoting_machines.rs
+4 apps/aberp/src/recover_from_nav.rs
+4 apps/aberp/src/reports.rs
+4 apps/aberp/src/request_technical_annulment.rs
+1 apps/aberp/src/restore_from_nav_extract.rs
+11 apps/aberp/src/restore_from_nav_outgoing.rs
+9 apps/aberp/src/retry_submission.rs
+144 apps/aberp/src/serve.rs
+1 apps/aberp/src/snapshot.rs
+1 apps/aberp/src/submission_queue.rs
+3 apps/aberp/src/submit_annulment.rs
+2 apps/aberp/src/submit_invoice.rs
+1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
+1 crates/aberp-mes/src/ledger_writer.rs
+8 crates/aberp-quote-intake/src/service.rs
+2 crates/aberp-snapshot/src/take.rs
+3 crates/audit-ledger/src/storage/mod.rs
+1 modules/billing/src/adapters/duckdb_store.rs
