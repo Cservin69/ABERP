@@ -916,17 +916,24 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         }
     }
 
-    // Session 152b — reconcile the audit-ledger mirror against the DB
-    // at boot. The mirror (`<db>.audit.log`) is a derivable cache, not
-    // a source of truth. If the operator nuked the DuckDB per the
-    // dev-DB-disposable rule but left the mirror in place, the mirror
-    // is now AHEAD of the fresh DB; pre-152b the first post-commit
-    // `sync_mirror` 500'd ("mirror is ahead of DB"), skipping the NAV
-    // XML write and cascading into a submit 500. Boot reconciliation
-    // truncates the ahead mirror back to the DB's max seq (and handles
-    // missing / behind / corrupt / hash-mismatch). Idempotent on a
-    // healthy state. Per-write `sync_mirror` still loud-fails on
-    // mid-process divergence — that IS a runtime bug.
+    // H1 / ADR-0099 Class 4 — reconcile the audit-ledger mirror against
+    // the DB at boot. The mirror (`<db>.audit.log`) is a derivable cache
+    // ONLY while it cannot hold entries the DB lacks. Boot reconciliation
+    // handles missing / behind idempotently, and — the durability
+    // hardening — treats DIVERGENCE as evidence to PRESERVE + REFUSE,
+    // never a silent truncate/rebuild:
+    //   (a) mirror AHEAD of the DB (torn-write / lost DB commit
+    //       fingerprint, the 2026-06-22 corruption class, or a dev
+    //       DB-nuke) → preserve to `<mirror>.ahead-<nanos>.bak` + REFUSE;
+    //   (b) a lone torn trailing line COVERED by the DB → preserve +
+    //       trim the torn tail + CONTINUE; a torn-tail prefix still ahead
+    //       of the DB routes to arm (a);
+    //   (c) equal-length head-hash divergence, or corruption deeper than
+    //       a torn tail → preserve `<mirror>.corrupt-<nanos>.bak` + REFUSE.
+    // A refuse arm exits boot NON-ZERO with an operator-actionable message
+    // + recovery pointer (the AppendError Display). Per-write `sync_mirror`
+    // still loud-fails on mid-process divergence — that IS a runtime bug.
+    // (H5 wires the guarded auto-recovery; H1 stops at preserve-and-refuse.)
     tracing::info!("boot step: reconciling audit-ledger mirror with DB (idempotent recovery)");
     {
         let _s = tracing::info_span!("serve.recover_audit_mirror").entered();
@@ -939,9 +946,39 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         aberp_audit_ledger::ensure_schema(&conn)
             .context("ensure audit-ledger schema at serve boot")?;
         let mirror_path = aberp_audit_ledger::mirror_path_for(&args.db);
-        let action = aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror_path)
-            .context("reconcile audit-ledger mirror with DB at serve boot")?;
-        tracing::info!(?action, "audit-ledger mirror reconciled at boot");
+        match aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror_path) {
+            Ok(action) => tracing::info!(?action, "audit-ledger mirror reconciled at boot"),
+            Err(e @ aberp_audit_ledger::AppendError::MirrorAheadOfDb { .. }) => {
+                // Arm (a). The ahead mirror was PRESERVED inside the reconcile;
+                // surface one operator-actionable line and REFUSE boot
+                // (non-zero). Never auto-truncate an ahead mirror.
+                tracing::error!(
+                    error = %e,
+                    "REFUSING to boot — audit-ledger mirror is AHEAD of the DB; the ahead mirror \
+                     was preserved to a side file. Investigate (possible lost DB commit) before \
+                     re-running; for an intentional dev DB-nuke, move the stale <db>.audit.log aside."
+                );
+                return Err(anyhow::Error::new(e))
+                    .context("reconcile audit-ledger mirror with DB at serve boot");
+            }
+            Err(e @ aberp_audit_ledger::AppendError::MirrorCorruptPreserved { .. }) => {
+                // Arms (b-deep) / (c). The original was preserved byte-for-byte
+                // inside the reconcile; REFUSE boot (non-zero). Never
+                // rebuild-from-DB, never hand-edit the mirror JSONL.
+                tracing::error!(
+                    error = %e,
+                    "REFUSING to boot — audit-ledger mirror is unrecoverable; the original was \
+                     preserved to a side file. Inspect it and restore from a verified DB snapshot \
+                     or known-good backup before re-running; do NOT hand-edit the mirror JSONL."
+                );
+                return Err(anyhow::Error::new(e))
+                    .context("reconcile audit-ledger mirror with DB at serve boot");
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .context("reconcile audit-ledger mirror with DB at serve boot");
+            }
+        }
     }
 
     // 2. Resolve / generate the loopback cert + key.
