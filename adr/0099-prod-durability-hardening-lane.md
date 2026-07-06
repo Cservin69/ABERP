@@ -158,3 +158,121 @@ chain break) ⇒ refuse; equal-length head-hash mismatch ⇒ refuse; evidence
 preserved in every refuse arm; plus the pure `decide_tail` truth table and a
 `parse_and_reverify_prefix` chain-break/seq-jump probe. Authoritative build/test is
 GitHub Actions (`ci.yml` + `cut-gate.yml`) — local DuckDB build is heavy.
+
+---
+
+## H2 — Class 3: atomic creation + safe-open-on-boot
+
+**Status:** Implemented on `prod-durability-adr0099` atop H1 (code-only; no
+deploy/cut — GL-2 not granted). **Date:** 2026-07-06.
+
+### Invariant
+
+A crash during the FIRST creation of the tenant DB can never leave a torn file at
+the live path; and a torn live file present at boot is detected at ONE guarded
+chokepoint BEFORE any subsystem opens it — preserved as evidence + refused, never
+opened half-torn by a downstream migration.
+
+### Problem (what H2 replaces)
+
+The serve boot (`apps/aberp/src/serve.rs`, "ensure billing schema" step) created
+the DB by letting the FIRST `DuckDbBillingStore::open(&args.db)` materialise it
+directly **at the live path**. A power loss mid-creation left a torn/unopenable
+file exactly where the next boot expects a good one (the first-launch torn-create
+class). And an already-torn live file was only discovered lazily, by whichever of
+the ~11 subsystem boot opens hit it first — after other opens/daemons had already
+begun.
+
+### Decision — the boot chokepoint (backported from editions ADR-0095 §1·§2·§4)
+
+A single guarded block runs right after the parent-dir `create_dir_all` and
+BEFORE the first `DuckDbBillingStore::open` (hence before every subsequent boot
+open and all daemon spawns):
+
+- **stale-staging sweep** — `cleanup_stale_staging` removes any `<db>.creating-*`
+  litter a crash-interrupted prior provision left, on BOTH arms.
+- **DB MISSING ⇒ `provision_atomic`** — build the DB ASIDE at
+  `<db>.creating-<tag>.duckdb` (the closure seeds the billing schema there, a
+  faithful port of the editions wiring), fold its WAL (`CHECKPOINT`), then
+  `atomic_install` (fsync → atomic `rename` → clear stale target WAL → fsync dir)
+  onto the live path and `write_marker` the verified-good `<db>.ckpt-ok`. A crash
+  before the rename leaves only a disposable temp; the live path is never written
+  with a torn file. The remaining subsystem schemas complete idempotently on the
+  now-safely-present DB.
+- **DB PRESENT ⇒ `probe_open_or_preserve`** — the SINGLE validated probe-open
+  (`Connection::open` + `PRAGMA database_list;`, the exact catalog-touch the
+  editions boot-crash e2e uses to prove a torn file will not open). Success ⇒ boot
+  proceeds. Failure ⇒ the corrupt file is PRESERVED byte-for-byte to
+  `<db>.CORRUPT-<ts>` (a COPY — original left in place) and boot REFUSES non-zero
+  with an operator-actionable line, exactly as H1's mirror arms do. **H2 stops at
+  preserve-and-refuse; the guarded auto-recovery is H5** (the editions
+  `attempt_db_auto_recovery` / `recover_or_refuse` path is deliberately NOT
+  ported here).
+
+### Prod-backport adaptation (flagged)
+
+The editions `provision_atomic` / probe entrypoints each call `ensure_not_prod_path`
+first, so an *editions* build can never act on the FROZEN prod line (`~/.aberp/`,
+ADR-0093). That guard is DELIBERATELY OMITTED from the prod backport — in the prod
+tree the live DB *is* the prod line H2 must provision, so porting the guard would
+refuse the very path this code exists to create. This is the only intentional
+divergence from the settled editions forms.
+
+### Scope / surface
+
+- `crates/aberp-snapshot/src/crash_safe.rs` (NEW) — the backported §1·§2·§4
+  primitives, scoped to H2 (no recovery engine): `atomic_install`, `write_marker`
+  / `read_marker` / `checkpoint_is_current` + `CheckpointMarker`, `provision_atomic`
+  + `checkpoint_file`, `probe_open_or_preserve` + `preserve_corrupt_db`,
+  `cleanup_stale_staging` + `cleanup_siblings_with_infix`, and the fsync/sibling/
+  tag helpers.
+- `crates/aberp-snapshot/src/lib.rs` — `mod crash_safe;` + re-exports; two new
+  `SnapshotError` variants (`Provision`, `DbCorruptPreserved`), the type surface
+  the in-scope arms return. `result_large_err` is workspace-allowed.
+- `crates/aberp-snapshot/src/take.rs` — `sha256_file` promoted to `pub(crate)` so
+  the §4 marker records the same file identity (no behaviour change).
+- `apps/aberp/src/serve.rs` — the boot chokepoint block (provision / probe /
+  sweep) ahead of the first `DuckDbBillingStore::open`.
+
+### Opener census — legitimately altered boot open path (+3: 289→292 / 42→43)
+
+H2 replaces the implicit torn-create with the atomic/probe path, so the frozen
+census is ratcheted up by exactly the atomic/probe openers, with the fingerprint
+set updated to match (CHECK P2 re-proven to still catch a count-preserving swap
+on the new openers):
+
+- `apps/aberp/src/serve.rs` 144→145 — the `DuckDbBillingStore::open(creating)`
+  provision seed-open (replaces the old implicit live-path creation).
+- `crates/aberp-snapshot/src/crash_safe.rs` +2 (new file) — `checkpoint_file`'s
+  fold-open + `probe_open`'s validated safe-open.
+
+No NEW un-gated opener is added; the count-freeze (P1) still forbids growth
+elsewhere, and the `#[cfg(test)]` opens in `crash_safe.rs` are correctly excluded
+by the scanner.
+
+### Rollback — binary-only
+
+H2 changes runtime behaviour only; there is **no schema change, no data migration,
+no on-disk format change**. Rolling the binary back to `PROD_v2.27.76` fully
+reverts to the prior behaviour. The `<db>.ckpt-ok` marker and any `<db>.CORRUPT-*`
+/ swept `<db>.creating-*` side files are inert to the old binary (they do not match
+the live DB path). No forward-migration to undo.
+
+### Tests (RED-before / GREEN-after; every gate has a proving negative probe)
+
+Plain-file unit matrix in `crash_safe.rs` (no DuckDB → runs in every arm):
+`atomic_install` replace / crash-before-rename-leaves-old-good / stale-target-WAL
+clear; marker round-trip + `checkpoint_is_current` (matching / staled / pending-WAL
+/ no-marker); stale-staging sweep keeps `.CORRUPT-*` evidence + never touches the
+live DB; `preserve_corrupt_db` copies aside + leaves original intact; and the
+load-bearing real-subprocess crash-injection test — a child writes the `.creating-`
+staging then `abort()`s before the rename, and the parent asserts **no file at the
+live path** + the temp survives + the retry finishes the install with zero manual
+steps. DuckDB-backed e2e in `tests/crash_safe_boot_e2e.rs` (CI gate): provision ⇒
+valid openable DB + verified-good marker + no staging litter; stale `.creating-*`
+swept by the next provision; probe OK on a clean DB; and the **refuse-arm form of
+`boot_crash_recovery_e2e`** — a torn live DB ⇒ `DbCorruptPreserved` + one
+`<db>.CORRUPT-<ts>` byte-for-byte copy + original left in place (no recovery).
+Authoritative build/test is GitHub Actions (`ci.yml` + `cut-gate.yml`); the
+cut-gate + negative probes are toolchain-free and were run locally green (the P2
+teeth re-proven against the new openers).

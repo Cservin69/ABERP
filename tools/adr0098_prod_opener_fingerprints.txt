@@ -293,3 +293,8 @@ crates/audit-ledger/src/storage/mod.rs|append_reopen:let mut conn = Connection::
 crates/audit-ledger/src/storage/mod.rs|append_reopen:pub fn append_reopen(
 crates/audit-ledger/src/storage/mod.rs|open:let conn = Connection::open(path)?;
 modules/billing/src/adapters/duckdb_store.rs|open:conn: Connection::open(path)?,
+# ── ADR-0099 H2 (Class 3) additions — the atomic-creation + safe-open path.
+# The set is sorted before comparison, so these trailing lines fold into place.
+apps/aberp/src/serve.rs|run:let mut store = DuckDbBillingStore::open(creating)?;
+crates/aberp-snapshot/src/crash_safe.rs|checkpoint_file:let conn = Connection::open(db)?;
+crates/aberp-snapshot/src/crash_safe.rs|probe_open:let conn = Connection::open(db_path).map_err(|e| e.to_string())?;

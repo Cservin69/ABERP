@@ -45,10 +45,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+mod crash_safe;
 mod retention;
 mod store;
 mod take;
 
+pub use crash_safe::{
+    atomic_install, checkpoint_is_current, cleanup_stale_staging, marker_path,
+    probe_open_or_preserve, provision_atomic, read_marker, write_marker, CheckpointMarker,
+};
 pub use retention::{plan_retention, prune, RetentionPlan, RetentionPolicy};
 pub use store::{default_store_dir, find_snapshot, list_snapshots, SnapshotRecord};
 pub use take::{
@@ -85,6 +90,20 @@ pub enum SnapshotError {
 
     #[error("snapshot metadata at {path} is unreadable: {detail}")]
     BadMeta { path: PathBuf, detail: String },
+
+    #[error("atomic provision of {path} failed before any live-path write: {detail}")]
+    Provision { path: PathBuf, detail: String },
+
+    #[error(
+        "REFUSING to serve: tenant DB {path} failed its validated boot probe-open ({detail}); \
+         the corrupt file was preserved to {preserved} — investigate, then recover from a \
+         verified snapshot or known-good backup (auto-recovery is a later durability step)"
+    )]
+    DbCorruptPreserved {
+        path: PathBuf,
+        preserved: PathBuf,
+        detail: String,
+    },
 }
 
 impl SnapshotError {

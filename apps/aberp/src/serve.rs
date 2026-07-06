@@ -712,6 +712,58 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 )
             })?;
         }
+
+        // H2 / ADR-0099 Class 3 — atomic creation + safe-open-on-boot. This is
+        // the SINGLE guarded chokepoint that runs BEFORE the first
+        // `DuckDbBillingStore::open` below and every subsequent boot open +
+        // daemon spawn (ADR-0095 §1·§2):
+        //   • stale-staging sweep — remove any `<db>.creating-*` litter left by
+        //     a provision a prior crash interrupted (runs on BOTH arms).
+        //   • DB MISSING ⇒ provision the initial DB ATOMICALLY: build it aside
+        //     at `<db>.creating-<tag>.duckdb` (seed the billing schema there),
+        //     fold its WAL, then atomically swap it onto the live path + write a
+        //     verified-good marker. A crash mid-creation leaves only a
+        //     disposable temp, NEVER a torn file at the live path (the exact
+        //     first-launch torn-creation class). The remaining subsystem schemas
+        //     below complete idempotently on the now-safely-present DB.
+        //   • DB PRESENT ⇒ ONE validated probe-open. A torn / unopenable live
+        //     file (the torn-checkpoint signature, "Failed to load metadata
+        //     pointer") is detected HERE — preserved byte-for-byte to
+        //     `<db>.CORRUPT-<ts>` and boot REFUSES (non-zero), so no subsystem
+        //     ever opens a torn file. H2 stops at preserve-and-refuse; the
+        //     guarded auto-recovery is a later durability step (H5).
+        aberp_snapshot::cleanup_stale_staging(&args.db);
+        if !args.db.exists() {
+            tracing::info!(
+                db = %args.db.display(),
+                "boot: tenant DB absent — provisioning atomically (ADR-0095 §2)"
+            );
+            aberp_snapshot::provision_atomic(&args.db, |creating| {
+                let mut store = DuckDbBillingStore::open(creating)?;
+                store.ensure_schema()?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .with_context(|| {
+                format!(
+                    "atomically provision initial tenant DuckDB at {}",
+                    args.db.display()
+                )
+            })?;
+        } else if let Err(e) = aberp_snapshot::probe_open_or_preserve(&args.db) {
+            // Torn/corrupt live DB — the evidence was preserved to
+            // `<db>.CORRUPT-<ts>` inside the probe (or preserving it failed).
+            // Surface one operator-actionable line and REFUSE boot (non-zero),
+            // exactly as H1's mirror arms do. Never auto-recover here (H5).
+            tracing::error!(
+                error = %e,
+                "REFUSING to boot — tenant DB failed its validated probe-open; the corrupt DB \
+                 was preserved to a `<db>.CORRUPT-<ts>` side file. Investigate, then recover from \
+                 a verified snapshot or known-good backup before re-running."
+            );
+            return Err(anyhow::Error::new(e))
+                .context("validated boot probe-open of the tenant DB at serve boot");
+        }
+
         let mut billing_store = DuckDbBillingStore::open(&args.db).with_context(|| {
             format!(
                 "open billing DuckDB at {} for boot migration",

@@ -19,6 +19,15 @@
 #
 # Scope: apps/aberp/src + modules + crates, minus */tests/*. Machine-derived from
 # frozen prod commit f7519b4 (tag PROD_v2.27.76). Re-derive: see cut_gate_opener_census.sh.
+#
+# ADR-0099 H2 (Class 3 atomic-creation + safe-open) legitimately alters the boot
+# open path, so the frozen census is ratcheted +3 (289→292 across 42→43 files):
+#   • apps/aberp/src/serve.rs 144→145 — the atomic-provision seed open
+#     (`DuckDbBillingStore::open(creating)`) that replaces the old implicit
+#     torn-creation of the DB at the live path.
+#   • crates/aberp-snapshot/src/crash_safe.rs +2 (NEW file) — the backported
+#     `checkpoint_file` fold-open + the `probe_open` validated boot safe-open.
+# These are the atomic/probe path G2 permits; NOT new un-gated openers.
 3 apps/aberp/src/ap_sync.rs
 2 apps/aberp/src/avl_vendors.rs
 2 apps/aberp/src/catalogue_push.rs
@@ -50,7 +59,7 @@
 1 apps/aberp/src/restore_from_nav_extract.rs
 11 apps/aberp/src/restore_from_nav_outgoing.rs
 9 apps/aberp/src/retry_submission.rs
-144 apps/aberp/src/serve.rs
+145 apps/aberp/src/serve.rs
 1 apps/aberp/src/snapshot.rs
 1 apps/aberp/src/submission_queue.rs
 3 apps/aberp/src/submit_annulment.rs
@@ -58,6 +67,7 @@
 1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
 1 crates/aberp-mes/src/ledger_writer.rs
 8 crates/aberp-quote-intake/src/service.rs
+2 crates/aberp-snapshot/src/crash_safe.rs
 2 crates/aberp-snapshot/src/take.rs
 3 crates/audit-ledger/src/storage/mod.rs
 1 modules/billing/src/adapters/duckdb_store.rs
