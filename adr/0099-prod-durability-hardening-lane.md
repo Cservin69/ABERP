@@ -291,12 +291,17 @@ PROD re-harden**. This turns `ci.yml` fully green for the first time on this lan
 ### Why the drift exists
 The `PROD_v2.27.76` tree was frozen on 2026-07-05, but `cargo-deny` / `cargo-audit`
 fetch the **latest RustSec advisory DB at run time**. Advisories published *after*
-the freeze therefore surface against an unchanged, pinned `Cargo.lock`. The exact
-current set that fails `ci.yml`'s `advisories` section (confirmed from the red run
-on `f477f47`, GitHub Actions run 28798583891 — `advisories FAILED, bans ok,
-licenses ok, sources ok`) is the four below. (`RUSTSEC-2024-0429`, listed in the
-original planning note, was already covered by the pre-existing GTK3 ignore block
-and is **not** part of the current failing set.)
+the freeze therefore surface against an unchanged, pinned `Cargo.lock`. The set spans
+two scan surfaces. `cargo deny check` (feature-resolved graph) failed on **four**
+in the red run on `f477f47` (GitHub Actions run 28798583891 — `advisories FAILED,
+bans ok, licenses ok, sources ok`): RUSTSEC-2026-0187/-0190/-0194/-0195. Because
+that step failed first, `cargo audit` never ran in the old red run; once the deny
+ignores made `cargo deny check` green, `cargo audit` (raw-lockfile scan of all 729
+lock entries) ran and surfaced a **fifth**, RUSTSEC-2026-0185 (quinn-proto),
+which cargo-deny does **not** report because quinn-proto is not in ABERP's resolved
+feature graph (see its entry below). All five are documented-ignored here.
+(`RUSTSEC-2024-0429`, listed in the original planning note, was already covered by
+the pre-existing GTK3 ignore block and is **not** part of the current failing set.)
 
 ### Scope of change — CONFIG ONLY
 No `Cargo.toml` / `Cargo.lock` edit, no dependency added/removed/bumped, no
@@ -330,9 +335,22 @@ inline because audit.toml auto-discovery is unreliable in CI, per S303).
   start tag for duplicate attribute names (DoS). **Same reachability envelope as
   -0194:** known-endpoint / self-authored XML only, single-tenant loopback
   desktop, DoS-only blast radius.
+- **RUSTSEC-2026-0185** — quinn-proto 0.11.14, remote memory exhaustion via
+  unbounded out-of-order QUIC stream reassembly (cargo-audit-only surface).
+  **Not compiled / unreachable.** quinn-proto enters `Cargo.lock` solely through
+  reqwest's optional `http3`/QUIC path, which ABERP does not enable — the
+  workspace pins `reqwest = { default-features = false, features = ["rustls",
+  "gzip", "stream", "json"] }` (no `http3`). `cargo tree -i quinn-proto` resolves
+  to nothing in the active graph, so cargo-deny's feature-resolved scan never
+  flags it; only cargo-audit's raw-lockfile scan sees the phantom entry. The
+  vulnerable QUIC reassembly code is never built into the binary, and ABERP makes
+  only outbound HTTPS client requests to known NAV/MNB endpoints — it never runs a
+  QUIC listener accepting inbound streams. (The lockstep `deny.toml` entry is a
+  placeholder for the surface cargo-deny doesn't currently reach.)
 
 ### Re-harden hook
-When the next PROD re-harden lands, revisit all four: bump lopdf / anyhow /
-quick-xml to fixed releases and delete the corresponding ignore entries from
-`deny.toml`, `audit.toml`, and `ci.yml` together. Until then the ignores are the
+When the next PROD re-harden lands, revisit all five: bump lopdf / anyhow /
+quick-xml (and, if the http3 path is ever enabled, quinn via reqwest) to fixed
+releases and delete the corresponding ignore entries from `deny.toml`,
+`audit.toml`, and `ci.yml` together. Until then the ignores are the
 owner-approved, reachability-justified posture and `ci.yml` is genuinely green.

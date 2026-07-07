@@ -48,4 +48,5 @@ ignore = [
     "RUSTSEC-2026-0190",  # anyhow downcast_mut unsoundness — downcast_mut never called in ABERP (grep-verified)
     "RUSTSEC-2026-0194",  # quick-xml NsReader alloc DoS — known-endpoint XML only (NAV/MNB/MES), single-tenant loopback
     "RUSTSEC-2026-0195",  # quick-xml quadratic-attr DoS — same envelope as -0194
+    "RUSTSEC-2026-0185",  # quinn-proto QUIC DoS — http3 feature OFF; not in resolved graph (cargo-deny doesn't flag it), phantom Cargo.lock entry, never compiled
 ]
