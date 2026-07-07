@@ -276,3 +276,63 @@ swept by the next provision; probe OK on a clean DB; and the **refuse-arm form o
 Authoritative build/test is GitHub Actions (`ci.yml` + `cut-gate.yml`); the
 cut-gate + negative probes are toolchain-free and were run locally green (the P2
 teeth re-proven against the new openers).
+
+---
+
+## Addendum — post-freeze advisory documented-ignore (2026-07-06, owner Ervin)
+
+**Status:** Accepted (config-only; supersedes nothing).
+**Decision (verbatim in intent):** the pre-existing, post-freeze `cargo-deny`
+security-advisory drift on this branch is handled by **reachability-assessed
+documented-ignore (config only)** — NOT dependency bumps. Dependency bumps remain
+a plan §2 **NON-GOAL**; the real dependency remediation is **deferred to a future
+PROD re-harden**. This turns `ci.yml` fully green for the first time on this lane.
+
+### Why the drift exists
+The `PROD_v2.27.76` tree was frozen on 2026-07-05, but `cargo-deny` / `cargo-audit`
+fetch the **latest RustSec advisory DB at run time**. Advisories published *after*
+the freeze therefore surface against an unchanged, pinned `Cargo.lock`. The exact
+current set that fails `ci.yml`'s `advisories` section (confirmed from the red run
+on `f477f47`, GitHub Actions run 28798583891 — `advisories FAILED, bans ok,
+licenses ok, sources ok`) is the four below. (`RUSTSEC-2024-0429`, listed in the
+original planning note, was already covered by the pre-existing GTK3 ignore block
+and is **not** part of the current failing set.)
+
+### Scope of change — CONFIG ONLY
+No `Cargo.toml` / `Cargo.lock` edit, no dependency added/removed/bumped, no
+application code touched. Three advisory-ignore surfaces are updated in lockstep,
+each with a specific per-advisory justification (no blanket ignore):
+`deny.toml [advisories].ignore`, `audit.toml [advisories].ignore`, and the
+`ci.yml` `cargo audit --ignore …` inline list (the audit step passes ignores
+inline because audit.toml auto-discovery is unreliable in CI, per S303).
+
+### Per-advisory reachability justification
+- **RUSTSEC-2026-0187** — lopdf 0.34.0, stack overflow via deeply nested PDF
+  objects. **Unreachable at runtime.** Production code only *generates* PDFs
+  (`crates/invoice-pdf`, `crates/aberp-quote-pdf` render ABERP's own invoice /
+  quote data). The only PDF-*parse* callsites (`lopdf::Document::load_mem`,
+  `pdf_extract::extract_text_from_mem`) are inside `#[cfg(test)]`
+  (`crates/aberp-quote-pdf/src/lib.rs:812` `mod tests`) round-tripping
+  self-generated PDFs to assert render fidelity. No untrusted PDF is ever parsed.
+- **RUSTSEC-2026-0190** — anyhow 1.0.102, unsoundness in `Error::downcast_mut()`.
+  **Unreachable.** `downcast_mut` is never called anywhere in ABERP source
+  (grep-verified empty); anyhow is used purely as an error-propagation type, so
+  the vulnerable API is never exercised.
+- **RUSTSEC-2026-0194** — quick-xml 0.36.2, unbounded namespace-declaration
+  allocation in `NsReader` (memory-exhaustion DoS). **Low reachability.**
+  quick-xml parses only responses from known, authenticated endpoints — NAV
+  (Hungarian tax authority) SOAP over pinned TLS, MNB (Hungarian National Bank)
+  FX-rate SOAP over TLS, LAN MTConnect agent telemetry — plus ABERP's own
+  catalogue / XSD XML. No attacker-controlled internet input. Worst case is a DoS
+  (hang / OOM) affecting only the single local operator on a loopback-only,
+  single-tenant desktop; there is no multi-tenant blast radius.
+- **RUSTSEC-2026-0195** — quick-xml 0.36.2, quadratic run time when checking a
+  start tag for duplicate attribute names (DoS). **Same reachability envelope as
+  -0194:** known-endpoint / self-authored XML only, single-tenant loopback
+  desktop, DoS-only blast radius.
+
+### Re-harden hook
+When the next PROD re-harden lands, revisit all four: bump lopdf / anyhow /
+quick-xml to fixed releases and delete the corresponding ignore entries from
+`deny.toml`, `audit.toml`, and `ci.yml` together. Until then the ignores are the
+owner-approved, reachability-justified posture and `ci.yml` is genuinely green.

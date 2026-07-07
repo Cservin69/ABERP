@@ -61,6 +61,18 @@ ignore = [
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; replaced upstream by web-time. Transitive via async-io / parking_lot test helpers." },
     { id = "RUSTSEC-2024-0388", reason = "derivative unmaintained; consider derive_more upstream. Transitive via Tauri ecosystem." },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; rustls 0.23.x pulls a transitional 2.x. Revisit when reqwest/rustls drop it." },
+
+    # ─── Post-PROD_v2.27.76-freeze advisories (published AFTER the freeze;
+    # cargo-deny fetches the latest RustSec DB at run time). ADR-0099
+    # addendum (2026-07-06, owner Ervin): reachability-assessed
+    # documented-ignore, CONFIG ONLY — NO dependency bumps (a plan §2
+    # NON-GOAL). Real dep remediation is deferred to a future PROD
+    # re-harden. Each entry carries a per-advisory reachability
+    # justification; NONE is a blanket ignore. See adr/0099 §"Addendum". ───
+    { id = "RUSTSEC-2026-0187", reason = "lopdf 0.34.0 stack overflow via deeply nested PDF objects. UNREACHABLE at runtime: prod code only GENERATES PDFs (invoice-pdf / aberp-quote-pdf render ABERP's own data); the only PDF-parse callsites (lopdf::Document::load_mem, pdf_extract::extract_text_from_mem) are inside #[cfg(test)] (aberp-quote-pdf/src/lib.rs:812 `mod tests`) round-tripping self-generated PDFs. No untrusted PDF is parsed. Loopback-only single-tenant desktop." },
+    { id = "RUSTSEC-2026-0190", reason = "anyhow 1.0.102 unsoundness in Error::downcast_mut(). UNREACHABLE: `downcast_mut` is never called anywhere in ABERP source (grep-verified empty); anyhow is used only as an error-propagation type, so the vulnerable API is never exercised." },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.36.2 unbounded namespace-declaration allocation in NsReader (memory-exhaustion DoS). Low reachability: quick-xml parses only responses from known authenticated endpoints — NAV (HU tax authority) SOAP over pinned TLS, MNB (HU national bank) FX SOAP over TLS, LAN MTConnect telemetry — plus ABERP's own catalogue/XSD XML; no attacker-controlled internet input. Worst case is a DoS harming only the single local operator on a loopback-only single-tenant desktop." },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.36.2 quadratic run time checking a start tag for duplicate attribute names (DoS). Same reachability envelope as RUSTSEC-2026-0194: known-endpoint / self-authored XML only, single-tenant loopback desktop, DoS-only blast radius." },
 ]
 
 # ─────────────────────────────────────────────────────────────────────
