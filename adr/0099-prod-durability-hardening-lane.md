@@ -646,3 +646,19 @@ Addendum 1 flagged the supply-chain-drift decision. (A future re-harden may
 instead pin an exact toolchain version on this branch — the escape hatch
 `rust-toolchain.toml`'s own comment names — but that is a policy call left to
 the owner; the mechanical sweep changes no documented policy.)
+
+#### Decision — EXACT toolchain pin for the hardening effort (2026-07-09, owner Ervin)
+
+Taken. The channel-only pin has now cost CI red **twice** mid-effort with no
+source change of ours (the Addendum-1 advisory drift, then this clippy-1.97
+drift). A floating compiler is incompatible with a multi-week **gated** change
+whose entire value is that a RED gate means a REAL regression — reproducibility
+of the gates is itself a hardening property. So `rust-toolchain.toml` is changed
+from `channel = "stable"` to `channel = "1.97.0"` — the EXACT stable version
+currently green on this branch (`rustc 1.97.0 (2d8144b78 2026-07-07)`) — in its
+own clearly-labelled commit. A contributor (and CI) now builds the branch with
+the same compiler; a gate going red from here is our code, not a toolchain bump.
+This is scoped to the hardening lane; **un-pinning back to floating `stable` is a
+separate, deliberate decision at H7** (end of effort), not to be reverted
+piecemeal. `rust-version` (MSRV floor) and `Cargo.lock` (dependency pin) are
+unchanged; this only removes the compiler-version degree of freedom.

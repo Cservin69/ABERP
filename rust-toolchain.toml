@@ -1,19 +1,22 @@
-# Pinned per ADR-0001 ("stable channel, with the toolchain version pinned
-# in rust-toolchain.toml") and ADR-0021 §Sub-decisions.
+# EXACT toolchain pin — reproducible gates for the ADR-0099 durability-hardening
+# effort (H1…H7). See ADR-0099 §"Toolchain drift" (Addendum) for the why.
 #
-# Pin the CHANNEL, not an exact version. This makes the repo maintainable
-# across years: a contributor cloning ABERP in 2027 builds with whatever
-# stable rustup has at that moment, not with an old toolchain we forced
-# them to install. The MSRV floor for our own code lives in each
-# Cargo.toml's `rust-version` field; transitive deps enforce their own
-# MSRVs at build time. Reproducibility comes from Cargo.lock (ADR-0007
-# §Supply chain), which is the load-bearing pin.
+# ADR-0001/ADR-0021 pinned only the *channel* ("stable"), so the compiler moved
+# under a multi-week gated change and turned CI RED twice mid-effort with no
+# source change of ours: (1) a floating cargo-audit/deny advisory DB, then
+# (2) `stable 1.97.0` (2026-07-07) tightening `useless_borrows_in_formatting` /
+# `question_mark` under `-D warnings`. A floating compiler is incompatible with
+# a hardening lane whose whole value is that a RED gate means a REAL regression.
 #
-# If a future build must be bit-reproducible (release engineering),
-# re-introduce a temporary exact-version pin in a branch dedicated to
-# that build — not on main.
+# So for the DURATION of the hardening effort we pin the EXACT stable version
+# that is currently green on this branch (1.97.0). A contributor building the
+# branch gets the same compiler CI uses; a gate going red is then our code, not
+# a toolchain bump. Un-pinning back to a floating `channel = "stable"` is a
+# SEPARATE, deliberate decision at H7 (end of the effort) — not to be reverted
+# piecemeal. The MSRV floor still lives in each Cargo.toml `rust-version`;
+# Cargo.lock remains the dependency pin (ADR-0007 §Supply chain).
 
 [toolchain]
-channel = "stable"
+channel = "1.97.0"
 components = ["rustfmt", "clippy"]
 profile = "default"
