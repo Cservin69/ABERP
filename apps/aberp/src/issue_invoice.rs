@@ -310,6 +310,15 @@ pub struct LineJson {
 // ──────────────────────────────────────────────────────────────────────
 
 pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
+    // H3 (ADR-0099 F-E) — cross-process whole-DB single-writer lock. A separate
+    // process opening the tenant DB read-write must REFUSE if `aberp serve` (or
+    // another DB-mutating command) holds the whole-DB writer lock, rather than
+    // opening a second concurrent writer. Held for the whole command. Acquired
+    // here in `run()` (not in `run_with_provider`, which the axum handler also
+    // calls) so it wraps the entire CLI invocation before the DB is opened.
+    let _db_writer_lock =
+        crate::db_writer_lock::acquire_or_refuse(&args.db, &args.tenant, "aberp issue-invoice")?;
+
     // PR-44γ — construct the production MNB-rates provider only when
     // the EUR (non-HUF) path actually needs one. The HUF path stays
     // network-free (no reqwest::Client built); a hypothetical

@@ -154,6 +154,13 @@ pub fn run(args: &PollAckArgs) -> Result<()> {
     )
     .entered();
 
+    // H3 (ADR-0099 F-E) — cross-process whole-DB single-writer lock. A separate
+    // process opening the tenant DB read-write must REFUSE if `aberp serve` (or
+    // another DB-mutating command) holds the whole-DB writer lock, rather than
+    // opening a second concurrent writer. Held for the whole command.
+    let _db_writer_lock =
+        crate::db_writer_lock::acquire_or_refuse(&args.db, &args.tenant, "aberp poll-ack")?;
+
     // PR-44η / session-60 — thin wrapper over [`poll_ack_from_inputs`].
     // The CLI-specific responsibilities (load NAV credentials, mint
     // the `Actor`, print the operator-visible summary line) stay here;

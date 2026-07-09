@@ -167,6 +167,17 @@ pub fn run(args: &DrainPendingRetriesArgs) -> Result<()> {
     )
     .entered();
 
+    // H3 (ADR-0099 F-E) — cross-process whole-DB single-writer lock. This CLI
+    // one-shot opens the tenant DB read-write in a SEPARATE process; if `aberp
+    // serve` (or another DB-mutating command) already holds the whole-DB writer
+    // lock it must REFUSE rather than open a second concurrent writer (the
+    // two-writer ledger-divergence class). Held for the whole command.
+    let _db_writer_lock = crate::db_writer_lock::acquire_or_refuse(
+        &args.db,
+        &args.tenant,
+        "aberp drain-pending-retries",
+    )?;
+
     // 1. Parse + validate CLI args.
     let tenant = TenantId::new(args.tenant.clone()).ok_or_else(|| {
         anyhow!(
