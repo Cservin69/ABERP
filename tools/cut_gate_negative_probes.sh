@@ -47,8 +47,13 @@ echo "root: $ROOT"; echo
 echo "[sanity] a clean copy passes"
 c="$(fresh)"; expect_pass "$c" "clean tree → CUT-GATE PASSED"
 
-echo "[CHECK P1] an existing residual GROWS its opener count (mes_manager.rs +1)"
-c="$(fresh)"; printf '\nfn _probe_grow(p: &std::path::Path) {\n    let _ = duckdb::Connection::open(p);\n}\n' >> "$c/apps/aberp/src/mes_manager.rs"
+# NOTE: the "existing residual" probes target crates/audit-ledger/src/storage/mod.rs
+# — a library PRIMITIVE (Ledger::open / append_reopen) that is allow-listed and
+# NEVER migrated onto the Handle, so it stays in the frozen census for the whole
+# H3 opener migration. (Earlier revisions targeted apps/aberp/src/mes_manager.rs,
+# which H3 wave 2b migrated OFF the census, making the grow/alias probes escape.)
+echo "[CHECK P1] an existing residual GROWS its opener count (storage/mod.rs +1)"
+c="$(fresh)"; printf '\nfn _probe_grow(p: &std::path::Path) {\n    let _ = duckdb::Connection::open(p);\n}\n' >> "$c/crates/audit-ledger/src/storage/mod.rs"
 expect_fail "$c" "grew its openers" "P1 — residual opener count grew beyond frozen baseline"
 
 echo "[CHECK P1] a BRAND-NEW opener-bearing file not on the frozen census"
@@ -60,21 +65,21 @@ c="$(fresh)"; mkdir -p "$c/crates/aberp-qa/src"; printf 'pub fn _probe(p:&std::p
 expect_fail "$c" "NEW unaccounted opener-bearing file" "P1/crates — a new separate opener in crates/ is rejected"
 
 echo "[CHECK P1] a Connection::open INSIDE #[cfg(test)] must NOT trip (cfg(test)-aware precision)"
-c="$(fresh)"; printf '\n#[cfg(test)]\nmod zz_probe_test {\n    fn t(p:&std::path::Path){ let _ = duckdb::Connection::open(p); }\n}\n' >> "$c/apps/aberp/src/mes_manager.rs"
+c="$(fresh)"; printf '\n#[cfg(test)]\nmod zz_probe_test {\n    fn t(p:&std::path::Path){ let _ = duckdb::Connection::open(p); }\n}\n' >> "$c/crates/audit-ledger/src/storage/mod.rs"
 expect_pass "$c" "P1 — Connection::open inside #[cfg(test)] is correctly IGNORED (not a residual)"
 
 echo "[CHECK P2] a COUNT-PRESERVING opener swap (rename the binding on a frozen opener line)"
 c="$(fresh)"
-sed -i 's/let mut conn = duckdb::Connection::open(&db_path)/let mut conn_swapped = duckdb::Connection::open(\&db_path)/' \
-    "$c/crates/aberp-mes/src/ledger_writer.rs"
+sed -i 's/let conn = Connection::open(path)/let conn_swapped = Connection::open(path)/' \
+    "$c/crates/audit-ledger/src/storage/mod.rs"
 expect_fail "$c" "opener fingerprint set DIVERGED" "P2 — a count-preserving intra-file opener swap is caught by the fingerprint freeze"
 
 echo "[CHECK P1/alias] an ALIASED live-DB open (use duckdb::Connection as X; X::open) — alias-evasion must be caught"
-c="$(fresh)"; printf '\nuse duckdb::Connection as ProbeAliasConn;\nfn _probe_alias(p:&std::path::Path){ let _ = ProbeAliasConn::open(p); }\n' >> "$c/apps/aberp/src/mes_manager.rs"
+c="$(fresh)"; printf '\nuse duckdb::Connection as ProbeAliasConn;\nfn _probe_alias(p:&std::path::Path){ let _ = ProbeAliasConn::open(p); }\n' >> "$c/crates/audit-ledger/src/storage/mod.rs"
 expect_fail "$c" "grew its openers" "P1/alias — an aliased Connection::open (alias-evasion) is caught, not invisible"
 
 echo "[CHECK P1/alias] an aliased open INSIDE #[cfg(test)] must NOT trip (alias scan is cfg(test)-aware)"
-c="$(fresh)"; printf '\n#[cfg(test)]\nmod zz_alias_test {\n    use duckdb::Connection as TAlias;\n    fn t(p:&std::path::Path){ let _ = TAlias::open(p); }\n}\n' >> "$c/apps/aberp/src/mes_manager.rs"
+c="$(fresh)"; printf '\n#[cfg(test)]\nmod zz_alias_test {\n    use duckdb::Connection as TAlias;\n    fn t(p:&std::path::Path){ let _ = TAlias::open(p); }\n}\n' >> "$c/crates/audit-ledger/src/storage/mod.rs"
 expect_pass "$c" "P1/alias — an aliased open inside #[cfg(test)] is correctly IGNORED"
 
 echo
