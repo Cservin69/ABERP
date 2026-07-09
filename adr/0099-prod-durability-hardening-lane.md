@@ -545,17 +545,31 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   deferred-flush + comments-stripped/strings-kept views; fixing them surfaced a
   25th read-fork, `quote_pdf_rerender_daemon::recover_unfinished_rerenders`, that
   the Ledger-only scan had missed. Probes P1d/P1e guard both.)
-- **HARD ORDERING (binding — a future session MUST NOT reorder this).**
-  `serve.rs::list_notes_history_request` and `serve.rs::sync_audit_mirror_best_effort`
-  / the material_inventory stock-movement mirror open read
-  `InvoiceDraftCreated`/`InvoiceStornoIssued` via a fresh `Ledger::open`. They do
-  NOT tear today only because the invoice issue/storno audit WRITERS are still on
-  fresh opens (main-file coherent). **The instant an invoice audit writer migrates
-  to the Handle, notes-history silently loses rows and NOTHING goes red** (CHECK N
-  is informational; no test covers cross-write-then-fresh-read of invoice events).
-  Therefore: migrate these READERS to Handle reads BEFORE — or in the SAME commit
-  as — any invoice issue/storno/draft audit WRITER. Do not migrate an invoice
-  audit writer while its fresh-open readers remain.
+- **THE COHERENCE MODEL (measured; pinned by `h3_handle_coherence_model.rs`).**
+  Q1 the Handle sees separate writes made BEFORE it opened; **Q2 the Handle is
+  BLIND to a separate connection's commit made AFTER it opened** (DuckDB keeps no
+  shared buffer cache across `Connection::open` instances); Q3 a fresh open sees
+  everything on disk (except when an interleaved separate open has torn the WAL —
+  the wave-2e machine_crud hazard). **Corollary — the migration invariant:** an
+  audit event FAMILY must be ENTIRELY on the Handle (writers + readers) or
+  ENTIRELY on fresh opens — never mixed. A reader migrates in the SAME atomic
+  commit as its family's writers, NOT before and NOT after.
+- **HARD ORDERING (binding — corrected by Q2; a future session MUST NOT reorder).**
+  `serve.rs::list_notes_history_request` + the invoice-side mirror-sync readers
+  read `InvoiceDraftCreated`/`InvoiceStornoIssued` via a fresh `Ledger::open`. They
+  are coherent TODAY only because the invoice audit WRITERS are also on fresh opens
+  (all-separate family). My earlier "migrate the readers BEFORE the writers" was
+  WRONG and is retracted: Q2 proves a Handle read while the writers are still
+  separate reads a STALE ledger — notes-history would drop live rows IMMEDIATELY,
+  not just later. **The invoice audit family — every invoice `append_in_tx` writer
+  (issue_invoice / issue_storno / issue_modification / invoice_draft / mark-paid /
+  the submit/poll/retry CLI one-shots that append invoice events) AND its readers
+  (notes_history, the invoice mirror-syncs, and the audit-query endpoints that read
+  invoice events) — must migrate to the Handle in ONE atomic commit.** Until that
+  commit, notes_history stays a fresh open (do not touch it). Cross-family audit
+  QUERY endpoints (`audit_events_request`, `get_audit_for_invoice/quote`) read
+  MANY families and are coherent only once ALL audit writers are on the Handle —
+  they migrate LAST.
 - **CANONICAL RECIPE — a `verify_chain` audit fn on the Handle** (resolved in
   wave-2c; the audit-ledger crate already supports it — `Ledger::from_connection`
   at `crates/audit-ledger/src/storage/mod.rs` + its test
