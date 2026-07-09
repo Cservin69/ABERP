@@ -45,10 +45,13 @@ for req in "$SCAN" "$COUNTS" "$FPRINTS"; do
 done
 [[ "$fail" -ne 0 ]] && { echo; echo "CUT-GATE: ✗ FAILED"; exit 1; }
 
-# Scope: apps/aberp/src + modules + crates, minus */tests/*. Pre-durability prod
-# has no aberp-db Handle / snapshot single-instance seam, so — unlike editions —
-# NOTHING is seam-excluded; every runtime opener is a frozen residual.
-scope_files() { find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/' | sort; }
+# Scope: apps/aberp/src + modules + crates, minus */tests/*. ADR-0099 H3
+# introduces the ONE sanctioned shared-instance seam — `crates/aberp-db` (the
+# shared DuckDB `Handle`) — which legitimately owns the single runtime
+# `Connection::open` every other site now routes through. Like the editions
+# gate, that seam is EXCLUDED from the census (its opener is the fix, not a
+# residual); every OTHER runtime opener remains a frozen residual to migrate.
+scope_files() { find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/|/aberp-db/' | sort; }
 
 # ── CHECK P1 — frozen census: no file exceeds its count; no new unlisted file ──
 echo "[CHECK P1] frozen opener census — no file grows, no new unlisted opener-bearing file (ENFORCED)"

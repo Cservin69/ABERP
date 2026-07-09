@@ -279,6 +279,108 @@ teeth re-proven against the new openers).
 
 ---
 
+## H3 — Class 1a/1b: one shared DuckDB `Handle` (in-process single-writer)
+
+Backported from the production-proven editions consolidation
+(`Cservin69/ABERP-Editions` @ `1e6097d`, ADR-0098/0099) under the LOCKED plan
+`PROD-HARDEN-2027.v1.0`. Landed incrementally on this branch; this section
+tracks the state and the exact remaining migration surface.
+
+### Invariant
+Exactly ONE `duckdb::Database` instance per `serve` process. Every runtime
+write routes through the shared `aberp_db::Handle` (`db.write()` +
+`append_in_tx`); every runtime read through `db.read()` (a `try_clone` of the
+one instance). ZERO non-Handle in-process runtime write-forks — where a
+write-fork is the TRUE fork primitive: ANY independent live-DB opener
+(`Connection::open` / `Ledger::open` / `append_reopen` / `DuckDbBillingStore::open`)
+followed by an audit append, in the same `serve`-process fn, outside the shared
+Handle. Allow-list ONLY: the `aberp-db`/`aberp-snapshot` seams,
+`#[cfg(test)]`/`open_in_memory`/`from_connection`, the pre-serve boot
+create/probe/recover openers (H2), and separate-process CLI one-shots (fenced by
+the whole-DB flock, F-E).
+
+### Problem (what H3 removes)
+The `serve` process hosts ~7 daemons + every request handler, each historically
+calling its OWN `Connection::open`/`Ledger::open`/`append_reopen` on the same
+single-file tenant DB, concurrently. DuckDB single-file storage is
+single-writer: N separate opens = N checkpoint actors racing one file
+(`duckdb#23046` torn metadata), AND two openers off the same audit head each
+self-assign the next `seq` → a forked audit ledger. The Defense line forked 4×
+(seq 369→416→428→515) precisely because openers were migrated PIECEMEAL; H3's
+gate is therefore ZERO residual, atomic — never partial.
+
+### Decision — the shared `Handle` (backported from editions `1e6097d`)
+`crates/aberp-db`: `Handle` / `WriteGuard` / `read()` = `try_clone` of the ONE
+instance + a post-commit lockstep `sync_mirror` hook, plus the pure D2
+`debounce` module. `AppState { db: HandleArc }`; the Handle is constructed at
+boot AFTER the H2 `provision_atomic` / `probe_open_or_preserve` chokepoint and
+threaded into every daemon `Deps`.
+
+Three deliberate prod adaptations vs. the editions source:
+1. **No `ensure_not_prod_path`** — that editions guard stops a Defense/dev build
+   from opening the real prod DB; the prod build legitimately operates on the
+   prod DB (the prod `aberp-snapshot` omits the guard by design).
+2. **`checkpoint_enabled` defaults `false`** — the runtime VALIDATED durable
+   checkpoint (`aberp_snapshot::live_durable_checkpoint`, quiesce→EXPORT→
+   atomic_install→reopen) is **H4's step**. In H3 the single-instance discipline
+   makes DuckDB's own bounded auto-checkpoint safe in the interim.
+   `Handle::run_durable_checkpoint_locked` is a clearly-marked H4 seam (a one-line
+   swap); the `aberp-snapshot` dep is deferred to H4 accordingly.
+3. Otherwise faithful — no re-derivation.
+
+### Mandatory pre-fixes (landed with the crate)
+- **Bug 5 (poison policy).** A panic while holding the shared `WriteGuard` would
+  poison the ONE process-wide writer mutex — a NEW single point of failure the
+  shared instance introduces. `Handle::write`/`read`/`checkpoint_on_idle` route
+  through `lock_recovering`: on a poisoned lock they `clear_poison`, reclaim the
+  guard, drop+reopen FRESH, and re-verify the audit hash-chain genesis→head. A
+  benign prior panic RESUMES; a FAILED re-verify is surfaced HARD
+  (`PoisonRecoveryFailed`, never served from a bad DB). The recovery emits a
+  `db.auto_recovered` (trigger `writer_poison_recovered`) forensic audit row.
+- **F-C (try_clone coherence).** `read()` is a `try_clone` of the shared
+  instance (one buffer cache), so a read observes every committed write
+  immediately — the S335 coherence property a separate read-only instance could
+  not provide. Pinned by the ported coherence e2e tests.
+- **F-A (runtime pragma + policy marker).** `open_runtime_connection` issues the
+  engine-adapter pragmas (`disable_checkpoint_on_shutdown` + `wal_autocheckpoint`
+  raise) behind an in-code policy marker documenting the authorized exception to
+  ADR-0021 `[[no-SQL-specific]]`. A pragma-presence gate check asserts the marker
+  + pragma are present.
+
+### New audit event
+`EventKind::DbAutoRecovered` (`db.auto_recovered`) added via the full F12 ritual:
+variant + `as_str` + `from_storage_str` + both `ALL_KINDS` lists + the three
+count pins (138→139: `all_kinds_count_is_pinned`, `aberp-verify` and
+`export_invoice_bundle` `const _` drift asserts) + the `db.`-scoped (never NAV
+XML) arm in both `extract_nav_xml` sweeps (ADR-0081).
+
+### Cut-gate evolution
+- The frozen opener-census gate (`cut_gate_opener_census.sh`, CHECK P1/P2) now
+  EXCLUDES the `crates/aberp-db` shared-instance seam (its `Connection::open` is
+  the fix, not a residual) — mirroring the editions gate. Negative probes still
+  green (teeth intact).
+- The **zero-residual write-fork gate** (editions CHECK 10M form:
+  `adr0099_write_fork_scan.awk`, opener+append per fn, allow-listed) is the H3
+  cut gate. It goes ENFORCING at residual = 0; until the in-process migration
+  reaches zero it is driven RED on the remainder (no de-gating).
+
+### Tests (RED-before / GREEN-after)
+`crates/aberp-db/tests/handle_concurrency_e2e.rs` (checkpoint-DISABLED subset;
+the checkpoint-fold tests land with H4):
+`concurrent_separate_opens_tear_the_file_but_shared_handle_never_does`,
+`daemon_write_appends_to_mirror_in_lockstep`, the F-C/S335 coherence pair,
+the separate-boot-opener fork repro + shared-Handle coherence pair, and
+`poisoned_writer_is_recovered_in_place_not_bricked` (Bug 5). Plus the 9 pure D2
+`debounce` unit tests.
+
+### Landed state / remaining migration
+Tracked in `tools/adr0099_write_fork_residuals.txt` (the shrinking-to-zero
+in-process write-fork residual) and the shrinking `adr0098_prod_*` census. The
+step is delivered incrementally; the exact remainder is reported with the gate
+RED on it rather than declaring done early.
+
+---
+
 ## Addendum — post-freeze advisory documented-ignore (2026-07-06, owner Ervin)
 
 **Status:** Accepted (config-only; supersedes nothing).

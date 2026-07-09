@@ -118,6 +118,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aberp-db"
+version = "0.0.0"
+dependencies = [
+ "aberp-audit-ledger",
+ "duckdb",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "aberp-digital-id"
 version = "0.0.0"
 dependencies = [

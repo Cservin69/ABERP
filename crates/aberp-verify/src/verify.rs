@@ -791,6 +791,10 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // event. `system.`-scoped; the payload names registered
         // daemons + their clean/timeout outcome, not NAV bytes.
         | EventKind::DaemonShutdownCompleted
+        // ADR-0099 H3 — durability auto-recovery event (`db.auto_recovered`,
+        // trigger writer_poison_recovered). `db.`-scoped; the payload is
+        // recovery telemetry (trigger + recovered head seq), never NAV bytes.
+        | EventKind::DbAutoRecovered
         // S220 / PR-217 — buyer-backfill cycle event. `system.`-scoped;
         // the payload carries cycle counters, not NAV bytes (the
         // per-row NAV bytes ride the row's NULL→filled customer_name
@@ -1145,7 +1149,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 138,
+        EventKind::ALL_KINDS_COUNT == 139,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
