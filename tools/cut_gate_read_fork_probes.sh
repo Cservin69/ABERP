@@ -120,6 +120,16 @@ if [[ "$withallow" -eq "$base" ]]; then
   printf '  ✓ an UNFENCED allow-list entry is REFUSED exemption — still counted (%s → %s). The flock earns the exemption, the filename does not.\n' "$base" "$withallow"; pass=$((pass+1))
 else printf '  ✗ HOLE: an unfenced allow-list entry was exempted (%s → %s) — CLI-on-filename is back\n' "$base" "$withallow"; bad=$((bad+1)); fi
 
+echo "[P8 exemption↔premise coupling] deleting the flock test makes CHECK N go RED"
+c="$(fresh)"
+# The allow-list is non-empty in the tree, so the gate REQUIRES the flock tests.
+# Remove the proving test file → the exemption's premise is gone → gate must fail.
+rm -f "$c/apps/aberp/tests/db_writer_lock_e2e.rs"
+rc=0; ( cd "$c" && bash "$GATE" ) >"$c/.o8" 2>&1 || rc=$?
+if [[ "$rc" -ne 0 ]] && grep -qF 'EXEMPTION PREMISE UNTESTED' "$c/.o8"; then
+  printf '  ✓ coupling holds: removing the flock test voids the CLI exemption (exit=%s) — the exemption cannot outlive its premise.\n' "$rc"; pass=$((pass+1))
+else printf '  ✗ DECOUPLED: flock test removed but CHECK N still passed (exit=%s) — exemption can rot alone\n' "$rc"; sed 's/^/        /' "$c/.o8"; bad=$((bad+1)); fi
+
 echo "[META fail-closed] a de-gated scanner must let real read-forks through"
 c="$(fresh)"
 printf 'END{}\n' > "$c/$SCAN"   # sabotage: scanner emits nothing for every file

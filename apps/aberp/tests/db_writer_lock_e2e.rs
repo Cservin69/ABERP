@@ -107,3 +107,78 @@ fn second_process_is_refused_the_whole_db_writer_lock() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// POISON / STALE-LOCK question, answered empirically instead of on trust: a
+/// process that DIES holding the lock — even by SIGKILL, which runs NO destructors
+/// (the guard's `Drop` never fires) — must not wedge the tenant DB forever. fs2
+/// advisory locks are held by the OS against the open file DESCRIPTION and are
+/// released when the kernel tears down the process's descriptors on exit, SIGKILL
+/// included. This test kills a lock-holding child with SIGKILL and asserts the
+/// next acquire succeeds — with NO manual cleanup. Deliberately NO `remove_file`:
+/// the lock file persists by design (same discipline as `submission_lock.rs`);
+/// only the OS-level lock is released. (If this ever regresses to needing a
+/// hand-deleted marker, that is the bug — do not add the delete.)
+#[test]
+fn lock_is_released_when_the_holder_is_sigkilled() {
+    // CHILD ARM: acquire the lock, signal readiness, then block "forever" (bounded
+    // so a lost parent can never wedge CI) until SIGKILL'd.
+    if std::env::var("ABERP_DBLOCK_KILL_CHILD").is_ok() {
+        let db = PathBuf::from(std::env::var("ABERP_DBLOCK_DB").unwrap());
+        let ready = PathBuf::from(std::env::var("ABERP_DBLOCK_READY").unwrap());
+        let _guard = db_writer_lock::acquire_or_refuse(&db, "prod", "kill-child")
+            .expect("kill-child must acquire the free lock");
+        std::fs::write(&ready, b"held").unwrap();
+        // Hold until killed; self-terminate after a bound so a dead parent cannot
+        // leave a zombie. The parent SIGKILLs us well before this elapses.
+        std::thread::sleep(Duration::from_secs(60));
+        return;
+    }
+
+    let dir = unique_dir("sigkill");
+    let db = dir.join("tenant.duckdb");
+    let ready = dir.join("child.ready");
+
+    let exe = std::env::current_exe().unwrap();
+    let mut child = std::process::Command::new(exe)
+        .args(["--exact", "lock_is_released_when_the_holder_is_sigkilled"])
+        .env("ABERP_DBLOCK_KILL_CHILD", "1")
+        .env("ABERP_DBLOCK_DB", &db)
+        .env("ABERP_DBLOCK_READY", &ready)
+        .env("RUST_TEST_THREADS", "1")
+        .spawn()
+        .expect("spawn kill-child holder process");
+
+    wait_for(&ready, "kill-child to acquire the lock");
+
+    // Held by a live separate process → we are refused.
+    assert!(
+        db_writer_lock::try_acquire(&db, "prod")
+            .expect("try_acquire ok")
+            .is_none(),
+        "lock must be held while the child is alive"
+    );
+
+    // SIGKILL the holder (std `Child::kill` sends SIGKILL on Unix — no destructors,
+    // no guard Drop, no cooperative cleanup).
+    child.kill().expect("SIGKILL the holder");
+    let _ = child.wait();
+
+    // The OS must have released the lock on the child's death. Poll briefly (the
+    // descriptor teardown is not strictly synchronous with wait()).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut freed = None;
+    while Instant::now() < deadline {
+        if let Some(g) = db_writer_lock::try_acquire(&db, "prod").expect("try_acquire ok") {
+            freed = Some(g);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        freed.is_some(),
+        "lock MUST be free after the holder is SIGKILLed — a dead process cannot poison the DB, and no marker is hand-deleted"
+    );
+    drop(freed);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

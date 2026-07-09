@@ -44,6 +44,30 @@ scope_files() { find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tes
 allow_set="$(grep -vE '^\s*#' "$ALLOW" | sed '/^\s*$/d' | sort -u)"
 is_allowed() { grep -qxF "$1" <<< "$allow_set"; }
 
+# ── EXEMPTION ↔ PREMISE COUPLING (hard invariant, ALWAYS enforced) ──
+# The CLI allow-list is sound ONLY because the cross-process F-E flock refuses a
+# second writer — proven by two PERMANENT process-level tests. If the allow-list
+# exempts anything, those tests MUST exist; otherwise the premise that justifies
+# every entry has silently rotted and the exemptions are void. Couple them so
+# neither can be removed alone.
+FLOCK_TEST_FILE="apps/aberp/tests/db_writer_lock_e2e.rs"
+FLOCK_REFUSE_TEST="second_process_is_refused_the_whole_db_writer_lock"
+FLOCK_SIGKILL_TEST="lock_is_released_when_the_holder_is_sigkilled"
+if [[ -n "$allow_set" ]]; then
+  miss=""
+  grep -q "fn ${FLOCK_REFUSE_TEST}" "$FLOCK_TEST_FILE" 2>/dev/null || miss="$miss $FLOCK_REFUSE_TEST"
+  grep -q "fn ${FLOCK_SIGKILL_TEST}" "$FLOCK_TEST_FILE" 2>/dev/null || miss="$miss $FLOCK_SIGKILL_TEST"
+  if [[ -n "$miss" ]]; then
+    echo "✗ EXEMPTION PREMISE UNTESTED — the CLI read-fork allow-list exempts $(wc -l <<< "$allow_set" | tr -d ' ') entry-lines"
+    echo "  on the cross-process flock, but its proving test(s) are MISSING:$miss"
+    echo "  (expected in $FLOCK_TEST_FILE). The premise that justifies EVERY allow-list entry is"
+    echo "  gone → the exemption is VOID. Restore the flock test, or empty the allow-list."
+    echo
+    echo "READ-FORK GATE: ✗ FAILED (exemption/premise decoupled — a hard invariant, not informational)"
+    exit 1
+  fi
+fi
+
 # A CLI one-shot's fresh audit read is coherent ONLY because the cross-process
 # whole-DB writer flock (F-E, db_writer_lock::acquire_or_refuse) makes it mutually
 # exclusive with serve — aberp-db's single-writer is a process-LOCAL Mutex and

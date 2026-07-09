@@ -494,9 +494,39 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   Probe P7 proves this has teeth. **This caught a real hole:** `export_invoice_bundle`
   was allow-listed but acquired the flock ZERO times — it could read a stale audit
   head mid-export. FIXED this wave (it now `acquire_or_refuse`s before opening the
-  ledger) + pinned by `run_refuses_while_the_whole_db_writer_lock_is_held`. The
-  flock's own cross-process refusal is proved by `db_writer_lock_e2e::second_process
-  _is_refused_the_whole_db_writer_lock` — the incident-preventing test.
+  ledger) + pinned by `run_refuses_while_the_whole_db_writer_lock_is_held`.
+- **THE FLOCK (F-E) IS BUILT, WIRED, AND PROVEN — the premise IS kept.**
+  `apps/aberp/src/db_writer_lock.rs` (fs2 `try_lock_exclusive`, consistent with
+  `mirror.rs`'s `fs2::FileExt`; NO `remove_file` — the marker persists by design,
+  like `submission_lock.rs`), acquired by `serve` at boot (`serve.rs`) and by every
+  CLI mutator before it opens the DB. Three PERMANENT process-level tests cover the
+  three cases: (A/B) `db_writer_lock_e2e::second_process_is_refused_the_whole_db_
+  writer_lock` — a separate OS process holds the lock, a second acquirer (a second
+  `serve`, or a CLI one-shot's `acquire_or_refuse`) is REFUSED, then re-acquires
+  after release; (poison) `lock_is_released_when_the_holder_is_sigkilled` — a
+  SIGKILL'd holder (no destructors run) still frees the lock, verified empirically
+  (fs2 releases on descriptor teardown), no marker hand-deleted; (C) the
+  export/mark-paid CLI paths run coherently when no `serve` holds the lock (the
+  export smoke suite). **Coupling:** `cut_gate_read_fork.sh` HARD-FAILS if the
+  allow-list is non-empty but either flock test is missing — the CLI exemption
+  cannot outlive its premise (probe P8). So the allow-list is no longer a promise;
+  the gate refuses to honour it unless the flock test that justifies it is present.
+- **P1c — RESOLUTION (was a scanner defect, now fixed; nothing known escapes).**
+  P1c (raw `Connection::open` + `SELECT … FROM audit_ledger`) was a SCANNER DEFECT,
+  not an invalid probe: the shape is legal Rust and is in fact used in ~10 files;
+  the scanner missed it because it stripped string literals (erasing the table name
+  inside the SQL) — plus a second defect, single-line/opener-on-closing-brace
+  blindness from flushing a fn's record mid-char-loop. BOTH are fixed
+  (comments-stripped/strings-kept `codenc` view; deferred flush), guarded by probes
+  P1e and P1d. Fixing them surfaced the 25th read-fork
+  (`quote_pdf_rerender_daemon::recover_unfinished_rerenders`). Opener shapes that
+  escape CHECK N TODAY, enumerated: (i) an audit reader that receives a `&Connection`
+  rather than opening one is intentionally NOT a read-fork (it rides the caller's —
+  possibly Handle — connection); (ii) an audit read via a non-`Ledger`, non-raw-SQL
+  path (none exists — all audit access is the typed `Ledger` or raw `audit_ledger`
+  SQL); (iii) dual-context fns whose in-serve hazard static scope can't isolate
+  (worklisted, covered by the proposed runtime tripwire). No silent Ledger/raw-SQL
+  reader shape is known to escape.
 - **CHECK N residual STATIC LIMITATION (flagged, not narrowed).**
   1. **Dual-context fns** — `issue_storno`/`issue_modification`/`poll_ack`/
      `submit_invoice` run in BOTH serve AND CLI; the same fn is coherent in the
