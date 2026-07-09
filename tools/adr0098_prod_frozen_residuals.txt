@@ -44,13 +44,13 @@
 # ADR-0099 H3 ratchet: serve.rs audit write-forks migrated onto the shared
 # aberp_db::Handle. Census ratcheted DOWN 285->271 / files 43. Re-derive: see
 # cut_gate_opener_census.sh. (P1 already forbids GROWTH; this is a sanctioned shrink.)
+#
+# ADR-0099 H3 ratchet (wave 2a, email_outbox + catalogue_push fully migrated): 267 openers / 41 files.
 3 apps/aberp/src/ap_sync.rs
 2 apps/aberp/src/avl_vendors.rs
-2 apps/aberp/src/catalogue_push.rs
 3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
 2 apps/aberp/src/email_invoice.rs
-2 apps/aberp/src/email_outbox_poll_daemon.rs
 7 apps/aberp/src/email_relay_daemon.rs
 1 apps/aberp/src/export_invoice_bundle.rs
 9 apps/aberp/src/incoming_invoices.rs

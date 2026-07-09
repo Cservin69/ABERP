@@ -1667,6 +1667,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     );
                     let push_deps = crate::catalogue_push::CataloguePushDeps {
                         db_path: (*st.db_path).clone(),
+                        db: st.db.clone(),
                         tenant: st.tenant.clone(),
                         binary_hash,
                         operator_login: operator_login.clone(),
@@ -2213,6 +2214,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 });
             let outbox_deps = crate::email_outbox_poll_daemon::EmailOutboxPollDaemonDeps {
                 db_path: (*recovery_state.db_path).clone(),
+                db: recovery_state.db.clone(),
                 tenant: recovery_state.tenant.clone(),
                 binary_hash,
                 operator_login,

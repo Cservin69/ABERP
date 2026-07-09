@@ -223,6 +223,8 @@ async fn run_push(
 
     let handle = CataloguePushHandle::dormant();
     let deps = CataloguePushDeps {
+        db: aberp::serve::open_tenant_handle(&db_path, TenantId::new("test").expect("tenant id"))
+            .expect("open shared handle"),
         db_path: db_path.clone(),
         tenant: TenantId::new("test").expect("tenant id"),
         binary_hash: BinaryHash::from_bytes([0u8; 32]),
