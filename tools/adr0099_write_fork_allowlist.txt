@@ -1,0 +1,22 @@
+# ADR-0099 H3 — write-fork ALLOW-LIST (the ONLY sanctioned in-tree opener+append fns).
+#
+# Format: <file>:<fname>  (one per line; '#' comments ignored).
+#
+# The write-fork scanner (tools/adr0099_write_fork_scan.awk) flags every RUNTIME
+# fn that contains BOTH an independent live-DB opener (Connection::open /
+# Ledger::open / append_reopen / DuckDbBillingStore::open) AND an audit append —
+# the TRUE audit-ledger fork primitive (lesson 1). The prod H3 gate is ZERO such
+# forks OUTSIDE this allow-list. Allow-listed here are ONLY:
+#   * the audit-ledger `append_reopen` PRIMITIVE itself (the reopen building block
+#     the pre-Handle boot/CLI paths call; not a serve-process fork).
+#   * separate-process CLI one-shots (no shared Handle in-process; fenced by the
+#     whole-DB writer flock, F-E) — currently request_technical_annulment::run.
+#   * pre-serve BOOT openers that run BEFORE the shared Handle is constructed
+#     (serve.rs Handle::open_default is the boot line) — record_upgrade_snapshot_mismatch_audit.
+#
+# Everything else the scanner flags is an in-serve write-fork that MUST route
+# through the shared aberp_db::Handle. The migration worklist (the not-yet-migrated
+# remainder) is tracked in tools/adr0099_write_fork_migration_worklist.txt.
+crates/audit-ledger/src/storage/mod.rs:append_reopen
+apps/aberp/src/request_technical_annulment.rs:run
+apps/aberp/src/serve.rs:record_upgrade_snapshot_mismatch_audit

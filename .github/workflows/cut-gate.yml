@@ -47,3 +47,13 @@ jobs:
         # alias-evasion) in a throwaway copy and asserts the gate FAILS — so a
         # green gate above is a meaningful signal, not a gate that can't go red.
         run: bash tools/cut_gate_negative_probes.sh
+
+      - name: ADR-0099 H3 write-fork migration tracker (informational)
+        # The corrected zero-residual fork gate (CHECK 10M): every in-serve
+        # audit write-fork must route through the shared aberp_db::Handle. While
+        # the H3 opener migration is in progress this runs INFORMATIONAL (prints
+        # the remaining forks + count, exits 0) so the branch stays green and the
+        # exact remainder is visible in CI. It flips to ENFORCING (fail on any
+        # remaining fork) by setting ENFORCE_WRITE_FORK=1 here the moment the
+        # migration reaches zero — that flip is the H3 acceptance cut.
+        run: bash tools/cut_gate_write_fork.sh
