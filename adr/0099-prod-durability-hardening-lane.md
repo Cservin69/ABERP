@@ -386,9 +386,14 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   + F-C/F-A pre-fixes.
 - `EventKind::DbAutoRecovered` (full F12 ritual).
 - F-E: the cross-process whole-DB single-writer flock (`db_writer_lock.rs`) +
-  serve boot acquisition + the cross-process refusal e2e.
+  serve boot acquisition + the cross-process refusal e2e, **and** all 14
+  DB-mutating CLI one-shots now `acquire_or_refuse` the whole-DB writer lock
+  before opening the tenant DB (COMPLETE — closes the CLI-vs-serve two-writer
+  class that forced a hand-stop of prod on 2026-07-09).
 - The zero-residual write-fork gate machinery (scanner + allow-list + the
   informational CI tracker) enumerating the exact remainder.
+- The EXACT toolchain pin (`channel = "1.97.0"`) so the gates are reproducible
+  for the effort.
 
 **Remainder (the ATOMIC step — deliberately NOT landed piecemeal):**
 Wiring the `Handle` into `AppState`/every daemon `Deps` and migrating **all**
@@ -403,12 +408,28 @@ shrinking waves because:
      in `build_state` (which also eager-creates the DB, tripping the
      "no-DB-write-before-gate" route tests) and then seed/verify through SEPARATE
      connections, so a partial migration leaves those harnesses reading a stale
-     instance. Routing every test harness's seed+verify through the shared Handle
-     is part of the same atomic change.
-The informational write-fork tracker prints the exact fork list to migrate
-(`bash tools/cut_gate_write_fork.sh` — currently 34 in-serve forks); completing
-it + flipping the gate to ENFORCING + re-cutting the census baselines + the
-test-harness coherence pass is the H3 acceptance cut.
+     instance. Routing the harnesses coherently is part of the same atomic change.
+
+**Proven fix strategy for (2) (empirically verified 2026-07-09).** Two DuckDB
+coherence probes settle the test-harness approach — it is a *reorder*, not a
+rewrite:
+  - A separate write **before** the Handle opens IS visible to `Handle::read()`
+    (the pre-open write folds to main on the seed-conn close; the Handle opens
+    fresh over it). ⇒ the fix is **seed-before-`build_state`** so migrated
+    handlers (reading via `state.db`) see the seed.
+  - A fresh separate `Connection::open` **sees the Handle's WAL-only committed
+    write while the Handle is still held** (fresh opens replay the WAL). ⇒ test
+    **verifies via fresh opens keep working** with no change.
+So the atomic change is: (a) a serve `open_tenant_handle` helper +
+`ensure_all_tenant_schemas` (so a test/boot Handle owns schema creation, editions
+form); (b) `AppState.db` + boot construction + daemon `Deps.db` threading;
+(c) migrate all 34 in-serve write-forks to `db.write()`/`db.read()`; (d) per
+affected route test, move seeding **before** `build_state` and adjust the handful
+of "no-DB-leak" assertions (the Handle now legitimately creates the DB);
+(e) re-cut the `adr0098_prod_*` census baselines; (f) flip the write-fork gate to
+`ENFORCE_WRITE_FORK=1` + add the F-A pragma-presence gate check. The informational
+tracker prints the exact fork list (`bash tools/cut_gate_write_fork.sh` — 34
+in-serve forks). That whole set landing green together is the H3 acceptance cut.
 
 ---
 
