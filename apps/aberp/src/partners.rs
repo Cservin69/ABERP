@@ -781,10 +781,7 @@ fn inputs_to_normalized(inputs: &PartnerInputs) -> NormalizedInputs {
 /// trimmed string if parsing yields zero tokens (defence in depth: the
 /// caller-side validator should have caught this).
 fn normalize_emails(s: Option<&str>) -> Option<String> {
-    let raw = match s {
-        Some(v) => v.trim(),
-        None => return None,
-    };
+    let raw = s?.trim();
     if raw.is_empty() {
         return None;
     }

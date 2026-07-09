@@ -619,3 +619,30 @@ Census baselines re-cut as above. `cargo fmt --check`, clippy `-D warnings`, and
 the full `aberp` test suite are green; no `#[ignore]`, no `continue-on-error`,
 zero durability skips. The `PROD_v2.27.76` tree hash and `main` are unchanged;
 nothing merged to `main`, no cut. H3 is sequenced off the resulting HEAD.
+
+### Toolchain drift — clippy 1.97 (separate, flagged commit)
+
+**Not part of the three defects.** While verifying `ci.yml` green, the shared
+`ci` job was found already RED on the H3 base (`7a169f3`) at the **Clippy** step
+— NOT a regression of this Addendum. Root cause is the same class as Addendum 1's
+`cargo-deny` advisory drift: `rust-toolchain.toml` pins the **channel** (`stable`,
+per ADR-0001 / ADR-0021), and CI installs stable **fresh at run time**. Stable
+**1.97.0** shipped 2026-07-07 (two days before this incident) and tightened
+`clippy::useless_borrows_in_formatting` + `clippy::question_mark`, so
+`cargo clippy --workspace -D warnings` now flags code the pinned-local 1.95.0
+did not. Reproduced locally under 1.97.0: **5 sites**, all mechanical and
+semantically no-ops —
+`aberp-quote-intake/src/transport.rs`, `apps/aberp/src/catalogue_push.rs`,
+`apps/aberp/src/quote_pricing_pipeline.rs`, `apps/aberp/src/serve.rs`
+(all `format!("… {}", &*x)` → `*x`, a redundant `&` removal on a
+`Zeroizing<String>` bearer token), and `apps/aberp/src/partners.rs`
+(`match s { Some(v) => …, None => return None }` → `s?`). Fixed in a **separate,
+clearly-labelled commit** so the three-defect change stays reviewable in
+isolation; `cargo-deny` / `cargo-audit` were re-run against the live advisory DB
+and are clean (no new supply-chain drift), so this clippy sweep is the sole
+delta needed to bring `ci.yml` fully green. The sweep touches unrelated crates
+only to satisfy the newer linter; it is flagged here for the owner exactly as
+Addendum 1 flagged the supply-chain-drift decision. (A future re-harden may
+instead pin an exact toolchain version on this branch — the escape hatch
+`rust-toolchain.toml`'s own comment names — but that is a policy call left to
+the owner; the mechanical sweep changes no documented policy.)
