@@ -380,6 +380,34 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
 
 ### Landed state / remaining migration
 
+#### Migration progress (2026-07-09, updated as waves land)
+- **Wave 1** — Handle wired into `AppState`/boot (`open_tenant_handle`); **10
+  serve.rs request-handler write-forks** migrated onto `state.db`. Residual
+  34 → 24. Census 285 → 271.
+- **Wave 2a** — **2 remote-queue daemons** (`email_outbox_poll_daemon`,
+  `catalogue_push`) migrated **100%** onto the Handle. Residual 24 → 22. Census
+  271 → 267.
+- **RESHAPED SCOPE (critical, from the interleaved-fold probe):** it is NOT
+  enough to migrate a subsystem's audit write-fork. With the runtime checkpoint
+  disabled in H3, the Handle holds a persistent WAL-resident connection; any
+  SEPARATE `Connection::open`/`Ledger::open` on the live file — even a read —
+  close-folds the Handle's pending audit WAL, and a fresh reader then sees only a
+  SUBSET of the audit rows. So a subsystem that touches the Handle must route
+  **100% of its DB access (reads AND writes)** through it. Request handlers whose
+  whole flow runs on one guard are safe (wave 1); long-running **daemons** and
+  handlers that interleave a separate business write with a Handle audit must be
+  fully migrated together. This is the real content of "migrate 100% of runtime
+  openers, atomic".
+- **Remaining (22 write-forks; each a FULL-subsystem migration):**
+  `email_relay_daemon`, `quote_pdf_rerender_daemon` (both reverted to coherent
+  all-reopen, await full migration), `ap_sync`, `avl_vendors`, `email_invoice`,
+  `incoming_invoices` (×2), `material_inventory`, `mes_manager`,
+  `quote_calibration`, `quoting_machines` (12 caller handlers on the shared
+  `append_machine_event`), `restore_from_nav_outgoing` (×2),
+  `quote_pricing_pipeline` (×9). `bash tools/cut_gate_write_fork.sh` prints the
+  live list. Each removes openers → re-cut the census baselines in the same
+  commit; the write-fork gate flips to `ENFORCE_WRITE_FORK=1` when it hits zero.
+
 **Landed on this branch (all genuinely green — ci both arms + cut-gate):**
 - `crates/aberp-db`: the shared `Handle`/`WriteGuard`/`read()` + pure D2
   `debounce` module + the checkpoint-disabled e2e suite + poison-recovery (Bug 5)
