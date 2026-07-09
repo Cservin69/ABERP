@@ -46,6 +46,8 @@
 # cut_gate_opener_census.sh. (P1 already forbids GROWTH; this is a sanctioned shrink.)
 #
 # ADR-0099 H3 ratchet (wave 2a, email_outbox + catalogue_push fully migrated): 267 openers / 41 files.
+#
+# ADR-0099 H3 ratchet (wave 2b, mes_manager): 266 openers / 40 files.
 3 apps/aberp/src/ap_sync.rs
 2 apps/aberp/src/avl_vendors.rs
 3 apps/aberp/src/drain_pending_retries.rs
@@ -60,7 +62,6 @@
 4 apps/aberp/src/mark_abandoned.rs
 3 apps/aberp/src/mark_invoice_paid.rs
 1 apps/aberp/src/material_inventory.rs
-1 apps/aberp/src/mes_manager.rs
 4 apps/aberp/src/observe_receiver_confirmation.rs
 5 apps/aberp/src/poll_ack.rs
 3 apps/aberp/src/poll_annulment_ack.rs

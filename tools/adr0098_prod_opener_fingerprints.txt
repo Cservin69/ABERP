@@ -12,6 +12,8 @@
 # ADR-0099 H3 ratchet: 271 openers after the serve.rs write-fork migration.
 #
 # ADR-0099 H3 ratchet (wave 2a): 267 openers.
+#
+# ADR-0099 H3 ratchet (wave 2b): 266 openers.
 apps/aberp/src/ap_sync.rs|bootstrap_year_already_recorded:let ledger = Ledger::open(db_path, tenant, binary_hash).with_context(|| {
 apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let mut conn = duckdb::Connection::open(db_path).with_context(|| {
@@ -58,7 +60,6 @@ apps/aberp/src/mark_invoice_paid.rs|mark_paid:let ledger = Ledger::open(db_path,
 apps/aberp/src/mark_invoice_paid.rs|mark_paid:let ledger_for_check = Ledger::open(db_path, tenant.clone(), binary_hash)
 apps/aberp/src/mark_invoice_paid.rs|mark_paid:let mut conn = Connection::open(db_path).with_context(|| {
 apps/aberp/src/material_inventory.rs|append_heat_lot_events:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-apps/aberp/src/mes_manager.rs|audit:let mut conn = Connection::open(&deps.db_path)
 apps/aberp/src/observe_receiver_confirmation.rs|load_base_nav_invoice_number:let store = DuckDbBillingStore::open(db_path)
 apps/aberp/src/observe_receiver_confirmation.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
 apps/aberp/src/observe_receiver_confirmation.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)

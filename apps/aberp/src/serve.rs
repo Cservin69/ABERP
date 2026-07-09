@@ -2047,6 +2047,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 .context("await background binary hash for MES adapter boot")?;
             let mes_deps = crate::mes_boot::MesBootDeps {
                 db_path: (*recovery_state.db_path).clone(),
+                db: recovery_state.db.clone(),
                 tenant: recovery_state.tenant.clone(),
                 binary_hash,
                 operator_login,
@@ -11098,6 +11099,7 @@ fn mes_deps_for_request(state: &AppState) -> Result<crate::mes_boot::MesBootDeps
         .context("await binary hash for adapter mutation")?;
     Ok(crate::mes_boot::MesBootDeps {
         db_path: (*state.db_path).clone(),
+        db: state.db.clone(),
         tenant: state.tenant.clone(),
         binary_hash,
         operator_login,
