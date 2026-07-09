@@ -33,7 +33,8 @@ cd "$ROOT"
 
 SCAN="tools/adr0099_write_fork_scan.awk"
 ALLOW="tools/adr0099_write_fork_allowlist.txt"
-for req in "$SCAN" "$ALLOW"; do
+OPENSCAN="tools/adr0098_opener_scan.awk"   # ALL runtime openers (cfg(test)-aware)
+for req in "$SCAN" "$ALLOW" "$OPENSCAN"; do
   [[ -f "$req" ]] || { echo "✗ FAIL: required gate asset missing: $req"; exit 1; }
 done
 
@@ -41,6 +42,37 @@ enforce="${ENFORCE_WRITE_FORK:-0}"
 echo "ADR-0099 H3 write-fork gate — root: $ROOT  (mode: $([[ "$enforce" == "1" ]] && echo ENFORCING || echo informational))"
 
 scope_files() { find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/|/aberp-db/' | sort; }
+
+# ── CHECK M — no half-migrated subsystem (the all-or-nothing rule, ALWAYS ENFORCED) ──
+# With the runtime checkpoint DISABLED in H3, the shared Handle holds a persistent
+# WAL-resident connection. A per-subsystem file that ROUTES access through the
+# Handle (`.db.write()` / `.db.read()`) MUST NOT also retain a SEPARATE runtime
+# live-DB opener: the Handle's writes sit in the WAL while the separate open
+# reads / close-folds the main file, so a fresh reader sees a TORN ledger — a live
+# correctness bug (the `entry_already_delivered` duplicate-delivery class), not a
+# style nit. A half-migrated subsystem is strictly WORSE than an unmigrated one.
+# serve.rs is EXEMPT: it is the router, migrated handler-by-handler; each migrated
+# handler runs its whole flow on ONE guard (self-contained, no interleave), which
+# the route tests exercise directly.
+echo "[CHECK M] no half-migrated subsystem — a Handle-using file keeps NO separate runtime opener (ENFORCED)"
+mixed=0
+while IFS= read -r f; do
+  [[ "$f" == "apps/aberp/src/serve.rs" ]] && continue
+  grep -qE '\.db\.(write|read)[[:space:]]*\(' "$f" || continue   # routes through the Handle?
+  op="$(awk -f "$OPENSCAN" "$f" 2>/dev/null)"                    # residual runtime openers?
+  [[ -z "$op" ]] && continue
+  echo "  ✗ HALF-MIGRATED: $f uses the shared Handle AND retains a separate runtime opener —"
+  echo "$op" | sed 's/^/        /'
+  mixed=$((mixed+1))
+done < <(scope_files)
+if [[ "$mixed" -ne 0 ]]; then
+  echo
+  echo "WRITE-FORK GATE: ✗ FAILED — $mixed half-migrated subsystem(s). Route ALL of each"
+  echo "subsystem's DB access (READS included: db.read()) through the shared Handle."
+  exit 1
+fi
+echo "  ✓ no half-migrated subsystem — every Handle-using file (bar the serve.rs router) is fully single-instance"
+echo
 
 # Build the allow-listed set of "<file>:<fname>".
 allow_set="$(grep -vE '^\s*#' "$ALLOW" | sed '/^\s*$/d' | sort -u)"

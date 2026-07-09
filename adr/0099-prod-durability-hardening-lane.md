@@ -397,16 +397,37 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   whole flow runs on one guard are safe (wave 1); long-running **daemons** and
   handlers that interleave a separate business write with a Handle audit must be
   fully migrated together. This is the real content of "migrate 100% of runtime
-  openers, atomic".
-- **Remaining (22 write-forks; each a FULL-subsystem migration):**
+  openers, atomic". This is the same WAL-visibility asymmetry that made head
+  measurement lie during the prod incident — treat it as a class.
+- **It is a LIVE CORRECTNESS BUG, not a test artifact.** `email_outbox_poll_daemon
+  ::entry_already_delivered` was an idempotency guard built on its own
+  `Ledger::open`: against Handle-routed writes it read a stale main-file view,
+  MISSED a just-delivered entry, and would have **sent the email a second time**.
+  Now on `db.read()`. Sibling sweep (dedupe / "already did this" guards that open
+  their own connection): `ap_sync::bootstrap_year_already_recorded` and
+  `restore_from_nav_outgoing::load_already_restored_cache` are the same shape —
+  they migrate WITH their subsystems (currently coherent as all-reopen). The CLI
+  retry-drains (`drain-pending-retries`/`retry-submission`) are genuinely
+  cross-process → they take the F-E **flock**, not `db.read()`.
+- **THE ALL-OR-NOTHING RULE (now a GATE).** A subsystem with a `db` field AND a
+  residual `Connection::open` is a violation. `tools/cut_gate_write_fork.sh`
+  **CHECK M** enforces it ALWAYS (not gated on `ENFORCE_WRITE_FORK`): any file
+  (bar the `serve.rs` router) that uses `.db.write()`/`.db.read()` AND retains a
+  runtime opener fails the gate. A half-migrated subsystem is strictly WORSE than
+  an unmigrated one (writes to the WAL, reads on the main file), so the gate
+  refuses it outright.
+- **Wave 2b** — `mes_manager` (adapter audit; the subsystem's only DB access).
+  Residual 22 → 21. Census 267 → 266.
+- **Remaining (21 write-forks; each a FULL-subsystem migration):**
   `email_relay_daemon`, `quote_pdf_rerender_daemon` (both reverted to coherent
   all-reopen, await full migration), `ap_sync`, `avl_vendors`, `email_invoice`,
-  `incoming_invoices` (×2), `material_inventory`, `mes_manager`,
-  `quote_calibration`, `quoting_machines` (12 caller handlers on the shared
-  `append_machine_event`), `restore_from_nav_outgoing` (×2),
-  `quote_pricing_pipeline` (×9). `bash tools/cut_gate_write_fork.sh` prints the
-  live list. Each removes openers → re-cut the census baselines in the same
-  commit; the write-fork gate flips to `ENFORCE_WRITE_FORK=1` when it hits zero.
+  `incoming_invoices` (×2), `material_inventory`, `quote_calibration`,
+  `quoting_machines` (12 caller handlers on the shared `append_machine_event`),
+  `restore_from_nav_outgoing` (×2), `quote_pricing_pipeline` (×9). `bash
+  tools/cut_gate_write_fork.sh` prints the live list. Each removes openers →
+  re-cut the census baselines in the same commit; the write-fork gate flips to
+  `ENFORCE_WRITE_FORK=1` when it hits zero. The negative probes are migration-
+  invariant (synthetic scratch files), so they do NOT need touching per wave.
 
 **Landed on this branch (all genuinely green — ci both arms + cut-gate):**
 - `crates/aberp-db`: the shared `Handle`/`WriteGuard`/`read()` + pure D2
