@@ -57,3 +57,20 @@ jobs:
         # remaining fork) by setting ENFORCE_WRITE_FORK=1 here the moment the
         # migration reaches zero — that flip is the H3 acceptance cut.
         run: bash tools/cut_gate_write_fork.sh
+
+      - name: ADR-0099 H3 READ-fork migration tracker (CHECK N, informational)
+        # The DUAL of the write-fork gate. CHECK 10M is structurally blind to an
+        # independent opener that READS the audit ledger: once any writer is on
+        # the shared Handle (checkpoint disabled), a fresh Ledger::open reader
+        # sees only the folded SUBSET — a silent torn read (proved in wave-2e).
+        # INFORMATIONAL while the in-serve readers migrate to Handle reads; flips
+        # to ENFORCING via ENFORCE_READ_FORK=1 at zero. See ADR-0099 §CHECK N for
+        # the static limitation (dual-context fns) + the runtime-tripwire backstop.
+        run: bash tools/cut_gate_read_fork.sh
+
+      - name: Prove the read-fork gate has teeth (negative probes)
+        # Synthetic scratch-file probes: detect a pure reader, EXCLUDE an appender
+        # (write-fork) and the from_connection seam, ignore cfg(test), honour the
+        # allow-list, and prove fail-closed (a de-gated scanner passes the real
+        # read-forks). A negative probe that cannot fail is decoration.
+        run: bash tools/cut_gate_read_fork_probes.sh

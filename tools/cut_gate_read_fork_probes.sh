@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+#
+# cut_gate_read_fork_probes.sh — proves CHECK N (the audit read-fork gate) has TEETH.
+#
+# MIGRATION-INVARIANT BY DESIGN. Every probe operates on a SYNTHETIC scratch file
+# the probe itself creates/mutates/deletes inside a throwaway COPY of the tree —
+# NEVER a real source file. So the probes stay valid through the entire read-fork
+# migration (24 → 0), including full zero-residual.
+#
+# Detection probes assert on the SCANNER (adr0099_read_fork_scan.awk) directly:
+# RED = the scanner emits a readfork record, GREEN = it stays silent. The gate
+# probes exercise the allow-list + the fail-closed property (a de-gated scanner
+# passes real read-forks). Exit 0 = every probe behaved.
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCAN="tools/adr0099_read_fork_scan.awk"
+GATE="tools/cut_gate_read_fork.sh"
+ALLOW="tools/adr0099_read_fork_allowlist.txt"
+SCRATCH="apps/aberp/src/zz_readfork_scratch.rs"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/readfork-probes.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+pass=0; bad=0
+
+emits() { # $1 = rust source text -> echoes the scanner's readfork records
+  printf '%s' "$1" | awk -f "$ROOT/$SCAN" 2>/dev/null
+}
+expect_emit() { # $1 label  $2 source
+  if [[ -n "$(emits "$2")" ]]; then printf '  ✓ detects: %s\n' "$1"; pass=$((pass+1))
+  else printf '  ✗ MISSED: %s — scanner emitted nothing\n' "$1"; bad=$((bad+1)); fi
+}
+expect_silent() { # $1 label  $2 source
+  if [[ -z "$(emits "$2")" ]]; then printf '  ✓ correctly ignores: %s\n' "$1"; pass=$((pass+1))
+  else printf '  ✗ FALSE POSITIVE: %s — scanner emitted: %s\n' "$1" "$(emits "$2")"; bad=$((bad+1)); fi
+}
+fresh() { local d; d="$(mktemp -d "$WORK/copy.XXXXXX")"; tar -C "$ROOT" --exclude=.git --exclude=target -cf - . | tar -C "$d" -xf -; printf '%s' "$d"; }
+
+echo "negative probes for the ADR-0099 read-fork gate CHECK N (synthetic, migration-invariant)"
+echo "root: $ROOT"; echo
+
+# ── detection correctness (scanner) ──────────────────────────────────────────
+# NOTE: snippets are MULTI-LINE like real code — the scanner emits a fn's record
+# when its body-closing `}` is seen, so the opener/read must land on earlier lines.
+expect_emit "P1 pure reader: Ledger::open + .entries() (no append)" \
+'fn _p(p: &std::path::Path) {
+    let l = aberp_audit_ledger::Ledger::open(p, t, h).unwrap();
+    let _ = l.entries();
+}'
+
+expect_emit "P1b sync_mirror-only reader: Ledger::open + .sync_mirror()" \
+'fn _p(p: &std::path::Path) {
+    let l = aberp_audit_ledger::Ledger::open(p, t, h).unwrap();
+    let _ = l.sync_mirror(&m);
+}'
+
+expect_silent "P2 appender EXCLUDED: Ledger::open + .entries() + append_in_tx (that is a WRITE-fork)" \
+'fn _p(p: &std::path::Path) {
+    let l = aberp_audit_ledger::Ledger::open(p, t, h).unwrap();
+    let _ = l.entries();
+    aberp_audit_ledger::append_in_tx(&tx, &m, k, v, a, None).unwrap();
+}'
+
+expect_silent "P3 from_connection seam: reads the SHARED instance, not a fresh open" \
+'fn _p(g: &Guard) {
+    let l = aberp_audit_ledger::Ledger::from_connection(g.try_clone().unwrap(), t, h);
+    let _ = l.entries();
+}'
+
+expect_silent "P4 cfg(test) ignored: a read-fork inside #[cfg(test)]" \
+'#[cfg(test)]
+mod z {
+    fn _p(p: &std::path::Path) {
+        let l = aberp_audit_ledger::Ledger::open(p, t, h).unwrap();
+        let _ = l.entries();
+    }
+}'
+
+expect_silent "P5 business read (no audit): Connection::open reading a business table" \
+'fn _p(p: &std::path::Path) {
+    let c = duckdb::Connection::open(p).unwrap();
+    let _ = c.prepare("SELECT id FROM vendors");
+}'
+
+# ── gate wiring: allow-list + fail-closed ────────────────────────────────────
+echo "[P6 allow-list] a scratch read-fork ADDED to the allow-list is not counted"
+c="$(fresh)"
+printf 'fn probe_reader(p: &std::path::Path) {\n    let l = aberp_audit_ledger::Ledger::open(p, t, h).unwrap();\n    let _ = l.entries();\n}\n' > "$c/$SCRATCH"
+base=$( ( cd "$c" && bash "$GATE" ) 2>&1 | grep -oE '[0-9]+ in-serve audit read-fork' | grep -oE '^[0-9]+' )
+printf '%s:probe_reader\n' "$SCRATCH" >> "$c/$ALLOW"
+withallow=$( ( cd "$c" && bash "$GATE" ) 2>&1 | grep -oE '[0-9]+ in-serve audit read-fork' | grep -oE '^[0-9]+' )
+if [[ "$base" -gt 0 && "$withallow" -eq $((base-1)) ]]; then
+  printf '  ✓ allow-list removes exactly the scratch reader (%s → %s)\n' "$base" "$withallow"; pass=$((pass+1))
+else printf '  ✗ BROKEN: allow-list did not drop the scratch reader (base=%s withallow=%s)\n' "$base" "$withallow"; bad=$((bad+1)); fi
+
+echo "[META fail-closed] a de-gated scanner must let real read-forks through"
+c="$(fresh)"
+printf 'END{}\n' > "$c/$SCAN"   # sabotage: scanner emits nothing for every file
+rc=0; ( cd "$c" && ENFORCE_READ_FORK=1 bash "$GATE" ) >/dev/null 2>&1 || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+  printf '  ✓ fail-closed: a de-gated scanner (emits nothing) makes ENFORCE pass the 24 real read-forks (rc=0) — so the SCANNER is load-bearing; the detection probes above would flip to MISSED the moment anyone neuters it.\n'
+  pass=$((pass+1))
+else printf '  ✗ META BROKEN: de-gated scanner still non-zero (rc=%s)\n' "$rc"; bad=$((bad+1)); fi
+
+echo
+echo "probes passed: $pass   broken/escaped: $bad"
+if [[ "$bad" -ne 0 ]]; then echo "READ-FORK PROBES: ✗ FAILED"; exit 1; fi
+echo "READ-FORK PROBES: ✓ ALL CHECKS HAVE TEETH (synthetic; invariant under the migration)"

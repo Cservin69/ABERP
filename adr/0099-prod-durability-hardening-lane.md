@@ -466,16 +466,54 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
     `email_invoice::record_email_audit_entry` (wave-2d) carries an extra
     `verify_chain` + explicit `sync_mirror` — a RECURRING shape (ap_sync's
     cycle-audit fn has it too) handled by the CANONICAL RECIPE below.
-- **NEW FINDING — audit-READ-forks (a cross-cutting H3 gap, flagged).** The
-  write-fork gate targets audit *appends*, but there are ALSO fresh-open audit
-  *reads* in serve that go incoherent once their events are Handle-resident:
-  `serve.rs` `notes_history` scan (`Ledger::open` → `list_notes_history`, reads
-  `InvoiceDraftCreated`/`InvoiceStornoIssued`) and the material_inventory
-  stock-movement `Ledger::open`→`sync_mirror`. Wave-2e does NOT regress
-  notes-history (it reads only invoice events, not machine/margin/partner), but
-  the moment the invoice issue/storno audit writers migrate, notes-history WILL
-  tear unless it is moved to a Handle read first. This class needs its own sweep
-  + (ideally) a gate, analogous to the write-fork gate. Not addressed here.
+- **CHECK N — the audit-READ-fork gate (BUILT; the write-fork gate's dual).**
+  The write-fork gate (CHECK 10M) targets audit *appends* and is STRUCTURALLY
+  BLIND to fresh-open audit *reads*. Once any writer is on the Handle (checkpoint
+  disabled), a fresh `Ledger::open` reader sees only the folded SUBSET on the
+  main file — a silent torn read (proved in wave-2e). A gate that cannot see a
+  bug class does not protect against it, so CHECK N closes the gap:
+  `tools/adr0099_read_fork_scan.awk` (fresh `Ledger::open` + a ledger READ —
+  `.entries()`/`.verify_chain()`/`.sync_mirror()`/`list_notes_history` — and NO
+  append), `tools/cut_gate_read_fork.sh` (informational → `ENFORCE_READ_FORK=1`
+  at zero), `tools/adr0099_read_fork_allowlist.txt` (CLI one-shots only),
+  `tools/cut_gate_read_fork_probes.sh` (synthetic, RED-before/GREEN-after,
+  fail-closed). Baseline: **24 in-serve read-forks** (15 in serve.rs — the audit
+  query/list/detail endpoints, `notes_history`, two `sync_mirror`-only fns — plus
+  `ap_sync`, `mark_invoice_paid`, `restore_from_nav_outgoing`, and the four
+  dual-context fns below); 10 CLI one-shots allow-listed as coherent. Wired into
+  cut-gate.yml (informational) + its probes.
+- **CHECK N STATIC LIMITATION (flagged, not narrowed).** Two honest gaps:
+  1. **Dual-context fns** — `issue_storno`, `issue_modification`, `poll_ack`,
+     `submit_invoice` run in BOTH serve (>0 call sites) AND CLI. The SAME fn is
+     coherent in the flock-fenced CLI process but hazardous in-serve; static
+     scanning cannot tell them apart per-invocation. They are (correctly) NOT
+     allow-listed → they sit in the worklist and must read via the Handle on the
+     in-serve path.
+  2. **Reachability assumption** — the allow-list encodes "serve=0" per CLI fn;
+     if one is later wired into serve, the static gate wrongly exempts it.
+  3. **Raw-SQL reads** — a `Connection::open` + `SELECT … FROM audit_ledger`
+     is not detected (table name inside a stripped SQL string; zero such cases
+     today, all audit reads go through the typed `Ledger`).
+
+  **Proposed RUNTIME TRIPWIRE (backstop for all three, owner call before build):**
+  a process-global `SERVE_HANDLE_LIVE` set when the shared Handle is constructed
+  in serve boot (never set in a CLI one-shot), and a guard on the fresh audit
+  opener that fires (debug-assert in tests / `tracing::error!` + counter in prod)
+  whenever a fresh `Ledger::open` happens while the flag is set. That catches ANY
+  in-serve fresh audit open regardless of static scoping. It touches the
+  audit-ledger crate's `open` path and would fire for the ~18 not-yet-migrated
+  write-forks too (expected during migration), so it is proposed, not landed.
+- **HARD ORDERING (binding — a future session MUST NOT reorder this).**
+  `serve.rs::list_notes_history_request` and `serve.rs::sync_audit_mirror_best_effort`
+  / the material_inventory stock-movement mirror open read
+  `InvoiceDraftCreated`/`InvoiceStornoIssued` via a fresh `Ledger::open`. They do
+  NOT tear today only because the invoice issue/storno audit WRITERS are still on
+  fresh opens (main-file coherent). **The instant an invoice audit writer migrates
+  to the Handle, notes-history silently loses rows and NOTHING goes red** (CHECK N
+  is informational; no test covers cross-write-then-fresh-read of invoice events).
+  Therefore: migrate these READERS to Handle reads BEFORE — or in the SAME commit
+  as — any invoice issue/storno/draft audit WRITER. Do not migrate an invoice
+  audit writer while its fresh-open readers remain.
 - **CANONICAL RECIPE — a `verify_chain` audit fn on the Handle** (resolved in
   wave-2c; the audit-ledger crate already supports it — `Ledger::from_connection`
   at `crates/audit-ledger/src/storage/mod.rs` + its test

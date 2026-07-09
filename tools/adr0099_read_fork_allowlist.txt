@@ -1,0 +1,40 @@
+# ADR-0099 H3 — audit-ledger READ-FORK allow-list (CHECK N).
+#
+# Format: <file>:<fname>  (one per line; '#' comments ignored).
+#
+# The read-fork scanner (tools/adr0099_read_fork_scan.awk) flags every RUNTIME fn
+# that READS the audit ledger through an INDEPENDENT fresh opener (Ledger::open /
+# Connection::open reading `audit_ledger`) and does NOT append. Once ANY audit
+# writer is on the shared Handle (checkpoint disabled in H3), such a fresh reader
+# sees only the folded SUBSET on the main file — a silent torn read the write-fork
+# gate is structurally blind to.
+#
+# Allow-listed here are ONLY the SEPARATE-PROCESS CLI one-shots (serve=0 call
+# sites; fenced by the whole-DB writer flock, F-E). A CLI one-shot runs in its OWN
+# process with NO live serve Handle — serve folds the WAL to the main file on exit
+# (and a crash replays the WAL on the CLI's fresh open), so the CLI's fresh audit
+# read is COHERENT. Reachability evidence (2026-07-10): each below has ZERO
+# `serve.rs` call sites and ≥1 `main.rs`/CLI call site.
+#
+# NOT allow-listed (therefore in the CHECK N worklist) — the in-serve readers:
+#   * every serve.rs route-handler / daemon reader,
+#   * ap_sync, mark_invoice_paid, restore_from_nav_outgoing (serve-side daemons),
+#   * the DUAL-CONTEXT fns (issue_storno / issue_modification / poll_ack /
+#     submit_invoice — serve>0 AND cli>0): they DO run in-serve, so the CLI
+#     context does NOT exempt them; the in-serve path must read via the Handle.
+#
+# STATIC LIMITATION (flagged, see ADR-0099 §CHECK N): this allow-list bakes in a
+# runtime-reachability assumption (serve=0). If a listed fn is later wired into
+# serve, the static gate would wrongly exempt it. The RUNTIME TRIPWIRE
+# (SERVE_HANDLE_LIVE, proposed) is the backstop that catches any fresh audit open
+# in the serve process regardless of this list.
+apps/aberp/src/drain_submission_queue.rs:drive_one_invoice
+apps/aberp/src/export_invoice_bundle.rs:run
+apps/aberp/src/mark_abandoned.rs:run
+apps/aberp/src/observe_receiver_confirmation.rs:run
+apps/aberp/src/poll_annulment_ack.rs:run
+apps/aberp/src/recover_from_nav.rs:run
+apps/aberp/src/retry_submission.rs:run
+apps/aberp/src/retry_submission.rs:resolve_stuck_or_loud_fail
+apps/aberp/src/retry_submission.rs:perform_layer_2_check
+apps/aberp/src/submit_annulment.rs:run
