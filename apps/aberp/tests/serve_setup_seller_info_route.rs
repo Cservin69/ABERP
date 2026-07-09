@@ -50,6 +50,11 @@ fn build_state(boot_state: ServeBootState, tenant: &str) -> AppState {
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
     let db_path = std::env::temp_dir().join(format!("aberp-seller-{}.duckdb", Ulid::new()));
     AppState {
+        db: aberp::serve::open_tenant_handle(
+            &db_path,
+            TenantId::new(tenant.to_string()).expect("tenant id"),
+        )
+        .expect("test: open shared aberp-db Handle"),
         db_path: Arc::new(db_path),
         tenant: tenant_id,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),

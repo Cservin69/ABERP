@@ -40,6 +40,10 @@
 # billing-store opens (Defect 1) plus the four reused drain Ledger::open sites
 # (Defect 3). Per the H3 "Remainder" note, each opener removal is re-cut into
 # this census + the fingerprint set in the SAME change.
+#
+# ADR-0099 H3 ratchet: serve.rs audit write-forks migrated onto the shared
+# aberp_db::Handle. Census ratcheted DOWN 285->271 / files 43. Re-derive: see
+# cut_gate_opener_census.sh. (P1 already forbids GROWTH; this is a sanctioned shrink.)
 3 apps/aberp/src/ap_sync.rs
 2 apps/aberp/src/avl_vendors.rs
 2 apps/aberp/src/catalogue_push.rs
@@ -71,7 +75,7 @@
 1 apps/aberp/src/restore_from_nav_extract.rs
 11 apps/aberp/src/restore_from_nav_outgoing.rs
 8 apps/aberp/src/retry_submission.rs
-145 apps/aberp/src/serve.rs
+131 apps/aberp/src/serve.rs
 1 apps/aberp/src/snapshot.rs
 1 apps/aberp/src/submission_queue.rs
 3 apps/aberp/src/submit_annulment.rs

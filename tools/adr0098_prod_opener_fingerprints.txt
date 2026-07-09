@@ -8,6 +8,8 @@
 # `derive_nav_invoice_number` billing-store opens (Defect 1) + the four drain
 # Ledger::open sites reused via free sync_mirror / Ledger::from_connection
 # (Defect 3). See adr0098_prod_frozen_residuals.txt header for the full rationale.
+#
+# ADR-0099 H3 ratchet: 271 openers after the serve.rs write-fork migration.
 apps/aberp/src/ap_sync.rs|bootstrap_year_already_recorded:let ledger = Ledger::open(db_path, tenant, binary_hash).with_context(|| {
 apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let mut conn = duckdb::Connection::open(db_path).with_context(|| {
@@ -123,7 +125,6 @@ apps/aberp/src/retry_submission.rs|run:let ledger = Ledger::open(&args.db, tenan
 apps/aberp/src/retry_submission.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
 apps/aberp/src/retry_submission.rs|run:let ledger_tx1 = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
 apps/aberp/src/retry_submission.rs|run:let mut conn = Connection::open(&args.db)
-apps/aberp/src/serve.rs|amend_pricing_job_material_request:let mut conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|archive_machine_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|archive_margin_profile_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|audit_event_detail_request:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
@@ -145,12 +146,8 @@ apps/aberp/src/serve.rs|create_work_order_request:let mut conn = Connection::ope
 apps/aberp/src/serve.rs|decide_qa_inspection_request:let mut conn = Connection::open(&*state.db_path).map_err(|e| {
 apps/aberp/src/serve.rs|delete_invoice_draft_request:let mut conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|delete_partner_request:let conn = Connection::open(&*state.db_path)
-apps/aberp/src/serve.rs|delete_pricing_job_request:let mut conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|delete_product_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|derive_state_for:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
-apps/aberp/src/serve.rs|emit_adapter_health_transition:Connection::open(db_path).context("open DuckDB for adapter health transition
-apps/aberp/src/serve.rs|enforce_heat_lot_gate_for_start:let conn = Connection::open(&*state.db_path).map_err(|e| {
-apps/aberp/src/serve.rs|enforce_heat_lot_gate_for_start:let mut ledger = aberp_audit_ledger::Ledger::open(
 apps/aberp/src/serve.rs|get_audit_for_invoice:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
 apps/aberp/src/serve.rs|get_audit_for_quote:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
 apps/aberp/src/serve.rs|get_avl_vendor_request:let conn = Connection::open(&*state.db_path)
@@ -185,8 +182,6 @@ apps/aberp/src/serve.rs|handle_list_quote_pricing_jobs:let conn = duckdb::Connec
 apps/aberp/src/serve.rs|handle_list_quoting_materials:let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
 apps/aberp/src/serve.rs|handle_list_stock_adjustments:let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
 apps/aberp/src/serve.rs|handle_list_tolerance_multipliers:let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-apps/aberp/src/serve.rs|handle_material_traceability:let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-apps/aberp/src/serve.rs|handle_material_traceability:let mut ledger = aberp_audit_ledger::Ledger::open(
 apps/aberp/src/serve.rs|handle_quote_intake_mark_irrelevant:let conn = duckdb::Connection::open(&db_path)
 apps/aberp/src/serve.rs|handle_quote_intake_notifications:let conn = duckdb::Connection::open(&db_path)
 apps/aberp/src/serve.rs|handle_quote_intake_notifications:let ledger = Ledger::open(&db_for_ledger, tenant_for_ledger, binary_hash)
@@ -228,9 +223,6 @@ apps/aberp/src/serve.rs|quote_intake_auth_paused:let ledger = Ledger::open(&*sta
 apps/aberp/src/serve.rs|read_base_currency:let mut conn = Connection::open(db_path)
 apps/aberp/src/serve.rs|read_invoice_currency:let mut conn = Connection::open(db_path).with_context(|| {
 apps/aberp/src/serve.rs|read_invoice_total_gross_minor:let mut conn = Connection::open(db_path).with_context(|| {
-apps/aberp/src/serve.rs|record_first_prod_launch_audit:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-apps/aberp/src/serve.rs|record_numbering_change_audit:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-apps/aberp/src/serve.rs|record_restore_from_nav_run_audit:let mut ledger = Ledger::open(&db_path, tenant, binary_hash)
 apps/aberp/src/serve.rs|record_upgrade_snapshot_mismatch_audit:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/serve.rs|resolve_customer_identity:let ledger = Ledger::open(
 apps/aberp/src/serve.rs|resolve_invoice_xml_path:let ledger = Ledger::open(
@@ -250,13 +242,12 @@ apps/aberp/src/serve.rs|run:let conn = Connection::open(&args.db).with_context(|
 apps/aberp/src/serve.rs|run:let mut billing_store = DuckDbBillingStore::open(&args.db).with_context(|| {
 apps/aberp/src/serve.rs|run:let mut conn = Connection::open(&args.db).with_context(|| {
 apps/aberp/src/serve.rs|run:let mut conn = Connection::open(&args.db).with_context(|| {
+apps/aberp/src/serve.rs|run:let mut store = DuckDbBillingStore::open(creating)?;
 apps/aberp/src/serve.rs|run_deal_saga_request:let mut conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|run_refuse_saga_request:let mut conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|screen_avl_vendor_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|set_avl_vendor_status_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|set_quote_buyer_partner_request:let conn = Connection::open(&*state.db_path)
-apps/aberp/src/serve.rs|set_restored_partner_request:let ledger = Ledger::open(&db_path, tenant.clone(), binary_hash)
-apps/aberp/src/serve.rs|set_restored_partner_request:let mut conn = duckdb::Connection::open(&db_path)
 apps/aberp/src/serve.rs|sync_audit_mirror_best_effort:if let Ok(ledger) = Ledger::open(db_path, tenant, binary_hash) {
 apps/aberp/src/serve.rs|transition_routing_op_request:let mut conn = Connection::open(&*state.db_path).map_err(|e| {
 apps/aberp/src/serve.rs|transition_work_order_request:let mut conn = Connection::open(&*state.db_path).map_err(|e| {
@@ -265,8 +256,6 @@ apps/aberp/src/serve.rs|update_machine_request:let conn = Connection::open(&*sta
 apps/aberp/src/serve.rs|update_margin_profile_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|update_partner_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|update_product_request:let conn = Connection::open(&*state.db_path)
-apps/aberp/src/serve.rs|write_shutdown_audit_entry:Connection::open(&db_path).context("open tenant DuckDB for shutdown audit en
-apps/aberp/src/serve.rs|write_shutdown_audit_entry:let ledger = Ledger::open(&db_path, tenant, binary_hash)
 apps/aberp/src/snapshot.rs|open_ledger:Ledger::open(db_path, tenant.clone(), binary_hash)
 apps/aberp/src/submission_queue.rs|count_pending:let ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/submit_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
@@ -284,14 +273,11 @@ crates/aberp-quote-intake/src/service.rs|retry_pending_writebacks:let conn = duc
 crates/aberp-quote-intake/src/service.rs|snapshot_pending_writebacks:let conn = duckdb::Connection::open(&db_for_list)
 crates/aberp-quote-intake/src/service.rs|write_cycle_audit:let mut conn = duckdb::Connection::open(&db_path)
 crates/aberp-quote-intake/src/service.rs|write_row_added:let mut conn = duckdb::Connection::open(&db_path).map_err(|e| {
+crates/aberp-snapshot/src/crash_safe.rs|checkpoint_file:let conn = Connection::open(db)?;
+crates/aberp-snapshot/src/crash_safe.rs|probe_open:let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
 crates/aberp-snapshot/src/take.rs|restore_into:let conn = Connection::open(&staging)?;
 crates/aberp-snapshot/src/take.rs|take_snapshot:let conn = Connection::open(db_path)?;
 crates/audit-ledger/src/storage/mod.rs|append_reopen:let mut conn = Connection::open(db_path)?;
 crates/audit-ledger/src/storage/mod.rs|append_reopen:pub fn append_reopen(
 crates/audit-ledger/src/storage/mod.rs|open:let conn = Connection::open(path)?;
 modules/billing/src/adapters/duckdb_store.rs|open:conn: Connection::open(path)?,
-# ── ADR-0099 H2 (Class 3) additions — the atomic-creation + safe-open path.
-# The set is sorted before comparison, so these trailing lines fold into place.
-apps/aberp/src/serve.rs|run:let mut store = DuckDbBillingStore::open(creating)?;
-crates/aberp-snapshot/src/crash_safe.rs|checkpoint_file:let conn = Connection::open(db)?;
-crates/aberp-snapshot/src/crash_safe.rs|probe_open:let conn = Connection::open(db_path).map_err(|e| e.to_string())?;

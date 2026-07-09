@@ -61,6 +61,8 @@ fn build_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
     AppState {
+        db: aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+            .expect("test: open shared aberp-db Handle"),
         db_path: Arc::new(db_path),
         tenant,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),
@@ -528,12 +530,18 @@ async fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
         "loud-fail must surface the expected shape so the operator knows the fix: got `{msg}`"
     );
 
-    // The audit ledger must NOT have a fresh draft — the gate fires
-    // BEFORE `pre_tx_setup`. A regression that opened the DB before
-    // the gate would surface here as a present-but-empty DB file.
-    assert!(
-        !dir.join("aberp.duckdb").exists(),
-        "pre-issuance gate must fail before any DB write; aberp.duckdb leaked at {}",
-        dir.join("aberp.duckdb").display()
+    // The audit ledger must NOT have a fresh draft — the gate fires BEFORE
+    // `pre_tx_setup`. H3: `build_state` opens the shared aberp_db::Handle, which
+    // legitimately CREATES the (empty) DB file, so file-absence is no longer the
+    // signal. The real invariant is row-absence: the gate fires before
+    // `pre_tx_setup` ensures the schema + writes, so NO audit row exists (and the
+    // `audit_ledger` table is not even created — treat a missing table as zero).
+    let conn = state.db.read().expect("shared read handle");
+    let audit_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM audit_ledger", [], |r| r.get(0))
+        .unwrap_or(0);
+    assert_eq!(
+        audit_rows, 0,
+        "pre-issuance gate must fire before any DB write — no audit row must exist"
     );
 }

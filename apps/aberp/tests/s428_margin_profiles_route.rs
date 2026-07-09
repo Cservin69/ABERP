@@ -42,6 +42,8 @@ fn test_dir(label: &str) -> PathBuf {
 fn build_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     AppState {
+        db: aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+            .expect("test: open shared aberp-db Handle"),
         db_path: Arc::new(db_path),
         tenant,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(TEST_HASH),
