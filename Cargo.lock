@@ -10,7 +10,6 @@ dependencies = [
  "aberp-billing",
  "aberp-cad-extract-wrapper",
  "aberp-compliance",
- "aberp-db",
  "aberp-digital-id",
  "aberp-dispatch",
  "aberp-inventory",

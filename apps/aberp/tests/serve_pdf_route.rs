@@ -184,8 +184,6 @@ fn build_state(wired: &WiredInvoice) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
     AppState {
-        db: aberp_db::Handle::open_default(&wired.db_path, tenant.clone())
-            .expect("test: open shared aberp-db Handle"),
         db_path: Arc::new(wired.db_path.clone()),
         tenant,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),

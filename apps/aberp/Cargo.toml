@@ -39,8 +39,6 @@ production = []
 # dependencies (below) so the production binary cannot reach
 # `Actor::test_only`. Closes fortnightly review F15.
 aberp-audit-ledger = { path = "../../crates/audit-ledger" }
-# ADR-0099 H3 — the process-wide shared DuckDB Handle (single in-process writer).
-aberp-db = { path = "../../crates/aberp-db" }
 # S426 / ADR-0082 — periodic validated logical DuckDB snapshot subsystem.
 aberp-snapshot = { path = "../../crates/aberp-snapshot" }
 # S344 / PR-38 — DigitalIdProvider swap-point. Boot constructs the mock
