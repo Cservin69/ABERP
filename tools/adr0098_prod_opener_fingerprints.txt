@@ -21,6 +21,8 @@
 # ADR-0099 H3 wave-2d (2026-07-09): re-cut -2 — email_invoice record_email_audit_entry
 # 2 opener fingerprints (Connection::open + Ledger::open) removed; both now the
 # shared Handle. Removals-only, verified via comm -13.
+# ADR-0099 H3 wave-2e (2026-07-09): re-cut -1 — append_machine_event Ledger::open
+# removed (now the shared Handle). Removals-only, verified via comm -13.
 apps/aberp/src/ap_sync.rs|bootstrap_year_already_recorded:let ledger = Ledger::open(db_path, tenant, binary_hash).with_context(|| {
 apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let mut conn = duckdb::Connection::open(db_path).with_context(|| {
@@ -95,7 +97,6 @@ apps/aberp/src/quote_pricing_pipeline.rs|emit_python_resolved_audit:duckdb::Conn
 apps/aberp/src/quote_pricing_pipeline.rs|enqueue_failed_no_cad:let conn = duckdb::Connection::open(&db_path).context("open DB for enqueue-f
 apps/aberp/src/quote_pricing_pipeline.rs|enqueue_one:let mut conn = duckdb::Connection::open(&db_path).context("open DB for enque
 apps/aberp/src/quote_pricing_pipeline.rs|next_actionable_blocking:let conn = duckdb::Connection::open(&db_path).context("open DB for next-job"
-apps/aberp/src/quoting_machines.rs|append_machine_event:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/recover_from_nav.rs|resolve_recovery_precondition:let ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/recover_from_nav.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
 apps/aberp/src/recover_from_nav.rs|run:let mut conn = Connection::open(&args.db)

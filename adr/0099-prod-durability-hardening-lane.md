@@ -431,23 +431,51 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   reader (same property the email_outbox 5-row read-back relies on). Residual
   21 → 20. Census 266 → 257 openers / 40 → 39 files (avl_vendors.rs drops off;
   serve.rs 131 → 124). Re-cut removals-only (0 additions, verified via `comm`).
-- **SEQUENCING — shared audit helpers are CROSS-SUBSYSTEM CHOKEPOINTS (found in
-  wave-2c scoping).** `append_vendor_event` was called by ONE subsystem (avl),
-  so avl migrated cleanly whole. But `quoting_machines::append_machine_event` is
-  called from **12 handlers across SIX subsystems** — machines, partners
-  (`update_partner_request`), margin profiles (create/update/archive), lead-time
-  overrides, quote-margin overrides, and reprice provenance. Migrating that
-  helper to the Handle forces ALL 12 callers to pass `&state.db`; but each caller
-  ALSO does its own business write via a separate `Connection::open`, which would
-  then interleave with the Handle audit write and TEAR the ledger. So a shared
-  helper cannot be migrated until EVERY calling handler's business flow is on the
-  Handle — it is a chokepoint to migrate LAST (or as one coordinated batch with
-  all its callers), NOT a per-subsystem wave. Check a helper's caller span
-  (`grep -rn '<helper>(' apps/aberp/src`) BEFORE scoping it as a wave. Likely
-  sibling chokepoint: `material_inventory::append_heat_lot_events` (verify its
-  span too). `email_invoice::record_email_audit_entry` is single-caller but
-  carries an extra `verify_chain` + explicit `sync_mirror` — a RECURRING shape
-  (ap_sync's cycle-audit fn has it too; likely others).
+- **Wave 2d** — `email_invoice::record_email_audit_entry` (the FIRST
+  `verify_chain` audit fn; established the CANONICAL RECIPE below). Single caller;
+  its only other db-ish call (`load_smtp_credentials`) is file/cache-only.
+  Residual 21 → 20 (wait — see 2e note). Census 39 → 38 (email_invoice.rs drops
+  off). Removals-only.
+- **Wave 2e** — `quoting_machines::append_machine_event` (the CROSS-SUBSYSTEM
+  shared audit helper: 12 callers across SIX subsystems — machines, partners
+  `update_partner_request`, margin profiles create/update/archive, lead-time /
+  quote-margin overrides, reprice provenance). Migrated **AUDIT-ONLY** in ONE
+  commit: helper → `&Handle`, 12 call sites → `&state.db`; the callers KEEP their
+  business `Connection::open`s. Residual 20 → 18 (also cleared 2d's fork).
+  Census 255 → 254 (quoting_machines.rs drops off).
+
+  **KEY CORRECTION to the earlier chokepoint fear.** I first assumed the helper
+  couldn't move until every caller's *business* write was also on the Handle
+  (else the business open would interleave-tear the audit ledger → a 6-subsystem
+  cascade). That was WRONG, and disproving it is the wave's real lesson:
+  - `machine_crud`'s fresh `Ledger::open` read-back saw only `[MachineCreated]`
+    of three — looked like a tear.
+  - But reading the SAME audit back through the Handle (`db.read()` → try_clone →
+    `Ledger::from_connection`) returned ALL THREE. So the interleaved business
+    opens do NOT corrupt the Handle's own view; the "tear" was purely a
+    **fresh-open READ artifact** (post-checkpoint-disable, a fresh `Ledger::open`
+    reads a folded subset). Audit-only migration is DATA-COHERENT.
+  - So a shared audit helper migrates AUDIT-ONLY (small, one commit), and the
+    fix for its callers' tests is to read audit through the Handle — NOT to
+    migrate business flows. avl (wave-2c) needed the full read+write migration
+    only because `fire_overdue` is a Handle *reader* of vendor data; a helper
+    with no Handle-reader of business data has no such coupling.
+
+    Check a helper's caller span (`grep -rn '<helper>(' apps/aberp/src`) before
+    scoping, but the span dictates the SIGNATURE ripple, not a business cascade.
+    `email_invoice::record_email_audit_entry` (wave-2d) carries an extra
+    `verify_chain` + explicit `sync_mirror` — a RECURRING shape (ap_sync's
+    cycle-audit fn has it too) handled by the CANONICAL RECIPE below.
+- **NEW FINDING — audit-READ-forks (a cross-cutting H3 gap, flagged).** The
+  write-fork gate targets audit *appends*, but there are ALSO fresh-open audit
+  *reads* in serve that go incoherent once their events are Handle-resident:
+  `serve.rs` `notes_history` scan (`Ledger::open` → `list_notes_history`, reads
+  `InvoiceDraftCreated`/`InvoiceStornoIssued`) and the material_inventory
+  stock-movement `Ledger::open`→`sync_mirror`. Wave-2e does NOT regress
+  notes-history (it reads only invoice events, not machine/margin/partner), but
+  the moment the invoice issue/storno audit writers migrate, notes-history WILL
+  tear unless it is moved to a Handle read first. This class needs its own sweep
+  + (ideally) a gate, analogous to the write-fork gate. Not addressed here.
 - **CANONICAL RECIPE — a `verify_chain` audit fn on the Handle** (resolved in
   wave-2c; the audit-ledger crate already supports it — `Ledger::from_connection`
   at `crates/audit-ledger/src/storage/mod.rs` + its test
@@ -470,17 +498,18 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   ```
 
   Apply this recipe deliberately; it is NOT a quick `db_path`→`db` swap.
-- **Remaining (20 write-forks; each a FULL-subsystem migration):**
+- **Remaining (18 write-forks):**
   `email_relay_daemon`, `quote_pdf_rerender_daemon` (both reverted to coherent
-  all-reopen, await full migration), `ap_sync`, `email_invoice`,
-  `incoming_invoices` (×2), `material_inventory`, `quote_calibration`,
-  `quoting_machines` (12 cross-subsystem callers on `append_machine_event` — a
-  chokepoint; see SEQUENCING above),
+  all-reopen, await full migration), `ap_sync` (verify_chain shape — apply the
+  recipe), `incoming_invoices` (×2), `material_inventory`, `quote_calibration`,
   `restore_from_nav_outgoing` (×2), `quote_pricing_pipeline` (×9). `bash
   tools/cut_gate_write_fork.sh` prints the live list. Each removes openers →
-  re-cut the census baselines in the same commit; the write-fork gate flips to
-  `ENFORCE_WRITE_FORK=1` when it hits zero. The negative probes are migration-
-  invariant (synthetic scratch files), so they do NOT need touching per wave.
+  re-cut the census baselines in the same commit (removals-only, verify via
+  `comm`); the write-fork gate flips to `ENFORCE_WRITE_FORK=1` when it hits zero.
+  The negative probes are migration-invariant (synthetic scratch files), so they
+  do NOT need touching per wave. Where a subsystem has a fresh-open audit READER
+  in a test or in prod, move that read to the Handle (see the audit-READ-fork
+  finding above) — a fresh `Ledger::open` sees a folded subset post-migration.
 
 **Landed on this branch (all genuinely green — ci both arms + cut-gate):**
 - `crates/aberp-db`: the shared `Handle`/`WriteGuard`/`read()` + pure D2

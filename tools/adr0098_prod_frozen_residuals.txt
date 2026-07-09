@@ -58,10 +58,14 @@
 # migrated onto the shared Handle via the verify_chain recipe (append + try_clone
 # from_connection verify + guard-drop mirror). email_invoice.rs drops off. Re-cut
 # -2 (257->255 openers, 39->38 files). Removals-only, verified via comm.
+# ADR-0099 H3 wave-2e (2026-07-09): append_machine_event (the CROSS-SUBSYSTEM
+# shared audit helper — 12 callers across machines/partners/margins/lead-time/
+# quote-margin/reprice) migrated AUDIT-ONLY onto the shared Handle. Business opens
+# stay put (coherent [business-fold, audit-append] per handler). Re-cut -1
+# (255->254 openers, 38->37 files; quoting_machines.rs drops off). Removals-only.
 1 apps/aberp/src/export_invoice_bundle.rs
 1 apps/aberp/src/issue_invoice.rs
 1 apps/aberp/src/material_inventory.rs
-1 apps/aberp/src/quoting_machines.rs
 1 apps/aberp/src/restore_from_nav_extract.rs
 1 apps/aberp/src/snapshot.rs
 1 apps/aberp/src/submission_queue.rs

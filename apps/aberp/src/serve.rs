@@ -9303,7 +9303,7 @@ pub fn update_partner_request(
         let tenant = TenantId::new(state.tenant.as_str())
             .with_context(|| format!("tenant id {}", state.tenant.as_str()))?;
         crate::quoting_machines::append_machine_event(
-            &state.db_path,
+            &state.db,
             tenant,
             binary_hash,
             operator_login,
@@ -9573,7 +9573,7 @@ pub fn create_machine_request(
         buffer_pct: machine.buffer_pct,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -9646,7 +9646,7 @@ pub fn update_machine_request(
         enabled: machine.enabled,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -9709,7 +9709,7 @@ pub fn archive_machine_request(
         archived_at,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -10508,7 +10508,7 @@ pub fn create_margin_profile_request(
         min_margin_pct: profile.min_margin_pct,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -10583,7 +10583,7 @@ pub fn update_margin_profile_request(
         enabled: profile.enabled,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -10644,7 +10644,7 @@ pub fn archive_margin_profile_request(
         archived_at,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -10736,7 +10736,7 @@ pub fn override_lead_time_request(
         override_days,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -11007,7 +11007,7 @@ pub fn override_quote_margin_request(
         override_margin_pct: body.margin_pct,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -11022,7 +11022,7 @@ pub fn override_quote_margin_request(
             reason: body.reason.unwrap_or_default(),
         };
         crate::quoting_machines::append_machine_event(
-            &state.db_path,
+            &state.db,
             state.tenant.clone(),
             binary_hash,
             operator_login,
@@ -11051,7 +11051,7 @@ fn emit_reprice_provenance(
             global_margin_base: o.applied_margin_base,
         };
         crate::quoting_machines::append_machine_event(
-            &state.db_path,
+            &state.db,
             state.tenant.clone(),
             binary_hash,
             operator_login,
@@ -11066,7 +11066,7 @@ fn emit_reprice_provenance(
             floor_pct: o.floor_pct.unwrap_or(0.0),
         };
         crate::quoting_machines::append_machine_event(
-            &state.db_path,
+            &state.db,
             state.tenant.clone(),
             binary_hash,
             operator_login,

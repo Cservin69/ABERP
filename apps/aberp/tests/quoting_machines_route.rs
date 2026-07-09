@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aberp_audit_ledger::{BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{BinaryHash, EventKind, TenantId};
 use ulid::Ulid;
 
 use aberp::quoting_machines::MachineInputs;
@@ -76,10 +76,21 @@ fn inputs(name: &str, family: &str, daily: f64, buffer: f64, enabled: bool) -> M
 }
 
 /// Every entry kind currently in the ledger (read-back for audit pins).
-fn ledger_kinds(db_path: &PathBuf) -> Vec<EventKind> {
+///
+/// H3 (ADR-0099): reads through the SAME shared Handle the handlers wrote through.
+/// A fresh `Ledger::open` here would read the pre-WAL main file (a folded subset)
+/// because these handlers' interleaved business `Connection::open`s leave the
+/// Handle's audit WAL unfolded — post-checkpoint-disable, the read contract is
+/// "audit reads go through the Handle". `try_clone` (F-C) shares the live instance.
+fn ledger_kinds(state: &AppState) -> Vec<EventKind> {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
-    let ledger = Ledger::open(db_path, tenant, TEST_HASH).expect("open ledger");
-    ledger
+    // Write guard so an as-yet-unwritten ledger still reads as [] (the old
+    // `Ledger::open` ensured the schema; `from_connection` does not); read the
+    // entries off a try_clone of the SAME live instance.
+    let guard = state.db.write().expect("shared write guard");
+    aberp_audit_ledger::ensure_schema(&guard).expect("ensure audit-ledger schema");
+    let owned = guard.try_clone().expect("clone shared conn");
+    aberp_audit_ledger::Ledger::from_connection(owned, tenant, TEST_HASH)
         .entries()
         .expect("read entries")
         .into_iter()
@@ -193,7 +204,7 @@ fn machine_crud_emits_the_three_event_kinds() {
     .expect("update");
     serve::archive_machine_request(&state, &m.id, "op", TEST_HASH).expect("archive");
 
-    let kinds = ledger_kinds(&db);
+    let kinds = ledger_kinds(&state);
     assert!(
         kinds.contains(&EventKind::MachineCreated),
         "created: {kinds:?}"
@@ -373,7 +384,7 @@ fn override_persists_and_emits_event() {
     assert_eq!(eff, Some(10), "override wins over computed");
 
     assert!(
-        ledger_kinds(&db).contains(&EventKind::QuoteLeadTimeOverridden),
+        ledger_kinds(&state).contains(&EventKind::QuoteLeadTimeOverridden),
         "override event emitted"
     );
 
