@@ -2547,20 +2547,23 @@ fn write_shutdown_audit_entry(state: &AppState, trigger: &str, result: &Shutdown
         elapsed_ms: result.elapsed_ms,
     };
 
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
     let bytes = payload.to_bytes();
 
     let write_outcome = (|| -> Result<()> {
-        let mut conn =
-            Connection::open(&db_path).context("open tenant DuckDB for shutdown audit entry")?;
-        aberp_audit_ledger::ensure_schema(&conn)
-            .context("ensure audit-ledger schema for shutdown audit entry")?;
-        let tx = conn
+        // H3 (ADR-0099): route the shutdown audit through the ONE shared Handle
+        // (still alive during graceful shutdown). The WriteGuard drop runs the
+        // lockstep sync_mirror, so the separate `Ledger::open` mirror pass this
+        // used to do is no longer needed.
+        let mut guard = db
+            .write()
+            .context("acquire shared writer for shutdown audit entry")?;
+        let tx = guard
             .transaction()
             .context("begin DuckDB transaction for shutdown audit entry")?;
-        let ledger_meta = aberp_audit_ledger::LedgerMeta::new(tenant.clone(), binary_hash);
+        let ledger_meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
         aberp_audit_ledger::append_in_tx(
             &tx,
             &ledger_meta,
@@ -2572,12 +2575,6 @@ fn write_shutdown_audit_entry(state: &AppState, trigger: &str, result: &Shutdown
         .context("audit_ledger::append_in_tx DaemonShutdownCompleted")?;
         tx.commit()
             .context("commit DuckDB transaction for shutdown audit entry")?;
-        let mirror_path = aberp_audit_ledger::mirror_path_for(&db_path);
-        let ledger = Ledger::open(&db_path, tenant, binary_hash)
-            .context("open audit ledger after shutdown entry")?;
-        ledger
-            .sync_mirror(&mirror_path)
-            .context("sync audit-ledger mirror after shutdown entry")?;
         Ok(())
     })();
 
@@ -4766,7 +4763,7 @@ fn acknowledge_first_prod_launch(state: &AppState, operator_login: &str) -> Resu
         .wait()
         .context("await background binary hash compute for first-launch acknowledgement")?;
     record_first_prod_launch_audit(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -4787,26 +4784,36 @@ fn acknowledge_first_prod_launch(state: &AppState, operator_login: &str) -> Resu
 /// constructing an [`AppState`] or mutating `HOME` (the touchfile-write
 /// half is pinned separately in `crate::first_launch`).
 fn record_first_prod_launch_audit(
-    db_path: &std::path::Path,
+    db: &aberp_db::Handle,
     tenant: TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     operator_login: &str,
     acknowledged_at: &str,
 ) -> Result<()> {
     let tenant_str = tenant.as_str().to_string();
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record first-launch acknowledgement")?;
+    // H3 (ADR-0099): route through the ONE shared Handle instead of an
+    // independent `Ledger::open` write-fork; guard drop lockstep-syncs the mirror.
+    let mut guard = db
+        .write()
+        .context("acquire shared writer to record first-launch acknowledgement")?;
+    let tx = guard
+        .transaction()
+        .context("begin first-launch acknowledgement audit tx")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
     let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
     let payload =
         audit_payloads::FirstProdLaunchAcknowledgedPayload::new(acknowledged_at, tenant_str);
-    ledger
-        .append(
-            EventKind::FirstProdLaunchAcknowledged,
-            payload.to_bytes(),
-            actor,
-            None,
-        )
-        .context("append FirstProdLaunchAcknowledged audit entry")?;
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        EventKind::FirstProdLaunchAcknowledged,
+        payload.to_bytes(),
+        actor,
+        None,
+    )
+    .context("append FirstProdLaunchAcknowledged audit entry")?;
+    tx.commit()
+        .context("commit first-launch acknowledgement audit")?;
     Ok(())
 }
 
@@ -15662,7 +15669,7 @@ async fn record_restore_from_nav_run_audit(
         .binary_hash
         .wait()
         .context("await binary hash for RestoreFromNavRun audit")?;
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let operator = operator_login.to_string();
     let payload = audit_payloads::RestoreFromNavRunPayload {
@@ -15680,17 +15687,29 @@ async fn record_restore_from_nav_run_audit(
         ts: ts.to_string(),
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut ledger = Ledger::open(&db_path, tenant, binary_hash)
-            .context("open audit ledger to record RestoreFromNavRun")?;
+        // H3 (ADR-0099): route through the ONE shared aberp_db::Handle — a
+        // serialized single-writer + lockstep post-commit mirror on guard drop —
+        // instead of an independent `Ledger::open` write-fork. The writer mutex
+        // subsumes AUDIT_APPEND_LOCK for Handle-routed appends.
+        let mut guard = db
+            .write()
+            .context("acquire shared writer to record RestoreFromNavRun")?;
+        let tx = guard
+            .transaction()
+            .context("begin RestoreFromNavRun audit tx")?;
+        let meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
         let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator);
-        ledger
-            .append(
-                EventKind::RestoreFromNavRun,
-                payload.to_bytes(),
-                actor,
-                None,
-            )
-            .context("append RestoreFromNavRun audit entry")?;
+        aberp_audit_ledger::append_in_tx(
+            &tx,
+            &meta,
+            EventKind::RestoreFromNavRun,
+            payload.to_bytes(),
+            actor,
+            None,
+        )
+        .context("append RestoreFromNavRun audit entry")?;
+        tx.commit().context("commit RestoreFromNavRun audit")?;
+        // guard drops here -> lockstep sync_mirror
         Ok(())
     })
     .await
@@ -16171,7 +16190,7 @@ fn diff_adapter_health(
 /// conflict. The actor is a system identity — this is a daemon-style
 /// observation, not an operator action.
 fn emit_adapter_health_transition(
-    db_path: &std::path::Path,
+    db: &aberp_db::Handle,
     tenant: &aberp_audit_ledger::TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     t: &AdapterHealthTransition,
@@ -16189,10 +16208,15 @@ fn emit_adapter_health_transition(
         ulid::Ulid::new().to_string(),
         "system:adapter-health",
     );
-    let mut conn =
-        Connection::open(db_path).context("open DuckDB for adapter health transition audit")?;
-    aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
-    let tx = conn.transaction().context("begin transition audit tx")?;
+    // H3 (ADR-0099): route through the ONE shared aberp_db::Handle instead of an
+    // independent `Connection::open` write-fork. The dashboard's read Connection
+    // is now a `db.read()` try_clone of the same instance, so this composes with
+    // it coherently; the writer mutex serializes and the guard drop lockstep-syncs
+    // the mirror.
+    let mut guard = db
+        .write()
+        .context("acquire shared writer for adapter health transition audit")?;
+    let tx = guard.transaction().context("begin transition audit tx")?;
     let meta = aberp_audit_ledger::LedgerMeta::new(tenant.clone(), binary_hash);
     aberp_audit_ledger::append_in_tx(
         &tx,
@@ -16544,9 +16568,7 @@ fn compute_workshop_dashboard(
         diff_adapter_health(&mut guard, &adapters)
     };
     for t in &transitions_to_emit {
-        if let Err(e) =
-            emit_adapter_health_transition(&state.db_path, &state.tenant, binary_hash, t)
-        {
+        if let Err(e) = emit_adapter_health_transition(&state.db, &state.tenant, binary_hash, t) {
             tracing::error!(
                 adapter_id = %t.adapter_id,
                 from = t.from_state,
@@ -24410,14 +24432,18 @@ mod tests {
 
         let tenant = TenantId::new("test").expect("tenant id");
         let bh = BinaryHash::from_bytes([0u8; 32]);
+        let handle = aberp_db::Handle::open_default(&db_path, tenant.clone()).expect("open handle");
         record_first_prod_launch_audit(
-            &db_path,
+            &handle,
             tenant.clone(),
             bh,
             "operator-login",
             "2026-06-01T08:00:00Z",
         )
         .expect("record audit entry");
+        // Drop the Handle so the fresh Ledger::open below replays the WAL-only
+        // append (checkpoint disabled in H3 keeps the write WAL-resident).
+        drop(handle);
 
         let ledger = Ledger::open(&db_path, tenant, bh).expect("reopen ledger");
         let entries = ledger.entries().expect("read entries");
