@@ -30,6 +30,7 @@ pub mod branding_config;
 pub mod build_profile;
 pub mod catalogue_push;
 pub mod cli;
+pub mod db_writer_lock;
 pub mod drain_pending_retries;
 pub mod drain_submission_queue;
 // S275 / PR-264 / F22 — DuckDB-binding helpers + the project's

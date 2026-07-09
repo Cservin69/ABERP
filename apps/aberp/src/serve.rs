@@ -459,6 +459,31 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             args.tenant
         )
     })?;
+
+    // H3 / ADR-0099 F-E — CROSS-PROCESS whole-DB single-writer lock. The shared
+    // in-process `aberp_db::Handle` guarantees one DuckDB instance WITHIN this
+    // process; it cannot see a SEPARATE process. The Defense line's worst
+    // durability incident was TWO `aberp serve` instances on one tenant DB
+    // forking the audit ledger. Acquire the whole-DB writer flock BEFORE any DB
+    // open (before the H2 provision/probe below), and HOLD it for the entire
+    // process lifetime (`_db_writer_lock` lives to the end of `run`): a second
+    // `serve` — or a DB-mutating CLI one-shot — that finds it held REFUSES to
+    // boot rather than opening a second concurrent writer. The lock file lives
+    // next to the tenant DB, so ensure its parent dir exists first (idempotent
+    // with the H2 create_dir_all below).
+    if let Some(parent) = args.db.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create parent directory {} for the whole-DB writer lock",
+                parent.display()
+            )
+        })?;
+    }
+    tracing::info!("boot step: acquiring cross-process whole-DB writer lock (F-E)");
+    let _db_writer_lock =
+        crate::db_writer_lock::acquire_or_refuse(&args.db, tenant.as_str(), "aberp serve")
+            .context("refusing to boot: another writer holds the tenant DB")?;
+
     // PR-46α.1 / session-62-fix — explicit step-entry log so a
     // macOS keychain ACL prompt blocking `entry.get_password()` is
     // visible at the operator-facing layer. The keychain re-prompts
