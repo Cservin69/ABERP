@@ -418,9 +418,22 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   refuses it outright.
 - **Wave 2b** — `mes_manager` (adapter audit; the subsystem's only DB access).
   Residual 22 → 21. Census 267 → 266.
-- **Remaining (21 write-forks; each a FULL-subsystem migration):**
+- **Wave 2c** — `avl_vendors` (the FIRST multi-handler subsystem taken whole).
+  All 7 serve AVL handlers (create / list / get / update / set-status / screen /
+  po-check), `append_vendor_event`, and `fire_overdue_screening_reminders` route
+  READS and WRITES through the shared Handle. This wave PROVED the read side of
+  the all-or-nothing rule empirically: migrating only the writers left `get`/
+  `list` on a fresh `Connection::open`, which read the stale pre-WAL main file —
+  `crud_smoke` saw `pending`, not the just-written `revoked`. Moving the reads to
+  `db.read()` fixed it. Business-write + audit run as TWO sequential Handle
+  guards (the write guard drops before the audit guard acquires); consecutive
+  Handle writes with no interleaved separate open stay coherent to a later fresh
+  reader (same property the email_outbox 5-row read-back relies on). Residual
+  21 → 20. Census 266 → 257 openers / 40 → 39 files (avl_vendors.rs drops off;
+  serve.rs 131 → 124). Re-cut removals-only (0 additions, verified via `comm`).
+- **Remaining (20 write-forks; each a FULL-subsystem migration):**
   `email_relay_daemon`, `quote_pdf_rerender_daemon` (both reverted to coherent
-  all-reopen, await full migration), `ap_sync`, `avl_vendors`, `email_invoice`,
+  all-reopen, await full migration), `ap_sync`, `email_invoice`,
   `incoming_invoices` (×2), `material_inventory`, `quote_calibration`,
   `quoting_machines` (12 caller handlers on the shared `append_machine_event`),
   `restore_from_nav_outgoing` (×2), `quote_pricing_pipeline` (×9). `bash

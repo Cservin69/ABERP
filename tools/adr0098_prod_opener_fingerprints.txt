@@ -14,11 +14,13 @@
 # ADR-0099 H3 ratchet (wave 2a): 267 openers.
 #
 # ADR-0099 H3 ratchet (wave 2b): 266 openers.
+# ADR-0099 H3 wave-2c (2026-07-09): re-cut −9 — the avl_vendors subsystem's 9
+# opener fingerprints (7 serve.rs AVL handlers + append_vendor_event Ledger::open
+# + fire_overdue Connection::open) removed; every one now routes through the
+# shared Handle (db.write()/db.read()). Removals-only, verified via comm -13.
 apps/aberp/src/ap_sync.rs|bootstrap_year_already_recorded:let ledger = Ledger::open(db_path, tenant, binary_hash).with_context(|| {
 apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let mut conn = duckdb::Connection::open(db_path).with_context(|| {
-apps/aberp/src/avl_vendors.rs|append_vendor_event:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-apps/aberp/src/avl_vendors.rs|fire_overdue_screening_reminders:let conn = Connection::open(db_path)
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
@@ -128,12 +130,10 @@ apps/aberp/src/serve.rs|archive_machine_request:let conn = Connection::open(&*st
 apps/aberp/src/serve.rs|archive_margin_profile_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|audit_event_detail_request:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
 apps/aberp/src/serve.rs|audit_events_request:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
-apps/aberp/src/serve.rs|avl_po_check_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|build_poll_daemon_inputs:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
 apps/aberp/src/serve.rs|calibration_overview_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|cancel_dispatch_request:let mut conn = Connection::open(&*state.db_path).map_err(|e| {
 apps/aberp/src/serve.rs|compute_workshop_dashboard:let conn = Connection::open(&*state.db_path)
-apps/aberp/src/serve.rs|create_avl_vendor_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|create_dispatch_request:let mut conn = Connection::open(&*state.db_path).map_err(|e| {
 apps/aberp/src/serve.rs|create_machine_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|create_margin_profile_request:let conn = Connection::open(&*state.db_path)
@@ -149,7 +149,6 @@ apps/aberp/src/serve.rs|delete_product_request:let conn = Connection::open(&*sta
 apps/aberp/src/serve.rs|derive_state_for:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
 apps/aberp/src/serve.rs|get_audit_for_invoice:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
 apps/aberp/src/serve.rs|get_audit_for_quote:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
-apps/aberp/src/serve.rs|get_avl_vendor_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|get_dispatch_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|get_invoice_detail:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
 apps/aberp/src/serve.rs|get_invoice_detail:let mut conn = Connection::open(&*state.db_path)
@@ -195,7 +194,6 @@ apps/aberp/src/serve.rs|handle_update_quoting_material:let mut conn = Connection
 apps/aberp/src/serve.rs|handle_update_stock_adjustment:let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
 apps/aberp/src/serve.rs|handle_update_tolerance_multiplier:let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
 apps/aberp/src/serve.rs|latest_quote_intake_poll:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
-apps/aberp/src/serve.rs|list_avl_vendors_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|list_dispatches_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|list_eligible_work_orders_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|list_invoice_drafts_request:let conn = Connection::open(&*state.db_path)
@@ -244,13 +242,10 @@ apps/aberp/src/serve.rs|run:let mut conn = Connection::open(&args.db).with_conte
 apps/aberp/src/serve.rs|run:let mut store = DuckDbBillingStore::open(creating)?;
 apps/aberp/src/serve.rs|run_deal_saga_request:let mut conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|run_refuse_saga_request:let mut conn = Connection::open(&*state.db_path)
-apps/aberp/src/serve.rs|screen_avl_vendor_request:let conn = Connection::open(&*state.db_path)
-apps/aberp/src/serve.rs|set_avl_vendor_status_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|set_quote_buyer_partner_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|sync_audit_mirror_best_effort:if let Ok(ledger) = Ledger::open(db_path, tenant, binary_hash) {
 apps/aberp/src/serve.rs|transition_routing_op_request:let mut conn = Connection::open(&*state.db_path).map_err(|e| {
 apps/aberp/src/serve.rs|transition_work_order_request:let mut conn = Connection::open(&*state.db_path).map_err(|e| {
-apps/aberp/src/serve.rs|update_avl_vendor_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|update_machine_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|update_margin_profile_request:let conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|update_partner_request:let conn = Connection::open(&*state.db_path)

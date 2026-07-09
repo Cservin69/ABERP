@@ -2138,11 +2138,11 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             };
             match recovery_state.binary_hash.wait() {
                 Ok(binary_hash) => {
-                    let db_path = (*recovery_state.db_path).clone();
+                    let db = recovery_state.db.clone();
                     let tenant = recovery_state.tenant.clone();
                     let scan = tokio::task::spawn_blocking(move || {
                         crate::avl_vendors::fire_overdue_screening_reminders(
-                            &db_path,
+                            &db,
                             tenant,
                             binary_hash,
                             &operator_login,
@@ -9805,8 +9805,13 @@ async fn handle_list_avl_vendors(headers: HeaderMap, State(state): State<AppStat
 pub fn list_avl_vendors_request(
     state: &AppState,
 ) -> std::result::Result<Vec<crate::avl_vendors::AvlVendor>, VendorRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099): read through the shared Handle's reader so this list sees
+    // the writers' pending WAL rows (a fresh Connection::open would read the
+    // pre-WAL main file → stale under the held Handle).
+    let conn = state
+        .db
+        .read()
+        .context("acquire shared reader to list AVL vendors")?;
     Ok(crate::avl_vendors::list_vendors(
         &conn,
         state.tenant.as_str(),
@@ -9836,8 +9841,12 @@ pub fn get_avl_vendor_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<crate::avl_vendors::AvlVendor, VendorRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099): read through the shared Handle's reader (coherent with the
+    // held Handle's WAL); a fresh Connection::open would see stale main-file data.
+    let conn = state
+        .db
+        .read()
+        .context("acquire shared reader to get AVL vendor")?;
     match crate::avl_vendors::get_vendor(&conn, state.tenant.as_str(), id)? {
         Some(v) => Ok(v),
         None => Err(VendorRouteError::NotFound),
@@ -9886,10 +9895,15 @@ pub fn create_avl_vendor_request(
     if let Err(errors) = crate::avl_vendors::validate_vendor_inputs(inputs) {
         return Err(VendorRouteError::Validation(errors));
     }
-    // Scope the write connection (DuckDB single-writer; see create_machine_request).
+    // H3 (ADR-0099): the business write and its audit row both ride the ONE
+    // shared Handle (two sequential guards — this write guard drops at the end
+    // of the block, before append_vendor_event acquires the next) instead of an
+    // independent Connection::open + Ledger::open pair of write-forks.
     let vendor = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        let conn = state
+            .db
+            .write()
+            .context("acquire shared writer to create AVL vendor")?;
         crate::avl_vendors::create_vendor(&conn, state.tenant.as_str(), inputs, operator_login)?
     };
     let payload = crate::audit_payloads::AvlVendorAddedPayload {
@@ -9900,7 +9914,7 @@ pub fn create_avl_vendor_request(
         reviewer_login: operator_login.to_string(),
     };
     crate::avl_vendors::append_vendor_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -9950,8 +9964,12 @@ pub fn update_avl_vendor_request(
     if let Err(errors) = crate::avl_vendors::validate_vendor_edit(inputs) {
         return Err(VendorRouteError::Validation(errors));
     }
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099): the edit UPDATE rides the shared Handle's writer instead of
+    // an independent Connection::open write-fork; the guard drop syncs the mirror.
+    let conn = state
+        .db
+        .write()
+        .context("acquire shared writer to edit AVL vendor")?;
     match crate::avl_vendors::update_vendor(
         &conn,
         state.tenant.as_str(),
@@ -10016,10 +10034,14 @@ pub fn set_avl_vendor_status_request(
             ),
         }])
     })?;
-    // Scope the write connection (DuckDB single-writer).
+    // H3 (ADR-0099): the status change and its audit row both ride the ONE
+    // shared Handle (sequential guards) instead of an independent
+    // Connection::open + Ledger::open pair of write-forks.
     let change = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        let conn = state
+            .db
+            .write()
+            .context("acquire shared writer to change AVL vendor status")?;
         match crate::avl_vendors::set_vendor_status(
             &conn,
             state.tenant.as_str(),
@@ -10066,7 +10088,7 @@ pub fn set_avl_vendor_status_request(
             reviewer_login: operator_login.to_string(),
         };
         crate::avl_vendors::append_vendor_event(
-            &state.db_path,
+            &state.db,
             state.tenant.clone(),
             binary_hash,
             operator_login,
@@ -10082,7 +10104,7 @@ pub fn set_avl_vendor_status_request(
             reviewer_login: operator_login.to_string(),
         };
         crate::avl_vendors::append_vendor_event(
-            &state.db_path,
+            &state.db,
             state.tenant.clone(),
             binary_hash,
             operator_login,
@@ -10164,10 +10186,14 @@ pub fn screen_avl_vendor_request(
         return Err(VendorRouteError::Validation(errors));
     }
 
-    // Scope the write connection (DuckDB single-writer).
+    // H3 (ADR-0099): the screening write and its audit row both ride the ONE
+    // shared Handle (sequential guards) instead of an independent
+    // Connection::open + Ledger::open pair of write-forks.
     let vendor = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        let conn = state
+            .db
+            .write()
+            .context("acquire shared writer to record AVL screening")?;
         match crate::avl_vendors::record_screening(
             &conn,
             state.tenant.as_str(),
@@ -10194,7 +10220,7 @@ pub fn screen_avl_vendor_request(
         decision_time_utc: now,
     };
     crate::avl_vendors::append_vendor_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -10255,9 +10281,14 @@ pub fn avl_po_check_request(
     operator_login: &str,
     binary_hash: BinaryHash,
 ) -> std::result::Result<(), VendorRouteError> {
+    // H3 (ADR-0099): the eligibility READ rides the shared Handle's reader
+    // (`db.read()` is a coherent try_clone of the one live instance); the
+    // conditional PoBlocked audit below routes through the same Handle's writer.
     let eligibility = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        let conn = state
+            .db
+            .read()
+            .context("acquire shared reader for AVL PO-eligibility check")?;
         crate::avl_vendors::po_eligibility(&conn, state.tenant.as_str(), partner_id)?
     };
     match eligibility {
@@ -10274,7 +10305,7 @@ pub fn avl_po_check_request(
                 attempted_at_utc: now,
             };
             crate::avl_vendors::append_vendor_event(
-                &state.db_path,
+                &state.db,
                 state.tenant.clone(),
                 binary_hash,
                 operator_login,

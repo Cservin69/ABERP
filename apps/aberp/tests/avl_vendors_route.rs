@@ -444,8 +444,11 @@ fn boot_overdue_scan_fires_avl_screening_overdue_exactly_once() {
     .expect("revoke");
 
     let now = time::OffsetDateTime::now_utc();
+    // The scan runs on the SAME shared Handle the CRUD above wrote through, so
+    // the whole flow is single-instance (no interleaved separate open to tear
+    // the ledger); the fresh `ledger_kinds` read-back below then sees every row.
     let fired = aberp::avl_vendors::fire_overdue_screening_reminders(
-        &db,
+        &state.db,
         tenant.clone(),
         TEST_HASH,
         "boot",
