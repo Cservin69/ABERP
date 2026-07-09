@@ -63,6 +63,11 @@
 # quote-margin/reprice) migrated AUDIT-ONLY onto the shared Handle. Business opens
 # stay put (coherent [business-fold, audit-append] per handler). Re-cut -1
 # (255->254 openers, 38->37 files; quoting_machines.rs drops off). Removals-only.
+# ADR-0099 H3 wave-3a (ap_sync family, atomic): the IncomingInvoiceSyncCycleCompleted
+# writer (write_cycle_audit_entry_inner, verify_chain recipe) + its sentinel reader
+# (bootstrap_year_already_recorded) both onto the shared Handle in ONE commit
+# (family invariant, [[aberp-h3-handle-coherence-model]]). ap_sync.rs drops off.
+# Removals-only.
 1 apps/aberp/src/export_invoice_bundle.rs
 1 apps/aberp/src/issue_invoice.rs
 1 apps/aberp/src/material_inventory.rs
@@ -81,7 +86,6 @@
 2 apps/aberp/src/submit_invoice.rs
 2 crates/aberp-snapshot/src/crash_safe.rs
 2 crates/aberp-snapshot/src/take.rs
-3 apps/aberp/src/ap_sync.rs
 3 apps/aberp/src/drain_pending_retries.rs
 3 apps/aberp/src/mark_invoice_paid.rs
 3 apps/aberp/src/poll_annulment_ack.rs

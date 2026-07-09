@@ -1417,6 +1417,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     let artifacts_dir = ap_artifacts_dir(st.tenant.as_str())?;
                     Ok(ap_sync::CycleInputs {
                         db_path: (*st.db_path).clone(),
+                        db: st.db.clone(),
                         tenant: st.tenant.clone(),
                         binary_hash,
                         operator_login,
@@ -15522,6 +15523,7 @@ async fn build_ap_sync_inputs(
     let artifacts_dir = ap_artifacts_dir(state.tenant.as_str())?;
     Ok(ap_sync::CycleInputs {
         db_path: (*state.db_path).clone(),
+        db: state.db.clone(),
         tenant: state.tenant.clone(),
         binary_hash,
         operator_login,

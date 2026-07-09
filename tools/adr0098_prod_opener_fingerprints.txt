@@ -23,9 +23,8 @@
 # shared Handle. Removals-only, verified via comm -13.
 # ADR-0099 H3 wave-2e (2026-07-09): re-cut -1 — append_machine_event Ledger::open
 # removed (now the shared Handle). Removals-only, verified via comm -13.
-apps/aberp/src/ap_sync.rs|bootstrap_year_already_recorded:let ledger = Ledger::open(db_path, tenant, binary_hash).with_context(|| {
-apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let ledger = Ledger::open(db_path, tenant, binary_hash)
-apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let mut conn = duckdb::Connection::open(db_path).with_context(|| {
+# ADR-0099 H3 wave-3a: re-cut - the 3 ap_sync.rs openers (write_cycle Connection+Ledger,
+# bootstrap Ledger) removed; all on the shared Handle now. Removals-only, comm-verified.
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
