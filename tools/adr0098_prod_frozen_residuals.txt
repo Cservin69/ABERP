@@ -28,10 +28,22 @@
 #   • crates/aberp-snapshot/src/crash_safe.rs +2 (NEW file) — the backported
 #     `checkpoint_file` fold-open + the `probe_open` validated boot safe-open.
 # These are the atomic/probe path G2 permits; NOT new un-gated openers.
+#
+# ADR-0099 Addendum 2 (2026-07-09, owner Ervin) — owner-approved surgical NAV
+# recovery fix (Defect 3) migrates the drain-pending-retries per-invoice openers
+# onto the live handle (free sync_mirror + Ledger::from_connection, both census-
+# excluded), ahead of the wider H3 migration, because the re-open was an active
+# duckdb#23046 corruption hazard on the operator's machine. The census RATCHETS
+# DOWN −7 (292→285 across 43 files, no file dropped to zero): 5 removed from
+# drain_pending_retries.rs (8→3), 1 from recover_from_nav.rs (4→3), 1 from
+# retry_submission.rs (9→8) — the three deleted `derive_nav_invoice_number`
+# billing-store opens (Defect 1) plus the four reused drain Ledger::open sites
+# (Defect 3). Per the H3 "Remainder" note, each opener removal is re-cut into
+# this census + the fingerprint set in the SAME change.
 3 apps/aberp/src/ap_sync.rs
 2 apps/aberp/src/avl_vendors.rs
 2 apps/aberp/src/catalogue_push.rs
-8 apps/aberp/src/drain_pending_retries.rs
+3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
 2 apps/aberp/src/email_invoice.rs
 2 apps/aberp/src/email_outbox_poll_daemon.rs
@@ -53,12 +65,12 @@
 3 apps/aberp/src/quote_pdf_rerender_daemon.rs
 12 apps/aberp/src/quote_pricing_pipeline.rs
 1 apps/aberp/src/quoting_machines.rs
-4 apps/aberp/src/recover_from_nav.rs
+3 apps/aberp/src/recover_from_nav.rs
 4 apps/aberp/src/reports.rs
 4 apps/aberp/src/request_technical_annulment.rs
 1 apps/aberp/src/restore_from_nav_extract.rs
 11 apps/aberp/src/restore_from_nav_outgoing.rs
-9 apps/aberp/src/retry_submission.rs
+8 apps/aberp/src/retry_submission.rs
 145 apps/aberp/src/serve.rs
 1 apps/aberp/src/snapshot.rs
 1 apps/aberp/src/submission_queue.rs

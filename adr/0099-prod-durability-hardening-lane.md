@@ -487,3 +487,135 @@ quick-xml (and, if the http3 path is ever enabled, quinn via reqwest) to fixed
 releases and delete the corresponding ignore entries from `deny.toml`,
 `audit.toml`, and `ci.yml` together. Until then the ignores are the
 owner-approved, reachability-justified posture and `ci.yml` is genuinely green.
+
+---
+
+## Addendum 2 — owner-approved surgical NAV recovery fix (2026-07-09, owner Ervin)
+
+**Status:** Accepted (owner-authorised deviation from the plan's §2 non-goal —
+"the plan bans drive-by fixes"). Sequenced deliberately **ahead of H3** at the
+owner's explicit direction.
+
+**Trigger.** A live PROD incident on 2026-07-09 (operator restarted PROD after
+the incident) exposed **three real defects** in the NAV submission-recovery CLI
+(`aberp retry-submission` / `drain-pending-retries` / `recover-from-nav` /
+`mark-abandoned`). All three were found by adversarial review and cited to the
+frozen tree `PROD_v2.27.76`; all three are still present there. Real NAV / real
+tax → the owner ordered the fix now rather than folding it into H3. This is a
+**deliberate, owner-authorised** deviation from §2 (which otherwise forbids
+drive-by fixes in this lane). No PROD runtime was touched; all work is on
+`prod-durability-adr0099`, pushed to origin, genuinely green on GitHub Actions.
+
+### Defect 1 (critical) — the Layer-2 duplicate guard never worked
+
+`derive_nav_invoice_number` SYNTHESISED the NAV-facing number as
+`format!("{}/{:05}", series.code, invoice.sequence_number)`
+(`drain_pending_retries.rs`, `retry_submission.rs`, `recover_from_nav.rs`).
+`series.code` is the legacy literal `INV-default` (`numbering.rs`) — the
+pre-PR-89 hardcoded shape alive at a ninth emit site PR-89 never migrated. The
+**real** invoice number lives ONLY in the on-disk `<InvoiceData>` XML. That
+synthesised string went verbatim into `<invoiceNumberQuery><invoiceNumber>`
+(`query_invoice_check` → `soap`), so NAV was asked about a number it has **never
+seen** ⇒ `queryInvoiceCheck` always returns `Absent` ⇒ `Layer2Decision::SkipRePost`
+was **unreachable** (the duplicate guard never fired). `recover-from-nav` used
+the synthesised number for `queryInvoiceData` AND for its derived-vs-recorded
+drift check (both wrong the same way, so the check silently agreed).
+`mark-abandoned`'s F49 guard reads the recorded `InvoiceCheckPerformed` outcome,
+which was therefore always `absent` — it would have let an operator abandon an
+invoice NAV actually holds.
+
+**Fix.** Replace every Layer-2 / NAV-query use with the existing correct helper
+**`nav_xml::read_invoice_number_from_xml`** (`nav_xml.rs`) — the byte-exact
+`<invoiceNumber>` NAV holds on file, written at issuance and never re-rewritten;
+the **S184** discipline already used by `issue_storno`, `issue_modification`, and
+`observe_receiver_confirmation` (S184's own doc warns that re-deriving "silently
+drifts the reference"). `recover-from-nav` resolves the base XML path via the
+canonical ledger-walk `issue_storno::find_base_nav_xml_path_for_chain` within its
+existing precondition-ledger scope; its drift check is now genuinely load-bearing
+(on-disk XML vs the recorded check number). The three now-dead
+`derive_nav_invoice_number` copies were deleted. **`mark-abandoned` needs no code
+change** — once the query sites record the real number, its F49 guard reads the
+correct `exists` outcome and blocks abandonment as intended. (The S392 issuance
+pre-flight `nav_number_probe` legitimately renders a candidate number via the
+template — there is no on-disk XML at pre-issuance time — and is NOT a defect
+site; left untouched.)
+
+### Defect 2 — a stuck STORNO would be re-POSTed as a CREATE
+
+`prepare_for_attempt_audit` is forked 4×. `submit_invoice` and
+`drain_submission_queue` take a ledger-derived `operation`; `retry_submission`
+and `drain_pending_retries` **hardcoded `InvoiceOperation::Create`** (`PendingRetry`
+had no `operation` field). Because NAV v3.0 STORNO / MODIFY bodies are
+byte-identical to CREATE (the operation is not sniffable from the body), a stuck
+STORNO retried through either path would be re-POSTed to NAV as a CREATE.
+
+**Fix.** Added `PendingRetry::operation`, stamped from the ledger chain-link
+entries via `submission_queue::operation_for_invoice` at classify time — the
+exact mirror of `PendingInvoice::operation`. `retry_submission` derives the
+operation from the ledger it already reads in `resolve_stuck_or_loud_fail` (no
+new opener). Threaded through both `prepare_for_attempt_audit` sites.
+
+### Defect 3 — the drain could fork the audit ledger
+
+`drain_pending_retries` called `Ledger::open` 4× per invoice (TX0 mirror-sync,
+TX1 mirror-sync, both TX2 arms) and `DuckDbBillingStore::open` once (inside the
+Defect-1 synthesiser) — the TX0 site opened a **second DuckDB instance while
+`conn` was still alive**, and every re-open re-runs DuckDB 1.5.x's
+LoadCheckpoint/ReadIndex replay, the duckdb#23046 / S332 checkpoint-ART
+corruption trigger (`storage/mod.rs` names `Ledger::open` as the trigger;
+`submit_invoice` was migrated OFF it under S388). An active corruption hazard on
+the very machine the operator is using today.
+
+**Fix.** Migrate the drain's per-invoice openers onto the live handle:
+- TX0 (`perform_layer_2_check`) and TX1 mirror-syncs now call the free
+  `audit_ledger::sync_mirror(&conn, …)` on the already-open, just-committed
+  `conn` — no second instance. `perform_layer_2_check` drops its now-unused
+  `tenant` / `binary_hash` params.
+- Both TX2 arms route through a new `verify_chain_and_sync_reusing_conn` (direct
+  mirror of `submit_invoice`'s S388 helper) using `Ledger::from_connection` —
+  the file is never re-opened.
+- Sequenced so at most **one** live DuckDB handle exists at any point (`conn#1`
+  for load/Layer-2/TX1, dropped before the wire send; `conn#2` for TX2,
+  consumed by the reuse helper).
+
+This is one slice of H3's wider opener migration, done now because it is an
+active hazard; the rest of H3 (the atomic `AppState`/daemon `Handle` wiring and
+the in-serve write-fork gate flip) remains the ATOMIC remainder per the "Landed
+state / remaining migration" section. Per that section's rule, each opener
+removal is **re-cut into the frozen census in the same change**: the
+`tools/adr0098_prod_frozen_residuals.txt` counts and
+`tools/adr0098_prod_opener_fingerprints.txt` fingerprint set ratchet DOWN −7
+(292→285 across 43 files; drain 8→3, recover 4→3, retry 9→8) — the three deleted
+billing-store opens (Defect 1) plus the four reused drain `Ledger::open` sites
+(Defect 3). `from_connection` and the free `sync_mirror` are census-excluded
+seams, so no opener was added. `cut-gate.yml` (P1 count-freeze + P2
+fingerprint-freeze + negative-probe teeth) stays green.
+
+### Tests (behavioural; RED-before / GREEN-after)
+
+- **Equality pin (Defect 1)** — `tests/adr0099_addendum2_equality_pin.rs`: the
+  `<invoiceNumber>` inside a real `queryInvoiceCheck` request EQUALS the
+  `<invoiceNumber>` read from the on-disk `<InvoiceData>` XML, and is NOT the
+  synthesised `INV-default/{seq:05}` form. Exercises the exact
+  `read_invoice_number_from_xml` → `build_request` seam all three modules now
+  share (fixture number chosen to differ from the synthesis for the same seq).
+- **Operation pin (Defect 2)** — `submission_queue` unit tests: a stuck STORNO
+  (Draft + Attempt, no Response/Abandon) classifies as a `PendingRetry` carrying
+  `operation = Storno`; a plain invoice carries `Create`. RED-before (the field
+  did not exist), GREEN-after.
+- **Opener pin (Defect 3)** — `drain_pending_retries` unit test: the new
+  `verify_chain_and_sync_reusing_conn` verifies a heavy (N=64) on-disk ledger and
+  syncs the mirror through the REUSED connection, no re-open. Mirror of
+  `submit_invoice`'s S388 helper test.
+
+### Scope / integrity
+
+Source touched: `drain_pending_retries.rs`, `retry_submission.rs`,
+`recover_from_nav.rs`, `submission_queue.rs` (+ two module-header doc
+refreshes), the equality-pin integration test, and `apps/aberp/Cargo.toml`
+(dev-dep on `aberp-nav-transport` with the `test-support` feature for
+`NavCredentials::from_parts`, same pattern as audit-ledger's `Actor::test_only`).
+Census baselines re-cut as above. `cargo fmt --check`, clippy `-D warnings`, and
+the full `aberp` test suite are green; no `#[ignore]`, no `continue-on-error`,
+zero durability skips. The `PROD_v2.27.76` tree hash and `main` are unchanged;
+nothing merged to `main`, no cut. H3 is sequenced off the resulting HEAD.

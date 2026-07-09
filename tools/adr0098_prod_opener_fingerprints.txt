@@ -4,6 +4,10 @@
 # removal, or content-change of an opener flips the set -> RED. P1 (count) is the
 # coarse backstop; P2 (this) also catches a COUNT-PRESERVING intra-file swap.
 # Machine-derived from frozen prod commit f7519b4 (tag PROD_v2.27.76).
+# ADR-0099 Addendum 2 (2026-07-09, owner Ervin) — re-cut −7: the three deleted
+# `derive_nav_invoice_number` billing-store opens (Defect 1) + the four drain
+# Ledger::open sites reused via free sync_mirror / Ledger::from_connection
+# (Defect 3). See adr0098_prod_frozen_residuals.txt header for the full rationale.
 apps/aberp/src/ap_sync.rs|bootstrap_year_already_recorded:let ledger = Ledger::open(db_path, tenant, binary_hash).with_context(|| {
 apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let mut conn = duckdb::Connection::open(db_path).with_context(|| {
@@ -11,13 +15,8 @@ apps/aberp/src/avl_vendors.rs|append_vendor_event:let mut ledger = Ledger::open(
 apps/aberp/src/avl_vendors.rs|fire_overdue_screening_reminders:let conn = Connection::open(db_path)
 apps/aberp/src/catalogue_push.rs|push_once:let conn = Connection::open(&db_path).with_context(|| {
 apps/aberp/src/catalogue_push.rs|write_audit:let mut conn = Connection::open(&db_path)
-apps/aberp/src/drain_pending_retries.rs|derive_nav_invoice_number:let store = DuckDbBillingStore::open(db_path).with_context(|| {
-apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let ledger = Ledger::open(db_path, tenant, binary_hash_bytes).map_err(|e| {
-apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let ledger = Ledger::open(db_path, tenant, binary_hash_bytes).map_err(|e| {
-apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let ledger_tx1 = Ledger::open(db_path, tenant.clone(), binary_hash_bytes).ma
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
-apps/aberp/src/drain_pending_retries.rs|perform_layer_2_check:let ledger_tx0 = Ledger::open(db_path, tenant, binary_hash).context(
 apps/aberp/src/drain_pending_retries.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
 apps/aberp/src/drain_submission_queue.rs|drive_one_invoice:let ledger = Ledger::open(db_path, tenant, binary_hash_bytes).map_err(|e| {
 apps/aberp/src/drain_submission_queue.rs|drive_one_invoice:let ledger = Ledger::open(db_path, tenant, binary_hash_bytes).map_err(|e| {
@@ -93,7 +92,6 @@ apps/aberp/src/quote_pricing_pipeline.rs|enqueue_failed_no_cad:let conn = duckdb
 apps/aberp/src/quote_pricing_pipeline.rs|enqueue_one:let mut conn = duckdb::Connection::open(&db_path).context("open DB for enque
 apps/aberp/src/quote_pricing_pipeline.rs|next_actionable_blocking:let conn = duckdb::Connection::open(&db_path).context("open DB for next-job"
 apps/aberp/src/quoting_machines.rs|append_machine_event:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-apps/aberp/src/recover_from_nav.rs|derive_nav_invoice_number:let store = DuckDbBillingStore::open(db_path).with_context(|| {
 apps/aberp/src/recover_from_nav.rs|resolve_recovery_precondition:let ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/recover_from_nav.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
 apps/aberp/src/recover_from_nav.rs|run:let mut conn = Connection::open(&args.db)
@@ -117,7 +115,6 @@ apps/aberp/src/restore_from_nav_outgoing.rs|process_digest:let ledger = Ledger::
 apps/aberp/src/restore_from_nav_outgoing.rs|process_digest:let mut conn = Connection::open(ctx.db_path).with_context(|| {
 apps/aberp/src/restore_from_nav_outgoing.rs|read_restore_lock_at:let conn = Connection::open(db_path)
 apps/aberp/src/restore_from_nav_outgoing.rs|release_restore_lock_at:let conn = Connection::open(db_path)
-apps/aberp/src/retry_submission.rs|derive_nav_invoice_number:let store = DuckDbBillingStore::open(db_path).with_context(|| {
 apps/aberp/src/retry_submission.rs|perform_layer_2_check:let ledger_tx0 = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/retry_submission.rs|resolve_stuck_or_loud_fail:let ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/retry_submission.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
