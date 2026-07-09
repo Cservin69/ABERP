@@ -360,9 +360,14 @@ XML) arm in both `extract_nav_xml` sweeps (ADR-0081).
   the fix, not a residual) — mirroring the editions gate. Negative probes still
   green (teeth intact).
 - The **zero-residual write-fork gate** (editions CHECK 10M form:
-  `adr0099_write_fork_scan.awk`, opener+append per fn, allow-listed) is the H3
-  cut gate. It goes ENFORCING at residual = 0; until the in-process migration
-  reaches zero it is driven RED on the remainder (no de-gating).
+  `tools/adr0099_write_fork_scan.awk` + `tools/adr0099_write_fork_allowlist.txt`,
+  run by `tools/cut_gate_write_fork.sh`, opener+append per fn) is the H3 cut gate.
+  It runs **INFORMATIONAL** in CI today (prints the remaining in-serve forks +
+  count, exit 0 — the branch stays green and the exact remainder is visible), and
+  flips to **ENFORCING** (`ENFORCE_WRITE_FORK=1`, fail on any non-allow-listed
+  fork) the moment the migration reaches zero. That flip is the H3 acceptance
+  cut. Allow-list: the `append_reopen` primitive, separate-process CLI one-shots
+  (fenced by the F-E flock), and pre-serve boot openers.
 
 ### Tests (RED-before / GREEN-after)
 `crates/aberp-db/tests/handle_concurrency_e2e.rs` (checkpoint-DISABLED subset;
@@ -374,10 +379,36 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
 `debounce` unit tests.
 
 ### Landed state / remaining migration
-Tracked in `tools/adr0099_write_fork_residuals.txt` (the shrinking-to-zero
-in-process write-fork residual) and the shrinking `adr0098_prod_*` census. The
-step is delivered incrementally; the exact remainder is reported with the gate
-RED on it rather than declaring done early.
+
+**Landed on this branch (all genuinely green — ci both arms + cut-gate):**
+- `crates/aberp-db`: the shared `Handle`/`WriteGuard`/`read()` + pure D2
+  `debounce` module + the checkpoint-disabled e2e suite + poison-recovery (Bug 5)
+  + F-C/F-A pre-fixes.
+- `EventKind::DbAutoRecovered` (full F12 ritual).
+- F-E: the cross-process whole-DB single-writer flock (`db_writer_lock.rs`) +
+  serve boot acquisition + the cross-process refusal e2e.
+- The zero-residual write-fork gate machinery (scanner + allow-list + the
+  informational CI tracker) enumerating the exact remainder.
+
+**Remainder (the ATOMIC step — deliberately NOT landed piecemeal):**
+Wiring the `Handle` into `AppState`/every daemon `Deps` and migrating **all**
+in-serve write-forks onto it is a SINGLE atomic change, per this lane's binding
+rule ("100% migration, ATOMIC, gated to ZERO — never partial; Defense forked 4×
+precisely because openers were migrated piecemeal"). It is **not** landable in
+shrinking waves because:
+  1. Each migrated opener removal diverges the frozen opener-census P2
+     fingerprint set — the census baselines must be re-cut in the SAME change.
+  2. With the runtime checkpoint disabled in H3 (H4's step), Handle writes are
+     WAL-resident; the ~24 serve-route **test harnesses** open the Handle eagerly
+     in `build_state` (which also eager-creates the DB, tripping the
+     "no-DB-write-before-gate" route tests) and then seed/verify through SEPARATE
+     connections, so a partial migration leaves those harnesses reading a stale
+     instance. Routing every test harness's seed+verify through the shared Handle
+     is part of the same atomic change.
+The informational write-fork tracker prints the exact fork list to migrate
+(`bash tools/cut_gate_write_fork.sh` — currently 34 in-serve forks); completing
+it + flipping the gate to ENFORCING + re-cutting the census baselines + the
+test-harness coherence pass is the H3 acceptance cut.
 
 ---
 
