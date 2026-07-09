@@ -190,6 +190,9 @@ mod tests {
         let p = lock_path_for(db, "ten/../ant").unwrap();
         assert_eq!(p.parent().unwrap(), Path::new("/tmp/aberp/x"));
         let name = p.file_name().unwrap().to_string_lossy();
-        assert!(!name.contains('/'), "sanitised name must not contain '/': {name}");
+        assert!(
+            !name.contains('/'),
+            "sanitised name must not contain '/': {name}"
+        );
     }
 }

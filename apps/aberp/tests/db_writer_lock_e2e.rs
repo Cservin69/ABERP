@@ -63,7 +63,10 @@ fn second_process_is_refused_the_whole_db_writer_lock() {
 
     let exe = std::env::current_exe().unwrap();
     let mut child = std::process::Command::new(exe)
-        .args(["--exact", "second_process_is_refused_the_whole_db_writer_lock"])
+        .args([
+            "--exact",
+            "second_process_is_refused_the_whole_db_writer_lock",
+        ])
         .env("ABERP_DBLOCK_CHILD", "1")
         .env("ABERP_DBLOCK_DB", &db)
         .env("ABERP_DBLOCK_READY", &ready)

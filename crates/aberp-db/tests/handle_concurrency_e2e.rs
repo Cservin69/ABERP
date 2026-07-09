@@ -342,7 +342,10 @@ fn poisoned_writer_is_recovered_in_place_not_bricked() {
         panic!("intentional panic to poison the shared writer mutex");
     })
     .join();
-    assert!(joined.is_err(), "the panicking writer thread must have unwound");
+    assert!(
+        joined.is_err(),
+        "the panicking writer thread must have unwound"
+    );
 
     // The mutex is now poisoned. A subsequent write() MUST recover in place and
     // succeed — NOT return an error and NOT brick the process.
@@ -375,11 +378,20 @@ fn poisoned_writer_is_recovered_in_place_not_bricked() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(trigger_ok, 1, "recovery row must carry trigger=writer_poison_recovered");
+    assert_eq!(
+        trigger_ok, 1,
+        "recovery row must carry trigger=writer_poison_recovered"
+    );
     // Both business rows survived (pre + post) alongside the one recovery row.
     let total = recent_entries(&conn, u32::MAX).unwrap().len();
-    assert_eq!(total, 3, "expected pre + auto_recovered + post = 3 rows, got {total}");
-    assert!(fresh_open_ok(&db), "DB must stay openable after poison recovery");
+    assert_eq!(
+        total, 3,
+        "expected pre + auto_recovered + post = 3 rows, got {total}"
+    );
+    assert!(
+        fresh_open_ok(&db),
+        "DB must stay openable after poison recovery"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
