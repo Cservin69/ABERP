@@ -253,6 +253,13 @@ zeroize = { workspace = true }
 # above — production code paths cannot reach `Actor::test_only`. F15.
 aberp-audit-ledger = { path = "../../crates/audit-ledger", features = ["test-support"] }
 
+# ADR-0099 Addendum 2 (Defect 1 equality pin) — integration tests need
+# `NavCredentials::from_parts` to build a real queryInvoiceCheck request
+# without the OS keychain. Same test-support pattern as audit-ledger's
+# `Actor::test_only`; kept OUT of production [dependencies] above so
+# production code paths cannot reach it. F15.
+aberp-nav-transport = { path = "../../crates/nav-transport", features = ["test-support"] }
+
 # S426 / ADR-0082 — the snapshot e2e/emission test seeds a DuckDB (invoice
 # table + audit chain) and reads snapshot records back, exercising the
 # crate API directly alongside `aberp::snapshot`'s audit emission.

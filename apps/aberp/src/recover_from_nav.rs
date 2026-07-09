@@ -48,11 +48,15 @@
 //!      The F8 idempotency-key cross-check happens inside
 //!      `audit_query::stuck_precondition` consumption (mirror of
 //!      `retry_submission::resolve_stuck_or_loud_fail`).
-//!   5. Construct the NAV-facing invoice number string
-//!      (`"{series_code}/{seq:05}"`) — same canonical shape per
-//!      ADR-0009 §3 / `nav_xml::render_invoice_data`. Mirror of
-//!      `observe_receiver_confirmation::load_base_nav_invoice_number`
-//!      and `retry_submission::derive_nav_invoice_number`.
+//!   5. Read the NAV-facing invoice number from the base invoice's
+//!      on-disk NAV XML via `nav_xml::read_invoice_number_from_xml`
+//!      (ADR-0099 Addendum 2, Defect 1) — the byte-exact
+//!      `<invoiceNumber>` NAV holds on file, resolved through the same
+//!      ledger scope as the precondition. Mirror of
+//!      `observe_receiver_confirmation::load_base_nav_invoice_number`.
+//!      Pre-Addendum-2 this SYNTHESISED `"{series_code}/{seq:05}"`,
+//!      which NAV never saw (the `INV-default` literal), so both the
+//!      `queryInvoiceData` lookup and the drift check were wrong.
 //!   6. Build a tokio current-thread runtime and drive ONE
 //!      `queryInvoiceData` call (one-shot per ADR-0028 §4 / ADR-
 //!      0034 §2; no loop).
@@ -217,8 +221,8 @@ pub fn run(args: &RecoverFromNavArgs) -> Result<()> {
     //    — so BOTH the `queryInvoiceData` lookup AND the drift check
     //    below used the wrong number (and, being derived the same wrong
     //    way as the recorded value, the drift check silently agreed).
-    let nav_invoice_number =
-        crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path).with_context(|| {
+    let nav_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path)
+        .with_context(|| {
             format!(
                 "ADR-0099 Addendum 2 — read NAV invoice number from on-disk XML at {} \
                  for recover-from-nav queryInvoiceData",
@@ -484,10 +488,12 @@ fn resolve_recovery_precondition(
     // ADR-0099 Addendum 2 (Defect 1) — resolve the base invoice's
     // on-disk NAV XML path from the same ledger scope so the caller reads
     // the NAV-authoritative `<invoiceNumber>` from it.
-    let base_nav_xml_path =
-        crate::issue_storno::find_base_nav_xml_path_for_chain(&ledger, invoice_id).context(
-            "ADR-0099 Addendum 2 — resolve base invoice's on-disk NAV XML path for recover-from-nav",
-        )?;
+    let base_nav_xml_path = crate::issue_storno::find_base_nav_xml_path_for_chain(
+        &ledger, invoice_id,
+    )
+    .context(
+        "ADR-0099 Addendum 2 — resolve base invoice's on-disk NAV XML path for recover-from-nav",
+    )?;
 
     Ok((nav_invoice_number_from_check, base_nav_xml_path))
 }

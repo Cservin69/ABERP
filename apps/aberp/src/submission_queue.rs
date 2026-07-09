@@ -1413,6 +1413,51 @@ mod tests {
         assert_eq!(pending[0].idempotency_key, idem);
     }
 
+    /// ADR-0099 Addendum 2 (Defect 2) — the drain-pending-retries worker
+    /// reads the NAV envelope operation off [`PendingRetry::operation`];
+    /// `classify_pending_retries` must stamp it from the chain-link
+    /// entries, exactly like `classify_pending` does for
+    /// `PendingInvoice`. A stuck STORNO child (Draft + Attempt, no
+    /// Response / Abandon) MUST carry `Storno` — pre-Addendum-2 the drain
+    /// hardcoded `InvoiceOperation::Create`, which would re-POST the
+    /// stuck STORNO to NAV as a CREATE (NAV v3.0 STORNO / MODIFY bodies
+    /// are byte-identical to CREATE and cannot be told apart from the
+    /// body). RED before the fix (`PendingRetry` had no `operation`
+    /// field), GREEN after.
+    #[test]
+    fn pending_retry_carries_storno_operation_from_chain_entries() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_draft_created(
+            &mut ledger,
+            &actor,
+            "inv_STORNO",
+            idem,
+            Some("/x/storno.xml"),
+        );
+        write_storno_issued(&mut ledger, &actor, "inv_STORNO", "inv_BASE", 1);
+        write_submission_attempt(&mut ledger, &actor, "inv_STORNO", idem);
+        let pending = pending_retries_from_ledger(&ledger).unwrap();
+        let storno = pending
+            .iter()
+            .find(|p| p.invoice_id == "inv_STORNO")
+            .expect("stuck storno child is a pending retry");
+        assert_eq!(storno.operation, InvoiceOperation::Storno);
+    }
+
+    /// ADR-0099 Addendum 2 (Defect 2) — a plain CREATE (no chain-link
+    /// entry for its id) still carries `Create`. Guards the else-arm of
+    /// the operation stamp against an over-eager regression.
+    #[test]
+    fn pending_retry_carries_create_operation_for_plain_invoice() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_draft_created(&mut ledger, &actor, "inv_A", idem, Some("/tmp/A.xml"));
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        let pending = pending_retries_from_ledger(&ledger).unwrap();
+        assert_eq!(pending[0].operation, InvoiceOperation::Create);
+    }
+
     /// Draft + Attempt + Response is NOT pending — the Response
     /// excludes per ADR-0032 §4 (state-2 requires NO Response).
     #[test]

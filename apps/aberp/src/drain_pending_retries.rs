@@ -1171,4 +1171,75 @@ mod tests {
             DrainRetryError::Application(_)
         ));
     }
+
+    /// ADR-0099 Addendum 2 (Defect 3) — opener pin. The drain's
+    /// post-commit verify+sync helper REUSES the connection handed to it
+    /// and never re-opens the DB file. Seed a heavy on-disk ledger (the
+    /// depth that historically tripped the re-open ART/checkpoint replay
+    /// crash, S332 / duckdb#23046), hand the helper a live `Connection`
+    /// on that file, and assert it (a) verifies the full chain (returning
+    /// the entry count) and (b) writes the mirror — all through the
+    /// reused handle, with no `Ledger::open` / `Connection::open` inside
+    /// the helper. Direct mirror of `submit_invoice::tests::
+    /// verify_chain_and_sync_reusing_conn_reuses_handle_on_heavy_ledger`
+    /// (S388). Pre-Addendum-2 the drain had no reuse helper and
+    /// re-opened the file per TX2 arm; this is the CI-runnable stand-in
+    /// for the otherwise live-only manageInvoice happy path.
+    #[test]
+    fn verify_chain_and_sync_reusing_conn_reuses_handle_on_heavy_ledger() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db = std::env::temp_dir().join(format!(
+            "aberp-add2-drainreuse-{}-{}-{}.duckdb",
+            std::process::id(),
+            nanos,
+            seq
+        ));
+        let tenant = TenantId::new("t-add2".to_string()).unwrap();
+        let bh = aberp_audit_ledger::BinaryHash::from_bytes([9u8; 32]);
+        let actor = Actor::from_local_cli("sess-add2".to_string(), "test-user");
+
+        // Seed a heavy ledger (the depth that historically tripped the
+        // re-open ART/checkpoint replay crash, S332 / duckdb#23046).
+        const N: usize = 64;
+        {
+            let mut ledger = Ledger::open(&db, tenant.clone(), bh).expect("open ledger to seed");
+            for i in 0..N {
+                let payload = serde_json::to_vec(&serde_json::json!({ "n": i })).unwrap();
+                ledger
+                    .append(
+                        EventKind::InvoiceSubmissionAttempt,
+                        payload,
+                        actor.clone(),
+                        None,
+                    )
+                    .expect("append seed entry");
+            }
+        } // ledger drops → its Connection closes, entries committed.
+
+        // Open a FRESH connection (stands in for the drain's own
+        // post-commit TX2 `conn`) and hand it to the helper, which must
+        // NOT re-open the file.
+        let conn = Connection::open(&db).expect("open post-commit conn");
+        let verified = verify_chain_and_sync_reusing_conn(conn, tenant, bh, &db)
+            .expect("verify+sync must succeed reusing the conn");
+        assert_eq!(verified, N as u64, "all seeded entries must verify");
+
+        // The mirror was written through the reused connection.
+        let mirror_path = audit_ledger::mirror_path_for(&db);
+        assert!(
+            mirror_path.exists(),
+            "mirror file must be synced at {}",
+            mirror_path.display()
+        );
+
+        // Cleanup (best-effort).
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(&mirror_path);
+    }
 }

@@ -31,7 +31,9 @@
 //!      same `--invoice-xml` file).
 //!   6. Build a tokio current-thread runtime and drive the NAV
 //!      prepare phase (`tokenExchange` + `manage_invoice::build_request`
-//!      for `operation = CREATE`, same shape as
+//!      for the ledger-derived `operation` — CREATE / STORNO / MODIFY,
+//!      resolved in step 4 via `submission_queue::operation_for_invoice`
+//!      per ADR-0099 Addendum 2 Defect 2; same shape as
 //!      `submit_invoice::prepare_for_attempt_audit`). NO wire send
 //!      yet — that happens in step 8 after TX1 commit.
 //!   7. **TX1 — RetryRequested + Attempt-before-call** (PR-19 /
@@ -339,8 +341,8 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
         // `series.code` is the legacy `INV-default` literal — a string
         // NAV has never seen — so the Layer-2 `queryInvoiceCheck`
         // always returned Absent and `SkipRePost` was unreachable.
-        let nav_invoice_number =
-            crate::nav_xml::read_invoice_number_from_xml(&args.invoice_xml).with_context(|| {
+        let nav_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&args.invoice_xml)
+            .with_context(|| {
                 format!(
                     "ADR-0099 Addendum 2 — read NAV invoice number from on-disk XML at {} \
                      for retry-submission Layer-2 check",
