@@ -18537,7 +18537,7 @@ fn finalize_email_audit(
     };
     let mut body = body;
     if let Err(e) = email_invoice::record_email_audit_entry(
-        state.db_path.as_path(),
+        &state.db,
         state.tenant.clone(),
         binary_hash_bytes,
         actor,

@@ -18,6 +18,9 @@
 # opener fingerprints (7 serve.rs AVL handlers + append_vendor_event Ledger::open
 # + fire_overdue Connection::open) removed; every one now routes through the
 # shared Handle (db.write()/db.read()). Removals-only, verified via comm -13.
+# ADR-0099 H3 wave-2d (2026-07-09): re-cut -2 — email_invoice record_email_audit_entry
+# 2 opener fingerprints (Connection::open + Ledger::open) removed; both now the
+# shared Handle. Removals-only, verified via comm -13.
 apps/aberp/src/ap_sync.rs|bootstrap_year_already_recorded:let ledger = Ledger::open(db_path, tenant, binary_hash).with_context(|| {
 apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/ap_sync.rs|write_cycle_audit_entry_inner:let mut conn = duckdb::Connection::open(db_path).with_context(|| {
@@ -30,8 +33,6 @@ apps/aberp/src/drain_submission_queue.rs|drive_one_invoice:let ledger_tx1 = Ledg
 apps/aberp/src/drain_submission_queue.rs|drive_one_invoice:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_submission_queue.rs|drive_one_invoice:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_submission_queue.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
-apps/aberp/src/email_invoice.rs|record_email_audit_entry:let ledger = Ledger::open(db_path, tenant, binary_hash_bytes)
-apps/aberp/src/email_invoice.rs|record_email_audit_entry:let mut conn = Connection::open(db_path).with_context(|| {
 apps/aberp/src/email_relay_daemon.rs|process_one_row:let conn = Connection::open(&db_path).with_context(|| {
 apps/aberp/src/email_relay_daemon.rs|process_one_row:let conn = Connection::open(&db_path2).context("open DB to mark Failed")?;
 apps/aberp/src/email_relay_daemon.rs|process_one_row:let conn = Connection::open(&db_path2).context("open DB to mark Sent")?;

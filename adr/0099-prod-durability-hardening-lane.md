@@ -446,10 +446,30 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   (`grep -rn '<helper>(' apps/aberp/src`) BEFORE scoping it as a wave. Likely
   sibling chokepoint: `material_inventory::append_heat_lot_events` (verify its
   span too). `email_invoice::record_email_audit_entry` is single-caller but
-  carries an extra `verify_chain` + explicit `sync_mirror` that must be
-  re-expressed on the Handle (guard-drop already lockstep-syncs the mirror; the
-  chain-verify count needs `Ledger::from_connection(&guard)` on the same
-  instance) — do it deliberately, not as a quick swap.
+  carries an extra `verify_chain` + explicit `sync_mirror` — a RECURRING shape
+  (ap_sync's cycle-audit fn has it too; likely others).
+- **CANONICAL RECIPE — a `verify_chain` audit fn on the Handle** (resolved in
+  wave-2c; the audit-ledger crate already supports it — `Ledger::from_connection`
+  at `crates/audit-ledger/src/storage/mod.rs` + its test
+  `from_connection_verifies_chain_on_post_commit_handle_without_reopen`; and
+  `WriteGuard::drop` runs a lockstep `sync_mirror`, aberp-db `lib.rs` §Drop):
+
+  ```rust
+  let mut guard = db.write()?;
+  aberp_audit_ledger::ensure_schema(&guard)?;
+  let tx = guard.transaction()?;
+  aberp_audit_ledger::append_in_tx(&tx, &meta, kind, payload, actor, Some(key))?;
+  tx.commit()?;
+  // verify on the SAME live instance — NO fresh Ledger::open (that folds the WAL
+  // + tears). try_clone (F-C) yields an owned Connection sharing the instance.
+  let verified = aberp_audit_ledger::Ledger::from_connection(
+      guard.try_clone()?, tenant, binary_hash,
+  ).verify_chain()?;
+  // DROP the old explicit `sync_mirror` — guard-drop lockstep-syncs it.
+  Ok(verified)
+  ```
+
+  Apply this recipe deliberately; it is NOT a quick `db_path`→`db` swap.
 - **Remaining (20 write-forks; each a FULL-subsystem migration):**
   `email_relay_daemon`, `quote_pdf_rerender_daemon` (both reverted to coherent
   all-reopen, await full migration), `ap_sync`, `email_invoice`,

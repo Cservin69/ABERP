@@ -54,6 +54,10 @@
 # and fire_overdue_screening_reminders now route READS and WRITES through the ONE
 # Handle. Re-cut −9 (266→257 openers, 40→39 files; avl_vendors.rs drops off,
 # serve.rs 131→124). Removals-only (0 additions), verified via comm.
+# ADR-0099 H3 wave-2d (2026-07-09): email_invoice::record_email_audit_entry
+# migrated onto the shared Handle via the verify_chain recipe (append + try_clone
+# from_connection verify + guard-drop mirror). email_invoice.rs drops off. Re-cut
+# -2 (257->255 openers, 39->38 files). Removals-only, verified via comm.
 1 apps/aberp/src/export_invoice_bundle.rs
 1 apps/aberp/src/issue_invoice.rs
 1 apps/aberp/src/material_inventory.rs
@@ -67,7 +71,6 @@
 11 apps/aberp/src/restore_from_nav_outgoing.rs
 12 apps/aberp/src/quote_pricing_pipeline.rs
 124 apps/aberp/src/serve.rs
-2 apps/aberp/src/email_invoice.rs
 2 apps/aberp/src/issue_modification.rs
 2 apps/aberp/src/issue_storno.rs
 2 apps/aberp/src/quote_calibration.rs
