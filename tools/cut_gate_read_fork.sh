@@ -44,18 +44,45 @@ scope_files() { find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tes
 allow_set="$(grep -vE '^\s*#' "$ALLOW" | sed '/^\s*$/d' | sort -u)"
 is_allowed() { grep -qxF "$1" <<< "$allow_set"; }
 
+# A CLI one-shot's fresh audit read is coherent ONLY because the cross-process
+# whole-DB writer flock (F-E, db_writer_lock::acquire_or_refuse) makes it mutually
+# exclusive with serve — aberp-db's single-writer is a process-LOCAL Mutex and
+# cannot fence a second process. So an allow-list entry is honoured ONLY if the
+# file actually acquires that flock; a "CLI" file that opens the DB WITHOUT the
+# flock can run concurrently with serve, read a stale main-file head, and (if it
+# then appends) fork the chain — the incident's primitive. The exemption must be
+# EARNED by the flock, never granted on the filename.
+is_flock_fenced() { grep -qE 'acquire_or_refuse|try_acquire' "$1"; }
+
 remaining=0
-worklist="$(mktemp)"; allowed_hits="$(mktemp)"
+worklist="$(mktemp)"; allowed_hits="$(mktemp)"; unfenced="$(mktemp)"
 while IFS= read -r f; do
   while IFS= read -r rec; do
     [[ -z "$rec" ]] && continue
     fname="$(cut -d: -f2 <<< "$rec")"
     key="$f:$fname"
-    if is_allowed "$key"; then printf '%s:%s\n' "$f" "$rec" >> "$allowed_hits"; continue; fi
+    if is_allowed "$key"; then
+      if is_flock_fenced "$f"; then
+        printf '%s:%s\n' "$f" "$rec" >> "$allowed_hits"; continue
+      fi
+      # Allow-listed but NOT flock-fenced → the exemption's justification is
+      # absent → it is a live cross-process hazard, NOT an accepted one.
+      printf '%s:%s\n' "$f" "$rec" >> "$unfenced"
+      printf '%s:%s\n' "$f" "$rec" >> "$worklist"
+      remaining=$((remaining + 1)); continue
+    fi
     printf '%s:%s\n' "$f" "$rec" >> "$worklist"
     remaining=$((remaining + 1))
   done < <(awk -f "$SCAN" "$f" 2>/dev/null)
 done < <(scope_files)
+
+if [[ -s "$unfenced" ]]; then
+  echo "  ✗ ALLOW-LISTED BUT NOT FLOCK-FENCED (exemption VOID — these read audit fresh with NO"
+  echo "    cross-process mutual exclusion against serve; add db_writer_lock::acquire_or_refuse"
+  echo "    or migrate to a Handle read):"
+  sort "$unfenced" | sed 's/^/      /'
+fi
+rm -f "$unfenced"
 
 na="$(wc -l < "$allowed_hits" | tr -d ' ')"
 echo "  ($na CLI one-shot read(s) allow-listed as coherent — separate process, flock-fenced.)"

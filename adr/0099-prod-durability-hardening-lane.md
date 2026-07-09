@@ -470,39 +470,51 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   The write-fork gate (CHECK 10M) targets audit *appends* and is STRUCTURALLY
   BLIND to fresh-open audit *reads*. Once any writer is on the Handle (checkpoint
   disabled), a fresh `Ledger::open` reader sees only the folded SUBSET on the
-  main file — a silent torn read (proved in wave-2e). A gate that cannot see a
-  bug class does not protect against it, so CHECK N closes the gap:
-  `tools/adr0099_read_fork_scan.awk` (fresh `Ledger::open` + a ledger READ —
-  `.entries()`/`.verify_chain()`/`.sync_mirror()`/`list_notes_history` — and NO
-  append), `tools/cut_gate_read_fork.sh` (informational → `ENFORCE_READ_FORK=1`
-  at zero), `tools/adr0099_read_fork_allowlist.txt` (CLI one-shots only),
-  `tools/cut_gate_read_fork_probes.sh` (synthetic, RED-before/GREEN-after,
-  fail-closed). Baseline: **24 in-serve read-forks** (15 in serve.rs — the audit
-  query/list/detail endpoints, `notes_history`, two `sync_mirror`-only fns — plus
-  `ap_sync`, `mark_invoice_paid`, `restore_from_nav_outgoing`, and the four
-  dual-context fns below); 10 CLI one-shots allow-listed as coherent. Wired into
-  cut-gate.yml (informational) + its probes.
-- **CHECK N STATIC LIMITATION (flagged, not narrowed).** Two honest gaps:
-  1. **Dual-context fns** — `issue_storno`, `issue_modification`, `poll_ack`,
-     `submit_invoice` run in BOTH serve (>0 call sites) AND CLI. The SAME fn is
-     coherent in the flock-fenced CLI process but hazardous in-serve; static
-     scanning cannot tell them apart per-invocation. They are (correctly) NOT
-     allow-listed → they sit in the worklist and must read via the Handle on the
-     in-serve path.
-  2. **Reachability assumption** — the allow-list encodes "serve=0" per CLI fn;
-     if one is later wired into serve, the static gate wrongly exempts it.
-  3. **Raw-SQL reads** — a `Connection::open` + `SELECT … FROM audit_ledger`
-     is not detected (table name inside a stripped SQL string; zero such cases
-     today, all audit reads go through the typed `Ledger`).
-
-  **Proposed RUNTIME TRIPWIRE (backstop for all three, owner call before build):**
-  a process-global `SERVE_HANDLE_LIVE` set when the shared Handle is constructed
-  in serve boot (never set in a CLI one-shot), and a guard on the fresh audit
-  opener that fires (debug-assert in tests / `tracing::error!` + counter in prod)
-  whenever a fresh `Ledger::open` happens while the flag is set. That catches ANY
-  in-serve fresh audit open regardless of static scoping. It touches the
-  audit-ledger crate's `open` path and would fire for the ~18 not-yet-migrated
-  write-forks too (expected during migration), so it is proposed, not landed.
+  main file — a silent torn read (proved in wave-2e; the persistent-connection
+  fork hazard is pinned permanently by `s335_persistent_connection_forks_chain_
+  documented_hazard`). A gate that cannot see a bug class does not protect against
+  it, so CHECK N closes the gap: `tools/adr0099_read_fork_scan.awk`,
+  `tools/cut_gate_read_fork.sh` (informational → `ENFORCE_READ_FORK=1` at zero),
+  `tools/adr0099_read_fork_allowlist.txt`, `tools/cut_gate_read_fork_probes.sh`
+  (12 probes, fail-closed). Wired into cut-gate.yml. Baseline: **25 in-serve
+  read-forks**; 10 CLI one-shots allow-listed — see the flock condition below.
+- **THE CLI EXEMPTION IS EARNED BY THE FLOCK, NEVER BY THE FILENAME.** "It's a
+  CLI one-shot so a fresh open is fine" is the exact reasoning that produced the
+  prod incident. `aberp-db`'s single-writer is a process-LOCAL `Mutex`; it cannot
+  fence a second OS process, and the DuckDB file takes no cross-process lock. So
+  while `serve` holds WAL-resident audit, a CLI one-shot that opens the DB
+  independently READS a stale main-file head (the incident's mis-measurement) and,
+  if it then appends off that head, FORKS the chain (`audit_ledger` has no UNIQUE
+  on `seq`, so the forked row is inserted, not rejected). The ONLY thing that
+  makes a cross-process fresh open sound is the F-E whole-DB fs2 flock
+  (`db_writer_lock::acquire_or_refuse`) that refuses the CLI while serve holds the
+  lock. Therefore `cut_gate_read_fork.sh` HONOURS an allow-list entry only if the
+  file actually calls `acquire_or_refuse`/`try_acquire`; an allow-listed file that
+  is NOT flock-fenced is REFUSED the exemption and printed as a live hazard.
+  Probe P7 proves this has teeth. **This caught a real hole:** `export_invoice_bundle`
+  was allow-listed but acquired the flock ZERO times — it could read a stale audit
+  head mid-export. FIXED this wave (it now `acquire_or_refuse`s before opening the
+  ledger) + pinned by `run_refuses_while_the_whole_db_writer_lock_is_held`. The
+  flock's own cross-process refusal is proved by `db_writer_lock_e2e::second_process
+  _is_refused_the_whole_db_writer_lock` — the incident-preventing test.
+- **CHECK N residual STATIC LIMITATION (flagged, not narrowed).**
+  1. **Dual-context fns** — `issue_storno`/`issue_modification`/`poll_ack`/
+     `submit_invoice` run in BOTH serve AND CLI; the same fn is coherent in the
+     flock-fenced CLI but hazardous in-serve. NOT allow-listed → worklisted; the
+     in-serve path must read via the Handle.
+  2. **Reachability** — the allow-list still assumes a listed fn is CLI-only; the
+     flock-condition narrows the blast radius (an unfenced serve wiring loses the
+     exemption) but a fenced fn newly wired into serve would still slip.
+  These residuals are why a **RUNTIME TRIPWIRE** is proposed (owner call before
+  build): a `SERVE_HANDLE_LIVE` flag set when the Handle is constructed in serve
+  boot, and a guard that fires whenever a fresh `Ledger::open` happens while it is
+  set — catching ANY in-serve fresh audit open regardless of static scoping. It
+  touches the audit-ledger `open` path and fires for the not-yet-migrated forks
+  during migration, so it is proposed, not landed.
+  (The scanner's earlier single-line and raw-SQL blind spots are now FIXED — the
+  deferred-flush + comments-stripped/strings-kept views; fixing them surfaced a
+  25th read-fork, `quote_pdf_rerender_daemon::recover_unfinished_rerenders`, that
+  the Ledger-only scan had missed. Probes P1d/P1e guard both.)
 - **HARD ORDERING (binding — a future session MUST NOT reorder this).**
   `serve.rs::list_notes_history_request` and `serve.rs::sync_audit_mirror_best_effort`
   / the material_inventory stock-movement mirror open read

@@ -52,6 +52,21 @@ expect_emit "P1b sync_mirror-only reader: Ledger::open + .sync_mirror()" \
     let _ = l.sync_mirror(&m);
 }'
 
+expect_emit "P1d single-line reader: opener shares the fn'\''s closing-brace line (deferred-flush fix)" \
+'fn one(p: &std::path::Path) { let l = aberp_audit_ledger::Ledger::open(p, t, h).unwrap(); let _ = l.entries(); }'
+
+expect_emit "P1e raw-SQL reader: fresh Connection::open + FROM audit_ledger (table name in a SQL string)" \
+'fn raw(p: &std::path::Path) {
+    let c = duckdb::Connection::open(p).unwrap();
+    let _ = c.query_row("SELECT COUNT(*) FROM audit_ledger", [], |r| r.get::<_, i64>(0));
+}'
+
+expect_silent "P2b raw INSERT INTO audit_ledger is a WRITE, not a read-fork" \
+'fn w(p: &std::path::Path) {
+    let c = duckdb::Connection::open(p).unwrap();
+    let _ = c.execute("INSERT INTO audit_ledger (seq) VALUES (1)", []);
+}'
+
 expect_silent "P2 appender EXCLUDED: Ledger::open + .entries() + append_in_tx (that is a WRITE-fork)" \
 'fn _p(p: &std::path::Path) {
     let l = aberp_audit_ledger::Ledger::open(p, t, h).unwrap();
@@ -81,15 +96,29 @@ expect_silent "P5 business read (no audit): Connection::open reading a business 
 }'
 
 # ── gate wiring: allow-list + fail-closed ────────────────────────────────────
-echo "[P6 allow-list] a scratch read-fork ADDED to the allow-list is not counted"
+count_worklist() { ( cd "$1" && bash "$GATE" ) 2>&1 | grep -oE '[0-9]+ in-serve audit read-fork' | grep -oE '^[0-9]+'; }
+
+echo "[P6 allow-list + FLOCK-FENCED] a FENCED scratch reader added to the allow-list is dropped"
 c="$(fresh)"
-printf 'fn probe_reader(p: &std::path::Path) {\n    let l = aberp_audit_ledger::Ledger::open(p, t, h).unwrap();\n    let _ = l.entries();\n}\n' > "$c/$SCRATCH"
-base=$( ( cd "$c" && bash "$GATE" ) 2>&1 | grep -oE '[0-9]+ in-serve audit read-fork' | grep -oE '^[0-9]+' )
+printf 'fn probe_reader(p: &std::path::Path) {\n    let _g = crate::db_writer_lock::acquire_or_refuse(p, "t", "probe").unwrap();\n    let l = aberp_audit_ledger::Ledger::open(p, t, h).unwrap();\n    let _ = l.entries();\n}\n' > "$c/$SCRATCH"
+base="$(count_worklist "$c")"
 printf '%s:probe_reader\n' "$SCRATCH" >> "$c/$ALLOW"
-withallow=$( ( cd "$c" && bash "$GATE" ) 2>&1 | grep -oE '[0-9]+ in-serve audit read-fork' | grep -oE '^[0-9]+' )
+withallow="$(count_worklist "$c")"
 if [[ "$base" -gt 0 && "$withallow" -eq $((base-1)) ]]; then
-  printf '  ✓ allow-list removes exactly the scratch reader (%s → %s)\n' "$base" "$withallow"; pass=$((pass+1))
-else printf '  ✗ BROKEN: allow-list did not drop the scratch reader (base=%s withallow=%s)\n' "$base" "$withallow"; bad=$((bad+1)); fi
+  printf '  ✓ a flock-fenced allow-list entry is honoured (%s → %s)\n' "$base" "$withallow"; pass=$((pass+1))
+else printf '  ✗ BROKEN: fenced allow-list entry not dropped (base=%s withallow=%s)\n' "$base" "$withallow"; bad=$((bad+1)); fi
+
+echo "[P7 allow-list but NOT flock-fenced → exemption VOID] the incident-shaped hole"
+c="$(fresh)"
+# same reader but with NO acquire_or_refuse — a CLI-looking file that opens audit
+# fresh without the cross-process flock is exactly the hazard, not an exemption.
+printf 'fn probe_reader(p: &std::path::Path) {\n    let l = aberp_audit_ledger::Ledger::open(p, t, h).unwrap();\n    let _ = l.entries();\n}\n' > "$c/$SCRATCH"
+base="$(count_worklist "$c")"
+printf '%s:probe_reader\n' "$SCRATCH" >> "$c/$ALLOW"
+withallow="$(count_worklist "$c")"
+if [[ "$withallow" -eq "$base" ]]; then
+  printf '  ✓ an UNFENCED allow-list entry is REFUSED exemption — still counted (%s → %s). The flock earns the exemption, the filename does not.\n' "$base" "$withallow"; pass=$((pass+1))
+else printf '  ✗ HOLE: an unfenced allow-list entry was exempted (%s → %s) — CLI-on-filename is back\n' "$base" "$withallow"; bad=$((bad+1)); fi
 
 echo "[META fail-closed] a de-gated scanner must let real read-forks through"
 c="$(fresh)"

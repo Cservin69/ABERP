@@ -1148,6 +1148,19 @@ pub fn run(args: &ExportInvoiceBundleArgs) -> Result<()> {
         ));
     }
 
+    // F-E whole-DB writer flock: an export READS the audit ledger, so it must be
+    // mutually exclusive with a running `serve`. aberp-db's single-writer is a
+    // process-LOCAL Mutex and cannot fence this separate CLI process; without the
+    // flock this fresh `Ledger::open` could read a stale main-file head while
+    // serve holds WAL-resident audit (the incident's mis-measurement) and export
+    // an incomplete bundle. Acquiring the flock (refused while serve holds it) is
+    // exactly what makes export-invoice-bundle's CHECK N read-fork exemption sound.
+    let _db_writer_lock = crate::db_writer_lock::acquire_or_refuse(
+        &args.db,
+        &args.tenant,
+        "aberp export-invoice-bundle",
+    )?;
+
     // 2. Compute binary hash.
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
 
