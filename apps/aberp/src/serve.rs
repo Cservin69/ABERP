@@ -1118,9 +1118,21 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         adapter_registry.clone(),
         shutdown_token_root.clone(),
     ));
+
+    // ADR-0099 H3 — open the ONE process-wide shared DuckDB Handle. The live
+    // file at `args.db` is known-good here (past the H2 provision/probe
+    // chokepoint above) and this process holds the whole-DB writer flock
+    // (acquired at boot), so this is the sole runtime opener of the live path.
+    // `HandleConfig::default()` is the H3 posture: the runtime validated durable
+    // checkpoint is DISABLED (H4's step); the lockstep post-commit mirror is on.
+    tracing::info!("boot step: opening the shared aberp-db Handle (H3 single-writer)");
+    let db_handle = aberp_db::Handle::open_default(&args.db, tenant.clone())
+        .context("open the shared aberp-db Handle (ADR-0099 H3)")?;
+
     let state = AppState {
         db_path: Arc::new(args.db.clone()),
         tenant,
+        db: db_handle,
         binary_hash: binary_hash_handle,
         session_token: Arc::new(session_token.clone()),
         boot_state: Arc::new(std::sync::RwLock::new(initial_boot_state)),
@@ -2898,6 +2910,14 @@ fn derive_initial_boot_state_with_seller_check(
 pub struct AppState {
     pub db_path: Arc<PathBuf>,
     pub tenant: TenantId,
+    /// ADR-0099 H3 — the process-wide shared DuckDB [`aberp_db::Handle`]. The
+    /// ONE runtime writer/reader instance for the live tenant DB: request
+    /// handlers use `state.db.write()` (serialized single writer + post-commit
+    /// lockstep mirror) and `state.db.read()` (a coherent `try_clone`), instead
+    /// of each opening its own `Connection`. Cheap to clone (Arc) into every
+    /// handler and daemon `Deps`. Constructed once at boot after the H2
+    /// provision/probe chokepoint.
+    pub db: aberp_db::HandleArc,
     /// PR-45a / session-61 — handle to the background-computed binary
     /// hash. Reading a debug `aberp` binary off cold disk + hashing it
     /// took ~7.5s in `aberp serve`'s synchronous boot path, which
@@ -26986,6 +27006,8 @@ mod tests {
         }
 
         let state = AppState {
+            db: aberp_db::Handle::open_default(&db_path, tenant.clone())
+                .expect("test: open shared aberp-db Handle"),
             db_path: std::sync::Arc::new(db_path),
             tenant,
             binary_hash: crate::binary_hash::BinaryHashHandle::from_ready(binary_hash),
@@ -27109,6 +27131,8 @@ mod tests {
         }
 
         let state = AppState {
+            db: aberp_db::Handle::open_default(&db_path, tenant.clone())
+                .expect("test: open shared aberp-db Handle"),
             db_path: std::sync::Arc::new(db_path),
             tenant,
             binary_hash: crate::binary_hash::BinaryHashHandle::from_ready(binary_hash),
@@ -27877,6 +27901,11 @@ mod tests {
     /// `restore_active`); the rest are inert defaults.
     fn abandon_test_state(db_path: std::path::PathBuf, tenant: &str) -> AppState {
         AppState {
+            db: aberp_db::Handle::open_default(
+                &db_path,
+                TenantId::new(tenant.to_string()).expect("tenant id"),
+            )
+            .expect("test: open shared aberp-db Handle"),
             db_path: std::sync::Arc::new(db_path),
             tenant: TenantId::new(tenant.to_string()).expect("tenant id"),
             binary_hash: crate::binary_hash::BinaryHashHandle::from_ready(BinaryHash::from_bytes(
