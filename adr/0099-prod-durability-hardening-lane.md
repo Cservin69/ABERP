@@ -431,11 +431,31 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   reader (same property the email_outbox 5-row read-back relies on). Residual
   21 → 20. Census 266 → 257 openers / 40 → 39 files (avl_vendors.rs drops off;
   serve.rs 131 → 124). Re-cut removals-only (0 additions, verified via `comm`).
+- **SEQUENCING — shared audit helpers are CROSS-SUBSYSTEM CHOKEPOINTS (found in
+  wave-2c scoping).** `append_vendor_event` was called by ONE subsystem (avl),
+  so avl migrated cleanly whole. But `quoting_machines::append_machine_event` is
+  called from **12 handlers across SIX subsystems** — machines, partners
+  (`update_partner_request`), margin profiles (create/update/archive), lead-time
+  overrides, quote-margin overrides, and reprice provenance. Migrating that
+  helper to the Handle forces ALL 12 callers to pass `&state.db`; but each caller
+  ALSO does its own business write via a separate `Connection::open`, which would
+  then interleave with the Handle audit write and TEAR the ledger. So a shared
+  helper cannot be migrated until EVERY calling handler's business flow is on the
+  Handle — it is a chokepoint to migrate LAST (or as one coordinated batch with
+  all its callers), NOT a per-subsystem wave. Check a helper's caller span
+  (`grep -rn '<helper>(' apps/aberp/src`) BEFORE scoping it as a wave. Likely
+  sibling chokepoint: `material_inventory::append_heat_lot_events` (verify its
+  span too). `email_invoice::record_email_audit_entry` is single-caller but
+  carries an extra `verify_chain` + explicit `sync_mirror` that must be
+  re-expressed on the Handle (guard-drop already lockstep-syncs the mirror; the
+  chain-verify count needs `Ledger::from_connection(&guard)` on the same
+  instance) — do it deliberately, not as a quick swap.
 - **Remaining (20 write-forks; each a FULL-subsystem migration):**
   `email_relay_daemon`, `quote_pdf_rerender_daemon` (both reverted to coherent
   all-reopen, await full migration), `ap_sync`, `email_invoice`,
   `incoming_invoices` (×2), `material_inventory`, `quote_calibration`,
-  `quoting_machines` (12 caller handlers on the shared `append_machine_event`),
+  `quoting_machines` (12 cross-subsystem callers on `append_machine_event` — a
+  chokepoint; see SEQUENCING above),
   `restore_from_nav_outgoing` (×2), `quote_pricing_pipeline` (×9). `bash
   tools/cut_gate_write_fork.sh` prints the live list. Each removes openers →
   re-cut the census baselines in the same commit; the write-fork gate flips to
