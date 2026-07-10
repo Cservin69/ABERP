@@ -127,3 +127,86 @@ fn shared_handle_access_does_not_trip() {
     .expect("append through the handle must NOT trip the tripwire");
     tx.commit().expect("commit");
 }
+
+#[test]
+fn handle_background_paths_do_not_trip_while_serve_handle_registered() {
+    // ADR-0099 H3 — Task 1 (arm-tripwire prerequisite). `shared_handle_access_does_
+    // not_trip` above proves read / write / append_in_tx are clean, but it does NOT
+    // exercise the Handle's BACKGROUND maintenance paths: the lockstep
+    // `WriteGuard::drop -> sync_mirror` and the debounced durable checkpoint
+    // (`checkpoint_on_idle` + the guard-drop checkpoint branch). If EITHER fresh-
+    // opened the registered live path (via Ledger::open / DuckDbBillingStore::open),
+    // arming the tripwire by default (Task 4) would trip on serve's OWN machinery.
+    // This proves it by EXERCISING those paths under an armed tripwire, not by
+    // reading the source.
+    //
+    // The H3 default is `checkpoint_enabled=false`, which would make the checkpoint
+    // branch a dead no-op we could not observe. We deliberately force it TRUE (and a
+    // large coalescing window) so the checkpoint code path actually RUNS — reaching
+    // `run_durable_checkpoint_locked`, the exact site the tripwire would fire on if
+    // it fresh-opened. In H3 that fn is a fold-nothing stub (it opens nothing and
+    // logs one error line), so forcing the flag on is safe for a test.
+    let db = fresh_db("bg-paths");
+    let cfg = aberp_db::HandleConfig {
+        // Large window: the FIRST guard-drop checkpoints (last_checkpoint==None), the
+        // second does not, leaving the file dirty so the later `checkpoint_on_idle`
+        // reaches `run_durable_checkpoint_locked` too — both checkpoint entry points
+        // exercised under the armed tripwire.
+        min_checkpoint_interval: std::time::Duration::from_secs(3600),
+        checkpoint_enabled: true,
+        disable_implicit_close_checkpoint: true,
+    };
+    let handle = aberp_db::Handle::open(&db, tid(), cfg).expect("open handle");
+    let _guard = register_serve_handle(&db);
+    assert!(is_serve_handle_live(&db));
+
+    let meta = LedgerMeta::new(tid(), BH);
+
+    // Write #1: seed schema + one committed audit row. Guard drops at scope end ->
+    // WriteGuard::drop runs sync_mirror (DB now has 1 row -> real mirror append) AND
+    // the checkpoint branch (first drop -> run_durable_checkpoint_locked). Neither
+    // may trip.
+    {
+        let mut w = handle.write().expect("handle write 1");
+        ensure_schema(&w).expect("ensure audit schema");
+        let tx = w.transaction().expect("begin tx1");
+        append_in_tx(
+            &tx,
+            &meta,
+            EventKind::DaemonShutdownCompleted,
+            b"{}".to_vec(),
+            Actor::from_local_cli(Ulid::new().to_string(), "bg-paths-test"),
+            None,
+        )
+        .expect("append 1");
+        tx.commit().expect("commit 1");
+    }
+
+    // Write #2: a second committed row. This guard-drop's sync_mirror now sees a
+    // NON-empty mirror head -> exercises the head-hash verification branch of
+    // sync_mirror (still no fresh open). This drop does NOT checkpoint (inside the
+    // 1h window), so the file stays dirty for the idle hook below.
+    {
+        let mut w = handle.write().expect("handle write 2");
+        let tx = w.transaction().expect("begin tx2");
+        append_in_tx(
+            &tx,
+            &meta,
+            EventKind::DaemonShutdownCompleted,
+            b"{}".to_vec(),
+            Actor::from_local_cli(Ulid::new().to_string(), "bg-paths-test"),
+            None,
+        )
+        .expect("append 2");
+        tx.commit().expect("commit 2");
+    }
+
+    // Idle-checkpoint hook while the tripwire is armed and the file is dirty ->
+    // reaches run_durable_checkpoint_locked via the SECOND checkpoint entry point.
+    handle.checkpoint_on_idle();
+
+    // Reached here without a `SERVE_HANDLE_LIVE tripwire` panic: sync_mirror and the
+    // debounced checkpoint both route through the shared instance / the mirror file,
+    // never a fresh open of the registered live path. Arming the tripwire is safe.
+    assert!(is_serve_handle_live(&db));
+}
