@@ -9151,8 +9151,16 @@ pub fn list_partners_request(
     state: &AppState,
     search: Option<&str>,
 ) -> std::result::Result<Vec<Partner>, PartnerRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099) — read through the shared Handle (a `try_clone` of
+    // the boot connection). A fresh `Connection::open` reader opens a
+    // SEPARATE DuckDB instance that checkpoints on close, truncating the
+    // Handle's uncheckpointed audit WAL tail and tearing the mirror on
+    // shutdown (proved deterministically by the live reproducer). All
+    // partner writers are on the Handle, so `db.read()` is coherent.
+    let conn = state
+        .db
+        .read()
+        .context("acquire shared reader to list partners")?;
     let partners = partners::list_partners(&conn, state.tenant.as_str(), search)?;
     Ok(partners)
 }
@@ -9185,8 +9193,12 @@ pub fn get_partner_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<Partner, PartnerRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099) — read through the shared Handle; see
+    // `list_partners_request` for why a fresh open is a truncator.
+    let conn = state
+        .db
+        .read()
+        .context("acquire shared reader to get partner")?;
     match partners::get_partner(&conn, state.tenant.as_str(), id)? {
         Some(p) => Ok(p),
         None => Err(PartnerRouteError::NotFound),
@@ -9236,8 +9248,16 @@ pub fn create_partner_request(
     if let Err(errors) = partners::validate_partner_inputs(inputs) {
         return Err(PartnerRouteError::Validation(errors));
     }
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099) — route the partner business write through the ONE
+    // shared Handle instead of a fresh `Connection::open` truncator. A
+    // fresh-open write across a Handle audit write folds the WAL and
+    // tears the audit mirror on shutdown (the master-data CRUD tear).
+    // `WriteGuard` derefs to `Connection`, so `create_partner` is
+    // unchanged. Guard is dropped at fn return (short guard, no `.await`).
+    let conn = state
+        .db
+        .write()
+        .context("acquire shared writer to create partner")?;
     let partner = partners::create_partner(&conn, state.tenant.as_str(), inputs)?;
     Ok(partner)
 }
@@ -9299,9 +9319,16 @@ pub fn update_partner_request(
     // detect a change and fire `PartnerCustomerTypeChanged`. The write
     // connection is scoped/dropped before the audit append opens its own
     // ledger connection (the S427 single-writer-lock posture).
+    // H3 (ADR-0099) — the business read+write ride the shared Handle
+    // writer (fresh-open truncator eliminated). The guard is scoped to
+    // this block and DROPPED before the audit append below, which
+    // acquires its own `db.write()` inside `append_machine_event`
+    // (nested writes on one thread trip the re-entrancy tripwire).
     let (partner, old_customer_type) = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        let conn = state
+            .db
+            .write()
+            .context("acquire shared writer to update partner")?;
         let old_customer_type =
             partners::get_partner(&conn, state.tenant.as_str(), id)?.map(|p| p.customer_type);
         let updated = match partners::update_partner(&conn, state.tenant.as_str(), id, inputs)? {
@@ -9373,8 +9400,12 @@ pub fn delete_partner_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<(), PartnerRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099) — soft-delete write on the shared Handle (fresh-open
+    // truncator eliminated). Guard dropped at fn return.
+    let conn = state
+        .db
+        .write()
+        .context("acquire shared writer to delete partner")?;
     let deleted = partners::soft_delete_partner(&conn, state.tenant.as_str(), id)?;
     if deleted {
         Ok(())

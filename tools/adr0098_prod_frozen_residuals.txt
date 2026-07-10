@@ -83,6 +83,16 @@
 # list_notes_history_request, derive_state_for, query_non_terminal_invoices,
 # build_poll_daemon_inputs, audit_events_request, audit_event_detail_request,
 # resolve_customer_identity, resolve_invoice_xml_path) removed -> all on the Handle.
+# H3 master-data partners subsystem (2026-07-10) — re-cut -5 (removals-only,
+# comm-verified 0 additions): the /api/partners CRUD surface migrated onto the
+# shared Handle. Writers create/update/delete_partner_request -> state.db.write();
+# readers list_partners_request/get_partner_request -> state.db.read() (a
+# fresh-open reader opens a SEPARATE DuckDB instance that checkpoints on close and
+# truncates the Handle's audit WAL tail — proven a shutdown-tear truncator by the
+# live NAV-off reproducer). serve.rs 111->106. (Products stay fresh-open: their
+# with-inventory reader reads products.stock_qty written by 8 WO/dispatch/QA
+# record_movement callers, so the product closure pulls in the inventory+WO
+# surface — handed off as its own atomic commit.)
 3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
 1 apps/aberp/src/export_invoice_bundle.rs
@@ -98,7 +108,7 @@
 4 apps/aberp/src/reports.rs
 4 apps/aberp/src/request_technical_annulment.rs
 8 apps/aberp/src/retry_submission.rs
-111 apps/aberp/src/serve.rs
+106 apps/aberp/src/serve.rs
 1 apps/aberp/src/snapshot.rs
 3 apps/aberp/src/submit_annulment.rs
 1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
