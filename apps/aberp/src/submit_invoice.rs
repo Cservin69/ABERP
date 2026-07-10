@@ -481,6 +481,12 @@ pub async fn submit_from_inputs(
     );
 
     // 4. Load the previously-issued invoice + its idempotency_key.
+    // ADR-0099 H3 Addendum 3 — SERVE_HANDLE_LIVE tripwire. Raw
+    // `duckdb::Connection::open` is a foreign fn with no chokepoint (unlike
+    // `Ledger::open` / `DuckDbBillingStore::open`); guard it explicitly so the
+    // oracle sees this invoice-family opener (debug/test only; no-op unless
+    // serve is armed + registered on this path).
+    audit_ledger::serve_tripwire::assert_no_serve_handle(db, "Connection::open @ submit_invoice");
     let mut conn = Connection::open(db)
         .with_context(|| format!("open tenant DuckDB at {}", db.display()))
         .map_err(SubmitFromInputsError::Other)?;

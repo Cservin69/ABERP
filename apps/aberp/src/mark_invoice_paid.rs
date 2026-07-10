@@ -124,6 +124,15 @@ pub fn mark_paid(
     let idempotency_key = IdempotencyKey::new();
 
     // 4. Append the InvoicePaymentRecorded entry under one tx.
+    // ADR-0099 H3 Addendum 3 — SERVE_HANDLE_LIVE tripwire. `Ledger::open` /
+    // `DuckDbBillingStore::open` guard themselves internally, but this raw
+    // `duckdb::Connection::open` is a foreign fn with no chokepoint; guard it
+    // explicitly so the oracle sees this invoice-family opener too (debug/test
+    // only; no-op unless serve is armed + registered on this path).
+    audit_ledger::serve_tripwire::assert_no_serve_handle(
+        db_path,
+        "Connection::open @ mark_invoice_paid",
+    );
     let mut conn = Connection::open(db_path).with_context(|| {
         format!(
             "open tenant DuckDB at {} for mark-paid audit append",

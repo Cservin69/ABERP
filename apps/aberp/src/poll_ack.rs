@@ -357,6 +357,14 @@ pub async fn poll_ack_from_inputs(
     let tax_number_8 = parse_tax_number_8(tax_number_raw)?;
 
     // 3. Open DuckDB; load the invoice + its idempotency key.
+    // ADR-0099 H3 Addendum 3 — SERVE_HANDLE_LIVE tripwire. Raw
+    // `duckdb::Connection::open` is a foreign fn with no chokepoint; guard it
+    // explicitly so the oracle sees this invoice-family opener (debug/test
+    // only; no-op unless serve is armed + registered on this path).
+    audit_ledger::serve_tripwire::assert_no_serve_handle(
+        db,
+        "Connection::open @ poll_ack_from_inputs",
+    );
     let mut conn =
         Connection::open(db).with_context(|| format!("open tenant DuckDB at {}", db.display()))?;
     let (ready_invoice, idempotency_key) = load_issued_invoice(&mut conn, invoice_id_str)?;
@@ -1005,6 +1013,14 @@ fn write_daemon_terminal_ack(
     inputs: &PollDaemonInputs,
     outcome: &QueryTransactionStatusOutcome,
 ) -> Result<()> {
+    // ADR-0099 H3 Addendum 3 — SERVE_HANDLE_LIVE tripwire. Raw
+    // `duckdb::Connection::open` is a foreign fn with no chokepoint; guard it
+    // explicitly so the oracle sees this invoice-family opener (debug/test
+    // only; no-op unless serve is armed + registered on this path).
+    audit_ledger::serve_tripwire::assert_no_serve_handle(
+        &inputs.db,
+        "Connection::open @ write_daemon_terminal_ack",
+    );
     let mut conn = Connection::open(&inputs.db).with_context(|| {
         format!(
             "open tenant DuckDB at {} for daemon terminal write",
@@ -1122,6 +1138,48 @@ mod tests {
             request_xml: Vec::new(),
             response_xml: b"<r/>".to_vec(),
         }
+    }
+
+    /// ADR-0099 H3 Addendum 3 — SERVE_HANDLE_LIVE tripwire, raw-`Connection::open`
+    /// coverage. `write_daemon_terminal_ack` is private, so its raw open
+    /// (poll_ack.rs:1008 — the FIRST statement in the fn) is proven here rather
+    /// than in the sibling integration test. While a serve `Handle` is registered
+    /// on the tenant DB, that open must trip with the site label BEFORE any
+    /// audit write. Debug/test only (`assert_no_serve_handle` is
+    /// `debug_assertions`-gated).
+    #[test]
+    #[should_panic(expected = "Connection::open @ write_daemon_terminal_ack")]
+    fn write_daemon_terminal_ack_raw_open_trips_while_serve_handle_registered() {
+        let tenant = TenantId::new("raw-conn-tripwire".to_string()).unwrap();
+        let bh = BinaryHash::from_bytes([7u8; 32]);
+        let db =
+            std::env::temp_dir().join(format!("aberp-poll-daemon-trip-{}.duckdb", Ulid::new()));
+        let _ = std::fs::remove_file(&db);
+        // Create the file so registration + open is a genuine independent RE-open.
+        drop(Ledger::open(&db, tenant.clone(), bh).expect("seed tenant DB file"));
+
+        let inputs = PollDaemonInputs {
+            db: db.clone(),
+            tenant: tenant.clone(),
+            binary_hash: bh,
+            invoice_id: "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            transaction_id: "TX-RAW-CONN".to_string(),
+            tax_number_8: "12345678".to_string(),
+            endpoint: NavEndpoint::Test,
+            credentials: NavCredentials::from_parts(
+                "raw-conn-tripwire",
+                "TECHNICAL_LOGIN",
+                "tech-password-01",
+                "SIGN-KEY-32B-ASCII-XXXXXXXXXXXXX",
+                "1234567890ABCDEF",
+            ),
+            actor: Actor::from_local_cli(Ulid::new().to_string(), "raw-conn-test"),
+        };
+        let outcome = ok_outcome(ProcessingStatus::Saved);
+
+        let _guard = audit_ledger::serve_tripwire::register_serve_handle(&db);
+        // Reaches poll_ack.rs:1008 -> the guarded raw open -> panic before write.
+        let _ = write_daemon_terminal_ack(&inputs, &outcome);
     }
 
     /// Build a scripted poll closure + a virtual-time log. `script(n)`
