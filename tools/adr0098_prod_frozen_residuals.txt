@@ -85,7 +85,6 @@
 # resolve_customer_identity, resolve_invoice_xml_path) removed -> all on the Handle.
 3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
-7 apps/aberp/src/email_relay_daemon.rs
 1 apps/aberp/src/export_invoice_bundle.rs
 9 apps/aberp/src/incoming_invoices.rs
 4 apps/aberp/src/mark_abandoned.rs

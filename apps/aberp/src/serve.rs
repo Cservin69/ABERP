@@ -2122,7 +2122,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             )
             .context("resolve seller.toml path for email-relay drain")?;
             let relay_deps = crate::email_relay_daemon::EmailRelayDaemonDeps {
-                db_path: (*recovery_state.db_path).clone(),
+                db: recovery_state.db.clone(),
                 tenant: recovery_state.tenant.clone(),
                 binary_hash,
                 operator_login,
@@ -24216,7 +24216,7 @@ async fn handle_relay_send_email(
     //    on audit-write failure so a corrupted ledger surfaces in
     //    tracing.
     let deps = crate::email_relay_daemon::EmailRelayDaemonDeps {
-        db_path: (*state.db_path).clone(),
+        db: state.db.clone(),
         tenant: state.tenant.clone(),
         binary_hash: match state.binary_hash.wait() {
             Ok(b) => b,
