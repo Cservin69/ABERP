@@ -71,11 +71,11 @@
 //! `InvoiceQueuedForSubmissionPayload` variant. The ritual remains
 //! at its ninth landing.
 
-use std::path::Path;
 use std::time::Duration;
 
 use aberp_audit_ledger::{BinaryHash, Entry, EventKind, Ledger, TenantId};
 use aberp_billing::IdempotencyKey;
+use aberp_db::Handle;
 use aberp_nav_transport::{soap::InvoiceOperation, NavTransportError};
 use anyhow::{anyhow, Context, Result};
 use time::OffsetDateTime;
@@ -172,13 +172,20 @@ pub fn pending_from_ledger(ledger: &Ledger) -> Result<Vec<PendingInvoice>> {
 /// metadata. Used by `issue-invoice`'s pre-allocation cap check
 /// (ADR-0031 §5).
 ///
-/// Opens its own `Ledger` from the supplied DB path. The signature
-/// takes the same `(db_path, tenant, binary_hash)` triple every
-/// other call site already builds; this keeps the cap check a one-
-/// liner at the `issue-*` orchestration boundaries.
-pub fn count_pending(db_path: &Path, tenant: TenantId, binary_hash: BinaryHash) -> Result<usize> {
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to count pending submissions")?;
+/// H3 (ADR-0099): reads the audit ledger through the shared `Handle`
+/// (`db.read()` = a coherent try_clone), not a fresh `Ledger::open`. The
+/// invoice `issue-*` handlers/one-shots hold no write guard when they run this
+/// pre-allocation cap check, so the read never re-enters the writer mutex. The
+/// signature takes the same `(db, tenant, binary_hash)` triple every call site
+/// already threads; this keeps the cap check a one-liner at the `issue-*`
+/// orchestration boundaries.
+pub fn count_pending(db: &Handle, tenant: TenantId, binary_hash: BinaryHash) -> Result<usize> {
+    let ledger = Ledger::from_connection(
+        db.read()
+            .context("acquire shared reader to count pending submissions")?,
+        tenant,
+        binary_hash,
+    );
     Ok(pending_from_ledger(&ledger)?.len())
 }
 

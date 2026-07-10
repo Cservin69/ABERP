@@ -88,7 +88,7 @@
 //!    trigger for the migrated-base path: the first PR that lands the
 //!    Billingo migration read (ADR-0010 build phase).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
 use aberp_billing::{
@@ -96,6 +96,7 @@ use aberp_billing::{
     DraftInvoice, DuckDbBillingStore, Huf, IdempotencyKey, InvoiceId, InvoiceSeries,
     IssueInvoiceCommand, LineItem, RateMetadata, ReadyInvoice, ResetPolicy, SeriesCode, SeriesId,
 };
+use aberp_db::Handle;
 use aberp_nav_transport::NavCredentials;
 use anyhow::{anyhow, bail, Context, Result};
 use duckdb::Connection;
@@ -156,9 +157,17 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
         "NAV credentials loaded; actor derived for this CLI invocation"
     );
 
+    // H3 (ADR-0099): open a PROCESS-LOCAL shared `Handle` for this CLI one-shot
+    // (checkpoint disabled, no daemon threads) — the same code path serve uses.
+    // The F-E writer flock acquired above keeps serve's Handle off this file.
+    let tenant_id = TenantId::new(args.tenant.clone())
+        .ok_or_else(|| anyhow!("tenant value '{}' is empty or has a null byte", args.tenant))?;
+    let db = Handle::open_default(&args.db, tenant_id)
+        .context("open shared DuckDB handle for issue-storno CLI (H3)")?;
+
     let summary = storno_from_inputs(
         input,
-        &args.db,
+        &db,
         &args.tenant,
         &args.series,
         &args.references,
@@ -226,7 +235,10 @@ pub struct StornoIssuedSummary {
 /// `Actor::from_local_cli` it always built.
 pub fn storno_from_inputs(
     input: InvoiceInputJson,
-    db: &Path,
+    // H3 (ADR-0099): the shared DuckDB `Handle` (serve: `&state.db`; CLI: a
+    // process-local `Handle::open_default` under the F-E flock). Storno is
+    // SYNCHRONOUS (no NAV call), so a single write guard spans setup→tx→verify.
+    db: &Handle,
     tenant_str: &str,
     series_str: &str,
     references: &str,
@@ -300,8 +312,15 @@ pub fn storno_from_inputs(
     //    `template.render_for_build(base_year, base_seq)` away from NAV's
     //    record → INVALID_INVOICE_REFERENCE ABORTED ack.
     let (base_nav_xml_path, saved_prior_modification_lines) = {
-        let ledger = Ledger::open(db, tenant.clone(), binary_hash_bytes)
-            .context("open audit ledger for storno precondition check")?;
+        // H3 (ADR-0099): read the precondition chain through the shared Handle
+        // (coherent try_clone), not a fresh `Ledger::open`. No write guard is
+        // held yet, so the reader does not re-enter the writer mutex.
+        let ledger = Ledger::from_connection(
+            db.read()
+                .context("acquire shared reader for storno precondition check")?,
+            tenant.clone(),
+            binary_hash_bytes,
+        );
         check_base_is_finalized(&ledger, references)?;
         let base_path = find_base_nav_xml_path_for_chain(&ledger, references)?;
         // S384/F5 — fold the lines of every SAVED prior modification in
@@ -325,10 +344,29 @@ pub fn storno_from_inputs(
     let template = crate::numbering::read_numbering_template(&seller_toml_path)
         .context("read [seller.numbering] template from seller.toml")?;
 
-    // 6. Pre-tx setup: schemas + series. Reuses the helper shape
-    //    `issue_invoice.rs` uses (kept inlined here to avoid a
-    //    speculative shared-helper extraction — rule 2).
-    let (conn, series) = pre_tx_setup(db, &series_code, template.reset_policy.to_billing())?;
+    // 6. Pre-tx setup on the shared Handle: billing schema + series on a
+    //    try_clone auto-commit (coherent with the tx below), audit schema on the
+    //    guard. H3 (ADR-0099): the write guard is acquired HERE and held across
+    //    the (synchronous) command build + tx + verify — no `.await` intervenes,
+    //    so no `!Send` guard crosses a yield point. The old fresh-open
+    //    `pre_tx_setup` + explicit `sync_mirror` are gone (guard-drop syncs).
+    let mut guard = db
+        .write()
+        .context("acquire shared writer for storno issuance")?;
+    let series = {
+        let mut billing = DuckDbBillingStore::from_connection(
+            guard
+                .try_clone()
+                .context("try_clone shared writer for storno billing pre-tx setup")?,
+        );
+        billing.ensure_schema().context("ensure billing schema")?;
+        ensure_series(
+            &mut billing,
+            &series_code,
+            template.reset_policy.to_billing(),
+        )?
+    };
+    audit_ledger::ensure_schema(&guard).context("ensure audit-ledger schema")?;
 
     // 7. Build the IssueInvoiceCommand for the STORNO's own content
     //    + AllocateArgs. The storno burns its own sequence number;
@@ -579,8 +617,8 @@ pub fn storno_from_inputs(
     //    render+write. `run_single_tx` runs the render closure before
     //    committing and hands the post-commit Connection back so the
     //    verify path below reuses it (no crash-prone re-open).
-    let (outcome, conn) = run_single_tx(
-        conn,
+    let outcome = run_single_tx(
+        guard.conn(),
         &ledger_meta,
         allocate_args,
         idempotency_key,
@@ -609,25 +647,23 @@ pub fn storno_from_inputs(
         "storno issued"
     );
 
-    // 9. Verify the audit chain — success-criterion gate. S375 — run
-    //    `verify_chain` + `sync_mirror` on the SAME post-commit
-    //    Connection `run_single_tx` handed back, rather than dropping it
-    //    and calling `Ledger::open` (a fresh `Connection::open` that
-    //    triggers DuckDB 1.5.x's LoadCheckpoint/ReadIndex ART assertion,
-    //    S332 / duckdb#23046 — the original DEV storno crash). No file
-    //    re-open → that crash is unreachable.
-    let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER storno issuance")?;
+    // 9. Verify the audit chain — success-criterion gate. S375 / H3 — run
+    //    `verify_chain` on a `try_clone` of the SAME live shared instance the tx
+    //    just committed on, NOT a fresh `Ledger::open`/`Connection::open` reopen
+    //    (which re-triggers DuckDB 1.5.x's LoadCheckpoint/ReadIndex ART assertion
+    //    S332 / duckdb#23046 — the original DEV storno crash). The explicit
+    //    post-commit `sync_mirror` is GONE: `WriteGuard::drop` lockstep-syncs the
+    //    audit mirror when `guard` falls out of scope at function end.
+    let verified = Ledger::from_connection(
+        guard
+            .try_clone()
+            .context("try_clone shared writer for post-storno verify")?,
+        tenant.clone(),
+        binary_hash_bytes,
+    )
+    .verify_chain()
+    .context("audit-ledger chain verification failed AFTER storno issuance")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
-
-    // 9a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    //     post-commit (matches the issue_invoice posture).
-    let mirror_path = audit_ledger::mirror_path_for(db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after storno commit")?;
 
     Ok(StornoIssuedSummary {
         invoice_id: outcome.storno.id.to_prefixed_string(),
@@ -852,22 +888,9 @@ impl HasInvoiceId for audit_payloads::InvoiceSubmissionResponsePayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Pre-tx setup — same shape as issue_invoice.rs
+// Pre-tx setup — inlined onto the shared Handle in `storno_from_inputs`
+// (H3 / ADR-0099); the fresh-open helper is gone.
 // ──────────────────────────────────────────────────────────────────────
-
-fn pre_tx_setup(
-    db_path: &Path,
-    series_code: &SeriesCode,
-    template_reset_policy: ResetPolicy,
-) -> Result<(Connection, InvoiceSeries)> {
-    let mut billing = DuckDbBillingStore::open(db_path)
-        .with_context(|| format!("open billing DuckDB at {}", db_path.display()))?;
-    billing.ensure_schema().context("ensure billing schema")?;
-    let series = ensure_series(&mut billing, series_code, template_reset_policy)?;
-    let conn = billing.into_connection();
-    audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema")?;
-    Ok((conn, series))
-}
 
 /// PR-90 / ADR-0045 §2 — mirror of `issue_invoice::ensure_series`:
 /// auto-create the series with the template's `reset_policy`, sync the
@@ -938,7 +961,9 @@ struct TxOutcome {
 /// shape).
 #[allow(clippy::too_many_arguments)]
 fn run_single_tx<F>(
-    mut conn: Connection,
+    // H3 (ADR-0099): a BORROWED `&mut Connection` — the shared Handle writer
+    // guard's connection. No owned Connection is moved in or handed back.
+    conn: &mut Connection,
     ledger_meta: &LedgerMeta,
     mut allocate_args: AllocateArgs,
     idempotency_key: IdempotencyKey,
@@ -966,7 +991,7 @@ fn run_single_tx<F>(
     // inherited currency + rate metadata) and returns the rendered NAV
     // invoice number.
     render_and_write: F,
-) -> Result<(TxOutcome, Connection)>
+) -> Result<TxOutcome>
 where
     F: FnOnce(&ReadyInvoice, u32, Currency, Option<&RateMetadata>) -> Result<String>,
 {
@@ -1172,16 +1197,13 @@ where
 
     tx.commit()
         .context("commit DuckDB transaction (storno: billing + audit-ledger)")?;
-    Ok((
-        TxOutcome {
-            storno: storno_invoice,
-            modification_index,
-            base_sequence_number,
-            was_fresh,
-            storno_invoice_number,
-        },
-        conn,
-    ))
+    Ok(TxOutcome {
+        storno: storno_invoice,
+        modification_index,
+        base_sequence_number,
+        was_fresh,
+        storno_invoice_number,
+    })
 }
 
 /// Walk `audit_ledger` inside the borrowed transaction for every

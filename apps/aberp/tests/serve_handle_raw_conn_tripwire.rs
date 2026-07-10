@@ -1,30 +1,30 @@
-//! ADR-0099 H3 Addendum 3 — SERVE_HANDLE_LIVE tripwire, RAW `Connection::open`
-//! coverage (session 6).
+//! ADR-0099 H3 — post-migration regression: the invoice-family writers route
+//! through the shared `Handle` and NO LONGER fork the DB (this SUPERSEDES the
+//! session-6 raw-`Connection::open` tripwire oracle, whose job — proving the
+//! pre-migration fork sites tripped — is spent now that those sites are gone).
 //!
-//! The tripwire's chokepoint asserts live inside `Ledger::open` and
-//! `DuckDbBillingStore::open`. But the invoice family also fresh-opens the DB
-//! through FOUR raw `duckdb::Connection::open` sites — a foreign fn with no
-//! chokepoint, so the oracle was BLIND to them (session 5 FINDING 1):
-//!   * `mark_invoice_paid.rs:127`  (shadowed at runtime by the `Ledger::open`
-//!     idempotency gate at :114 — see the shadow note on the mark_paid test)
-//!   * `submit_invoice.rs:484`
-//!   * `poll_ack.rs:361`           (poll_ack_from_inputs)
-//!   * `poll_ack.rs:1008`          (write_daemon_terminal_ack — private; proven
-//!     by a unit test inside `poll_ack.rs` at its own module)
+//! Before the invoice-family migration these fns fresh-opened the tenant DB
+//! (`DuckDbBillingStore::open` / `Ledger::open` / four raw `Connection::open`),
+//! so while a serve `Handle` was registered the SERVE_HANDLE_LIVE tripwire caught
+//! them. After the migration every read is `db.read()` and every append is under
+//! a `db.write()` guard on the ONE shared instance — there is no independent
+//! opener left, so the tripwire (its chokepoint asserts still live in
+//! `Ledger::open` / `DuckDbBillingStore::open`, and are exercised by
+//! `serve_handle_tripwire.rs`) has NOTHING to fire on in these paths.
 //!
-//! Session 6 wired an explicit `serve_tripwire::assert_no_serve_handle(path,
-//! "Connection::open @ …")` immediately before each raw open. This file proves
-//! the guard has TEETH at the reachable-first sites — while a serve `Handle` is
-//! registered on the tenant DB, driving the fn to its raw open panics with the
-//! site-labelled tripwire message BEFORE any NAV interaction.
-//!
-//! Debug/test only by construction (`assert_no_serve_handle` is
-//! `debug_assertions`-gated); `cargo test` builds set it, so these run.
+//! This file now PINS that inversion: with a serve `Handle` registered on the
+//! tenant DB, driving each migrated writer through the SAME `Handle` must NOT
+//! panic with a tripwire message — it either succeeds or fails cleanly on the
+//! (deliberately-absent) invoice, never on a fork. A regression that re-introduced
+//! a fresh open on any of these paths would panic here (the tripwire would fire)
+//! instead of passing. Debug/test only by construction (`assert_no_serve_handle`
+//! is `debug_assertions`-gated); `cargo test` builds set it, so these run.
 
 use std::path::PathBuf;
 
 use aberp_audit_ledger::serve_tripwire::register_serve_handle;
 use aberp_audit_ledger::{Actor, BinaryHash, Ledger, TenantId};
+use aberp_db::Handle;
 use aberp_nav_transport::{NavCredentials, NavEndpoint};
 use ulid::Ulid;
 
@@ -40,8 +40,8 @@ fn tid() -> TenantId {
 
 /// A unique temp DB path per test — the registry is process-global, so distinct
 /// paths keep parallel tests from cross-contaminating. Creates the file (via a
-/// throwaway `Ledger::open`) so a later open is a genuine independent RE-open,
-/// not a create.
+/// throwaway `Ledger::open`, BEFORE any registration) so opening the `Handle`
+/// on it is a genuine re-open of an existing tenant DB.
 fn seeded_db(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("aberp-raw-conn-{tag}-{}.duckdb", Ulid::new()));
     let _ = std::fs::remove_file(&p);
@@ -49,8 +49,9 @@ fn seeded_db(tag: &str) -> PathBuf {
     p
 }
 
-/// A throwaway NAV credential blob. The tripwire fires at the DB OPEN, which is
-/// reached BEFORE any wire call, so these bytes are never used against NAV.
+/// A throwaway NAV credential blob. The migrated writers fail on the absent
+/// invoice at the Handle READ — BEFORE any wire call — so these bytes are never
+/// used against NAV.
 fn dummy_credentials() -> NavCredentials {
     NavCredentials::from_parts(
         "raw-conn-tripwire",
@@ -61,19 +62,20 @@ fn dummy_credentials() -> NavCredentials {
     )
 }
 
-/// `poll_ack_from_inputs` reaches its raw `Connection::open` (poll_ack.rs:361)
-/// right after parsing the tenant + tax number — BEFORE the NAV token exchange.
-/// While a serve Handle is registered, that open must trip with the site label.
+/// `poll_ack_from_inputs` now loads the invoice through `db.read()` (was a raw
+/// `Connection::open`). While a serve `Handle` is registered on the same path,
+/// driving it through that `Handle` must NOT trip — it fails cleanly on the
+/// absent invoice, BEFORE any NAV I/O. (A `#[should_panic]` here would mean a
+/// fresh open crept back in.)
 #[tokio::test]
-#[should_panic(expected = "Connection::open @ poll_ack_from_inputs")]
-async fn poll_ack_from_inputs_raw_open_trips_while_serve_handle_registered() {
-    let db = seeded_db("poll");
+async fn poll_ack_from_inputs_routes_through_handle_without_tripping() {
+    let db_path = seeded_db("poll");
+    let handle = Handle::open_default(&db_path, tid()).expect("open shared handle");
     let creds = dummy_credentials();
     let actor = Actor::from_local_cli(Ulid::new().to_string(), "raw-conn-test");
-    let _guard = register_serve_handle(&db);
-    // Reaches poll_ack.rs:361 -> the guarded raw open -> panic before any NAV I/O.
-    let _ = poll_ack::poll_ack_from_inputs(
-        &db,
+    let _guard = register_serve_handle(&db_path);
+    let res = poll_ack::poll_ack_from_inputs(
+        &handle,
         "raw-conn-tripwire",
         "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         "12345678",
@@ -82,23 +84,26 @@ async fn poll_ack_from_inputs_raw_open_trips_while_serve_handle_registered() {
         actor,
     )
     .await;
+    // Reaches the Handle read (no tripwire panic), fails on the absent invoice.
+    assert!(
+        res.is_err(),
+        "expected a clean Err on the absent invoice, not a tripwire panic"
+    );
 }
 
-/// `submit_from_inputs` validates the InvoiceData XML (step 3a) then reaches its
-/// raw `Connection::open` (submit_invoice.rs:484) — still BEFORE the NAV token
-/// exchange. `MIN_VALID` is the validator's own golden positive fixture (copied
-/// so this test does not depend on a `#[cfg(test)]` const in another crate), so
-/// step 3a passes and control reaches the guarded open, which must trip.
+/// `submit_from_inputs` validates the InvoiceData XML (step 3a), then loads the
+/// invoice through `db.read()` (was a raw `Connection::open`). Registered +
+/// driven through the SAME `Handle`, it must NOT trip — it fails cleanly on the
+/// absent invoice BEFORE the NAV token exchange.
 #[tokio::test]
-#[should_panic(expected = "Connection::open @ submit_invoice")]
-async fn submit_from_inputs_raw_open_trips_while_serve_handle_registered() {
-    let db = seeded_db("submit");
+async fn submit_from_inputs_routes_through_handle_without_tripping() {
+    let db_path = seeded_db("submit");
+    let handle = Handle::open_default(&db_path, tid()).expect("open shared handle");
     let creds = dummy_credentials();
     let actor = Actor::from_local_cli(Ulid::new().to_string(), "raw-conn-test");
-    let _guard = register_serve_handle(&db);
-    // Reaches submit_invoice.rs:484 -> the guarded raw open -> panic before NAV.
-    let _ = submit_invoice::submit_from_inputs(submit_invoice::SubmitFromInputs {
-        db: &db,
+    let _guard = register_serve_handle(&db_path);
+    let res = submit_invoice::submit_from_inputs(submit_invoice::SubmitFromInputs {
+        db: &handle,
         tenant_str: "raw-conn-tripwire",
         invoice_id_str: "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         invoice_xml_origin: "raw-conn-test-fixture".to_string(),
@@ -110,19 +115,20 @@ async fn submit_from_inputs_raw_open_trips_while_serve_handle_registered() {
         actor,
     })
     .await;
+    assert!(
+        res.is_err(),
+        "expected a clean Err on the absent invoice, not a tripwire panic"
+    );
 }
 
-/// `mark_paid` is CAUGHT by the oracle — but at its `Ledger::open` idempotency
-/// gate (mark_invoice_paid.rs:114), which runs BEFORE the raw open at :127. So
-/// the runtime panic here names `Ledger::open`, not the raw-open label. This
-/// test pins that mark_paid trips at all while registered (oracle completeness);
-/// the raw-open guard at :127 becomes load-bearing only once :114 is migrated to
-/// the Handle, and its exact label is proven by the session-6 injection
-/// experiment recorded in the handoff (the :114 shadow removed transiently).
+/// `mark_paid` now reads the idempotency gate via `db.read()` and appends under a
+/// `db.write()` guard (was `Ledger::open` + a raw `Connection::open`). Registered
+/// + driven through the SAME `Handle`, it must NOT trip — it records the payment
+/// and returns `Ok` (it does not require a pre-existing billing row).
 #[test]
-#[should_panic(expected = "SERVE_HANDLE_LIVE tripwire")]
-fn mark_paid_is_caught_while_serve_handle_registered() {
-    let db = seeded_db("markpaid");
+fn mark_paid_routes_through_handle_without_tripping() {
+    let db_path = seeded_db("markpaid");
+    let handle = Handle::open_default(&db_path, tid()).expect("open shared handle");
     let input = MarkPaidInput {
         invoice_id: "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
         paid_at: "2026-05-20".to_string(),
@@ -131,9 +137,12 @@ fn mark_paid_is_caught_while_serve_handle_registered() {
         method: PaymentMethod::BankTransfer,
         reference: None,
     };
-    let _guard = register_serve_handle(&db);
-    // Trips at mark_invoice_paid.rs:114 (Ledger::open) — the fn is caught.
-    let _ = mark_invoice_paid::mark_paid(&db, tid(), BH, "raw-conn-test", input);
+    let _guard = register_serve_handle(&db_path);
+    let res = mark_invoice_paid::mark_paid(&handle, tid(), BH, "raw-conn-test", input);
+    assert!(
+        res.is_ok(),
+        "mark_paid must record the payment through the Handle without tripping: {res:?}"
+    );
 }
 
 /// The validator's golden minimum-valid InvoiceData, copied verbatim from

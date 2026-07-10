@@ -74,19 +74,23 @@
 # H3 wave-3c (2026-07-10) — re-cut −12 (removals-only, comm-verified 0 additions):
 # restore_from_nav migrated onto the shared Handle (restore_from_nav_outgoing.rs −11,
 # restore_from_nav_extract.rs open_for_extract −1). 249/36 → 237/34.
+# H3 invoice-family (2026-07-10) — re-cut -29 (removals-only, comm-verified 0
+# additions): the invoice-family atomic migration onto the shared Handle. 271-era
+# census 237/34 -> 208/27. 16 writer openers (issue_invoice/issue_storno/
+# issue_modification/submit_invoice/poll_ack/mark_invoice_paid + submission_queue::
+# count_pending) + 13 serve.rs invoice-audit/billing READER openers (list_invoices
+# +billing conn, get_invoice_detail +billing conn, get_audit_for_invoice,
+# list_notes_history_request, derive_state_for, query_non_terminal_invoices,
+# build_poll_daemon_inputs, audit_events_request, audit_event_detail_request,
+# resolve_customer_identity, resolve_invoice_xml_path) removed -> all on the Handle.
 3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
 7 apps/aberp/src/email_relay_daemon.rs
 1 apps/aberp/src/export_invoice_bundle.rs
 9 apps/aberp/src/incoming_invoices.rs
-1 apps/aberp/src/issue_invoice.rs
-2 apps/aberp/src/issue_modification.rs
-2 apps/aberp/src/issue_storno.rs
 4 apps/aberp/src/mark_abandoned.rs
-3 apps/aberp/src/mark_invoice_paid.rs
 1 apps/aberp/src/material_inventory.rs
 4 apps/aberp/src/observe_receiver_confirmation.rs
-5 apps/aberp/src/poll_ack.rs
 3 apps/aberp/src/poll_annulment_ack.rs
 3 apps/aberp/src/print_invoice.rs
 2 apps/aberp/src/quote_calibration.rs
@@ -96,11 +100,9 @@
 4 apps/aberp/src/reports.rs
 4 apps/aberp/src/request_technical_annulment.rs
 8 apps/aberp/src/retry_submission.rs
-124 apps/aberp/src/serve.rs
+111 apps/aberp/src/serve.rs
 1 apps/aberp/src/snapshot.rs
-1 apps/aberp/src/submission_queue.rs
 3 apps/aberp/src/submit_annulment.rs
-2 apps/aberp/src/submit_invoice.rs
 1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
 1 crates/aberp-mes/src/ledger_writer.rs
 8 crates/aberp-quote-intake/src/service.rs

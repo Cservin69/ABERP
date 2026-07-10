@@ -60,9 +60,18 @@ fn test_dir(label: &str) -> PathBuf {
 fn build_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
+    let db = aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+        .expect("test: open shared aberp-db Handle");
+    // H3 (ADR-0099): serve boot ensures the audit-ledger schema BEFORE the Handle
+    // opens (serve.rs:1023 < :1128) so the migrated readers (count_pending's cap
+    // check) use db.read() without re-ensuring. Tests bypass boot — ensure it here
+    // on the shared instance so the first issuance's read finds the table.
+    {
+        let guard = db.write().expect("write guard to ensure audit schema");
+        aberp_audit_ledger::ensure_schema(&guard).expect("ensure audit-ledger schema (test boot)");
+    }
     AppState {
-        db: aberp::serve::open_tenant_handle(&db_path, tenant.clone())
-            .expect("test: open shared aberp-db Handle"),
+        db,
         db_path: Arc::new(db_path),
         tenant,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),

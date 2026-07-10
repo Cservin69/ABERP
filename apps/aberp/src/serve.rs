@@ -6734,7 +6734,7 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         };
     issue_invoice::issue_from_parsed(
         input,
-        &state.db_path,
+        &state.db,
         state.tenant.as_str(),
         series,
         request.currency,
@@ -7250,7 +7250,7 @@ pub async fn submit_invoice_request(
     let endpoint = build_profile::nav_endpoint();
     build_profile::assert_endpoint_allowed(endpoint).map_err(SubmitRouteError::Other)?;
     submit_invoice::submit_from_inputs(submit_invoice::SubmitFromInputs {
-        db: &state.db_path,
+        db: &state.db,
         tenant_str: state.tenant.as_str(),
         invoice_id_str: invoice_id,
         invoice_xml_origin: nav_xml_path.display().to_string(),
@@ -7386,7 +7386,7 @@ pub async fn poll_ack_request(
     let endpoint = build_profile::nav_endpoint();
     build_profile::assert_endpoint_allowed(endpoint).map_err(SubmitRouteError::Other)?;
     poll_ack::poll_ack_from_inputs(
-        &state.db_path,
+        &state.db,
         state.tenant.as_str(),
         invoice_id,
         &tax_number_8,
@@ -7737,7 +7737,7 @@ pub fn storno_invoice_request(
 
     issue_storno::storno_from_inputs(
         input,
-        &state.db_path,
+        &state.db,
         state.tenant.as_str(),
         DEFAULT_SERIES_CODE,
         invoice_id,
@@ -8150,7 +8150,7 @@ pub fn modification_invoice_request(
     // 6. Dispatch into the library helper.
     issue_modification::modification_from_inputs(
         input,
-        &state.db_path,
+        &state.db,
         state.tenant.as_str(),
         series,
         invoice_id,
@@ -8976,7 +8976,7 @@ pub fn mark_paid_request(
         }),
     };
     match mark_invoice_paid::mark_paid(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         &operator_login,
@@ -12299,8 +12299,16 @@ pub fn list_notes_history_request(
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for notes-history scan")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle
+    // (`db.read()` = a coherent try_clone), not a fresh `Ledger::open`.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for notes-history scan")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     crate::notes_history::list_notes_history(&ledger, scope, limit)
 }
 
@@ -18687,15 +18695,22 @@ fn resolve_customer_identity(
     state: &AppState,
     invoice_id: &str,
 ) -> Result<(Option<String>, String)> {
-    let ledger = Ledger::open(
-        &*state.db_path,
+    // H3 (ADR-0099): read the invoice audit chain through the shared Handle
+    // (`db.read()` = a coherent try_clone), not a fresh `Ledger::open` — the
+    // read-fork gate's curated-helper heuristic is BLIND to this reader (it
+    // reads via `find_draft_xml_path`/`chain_link_base_for`), but it reads
+    // invoice audit rows the issuing writers now keep WAL-resident.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader to resolve customer identity")?,
         state.tenant.clone(),
         state
             .binary_hash
             .wait()
             .map_err(|e| anyhow!("binary hash: {e}"))?,
-    )
-    .with_context(|| format!("open audit ledger at {}", state.db_path.display()))?;
+    );
     // S184 — walk chain children up to the first ancestor whose
     // sibling input.json actually exists on disk. Bounded depth: in
     // practice chain depth is 1 (storno of a base) or 2 (storno of an
@@ -18786,15 +18801,21 @@ fn chain_link_base_for(ledger: &Ledger, invoice_id: &str) -> Result<Option<Strin
 }
 
 fn resolve_invoice_xml_path(state: &AppState, invoice_id: &str) -> Result<PathBuf> {
-    let ledger = Ledger::open(
-        &*state.db_path,
+    // H3 (ADR-0099): read the invoice audit chain through the shared Handle —
+    // same read-fork-gate blind spot as `resolve_customer_identity` (reads via
+    // `find_draft_xml_path`), migrated for coherence with the WAL-resident
+    // issuing writers.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader to resolve invoice XML path")?,
         state.tenant.clone(),
         state
             .binary_hash
             .wait()
             .map_err(|e| anyhow!("binary hash: {e}"))?,
-    )
-    .with_context(|| format!("open audit ledger at {}", state.db_path.display()))?;
+    );
     find_draft_xml_path(&ledger, invoice_id)
 }
 
@@ -18926,8 +18947,15 @@ fn derive_state_for(
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for serve mutation precondition")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for serve mutation precondition")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger
         .entries()
         .context("read audit ledger entries for precondition")?;
@@ -21841,8 +21869,15 @@ fn query_non_terminal_invoices(state: &AppState) -> Result<Vec<String>> {
         .binary_hash
         .wait()
         .context("await background binary hash compute for boot-recovery scan")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for boot-recovery scan")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for boot-recovery scan")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger
         .entries()
         .context("read audit ledger entries for boot-recovery scan")?;
@@ -21877,8 +21912,15 @@ async fn build_poll_daemon_inputs(
         .binary_hash
         .wait()
         .context("await background binary hash compute for poll daemon inputs")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger to build poll daemon inputs")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader to build poll daemon inputs")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger
         .entries()
         .context("read audit ledger entries to build poll daemon inputs")?;
@@ -21926,7 +21968,9 @@ async fn build_poll_daemon_inputs(
     build_profile::assert_endpoint_allowed(endpoint)?;
 
     Ok(poll_ack::PollDaemonInputs {
-        db: (*state.db_path).clone(),
+        // H3 (ADR-0099): the daemon owns an Arc-clone of the shared Handle and
+        // routes 100% of its DB access through it (CHECK M whole-subsystem rule).
+        db: state.db.clone(),
         tenant: state.tenant.clone(),
         binary_hash,
         invoice_id: invoice_id.to_string(),
@@ -22095,8 +22139,15 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for serve list")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for serve list")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger.entries().context("read audit ledger entries")?;
 
     // PR-65 / session-86 — sidecar map from invoice_id to the
@@ -22157,8 +22208,13 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
 
     // Load billing details for each invoice id.
     let mut items: Vec<InvoiceListItem> = Vec::new();
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099): read the invoice billing row through the shared Handle
+    // (`db.read()` = a coherent try_clone), not a fresh `Connection::open` —
+    // `allocate_in_tx` now writes these billing rows WAL-resident via the Handle.
+    let mut conn = state
+        .db
+        .read()
+        .context("acquire shared reader for invoice billing rows (list)")?;
     // S242 / PR-236 — same `YYYY-MM-DD` format the detail-modal
     // path emits (`get_invoice_detail` uses an identical descriptor);
     // both surfaces feed the SPA's `formatInvoiceDate` HU display
@@ -22404,8 +22460,15 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for serve detail")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for serve detail")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger.entries().context("read audit ledger entries")?;
 
     let mut trace = InvoiceTrace::default();
@@ -22486,8 +22549,11 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         }
     }
 
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099): read the invoice billing row through the shared Handle.
+    let mut conn = state
+        .db
+        .read()
+        .context("acquire shared reader for invoice billing row (detail)")?;
     let billing = read_invoice_row(&mut conn, invoice_id)?;
 
     if !found_any && billing.is_none() {
@@ -22619,8 +22685,15 @@ fn get_audit_for_invoice(state: &AppState, invoice_id: &str) -> Result<Vec<Audit
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for serve audit")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for serve audit")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger.entries().context("read audit ledger entries")?;
     let mut out = Vec::new();
     for entry in &entries {
@@ -23391,8 +23464,15 @@ fn audit_events_request(state: &AppState, query: &AuditEventsQuery) -> Result<Au
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for audit-events")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for audit-events")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger.entries().context("read audit ledger entries")?;
 
     // ── Whole-chain verdict (design §3.4). head_seq is the max seq. ──
@@ -23565,8 +23645,15 @@ fn audit_event_detail_request(state: &AppState, seq: u64) -> Result<Option<Audit
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for audit-event detail")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for audit-event detail")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger.entries().context("read audit ledger entries")?;
     let entry = match entries.iter().find(|e| e.seq.as_u64() == seq) {
         Some(e) => e,

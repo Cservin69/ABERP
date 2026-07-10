@@ -36,6 +36,7 @@
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
 use aberp_billing::IdempotencyKey;
+use aberp_db::Handle;
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
 
@@ -96,7 +97,10 @@ pub struct MarkPaidOutcome {
 /// preconditions. Returns the resulting [`PaymentRecord`] for the
 /// route's JSON echo body.
 pub fn mark_paid(
-    db_path: &std::path::Path,
+    // H3 (ADR-0099): the shared DuckDB `Handle`. mark-paid is serve-only (no CLI
+    // subcommand) and SYNCHRONOUS, so the idempotency read goes through
+    // `db.read()` and the append + verify through ONE `db.write()` guard.
+    db: &Handle,
     tenant: TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     operator_login: &str,
@@ -110,9 +114,14 @@ pub fn mark_paid(
         )));
     }
 
-    // 2. Idempotency gate — refuse double-payment.
-    let ledger_for_check = Ledger::open(db_path, tenant.clone(), binary_hash)
-        .context("open audit ledger to check is_invoice_paid (mark-paid gate)")?;
+    // 2. Idempotency gate — refuse double-payment. H3 (ADR-0099): read through
+    //    the shared Handle (coherent try_clone), not a fresh `Ledger::open`.
+    let ledger_for_check = Ledger::from_connection(
+        db.read()
+            .context("acquire shared reader to check is_invoice_paid (mark-paid gate)")?,
+        tenant.clone(),
+        binary_hash,
+    );
     if let Some(existing) = audit_query::payment_record_for(&ledger_for_check, &input.invoice_id)? {
         return Err(MarkPaidError::AlreadyPaid(existing));
     }
@@ -123,38 +132,29 @@ pub fn mark_paid(
     let actor = Actor::from_local_cli(session_id, operator_login);
     let idempotency_key = IdempotencyKey::new();
 
-    // 4. Append the InvoicePaymentRecorded entry under one tx.
-    // ADR-0099 H3 Addendum 3 — SERVE_HANDLE_LIVE tripwire. `Ledger::open` /
-    // `DuckDbBillingStore::open` guard themselves internally, but this raw
-    // `duckdb::Connection::open` is a foreign fn with no chokepoint; guard it
-    // explicitly so the oracle sees this invoice-family opener too (debug/test
-    // only; no-op unless serve is armed + registered on this path).
-    audit_ledger::serve_tripwire::assert_no_serve_handle(
-        db_path,
-        "Connection::open @ mark_invoice_paid",
-    );
-    let mut conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for mark-paid audit append",
-            db_path.display()
-        )
-    })?;
+    // 4. Append the InvoicePaymentRecorded entry under one tx, on the shared
+    //    Handle's WRITE guard. H3 (ADR-0099): the raw `Connection::open` +
+    //    SERVE_HANDLE_LIVE tripwire guard are GONE — this now routes through the
+    //    ONE shared instance, so there is no foreign opener to guard.
+    let mut guard = db
+        .write()
+        .context("acquire shared writer for mark-paid audit append")?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash);
-    write_payment_audit_entry(&mut conn, &ledger_meta, actor, idempotency_key, &input)?;
+    write_payment_audit_entry(guard.conn(), &ledger_meta, actor, idempotency_key, &input)?;
 
-    // 5. Verify chain post-commit.
-    drop(conn);
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to verify chain after mark-paid")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER mark-paid")?;
-
-    // 6. Sync the audit-ledger mirror.
-    let mirror_path = audit_ledger::mirror_path_for(db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after mark-paid commit")?;
+    // 5. Verify chain on a `try_clone` of the SAME live instance (no reopen ->
+    //    no WAL fold/tear, no duckdb#23046). The explicit `sync_mirror` is GONE:
+    //    `WriteGuard::drop` lockstep-syncs the audit mirror on scope exit.
+    let verified = Ledger::from_connection(
+        guard
+            .try_clone()
+            .context("try_clone shared writer to verify chain after mark-paid")?,
+        tenant,
+        binary_hash,
+    )
+    .verify_chain()
+    .context("audit-ledger chain verification failed AFTER mark-paid")?;
+    drop(guard);
 
     // 7. Build the PaymentRecord echo from the inputs (the ledger
     //    has just persisted them verbatim).

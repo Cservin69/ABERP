@@ -45,7 +45,6 @@
 //! ADR-0008's append-only contract forbids writing duplicates for the
 //! same business event.
 
-use std::path::Path;
 use std::str::FromStr;
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
@@ -55,6 +54,7 @@ use aberp_billing::{
     IdempotencyKey, InvoiceId, InvoiceSeries, IssueInvoiceCommand, LineItem, PaymentMethod,
     ProductUnit, RateMetadata, ResetPolicy, SeriesCode, SeriesId,
 };
+use aberp_db::Handle;
 use aberp_mnb_rates::{MnbError, MnbRate, SOURCE as MNB_SOURCE};
 use aberp_nav_transport::operations::query_invoice_check::QueryInvoiceCheckOutcome;
 use aberp_nav_transport::NavCredentials;
@@ -430,9 +430,19 @@ pub async fn run_with_provider<P: MnbRatesProvider + ?Sized>(
         let nav_probe =
             crate::nav_number_probe::build_issue_probe(credentials, &input.supplier.tax_number);
 
+        // H3 (ADR-0099): open a PROCESS-LOCAL shared `Handle` for this CLI
+        // one-shot (checkpoint disabled, no daemon threads) and route the
+        // issuance through it — the same code path serve uses. The F-E whole-DB
+        // writer flock acquired in `run()` guarantees serve is not concurrently
+        // holding its own Handle on this file, so the two never coexist.
+        let tenant_id = TenantId::new(args.tenant.clone())
+            .ok_or_else(|| anyhow!("tenant value '{}' is empty or has a null byte", args.tenant))?;
+        let db = Handle::open_default(&args.db, tenant_id)
+            .context("open shared DuckDB handle for issue-invoice CLI (H3)")?;
+
         let summary = issue_from_parsed(
             input,
-            &args.db,
+            &db,
             &args.tenant,
             &args.series,
             args.currency.to_billing_currency(),
@@ -499,7 +509,13 @@ pub async fn run_with_provider<P: MnbRatesProvider + ?Sized>(
 #[allow(clippy::too_many_arguments)]
 pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     input: InvoiceInputJson,
-    db: &Path,
+    // H3 (ADR-0099): the shared DuckDB `Handle` — the ONE runtime instance for
+    // this tenant, in BOTH contexts. Serve handlers pass `&state.db`; the CLI
+    // `run` opens a process-local `Handle::open_default` under the F-E writer
+    // flock and passes it here. Replaces the per-call fresh opens that made this
+    // the repo's last in-serve invoice write-fork (write-fork/read-fork gates +
+    // opener census all ratchet down when this lands).
+    db: &Handle,
     tenant_str: &str,
     series_str: &str,
     currency: Currency,
@@ -592,11 +608,42 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     let template = crate::numbering::read_numbering_template(&seller_toml_path)
         .context("read [seller.numbering] template from seller.toml")?;
 
-    // 5–6. Pre-tx setup: schemas + series. PR-90 — `ensure_series` syncs
-    //      the row's `reset_policy` to the template's choice; on a
-    //      mid-stream Never → OnYearChange flip the next allocation
-    //      lands in the issue-year bucket (gap-free within each year).
-    let (conn, series) = pre_tx_setup(db, &series_code, template.reset_policy.to_billing())?;
+    // 5–6. Pre-tx setup on the shared Handle: billing schema + series, then the
+    //      audit schema. PR-90 — `ensure_series` syncs the row's `reset_policy`
+    //      to the template's choice; on a mid-stream Never → OnYearChange flip
+    //      the next allocation lands in the issue-year bucket (gap-free within
+    //      each year).
+    //
+    //      H3 (ADR-0099): the billing schema + series run on a `try_clone` of the
+    //      shared writer (auto-commit DDL/DML), coherent with the issuance tx
+    //      below — proven by `h3_handle_coherence_model::billing_store_on_guard_
+    //      try_clone_is_coherent_with_the_guards_own_tx`. The write guard is
+    //      SHORT-LIVED (dropped before the async rate / NAV-pre-flight steps) so
+    //      no `!Send` guard is ever held across an `.await` — the axum/`tokio::
+    //      spawn` Send invariant. `into_connection`/fresh-open are gone.
+    let series = {
+        let guard = db
+            .write()
+            .context("acquire shared writer for invoice pre-tx setup")?;
+        let series = {
+            let mut billing = DuckDbBillingStore::from_connection(
+                guard
+                    .try_clone()
+                    .context("try_clone shared writer for billing pre-tx setup")?,
+            );
+            billing.ensure_schema().context("ensure billing schema")?;
+            ensure_series(
+                &mut billing,
+                &series_code,
+                template.reset_policy.to_billing(),
+            )?
+            // `billing` (the clone) drops here — its auto-commits are durable on
+            // the shared instance the guard also holds.
+        };
+        audit_ledger::ensure_schema(&guard).context("ensure audit-ledger schema")?;
+        series
+        // guard drops — lockstep mirror sync (a no-op append here; no new rows).
+    };
 
     // 7. Build IssueInvoiceCommand + AllocateArgs for the tx body.
     let command = build_command(&input, &series_code)?;
@@ -660,13 +707,23 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     // skips the probe entirely (zero NAV calls). See `crate::nav_number_probe`.
     let (sequence_floor, nav_number_skips) = match nav_probe {
         Some(probe) => {
-            let start_seq = billing::peek_next_number(
-                &conn,
-                series.id,
-                issue_date.year(),
-                template.start_value,
-            )
-            .context("peek next sequence number for NAV pre-flight (S392)")?;
+            // H3 (ADR-0099): peek the next sequence through a SHORT-LIVED shared
+            // reader (`db.read()` = a coherent try_clone that sees the series the
+            // setup guard just created), dropped BEFORE the async
+            // `resolve_clear_sequence` below so no reader/guard crosses an
+            // `.await`. Pure read; the reservation itself happens in the tx.
+            let start_seq = {
+                let peek_conn = db
+                    .read()
+                    .context("acquire shared reader for NAV pre-flight peek (S392)")?;
+                billing::peek_next_number(
+                    &peek_conn,
+                    series.id,
+                    issue_date.year(),
+                    template.start_value,
+                )
+                .context("peek next sequence number for NAV pre-flight (S392)")?
+            };
             let clear = crate::nav_number_probe::resolve_clear_sequence(
                 Some(probe),
                 &template,
@@ -839,8 +896,14 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     //    PR-18 / ADR-0031 §2: the `nav_xml_out` path is threaded into
     //    `run_single_tx` so the InvoiceDraftCreated payload's
     //    `nav_xml_path` field records where the XML is written.
-    let (outcome, conn) = run_single_tx(
-        conn,
+    // H3 (ADR-0099): run the issuance tx on the shared Handle's WRITE guard
+    // (single serialized writer + post-commit lockstep mirror). Acquired AFTER
+    // the last `.await` above, so the `!Send` guard never crosses a yield point.
+    let mut guard = db
+        .write()
+        .context("acquire shared writer for invoice issuance tx")?;
+    let outcome = run_single_tx(
+        guard.conn(),
         &ledger_meta,
         allocate_args,
         idempotency_key,
@@ -886,28 +949,24 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         "invoice issued"
     );
 
-    // 9. Verify the audit chain — the success-criterion gate. S375 — run
-    //    `verify_chain` + `sync_mirror` on the SAME post-commit
-    //    Connection `run_single_tx` handed back, rather than dropping it
-    //    and calling `Ledger::open` (a fresh `Connection::open` that
-    //    triggers DuckDB 1.5.x's LoadCheckpoint/ReadIndex ART assertion,
-    //    S332 / duckdb#23046). No file re-open → that crash is
-    //    unreachable.
-    let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER issuance")?;
+    // 9. Verify the audit chain — the success-criterion gate. S375 / H3 — run
+    //    `verify_chain` on a `try_clone` of the SAME live shared instance the tx
+    //    just committed on, NOT a fresh `Ledger::open`/`Connection::open` reopen
+    //    (which re-triggers DuckDB 1.5.x's LoadCheckpoint/ReadIndex ART assertion
+    //    S332 / duckdb#23046, and would be blind to the WAL-resident commit). The
+    //    explicit post-commit `sync_mirror` is GONE: `WriteGuard::drop`
+    //    lockstep-syncs the audit mirror when `guard` falls out of scope at the
+    //    end of this function (ADR-0030 §2 backfill still runs on first sync).
+    let verified = Ledger::from_connection(
+        guard
+            .try_clone()
+            .context("try_clone shared writer for post-issue verify")?,
+        tenant.clone(),
+        binary_hash_bytes,
+    )
+    .verify_chain()
+    .context("audit-ledger chain verification failed AFTER issuance")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
-
-    // 9a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    //     post-commit. On a fresh DB (or first post-PR-17 invocation
-    //     on a pre-existing DB) `sync_mirror` runs the implicit
-    //     one-time backfill per ADR-0030 §7 and logs
-    //     `audit_mirror_initialized` at INFO.
-    let mirror_path = audit_ledger::mirror_path_for(db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after commit")?;
 
     tracing::info!(
         invoice_number = %invoice_number,
@@ -947,26 +1006,11 @@ pub struct IssuedInvoiceSummary {
 // ──────────────────────────────────────────────────────────────────────
 // Pre-tx setup
 // ──────────────────────────────────────────────────────────────────────
-
-/// Open the tenant DB, run idempotent schema creation for both crates,
-/// and ensure the requested series exists with the operator's chosen
-/// `reset_policy`. Returns the Connection (handed back from the billing
-/// store via `into_connection`) and the resolved `InvoiceSeries`. No
-/// allocation occurs here; ADR-0008 §Storage's transactional contract is
-/// engaged in `run_single_tx`.
-fn pre_tx_setup(
-    db_path: &Path,
-    series_code: &SeriesCode,
-    template_reset_policy: ResetPolicy,
-) -> Result<(Connection, InvoiceSeries)> {
-    let mut billing = DuckDbBillingStore::open(db_path)
-        .with_context(|| format!("open billing DuckDB at {}", db_path.display()))?;
-    billing.ensure_schema().context("ensure billing schema")?;
-    let series = ensure_series(&mut billing, series_code, template_reset_policy)?;
-    let conn = billing.into_connection();
-    audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema")?;
-    Ok((conn, series))
-}
+//
+// H3 (ADR-0099): the old `pre_tx_setup(db_path) -> (Connection, InvoiceSeries)`
+// fresh-open helper is GONE. Billing schema + series now run inline in
+// `issue_from_parsed` on a `try_clone` of the shared writer, and the audit
+// schema on the guard itself — no independent opener, no moved `Connection`.
 
 /// PR-90 / ADR-0045 §2 — auto-create the series with the template's
 /// `reset_policy` when absent; sync the existing series row's policy
@@ -1048,7 +1092,12 @@ struct TxOutcome {
 /// `apps/aberp/tests/rollback_conformance.rs`.
 #[allow(clippy::too_many_arguments)]
 fn run_single_tx<F>(
-    mut conn: Connection,
+    // H3 (ADR-0099): a BORROWED `&mut Connection` — the shared Handle writer
+    // guard's connection (or, on the CLI, the process-local Handle's). The tx
+    // runs on it; the caller keeps the guard for the post-commit try_clone
+    // verify + the guard-drop mirror sync. No owned Connection is moved in or
+    // handed back (that moved-Connection shape was the split write-fork).
+    conn: &mut Connection,
     ledger_meta: &LedgerMeta,
     allocate_args: AllocateArgs,
     idempotency_key: IdempotencyKey,
@@ -1098,7 +1147,7 @@ fn run_single_tx<F>(
     // render/write failure rolls back the allocation + audit appends).
     // Returns the rendered NAV invoice number.
     render_and_write: F,
-) -> Result<(TxOutcome, Connection)>
+) -> Result<TxOutcome>
 where
     F: FnOnce(&aberp_billing::ReadyInvoice) -> Result<String>,
 {
@@ -1270,14 +1319,11 @@ where
 
     tx.commit()
         .context("commit DuckDB transaction (billing + audit-ledger)")?;
-    Ok((
-        TxOutcome {
-            invoice,
-            was_fresh,
-            invoice_number,
-        },
-        conn,
-    ))
+    Ok(TxOutcome {
+        invoice,
+        was_fresh,
+        invoice_number,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────
