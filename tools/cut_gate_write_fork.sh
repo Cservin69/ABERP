@@ -11,6 +11,13 @@
 # ledger. tools/adr0099_write_fork_scan.awk detects that primitive per-fn
 # (comment/string/cfg(test)-aware).
 #
+# ADR-0099 Addendum 3 (this session): the scanner also detects the SPLIT fork —
+# an opener whose owned Connection is MOVED to an append in another fn (the
+# invoice store-shape `DuckDbBillingStore::open(_).into_connection()`, and its
+# transitive helper-chain variants). Those forks (issue_invoice / issue_storno /
+# issue_modification / submit_invoice / poll_ack / mark_invoice_paid) were
+# UNCOUNTED under the old per-fn model; teeth proven by cut_gate_write_fork_probes.sh.
+#
 # The prod H3 gate is ZERO such forks outside tools/adr0099_write_fork_allowlist.txt
 # (the append_reopen primitive, separate-process CLI one-shots fenced by the F-E
 # flock, and pre-serve boot openers). NO frozen-residual ledger, NO deferrals —

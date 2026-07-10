@@ -986,3 +986,117 @@ This is scoped to the hardening lane; **un-pinning back to floating `stable` is 
 separate, deliberate decision at H7** (end of effort), not to be reverted
 piecemeal. `rust-version` (MSRV floor) and `Cargo.lock` (dependency pin) are
 unchanged; this only removes the compiler-version degree of freedom.
+
+## Addendum 3 — the write-fork gate's STORE-SHAPE blind spot (2026-07-10)
+
+Two deliverables, no code migration: (1) teach the write-fork scanner the split /
+moved-`Connection` fork shape and re-baseline honestly; (2) build the
+`SERVE_HANDLE_LIVE` runtime tripwire (proposed above, lines "CHECK N residual
+STATIC LIMITATION"; now a **prerequisite** for the invoice-family migration). The
+invoice-family migration itself is NOT started here — it is the next session's
+atomic commit, and it was blocked on these two.
+
+### Deliverable 1 — the split write-fork was UNCOUNTED
+
+**The blind spot.** The `tools/adr0099_write_fork_scan.awk` model required the
+independent opener AND the audit append to sit in the SAME function. The core
+invoicing path SPLITS them across a function boundary via an owned `Connection`
+that is MOVED:
+
+- `issue_invoice.rs::pre_tx_setup` (`:962`) does
+  `DuckDbBillingStore::open(db).into_connection()` (`duckdb_store.rs:356-358` is a
+  plain `Connection::open`; `:398` hands back the owned raw `Connection`) and
+  RETURNS it — no append in that fn.
+- `issue_invoice.rs::run_single_tx` (`:1050`) receives `conn: Connection` **by
+  move as a parameter**, does `conn.transaction()` (`:1105`) and
+  `audit_ledger::append_in_tx(&tx, …)` (`:1151`/`:1174`/`:1228`) — no opener token
+  in that fn.
+
+So the opener half and the append half each looked innocent per-fn. The result:
+`issue_invoice`, `issue_storno`, `issue_modification`, `submit_invoice`,
+`mark_invoice_paid`, `poll_ack` — the entire in-serve invoicing path — appeared on
+**no** worklist. `serve.rs:6718` dispatches `issue_invoice::issue_from_parsed`
+(and `submit_from_inputs` / `poll_ack_from_inputs` / `storno_from_inputs` /
+`modification_from_inputs` / `mark_paid` at `:7235`/`:7371`/`:7721`/`:7982`/
+`handle_mark_invoice_paid`), all in-serve, all off the shared writer flock that
+serve holds for its lifetime (`serve.rs:484`). `DuckDbBillingStore::into_connection`
+is the ONLY owned-`Connection` constructor in the tree (grep-verified), so the
+class is bounded — but the move can chain: `poll_ack_from_inputs` (`:361`) opens
+`conn`, hands `&mut conn` to `poll_loop` (`:404`), which calls
+`write_ack_audit_entry(&mut conn)` (`:585`) — a **2-hop** flow to the append. A
+one-hop rule would still have missed it.
+
+**The scanner now follows the connection transitively.** It emits two record
+classes: COLOCATED (opener + append in one fn — the original primitive, byte-for-
+byte unchanged output) and SPLIT (opener, no in-fn append, whose owned
+`Connection` reaches an append in another fn — proven by `.into_connection()` OR a
+call, direct or transitive, to an audit-writer helper: a fn that takes a
+`Connection`/`Transaction` and appends). The helper set is the fixpoint closure
+`A*` over the file's call graph. **Why the file-local closure is SOUND without a
+cross-file call graph:** CHECK M (always enforced) guarantees a Handle-routed file
+retains NO independent opener, so a Handle-served append (which acquires its tx
+from `.db.write()` in its own fn) never coexists with an independent opener in the
+same file — the split rule cannot mistake a migrated append for a fork. serve.rs
+(the router, CHECK-M-exempt) stays clean: its shutdown append acquires the Handle
+guard in-fn, so it is not an orphan appender and joins no `A*`.
+
+**Two scanner defects found and fixed** (the probes are the reason they surfaced):
+- `takes_conn` was read AFTER the char-loop, so a **single-line** signature
+  `fn h(c: &Connection) {` — where `{` flips the in-signature flag mid-line — lost
+  the param type. Fixed by pinning `was_insig` at line start.
+- the fn record was flushed mid-char-loop at the body-closing `}`, BEFORE that
+  line's opener/append/`takes_conn` detection ran — so a fully single-line fn was
+  mis-recorded. Fixed with the **deferred flush** (same fix CHECK N's scanner
+  already carried; this scanner predated it). Guarded by probes W1b/W3.
+
+**Honest re-baseline (the number went UP, as it must).**
+
+| metric | before | after |
+|---|---|---|
+| non-allow-listed in-serve write-forks (the residual) | **14** | **24** |
+| of which COLOCATED (unchanged) | 14 | 14 |
+| of which SPLIT, in-serve (newly visible) | 0 | **10** |
+
+The 10 newly-counted in-serve split forks: `issue_invoice::pre_tx_setup`,
+`issue_modification::{modification_from_inputs, pre_tx_setup}`,
+`issue_storno::{storno_from_inputs, pre_tx_setup}`, `mark_invoice_paid::mark_paid`,
+`poll_ack::{poll_ack_from_inputs, write_daemon_terminal_ack}`,
+`submit_invoice::submit_from_inputs`, `quote_pricing_pipeline::enqueue_failed_no_cad`.
+
+The scanner ALSO newly SEES 11 split forks in separate-process CLI one-shots
+(`drain_pending_retries`, `drain_submission_queue`, `mark_abandoned`,
+`observe_receiver_confirmation` ×2, `poll_annulment_ack`, `recover_from_nav`,
+`request_technical_annulment`, `retry_submission` ×2, `submit_annulment`). Each is
+dispatched ONLY from `main.rs`, is never called by serve (`grep -c '<mod>::'
+serve.rs == 0`; the only cross-refs are doc-comments), and acquires the F-E
+whole-DB writer flock (`db_writer_lock::acquire_or_refuse`) that serve also holds
+(`serve.rs:484`) — mutually exclusive with serve. So they go on the ALLOW-LIST
+(Addendum-3 block in `adr0099_write_fork_allowlist.txt`), on the same footing as
+the pre-existing `request_technical_annulment::run`. This is applying the existing
+CLI-one-shot sanctioning rule to newly-visible forks — NOT tuning the number: the
+residual that matters (in-serve) still rose 14 → 24. The dual-context invoice
+family is deliberately NOT allow-listed even though its CLI `run` path is
+flock-fenced: the SAME fn (`pre_tx_setup`, `*_from_inputs`) runs in-serve too, and
+a per-fn allow-list cannot tell the two apart. That is exactly what Deliverable 2's
+runtime tripwire closes.
+
+**THE LOAD-BEARING SENTENCE.** Before this fix, flipping the write-fork gate to
+`ENFORCE_WRITE_FORK=1` at "residual zero" would have certified a tree in which the
+entire in-serve invoicing path — issue, storno, modification, submit, poll-ack,
+mark-paid — was STILL forking the audit ledger. The gate would have reported green
+on a forked ledger. That is why the residual is allowed to RISE when the scanner
+gains sight: the census "may only shrink" invariant governs *openers*; the fork
+residual is a different metric and rises honestly here. The scanner was never
+tuned to keep the number pretty — the probe `cut_gate_write_fork_probes.sh`
+BLIND-SPOT check pins this: it runs the store-shape through a reference copy of the
+OLD colocated-only model and asserts it stays SILENT while the current scanner
+EMITS. If anyone reverts the extension, that probe goes red.
+
+**Teeth (`tools/cut_gate_write_fork_probes.sh`, wired into `cut-gate.yml`).** 15
+synthetic probes, migration-invariant (stdin snippets / throwaway tree copies,
+never a real source file): detect COLOCATED, the SPLIT store-shape, the SPLIT-via-
+helper and the SPLIT transitive 2-hop (the `poll_ack` regression guard); stay
+SILENT on a pure reader, a Handle-served append (with and without a helper), the
+`from_connection` / `open_in_memory` seams, `cfg(test)`, and an appender-helper
+with no opener; honour the allow-list; prove fail-closed (a de-gated scanner passes
+the real forks under ENFORCE); and pin the BLIND-SPOT invariant above.

@@ -58,6 +58,17 @@ jobs:
         # migration reaches zero — that flip is the H3 acceptance cut.
         run: bash tools/cut_gate_write_fork.sh
 
+      - name: Prove the write-fork gate has teeth (negative probes)
+        # Synthetic scratch-file / stdin probes: detect a colocated fork, the
+        # Addendum-3 SPLIT store-shape (DuckDbBillingStore::open(_).into_connection())
+        # and its transitive 2-hop variant, EXCLUDE the Handle-served append and the
+        # from_connection / open_in_memory seams, ignore cfg(test), honour the
+        # allow-list, prove fail-closed (a de-gated scanner passes the real
+        # write-forks), and pin the BLIND-SPOT invariant (the old colocated-only
+        # model is silent on the invoice store-shape). A negative probe that cannot
+        # fail is decoration.
+        run: bash tools/cut_gate_write_fork_probes.sh
+
       - name: ADR-0099 H3 READ-fork migration tracker (CHECK N, informational)
         # The DUAL of the write-fork gate. CHECK 10M is structurally blind to an
         # independent opener that READS the audit ledger: once any writer is on
