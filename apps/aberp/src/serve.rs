@@ -1789,7 +1789,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     // missing audit row is operator-visible via the SPA
                     // status snapshot).
                     if let Err(e) = crate::quote_pricing_pipeline::emit_python_resolved_audit(
-                        st.db_path.as_path(),
+                        &st.db,
                         st.tenant.as_str(),
                         binary_hash,
                         &pipeline_operator_login,
@@ -1839,7 +1839,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                 };
                             let pipeline_deps =
                                 crate::quote_pricing_pipeline::PricingPipelineDeps {
-                                    db_path: (*st.db_path).clone(),
+                                    db: st.db.clone(),
                                     tenant: st.tenant.clone(),
                                     binary_hash,
                                     operator_login: pipeline_operator_login.clone(),
@@ -1922,7 +1922,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                             );
                                             if let Err(e) =
                                                 crate::quote_pricing_pipeline::emit_index_migrated_audit(
-                                                    st.db_path.as_path(),
+                                                    &st.db,
                                                     st.tenant.as_str(),
                                                     binary_hash,
                                                     &pipeline_operator_login,

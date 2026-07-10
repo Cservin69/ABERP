@@ -82,18 +82,6 @@ apps/aberp/src/print_invoice.rs|render_to_bytes:let ledger = Ledger::open(db, te
 apps/aberp/src/quote_calibration.rs|append_calibration_events:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/quote_calibration.rs|record_calibration_for_completed_wo:let conn = Connection::open(db_path).context("open tenant DuckDB for calibra
 apps/aberp/src/quote_pdf_rerender_daemon.rs|prepare_rerender:let conn = Connection::open(db_path)
-apps/aberp/src/quote_pricing_pipeline.rs|advance_extract:let mut conn = duckdb::Connection::open(&db_path).context("open DB for extra
-apps/aberp/src/quote_pricing_pipeline.rs|advance_post:let conn = duckdb::Connection::open(&db).context("open DB for post")?;
-apps/aberp/src/quote_pricing_pipeline.rs|advance_post:let mut conn = duckdb::Connection::open(&db_path).context("open DB for post-
-apps/aberp/src/quote_pricing_pipeline.rs|advance_price:let mut conn = duckdb::Connection::open(&db_path).context("open DB for price
-apps/aberp/src/quote_pricing_pipeline.rs|advance_render:let mut conn = duckdb::Connection::open(&db_path).context("open DB for rende
-apps/aberp/src/quote_pricing_pipeline.rs|emit_daemon_panicked_audit:duckdb::Connection::open(&deps.db_path).context("open DB for daemon-panic au
-apps/aberp/src/quote_pricing_pipeline.rs|emit_index_migrated_audit:let mut conn = duckdb::Connection::open(db_path).context("open DB for index-
-apps/aberp/src/quote_pricing_pipeline.rs|emit_poll_outcome_audit:duckdb::Connection::open(&db_path).context("open DB for poll-outcome audit")
-apps/aberp/src/quote_pricing_pipeline.rs|emit_python_resolved_audit:duckdb::Connection::open(db_path).context("open DB for python-resolved audit
-apps/aberp/src/quote_pricing_pipeline.rs|enqueue_failed_no_cad:let conn = duckdb::Connection::open(&db_path).context("open DB for enqueue-f
-apps/aberp/src/quote_pricing_pipeline.rs|enqueue_one:let mut conn = duckdb::Connection::open(&db_path).context("open DB for enque
-apps/aberp/src/quote_pricing_pipeline.rs|next_actionable_blocking:let conn = duckdb::Connection::open(&db_path).context("open DB for next-job"
 apps/aberp/src/recover_from_nav.rs|resolve_recovery_precondition:let ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/recover_from_nav.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
 apps/aberp/src/recover_from_nav.rs|run:let mut conn = Connection::open(&args.db)

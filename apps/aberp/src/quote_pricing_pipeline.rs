@@ -42,6 +42,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aberp_db::{Handle, HandleArc};
+
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -131,7 +133,11 @@ pub struct PricingPipelineConfig {
 /// hash + operator login the rest of ABERP's audit ledger uses.
 #[derive(Debug, Clone)]
 pub struct PricingPipelineDeps {
-    pub db_path: PathBuf,
+    /// H3 (ADR-0099): the process-wide shared DuckDB [`aberp_db::Handle`]
+    /// (serve: cloned from `state.db`; the daemon routes 100% of its per-step
+    /// reads + audit appends through it — the whole-subsystem-daemon rule).
+    /// A separate `Connection::open` here would close-fold the shared WAL.
+    pub db: HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -357,7 +363,7 @@ impl PricingPipelineService {
         // so the operator panel can show who they're quoting at a glance.
         let customer_company = quote.contact.company.trim().to_string();
 
-        let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         let quote_id = qid.clone();
         let filename = cad.filename.clone();
@@ -366,7 +372,7 @@ impl PricingPipelineService {
         let login = self.deps.operator_login.clone();
 
         let inserted = spawn_blocking(move || -> Result<bool> {
-            let mut conn = duckdb::Connection::open(&db_path).context("open DB for enqueue")?;
+            let mut conn = db.write().context("acquire shared writer for enqueue")?;
             audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
             jobs::ensure_schema(&conn).context("ensure quote_pricing_jobs schema")?;
             let now = OffsetDateTime::now_utc();
@@ -459,7 +465,7 @@ impl PricingPipelineService {
         // panel identifies the buyer even when the listing had no CAD.
         let customer_company = quote.contact.company.trim().to_string();
 
-        let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         let quote_id = qid.clone();
         let binary_hash = self.deps.binary_hash;
@@ -469,7 +475,9 @@ impl PricingPipelineService {
         let reason = "no CAD file on listing";
 
         let inserted = spawn_blocking(move || -> Result<bool> {
-            let conn = duckdb::Connection::open(&db_path).context("open DB for enqueue-fail")?;
+            let conn = db
+                .write()
+                .context("acquire shared writer for enqueue-fail")?;
             audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
             jobs::ensure_schema(&conn).context("ensure quote_pricing_jobs schema")?;
             let now = OffsetDateTime::now_utc();
@@ -545,7 +553,7 @@ impl PricingPipelineService {
     /// but never changes the cycle's already-decided failure outcome. Own DB
     /// connection + tx (the poll path has no surrounding `spawn_blocking`).
     async fn emit_poll_outcome_audit(&self, outcome: &WritebackOutcome) {
-        let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
@@ -555,8 +563,9 @@ impl PricingPipelineService {
         let body_excerpt = outcome.body_excerpt().map(|s| s.to_string());
         let retryable = outcome.retryable();
         let res = spawn_blocking(move || -> Result<()> {
-            let mut conn =
-                duckdb::Connection::open(&db_path).context("open DB for poll-outcome audit")?;
+            let mut conn = db
+                .write()
+                .context("acquire shared writer for poll-outcome audit")?;
             audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
             let tx = conn.transaction().context("open poll-outcome tx")?;
             let meta =
@@ -595,10 +604,10 @@ impl PricingPipelineService {
     }
 
     async fn next_actionable_blocking(&self) -> Result<Option<PricingJobRow>> {
-        let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         spawn_blocking(move || -> Result<Option<PricingJobRow>> {
-            let conn = duckdb::Connection::open(&db_path).context("open DB for next-job")?;
+            let conn = db.read().context("acquire shared reader for next-job")?;
             jobs::next_actionable_job(&conn, &tenant_id)
         })
         .await
@@ -622,7 +631,7 @@ impl PricingPipelineService {
     }
 
     async fn advance_extract(&self, row: PricingJobRow) -> Result<StepOutcome> {
-        let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
@@ -635,84 +644,92 @@ impl PricingPipelineService {
         let cad_blob = self.cad_blob.clone();
 
         let outcome = spawn_blocking(move || -> Result<StepOutcome> {
-            let mut conn = duckdb::Connection::open(&db_path).context("open DB for extract")?;
-            audit_ensure_schema(&conn).context("audit schema")?;
-            jobs::ensure_schema(&conn).context("jobs schema")?;
-            // S286 hotfix: NotFound aborts this step, AlreadyInState
-            // continues (the prior cycle marked us Extracting; safe to
-            // re-run the extract because the audit emit is keyed on the
-            // post-extract feature_graph_hash, not the pre-extract mark).
-            match jobs::set_state(
-                &conn,
-                &quote_id,
-                &tenant_id_string,
-                JobState::Extracting,
-                OffsetDateTime::now_utc(),
-            )? {
-                jobs::TransitionOutcome::NotFound => {
-                    tracing::warn!(
-                        quote_id = %quote_id,
-                        "pricing-pipeline row vanished before extract; skipping"
-                    );
-                    return Ok(StepOutcome::Advanced);
+            // H3 (ADR-0099): the state transition + CAD read-audit run under a
+            // SHORT-LIVED shared write guard that is DROPPED before the
+            // out-of-process CAD extractor — the shared writer mutex is never
+            // held across the (multi-second) `aberp-cad-extract` subprocess, so
+            // an in-flight extract cannot stall serve's invoice/audit writers.
+            let (plaintext, cad_local_path) = {
+                let mut conn = db
+                    .write()
+                    .context("acquire shared writer for extract setup")?;
+                audit_ensure_schema(&conn).context("audit schema")?;
+                jobs::ensure_schema(&conn).context("jobs schema")?;
+                // S286 hotfix: NotFound aborts this step, AlreadyInState
+                // continues (the prior cycle marked us Extracting; safe to
+                // re-run the extract because the audit emit is keyed on the
+                // post-extract feature_graph_hash, not the pre-extract mark).
+                match jobs::set_state(
+                    &conn,
+                    &quote_id,
+                    &tenant_id_string,
+                    JobState::Extracting,
+                    OffsetDateTime::now_utc(),
+                )? {
+                    jobs::TransitionOutcome::NotFound => {
+                        tracing::warn!(
+                            quote_id = %quote_id,
+                            "pricing-pipeline row vanished before extract; skipping"
+                        );
+                        return Ok(StepOutcome::Advanced);
+                    }
+                    jobs::TransitionOutcome::AlreadyInState | jobs::TransitionOutcome::Applied => {}
                 }
-                jobs::TransitionOutcome::AlreadyInState | jobs::TransitionOutcome::Applied => {}
-            }
-            let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
-            // S430 / ADR-0083 — the on-disk CAD is encrypted at rest, but
-            // the Python extractor reads a file PATH (not bytes), so we
-            // decrypt to a short-lived sibling temp file deleted on drop.
-            let on_disk = std::fs::read(&arts.cad_local_path)
-                .with_context(|| format!("read CAD blob {}", arts.cad_local_path))?;
-            let opened = match cad_blob.key.open(&on_disk) {
-                Ok(o) => o,
-                Err(e) => {
-                    // Tampered blob / wrong key: a customer-visible failure,
-                    // not a daemon crash. Mark the job Failed (the SPA shows
-                    // a red error chip with the reason) and move on.
-                    emit_failure(
+                let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
+                // S430 / ADR-0083 — the on-disk CAD is encrypted at rest, but
+                // the Python extractor reads a file PATH (not bytes), so we
+                // decrypt to a short-lived sibling temp file deleted on drop.
+                let on_disk = std::fs::read(&arts.cad_local_path)
+                    .with_context(|| format!("read CAD blob {}", arts.cad_local_path))?;
+                let opened = match cad_blob.key.open(&on_disk) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        // Tampered blob / wrong key: a customer-visible failure,
+                        // not a daemon crash. Mark the job Failed (the SPA shows
+                        // a red error chip with the reason) and move on.
+                        emit_failure(
+                            &mut conn,
+                            &tenant_id_string,
+                            binary_hash,
+                            &login,
+                            &quote_id,
+                            "decrypt",
+                            &format!("CAD blob decryption failed: {e}"),
+                            attempt_n,
+                        )?;
+                        return Ok(StepOutcome::Failed);
+                    }
+                };
+                // The daemon reads on behalf of the quote engine to (re-)price.
+                let requester = login.clone();
+                if opened.was_legacy_plaintext {
+                    crate::cad_blob::emit_legacy_plaintext_read(
                         &mut conn,
                         &tenant_id_string,
                         binary_hash,
                         &login,
                         &quote_id,
-                        "decrypt",
-                        &format!("CAD blob decryption failed: {e}"),
-                        attempt_n,
+                        &requester,
                     )?;
-                    return Ok(StepOutcome::Failed);
                 }
+                if cad_blob
+                    .debounce
+                    .should_emit(&requester, &quote_id, Instant::now())
+                {
+                    crate::cad_blob::emit_blob_read(
+                        &mut conn,
+                        &tenant_id_string,
+                        binary_hash,
+                        &login,
+                        &quote_id,
+                        &requester,
+                        ReadPurpose::Reprice,
+                    )?;
+                }
+                (opened.plaintext, arts.cad_local_path)
+                // write guard dropped here — the extractor runs lock-free.
             };
-            // The daemon reads on behalf of the quote engine to (re-)price.
-            let requester = login.clone();
-            if opened.was_legacy_plaintext {
-                crate::cad_blob::emit_legacy_plaintext_read(
-                    &mut conn,
-                    &tenant_id_string,
-                    binary_hash,
-                    &login,
-                    &quote_id,
-                    &requester,
-                )?;
-            }
-            if cad_blob
-                .debounce
-                .should_emit(&requester, &quote_id, Instant::now())
-            {
-                crate::cad_blob::emit_blob_read(
-                    &mut conn,
-                    &tenant_id_string,
-                    binary_hash,
-                    &login,
-                    &quote_id,
-                    &requester,
-                    ReadPurpose::Reprice,
-                )?;
-            }
-            let temp = DecryptedTempFile::write_beside(
-                Path::new(&arts.cad_local_path),
-                &opened.plaintext,
-            )?;
+            let temp = DecryptedTempFile::write_beside(Path::new(&cad_local_path), &plaintext)?;
             let extractor = CadExtractor::new().with_python_bin(python_bin);
             let req = ExtractRequest {
                 input_path: temp.path().to_path_buf(),
@@ -720,6 +737,11 @@ impl PricingPipelineService {
             };
             match extractor.extract(&req) {
                 Ok(graph) => {
+                    // H3: re-acquire a fresh short write guard to persist +
+                    // audit the extract result.
+                    let mut conn = db
+                        .write()
+                        .context("acquire shared writer for extract persist")?;
                     let canonical =
                         serde_json::to_vec(&graph).context("encode FeatureGraph for hash")?;
                     let hash = blake3::hash(&canonical);
@@ -778,6 +800,10 @@ impl PricingPipelineService {
                 }
                 Err(e) => {
                     let reason = e.to_string();
+                    // H3: fresh short write guard for the failure audit.
+                    let mut conn = db
+                        .write()
+                        .context("acquire shared writer for extract failure")?;
                     emit_failure(
                         &mut conn,
                         &tenant_id_string,
@@ -798,7 +824,7 @@ impl PricingPipelineService {
     }
 
     async fn advance_price(&self, row: PricingJobRow) -> Result<StepOutcome> {
-        let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
@@ -807,7 +833,7 @@ impl PricingPipelineService {
         let target_tol = self.config.default_tolerance;
 
         let outcome = spawn_blocking(move || -> Result<StepOutcome> {
-            let mut conn = duckdb::Connection::open(&db_path).context("open DB for price")?;
+            let mut conn = db.write().context("acquire shared writer for price")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
             let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
@@ -1131,7 +1157,7 @@ impl PricingPipelineService {
     }
 
     async fn advance_render(&self, row: PricingJobRow) -> Result<StepOutcome> {
-        let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
@@ -1146,7 +1172,7 @@ impl PricingPipelineService {
         let target_tol = self.config.default_tolerance;
 
         let outcome = spawn_blocking(move || -> Result<StepOutcome> {
-            let mut conn = duckdb::Connection::open(&db_path).context("open DB for render")?;
+            let mut conn = db.write().context("acquire shared writer for render")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
             let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
@@ -1271,15 +1297,15 @@ impl PricingPipelineService {
     async fn advance_post(&self, row: PricingJobRow) -> Result<StepOutcome> {
         // Read row artifacts off-thread, then do the async HTTP POST
         // on the main runtime.
-        let db_path = self.deps.db_path.clone();
+        let db_handle = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let quote_id = row.quote_id.clone();
         let read_arts = {
             let qid = quote_id.clone();
             let tid = tenant_id_string.clone();
-            let db = db_path.clone();
+            let db = db_handle.clone();
             spawn_blocking(move || -> Result<(jobs::JobArtifacts, String, String)> {
-                let conn = duckdb::Connection::open(&db).context("open DB for post")?;
+                let conn = db.read().context("acquire shared reader for post")?;
                 let arts = jobs::get_job_artifacts(&conn, &qid, &tid)?;
                 // Re-fetch the persisted breakdown + hash from the row.
                 let mut stmt = conn.prepare(
@@ -1314,7 +1340,7 @@ impl PricingPipelineService {
             )
             .await;
 
-        let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
@@ -1322,7 +1348,9 @@ impl PricingPipelineService {
         let attempt_n = row.attempt_n;
 
         let final_outcome = spawn_blocking(move || -> Result<StepOutcome> {
-            let mut conn = duckdb::Connection::open(&db_path).context("open DB for post-finish")?;
+            let mut conn = db
+                .write()
+                .context("acquire shared writer for post-finish")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
 
@@ -1734,8 +1762,10 @@ pub(crate) fn emit_daemon_panicked_audit(
     restart_count_since_boot: u32,
     last_known_quote_id: Option<String>,
 ) -> Result<()> {
-    let mut conn =
-        duckdb::Connection::open(&deps.db_path).context("open DB for daemon-panic audit")?;
+    let mut conn = deps
+        .db
+        .write()
+        .context("acquire shared writer for daemon-panic audit")?;
     audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
     let tx = conn.transaction().context("open daemon-panic tx")?;
     let meta = LedgerMeta::new(
@@ -3396,14 +3426,15 @@ struct PipelinePythonResolvedPayload {
 /// double-call inside the same spawn-window is a no-op via the audit-
 /// ledger's UNIQUE defence.
 pub fn emit_python_resolved_audit(
-    db_path: &Path,
+    db: &Handle,
     tenant_id: &str,
     binary_hash: BinaryHash,
     login: &str,
     status: &PipelinePythonStatus,
 ) -> Result<()> {
-    let mut conn =
-        duckdb::Connection::open(db_path).context("open DB for python-resolved audit")?;
+    let mut conn = db
+        .write()
+        .context("acquire shared writer for python-resolved audit")?;
     audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
     let tx = conn.transaction().context("open python-resolved tx")?;
     let meta = LedgerMeta::new(TenantId::new(tenant_id).context("tenant id")?, binary_hash);
@@ -3458,12 +3489,14 @@ struct QuotePricingJobsIndexMigratedPayload {
 /// impossible (the migration helper returns `false` once the index is
 /// gone), so the UNIQUE idempotency-key constraint is belt-and-braces.
 pub fn emit_index_migrated_audit(
-    db_path: &Path,
+    db: &Handle,
     tenant_id: &str,
     binary_hash: BinaryHash,
     login: &str,
 ) -> Result<()> {
-    let mut conn = duckdb::Connection::open(db_path).context("open DB for index-migrated audit")?;
+    let mut conn = db
+        .write()
+        .context("acquire shared writer for index-migrated audit")?;
     audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
     let tx = conn.transaction().context("open index-migrated tx")?;
     let meta = LedgerMeta::new(TenantId::new(tenant_id).context("tenant id")?, binary_hash);
@@ -3495,6 +3528,16 @@ pub fn emit_index_migrated_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H3 (ADR-0099): a process-local shared `Handle` over a test temp DB —
+    /// the same `open_default` shape the CLI one-shots use. The daemon under
+    /// test now routes every per-step read/append through this Handle; drive
+    /// the service, then read it back via `svc.deps.db.read()` (a fresh
+    /// `Connection::open` on the same path would deadlock on the file lock
+    /// while this Handle is live).
+    fn test_handle(db_path: &std::path::Path) -> HandleArc {
+        Handle::open_default(db_path, TenantId::new("T").expect("tid")).expect("open test handle")
+    }
 
     #[test]
     fn backoff_follows_5_15_60_then_cadence() {
@@ -3899,14 +3942,14 @@ mod tests {
         // Best-effort: clean up a prior leftover from a flaky run.
         let _ = std::fs::remove_file(&db_path);
         let deps = PricingPipelineDeps {
-            db_path: db_path.clone(),
+            db: test_handle(&db_path),
             tenant: TenantId::new("T").expect("tid"),
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
             operator_login: "ervin".to_string(),
         };
         emit_daemon_panicked_audit(&deps, "boom", 1, Some("q-1".to_string())).expect("emit");
         emit_daemon_panicked_audit(&deps, "second", 2, None).expect("emit2");
-        let conn = duckdb::Connection::open(&db_path).expect("reopen");
+        let conn = deps.db.read().expect("read via handle");
         let entries = recent_entries(&conn, 10).expect("recent");
         // Two panic rows in seq-DESC order: "second" is newest.
         assert_eq!(entries.len(), 2);
@@ -4553,7 +4596,12 @@ mod tests {
                 default_tolerance: ToleranceRange::Standard,
             },
             deps: PricingPipelineDeps {
-                db_path: std::env::temp_dir().join("aberp-s347-unused.duckdb"),
+                // S347 tests exercise only the HTTP writeback path; the DB is
+                // unused, but the Handle needs a unique path so concurrent
+                // tests don't collide on the DuckDB file lock.
+                db: test_handle(
+                    &std::env::temp_dir().join(format!("aberp-s347-{}.duckdb", Ulid::new())),
+                ),
                 tenant: TenantId::new("T").expect("tid"),
                 binary_hash: BinaryHash::from_bytes([0u8; 32]),
                 operator_login: "ervin".to_string(),
@@ -5036,7 +5084,7 @@ mod tests {
                 default_tolerance: ToleranceRange::Standard,
             },
             deps: PricingPipelineDeps {
-                db_path,
+                db: test_handle(&db_path),
                 tenant: TenantId::new("T").expect("tid"),
                 binary_hash: BinaryHash::from_bytes([0u8; 32]),
                 operator_login: "ervin".to_string(),
@@ -5162,7 +5210,7 @@ mod tests {
                 default_tolerance: ToleranceRange::Standard,
             },
             deps: PricingPipelineDeps {
-                db_path,
+                db: test_handle(&db_path),
                 tenant: TenantId::new("T").expect("tid"),
                 binary_hash: BinaryHash::from_bytes([0u8; 32]),
                 operator_login: "ervin".to_string(),
@@ -5215,7 +5263,7 @@ mod tests {
             .expect("no-CAD enqueue must not error");
         assert!(!first, "a no-CAD quote is not an enqueued pricing job");
 
-        let conn = duckdb::Connection::open(&db).expect("reopen");
+        let conn = svc.deps.db.read().expect("read via handle");
         let rows = jobs::list_jobs(&conn, "T").expect("list");
         assert_eq!(rows.len(), 1, "exactly one Failed row after cycle 1");
         let row = &rows[0];
@@ -5252,7 +5300,7 @@ mod tests {
             .expect("second no-CAD enqueue must not error");
         assert!(!second);
 
-        let conn = duckdb::Connection::open(&db).expect("reopen2");
+        let conn = svc.deps.db.read().expect("read via handle 2");
         assert_eq!(
             jobs::list_jobs(&conn, "T").expect("list2").len(),
             1,
@@ -5335,7 +5383,7 @@ mod tests {
                 default_tolerance: ToleranceRange::Standard,
             },
             deps: PricingPipelineDeps {
-                db_path,
+                db: test_handle(&db_path),
                 tenant: TenantId::new("T").expect("tid"),
                 binary_hash: BinaryHash::from_bytes([0u8; 32]),
                 operator_login: "ervin".to_string(),
@@ -5369,8 +5417,8 @@ mod tests {
         p
     }
 
-    fn s430_read_state(db: &std::path::Path, qid: &str) -> (String, Option<String>) {
-        let conn = duckdb::Connection::open(db).expect("reopen db");
+    fn s430_read_state(db: &Handle, qid: &str) -> (String, Option<String>) {
+        let conn = db.read().expect("read via handle");
         conn.query_row(
             "SELECT state, error_stage FROM quote_pricing_jobs WHERE quote_id = ?",
             [qid],
@@ -5379,8 +5427,8 @@ mod tests {
         .expect("job row")
     }
 
-    fn s430_count_kind(db: &std::path::Path, kind: &str) -> usize {
-        let conn = duckdb::Connection::open(db).expect("reopen db");
+    fn s430_count_kind(db: &Handle, kind: &str) -> usize {
+        let conn = db.read().expect("read via handle");
         aberp_audit_ledger::recent_entries(&conn, 200)
             .expect("recent")
             .iter()
@@ -5454,7 +5502,7 @@ mod tests {
             matches!(outcome, StepOutcome::Failed),
             "tampered blob must Fail the step, got {outcome:?}"
         );
-        let (state, stage) = s430_read_state(&db, qid);
+        let (state, stage) = s430_read_state(&svc.deps.db, qid);
         assert_eq!(state, "failed");
         assert_eq!(
             stage.as_deref(),
@@ -5486,12 +5534,12 @@ mod tests {
 
         // The read fired exactly once (debounce is single-read here).
         assert_eq!(
-            s430_count_kind(&db, "cad.blob_read"),
+            s430_count_kind(&svc.deps.db, "cad.blob_read"),
             1,
             "exactly one CadBlobRead per fetch"
         );
         // Decrypt succeeded → the failure (if any, no python) is NOT decrypt.
-        let (_state, stage) = s430_read_state(&db, qid);
+        let (_state, stage) = s430_read_state(&svc.deps.db, qid);
         assert_ne!(
             stage.as_deref(),
             Some("decrypt"),

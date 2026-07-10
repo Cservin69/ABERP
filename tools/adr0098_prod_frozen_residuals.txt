@@ -95,7 +95,6 @@
 3 apps/aberp/src/print_invoice.rs
 2 apps/aberp/src/quote_calibration.rs
 1 apps/aberp/src/quote_pdf_rerender_daemon.rs
-12 apps/aberp/src/quote_pricing_pipeline.rs
 3 apps/aberp/src/recover_from_nav.rs
 4 apps/aberp/src/reports.rs
 4 apps/aberp/src/request_technical_annulment.rs
