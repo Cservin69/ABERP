@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::entry::{Actor, Entry, EntryHash, EntryId, EventKind, Sequence};
+use crate::entry::{Actor, BinaryHash, Entry, EntryHash, EntryId, EventKind, Sequence, TenantId};
 use crate::error::AppendError;
 use crate::storage::LedgerMeta;
 
@@ -149,6 +149,64 @@ impl MirrorEntry {
         })
     }
 
+    /// Inverse of [`MirrorEntry::from_entry`]: decode this JSON-Lines record
+    /// back into a fully-formed in-memory [`Entry`], byte-exact. Hex-decodes the
+    /// three 32-byte hash fields, base64-decodes `payload`, RFC3339-parses
+    /// `time_wall`, and rebuilds `EntryId` / `Sequence` / `TenantId` /
+    /// `EventKind`. Total and lossless: for any entry `e`,
+    /// `MirrorEntry::from_entry(&e).to_entry()` reproduces `e`, and the decoded
+    /// entry's [`crate::compute_entry_hash`] reproduces the stored `entry_hash`
+    /// — the property the boot heal's full `verify_chain` (MF-1) relies on.
+    ///
+    /// A decode failure means the mirror line is malformed; it surfaces as
+    /// [`AppendError::MirrorCorrupt`] naming the seq + field, matching the
+    /// loud-fail posture the reconcile already takes on a corrupt mirror.
+    pub(crate) fn to_entry(&self) -> Result<Entry, AppendError> {
+        let corrupt = |field: &str, detail: String| AppendError::MirrorCorrupt {
+            reason: format!("mirror row seq {}: {field} {detail}", self.seq),
+        };
+
+        let id_ulid_str = self
+            .id
+            .strip_prefix("aud_")
+            .ok_or_else(|| corrupt("id", "missing `aud_` prefix".to_string()))?;
+        let id_ulid = ulid::Ulid::from_string(id_ulid_str)
+            .map_err(|e| corrupt("id", format!("is not a valid Crockford-base32 ULID: {e}")))?;
+
+        let seq = Sequence::new(self.seq)
+            .ok_or_else(|| corrupt("seq", "is 0 (must be >= 1)".to_string()))?;
+
+        let prev_hash = decode_hash32(&self.prev_hash).map_err(|d| corrupt("prev_hash", d))?;
+        let binary_hash =
+            decode_hash32(&self.binary_hash).map_err(|d| corrupt("binary_hash", d))?;
+        let entry_hash = decode_hash32(&self.entry_hash).map_err(|d| corrupt("entry_hash", d))?;
+
+        let tenant_id = TenantId::new(self.tenant_id.clone())
+            .ok_or_else(|| corrupt("tenant_id", "is empty or contains a null byte".to_string()))?;
+        let time_wall = OffsetDateTime::parse(&self.time_wall, &Rfc3339)
+            .map_err(|e| corrupt("time_wall", format!("is not RFC3339: {e}")))?;
+        let kind = EventKind::from_storage_str(&self.kind)
+            .map_err(|e| corrupt("kind", format!("is an unknown event kind: {e}")))?;
+        let payload = BASE64_STANDARD
+            .decode(&self.payload)
+            .map_err(|e| corrupt("payload", format!("is not valid base64: {e}")))?;
+
+        Ok(Entry {
+            id: EntryId(id_ulid),
+            seq,
+            prev_hash: EntryHash::from_bytes(prev_hash),
+            time_wall,
+            time_mono: self.time_mono,
+            actor: self.actor.clone(),
+            binary_hash: BinaryHash::from_bytes(binary_hash),
+            tenant_id,
+            kind,
+            payload,
+            idempotency_key: self.idempotency_key.clone(),
+            entry_hash: EntryHash::from_bytes(entry_hash),
+        })
+    }
+
     /// `seq` accessor for the bundle reader's seq-ordered scan.
     pub fn seq(&self) -> u64 {
         self.seq
@@ -168,6 +226,19 @@ fn encode_line(record: &MirrorEntry) -> Result<Vec<u8>, AppendError> {
     let mut bytes = serde_json::to_vec(record)?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+/// Hex-decode a mirror hash field into the 32-byte SHA-256 array, or a loud
+/// reason string. Shared by [`MirrorEntry::to_entry`] for `prev_hash` /
+/// `binary_hash` / `entry_hash`.
+fn decode_hash32(hex_str: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(hex_str).map_err(|e| format!("is not valid hex: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!("decoded to {} bytes (expected 32)", bytes.len()));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 /// Append-only read of the mirror file. Returns the seq-ordered
@@ -467,6 +538,24 @@ fn preserve_ahead_mirror(mirror_path: &Path) -> Result<PathBuf, AppendError> {
     Ok(backup)
 }
 
+/// ADR-audit-armor preserve-BEFORE-heal — copy the ahead mirror to
+/// `<mirror>.healed-<nanos>.bak` BEFORE the heal touches the DB, so the exact
+/// bytes that were replayed survive even the successful-heal path (the DB heal
+/// is a mutation; the evidence of what it healed from must not be lost). A
+/// byte-for-byte copy; the original mirror is left in place. Returns the backup
+/// path for the surfaced log line.
+fn preserve_healed_mirror(mirror_path: &Path) -> Result<PathBuf, AppendError> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut os = mirror_path.as_os_str().to_owned();
+    os.push(format!(".healed-{nanos}.bak"));
+    let backup = PathBuf::from(os);
+    std::fs::copy(mirror_path, &backup).map_err(AppendError::MirrorIo)?;
+    Ok(backup)
+}
+
 /// Synchronise the mirror file to the DB's current head. ADR-0030
 /// §2. Called by the binary path after `tx.commit()`.
 ///
@@ -662,6 +751,17 @@ pub enum RecoveryAction {
     /// API (a rebuild remains a legitimate recovery outcome a future guarded
     /// path may report).
     Rebuilt { entries_written: u64 },
+
+    /// ADR-audit-armor — the mirror was AHEAD of the DB and the gated auto-heal
+    /// PROVED it was a benign WAL-fold loss (boundary `entry_hash` agreed, the
+    /// decoded tail verified, and the post-replay full-genesis `verify_chain`
+    /// passed inside the heal transaction), so the mirror's extra rows were
+    /// replayed into the DB instead of refusing. `entries_replayed` is the count
+    /// of mirror tail rows restored (excluding the `db.auto_recovered` forensic
+    /// row the heal appends). A real fork never reaches this outcome — it fails
+    /// a discriminator or the in-tx re-verify and falls back to
+    /// [`AppendError::MirrorAheadOfDb`].
+    Healed { entries_replayed: u64 },
 }
 
 /// Boot-time reconciliation of the mirror against the DB. Session
@@ -753,8 +853,25 @@ pub fn ensure_consistent_with_db(
                 entries
             } else {
                 // The intact prefix is STILL AHEAD of the DB even after dropping
-                // the torn tail — the fingerprint of a lost DB commit. Do NOT
-                // trim (H1 Bug-3 pre-fix); preserve the ahead mirror and REFUSE.
+                // the torn tail — the fingerprint of a lost DB commit.
+                //
+                // ADR-audit-armor — attempt the GATED AUTO-HEAL first over the
+                // chain-reverified intact prefix. On success the DB is replayed
+                // up to the prefix head and the torn tail is dropped from the
+                // mirror file (`trim_to = Some(prefix_len)`); on ANY refusal fall
+                // back to preserve_ahead + REFUSE, leaving the on-disk mirror
+                // BYTE-FOR-BYTE untouched (the H1 Bug-3 pre-fix: never trim on a
+                // refuse).
+                if let Some(action) = heal_from_mirror_ahead(
+                    conn,
+                    mirror_path,
+                    &entries,
+                    db_max_seq,
+                    Some(prefix_len),
+                )? {
+                    return Ok(action);
+                }
+                // Heal refused — do NOT trim; preserve the ahead mirror and REFUSE.
                 let preserved = preserve_ahead_mirror(mirror_path)?;
                 tracing::error!(
                     target: "audit_event",
@@ -824,12 +941,23 @@ pub fn ensure_consistent_with_db(
         })
     } else if mirror_max_seq > db_max_seq {
         // Arm (a): a CLEAN mirror AHEAD of the DB (mirror_max_seq > db_max_seq).
-        // The fingerprint of a torn-write / lost DB commit (the 2026-06-22
-        // corruption class) or a dev DB-nuke. NEVER silently truncate (that
-        // destroys the only surviving record of what the DB lost). Preserve the
-        // ahead mirror to a side file FIRST, then REFUSE so a human investigates
-        // before any rebuild. Direct backport of the editions preserve_ahead
-        // arm.
+        // The fingerprint of a WAL-fold tear / lost DB commit (any fresh-open
+        // writer OR reader — scenario G/H) or a dev DB-nuke.
+        //
+        // ADR-audit-armor — attempt the GATED AUTO-HEAL first: if this is a
+        // provable benign loss (boundary agrees, tail verifies, in-tx
+        // full-genesis re-verify passes), replay the mirror's lost tail into the
+        // DB and CONTINUE. On ANY refusal fall back to the historical
+        // preserve_ahead + REFUSE (the whole mirror is the intact prefix, so
+        // nothing to trim).
+        if let Some(action) =
+            heal_from_mirror_ahead(conn, mirror_path, &mirror_entries, db_max_seq, None)?
+        {
+            return Ok(action);
+        }
+        // Heal refused — NEVER silently truncate (that destroys the only
+        // surviving record of what the DB lost). Preserve the ahead mirror to a
+        // side file FIRST, then REFUSE so a human investigates.
         let entries_ahead = mirror_max_seq - db_max_seq;
         let preserved = preserve_ahead_mirror(mirror_path)?;
         tracing::error!(
@@ -883,6 +1011,212 @@ pub fn ensure_consistent_with_db(
             })
         }
     }
+}
+
+/// ADR-audit-armor — attempt the gated auto-heal for a mirror that is AHEAD of
+/// the DB (`mirror_max_seq > db_max_seq`), replaying the mirror's provable-loss
+/// tail into the DB instead of refusing. Returns:
+///   * `Ok(Some(action))` — HEALED; the caller returns it and boot continues.
+///   * `Ok(None)`          — REFUSED (a discriminator or the in-tx MF-1 full
+///     re-verify rejected it); the caller falls back to the historical
+///     `preserve_ahead_mirror` + [`AppendError::MirrorAheadOfDb`].
+///   * `Err(e)`            — a hard filesystem failure while preserving evidence
+///     before the DB was touched; propagate (boot refuses loudly).
+///
+/// `intact` is the chain-reverified mirror prefix — the WHOLE mirror for the
+/// clean-ahead arm, or the pre-torn-tail prefix for the torn-tail-still-ahead
+/// arm. `trim_to` is `Some(prefix_len)` for the torn-tail arm (the on-disk
+/// mirror carries a torn trailing line to drop after a successful heal) and
+/// `None` for the clean arm.
+///
+/// # Safety (MF-1 / MF-2, `_handoffs/ADR-audit-armor-ADVERSARIAL.md`)
+///
+/// Discriminator 1 (boundary `entry_hash` equality) and Discriminator 2 (decoded
+/// full-mirror `verify_chain`) below are a FAST-PATH EARLY REJECT, **not** the
+/// safety boundary. The authoritative fork-detector is the full-genesis
+/// `verify_chain` run INSIDE the heal transaction by
+/// [`crate::storage::heal_replay_mirror_tail`], which rolls back and refuses on
+/// any failure. A duplicate-seq fork (there is no `UNIQUE(seq)`) can pass
+/// Discriminator 1 — the boundary read is `WHERE seq=? LIMIT 1`, no `ORDER BY` —
+/// yet it cannot pass the in-tx full re-verify. Do not treat the discriminators
+/// as the fork guard. Discriminator 2 uses the FULL `verify_chain` (recomputes
+/// `entry_hash`), never the link-only `parse_and_reverify_prefix` (MF-3).
+fn heal_from_mirror_ahead(
+    conn: &Connection,
+    mirror_path: &Path,
+    intact: &[MirrorEntry],
+    db_max_seq: u64,
+    trim_to: Option<u64>,
+) -> Result<Option<RecoveryAction>, AppendError> {
+    let mirror_max_seq = intact.last().map(|e| e.seq).unwrap_or(0);
+    // Precondition guard: only heal a strictly-ahead mirror over a non-empty DB
+    // (a common prefix must exist to prove agreement against). Anything else
+    // refuses (fall back to the existing ahead-refuse).
+    if mirror_max_seq <= db_max_seq || db_max_seq == 0 {
+        return Ok(None);
+    }
+
+    // ── Discriminator 1 (fast-path early reject) — boundary entry_hash equality.
+    // The DB head (seq db_max_seq) entry_hash must equal the mirror's entry_hash
+    // at the same seq. By the Merkle property this makes `[1..=db_max_seq]`
+    // byte-identical in both — IF the DB prefix is itself internally valid, which
+    // ONLY the in-tx full re-verify establishes. This is the cheap "obvious fork"
+    // rejector, not the proof.
+    let db_boundary = match read_db_entry_at_seq(conn, db_max_seq)? {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    let mirror_boundary = match intact.iter().find(|e| e.seq == db_max_seq) {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    if hex::encode(db_boundary.entry_hash.as_bytes()) != mirror_boundary.entry_hash {
+        tracing::warn!(
+            target: "audit_event",
+            event = "audit_mirror_heal_boundary_mismatch",
+            mirror_path = %mirror_path.display(),
+            db_max_seq,
+            mirror_max_seq,
+            "boot auto-heal early-reject: DB head entry_hash != mirror entry_hash at the boundary \
+             seq — the chains fork at/below the boundary; this is NOT a benign loss. Refusing."
+        );
+        return Ok(None);
+    }
+
+    // ── Discriminator 2 (fast-path early reject) — decode the FULL mirror to
+    // `Entry` and run the full `verify_chain` genesis→mirror head, recomputing
+    // every `entry_hash` from canonical content (MF-3: the full verifier, never
+    // the link-only `parse_and_reverify_prefix`). Proves the mirror tail chains
+    // cleanly onto the boundary AND is internally untampered.
+    let mut decoded: Vec<Entry> = Vec::with_capacity(intact.len());
+    for m in intact {
+        match m.to_entry() {
+            Ok(e) => decoded.push(e),
+            Err(e) => {
+                tracing::warn!(
+                    target: "audit_event",
+                    event = "audit_mirror_heal_decode_failed",
+                    mirror_path = %mirror_path.display(),
+                    error = %e,
+                    "boot auto-heal early-reject: an ahead mirror row failed to decode — refusing"
+                );
+                return Ok(None);
+            }
+        }
+    }
+    let tenant = match decoded.first() {
+        Some(e) => e.tenant_id.clone(),
+        None => return Ok(None),
+    };
+    if let Err(e) = crate::chain::verify::verify_chain(&tenant, decoded.iter()) {
+        tracing::warn!(
+            target: "audit_event",
+            event = "audit_mirror_heal_tail_unverified",
+            mirror_path = %mirror_path.display(),
+            error = %e,
+            "boot auto-heal early-reject: the decoded ahead mirror does NOT verify genesis→head — \
+             a tampered/forked tail, not a benign loss. Refusing."
+        );
+        return Ok(None);
+    }
+
+    // ── Preserve-before-heal: copy the ahead mirror to `<mirror>.healed-<nanos>.bak`
+    //    BEFORE touching the DB, so the replayed bytes survive even on success.
+    //    A copy failure is loud (we must not heal without preserving evidence).
+    let preserved = preserve_healed_mirror(mirror_path)?;
+
+    // ── The heal proper: replay `[db_max_seq+1 ..= mirror_max_seq]` verbatim +
+    //    the forensic row + the MF-1 full-genesis re-verify, all in ONE tx that
+    //    rolls back and refuses on any failure (THE fork guard).
+    let tail: Vec<Entry> = decoded
+        .iter()
+        .filter(|e| e.seq.as_u64() > db_max_seq)
+        .cloned()
+        .collect();
+    let replayed = tail.len() as u64;
+    let session_id = format!(
+        "audit-heal-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let actor = Actor::from_local_cli(session_id, "system:audit-heal");
+    // Injection-free: every interpolation is a `u64`. Field set matches the
+    // documented `DbAutoRecoveredPayload` shape (aberp-db poison-recovery
+    // convention) so any typed decoder round-trips it.
+    let payload = format!(
+        "{{\"trigger\":\"mirror_ahead_heal\",\"source_snapshot_seq\":{db_max_seq},\
+         \"snapshot_audit_count\":{db_max_seq},\"replayed_entries\":{replayed},\
+         \"recovered_max_seq\":{mirror_max_seq},\"retained_corrupt_db\":null}}"
+    )
+    .into_bytes();
+    if let Err(e) = crate::storage::heal_replay_mirror_tail(conn, &tail, payload, actor) {
+        tracing::error!(
+            target: "audit_event",
+            event = "audit_mirror_heal_refused_reverify",
+            mirror_path = %mirror_path.display(),
+            db_max_seq,
+            mirror_max_seq,
+            error = %e,
+            "boot auto-heal REFUSED at the in-tx full-genesis verify (rolled back, DB untouched) — \
+             this is the fork/tamper guard, not a benign loss. Falling back to preserve+refuse."
+        );
+        return Ok(None);
+    }
+
+    // Success — the DB is durably `[1..=mirror_max_seq]` (== mirror) + a forensic
+    // `db.auto_recovered` row at `mirror_max_seq + 1`, committed. Everything below
+    // is BEST-EFFORT mirror-file hygiene: any lag self-corrects on the next boot's
+    // Extended / torn-tail-covered arm, so a failure here must NOT re-brick a
+    // heal that already landed.
+
+    // Torn-tail arm: drop the never-durable torn trailing line so the on-disk
+    // mirror matches the healed DB (the original — incl. the torn tail — is in
+    // the `.healed` backup already).
+    if let Some(len) = trim_to {
+        if let Err(e) = trim_mirror_to(mirror_path, len) {
+            tracing::warn!(
+                target: "audit_event",
+                event = "audit_mirror_heal_trim_deferred",
+                mirror_path = %mirror_path.display(),
+                error = %e,
+                "auto-heal landed but trimming the torn tail failed; next boot's torn-tail-covered \
+                 arm will clean it"
+            );
+        }
+    }
+
+    // Push the forensic row into the mirror so the mirror == the healed DB and
+    // the next boot is `Unchanged` (not `Extended`).
+    let meta = LedgerMeta::new(tenant, BinaryHash::from_bytes([0u8; 32]));
+    match sync_mirror(conn, &meta, mirror_path) {
+        Ok(head) => tracing::warn!(
+            target: "audit_event",
+            event = "audit_mirror_auto_healed",
+            mirror_path = %mirror_path.display(),
+            db_max_seq,
+            mirror_max_seq,
+            entries_replayed = replayed,
+            new_head_seq = head,
+            preserved = %preserved.display(),
+            "audit-ledger mirror was AHEAD of the DB and the gated auto-heal PROVED a benign \
+             WAL-fold loss (boundary agreed, tail verified, in-tx full-genesis re-verify passed) — \
+             replayed the lost tail into the DB and continued; the ahead mirror was preserved"
+        ),
+        Err(e) => tracing::warn!(
+            target: "audit_event",
+            event = "audit_mirror_heal_resync_deferred",
+            mirror_path = %mirror_path.display(),
+            error = %e,
+            "auto-heal landed durably; the forensic-row mirror re-sync failed and will be picked \
+             up by the next boot's Extended arm"
+        ),
+    }
+
+    Ok(Some(RecoveryAction::Healed {
+        entries_replayed: replayed,
+    }))
 }
 
 /// Read the DB's max entry seq (0 if the table is empty). Reuses the
@@ -1723,6 +2057,206 @@ mod tests {
         let second = ensure_consistent_with_db(&conn, &mirror).unwrap();
         assert_eq!(second, RecoveryAction::Unchanged);
         assert_eq!(read_mirror_entries(&mirror).unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── ADR-audit-armor — the gated auto-heal (positive) + the fork/tamper
+    //    refusals (negative). MF-1 (the in-tx full-genesis re-verify) is THE
+    //    fork-detector; the discriminators are only an early reject.
+
+    /// Build a BENIGN mirror-ahead state: DB `[1..=2]`, mirror `[1..=2..=extra]`
+    /// where the extra rows are a valid continuation the DB lost to a WAL fold
+    /// (synced while the DB held them, then rolled back). Returns
+    /// `(conn, mirror_path, dir)`.
+    fn benign_ahead(name: &str, extra: usize) -> (Connection, PathBuf, PathBuf) {
+        let dir = tempdir_under_target();
+        let mirror = dir.join(format!("{name}.audit.log"));
+        let (mut conn, meta) = open_conn_with_two_entries(); // DB [1,2]
+        sync_mirror(&conn, &meta, &mirror).unwrap(); // mirror [1,2]
+        for i in 0..extra {
+            append_one(
+                &mut conn,
+                &meta,
+                &format!("ahead-{i}"),
+                format!("ahead-payload-{i}").as_bytes(),
+            );
+        }
+        sync_mirror(&conn, &meta, &mirror).unwrap(); // mirror [1,2,..2+extra]
+                                                     // WAL-fold tear: the DB loses everything above seq 2; the mirror keeps it.
+        conn.execute_batch("DELETE FROM audit_ledger WHERE seq > 2;")
+            .unwrap();
+        assert_eq!(read_db_max_seq(&conn).unwrap(), 2);
+        assert_eq!(read_mirror_entries(&mirror).unwrap().len(), 2 + extra);
+        (conn, mirror, dir)
+    }
+
+    #[test]
+    fn ensure_consistent_heals_benign_ahead_and_is_idempotent() {
+        // The reproduced WAL-fold tear, healed: mirror ahead by 1 over a boundary
+        // the DB agrees with and a tail that verifies → the heal replays the lost
+        // row (+ a db.auto_recovered forensic row) and CONTINUES, leaving db ==
+        // mirror. Second boot is Unchanged (idempotent — negative test (d)).
+        let (conn, mirror, dir) = benign_ahead("heal", 1);
+
+        let action = ensure_consistent_with_db(&conn, &mirror).unwrap();
+        assert_eq!(
+            action,
+            RecoveryAction::Healed {
+                entries_replayed: 1
+            },
+            "a benign mirror-ahead must HEAL, not refuse"
+        );
+
+        // db == mirror, and both carry the replayed row + the forensic row.
+        let db = read_db_entries_after(&conn, 0).unwrap();
+        let mir = read_mirror_entries(&mirror).unwrap();
+        assert_eq!(db.len(), 4, "DB = [1,2,3 replayed] + db.auto_recovered @4");
+        assert_eq!(mir.len(), 4, "mirror re-synced to match the healed DB");
+        assert_eq!(
+            db.last().unwrap().kind.as_str(),
+            "db.auto_recovered",
+            "the heal emits a db.auto_recovered forensic row"
+        );
+        for (d, m) in db.iter().zip(mir.iter()) {
+            assert_eq!(d.seq.as_u64(), m.seq);
+            assert_eq!(
+                hex::encode(d.entry_hash.as_bytes()),
+                m.entry_hash,
+                "db == mirror at seq {}",
+                m.seq
+            );
+        }
+        // The ahead mirror was preserved BEFORE the heal touched the DB.
+        assert!(
+            find_one_backup(&dir, ".healed-").is_some(),
+            "ahead mirror preserved to .healed-*.bak before the heal"
+        );
+
+        // (d) idempotency — second boot is Unchanged, no loop, no further growth.
+        let again = ensure_consistent_with_db(&conn, &mirror).unwrap();
+        assert_eq!(
+            again,
+            RecoveryAction::Unchanged,
+            "second boot must not loop"
+        );
+        assert_eq!(read_mirror_entries(&mirror).unwrap().len(), 4);
+        assert_eq!(read_db_entries_after(&conn, 0).unwrap().len(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_consistent_refuses_duplicate_seq_fork_at_boundary() {
+        // NEGATIVE (a) — THE fork the adversary found: a DUPLICATE row at
+        // db_max_seq whose head hash MATCHES the mirror (there is no
+        // UNIQUE(seq)). The boundary discriminator (`WHERE seq=? LIMIT 1`, no
+        // ORDER BY) samples the honest row and PASSES — yet the heal must still
+        // refuse. Only the in-tx full-genesis re-verify (MF-1) catches it: the
+        // duplicate seq trips OutOfOrder walking SELECT_ALL. This is the test
+        // that proves MF-1 — not the discriminators — is the fork-detector.
+        let (conn, mirror, dir) = benign_ahead("dup-seq", 1);
+        // Inject a byte-identical duplicate of seq 2 → rows at seqs {1, 2, 2}.
+        conn.execute_batch("INSERT INTO audit_ledger SELECT * FROM audit_ledger WHERE seq = 2;")
+            .unwrap();
+
+        let err = ensure_consistent_with_db(&conn, &mirror).unwrap_err();
+        match err {
+            AppendError::MirrorAheadOfDb {
+                mirror_max_seq,
+                db_max_seq,
+                preserved,
+            } => {
+                assert_eq!(mirror_max_seq, 3);
+                assert_eq!(db_max_seq, 2);
+                assert!(preserved.contains(".ahead-"));
+            }
+            other => panic!("expected MirrorAheadOfDb (fork masked → refuse), got {other:?}"),
+        }
+        assert!(find_one_backup(&dir, ".ahead-").is_some());
+        // The DB was NOT healed: still {1,2,2}, no seq-3 / forensic row committed.
+        let db = read_db_entries_after(&conn, 0).unwrap();
+        assert_eq!(db.len(), 3, "duplicate fork left intact; heal rolled back");
+        assert!(
+            db.iter().all(|e| e.kind.as_str() != "db.auto_recovered"),
+            "no forensic row on a refused heal"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_consistent_refuses_boundary_hash_mismatch() {
+        // NEGATIVE (b) — the DB's boundary entry_hash DISAGREES with the mirror's
+        // at db_max_seq (the chains forked at/below the boundary). Discriminator 1
+        // early-rejects it; the in-tx re-verify would too. Must refuse.
+        let (conn, mirror, dir) = benign_ahead("boundary", 1);
+        // Tamper the DB boundary (seq 2) entry_hash so it no longer matches the
+        // mirror — set it to seq 1's hash (no BLOB literal / params needed).
+        conn.execute_batch(
+            "UPDATE audit_ledger \
+             SET entry_hash = (SELECT entry_hash FROM audit_ledger WHERE seq = 1) \
+             WHERE seq = 2;",
+        )
+        .unwrap();
+
+        let err = ensure_consistent_with_db(&conn, &mirror).unwrap_err();
+        match err {
+            AppendError::MirrorAheadOfDb {
+                mirror_max_seq,
+                db_max_seq,
+                preserved,
+            } => {
+                assert_eq!(mirror_max_seq, 3);
+                assert_eq!(db_max_seq, 2);
+                assert!(preserved.contains(".ahead-"));
+            }
+            other => panic!("expected MirrorAheadOfDb (boundary fork → refuse), got {other:?}"),
+        }
+        // Not healed — no forensic row, DB still 2 rows.
+        let db = read_db_entries_after(&conn, 0).unwrap();
+        assert_eq!(db.len(), 2);
+        assert!(db.iter().all(|e| e.kind.as_str() != "db.auto_recovered"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_consistent_refuses_tampered_tail_content() {
+        // NEGATIVE (c) / MF-3 — a mirror tail row with VALID chain LINKS but
+        // tampered CONTENT (payload changed; prev_hash + stored entry_hash left
+        // honest). The link-only `parse_and_reverify_prefix` (which classifies
+        // the mirror as Clean) MISSES it — proving why the heal must decode to
+        // Entry and run the FULL verify_chain, which recomputes entry_hash and
+        // trips TamperedAt. Must refuse.
+        let (conn, mirror, dir) = benign_ahead("tamper-tail", 1);
+        // Rewrite the mirror: change seq 3's payload only, keeping its stored
+        // entry_hash + prev_hash (valid links, wrong content hash).
+        let mut entries = read_mirror_entries(&mirror).unwrap();
+        assert_eq!(entries.len(), 3);
+        entries[2].payload = BASE64_STANDARD.encode(b"TAMPERED-content-not-matching-hash");
+        let mut bytes = Vec::new();
+        for r in &entries {
+            bytes.extend_from_slice(&encode_line(r).unwrap());
+        }
+        std::fs::write(&mirror, &bytes).unwrap();
+
+        let err = ensure_consistent_with_db(&conn, &mirror).unwrap_err();
+        match err {
+            AppendError::MirrorAheadOfDb {
+                mirror_max_seq,
+                db_max_seq,
+                preserved,
+            } => {
+                assert_eq!(mirror_max_seq, 3);
+                assert_eq!(db_max_seq, 2);
+                assert!(preserved.contains(".ahead-"));
+            }
+            other => panic!("expected MirrorAheadOfDb (tampered tail → refuse), got {other:?}"),
+        }
+        let db = read_db_entries_after(&conn, 0).unwrap();
+        assert_eq!(db.len(), 2, "tampered tail not replayed");
+        assert!(db.iter().all(|e| e.kind.as_str() != "db.auto_recovered"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

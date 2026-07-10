@@ -18,15 +18,18 @@
 //! write, its checkpoint truncates the WAL back to its stale snapshot — dropping
 //! the Handle's mirrored tail from the on-disk DB. Mirror ahead → boot refuses.
 //!
-//! WHAT IT PROVES FOR THE H3 SWEEP. The finish line is NOT census-zero — it is a
-//! CLEAN SHUTDOWN AFTER REAL WRITES. As long as ONE in-serve residual fresh-open
-//! writer can run concurrently with a Handle write (scenario G), the ledger can
-//! tear. Only when every in-serve opener routes through the one shared Handle
-//! does the hazard vanish. Scenarios A–F pin what is SAFE; G pins the hazard.
+//! WHAT IT PROVES NOW (ADR-audit-armor). The raw DuckDB WAL-fold hazard is real
+//! and unchanged — a residual fresh-open writer that snapshots before a Handle
+//! write and commits its own write still drops the mirrored tail from the DB
+//! (scenario G). What changed is the boot oracle: rather than migrate every
+//! opener and refuse on a tear, the audit ledger is ARMORED — the gated auto-heal
+//! (`ensure_consistent_with_db`) replays the mirror's provable-loss tail back
+//! into the DB, so the tear self-heals at the next boot. Scenarios A/C pin what
+//! folds safely; G now pins that the tear HEALS (was: refuses) with db == mirror.
 
 use aberp_audit_ledger::{
-    append_in_tx, ensure_consistent_with_db, ensure_schema, mirror_path_for, Actor, BinaryHash,
-    EventKind, LedgerMeta, TenantId,
+    append_in_tx, ensure_consistent_with_db, ensure_schema, mirror_path_for, read_mirror_entries,
+    Actor, BinaryHash, EventKind, LedgerMeta, RecoveryAction, TenantId,
 };
 use duckdb::Connection;
 
@@ -110,29 +113,80 @@ fn c_fresh_open_that_commits_after_the_write_is_clean() {
     );
 }
 
-// ── THE HAZARD — this DOES tear on the current tree ──────────────────────────
+// ── THE HAZARD — now a SELF-HEALING non-event (ADR-audit-armor) ──────────────
 
 #[test]
-fn g_spanning_residual_writer_tears_the_ledger() {
-    // The reproduced corruption: a residual fresh `Connection::open` whose
-    // snapshot PREDATES a Handle write, that then COMMITS ITS OWN write, folds
-    // the WAL back to its stale snapshot and drops the Handle's mirrored tail.
-    let result = run(|db, h| {
-        let residual = Connection::open(db).expect("residual open (snapshot pre-write)");
-        handle_append(h, "victim"); // mirrored (seq 2); still only in the WAL
+fn g_spanning_residual_writer_heals_the_ledger() {
+    // FLIPPED by ADR-audit-armor (was: assert tear/refuse). The raw DuckDB
+    // WAL-fold hazard is unchanged — a residual fresh `Connection::open` whose
+    // snapshot PREDATES a Handle write, that then COMMITS ITS OWN write, still
+    // folds the WAL back and drops the Handle's mirrored tail from the DB, so
+    // the mirror ends AHEAD. What changed is the boot oracle: instead of
+    // refusing (`MirrorAheadOfDb`), the gated auto-heal PROVES this a benign
+    // loss (boundary agrees, tail verifies, in-tx full-genesis re-verify passes)
+    // and REPLAYS the lost tail into the DB, so boot CONTINUES with db == mirror.
+    let db = tmp_db();
+    {
+        let c = Connection::open(&db).expect("boot-ensure conn");
+        ensure_schema(&c).expect("boot-ensure schema");
+    }
+    let handle = aberp_db::Handle::open_default(&db, tid()).expect("open shared Handle");
+    handle_append(&handle, "handle-write"); // the mirrored anchor (seq 1)
+    {
+        let residual = Connection::open(&db).expect("residual open (snapshot pre-write)");
+        handle_append(&handle, "victim"); // mirrored (seq 2); still only in the WAL
         residual
             .execute_batch("CREATE TABLE IF NOT EXISTS junk(x INT); INSERT INTO junk VALUES(1);")
             .expect("residual commit truncates the WAL");
         drop(residual);
-    });
-    let err = result.expect_err(
-        "REGRESSION-OR-FIX: a spanning residual writer no longer tears the ledger. \
-         If the Handle machinery changed to make this safe, update this test; if an \
-         in-serve opener was migrated, that is progress but this synthetic residual \
-         should still demonstrate the raw DuckDB WAL-fold hazard.",
+    }
+    drop(handle); // clean shutdown — checkpoint disabled, WAL preserved
+
+    let mirror = mirror_path_for(&db);
+    // Pre-boot the raw hazard is intact: the mirror kept the lost seq-2 tail.
+    assert_eq!(
+        read_mirror_entries(&mirror).unwrap().len(),
+        2,
+        "mirror still holds the WAL-folded tail (the raw hazard is unchanged)"
+    );
+
+    // Boot reconcile — must HEAL, not refuse.
+    let c = Connection::open(&db).expect("reboot conn");
+    let action = ensure_consistent_with_db(&c, &mirror).expect(
+        "REGRESSION: the WAL-fold tear must now AUTO-HEAL, not refuse. If the heal was \
+         removed or gated off, this reverts to MirrorAheadOfDb — restore the armor.",
     );
     assert!(
-        err.contains("MirrorAheadOfDb"),
-        "expected MirrorAheadOfDb (mirror head past DB head), got: {err}"
+        matches!(
+            action,
+            RecoveryAction::Healed {
+                entries_replayed: 1
+            }
+        ),
+        "expected Healed{{entries_replayed:1}} (the lost seq-2 row replayed), got {action:?}"
     );
+    drop(c);
+
+    // db == mirror proof: a SECOND boot reconcile is Unchanged — which by its own
+    // definition requires equal length + matching head hash — and it does not
+    // loop into a re-heal.
+    let c2 = Connection::open(&db).expect("second reboot conn");
+    let again =
+        ensure_consistent_with_db(&c2, &mirror).expect("second boot after a heal must succeed");
+    assert_eq!(
+        again,
+        RecoveryAction::Unchanged,
+        "the healed state is stable (db == mirror) — no re-heal loop"
+    );
+    drop(c2);
+
+    // The healed mirror = [seq1, seq2 replayed, db.auto_recovered forensic row].
+    let healed = read_mirror_entries(&mirror).unwrap();
+    assert_eq!(healed.len(), 3, "seq1 + replayed seq2 + forensic row");
+    assert_eq!(
+        healed[2].kind, "db.auto_recovered",
+        "the heal emits a db.auto_recovered forensic row"
+    );
+
+    let _ = std::fs::remove_dir_all(db.parent().unwrap());
 }

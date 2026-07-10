@@ -572,6 +572,109 @@ fn insert_entry_verbatim(conn: &Connection, entry: &Entry) -> Result<(), AppendE
     Ok(())
 }
 
+/// ADR-audit-armor / MF-1 — the transactional CORE of the boot audit-ledger
+/// auto-heal: replay the mirror's extra tail rows into the DB, append the
+/// `db.auto_recovered` forensic row, and — the LOAD-BEARING safety check — run
+/// the FULL `verify_chain` over the ENTIRE DB from genesis INSIDE the same
+/// transaction, ROLLING BACK and refusing (returning `Err`) on ANY failure.
+///
+/// `tail` is the decoded mirror rows for seq `[db_max_seq+1 ..= mirror_max_seq]`
+/// in ascending order; it MUST be non-empty (the caller only heals when the
+/// mirror is strictly ahead). Each is inserted VERBATIM via
+/// [`insert_entry_verbatim`], so its `seq`/`prev_hash`/`entry_hash` bytes are
+/// preserved exactly. On success the DB is `[1..=mirror_max_seq]` (byte-identical
+/// to the mirror) plus one fresh forensic row at `mirror_max_seq + 1`.
+///
+/// # THE final full-genesis verify is the fork-detector — not the caller's discriminators
+///
+/// Per the adversarial review of the ADR (`_handoffs/ADR-audit-armor-ADVERSARIAL.md`,
+/// MF-1 + MF-2): the boundary/tail discriminators the caller runs first are a
+/// fast-path EARLY REJECT ONLY. `audit_ledger` has **no `UNIQUE(seq)`**, and the
+/// boundary read is `SELECT … WHERE seq=? LIMIT 1` with no `ORDER BY`, so a
+/// duplicate-seq fork at the boundary can pass a naive boundary `entry_hash`
+/// check (the read may sample the honest row). It is THIS re-verify — walking
+/// `SELECT_ALL … ORDER BY seq ASC` from genesis and recomputing every
+/// `entry_hash` — that defeats it: a duplicate seq trips `OutOfOrder`, a tampered
+/// prefix trips `TamperedAt`, a below-boundary divergence trips `ChainBroken`.
+/// A heal that PASSES this verify provably left the DB a contiguous valid chain
+/// equal to the mirror. If a future edit weakens this to a tail-only check, drops
+/// it, or moves it after `COMMIT`, a real fork is MASKED — that is the one way to
+/// build an unsafe heal. Do NOT.
+///
+/// Runs at serve boot, single-threaded, on the plain reconcile `Connection`
+/// BEFORE the shared `Handle` opens (adversarial §3b), so no concurrent writer
+/// can fork alongside the manual `BEGIN`/`COMMIT` (the same reason
+/// [`migrate_drop_unique_art_if_present`] takes no append lock).
+pub(crate) fn heal_replay_mirror_tail(
+    conn: &Connection,
+    tail: &[Entry],
+    forensic_payload: Vec<u8>,
+    forensic_actor: Actor,
+) -> Result<(), AppendError> {
+    let head = tail
+        .last()
+        .expect("heal tail is non-empty by construction (mirror is strictly ahead of the DB)");
+    let tenant_id = head.tenant_id.clone();
+
+    // The forensic `db.auto_recovered` row chains off the healed head (the mirror
+    // head), so the post-heal chain stays contiguous and the MF-1 verify below
+    // covers it too. `binary_hash = [0u8; 32]` + a synthetic system actor match
+    // the aberp-db poison-recovery forensic convention (a system/durability
+    // event, not a business write).
+    let mut forensic = Entry {
+        id: EntryId::new(),
+        seq: head.seq.next(),
+        prev_hash: head.entry_hash,
+        time_wall: OffsetDateTime::now_utc(),
+        time_mono: 0,
+        actor: forensic_actor,
+        binary_hash: BinaryHash::from_bytes([0u8; 32]),
+        tenant_id: tenant_id.clone(),
+        kind: EventKind::DbAutoRecovered,
+        payload: forensic_payload,
+        idempotency_key: None,
+        entry_hash: EntryHash::from_bytes([0u8; 32]),
+    };
+    forensic.entry_hash = compute_entry_hash(&forensic);
+
+    // Manual BEGIN/COMMIT on the borrowed `&Connection` — the same shape
+    // `migrate_drop_unique_art_if_present` uses, so the heal needs no `&mut`
+    // ripple through `ensure_consistent_with_db`'s callers. DuckDB executes the
+    // inserts transactionally; any `Err` below ROLLBACKs and leaves the DB
+    // untouched.
+    conn.execute_batch("BEGIN TRANSACTION;")?;
+    let outcome = (|| -> Result<(), AppendError> {
+        for entry in tail {
+            insert_entry_verbatim(conn, entry)?;
+        }
+        insert_entry_verbatim(conn, &forensic)?;
+        // MF-1 — the authoritative fork-detector: full-genesis re-verify over the
+        // ENTIRE DB, INSIDE this transaction, before COMMIT.
+        let all = read_all_entries(conn)?;
+        verify_chain(&tenant_id, all.iter()).map_err(|e| {
+            AppendError::Migration(format!(
+                "boot audit auto-heal REFUSED — post-replay full-genesis verify_chain FAILED \
+                 ({e}). The DB is NOT a clean prefix of the mirror (duplicate seq / tampered \
+                 prefix / boundary fork). Rolling back the heal; the ahead mirror will be \
+                 preserved and boot will refuse."
+            ))
+        })?;
+        Ok(())
+    })();
+
+    match outcome {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort rollback; the outcome error is the real diagnostic.
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
 /// Drop and recreate the `audit_ledger` table, re-inserting `entries`
 /// verbatim in the given order. The caller wraps this in a transaction
 /// (the migration's manual `BEGIN`/`COMMIT`).
