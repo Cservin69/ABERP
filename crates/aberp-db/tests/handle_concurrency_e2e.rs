@@ -574,3 +574,69 @@ fn boot_access_through_shared_handle_keeps_python_resolved_db_mirror_coherent() 
         "mirror head ({mir_max}) must equal DB head ({db_max}) — no DB-only rows"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// ADR-0099 H3 — re-entrancy tripwire (the deadlock made impossible-to-miss).
+//
+// The writer Mutex is non-reentrant, so a second write() — or any read(),
+// which locks the same mutex — issued while this thread holds the guard would
+// HANG prod. The tripwire converts that deadlock into a loud panic in
+// debug/test so the whole suite is the trace. These #[should_panic] proofs are
+// debug-gated: in --release the tripwire is compiled out and the real acquire
+// WOULD deadlock, so we must not compile a test that then hangs.
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "RE-ENTRANCY TRIPWIRE")]
+fn reentrant_write_while_holding_guard_panics_not_deadlocks() {
+    let tmp = Tmp::new("reentrant-write");
+    let db = tmp.db();
+    seed(&db);
+    let handle = Handle::open(&db, tenant(), HandleConfig::default()).unwrap();
+    let _g = handle.write().unwrap();
+    // Same thread, same Handle, guard still held: without the tripwire this
+    // second acquire deadlocks the non-reentrant mutex forever.
+    let _g2 = handle.write().unwrap();
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "RE-ENTRANCY TRIPWIRE")]
+fn read_while_holding_write_guard_panics_not_deadlocks() {
+    let tmp = Tmp::new("reentrant-read");
+    let db = tmp.db();
+    seed(&db);
+    let handle = Handle::open(&db, tenant(), HandleConfig::default()).unwrap();
+    let _g = handle.write().unwrap();
+    // read() locks the SAME mutex to try_clone — also a deadlock without the wire.
+    let _c = handle.read().unwrap();
+}
+
+#[test]
+fn sequential_and_cross_handle_acquires_do_not_trip_the_wire() {
+    // (1) Sequential guards on the SAME handle: each drops before the next — no
+    //     re-entrancy, must not panic.
+    let tmp = Tmp::new("reentrant-ok");
+    let db = tmp.db();
+    seed(&db);
+    let handle = Handle::open(&db, tenant(), HandleConfig::default()).unwrap();
+    {
+        let _g = handle.write().unwrap();
+    }
+    {
+        let _g = handle.write().unwrap();
+    }
+    // A read() after the guard dropped is fine.
+    let _c = handle.read().unwrap();
+
+    // (2) Cross-handle nesting: holding handle A's guard while acquiring a
+    //     DIFFERENT handle B's guard touches a DIFFERENT mutex — legitimate, must
+    //     not false-trip (the tripwire is keyed per-Handle, not per-thread).
+    let tmp_b = Tmp::new("reentrant-ok-b");
+    let db_b = tmp_b.db();
+    seed(&db_b);
+    let handle_b = Handle::open(&db_b, tenant(), HandleConfig::default()).unwrap();
+    let _ga = handle.write().unwrap();
+    let _gb = handle_b.write().unwrap();
+}

@@ -157,11 +157,38 @@ struct Inner {
 /// (cloned into `AppState` and every daemon `Deps`).
 pub type HandleArc = std::sync::Arc<Handle>;
 
+/// Process-wide monotonic id source for [`Handle`] instances. Consumed ONLY by
+/// the debug/test re-entrancy tripwire (below) to tell one Handle's writer mutex
+/// from another's — re-entrancy that deadlocks is per-mutex (per-Handle), so a
+/// thread legitimately holding Handle A's guard while acquiring Handle B's must
+/// NOT trip.
+static NEXT_HANDLE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// Ids of the [`Handle`]s whose [`WriteGuard`] THIS thread currently holds.
+    ///
+    /// The writer `Mutex` is **non-reentrant**: a second [`Handle::write`] — or
+    /// ANY [`Handle::read`], which locks the same mutex to `try_clone` — issued
+    /// while this thread already holds the guard blocks forever on the lock. That
+    /// is a HUNG prod: invoicing stops with no error to read, which is as bad as
+    /// corruption and harder to diagnose. This lets `write()`/`read()` PANIC
+    /// loudly at the re-entrant acquire instead, so the whole test suite becomes
+    /// the deadlock trace and a future nested acquire fails in CI rather than
+    /// hanging prod (ADR-0099 H3 §re-entrancy tripwire). Debug/test only — zero
+    /// release overhead, prod runtime behaviour unchanged.
+    static HELD_WRITE_IDS: std::cell::RefCell<Vec<u64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// The process-wide shared DuckDB handle (ADR-0099 H3). Construct once at boot
 /// ([`Handle::open`]); share as `Arc<Handle>` into `AppState` and every daemon
 /// spawn. **Send + Sync**: the `Connection` (which is `Send` but not `Sync`)
 /// lives behind a `Mutex`, and reads are served by owned `try_clone`s.
 pub struct Handle {
+    /// Process-unique id (from [`NEXT_HANDLE_ID`]). Consumed ONLY by the
+    /// debug/test re-entrancy tripwire to identify THIS Handle's writer mutex.
+    id: u64,
     db_path: PathBuf,
     mirror_path: PathBuf,
     /// Built **once** per process (S341 semantics): tenant + binary hash. The
@@ -216,6 +243,7 @@ impl Handle {
         let min_interval = config.min_checkpoint_interval;
 
         Ok(Arc::new(Handle {
+            id: NEXT_HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             db_path: db_path.to_path_buf(),
             mirror_path,
             meta,
@@ -253,11 +281,21 @@ impl Handle {
     /// single-writer discipline (a throughput ceiling, acceptable for a
     /// single-operator CNC-shop ERP).
     pub fn write(&self) -> Result<WriteGuard<'_>, DbError> {
+        // Re-entrancy tripwire (ADR-0099 H3): PANIC before the lock if this thread
+        // already holds THIS Handle's write guard — the mutex is non-reentrant, so
+        // the acquire below would deadlock (hung prod). Debug/test only.
+        #[cfg(debug_assertions)]
+        self.assert_not_reentrant("write");
         // Bug 5: recover a poisoned writer in-place instead of returning
         // `DbError::Poisoned` forever (which would brick every write path for the
         // whole process). See [`Self::lock_recovering`].
         let mut inner = self.lock_recovering()?;
         self.ensure_open(&mut inner)?;
+        // Register the held guard AFTER a clean acquire (a failed lock/ensure_open
+        // above returns via `?` and must not leave a phantom entry). Deregistered
+        // in `WriteGuard::drop`.
+        #[cfg(debug_assertions)]
+        self.register_write_held();
         Ok(WriteGuard {
             handle: self,
             inner,
@@ -274,6 +312,11 @@ impl Handle {
     /// (WAL-only) writes would be invisible to it; a `try_clone` of the shared
     /// instance is coherent.
     pub fn read(&self) -> Result<Connection, DbError> {
+        // Re-entrancy tripwire (ADR-0099 H3): `read()` locks the SAME writer mutex
+        // to `try_clone`, so a read issued while this thread holds the write guard
+        // ALSO deadlocks. PANIC before the lock. Debug/test only.
+        #[cfg(debug_assertions)]
+        self.assert_not_reentrant("read");
         // Bug 5: same poison-recovery as write() — a reader must not be bricked
         // by another holder's panic either.
         let mut inner = self.lock_recovering()?;
@@ -311,6 +354,50 @@ impl Handle {
         if inner.debouncer.should_checkpoint_on_idle() {
             self.run_durable_checkpoint_locked(&mut inner);
         }
+    }
+
+    /// Re-entrancy tripwire (ADR-0099 H3). PANIC if this thread already holds
+    /// THIS Handle's write guard: a nested [`Self::write`] — or any [`Self::read`],
+    /// which locks the same mutex — would deadlock the non-reentrant writer mutex
+    /// (a hung prod: invoicing stops with no error). The fix a caller must make is
+    /// NEVER to re-acquire: pass the outer guard's `&Connection`/`&mut Connection`
+    /// down instead. Debug/test only.
+    #[cfg(debug_assertions)]
+    fn assert_not_reentrant(&self, op: &str) {
+        HELD_WRITE_IDS.with(|held| {
+            if held.borrow().contains(&self.id) {
+                panic!(
+                    "aberp-db RE-ENTRANCY TRIPWIRE: Handle::{op}() on the live DB at \
+                     {} while this thread ALREADY holds this Handle's write guard. \
+                     The writer Mutex is non-reentrant — a nested acquire DEADLOCKS \
+                     (hung prod: invoicing stops with no error). Restructure to pass \
+                     the outer guard's &Connection / &mut Connection down instead of \
+                     re-acquiring db.write()/db.read(). (ADR-0099 H3 §re-entrancy \
+                     tripwire.)",
+                    self.db_path.display()
+                );
+            }
+        });
+    }
+
+    /// Record that this thread now holds THIS Handle's write guard (tripwire
+    /// bookkeeping). Debug/test only.
+    #[cfg(debug_assertions)]
+    fn register_write_held(&self) {
+        HELD_WRITE_IDS.with(|held| held.borrow_mut().push(self.id));
+    }
+
+    /// Drop the most-recent held-guard record for `id` (tripwire bookkeeping,
+    /// called from [`WriteGuard::drop`]). `rposition` so correctly-nested guards
+    /// on DIFFERENT Handles unwind LIFO. Debug/test only.
+    #[cfg(debug_assertions)]
+    fn deregister_write_held(id: u64) {
+        HELD_WRITE_IDS.with(|held| {
+            let mut v = held.borrow_mut();
+            if let Some(pos) = v.iter().rposition(|&x| x == id) {
+                v.remove(pos);
+            }
+        });
     }
 
     /// (Re)open the shared connection if it is not currently present.
@@ -593,5 +680,12 @@ impl Drop for WriteGuard<'_> {
             let inner: &mut Inner = &mut self.inner;
             handle.run_durable_checkpoint_locked(inner);
         }
+
+        // Re-entrancy tripwire bookkeeping: this thread no longer holds this
+        // Handle's write guard. Done LAST so the guard counts as held for the
+        // whole drop body (the mirror sync above touches `inner.conn` directly,
+        // never re-acquiring, so it is safe). Debug/test only.
+        #[cfg(debug_assertions)]
+        Handle::deregister_write_held(handle.id);
     }
 }
