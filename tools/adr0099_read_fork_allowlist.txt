@@ -29,6 +29,7 @@
 # (SERVE_HANDLE_LIVE, proposed) is the backstop that catches any fresh audit open
 # in the serve process regardless of this list.
 apps/aberp/src/drain_submission_queue.rs:drive_one_invoice
+apps/aberp/src/drain_submission_queue.rs:run
 apps/aberp/src/export_invoice_bundle.rs:run
 apps/aberp/src/mark_abandoned.rs:run
 apps/aberp/src/observe_receiver_confirmation.rs:run

@@ -61,6 +61,12 @@ expect_emit "P1e raw-SQL reader: fresh Connection::open + FROM audit_ledger (tab
     let _ = c.query_row("SELECT COUNT(*) FROM audit_ledger", [], |r| r.get::<_, i64>(0));
 }'
 
+expect_emit "P1f read-via-helper: Ledger::open + pending_from_ledger(&l) (read hidden one indirection away — the count_pending blind spot)" \
+'fn _p(p: &std::path::Path) {
+    let l = aberp_audit_ledger::Ledger::open(p, t, h).unwrap();
+    let _ = submission_queue::pending_from_ledger(&l).unwrap().len();
+}'
+
 expect_silent "P2b raw INSERT INTO audit_ledger is a WRITE, not a read-fork" \
 'fn w(p: &std::path::Path) {
     let c = duckdb::Connection::open(p).unwrap();
@@ -78,6 +84,12 @@ expect_silent "P3 from_connection seam: reads the SHARED instance, not a fresh o
 'fn _p(g: &Guard) {
     let l = aberp_audit_ledger::Ledger::from_connection(g.try_clone().unwrap(), t, h);
     let _ = l.entries();
+}'
+
+expect_silent "P3b from_connection seam + read-via-helper: pending_from_ledger on the SHARED instance (the migrated count_pending shape)" \
+'fn _p(g: &Guard) {
+    let l = aberp_audit_ledger::Ledger::from_connection(g.try_clone().unwrap(), t, h);
+    let _ = submission_queue::pending_from_ledger(&l).unwrap().len();
 }'
 
 expect_silent "P4 cfg(test) ignored: a read-fork inside #[cfg(test)]" \

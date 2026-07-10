@@ -15,8 +15,22 @@
 # verify/mirror read tail the recipe migration removes anyway — so it is excluded
 # here to avoid double-counting). A read-fork is a fn with NO append AND either:
 #   * a fresh `Ledger::open(` AND a typed ledger READ
-#       (.entries( / .verify_chain( / .sync_mirror( / list_notes_history( ), OR
+#       (.entries( / .verify_chain( / .sync_mirror( / list_notes_history( /
+#        pending_from_ledger( ), OR
 #   * a fresh `Connection::open(` AND a raw `... FROM audit_ledger` SELECT.
+#
+# ── ADR-0099 Addendum 3 (this session): the read-VIA-HELPER blind spot ──
+# `submission_queue::count_pending` (submission_queue.rs:180, reached in-serve from
+# issue_invoice:563 / issue_storno:279 / issue_modification:242) opens a fresh
+# `Ledger` then reads it through `pending_from_ledger(&ledger)` (which calls
+# `.entries()` one indirection away). The typed-read token list above only saw a
+# read when `.entries(`/`.verify_chain(`/`.sync_mirror(`/`list_notes_history(`
+# appeared textually IN the fn, so `count_pending` (and the CLI one-shot
+# `drain_submission_queue::run`, same shape) were UNCOUNTED reads — the SERVE_HANDLE
+# tripwire (which hooks `Ledger::open`) caught `count_pending` while BOTH static
+# gates missed it (it is not a write, and its read hid behind the helper). Adding
+# `pending_from_ledger(` to the typed-read set closes it, the same way
+# `list_notes_history(` (also a read-helper name, not a `.method`) already is.
 #
 # `from_connection` / `open_in_memory` are the sanctioned shared-instance seams (a
 # from_connection reader rides the Handle — coherent) and never trip it.
@@ -89,7 +103,7 @@ function flush(   is_read){
       cur_connopen=1
     }
     if (code ~ /\.entries[ \t]*\(/ || code ~ /\.verify_chain[ \t]*\(/ || code ~ /\.sync_mirror[ \t]*\(/ \
-        || code ~ /list_notes_history[ \t]*\(/) { cur_read=1 }
+        || code ~ /list_notes_history[ \t]*\(/ || code ~ /pending_from_ledger[ \t]*\(/) { cur_read=1 }
     if (codenc ~ /[Ff][Rr][Oo][Mm][ \t]+audit_ledger/) { cur_auditsel=1 }
     if (code ~ /\.append(_signed)?[ \t]*\(/ || code ~ /append_in_tx(_signed)?[ \t]*\(/ \
         || code ~ /append_reopen[ \t]*\(/ || codenc ~ /[Ii][Nn][Tt][Oo][ \t]+audit_ledger/) { cur_app=1 }
