@@ -71,39 +71,40 @@
 # ADR-0099 H3 wave-3b (quote_pdf_rerender_daemon family, atomic): write_audit (writer)
 # + recover_unfinished_rerenders (raw-SQL FROM audit_ledger reader) onto the Handle.
 # prepare_rerender business open stays. Removals-only.
-1 apps/aberp/src/export_invoice_bundle.rs
-1 apps/aberp/src/issue_invoice.rs
-1 apps/aberp/src/material_inventory.rs
-1 apps/aberp/src/quote_pdf_rerender_daemon.rs
-1 apps/aberp/src/restore_from_nav_extract.rs
-1 apps/aberp/src/snapshot.rs
-1 apps/aberp/src/submission_queue.rs
-1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
-1 crates/aberp-mes/src/ledger_writer.rs
-1 modules/billing/src/adapters/duckdb_store.rs
-11 apps/aberp/src/restore_from_nav_outgoing.rs
-12 apps/aberp/src/quote_pricing_pipeline.rs
-124 apps/aberp/src/serve.rs
-2 apps/aberp/src/issue_modification.rs
-2 apps/aberp/src/issue_storno.rs
-2 apps/aberp/src/quote_calibration.rs
-2 apps/aberp/src/submit_invoice.rs
-2 crates/aberp-snapshot/src/crash_safe.rs
-2 crates/aberp-snapshot/src/take.rs
+# H3 wave-3c (2026-07-10) — re-cut −12 (removals-only, comm-verified 0 additions):
+# restore_from_nav migrated onto the shared Handle (restore_from_nav_outgoing.rs −11,
+# restore_from_nav_extract.rs open_for_extract −1). 249/36 → 237/34.
 3 apps/aberp/src/drain_pending_retries.rs
-3 apps/aberp/src/mark_invoice_paid.rs
-3 apps/aberp/src/poll_annulment_ack.rs
-3 apps/aberp/src/print_invoice.rs
-3 apps/aberp/src/recover_from_nav.rs
-3 apps/aberp/src/submit_annulment.rs
-3 crates/audit-ledger/src/storage/mod.rs
-4 apps/aberp/src/mark_abandoned.rs
-4 apps/aberp/src/observe_receiver_confirmation.rs
-4 apps/aberp/src/reports.rs
-4 apps/aberp/src/request_technical_annulment.rs
-5 apps/aberp/src/poll_ack.rs
 6 apps/aberp/src/drain_submission_queue.rs
 7 apps/aberp/src/email_relay_daemon.rs
-8 apps/aberp/src/retry_submission.rs
-8 crates/aberp-quote-intake/src/service.rs
+1 apps/aberp/src/export_invoice_bundle.rs
 9 apps/aberp/src/incoming_invoices.rs
+1 apps/aberp/src/issue_invoice.rs
+2 apps/aberp/src/issue_modification.rs
+2 apps/aberp/src/issue_storno.rs
+4 apps/aberp/src/mark_abandoned.rs
+3 apps/aberp/src/mark_invoice_paid.rs
+1 apps/aberp/src/material_inventory.rs
+4 apps/aberp/src/observe_receiver_confirmation.rs
+5 apps/aberp/src/poll_ack.rs
+3 apps/aberp/src/poll_annulment_ack.rs
+3 apps/aberp/src/print_invoice.rs
+2 apps/aberp/src/quote_calibration.rs
+1 apps/aberp/src/quote_pdf_rerender_daemon.rs
+12 apps/aberp/src/quote_pricing_pipeline.rs
+3 apps/aberp/src/recover_from_nav.rs
+4 apps/aberp/src/reports.rs
+4 apps/aberp/src/request_technical_annulment.rs
+8 apps/aberp/src/retry_submission.rs
+124 apps/aberp/src/serve.rs
+1 apps/aberp/src/snapshot.rs
+1 apps/aberp/src/submission_queue.rs
+3 apps/aberp/src/submit_annulment.rs
+2 apps/aberp/src/submit_invoice.rs
+1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
+1 crates/aberp-mes/src/ledger_writer.rs
+8 crates/aberp-quote-intake/src/service.rs
+2 crates/aberp-snapshot/src/crash_safe.rs
+2 crates/aberp-snapshot/src/take.rs
+3 crates/audit-ledger/src/storage/mod.rs
+1 modules/billing/src/adapters/duckdb_store.rs

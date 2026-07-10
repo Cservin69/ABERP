@@ -1512,7 +1512,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                         }
                     };
                     restore_outgoing::BackfillInputs {
-                        db_path: (*st.db_path).clone(),
+                        db: st.db.clone(),
                         tenant: st.tenant.clone(),
                         tax_number_8: parsed.taxpayer_id,
                         endpoint,
@@ -15612,13 +15612,13 @@ async fn handle_restore_from_nav_outgoing(
         Err(e) => return internal_error("restore_from_nav_outgoing:ts", anyhow!("{e}")),
     };
     {
-        let db_path = (*state.db_path).clone();
+        let db = state.db.clone();
         let tenant = state.tenant.clone();
         let op = operator_login.clone();
         let year = body.year;
         let at = acquired_at.clone();
         let acquired = tokio::task::spawn_blocking(move || {
-            restore_outgoing::acquire_restore_lock_at(&db_path, tenant.as_str(), &op, year, &at)
+            restore_outgoing::acquire_restore_lock_at(&db, tenant.as_str(), &op, year, &at)
         })
         .await;
         match acquired {
@@ -15706,10 +15706,10 @@ impl Drop for RestoreActiveGuard {
 /// itself fail the response (the lock can always be abandoned from the
 /// UI), but the failure must surface per CLAUDE.md rule 12.
 async fn release_restore_lock_best_effort(state: &AppState) {
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let released = tokio::task::spawn_blocking(move || {
-        restore_outgoing::release_restore_lock_at(&db_path, tenant.as_str())
+        restore_outgoing::release_restore_lock_at(&db, tenant.as_str())
     })
     .await;
     match released {
@@ -15827,10 +15827,10 @@ async fn handle_restore_lock_status(headers: HeaderMap, State(state): State<AppS
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let result = tokio::task::spawn_blocking(move || {
-        restore_outgoing::read_restore_lock_at(&db_path, tenant.as_str())
+        restore_outgoing::read_restore_lock_at(&db, tenant.as_str())
     })
     .await;
     match result {
@@ -15890,10 +15890,10 @@ async fn handle_restore_lock_abandon(
         )
             .into_response();
     }
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let result = tokio::task::spawn_blocking(move || {
-        restore_outgoing::release_restore_lock_at(&db_path, tenant.as_str())
+        restore_outgoing::release_restore_lock_at(&db, tenant.as_str())
     })
     .await;
     match result {
@@ -15913,10 +15913,10 @@ async fn handle_restore_lock_abandon(
 /// must not wedge invoicing, and the per-row idempotency + the confirm-
 /// side acquire remain the hard guarantees.
 async fn restore_lock_block(state: &AppState) -> Option<Response> {
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let result = tokio::task::spawn_blocking(move || {
-        restore_outgoing::read_restore_lock_at(&db_path, tenant.as_str())
+        restore_outgoing::read_restore_lock_at(&db, tenant.as_str())
     })
     .await;
     match result {
@@ -15953,12 +15953,11 @@ async fn handle_list_restored_invoices(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = state.db_path.clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        restore_outgoing::list_restored(&db_path, tenant.as_str())
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || restore_outgoing::list_restored(&db, tenant.as_str()))
+            .await;
     match result {
         Ok(Ok(rows)) => Json(rows).into_response(),
         Ok(Err(e)) => internal_error("list_restored_invoices", e),
@@ -16979,7 +16978,7 @@ async fn build_restore_inputs(
     let endpoint = build_profile::nav_endpoint();
     build_profile::assert_endpoint_allowed(endpoint)?;
     Ok(restore_outgoing::RestoreInputs {
-        db_path: (*state.db_path).clone(),
+        db: state.db.clone(),
         tenant: state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -22202,7 +22201,7 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
     // (`HUF`/`EUR`); the app-layer `parse_digest_currency` gate
     // (S410 / [[no-sql-specific]] — no DB CHECK) makes any other value a
     // bug we surface loudly per CLAUDE.md rule 12.
-    let restored = restore_outgoing::list_restored(&state.db_path, state.tenant.as_str())
+    let restored = restore_outgoing::list_restored(&state.db, state.tenant.as_str())
         .context("read restored_invoice mirror for unified list")?;
     for ext in restored {
         items.push(restored_to_list_item(ext)?);
@@ -27789,7 +27788,11 @@ mod tests {
             .expect("INSERT restored_invoice");
         }
 
-        let restored = restore_outgoing::list_restored(&db_path, tenant).expect("list_restored");
+        // H3: the raw seed conn dropped with its block above; open the shared
+        // Handle now (fresh open sees the committed rows, Q3) and read through it.
+        let handle = open_tenant_handle(&db_path, TenantId::new(tenant.to_string()).unwrap())
+            .expect("open shared handle");
+        let restored = restore_outgoing::list_restored(&handle, tenant).expect("list_restored");
         assert_eq!(restored.len(), 2, "two rows MUST come back");
         let synthesized: Vec<InvoiceListItem> = restored
             .into_iter()
@@ -28127,7 +28130,7 @@ mod tests {
 
         // Acquire a lock so there is something to abandon.
         restore_outgoing::acquire_restore_lock_at(
-            &db_path,
+            &state.db,
             "abandon-test",
             "ervin",
             2026,
@@ -28154,7 +28157,7 @@ mod tests {
 
         // The lock must still be held (abandon did NOT delete it).
         assert!(
-            restore_outgoing::read_restore_lock_at(&db_path, "abandon-test")
+            restore_outgoing::read_restore_lock_at(&state.db, "abandon-test")
                 .expect("read lock")
                 .is_some(),
             "a refused abandon must leave the live restore's lock intact"
@@ -28178,7 +28181,7 @@ mod tests {
             "abandon must succeed once no restore is live"
         );
         assert!(
-            restore_outgoing::read_restore_lock_at(&db_path, "abandon-test")
+            restore_outgoing::read_restore_lock_at(&state.db, "abandon-test")
                 .expect("read lock")
                 .is_none(),
             "a successful abandon must clear the stale lock"

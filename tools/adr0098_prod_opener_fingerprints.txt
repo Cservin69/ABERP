@@ -26,6 +26,9 @@
 # ADR-0099 H3 wave-3a: re-cut - the 3 ap_sync.rs openers (write_cycle Connection+Ledger,
 # bootstrap Ledger) removed; all on the shared Handle now. Removals-only, comm-verified.
 # ADR-0099 H3 wave-3b: re-cut - write_audit Connection + recover Connection removed. Removals-only.
+# H3 wave-3c (2026-07-10) — re-cut −12 (removals-only, comm-verified 0 additions):
+# restore_from_nav migrated onto the shared Handle (restore_from_nav_outgoing.rs −11,
+# restore_from_nav_extract.rs open_for_extract −1). 249/36 → 237/34.
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
@@ -106,18 +109,6 @@ apps/aberp/src/request_technical_annulment.rs|load_base_invoice_issue_year:let s
 apps/aberp/src/request_technical_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
 apps/aberp/src/request_technical_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
 apps/aberp/src/request_technical_annulment.rs|run:let mut conn = Connection::open(&args.db)
-apps/aberp/src/restore_from_nav_extract.rs|open_for_extract:let conn = Connection::open(db_path).with_context(|| {
-apps/aberp/src/restore_from_nav_outgoing.rs|acquire_restore_lock_at:let conn = Connection::open(db_path)
-apps/aberp/src/restore_from_nav_outgoing.rs|append_backfill_cycle_entry:let ledger = Ledger::open(&inputs.db_path, inputs.tenant.clone(), inputs.bin
-apps/aberp/src/restore_from_nav_outgoing.rs|append_backfill_cycle_entry:let mut conn = Connection::open(&inputs.db_path)
-apps/aberp/src/restore_from_nav_outgoing.rs|backfill_one_row:let conn = Connection::open(&db_path).with_context(|| {
-apps/aberp/src/restore_from_nav_outgoing.rs|list_restored:let conn = Connection::open(db_path)
-apps/aberp/src/restore_from_nav_outgoing.rs|list_restored_missing_buyer:let conn = Connection::open(db_path)
-apps/aberp/src/restore_from_nav_outgoing.rs|load_already_restored_cache:let ledger = Ledger::open(db_path, tenant.clone(), binary_hash)
-apps/aberp/src/restore_from_nav_outgoing.rs|process_digest:let ledger = Ledger::open(ctx.db_path, ctx.tenant.clone(), ctx.binary_hash)
-apps/aberp/src/restore_from_nav_outgoing.rs|process_digest:let mut conn = Connection::open(ctx.db_path).with_context(|| {
-apps/aberp/src/restore_from_nav_outgoing.rs|read_restore_lock_at:let conn = Connection::open(db_path)
-apps/aberp/src/restore_from_nav_outgoing.rs|release_restore_lock_at:let conn = Connection::open(db_path)
 apps/aberp/src/retry_submission.rs|perform_layer_2_check:let ledger_tx0 = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/retry_submission.rs|resolve_stuck_or_loud_fail:let ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/retry_submission.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)

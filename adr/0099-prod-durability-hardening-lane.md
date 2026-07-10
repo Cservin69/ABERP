@@ -347,6 +347,39 @@ Three deliberate prod adaptations vs. the editions source:
   ADR-0021 `[[no-SQL-specific]]`. A pragma-presence gate check asserts the marker
   + pragma are present.
 
+  **Why this makes CHECK M's file-granularity LOAD-BEARING (not incidental) — a
+  corruption vector, not mere incoherence.** A separate `Connection::open` on the
+  live file does NOT carry the F-A pragmas, so when it DROPS, DuckDB's default
+  checkpoint-on-shutdown FOLDS the Handle's pending, WAL-resident audit rows into
+  the main file mid-flight. A fresh reader then sees a TORN ledger (a folded
+  subset — the incident's mis-measurement class), and a subsequent append off that
+  stale head FORKS the chain (`audit_ledger` has no UNIQUE on `seq`). Because the
+  close-fold fires on ANY separate opener's drop REGARDLESS of which table it
+  touched (the fold is DB-wide, not table-scoped), a single residual opener
+  anywhere in a Handle-using file taints that whole file. That is precisely why
+  CHECK M is **file-granular** — a file with any `.db.write()`/`.db.read()` must
+  retain ZERO separate runtime openers — and not function-granular: a "harmless"
+  business `Connection::open` sitting beside a migrated audit writer is not
+  harmless, it close-folds the audit WAL on drop.
+- **Re-entrancy tripwire (write-guard self-deadlock; wave-3c pre-fix, commit
+  `ad72022`).** The writer `Mutex` is NON-REENTRANT: a second `db.write()` — or
+  ANY `db.read()`, which locks the same mutex to `try_clone` — issued while this
+  thread already holds the `WriteGuard` blocks FOREVER on the lock. That is a HUNG
+  prod (invoicing stops with NO error to read), as bad as corruption and harder to
+  diagnose. An exhaustive manual call-site trace proves absence only until someone
+  adds the next caller — safety belongs in code, not in a session's diligence. So
+  `write()`/`read()` now PANIC at a re-entrant acquire (debug/test only, keyed
+  per-`Handle` via a process-unique id + a thread-local held-id set): the whole
+  test suite becomes the deadlock trace and a future nested acquire fails in CI
+  rather than hanging prod. Zero release overhead; prod runtime behaviour
+  unchanged (compiled out in `--release`). Teeth + no-false-trip proofs (debug-
+  gated so `--release` never compiles a test that would then deadlock):
+  `handle_concurrency_e2e::{reentrant_write_while_holding_guard_panics_not_
+  deadlocks, read_while_holding_write_guard_panics_not_deadlocks,
+  sequential_and_cross_handle_acquires_do_not_trip_the_wire}`. This is what lets
+  the restore_from_nav migration (wave-3c, ~20 in-serve call sites through the
+  Handle) fail loud in CI instead of hanging prod if a nested acquire slips in.
+
 ### New audit event
 `EventKind::DbAutoRecovered` (`db.auto_recovered`) added via the full F12 ritual:
 variant + `as_str` + `from_storage_str` + both `ALL_KINDS` lists + the three
@@ -466,6 +499,51 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
     `email_invoice::record_email_audit_entry` (wave-2d) carries an extra
     `verify_chain` + explicit `sync_mirror` — a RECURRING shape (ap_sync's
     cycle-audit fn has it too) handled by the CANONICAL RECIPE below.
+- **Wave 3a** — `ap_sync` audit family (`IncomingInvoiceSyncCycleCompleted`)
+  migrated atomically: the writer `write_cycle_audit_entry_inner` (the recipe) +
+  the `bootstrap_year_already_recorded` sentinel READER, in ONE commit (never a
+  reader before its writer per Q2, never after per Q3). `CycleInputs` gained a
+  `db: HandleArc`; `db_path` retained ONLY for the still-separate incoming_invoices
+  ingest + the restore-lock sidecar. Residual write 18 → 17, read 25 → 24. Census
+  254 → 251 / 37 → 36 (ap_sync.rs drops off). Removals-only re-cut.
+- **Wave 3b** — `quote_pdf_rerender_daemon` audit family migrated onto the Handle
+  (atomic). Residual write 17 → 16, read 24 → 23.
+- **Wave 3c** — `restore_from_nav` (the incident subsystem), the WHOLE subsystem
+  in ONE atomic commit across FOUR files. **NOT "2 writers + 1 reader":** 11
+  runtime openers / 9 fns in `restore_from_nav_outgoing.rs` — the 3 fork-gate-
+  flagged (`process_digest`, `append_backfill_cycle_entry`,
+  `load_already_restored_cache`) PLUS 8 business openers the census tracked (the
+  `acquire`/`read`/`release_restore_lock_at` trio, `list_restored`,
+  `list_restored_missing_buyer`, `backfill_one_row`) — all → the shared Handle;
+  plus `restore_from_nav_extract::open_for_extract` (−1). `ap_sync`'s 3
+  `*_restore_lock_at` call sites re-pointed to `inputs.db`; ~20 serve.rs call
+  sites + the `RestoreInputs`/`BackfillInputs` builders threaded `state.db`; the
+  cfg(test) suites of both files + serve + ap_sync rewritten to route reads AND
+  writes through ONE Handle (a fresh `Ledger::open` readback would miss the WAL-
+  resident writes — the coherence property under test). Guard choices:
+  - writers → `db.write()` recipe (ensure_schema kept on the guard);
+  - `load_already_restored_cache` → `db.read()` + `Ledger::from_connection`;
+  - the 3 restore-lock/list READERS → `db.read()` with `ensure_schema` DROPPED —
+    **PROVEN safe (verify, don't inherit the smell):** serve boot ensures the
+    restore schema (`serve.rs:974`) BEFORE it opens the Handle (`serve.rs:1128`),
+    so a fresh Handle open observes the on-disk schema (Q3), and NO CLI/separate-
+    process caller exists (the CLI `Command` enum has no ap-sync/restore
+    subcommand; `CycleInputs` is built only in serve). This is NOT the
+    `recover_unfinished_rerenders` write-guard-for-a-read smell — it is a genuine
+    read.
+  - the extraction paths (`count_new_catalog`, `extract_catalog_for_invoice`)
+    KEEP the schema-ensure on a WRITE guard — **the one unproven path, named per
+    the ruling:** serve boot does NOT run `partners::ensure_schema` before the
+    Handle opens (only a PR-73a *comment* claims it), so the extraction path
+    cannot assume the `partners` table exists and must ensure it (DDL → write
+    guard is correct, not a smell).
+  `open_for_extract` was restructured to `ensure_extract_schemas(&Connection)` —
+  the CALLER owns the write guard and passes its connection in; no returned
+  connection (returning a connection IS the opener shape H3 eliminates). Prereq:
+  the re-entrancy tripwire (`ad72022`) landed first so any nested `db.write()`/
+  `db.read()` across these ~20 in-serve sites fails LOUD in CI, not as a hung
+  prod. Residual write 16 → 14, read 23 → 22. Census 249/36 → 237/34 (both restore
+  files drop off; re-cut removals-only, comm-verified 0 additions). CHECK M ✓.
 - **CHECK N — the audit-READ-fork gate (BUILT; the write-fork gate's dual).**
   The write-fork gate (CHECK 10M) targets audit *appends* and is STRUCTURALLY
   BLIND to fresh-open audit *reads*. Once any writer is on the Handle (checkpoint

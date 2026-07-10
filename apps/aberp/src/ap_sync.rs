@@ -197,8 +197,11 @@ pub struct CycleInputs {
 /// posture: the hard guarantee is the restore's own per-row idempotency
 /// + the confirm-side lock acquire; this check is contention-avoidance,
 /// not a correctness gate, so a read error degrades to "run the cycle".
-fn restore_lock_held(db_path: &std::path::Path, tenant: &str) -> bool {
-    match crate::restore_from_nav_outgoing::read_restore_lock_at(db_path, tenant) {
+fn restore_lock_held(db: &aberp_db::Handle, tenant: &str) -> bool {
+    // H3 (ADR-0099): the restore-lock probe now reads through the shared Handle
+    // (restore_from_nav migrated). `db_path` is retained on CycleInputs for the
+    // still-unmigrated incoming_invoices ingest path, NOT this probe.
+    match crate::restore_from_nav_outgoing::read_restore_lock_at(db, tenant) {
         Ok(lock) => lock.is_some(),
         Err(e) => {
             tracing::error!(
@@ -259,7 +262,7 @@ where
             return;
         }
         match build_inputs() {
-            Ok(inputs) if restore_lock_held(&inputs.db_path, inputs.tenant.as_str()) => {
+            Ok(inputs) if restore_lock_held(&inputs.db, inputs.tenant.as_str()) => {
                 // S264 / PR-253 (F2) — a restore-from-NAV lock is held
                 // (or a crashed restore left one). A daemon NAV walk
                 // against the same tenant is exactly the parallel
@@ -1169,7 +1172,7 @@ async fn run_bootstrap_year_once(build_inputs: &(dyn Fn() -> Result<CycleInputs>
     // contention case the restore lock exists to prevent. Skip the whole
     // sweep when a lock is held; the once-per-DB sentinel is NOT recorded
     // on a skip, so the next boot (post-abandon) re-runs it.
-    if restore_lock_held(&inputs.db_path, inputs.tenant.as_str()) {
+    if restore_lock_held(&inputs.db, inputs.tenant.as_str()) {
         tracing::info!(
             "AP bootstrap-year sweep skipped — a restore-from-NAV lock is held; will retry on a \
              future boot once the restore is abandoned or completed"
@@ -1404,15 +1407,31 @@ mod tests {
         let db_path = dir.join("tenant.duckdb");
         let tenant = "test-tenant";
 
+        // H3 (ADR-0099): mirror serve boot — ensure the restore schema on a
+        // SEPARATE connection BEFORE the Handle opens, so a fresh Handle open
+        // observes the on-disk `restore_lock` table (Q3 coherence) and the
+        // read-path probe (`read_restore_lock_at`, which no longer ensures
+        // schema) reads an EMPTY table, not a missing one. Without this the first
+        // assertion would pass vacuously via the probe's fail-open path.
+        {
+            let conn = duckdb::Connection::open(&db_path).expect("open for boot schema");
+            crate::restore_from_nav_outgoing::ensure_schema(&conn).expect("ensure restore schema");
+        }
+        let handle = aberp_db::Handle::open_default(
+            &db_path,
+            TenantId::new(tenant.to_string()).expect("tenant id"),
+        )
+        .expect("open shared handle");
+
         // No restore in progress → the daemon is free to run.
         assert!(
-            !restore_lock_held(&db_path, tenant),
+            !restore_lock_held(&handle, tenant),
             "fresh DB has no restore lock"
         );
 
         // A held restore lock must defer the cycle.
         crate::restore_from_nav_outgoing::acquire_restore_lock_at(
-            &db_path,
+            &handle,
             tenant,
             "ervin",
             2026,
@@ -1420,15 +1439,15 @@ mod tests {
         )
         .expect("acquire restore lock");
         assert!(
-            restore_lock_held(&db_path, tenant),
+            restore_lock_held(&handle, tenant),
             "a held restore lock must gate AP-sync"
         );
 
         // Abandoning the lock re-opens AP-sync.
-        crate::restore_from_nav_outgoing::release_restore_lock_at(&db_path, tenant)
+        crate::restore_from_nav_outgoing::release_restore_lock_at(&handle, tenant)
             .expect("release restore lock");
         assert!(
-            !restore_lock_held(&db_path, tenant),
+            !restore_lock_held(&handle, tenant),
             "released lock must un-gate AP-sync"
         );
 
