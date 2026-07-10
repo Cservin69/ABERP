@@ -10,7 +10,9 @@
 //! gated); `cargo test` builds set `debug_assertions`, so these run.
 
 use aberp_audit_ledger::serve_tripwire::{is_serve_handle_live, register_serve_handle};
-use aberp_audit_ledger::{append_in_tx, ensure_schema, Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId};
+use aberp_audit_ledger::{
+    append_in_tx, ensure_schema, Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId,
+};
 use aberp_billing::DuckDbBillingStore;
 use std::path::PathBuf;
 use ulid::Ulid;

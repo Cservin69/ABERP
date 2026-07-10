@@ -1137,7 +1137,10 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // mid-migration; flipped ON as the FINAL step of the invoice-family migration,
     // the same "arm at zero" posture as `ENFORCE_WRITE_FORK=1`. No-op in release.
     let _serve_handle_tripwire = std::env::var_os("ABERP_SERVE_HANDLE_TRIPWIRE").map(|_| {
-        tracing::info!("boot step: SERVE_HANDLE_LIVE tripwire ARMED for {}", args.db.display());
+        tracing::info!(
+            "boot step: SERVE_HANDLE_LIVE tripwire ARMED for {}",
+            args.db.display()
+        );
         aberp_audit_ledger::serve_tripwire::register_serve_handle(&args.db)
     });
 
