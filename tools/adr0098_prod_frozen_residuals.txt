@@ -68,9 +68,13 @@
 # (bootstrap_year_already_recorded) both onto the shared Handle in ONE commit
 # (family invariant, [[aberp-h3-handle-coherence-model]]). ap_sync.rs drops off.
 # Removals-only.
+# ADR-0099 H3 wave-3b (quote_pdf_rerender_daemon family, atomic): write_audit (writer)
+# + recover_unfinished_rerenders (raw-SQL FROM audit_ledger reader) onto the Handle.
+# prepare_rerender business open stays. Removals-only.
 1 apps/aberp/src/export_invoice_bundle.rs
 1 apps/aberp/src/issue_invoice.rs
 1 apps/aberp/src/material_inventory.rs
+1 apps/aberp/src/quote_pdf_rerender_daemon.rs
 1 apps/aberp/src/restore_from_nav_extract.rs
 1 apps/aberp/src/snapshot.rs
 1 apps/aberp/src/submission_queue.rs
@@ -90,7 +94,6 @@
 3 apps/aberp/src/mark_invoice_paid.rs
 3 apps/aberp/src/poll_annulment_ack.rs
 3 apps/aberp/src/print_invoice.rs
-3 apps/aberp/src/quote_pdf_rerender_daemon.rs
 3 apps/aberp/src/recover_from_nav.rs
 3 apps/aberp/src/submit_annulment.rs
 3 crates/audit-ledger/src/storage/mod.rs

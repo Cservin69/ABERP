@@ -25,6 +25,7 @@
 # removed (now the shared Handle). Removals-only, verified via comm -13.
 # ADR-0099 H3 wave-3a: re-cut - the 3 ap_sync.rs openers (write_cycle Connection+Ledger,
 # bootstrap Ledger) removed; all on the shared Handle now. Removals-only, comm-verified.
+# ADR-0099 H3 wave-3b: re-cut - write_audit Connection + recover Connection removed. Removals-only.
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
@@ -82,8 +83,6 @@ apps/aberp/src/print_invoice.rs|render_to_bytes:let ledger = Ledger::open(db, te
 apps/aberp/src/quote_calibration.rs|append_calibration_events:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/quote_calibration.rs|record_calibration_for_completed_wo:let conn = Connection::open(db_path).context("open tenant DuckDB for calibra
 apps/aberp/src/quote_pdf_rerender_daemon.rs|prepare_rerender:let conn = Connection::open(db_path)
-apps/aberp/src/quote_pdf_rerender_daemon.rs|recover_unfinished_rerenders:let conn = Connection::open(db_path).with_context(|| {
-apps/aberp/src/quote_pdf_rerender_daemon.rs|write_audit:let mut conn = Connection::open(&db_path).context("open DB for pdf-rerender 
 apps/aberp/src/quote_pricing_pipeline.rs|advance_extract:let mut conn = duckdb::Connection::open(&db_path).context("open DB for extra
 apps/aberp/src/quote_pricing_pipeline.rs|advance_post:let conn = duckdb::Connection::open(&db).context("open DB for post")?;
 apps/aberp/src/quote_pricing_pipeline.rs|advance_post:let mut conn = duckdb::Connection::open(&db_path).context("open DB for post-

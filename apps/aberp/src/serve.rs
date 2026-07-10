@@ -2271,7 +2271,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             // Best-effort: a recovery error is logged, not fatal — the
             // daemon still serves new transitions.
             match crate::quote_pdf_rerender_daemon::recover_unfinished_rerenders(
-                &recovery_state.db_path,
+                &recovery_state.db,
                 &recovery_state.tenant,
                 &recovery_state.quote_pdf_rerender_queue,
             ) {
@@ -2287,6 +2287,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             }
             let rr_deps = crate::quote_pdf_rerender_daemon::QuotePdfRerenderDaemonDeps {
                 db_path: (*recovery_state.db_path).clone(),
+                db: recovery_state.db.clone(),
                 tenant: recovery_state.tenant.clone(),
                 binary_hash: rr_binary_hash,
                 operator_login: rr_operator_login,
