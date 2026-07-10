@@ -1100,3 +1100,78 @@ SILENT on a pure reader, a Handle-served append (with and without a helper), the
 `from_connection` / `open_in_memory` seams, `cfg(test)`, and an appender-helper
 with no opener; honour the allow-list; prove fail-closed (a de-gated scanner passes
 the real forks under ENFORCE); and pin the BLIND-SPOT invariant above.
+
+### Deliverable 2 — the `SERVE_HANDLE_LIVE` runtime tripwire (BUILT)
+
+The static gates cannot isolate the dual-context fns (above): the SAME
+`pre_tx_setup` / `*_from_inputs` fn runs BOTH as a flock-fenced CLI one-shot AND
+in-serve, and a per-fn allow-list cannot tell the two reaches apart. So a fenced
+CLI fn newly wired into serve would slip. The tripwire (proposed earlier in this
+ADR, now a PREREQUISITE for the invoice-family migration) closes it at RUNTIME by
+firing on the OPEN itself, regardless of fn/crate/static scope.
+
+- **Mechanism** (`crates/audit-ledger/src/serve_tripwire.rs`, the leaf crate so it
+  is reachable acyclically from aberp-db, audit-ledger AND billing): a process-
+  global refcounted registry of serve-live tenant-DB paths. `register_serve_handle`
+  returns a drop-guard; `assert_no_serve_handle(path, opener)` PANICS if `path` is
+  live. **Debug/test only** — `assert_no_serve_handle` is `debug_assertions`-gated
+  and a zero-cost no-op in release, exactly like the writer-mutex re-entrancy
+  tripwire (`ad72022`). Safety in code, not a future session's diligence.
+- **Check sites** — the two independent-opener chokepoints the invoice family uses:
+  `aberp_audit_ledger::Ledger::open` (`storage/mod.rs:144`) and
+  `aberp_billing::DuckDbBillingStore::open` (`duckdb_store.rs:356` — billing gains
+  an acyclic `aberp-audit-ledger` dep for this). `Ledger::open` catches submit /
+  poll / mark / storno-derive / modification-derive; `DuckDbBillingStore::open`
+  catches the pure store-shape (`issue_invoice`, which appends via raw
+  `append_in_tx` and never opens a `Ledger`). Between them the whole invoice family
+  is covered.
+- **Registration + ARMING** — serve registers `&args.db` right after opening the
+  Handle (`serve.rs:1128`), holding the guard for `run()`'s lifetime next to
+  `_db_writer_lock`. Registration is behind the `ABERP_SERVE_HANDLE_TRIPWIRE` env
+  arm, **OFF by default** so the 24 not-yet-migrated in-serve forks do not trip it
+  mid-migration. It is flipped ON as the FINAL step of the invoice-family migration
+  — the same "arm at zero" posture as `ENFORCE_WRITE_FORK=1`. The check itself is
+  always compiled in debug/test and is a no-op only because nothing is registered.
+- **Teeth** (`apps/aberp/tests/serve_handle_tripwire.rs`, 7 tests, all green):
+  `Ledger::open` and `DuckDbBillingStore::open` PANIC while a path is registered;
+  and it does NOT over-fire — unregistered opens, a different path, a dropped guard
+  (refcount to zero), and the shared Handle's OWN `read()` / `write()`+`append_in_tx`
+  all pass clean (the migrated shape rides the shared instance via `try_clone`, never
+  an independent open). The registration/check ordering is fork-safe: serve's boot
+  billing-schema ensure (`:792`) and Handle open (`:1128`) both precede the register
+  (`:1129`).
+- **FLAGGED (conservative branch taken):** arming is env-gated OFF, not on-by-
+  default, because arming now would trip the 24 in-flight forks' serve tests. This
+  is the honest bridge, not a dormant-forever switch — the migration session flips
+  it as its acceptance step. A second thing to VALIDATE at arm time: that serve's
+  own Handle machinery (checkpoint debouncer, `WriteGuard::drop` → `sync_mirror`)
+  never does a fresh `Connection::open`/`Ledger::open` on the registered tenant path
+  — the `shared_handle_access_does_not_trip` test covers the core read/write/append
+  ops, but the migration session should arm in a full serve integration run before
+  the cut.
+
+### Also settled — is the billing schema boot-ensured before the Handle opens?
+
+**YES, on every serve boot path, with file:line proof.** `serve.rs` boot ensures
+the billing schema UNCONDITIONALLY before the Handle exists:
+- fresh DB (`:761` `!args.db.exists()`) → `provision_atomic` seeds it via
+  `DuckDbBillingStore::open(creating).ensure_schema()` (`:767-768`) into the staged
+  file before the atomic swap;
+- existing DB → validated probe-open (`:777`), then the unconditional post-branch
+  `DuckDbBillingStore::open(&args.db).ensure_schema()` (`:792-800`) runs
+  `CREATE TABLE IF NOT EXISTS` + the one-shot column migrations (e.g. S157);
+- the corrupt path REFUSES boot (`:788`), so no successful boot skips the ensure.
+
+All of this is at lines < `:1128` where the Handle opens (and < `:1129` where the
+tripwire registers). The boot comment at `:803` names the intent outright — the
+billing/partners/products schemas are boot-pinned "for the read-only-cold-start
+reason." **Consequence for the next session:** the IN-SERVE invoice READERS may
+migrate to `db.read()` WITHOUT re-ensuring schema — the tables (and the S157-class
+migrations) are guaranteed present before any Handle read can occur. This mirrors
+the restore-reader ruling exactly: readers use `db.read()`; the WRITE path
+(issuance `pre_tx_setup`, `:964`) keeps its own `ensure_schema` on a write guard.
+CLI one-shots are out of scope for `db.read()` — they hold no Handle and each
+ensures its own schema (`issue_*`/`reports`/`print_invoice`). The one caveat, named
+not hand-waved: this is proven for the billing schema (the question asked); the
+AUDIT-ledger schema on the Handle read path is a SEPARATE guarantee owned by the
+read-fork (CHECK N) migration, not settled here.

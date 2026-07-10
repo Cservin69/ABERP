@@ -1127,6 +1127,20 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     tracing::info!("boot step: opening the shared aberp-db Handle (H3 single-writer)");
     let db_handle = open_tenant_handle(&args.db, tenant.clone())?;
 
+    // ADR-0099 H3 Addendum 3 — SERVE_HANDLE_LIVE tripwire. Register this tenant DB
+    // as serve-live so that ANY independent open of it (a fresh Ledger::open /
+    // DuckDbBillingStore::open in a dual-context fn wrongly reached in-serve) fails
+    // LOUD in debug/test instead of silently forking the audit ledger. Held for
+    // run()'s lifetime alongside `_db_writer_lock`; drop deregisters. ARMED via the
+    // `ABERP_SERVE_HANDLE_TRIPWIRE` env var — OFF by default so the not-yet-migrated
+    // in-serve forks (the write/read-fork gates still list them) do not trip it
+    // mid-migration; flipped ON as the FINAL step of the invoice-family migration,
+    // the same "arm at zero" posture as `ENFORCE_WRITE_FORK=1`. No-op in release.
+    let _serve_handle_tripwire = std::env::var_os("ABERP_SERVE_HANDLE_TRIPWIRE").map(|_| {
+        tracing::info!("boot step: SERVE_HANDLE_LIVE tripwire ARMED for {}", args.db.display());
+        aberp_audit_ledger::serve_tripwire::register_serve_handle(&args.db)
+    });
+
     let state = AppState {
         db_path: Arc::new(args.db.clone()),
         tenant,

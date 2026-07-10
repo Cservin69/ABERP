@@ -86,6 +86,7 @@ dependencies = [
 name = "aberp-billing"
 version = "0.0.0"
 dependencies = [
+ "aberp-audit-ledger",
  "duckdb",
  "rust_decimal",
  "serde",

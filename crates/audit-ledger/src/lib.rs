@@ -39,6 +39,7 @@ mod chain;
 mod entry;
 mod error;
 mod mirror;
+pub mod serve_tripwire;
 mod signer;
 mod storage;
 

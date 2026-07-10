@@ -146,6 +146,10 @@ impl Ledger {
         tenant_id: TenantId,
         binary_hash: BinaryHash,
     ) -> Result<Self, AppendError> {
+        // ADR-0099 H3 Addendum 3 — SERVE_HANDLE_LIVE tripwire. A fresh audit open
+        // while serve holds the shared Handle on this file forks the ledger
+        // (debug/test only; no-op unless serve is armed + registered).
+        crate::serve_tripwire::assert_no_serve_handle(path.as_ref(), "Ledger::open");
         let conn = Connection::open(path)?;
         Self::initialise(conn, tenant_id, binary_hash)
     }

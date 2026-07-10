@@ -354,6 +354,14 @@ pub struct DuckDbBillingStore {
 
 impl DuckDbBillingStore {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, BillingError> {
+        // ADR-0099 H3 Addendum 3 — SERVE_HANDLE_LIVE tripwire. The invoice
+        // store-shape fork (`DuckDbBillingStore::open(_).into_connection()` →
+        // `audit_ledger::append_in_tx`) opens the tenant DB HERE; trip if serve
+        // holds the shared Handle on it (debug/test only; no-op unless armed).
+        aberp_audit_ledger::serve_tripwire::assert_no_serve_handle(
+            path.as_ref(),
+            "DuckDbBillingStore::open",
+        );
         Ok(Self {
             conn: Connection::open(path)?,
         })
