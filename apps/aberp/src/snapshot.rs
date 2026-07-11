@@ -345,7 +345,14 @@ pub fn run_restore(args: &SnapshotRestoreArgs) -> Result<()> {
         actor,
     )?;
     println!(
-        "Restored snapshot #{} → {}\n(verify it, then stop `aberp serve` and swap it into place if this is a prod recovery)",
+        "Restored snapshot #{} → {}\n\
+         (verify it, then stop `aberp serve` and swap it into place if this is a prod recovery)\n\
+         NOTE: the audit-ledger mirror `<db>.audit.log` is NOT rebuilt by a restore.\n\
+         For CORRUPTION RECOVERY this is correct — the next serve boot heals the DB\n\
+         forward from the mirror. For a DELIBERATE ROLLBACK you intend to KEEP, first\n\
+         clear `<db>.audit.log` + any `.healed-*/.ahead-*/.corrupt-*.bak` siblings, else\n\
+         the boot auto-heal replays the newer tail back in and undoes the rollback.\n\
+         See docs/runbooks/audit-mirror-restore-rollback-caveat.md.",
         rec.meta.seq,
         args.to.display()
     );
