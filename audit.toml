@@ -37,4 +37,16 @@ ignore = [
     "RUSTSEC-2024-0384",  # instant (replaced by web-time)
     "RUSTSEC-2024-0388",  # derivative (consider derive_more)
     "RUSTSEC-2025-0134",  # rustls-pemfile (transitional 2.x via rustls 0.23.x)
+
+    # Post-PROD_v2.27.76-freeze advisories — ADR-0099 addendum (2026-07-06,
+    # owner Ervin): reachability-assessed documented-ignore, CONFIG ONLY, no
+    # dep bumps; real remediation deferred to a future PROD re-harden. Kept in
+    # lockstep with deny.toml::[advisories].ignore and the ci.yml cargo-audit
+    # inline --ignore list. Full per-advisory justifications live in deny.toml
+    # and adr/0099 §"Addendum".
+    "RUSTSEC-2026-0187",  # lopdf stack overflow — prod only GENERATES PDFs; parse callsites are #[cfg(test)] only
+    "RUSTSEC-2026-0190",  # anyhow downcast_mut unsoundness — downcast_mut never called in ABERP (grep-verified)
+    "RUSTSEC-2026-0194",  # quick-xml NsReader alloc DoS — known-endpoint XML only (NAV/MNB/MES), single-tenant loopback
+    "RUSTSEC-2026-0195",  # quick-xml quadratic-attr DoS — same envelope as -0194
+    "RUSTSEC-2026-0185",  # quinn-proto QUIC DoS — http3 feature OFF; not in resolved graph (cargo-deny doesn't flag it), phantom Cargo.lock entry, never compiled
 ]

@@ -1,0 +1,87 @@
+# ADR-0099 (PROD SAFE lane) opener-census cut-gate — the REQUIRED check.
+#
+# Ported from the editions saw-off cut-gate (Cservin69/ABERP-Editions
+# .github/workflows/cut-gate.yml). Deliberately a standalone, TOOLCHAIN-FREE job:
+# it runs the bash census gate (tools/cut_gate_opener_census.sh: CHECK P1 count-
+# freeze + P2 fingerprint-freeze) PLUS the negative-probe harness with nothing but
+# a checkout, so it gates in SECONDS and stays green independently of the heavy
+# Rust+Tauri+DuckDB build in ci.yml. Its sole job is to make the PRE-H3 live-DB
+# opener census un-growable at the prod line while durability (H1/H3) lands.
+#
+# NOTE (SAFE lane): the editions gate also asserts durability/edition-saw-off
+# invariants (shared Handle, crash-safe checkpoint, mirror preserve-and-refuse,
+# edition DB binding, storefront gating). NONE of that code exists in the frozen
+# prod tree yet — it is the follow-up durability session (H1/H3) — so only the
+# census-freeze mechanism is ported here. See cut_gate_opener_census.sh header.
+#
+# Because it needs no toolchain it can be a branch-protection required status
+# check without making the gate hostage to an 8-minute build.
+name: cut-gate
+on:
+  push:
+    branches: [main, prod-durability-adr0099]
+  pull_request:
+    branches: [main]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  opener-census:
+    name: ADR-0099 opener-census cut-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run opener-census cut-gate (CHECK P1 count + P2 fingerprint, ENFORCED)
+        # Every ENFORCE_* flag explicit here as well as defaulted in the script,
+        # so enforcement is visible at the CI surface and cannot be silently
+        # weakened by a one-line script edit.
+        env:
+          ENFORCE_OPENER_CENSUS: "1"
+          ENFORCE_OPENER_FINGERPRINTS: "1"
+        run: bash tools/cut_gate_opener_census.sh
+
+      - name: Prove the cut-gate has teeth (negative probes)
+        # Plants each regression (count grow / new file / count-preserving swap /
+        # alias-evasion) in a throwaway copy and asserts the gate FAILS — so a
+        # green gate above is a meaningful signal, not a gate that can't go red.
+        run: bash tools/cut_gate_negative_probes.sh
+
+      - name: ADR-0099 H3 write-fork migration tracker (informational)
+        # The corrected zero-residual fork gate (CHECK 10M): every in-serve
+        # audit write-fork must route through the shared aberp_db::Handle. While
+        # the H3 opener migration is in progress this runs INFORMATIONAL (prints
+        # the remaining forks + count, exits 0) so the branch stays green and the
+        # exact remainder is visible in CI. It flips to ENFORCING (fail on any
+        # remaining fork) by setting ENFORCE_WRITE_FORK=1 here the moment the
+        # migration reaches zero — that flip is the H3 acceptance cut.
+        run: bash tools/cut_gate_write_fork.sh
+
+      - name: Prove the write-fork gate has teeth (negative probes)
+        # Synthetic scratch-file / stdin probes: detect a colocated fork, the
+        # Addendum-3 SPLIT store-shape (DuckDbBillingStore::open(_).into_connection())
+        # and its transitive 2-hop variant, EXCLUDE the Handle-served append and the
+        # from_connection / open_in_memory seams, ignore cfg(test), honour the
+        # allow-list, prove fail-closed (a de-gated scanner passes the real
+        # write-forks), and pin the BLIND-SPOT invariant (the old colocated-only
+        # model is silent on the invoice store-shape). A negative probe that cannot
+        # fail is decoration.
+        run: bash tools/cut_gate_write_fork_probes.sh
+
+      - name: ADR-0099 H3 READ-fork migration tracker (CHECK N, informational)
+        # The DUAL of the write-fork gate. CHECK 10M is structurally blind to an
+        # independent opener that READS the audit ledger: once any writer is on
+        # the shared Handle (checkpoint disabled), a fresh Ledger::open reader
+        # sees only the folded SUBSET — a silent torn read (proved in wave-2e).
+        # INFORMATIONAL while the in-serve readers migrate to Handle reads; flips
+        # to ENFORCING via ENFORCE_READ_FORK=1 at zero. See ADR-0099 §CHECK N for
+        # the static limitation (dual-context fns) + the runtime-tripwire backstop.
+        run: bash tools/cut_gate_read_fork.sh
+
+      - name: Prove the read-fork gate has teeth (negative probes)
+        # Synthetic scratch-file probes: detect a pure reader, EXCLUDE an appender
+        # (write-fork) and the from_connection seam, ignore cfg(test), honour the
+        # allow-list, and prove fail-closed (a de-gated scanner passes the real
+        # read-forks). A negative probe that cannot fail is decoration.
+        run: bash tools/cut_gate_read_fork_probes.sh

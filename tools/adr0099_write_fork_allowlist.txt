@@ -1,0 +1,52 @@
+# ADR-0099 H3 — write-fork ALLOW-LIST (the ONLY sanctioned in-tree opener+append fns).
+#
+# Format: <file>:<fname>  (one per line; '#' comments ignored).
+#
+# The write-fork scanner (tools/adr0099_write_fork_scan.awk) flags every RUNTIME
+# fn that contains BOTH an independent live-DB opener (Connection::open /
+# Ledger::open / append_reopen / DuckDbBillingStore::open) AND an audit append —
+# the TRUE audit-ledger fork primitive (lesson 1). The prod H3 gate is ZERO such
+# forks OUTSIDE this allow-list. Allow-listed here are ONLY:
+#   * the audit-ledger `append_reopen` PRIMITIVE itself (the reopen building block
+#     the pre-Handle boot/CLI paths call; not a serve-process fork).
+#   * separate-process CLI one-shots (no shared Handle in-process; fenced by the
+#     whole-DB writer flock, F-E) — currently request_technical_annulment::run.
+#   * pre-serve BOOT openers that run BEFORE the shared Handle is constructed
+#     (serve.rs Handle::open_default is the boot line) — record_upgrade_snapshot_mismatch_audit.
+#
+# Everything else the scanner flags is an in-serve write-fork that MUST route
+# through the shared aberp_db::Handle. The migration worklist (the not-yet-migrated
+# remainder) is tracked in tools/adr0099_write_fork_migration_worklist.txt.
+crates/audit-ledger/src/storage/mod.rs:append_reopen
+apps/aberp/src/request_technical_annulment.rs:run
+apps/aberp/src/serve.rs:record_upgrade_snapshot_mismatch_audit
+
+# ── ADR-0099 Addendum 3 — SPLIT-fork CLI one-shots (this session) ──────────────
+# The scanner now sees the store-shape / moved-Connection split fork (opener and
+# append in different fns). That made a set of SEPARATE-PROCESS CLI one-shots newly
+# VISIBLE. Each fn below is a sanctioned CLI-one-shot opener, on the SAME footing as
+# request_technical_annulment::run above. Proof, verified this session:
+#   (1) dispatched ONLY from apps/aberp/src/main.rs as a `cli::Command::*` subcommand;
+#   (2) `grep -c '<module>::' serve.rs` == 0 — serve never calls into these modules,
+#       and no other in-serve module calls them (only doc-comment cross-refs);
+#   (3) the module's `run` acquires the F-E whole-DB writer flock
+#       (crate::db_writer_lock::acquire_or_refuse) which serve ALSO holds for its
+#       lifetime (serve.rs:484), so a one-shot and serve are mutually exclusive —
+#       the helpers below are reached only under `run`, i.e. under that flock.
+# NOT sanctioned here (kept on the worklist, deliberately): the dual-context invoice
+# family (issue_invoice/issue_storno/issue_modification/submit_invoice/poll_ack/
+# mark_invoice_paid). Those SAME fns run BOTH as flocked CLI one-shots AND in-serve;
+# a per-fn allow-list cannot tell the two apart, so they stay counted. The
+# SERVE_HANDLE_LIVE tripwire (this session) is what closes that dual-context hole at
+# runtime.
+apps/aberp/src/drain_pending_retries.rs:drive_one_retry
+apps/aberp/src/drain_submission_queue.rs:drive_one_invoice
+apps/aberp/src/mark_abandoned.rs:run
+apps/aberp/src/observe_receiver_confirmation.rs:run
+apps/aberp/src/observe_receiver_confirmation.rs:load_base_nav_invoice_number
+apps/aberp/src/poll_annulment_ack.rs:run
+apps/aberp/src/recover_from_nav.rs:run
+apps/aberp/src/request_technical_annulment.rs:load_base_invoice_issue_year
+apps/aberp/src/retry_submission.rs:run
+apps/aberp/src/retry_submission.rs:perform_layer_2_check
+apps/aberp/src/submit_annulment.rs:run

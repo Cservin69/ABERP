@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
 use aberp_quote_engine::FeatureGraph;
 use ulid::Ulid;
 
@@ -42,6 +42,8 @@ fn test_dir(label: &str) -> PathBuf {
 fn build_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     AppState {
+        db: aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+            .expect("test: open shared aberp-db Handle"),
         db_path: Arc::new(db_path),
         tenant,
         nav_enabled: true,
@@ -105,10 +107,19 @@ fn partner_inputs(name: &str, ct: CustomerType) -> PartnerInputs {
     }
 }
 
-fn ledger_kinds(db_path: &PathBuf) -> Vec<EventKind> {
+// H3 (ADR-0099): read audit through the SAME shared Handle the handlers wrote
+// through — the margin/partner/quote-margin events now land in the Handle's audit
+// WAL (via append_machine_event), which a fresh `Ledger::open` cannot coherently
+// see while the Handle holds it. `try_clone` (F-C) shares the live instance.
+fn ledger_kinds(state: &AppState) -> Vec<EventKind> {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
-    let ledger = Ledger::open(db_path, tenant, TEST_HASH).expect("open ledger");
-    ledger
+    // Write guard so an as-yet-unwritten ledger still reads as [] (the old
+    // `Ledger::open` ensured the schema; `from_connection` does not); read the
+    // entries off a try_clone of the SAME live instance.
+    let guard = state.db.write().expect("shared write guard");
+    aberp_audit_ledger::ensure_schema(&guard).expect("ensure audit-ledger schema");
+    let owned = guard.try_clone().expect("clone shared conn");
+    aberp_audit_ledger::Ledger::from_connection(owned, tenant, TEST_HASH)
         .entries()
         .expect("read entries")
         .into_iter()
@@ -161,7 +172,7 @@ fn profile_crud_emits_three_event_kinds_and_blocks_duplicate() {
         .expect("list")
         .is_empty());
 
-    let kinds = ledger_kinds(&db);
+    let kinds = ledger_kinds(&state);
     assert!(
         kinds.contains(&EventKind::MarginProfileCreated),
         "{kinds:?}"
@@ -195,7 +206,7 @@ fn partner_customer_type_change_emits_audit() {
     )
     .expect("noop update");
     assert!(
-        !ledger_kinds(&db).contains(&EventKind::PartnerCustomerTypeChanged),
+        !ledger_kinds(&state).contains(&EventKind::PartnerCustomerTypeChanged),
         "no-op edit must not fire the customer-type audit"
     );
 
@@ -209,7 +220,7 @@ fn partner_customer_type_change_emits_audit() {
     )
     .expect("type change");
     assert!(
-        ledger_kinds(&db).contains(&EventKind::PartnerCustomerTypeChanged),
+        ledger_kinds(&state).contains(&EventKind::PartnerCustomerTypeChanged),
         "customer-type change must fire the audit"
     );
 }
@@ -322,7 +333,7 @@ fn customer_journey_partner_profile_quote_margin_floor_refuse() {
         "defense profile (gross 4% < floor 10%) must trip the floor"
     );
     assert!(
-        ledger_kinds(&db).contains(&EventKind::QuoteMarginBelowFloor),
+        ledger_kinds(&state).contains(&EventKind::QuoteMarginBelowFloor),
         "below-floor event must fire on the re-price"
     );
 
@@ -403,7 +414,7 @@ fn margin_override_below_floor_needs_confirmation() {
         aberp::quote_pricing_jobs::margin_below_floor(&conn2, quote_id, TEST_TENANT).expect("flag"),
         "confirmed below-floor override flags the job"
     );
-    let kinds = ledger_kinds(&db);
+    let kinds = ledger_kinds(&state);
     assert!(
         kinds.contains(&EventKind::QuoteMarginOverridden),
         "{kinds:?}"

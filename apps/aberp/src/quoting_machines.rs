@@ -32,7 +32,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, TenantId};
 use aberp_quote_engine::{MachineCapacity, MachineFamily};
 
 /// Default schedulable hours per day for a new machine (brief default).
@@ -377,18 +377,30 @@ pub fn list_enabled_capacities(conn: &Connection, tenant: &str) -> Result<Vec<Ma
 /// the write half stays unit-testable without a ledger, mirroring
 /// `record_numbering_change_audit`.
 pub fn append_machine_event(
-    db_path: &std::path::Path,
+    db: &aberp_db::Handle,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator_login: &str,
     kind: EventKind,
     payload: Vec<u8>,
 ) -> Result<()> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record machine event")?;
+    // H3 (ADR-0099): route the audit append through the ONE shared Handle instead
+    // of an independent `Ledger::open` write-fork. This is an AUDIT-ONLY migration
+    // of a CROSS-SUBSYSTEM shared helper: the 12 callers (machines, partners,
+    // margin profiles, lead-time / quote-margin overrides, reprice provenance)
+    // KEEP their business `Connection::open`s — a single `[business-fold,
+    // audit-append]` per request handler is coherent, and no fn reads this audit
+    // via the Handle, so there is no read-side cascade (unlike avl's fire_overdue).
+    // The guard drop lockstep-syncs the mirror.
+    let mut guard = db
+        .write()
+        .context("acquire shared writer to record machine event")?;
+    aberp_audit_ledger::ensure_schema(&guard).context("ensure audit-ledger schema")?;
+    let tx = guard.transaction().context("begin machine audit tx")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
     let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
-    ledger
-        .append(kind, payload, actor, None)
+    aberp_audit_ledger::append_in_tx(&tx, &meta, kind, payload, actor, None)
         .context("append machine audit entry")?;
+    tx.commit().context("commit machine audit entry")?;
     Ok(())
 }

@@ -649,6 +649,18 @@ pub enum SnapshotCommand {
     /// any live `~/.aberp/` tenant home — a fat-fingered restore can never
     /// clobber the live prod DB. Recover prod by restoring to a side path,
     /// stopping serve, then swapping the file in.
+    ///
+    /// ⚠️ DELIBERATE ROLLBACK vs CORRUPTION RECOVERY (ADR-audit-armor).
+    /// A restore only rebuilds the DB file; it does NOT touch the tenant's
+    /// audit-ledger mirror sibling `<db>.audit.log`. On the next `aberp
+    /// serve` boot the gated auto-heal replays any mirror-ahead tail FORWARD
+    /// into the DB. That is exactly what corruption recovery wants (restore
+    /// snapshot + replay the mirror = heal forward). But if you are
+    /// deliberately rolling a tenant BACK to an older DB and intend to STAY
+    /// there, the forward-heal will silently undo the rollback: FIRST clear
+    /// `<db>.audit.log` and any `<db>.audit.log.healed-*.bak` /
+    /// `.ahead-*.bak` / `.corrupt-*.bak` siblings, THEN swap the DB in.
+    /// See docs/runbooks/audit-mirror-restore-rollback-caveat.md.
     Restore(SnapshotRestoreArgs),
 }
 

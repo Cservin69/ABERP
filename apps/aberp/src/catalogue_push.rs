@@ -75,7 +75,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use duckdb::Connection;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
@@ -326,6 +325,8 @@ struct CatalogueBody {
 /// Dependencies for the audit write + table read (mirrors `QuoteIntakeDeps`).
 pub struct CataloguePushDeps {
     pub db_path: PathBuf,
+    /// ADR-0099 H3 — the shared DuckDB Handle; audit appends route through it.
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -463,12 +464,14 @@ impl CataloguePushService {
 
         // Read the public catalogue off the DB (sync duckdb on a blocking
         // thread).
-        let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_str = self.deps.tenant.as_str().to_string();
         let rows = match tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(&db_path).with_context(|| {
-                format!("open DuckDB at {} for catalogue push", db_path.display())
-            })?;
+            // H3 (ADR-0099): read the catalogue via the shared Handle's coherent
+            // read clone. This daemon must touch the DB ONLY through the Handle —
+            // a separate Connection::open would close-fold the Handle's pending
+            // audit WAL and tear the ledger for fresh readers.
+            let conn = db.read().context("shared read handle for catalogue push")?;
             crate::quoting_materials::list_public(&conn, &tenant_str)
         })
         .await
@@ -489,7 +492,7 @@ impl CataloguePushService {
         let count = rows.len() as i64;
         let body = CatalogueBody { materials: rows };
         let url = format!("{}{CATALOGUE_PATH}", credential.base_url);
-        let auth = format!("Bearer {}", &*credential.bearer);
+        let auth = format!("Bearer {}", *credential.bearer);
 
         // S339 / PR-24 — satisfy the storefront's CloudFront→origin
         // shared-secret gate when provisioned. Additive: a `None`
@@ -530,7 +533,7 @@ impl CataloguePushService {
     }
 
     async fn write_audit(&self, trigger: &str, outcome: &PushOutcome) {
-        let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant = self.deps.tenant.clone();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
@@ -538,9 +541,11 @@ impl CataloguePushService {
         let outcome = outcome.clone();
 
         let res = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = Connection::open(&db_path)
-                .context("open DuckDB for MaterialCataloguePushed audit")?;
-            aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
+            // H3 (ADR-0099): route through the ONE shared Handle instead of an
+            // independent Connection::open write-fork; guard drop lockstep-syncs.
+            let mut guard = db
+                .write()
+                .context("acquire shared writer for MaterialCataloguePushed audit")?;
             let payload = serde_json::json!({
                 "trigger": trigger,
                 "outcome": outcome.label(),
@@ -554,7 +559,7 @@ impl CataloguePushService {
                 "idempotency_key": Ulid::new().to_string(),
             });
             let bytes = serde_json::to_vec(&payload).context("serialize push payload")?;
-            let tx = conn.transaction().context("begin push audit tx")?;
+            let tx = guard.transaction().context("begin push audit tx")?;
             let meta = LedgerMeta::new(tenant, binary_hash);
             let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
             append_in_tx(

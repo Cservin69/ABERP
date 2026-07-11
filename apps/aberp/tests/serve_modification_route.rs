@@ -60,6 +60,19 @@ fn build_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
     AppState {
+        db: {
+            let db = aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+                .expect("test: open shared aberp-db Handle");
+            // H3 (ADR-0099): mirror serve boot's audit-schema ensure (serve.rs
+            // :1023 < Handle open :1128) so count_pending's db.read() finds the
+            // table on a fresh DB.
+            {
+                let guard = db.write().expect("write guard to ensure audit schema");
+                aberp_audit_ledger::ensure_schema(&guard)
+                    .expect("ensure audit-ledger schema (test boot)");
+            }
+            db
+        },
         db_path: Arc::new(db_path),
         tenant,
         nav_enabled: true,
@@ -283,6 +296,20 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
     // CLI library helper to mint a fresh local invoice end-to-end so
     // the billing row + audit trace are co-created in lockstep.
     let xml_out = dir.join("base.xml");
+    // H3 (ADR-0099): `issue_from_parsed` takes the shared Handle. Open a scoped
+    // seed handle for the base issuance and DROP it before `build_state` opens
+    // the AppState's own handle on the same path (sequential, never overlapping).
+    let seed_handle = aberp::serve::open_tenant_handle(
+        &db_path,
+        TenantId::new(TEST_TENANT.to_string()).expect("seed tenant id"),
+    )
+    .expect("open seed handle for base invoice");
+    // H3 (ADR-0099): ensure the audit-ledger schema (serve boot's job) so the
+    // base issuance's count_pending db.read() finds the table on this fresh DB.
+    {
+        let guard = seed_handle.write().expect("seed write guard");
+        aberp_audit_ledger::ensure_schema(&guard).expect("ensure audit-ledger schema (seed)");
+    }
     aberp::issue_invoice::issue_from_parsed(
         aberp::issue_invoice::InvoiceInputJson {
             supplier: SupplierJson {
@@ -332,7 +359,7 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
             // base's resolver continues to fall back to partner.email.
             email_recipient_override: None,
         },
-        &db_path,
+        &seed_handle,
         TEST_TENANT,
         "INV-default",
         aberp_billing::Currency::Huf,
@@ -345,6 +372,7 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
     )
     .await
     .expect("issue base HUF invoice");
+    drop(seed_handle);
 
     // Find the base id from the audit ledger.
     let base_invoice_id = {

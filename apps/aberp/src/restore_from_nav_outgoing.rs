@@ -120,10 +120,10 @@
 //!     operator abandons or completes it (per [[trust-code-not-operator]]).
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, BinaryHash, EventKind, Ledger, TenantId};
 use aberp_billing::{Currency, IdempotencyKey};
+use aberp_db::{Handle, HandleArc};
 use aberp_nav_transport::error::NavTransportError;
 use aberp_nav_transport::operations::query_invoice_data;
 use aberp_nav_transport::operations::query_invoice_digest::{
@@ -364,39 +364,53 @@ pub fn read_restore_lock(conn: &Connection, tenant: &str) -> Result<Option<Resto
     }
 }
 
-/// S261 — open, ensure schema, acquire. Path-taking wrapper for the
-/// confirm handler. Returns `Ok(true)` when freshly taken, `Ok(false)`
-/// when a lock is already held.
+/// S261 — ensure schema, acquire. Handle-taking wrapper for the confirm
+/// handler. Returns `Ok(true)` when freshly taken, `Ok(false)` when a lock is
+/// already held.
+///
+/// H3 (ADR-0099): routes through the shared `Handle`'s WRITE guard (was a fresh
+/// `Connection::open`). `ensure_schema` is retained on the write guard — it is a
+/// write anyway (the INSERT) and the DDL is idempotent.
 pub fn acquire_restore_lock_at(
-    db_path: &Path,
+    db: &Handle,
     tenant: &str,
     operator: &str,
     year: i32,
     acquired_at: &str,
 ) -> Result<bool> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
-    ensure_schema(&conn)?;
-    acquire_restore_lock(&conn, tenant, operator, year, acquired_at)
+    let guard = db
+        .write()
+        .context("acquire shared writer for restore-lock acquire")?;
+    ensure_schema(&guard)?;
+    acquire_restore_lock(&guard, tenant, operator, year, acquired_at)
 }
 
-/// S261 — open the tenant DuckDB, ensure schema, read the lock. The
-/// path-taking convenience wrapper the HTTP handlers + boot check use
-/// (they have a `db_path`, not an open `Connection`).
-pub fn read_restore_lock_at(db_path: &Path, tenant: &str) -> Result<Option<RestoreLock>> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
-    ensure_schema(&conn)?;
+/// S261 — read the lock. The Handle-taking convenience wrapper the HTTP handlers
+/// + AP-sync gate use.
+///
+/// H3 (ADR-0099): reads through the shared `Handle` (`db.read()` = a `try_clone`
+/// of the one live instance, coherent with in-flight writes). `ensure_schema` is
+/// DROPPED here: serve boot ensures the `restore_lock` schema (serve.rs
+/// `ensure restored_invoice schema at serve boot`) BEFORE it opens the Handle,
+/// so a fresh Handle open observes the on-disk schema and every in-serve reader
+/// sees it — no write-guard-for-a-read is warranted (verified: no CLI/separate-
+/// process caller exists; `CycleInputs` is built only in `serve.rs`).
+pub fn read_restore_lock_at(db: &Handle, tenant: &str) -> Result<Option<RestoreLock>> {
+    let conn = db
+        .read()
+        .context("acquire shared reader for restore-lock read")?;
     read_restore_lock(&conn, tenant)
 }
 
-/// S261 — open, ensure schema, DELETE the lock. The abandon route's
-/// path-taking wrapper.
-pub fn release_restore_lock_at(db_path: &Path, tenant: &str) -> Result<()> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
-    ensure_schema(&conn)?;
-    release_restore_lock(&conn, tenant)
+/// S261 — DELETE the lock. The abandon route's Handle-taking wrapper.
+///
+/// H3 (ADR-0099): shared `Handle` WRITE guard (was `Connection::open`).
+pub fn release_restore_lock_at(db: &Handle, tenant: &str) -> Result<()> {
+    let guard = db
+        .write()
+        .context("acquire shared writer for restore-lock release")?;
+    ensure_schema(&guard)?;
+    release_restore_lock(&guard, tenant)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -633,10 +647,13 @@ pub struct RestoredInvoice {
 /// List every restored invoice for the tenant, newest issue_date
 /// first. Used by the wizard's "what's already restored" panel and by
 /// the SPA virtual-union outgoing list per ADR-0058 / S215.
-pub fn list_restored(db_path: &Path, tenant: &str) -> Result<Vec<RestoredInvoice>> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
-    ensure_schema(&conn)?;
+pub fn list_restored(db: &Handle, tenant: &str) -> Result<Vec<RestoredInvoice>> {
+    // H3 (ADR-0099): read through the shared Handle. `ensure_schema` dropped —
+    // `restored_invoice` is boot-ensured before the Handle opens (see
+    // `read_restore_lock_at`).
+    let conn = db
+        .read()
+        .context("acquire shared reader to list restored invoices")?;
     let mut stmt = conn.prepare(
         "SELECT id, source_nav_invoice_number, source_nav_transaction_id, issue_date,
                 total_net_minor, total_vat_minor, total_gross_minor, currency,
@@ -856,13 +873,12 @@ pub fn update_partner_for_restored(
 /// re-attempted on every subsequent boot, which is fine (one extra
 /// `queryInvoiceData` call per such row per boot) and lets a future
 /// NAV-side data correction be picked up automatically.
-pub fn list_restored_missing_buyer(
-    db_path: &Path,
-    tenant: &str,
-) -> Result<Vec<RestoredMissingBuyer>> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
-    ensure_schema(&conn)?;
+pub fn list_restored_missing_buyer(db: &Handle, tenant: &str) -> Result<Vec<RestoredMissingBuyer>> {
+    // H3 (ADR-0099): read through the shared Handle. `ensure_schema` dropped —
+    // `restored_invoice` is boot-ensured before the Handle opens.
+    let conn = db
+        .read()
+        .context("acquire shared reader to list restored rows missing buyer")?;
     let mut stmt = conn.prepare(
         "SELECT source_nav_invoice_number
            FROM restored_invoice
@@ -900,7 +916,11 @@ pub struct RestoredMissingBuyer {
 /// posture (built once by the route handler from `AppState` +
 /// keychain).
 pub struct RestoreInputs {
-    pub db_path: PathBuf,
+    /// H3 (ADR-0099): the ONE shared aberp-db Handle. The restore wizard is an
+    /// in-serve operator flow, so its whole DB surface (restored_invoice inserts,
+    /// the InvoiceRestoredFromNav audit family, the restore lock, catalog
+    /// extraction) routes through this — never a fresh `Connection::open`.
+    pub db: HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -916,7 +936,10 @@ pub struct RestoreInputs {
 /// `test-support` feature on `aberp-nav-transport`, kept out of this
 /// crate's dev-dependencies to mirror S178's posture).
 struct DigestContext<'a> {
-    db_path: &'a Path,
+    /// H3 (ADR-0099): the shared Handle (was `db_path: &Path`). `process_digest`
+    /// runs the restored_invoice INSERT + the audit append on ONE `db.write()`
+    /// guard.
+    db: &'a Handle,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator_login: &'a str,
@@ -940,12 +963,19 @@ type AlreadyRestoredCache = HashSet<String>;
 /// string + HashSet overhead) — fine for tenants with tens of
 /// thousands of restored rows.
 fn load_already_restored_cache(
-    db_path: &Path,
+    db: &Handle,
     tenant: TenantId,
     binary_hash: BinaryHash,
 ) -> Result<AlreadyRestoredCache> {
-    let ledger = Ledger::open(db_path, tenant.clone(), binary_hash)
-        .context("open audit ledger to pre-load already-restored cache")?;
+    // H3 (ADR-0099): read the audit family through the shared Handle. A fresh
+    // `Ledger::open` here would read only the WAL-folded SUBSET post-checkpoint-
+    // disable and could MISS a just-written InvoiceRestoredFromNav row — the
+    // idempotency cache would then re-restore an invoice already restored this
+    // cycle. `db.read()` is a `try_clone` of the one live instance (coherent).
+    let conn = db
+        .read()
+        .context("acquire shared reader to pre-load already-restored cache")?;
+    let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash);
     let entries = ledger
         .entries()
         .context("read audit ledger entries for already-restored cache")?;
@@ -1117,7 +1147,7 @@ pub async fn run(inputs: RestoreInputs) -> Result<RestoreSummary> {
     // JSON-decode work over potentially tens of thousands of
     // entries; fence it inside `spawn_blocking` so the tokio worker
     // is not held until it returns.
-    let cache_db = inputs.db_path.clone();
+    let cache_db = inputs.db.clone();
     let cache_tenant = inputs.tenant.clone();
     let cache_binary_hash = inputs.binary_hash;
     let mut already_restored_cache = tokio::task::spawn_blocking(move || {
@@ -1305,7 +1335,7 @@ pub async fn preview(inputs: RestoreInputs) -> Result<RestorePreview> {
     let (gaps, gaps_truncated) = detect_gaps(&all_numbers);
 
     // Partition against the already-restored set (one ledger walk).
-    let cache_db = inputs.db_path.clone();
+    let cache_db = inputs.db.clone();
     let cache_tenant = inputs.tenant.clone();
     let cache_binary_hash = inputs.binary_hash;
     let already_restored = tokio::task::spawn_blocking(move || {
@@ -1369,10 +1399,10 @@ pub async fn preview(inputs: RestoreInputs) -> Result<RestorePreview> {
 
     // Counting phase — parse + local-existence dedup on the blocking
     // pool (synchronous XML parse + DuckDB reads).
-    let db_path = inputs.db_path.clone();
+    let db = inputs.db.clone();
     let tenant = inputs.tenant.clone();
     let (new_partner_count, new_product_count, parse_errored) =
-        tokio::task::spawn_blocking(move || count_new_catalog(&db_path, tenant.as_str(), samples))
+        tokio::task::spawn_blocking(move || count_new_catalog(&db, tenant.as_str(), samples))
             .await
             .map_err(|join_err| anyhow!("restore preview count task panicked: {join_err}"))??;
     extraction_errored += parse_errored;
@@ -1402,15 +1432,24 @@ pub async fn preview(inputs: RestoreInputs) -> Result<RestorePreview> {
 /// failures are CONTAINED (warn + counter) so one malformed XML body
 /// does not abort the whole preview.
 fn count_new_catalog(
-    db_path: &Path,
+    db: &Handle,
     tenant: &str,
     samples: Vec<(Currency, Vec<u8>)>,
 ) -> Result<(u64, u64, u64)> {
     use crate::restore_from_nav_extract::{
         extract_inner_invoice_data_xml, parse_customer_info, parse_invoice_lines,
     };
-    let conn = restore_from_nav_extract::open_for_extract(db_path)
-        .context("open DuckDB for restore-preview catalog count")?;
+    // H3 (ADR-0099): hold the shared Handle's WRITE guard for the catalog count.
+    // It is a write guard (not a read) because the extraction schema-ensure below
+    // is DDL and partners boot-ensure is not proven (see `ensure_extract_schemas`).
+    // The synchronous parse + local-existence reads below run on this ONE guard;
+    // `&conn` deref-coerces to `&Connection` at every call site. Preview is an
+    // infrequent operator dry-run, so serializing it behind the writer is fine.
+    let conn = db
+        .write()
+        .context("acquire shared writer for restore-preview catalog count")?;
+    restore_from_nav_extract::ensure_extract_schemas(&conn)
+        .context("ensure extract schemas for restore-preview catalog count")?;
     let mut seen_partner_keys: HashSet<String> = HashSet::new();
     let mut seen_product_keys: HashSet<String> = HashSet::new();
     let mut new_partners: u64 = 0;
@@ -1683,7 +1722,7 @@ async fn walk_month(
         // run-level checksum BEFORE `digests` moves into the blocking
         // closure below.
         month_numbers.extend(digests.iter().map(|d| d.invoice_number.clone()));
-        let db_path = inputs.db_path.clone();
+        let db = inputs.db.clone();
         let tenant = inputs.tenant.clone();
         let binary_hash = inputs.binary_hash;
         let operator_login = inputs.operator_login.clone();
@@ -1692,7 +1731,7 @@ async fn walk_month(
         let (cache_returned, page_restored, page_skipped, page_errored, fresh_restored) =
             tokio::task::spawn_blocking(move || {
                 let ctx = DigestContext {
-                    db_path: &db_path,
+                    db: &db,
                     tenant,
                     binary_hash,
                     operator_login: &operator_login,
@@ -1752,7 +1791,7 @@ async fn walk_month(
         // wizard is operator-paced (one operator click per cycle).
         for fresh in fresh_restored {
             let delta = extract_catalog_for_invoice(
-                &inputs.db_path,
+                inputs.db.clone(),
                 &inputs.tenant,
                 &inputs.tax_number_8,
                 &inputs.credentials,
@@ -1818,7 +1857,7 @@ fn parse_digest_currency(digest: &InvoiceDigest) -> Result<Currency> {
 /// primary contract is the invoice restore itself, which has already
 /// landed by the time this function runs.
 async fn extract_catalog_for_invoice(
-    db_path: &Path,
+    db: HandleArc,
     tenant: &TenantId,
     tax_number_8: &str,
     credentials: &NavCredentials,
@@ -1850,7 +1889,6 @@ async fn extract_catalog_for_invoice(
     };
 
     let response_xml = outcome.response_xml;
-    let db_path_owned = db_path.to_path_buf();
     let tenant_owned = tenant.clone();
     let invoice_number_owned = invoice_number.to_string();
 
@@ -1920,13 +1958,18 @@ async fn extract_catalog_for_invoice(
                 };
             }
         };
-        let conn = match restore_from_nav_extract::open_for_extract(&db_path_owned) {
-            Ok(c) => c,
+        // H3 (ADR-0099): the partner/product upserts run on the shared Handle's
+        // WRITE guard (was a fresh `open_for_extract` Connection::open). Held for
+        // the duration of `apply_candidates` (one write scope; `&conn` deref-
+        // coerces to `&Connection`). Not nested with `process_digest`'s guard —
+        // that ran in the earlier per-page spawn_blocking, already dropped.
+        let conn = match db.write() {
+            Ok(g) => g,
             Err(e) => {
                 tracing::warn!(
                     invoice_number = invoice_number_owned.as_str(),
-                    error = ?e,
-                    "S196: failed to open tenant DB for catalog extraction"
+                    error = %e,
+                    "S196: failed to acquire shared writer for catalog extraction"
                 );
                 return ExtractionDelta {
                     invoice_extraction_errored: 1,
@@ -1934,6 +1977,17 @@ async fn extract_catalog_for_invoice(
                 };
             }
         };
+        if let Err(e) = restore_from_nav_extract::ensure_extract_schemas(&conn) {
+            tracing::warn!(
+                invoice_number = invoice_number_owned.as_str(),
+                error = ?e,
+                "S196: failed to ensure extract schemas for catalog extraction"
+            );
+            return ExtractionDelta {
+                invoice_extraction_errored: 1,
+                ..Default::default()
+            };
+        }
         restore_from_nav_extract::apply_candidates(
             &conn,
             tenant_owned.as_str(),
@@ -2042,16 +2096,17 @@ fn process_digest(
     let actor = Actor::from_local_cli(session_id, ctx.operator_login);
     let ledger_meta = audit_ledger::LedgerMeta::new(ctx.tenant.clone(), ctx.binary_hash);
 
-    let mut conn = Connection::open(ctx.db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for restored_invoice insert",
-            ctx.db_path.display()
-        )
-    })?;
-    ensure_schema(&conn).context("ensure restored_invoice schema (insert)")?;
-    audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema (restore insert)")?;
+    // H3 (ADR-0099): the restored_invoice INSERT and the InvoiceRestoredFromNav
+    // audit append share ONE `db.write()` guard (they were already one tx; now on
+    // the shared instance). ensure_schema stays on the guard (idempotent DDL).
+    let mut guard = ctx
+        .db
+        .write()
+        .context("acquire shared writer for restored_invoice insert")?;
+    ensure_schema(&guard).context("ensure restored_invoice schema (insert)")?;
+    audit_ledger::ensure_schema(&guard).context("ensure audit-ledger schema (restore insert)")?;
 
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin DuckDB transaction (restored_invoice insert)")?;
     tx.execute(
@@ -2099,17 +2154,19 @@ fn process_digest(
     .map_err(|e| anyhow!("audit_ledger::append_in_tx InvoiceRestoredFromNav: {e}"))?;
     tx.commit()
         .context("commit DuckDB transaction (restored_invoice insert)")?;
-    drop(conn);
 
-    let ledger = Ledger::open(ctx.db_path, ctx.tenant.clone(), ctx.binary_hash)
-        .context("open audit ledger to verify chain after restore insert")?;
-    ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER restore insert")?;
-    let mirror_path = audit_ledger::mirror_path_for(ctx.db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after restore insert")?;
+    // H3 (ADR-0099): verify the chain on a try_clone of the SAME live instance
+    // (no reopen → no WAL fold/tear). The guard's drop runs the lockstep mirror
+    // sync, so the pre-fix `Ledger::open` verify + explicit `sync_mirror` are gone.
+    audit_ledger::Ledger::from_connection(
+        guard
+            .try_clone()
+            .context("try_clone shared handle for post-restore chain verify")?,
+        ctx.tenant.clone(),
+        ctx.binary_hash,
+    )
+    .verify_chain()
+    .context("audit-ledger chain verification failed AFTER restore insert")?;
 
     // S186 — mark this NAV invoice number as already-restored so a
     // subsequent digest in the SAME cycle that re-names it (NAV
@@ -2179,7 +2236,10 @@ pub struct BuyerBackfillSummary {
 /// resolved at the call site (via `BinaryHashHandle::wait()`) so the
 /// backfill task does not need to know about the handle abstraction.
 pub struct BackfillInputs {
-    pub db_path: PathBuf,
+    /// H3 (ADR-0099): the shared aberp-db Handle (was `db_path: PathBuf`). The
+    /// boot backfill scans, per-row updates, and the cycle audit entry all route
+    /// through it.
+    pub db: HandleArc,
     pub tenant: TenantId,
     pub tax_number_8: String,
     pub endpoint: NavEndpoint,
@@ -2215,7 +2275,7 @@ pub async fn run_buyer_backfill_once(
     // tokio worker is not held across the DuckDB read. The worklist
     // is fully consumed (then dropped) before any NAV call — no
     // long-lived DB handle.
-    let scan_db = inputs.db_path.clone();
+    let scan_db = inputs.db.clone();
     let scan_tenant = inputs.tenant.as_str().to_string();
     let worklist = match tokio::task::spawn_blocking(move || {
         list_restored_missing_buyer(&scan_db, &scan_tenant)
@@ -2386,13 +2446,19 @@ fn append_backfill_cycle_entry(
     inputs: &BackfillInputs,
     payload: &RestoreBuyerBackfillCycleCompletedPayload,
 ) -> Result<()> {
-    let mut conn = Connection::open(&inputs.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", inputs.db_path.display()))?;
-    audit_ledger::ensure_schema(&conn)
+    // H3 (ADR-0099): append on the shared Handle's WRITE guard (was
+    // `Connection::open`). The guard's drop runs the lockstep mirror sync, so the
+    // pre-fix `Ledger::open` + explicit `sync_mirror` pair is gone. (This cycle
+    // entry did not verify_chain pre-fix; that behaviour is preserved.)
+    let mut guard = inputs
+        .db
+        .write()
+        .context("acquire shared writer for backfill cycle audit entry")?;
+    audit_ledger::ensure_schema(&guard)
         .context("ensure audit-ledger schema for backfill cycle audit entry")?;
     let session_id = Ulid::new().to_string();
     let actor = Actor::from_local_cli(session_id, inputs.credentials.login());
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin tx for backfill cycle audit")?;
     let ledger_meta = audit_ledger::LedgerMeta::new(inputs.tenant.clone(), inputs.binary_hash);
@@ -2408,13 +2474,6 @@ fn append_backfill_cycle_entry(
     .map_err(|e| anyhow!("audit_ledger::append_in_tx RestoreBuyerBackfillCycleCompleted: {e}"))?;
     tx.commit()
         .context("commit DuckDB transaction (backfill cycle audit)")?;
-    drop(conn);
-    let ledger = Ledger::open(&inputs.db_path, inputs.tenant.clone(), inputs.binary_hash)
-        .context("open audit ledger to sync mirror after backfill cycle entry")?;
-    let mirror_path = audit_ledger::mirror_path_for(&inputs.db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after backfill cycle entry")?;
     Ok(())
 }
 
@@ -2449,7 +2508,7 @@ async fn backfill_one_row(
     })?;
 
     let response_xml = outcome.response_xml;
-    let db_path = inputs.db_path.clone();
+    let db = inputs.db.clone();
     let tenant = inputs.tenant.as_str().to_string();
     let source_nav_invoice_number = row.source_nav_invoice_number.clone();
 
@@ -2468,14 +2527,14 @@ async fn backfill_one_row(
         let customer = crate::restore_from_nav_extract::parse_customer_info(&inner)
             .context("parse <customerInfo> for buyer backfill")?;
 
-        let conn = Connection::open(&db_path).with_context(|| {
-            format!(
-                "open tenant DuckDB at {} for buyer-backfill UPDATE",
-                db_path.display()
-            )
-        })?;
+        // H3 (ADR-0099): UPDATE on the shared Handle's WRITE guard (was
+        // `Connection::open`). `update_buyer_fields` ensures the schema on this
+        // guard and runs the UPDATE; not nested (per-row, sequential in the loop).
+        let guard = db
+            .write()
+            .context("acquire shared writer for buyer-backfill UPDATE")?;
         let affected = update_buyer_fields(
-            &conn,
+            &guard,
             &tenant,
             &source_nav_invoice_number,
             customer.name.as_deref(),
@@ -2628,14 +2687,45 @@ mod tests {
         }
     }
 
+    /// H3 (ADR-0099): open a shared `Handle` for a test, mirroring serve boot —
+    /// ensure the restore + audit schema on a SEPARATE connection that commits and
+    /// drops BEFORE the Handle opens, so the fresh Handle open observes the
+    /// on-disk schema (Q3 coherence) and the read-path callers (which no longer
+    /// ensure schema) work. All of a test's DB access then routes through the ONE
+    /// returned Handle — writes AND audit read-backs — so the assertions see the
+    /// WAL-resident writes (a fresh `Ledger::open` would not: that IS the
+    /// coherence property under test).
+    fn test_handle(db_path: &std::path::Path, tenant: &str) -> HandleArc {
+        {
+            let conn = Connection::open(db_path).expect("open for boot schema");
+            ensure_schema(&conn).expect("ensure restore schema");
+            audit_ledger::ensure_schema(&conn).expect("ensure audit schema");
+        }
+        Handle::open_default(db_path, TenantId::new(tenant.to_string()).unwrap())
+            .expect("open shared handle")
+    }
+
+    /// Read the audit ledger's entries through the shared Handle (coherent with
+    /// Handle writes; a fresh `Ledger::open` would miss WAL-resident rows).
+    fn handle_entries(
+        handle: &Handle,
+        tenant: TenantId,
+        binary_hash: BinaryHash,
+    ) -> Vec<audit_ledger::Entry> {
+        let conn = handle.read().expect("shared reader");
+        Ledger::from_connection(conn, tenant, binary_hash)
+            .entries()
+            .expect("read entries")
+    }
+
     fn fixture_context<'a>(
-        db_path: &'a Path,
+        db: &'a Handle,
         tenant_str: &str,
         operator: &'a str,
         year: i32,
     ) -> DigestContext<'a> {
         DigestContext {
-            db_path,
+            db,
             tenant: TenantId::new(tenant_str.to_string()).unwrap(),
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
             operator_login: operator,
@@ -2806,7 +2896,8 @@ mod tests {
     fn process_digest_is_idempotent_within_cycle_via_cache() {
         let tmp = ScopedTempDir::new("test");
         let db_path = tmp.path().join("aberp.duckdb");
-        let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+        let handle = test_handle(&db_path, "t1");
+        let ctx = fixture_context(&handle, "t1", "test-user", 2026);
         let mut cache: AlreadyRestoredCache = HashSet::new();
 
         let d = fixture_digest("INV-default/00042", "2026-04-15");
@@ -2821,7 +2912,7 @@ mod tests {
             process_digest(&ctx, &d, &mut cache).expect("second call short-circuits via cache");
         assert!(matches!(outcome2, ProcessOutcome::Skipped));
 
-        let list = list_restored(&db_path, "t1").expect("list");
+        let list = list_restored(&handle, "t1").expect("list");
         assert_eq!(list.len(), 1, "exactly one row after two calls");
         assert_eq!(list[0].source_nav_invoice_number, "INV-default/00042");
         assert_eq!(list[0].issue_date, "2026-04-15");
@@ -2834,9 +2925,7 @@ mod tests {
         // Verify the audit chain has exactly ONE InvoiceRestoredFromNav
         // entry (not two — the skipped re-run must not write a
         // duplicate).
-        let ledger =
-            Ledger::open(&db_path, ctx.tenant.clone(), ctx.binary_hash).expect("open ledger");
-        let entries = ledger.entries().expect("read entries");
+        let entries = handle_entries(&handle, ctx.tenant.clone(), ctx.binary_hash);
         let restored_entries: Vec<_> = entries
             .iter()
             .filter(|e| e.kind == EventKind::InvoiceRestoredFromNav)
@@ -2851,7 +2940,8 @@ mod tests {
     fn process_digest_loud_fails_on_unknown_currency() {
         let tmp = ScopedTempDir::new("test");
         let db_path = tmp.path().join("aberp.duckdb");
-        let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+        let handle = test_handle(&db_path, "t1");
+        let ctx = fixture_context(&handle, "t1", "test-user", 2026);
         let mut cache: AlreadyRestoredCache = HashSet::new();
 
         let mut d = fixture_digest("INV-default/00099", "2026-05-01");
@@ -2865,7 +2955,8 @@ mod tests {
     fn process_digest_loud_fails_on_missing_issue_date() {
         let tmp = ScopedTempDir::new("test");
         let db_path = tmp.path().join("aberp.duckdb");
-        let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+        let handle = test_handle(&db_path, "t1");
+        let ctx = fixture_context(&handle, "t1", "test-user", 2026);
         let mut cache: AlreadyRestoredCache = HashSet::new();
 
         let mut d = fixture_digest("INV-default/00100", "2026-05-01");
@@ -2886,7 +2977,8 @@ mod tests {
     fn load_already_restored_cache_is_tenant_scoped() {
         let tmp = ScopedTempDir::new("test");
         let db_path = tmp.path().join("aberp.duckdb");
-        let ctx_a = fixture_context(&db_path, "t1", "test-user", 2026);
+        let handle = test_handle(&db_path, "t1");
+        let ctx_a = fixture_context(&handle, "t1", "test-user", 2026);
         let mut cache_a: AlreadyRestoredCache = HashSet::new();
 
         let d = fixture_digest("INV-default/00050", "2026-03-10");
@@ -2895,7 +2987,7 @@ mod tests {
         // Tenant B's cache must NOT contain tenant A's restored
         // NAV invoice number.
         let cache_b = load_already_restored_cache(
-            &db_path,
+            &handle,
             TenantId::new("t2".to_string()).unwrap(),
             ctx_a.binary_hash,
         )
@@ -2907,7 +2999,7 @@ mod tests {
 
         // Tenant A's freshly-loaded cache MUST contain it.
         let cache_a_reloaded =
-            load_already_restored_cache(&db_path, ctx_a.tenant.clone(), ctx_a.binary_hash)
+            load_already_restored_cache(&handle, ctx_a.tenant.clone(), ctx_a.binary_hash)
                 .expect("load cache t1");
         assert!(
             cache_a_reloaded.contains("INV-default/00050"),
@@ -2927,7 +3019,8 @@ mod tests {
     fn load_already_restored_cache_hydrates_from_prior_ledger_entries() {
         let tmp = ScopedTempDir::new("test");
         let db_path = tmp.path().join("aberp.duckdb");
-        let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+        let handle = test_handle(&db_path, "t1");
+        let ctx = fixture_context(&handle, "t1", "test-user", 2026);
 
         // Cycle 1 — fresh cache, restore one digest.
         {
@@ -2944,7 +3037,7 @@ mod tests {
         // the NAV invoice number from cycle 1, so a re-encounter
         // skips and writes NO duplicate audit entry.
         let mut cache_two =
-            load_already_restored_cache(&db_path, ctx.tenant.clone(), ctx.binary_hash)
+            load_already_restored_cache(&handle, ctx.tenant.clone(), ctx.binary_hash)
                 .expect("load cache cycle 2");
         assert!(
             cache_two.contains("INV-default/77777"),
@@ -2960,9 +3053,7 @@ mod tests {
 
         // Exactly ONE audit entry — the hydrated cache prevented
         // a duplicate insert.
-        let ledger =
-            Ledger::open(&db_path, ctx.tenant.clone(), ctx.binary_hash).expect("open ledger");
-        let entries = ledger.entries().expect("read entries");
+        let entries = handle_entries(&handle, ctx.tenant.clone(), ctx.binary_hash);
         let restored_count = entries
             .iter()
             .filter(|e| e.kind == EventKind::InvoiceRestoredFromNav)
@@ -2999,7 +3090,8 @@ mod tests {
     fn process_digest_re_run_recovers_via_cache_when_prior_commit_landed() {
         let tmp = ScopedTempDir::new("recovery");
         let db_path = tmp.path().join("aberp.duckdb");
-        let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+        let handle = test_handle(&db_path, "t1");
+        let ctx = fixture_context(&handle, "t1", "test-user", 2026);
 
         // Cycle 1 — process_digest commits row + audit successfully.
         // (In the failure scenario this test models, the cycle would
@@ -3022,7 +3114,7 @@ mod tests {
         // walks `entries()` (NOT `verify_chain`), so even a tampered
         // / unverifiable chain would still hydrate the cache.
         let mut cache_two =
-            load_already_restored_cache(&db_path, ctx.tenant.clone(), ctx.binary_hash)
+            load_already_restored_cache(&handle, ctx.tenant.clone(), ctx.binary_hash)
                 .expect("cycle 2 cache loads independent of chain-verify state");
         assert!(
             cache_two.contains("INV-recovery/00001"),
@@ -3045,15 +3137,13 @@ mod tests {
         // A regression where the cache loader silently failed (e.g.,
         // returning an empty set on any read error) would surface
         // here as two rows or two audit entries.
-        let rows = list_restored(&db_path, "t1").expect("list");
+        let rows = list_restored(&handle, "t1").expect("list");
         assert_eq!(
             rows.len(),
             1,
             "exactly one row across the partial-commit + recovery flow"
         );
-        let ledger =
-            Ledger::open(&db_path, ctx.tenant.clone(), ctx.binary_hash).expect("open ledger");
-        let entries = ledger.entries().expect("read entries");
+        let entries = handle_entries(&handle, ctx.tenant.clone(), ctx.binary_hash);
         let restored_count = entries
             .iter()
             .filter(|e| e.kind == EventKind::InvoiceRestoredFromNav)
@@ -3071,7 +3161,8 @@ mod tests {
     fn process_digest_two_distinct_invoices() {
         let tmp = ScopedTempDir::new("test");
         let db_path = tmp.path().join("aberp.duckdb");
-        let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+        let handle = test_handle(&db_path, "t1");
+        let ctx = fixture_context(&handle, "t1", "test-user", 2026);
         let mut cache: AlreadyRestoredCache = HashSet::new();
 
         process_digest(
@@ -3087,7 +3178,7 @@ mod tests {
         )
         .expect("second row");
 
-        let list = list_restored(&db_path, "t1").expect("list");
+        let list = list_restored(&handle, "t1").expect("list");
         assert_eq!(list.len(), 2);
         // Newest issue_date first.
         assert_eq!(list[0].source_nav_invoice_number, "INV-default/00011");
@@ -3104,7 +3195,8 @@ mod tests {
     fn update_buyer_fields_round_trips_through_list_restored() {
         let tmp = ScopedTempDir::new("s218-rt");
         let db_path = tmp.path().join("aberp.duckdb");
-        let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+        let handle = test_handle(&db_path, "t1");
+        let ctx = fixture_context(&handle, "t1", "test-user", 2026);
         let mut cache: AlreadyRestoredCache = HashSet::new();
 
         process_digest(
@@ -3116,7 +3208,7 @@ mod tests {
 
         // Pre-update: customer_name MUST be None (the new columns
         // default to NULL because the INSERT path does not touch them).
-        let pre = list_restored(&db_path, "t1").expect("list pre");
+        let pre = list_restored(&handle, "t1").expect("list pre");
         assert_eq!(pre.len(), 1);
         assert!(
             pre[0].customer_name.is_none(),
@@ -3125,21 +3217,25 @@ mod tests {
         assert!(pre[0].customer_tax_number.is_none());
         assert!(pre[0].customer_vat_status.is_none());
 
-        // Apply the buyer write-back.
-        let conn = Connection::open(&db_path).expect("open");
-        let affected = update_buyer_fields(
-            &conn,
-            "t1",
-            "BIL-2026-0001",
-            Some("Áben Consulting Kft."),
-            Some("24904362-2-41"),
-            Some("Domestic"),
-        )
-        .expect("UPDATE succeeds");
-        assert_eq!(affected, 1, "UPDATE matched exactly the seeded row");
+        // Apply the buyer write-back through the shared Handle's write guard.
+        // Scoped so the guard drops before the read below — a `db.read()` while
+        // this thread holds the write guard would trip the re-entrancy tripwire.
+        {
+            let guard = handle.write().expect("writer");
+            let affected = update_buyer_fields(
+                &guard,
+                "t1",
+                "BIL-2026-0001",
+                Some("Áben Consulting Kft."),
+                Some("24904362-2-41"),
+                Some("Domestic"),
+            )
+            .expect("UPDATE succeeds");
+            assert_eq!(affected, 1, "UPDATE matched exactly the seeded row");
+        }
 
         // Round-trip via list_restored.
-        let post = list_restored(&db_path, "t1").expect("list post");
+        let post = list_restored(&handle, "t1").expect("list post");
         assert_eq!(post.len(), 1);
         assert_eq!(
             post[0].customer_name.as_deref(),
@@ -3235,16 +3331,19 @@ mod tests {
         .expect("UPDATE");
         assert_eq!(affected, 1, "exactly one row affected (tenant-scoped)");
         drop(conn);
+        // H3: open the shared Handle AFTER the raw seed conn drops (Q3 — a fresh
+        // open sees the committed rows); route the read-backs through it.
+        let handle = test_handle(&db_path, "t1");
 
         // t2's row stays untouched.
-        let t2 = list_restored(&db_path, "t2").expect("list t2");
+        let t2 = list_restored(&handle, "t2").expect("list t2");
         assert_eq!(t2.len(), 1);
         assert!(
             t2[0].customer_name.is_none(),
             "t2's row MUST NOT be touched by a t1-scoped UPDATE"
         );
 
-        let t1 = list_restored(&db_path, "t1").expect("list t1");
+        let t1 = list_restored(&handle, "t1").expect("list t1");
         assert_eq!(t1[0].customer_name.as_deref(), Some("Only T1 Customer"));
     }
 
@@ -3273,14 +3372,15 @@ mod tests {
         )
         .expect("fill A");
         drop(conn);
+        let handle = test_handle(&db_path, "t1");
 
         // t1's worklist: only B-002.
-        let work = list_restored_missing_buyer(&db_path, "t1").expect("list missing t1");
+        let work = list_restored_missing_buyer(&handle, "t1").expect("list missing t1");
         assert_eq!(work.len(), 1, "exactly one row remains NULL in t1");
         assert_eq!(work[0].source_nav_invoice_number, "B-002");
 
         // t2's worklist: only C-003 (NOT B-002 from t1).
-        let work_t2 = list_restored_missing_buyer(&db_path, "t2").expect("list missing t2");
+        let work_t2 = list_restored_missing_buyer(&handle, "t2").expect("list missing t2");
         assert_eq!(work_t2.len(), 1);
         assert_eq!(work_t2[0].source_nav_invoice_number, "C-003");
     }
@@ -3343,9 +3443,16 @@ mod tests {
         // Re-run to pin idempotency.
         ensure_schema(&conn).expect("ensure_schema is idempotent");
 
+        // H3: drop the raw seed connection, then open the shared Handle. A fresh
+        // open sees the committed migrated schema + legacy row (Q3); all
+        // subsequent access — the read-backs AND the backfill UPDATE — routes
+        // through the ONE Handle so they stay coherent.
+        drop(conn);
+        let handle = test_handle(&db_path, "t1");
+
         // Step 3: list_restored reads the legacy row with NULL buyer
         // columns (migration added them as NULLABLE).
-        let list = list_restored(&db_path, "t1").expect("list");
+        let list = list_restored(&handle, "t1").expect("list");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].source_nav_invoice_number, "BIL-LEGACY");
         assert!(
@@ -3353,28 +3460,24 @@ mod tests {
             "legacy row's customer_name MUST be None after migration"
         );
 
-        // Step 4: backfill via update_buyer_fields succeeds —
-        // proving the new columns are writable post-migration.
-        let affected = update_buyer_fields(
-            &conn,
-            "t1",
-            "BIL-LEGACY",
-            Some("Áben Consulting Kft."),
-            Some("24904362-2-41"),
-            Some("Domestic"),
-        )
-        .expect("UPDATE post-migration");
-        assert_eq!(affected, 1);
-        // Drop the seed connection so list_restored's fresh
-        // `Connection::open` sees the committed UPDATE rather than
-        // racing the seed connection's in-flight write state. DuckDB
-        // auto-commits but a second connection reading from the same
-        // file via a separate `open` was observed to surface NULL for
-        // the just-written column when both connections coexist mid-
-        // test; dropping the writer first is the surgical fix.
-        drop(conn);
+        // Step 4: backfill via update_buyer_fields succeeds — proving the new
+        // columns are writable post-migration. Scoped write guard so it drops
+        // before the read below (re-entrancy tripwire).
+        {
+            let guard = handle.write().expect("writer");
+            let affected = update_buyer_fields(
+                &guard,
+                "t1",
+                "BIL-LEGACY",
+                Some("Áben Consulting Kft."),
+                Some("24904362-2-41"),
+                Some("Domestic"),
+            )
+            .expect("UPDATE post-migration");
+            assert_eq!(affected, 1);
+        }
 
-        let list_post = list_restored(&db_path, "t1").expect("list post");
+        let list_post = list_restored(&handle, "t1").expect("list post");
         assert_eq!(
             list_post[0].customer_name.as_deref(),
             Some("Áben Consulting Kft.")
@@ -3410,8 +3513,9 @@ mod tests {
         .expect("UPDATE");
         assert_eq!(affected, 1, "exactly one row affected by tenant+id key");
         drop(conn);
+        let handle = test_handle(&db_path, "t1");
 
-        let list = list_restored(&db_path, "t1").expect("list");
+        let list = list_restored(&handle, "t1").expect("list");
         assert_eq!(list.len(), 1);
         assert_eq!(
             list[0].partner_id.as_deref(),
@@ -3463,8 +3567,9 @@ mod tests {
             .expect("clear");
         assert_eq!(affected, 1);
         drop(conn);
+        let handle = test_handle(&db_path, "t1");
 
-        let list = list_restored(&db_path, "t1").expect("list");
+        let list = list_restored(&handle, "t1").expect("list");
         assert_eq!(list.len(), 1);
         assert!(list[0].partner_id.is_none(), "partner_id cleared to NULL");
         assert!(
@@ -3506,8 +3611,9 @@ mod tests {
         .expect("UPDATE");
         assert_eq!(affected, 1);
         drop(conn);
+        let handle = test_handle(&db_path, "t1");
 
-        let t2 = list_restored(&db_path, "t2").expect("list t2");
+        let t2 = list_restored(&handle, "t2").expect("list t2");
         assert_eq!(t2.len(), 1);
         assert!(
             t2[0].partner_id.is_none(),
@@ -3620,8 +3726,9 @@ mod tests {
         .expect("UPDATE post-migration");
         assert_eq!(affected, 1);
         drop(conn);
+        let handle = test_handle(&db_path, "t1");
 
-        let list = list_restored(&db_path, "t1").expect("list");
+        let list = list_restored(&handle, "t1").expect("list");
         assert_eq!(list[0].partner_id.as_deref(), Some("prt_TEST"));
     }
 

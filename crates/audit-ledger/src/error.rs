@@ -104,6 +104,47 @@ pub enum AppendError {
     /// failed at session open.
     #[error("session crypto error: {0}")]
     Crypto(String),
+
+    /// H1 / ADR-0099 Class 4 (ported from editions ADR-0093 chunk 3 /
+    /// ADR-0082 reconcile safety) — at boot the audit mirror
+    /// (`<db>.audit.log`) was found AHEAD of the DB (its max seq is greater
+    /// than the DB's). This is the fingerprint of a torn-write / lost-commit
+    /// on the DB side (the 2026-06-22 corruption class), or a dev DB-nuke.
+    /// The mirror is NEVER silently auto-truncated (that would destroy the
+    /// only surviving record of what the DB lost); the ahead mirror is first
+    /// PRESERVED to a side file and boot REFUSES so a human investigates
+    /// before anything is rebuilt. Recovery: inspect `preserved`, restore the
+    /// DB from the newest valid snapshot if a commit was truly lost, or (for an
+    /// intentional dev-nuke) move the stale mirror aside and re-run.
+    #[error(
+        "audit-ledger mirror is AHEAD of the DB (mirror seq {mirror_max_seq} > DB seq \
+         {db_max_seq}); refusing to auto-truncate — the ahead mirror was preserved to \
+         {preserved}. Investigate (possible lost DB commit) before re-running. \
+         Magyarul: a napló-tükör előrébb tart a DB-nél; nem csonkítom, először vizsgáld ki."
+    )]
+    MirrorAheadOfDb {
+        mirror_max_seq: u64,
+        db_max_seq: u64,
+        preserved: String,
+    },
+
+    /// H1 / ADR-0099 Class 4 (ported from editions ADR-0098 R1) — the
+    /// audit-ledger mirror is corrupt in a way the unified torn-tail policy
+    /// will NOT auto-heal: either corruption DEEPER than a single torn trailing
+    /// line (a break/gap/JSON/hash-chain mismatch not at the final line), or a
+    /// head `entry_hash` that DIVERGES from the DB at equal length. In every
+    /// case the original mirror was PRESERVED byte-for-byte to `preserved`
+    /// BEFORE refusing. NEVER rebuild-from-DB here (that could destroy a prefix
+    /// the DB lost via a dropped WAL tail) and the operator must NEVER hand-edit
+    /// the JSONL. Recovery: inspect `preserved`, then restore the mirror from a
+    /// verified DB snapshot or known-good backup before re-running.
+    #[error(
+        "audit-ledger mirror is unrecoverable ({reason}); the original was preserved to \
+         {preserved}. Inspect it and restore the mirror from a verified DB snapshot or \
+         known-good backup before re-running; do NOT hand-edit the mirror JSONL. \
+         Magyarul: a napló-tükör sérült; az eredetit félretettem, ne szerkeszd kézzel."
+    )]
+    MirrorCorruptPreserved { preserved: String, reason: String },
 }
 
 /// Errors returned by [`crate::chain::verify_chain`]. Each variant names

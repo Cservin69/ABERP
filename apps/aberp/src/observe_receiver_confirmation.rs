@@ -154,6 +154,16 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
     )
     .entered();
 
+    // H3 (ADR-0099 F-E) — cross-process whole-DB single-writer lock. A separate
+    // process opening the tenant DB read-write must REFUSE if `aberp serve` (or
+    // another DB-mutating command) holds the whole-DB writer lock, rather than
+    // opening a second concurrent writer. Held for the whole command.
+    let _db_writer_lock = crate::db_writer_lock::acquire_or_refuse(
+        &args.db,
+        &args.tenant,
+        "aberp observe-receiver-confirmation",
+    )?;
+
     // 1. Parse + validate CLI args.
     let tenant = TenantId::new(args.tenant.clone()).ok_or_else(|| {
         anyhow!(

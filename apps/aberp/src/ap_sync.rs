@@ -171,6 +171,12 @@ pub struct CycleSummary {
 /// the same.
 pub struct CycleInputs {
     pub db_path: PathBuf,
+    /// H3 (ADR-0099): the ONE shared aberp-db Handle. AP-sync is an in-serve
+    /// daemon, so its audit family (the `IncomingInvoiceSyncCycleCompleted` writer
+    /// + the bootstrap-year sentinel reader) routes through this, not fresh opens.
+    /// `db_path` is retained for the restore-lock file derivation (a sidecar path,
+    /// not a DB open).
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -191,8 +197,11 @@ pub struct CycleInputs {
 /// posture: the hard guarantee is the restore's own per-row idempotency
 /// + the confirm-side lock acquire; this check is contention-avoidance,
 /// not a correctness gate, so a read error degrades to "run the cycle".
-fn restore_lock_held(db_path: &std::path::Path, tenant: &str) -> bool {
-    match crate::restore_from_nav_outgoing::read_restore_lock_at(db_path, tenant) {
+fn restore_lock_held(db: &aberp_db::Handle, tenant: &str) -> bool {
+    // H3 (ADR-0099): the restore-lock probe now reads through the shared Handle
+    // (restore_from_nav migrated). `db_path` is retained on CycleInputs for the
+    // still-unmigrated incoming_invoices ingest path, NOT this probe.
+    match crate::restore_from_nav_outgoing::read_restore_lock_at(db, tenant) {
         Ok(lock) => lock.is_some(),
         Err(e) => {
             tracing::error!(
@@ -253,7 +262,7 @@ where
             return;
         }
         match build_inputs() {
-            Ok(inputs) if restore_lock_held(&inputs.db_path, inputs.tenant.as_str()) => {
+            Ok(inputs) if restore_lock_held(&inputs.db, inputs.tenant.as_str()) => {
                 // S264 / PR-253 (F2) — a restore-from-NAV lock is held
                 // (or a crashed restore left one). A daemon NAV walk
                 // against the same tenant is exactly the parallel
@@ -345,7 +354,7 @@ pub async fn run_one_cycle_for_window(
     // tokio worker pool is not blocked for the duration of the
     // INSERT + chain-verify + mirror-sync. `JoinError` is unified
     // into the existing warn! surface.
-    let audit_inputs_db = inputs.db_path.clone();
+    let audit_inputs_db = inputs.db.clone();
     let audit_inputs_tenant = inputs.tenant.clone();
     let audit_inputs_binary_hash = inputs.binary_hash;
     let audit_inputs_login = inputs.operator_login.clone();
@@ -1092,16 +1101,19 @@ pub fn year_to_date_month_chunks(now_utc: OffsetDateTime) -> Result<Vec<(String,
 /// returns `Ok(false)` so the bootstrap fires once on first launch
 /// after this PR lands.
 fn bootstrap_year_already_recorded(
-    db_path: &std::path::Path,
+    db: &aberp_db::Handle,
     tenant: TenantId,
     binary_hash: BinaryHash,
 ) -> Result<bool> {
-    let ledger = Ledger::open(db_path, tenant, binary_hash).with_context(|| {
-        format!(
-            "open audit ledger at {} for bootstrap-year sentinel scan",
-            db_path.display()
-        )
-    })?;
+    // H3 (ADR-0099): read the sentinel through the shared Handle (coherent with
+    // the writer above). A fresh `Ledger::open` here would read a folded SUBSET
+    // post-checkpoint-disable and could MISS a just-written cycle row — re-running
+    // the bootstrap-year sweep and duplicating the audit event. Same family, same
+    // instance ([[aberp-h3-handle-coherence-model]]).
+    let conn = db
+        .read()
+        .context("acquire shared reader for bootstrap-year sentinel scan")?;
+    let ledger = Ledger::from_connection(conn, tenant, binary_hash);
     let entries = ledger
         .entries()
         .context("read audit-ledger entries to look for prior bootstrap-year row")?;
@@ -1160,7 +1172,7 @@ async fn run_bootstrap_year_once(build_inputs: &(dyn Fn() -> Result<CycleInputs>
     // contention case the restore lock exists to prevent. Skip the whole
     // sweep when a lock is held; the once-per-DB sentinel is NOT recorded
     // on a skip, so the next boot (post-abandon) re-runs it.
-    if restore_lock_held(&inputs.db_path, inputs.tenant.as_str()) {
+    if restore_lock_held(&inputs.db, inputs.tenant.as_str()) {
         tracing::info!(
             "AP bootstrap-year sweep skipped — a restore-from-NAV lock is held; will retry on a \
              future boot once the restore is abandoned or completed"
@@ -1169,11 +1181,7 @@ async fn run_bootstrap_year_once(build_inputs: &(dyn Fn() -> Result<CycleInputs>
     }
 
     // Sentinel check — already done? Skip silently.
-    match bootstrap_year_already_recorded(
-        &inputs.db_path,
-        inputs.tenant.clone(),
-        inputs.binary_hash,
-    ) {
+    match bootstrap_year_already_recorded(&inputs.db, inputs.tenant.clone(), inputs.binary_hash) {
         Ok(true) => {
             tracing::info!("AP bootstrap-year sweep already recorded in audit ledger; skipping");
             return;
@@ -1257,7 +1265,7 @@ async fn run_bootstrap_year_once(build_inputs: &(dyn Fn() -> Result<CycleInputs>
 /// splitting the owned fields out keeps the move ergonomics clean
 /// without a wrapping `Arc<CycleInputs>` clone.
 fn write_cycle_audit_entry_inner(
-    db_path: &std::path::Path,
+    db: &aberp_db::Handle,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator_login: &str,
@@ -1278,15 +1286,17 @@ fn write_cycle_audit_entry_inner(
     let actor = Actor::from_local_cli(session_id, operator_login);
     let ledger_meta = audit_ledger::LedgerMeta::new(tenant.clone(), binary_hash);
 
-    let mut conn = duckdb::Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for AP sync cycle audit entry",
-            db_path.display()
-        )
-    })?;
-    audit_ledger::ensure_schema(&conn)
+    // H3 (ADR-0099): append + chain-verify on the ONE shared Handle (the
+    // verify_chain recipe) instead of a Connection::open write + a fresh
+    // Ledger::open verify/mirror pair. The guard drop runs the lockstep mirror
+    // sync, so the explicit sync_mirror is gone; the verify runs off a try_clone
+    // of the SAME live instance (no reopen → no WAL fold/tear).
+    let mut guard = db
+        .write()
+        .context("acquire shared writer for AP sync cycle audit entry")?;
+    audit_ledger::ensure_schema(&guard)
         .context("ensure audit-ledger schema for AP sync cycle audit entry")?;
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin DuckDB transaction (AP sync cycle audit entry)")?;
     audit_ledger::append_in_tx(
@@ -1300,17 +1310,15 @@ fn write_cycle_audit_entry_inner(
     .map_err(|e| anyhow!("audit_ledger::append_in_tx IncomingInvoiceSyncCycleCompleted: {e}"))?;
     tx.commit()
         .context("commit DuckDB transaction (AP sync cycle audit entry)")?;
-    drop(conn);
-
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to verify chain after AP sync cycle entry")?;
-    ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER AP sync cycle entry")?;
-    let mirror_path = audit_ledger::mirror_path_for(db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after AP sync cycle entry")?;
+    audit_ledger::Ledger::from_connection(
+        guard
+            .try_clone()
+            .context("try_clone shared handle for post-cycle chain verify")?,
+        tenant,
+        binary_hash,
+    )
+    .verify_chain()
+    .context("audit-ledger chain verification failed AFTER AP sync cycle entry")?;
     Ok(())
 }
 
@@ -1399,15 +1407,31 @@ mod tests {
         let db_path = dir.join("tenant.duckdb");
         let tenant = "test-tenant";
 
+        // H3 (ADR-0099): mirror serve boot — ensure the restore schema on a
+        // SEPARATE connection BEFORE the Handle opens, so a fresh Handle open
+        // observes the on-disk `restore_lock` table (Q3 coherence) and the
+        // read-path probe (`read_restore_lock_at`, which no longer ensures
+        // schema) reads an EMPTY table, not a missing one. Without this the first
+        // assertion would pass vacuously via the probe's fail-open path.
+        {
+            let conn = duckdb::Connection::open(&db_path).expect("open for boot schema");
+            crate::restore_from_nav_outgoing::ensure_schema(&conn).expect("ensure restore schema");
+        }
+        let handle = aberp_db::Handle::open_default(
+            &db_path,
+            TenantId::new(tenant.to_string()).expect("tenant id"),
+        )
+        .expect("open shared handle");
+
         // No restore in progress → the daemon is free to run.
         assert!(
-            !restore_lock_held(&db_path, tenant),
+            !restore_lock_held(&handle, tenant),
             "fresh DB has no restore lock"
         );
 
         // A held restore lock must defer the cycle.
         crate::restore_from_nav_outgoing::acquire_restore_lock_at(
-            &db_path,
+            &handle,
             tenant,
             "ervin",
             2026,
@@ -1415,15 +1439,15 @@ mod tests {
         )
         .expect("acquire restore lock");
         assert!(
-            restore_lock_held(&db_path, tenant),
+            restore_lock_held(&handle, tenant),
             "a held restore lock must gate AP-sync"
         );
 
         // Abandoning the lock re-opens AP-sync.
-        crate::restore_from_nav_outgoing::release_restore_lock_at(&db_path, tenant)
+        crate::restore_from_nav_outgoing::release_restore_lock_at(&handle, tenant)
             .expect("release restore lock");
         assert!(
-            !restore_lock_held(&db_path, tenant),
+            !restore_lock_held(&handle, tenant),
             "released lock must un-gate AP-sync"
         );
 

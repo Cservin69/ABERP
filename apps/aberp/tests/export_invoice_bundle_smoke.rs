@@ -18,16 +18,21 @@ use aberp_billing::IdempotencyKey;
 const TEST_BINARY_HASH: BinaryHash = BinaryHash::from_bytes([0xAB; 32]);
 
 fn temp_path(tag: &str, ext: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "aberp-bundle-smoke-{}-{}-{:?}-{}.{}",
+    // Each path lives in its OWN unique dir. The whole-DB writer flock (F-E) that
+    // export-invoice-bundle now acquires keys on `<db-parent-dir>.<tenant>`, and
+    // every case here shares the `tenant-bundle-smoke` tenant; a shared parent dir
+    // would make cargo's parallel test runner collide on one lock file. A unique
+    // parent per db keeps the cases isolated (also better hygiene generally).
+    let mut dir = std::env::temp_dir();
+    dir.push(format!(
+        "aberp-bundle-smoke-{}-{}-{:?}-{}",
         std::process::id(),
         tag,
         std::thread::current().id(),
         ulid::Ulid::new(),
-        ext,
     ));
-    p
+    std::fs::create_dir_all(&dir).expect("create unique test dir");
+    dir.join(format!("{tag}.{ext}"))
 }
 
 fn seed_ledger(db_path: &std::path::Path, invoice_id: &str) {
@@ -432,5 +437,48 @@ fn run_loud_fails_on_invoice_with_no_entries() {
     );
 
     // Cleanup.
+    let _ = std::fs::remove_file(&db);
+}
+
+/// F-E coherence guarantee, pinned permanently: export-invoice-bundle's CHECK N
+/// read-fork exemption is EARNED by the whole-DB writer flock, not by being a CLI.
+/// While another writer (stand-in for a running `aberp serve`) holds the lock, the
+/// export must REFUSE — otherwise its fresh `Ledger::open` would read a stale
+/// main-file audit head (aberp-db's single-writer is a process-local Mutex and
+/// cannot fence this separate process) and export an incomplete bundle. This is
+/// the same-process contention the db_writer_lock unit test proves, applied to the
+/// actual export path (the experiment that showed the CLI exemption is sound only
+/// under the flock, landed as a test rather than a transcript).
+#[test]
+fn run_refuses_while_the_whole_db_writer_lock_is_held() {
+    let db = temp_path("db", "duckdb");
+    let out = temp_path("bundle", "tar.zst");
+    let invoice_id = "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    seed_ledger(&db, invoice_id);
+
+    // Stand-in for a running `serve`: hold the whole-DB writer lock for `db`.
+    let _held = aberp::db_writer_lock::try_acquire(&db, "tenant-bundle-smoke")
+        .expect("acquire ok")
+        .expect("stand-in serve must get the lock");
+
+    let args = ExportInvoiceBundleArgs {
+        invoice_id: invoice_id.to_string(),
+        out: out.clone(),
+        allow_overwrite: false,
+        db: db.clone(),
+        tenant: "tenant-bundle-smoke".to_string(),
+    };
+    let err = aberp::export_invoice_bundle::run(&args)
+        .expect_err("export MUST refuse while the whole-DB writer lock is held");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("single-writer") || msg.contains("already running"),
+        "refusal must cite the single-writer rule (not silently read a stale head): {msg}"
+    );
+    assert!(
+        !out.exists(),
+        "no bundle may be written when the export refuses"
+    );
+
     let _ = std::fs::remove_file(&db);
 }

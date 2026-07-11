@@ -759,6 +759,18 @@ pub enum EventKind {
     /// no NAV bytes. F12 four-edit ritual fires once.
     DaemonShutdownCompleted,
 
+    /// ADR-0099 H3 (PROD-HARDEN-2027) — a durability auto-recovery event. In
+    /// H3 the shared `aberp_db::Handle` emits this (trigger
+    /// `writer_poison_recovered`) after it heals a POISONED process-wide writer
+    /// mutex in place (`clear_poison` + drop/reopen + a post-poison audit
+    /// hash-chain re-verify that PASSED), so a single daemon panic no longer
+    /// bricks every write path. Payload (`DbAutoRecoveredPayload`) carries the
+    /// trigger, source snapshot seq, replay range, and recovered head seq; the
+    /// boot/CLI auto-recovery engine (H4/ADR-0095) reuses the same kind. `db.*`
+    /// prefix — a system/durability event, app-layer JSON only (never NAV XML),
+    /// never swept into a per-invoice export bundle. F12 four-edit ritual fires.
+    DbAutoRecovered,
+
     /// S220 / PR-217 — the buyer-backfill cycle completed one pass.
     /// The boot-time backfill walks restored_invoice rows with a
     /// NULL `customer_name` and tries to fetch buyer fields via NAV's
@@ -3141,6 +3153,7 @@ impl EventKind {
             EventKind::InvoiceRestoredFromNav => "system.invoice_restored_from_nav",
             EventKind::QuoteIntakePollCompleted => "system.quote_intake_poll_completed",
             EventKind::DaemonShutdownCompleted => "system.daemon_shutdown_completed",
+            EventKind::DbAutoRecovered => "db.auto_recovered",
             EventKind::RestoreBuyerBackfillCycleCompleted => {
                 "system.restore_buyer_backfill_cycle_completed"
             }
@@ -3359,6 +3372,7 @@ impl EventKind {
             "system.invoice_restored_from_nav" => Ok(EventKind::InvoiceRestoredFromNav),
             "system.quote_intake_poll_completed" => Ok(EventKind::QuoteIntakePollCompleted),
             "system.daemon_shutdown_completed" => Ok(EventKind::DaemonShutdownCompleted),
+            "db.auto_recovered" => Ok(EventKind::DbAutoRecovered),
             "system.restore_buyer_backfill_cycle_completed" => {
                 Ok(EventKind::RestoreBuyerBackfillCycleCompleted)
             }
@@ -3568,6 +3582,7 @@ impl EventKind {
         EventKind::InvoiceRestoredFromNav,
         EventKind::QuoteIntakePollCompleted,
         EventKind::DaemonShutdownCompleted,
+        EventKind::DbAutoRecovered,
         EventKind::RestoreBuyerBackfillCycleCompleted,
         EventKind::RestoreFromNavRun,
         EventKind::ExtNavPartnerManualLink,
@@ -3781,6 +3796,7 @@ mod tests {
             EventKind::InvoiceRestoredFromNav,
             EventKind::QuoteIntakePollCompleted,
             EventKind::DaemonShutdownCompleted,
+            EventKind::DbAutoRecovered,
             EventKind::RestoreBuyerBackfillCycleCompleted,
             EventKind::ExtNavPartnerManualLink,
             EventKind::RestoreFromNavRun,
@@ -3975,7 +3991,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            186,
+            187,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \

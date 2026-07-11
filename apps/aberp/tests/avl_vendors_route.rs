@@ -32,6 +32,8 @@ fn test_dir(label: &str) -> PathBuf {
 fn build_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     AppState {
+        db: aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+            .expect("test: open shared aberp-db Handle"),
         db_path: Arc::new(db_path),
         tenant,
         nav_enabled: true,
@@ -443,8 +445,11 @@ fn boot_overdue_scan_fires_avl_screening_overdue_exactly_once() {
     .expect("revoke");
 
     let now = time::OffsetDateTime::now_utc();
+    // The scan runs on the SAME shared Handle the CRUD above wrote through, so
+    // the whole flow is single-instance (no interleaved separate open to tear
+    // the ledger); the fresh `ledger_kinds` read-back below then sees every row.
     let fired = aberp::avl_vendors::fire_overdue_screening_reminders(
-        &db,
+        &state.db,
         tenant.clone(),
         TEST_HASH,
         "boot",

@@ -100,6 +100,11 @@ const PANIC_LONG_BACKOFF: Duration = Duration::from_secs(5 * 60);
 #[derive(Clone)]
 pub struct QuotePdfRerenderDaemonDeps {
     pub db_path: PathBuf,
+    /// H3 (ADR-0099): the ONE shared aberp-db Handle. This in-serve daemon's audit
+    /// family (`write_audit` + the boot `recover_unfinished_rerenders` reader)
+    /// routes through it. `db_path` stays for the business `prepare_rerender` read
+    /// (a separate, all-fresh-open family).
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -151,16 +156,18 @@ pub fn is_disabled() -> bool {
 /// re-enqueue it implies was also lost on the crash, so the banner is
 /// still undelivered and must be recovered. Returns the count re-enqueued.
 pub fn recover_unfinished_rerenders(
-    db_path: &std::path::Path,
+    db: &aberp_db::Handle,
     tenant: &TenantId,
     queue: &QuotePdfRerenderQueue,
 ) -> Result<usize> {
-    let conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DB for pdf-rerender boot recovery at {}",
-            db_path.display()
-        )
-    })?;
+    // H3 (ADR-0099): read the rerender audit stream through the shared Handle. A
+    // fresh Connection::open would read a folded SUBSET post-checkpoint-disable and
+    // mis-rebuild the outstanding set (same family as write_audit below —
+    // [[aberp-h3-handle-coherence-model]]). A brief write guard also ensures the
+    // schema, since boot may run recovery before any audit write has happened.
+    let conn = db
+        .write()
+        .context("acquire shared writer for pdf-rerender boot recovery")?;
     aberp_audit_ledger::ensure_schema(&conn)
         .context("ensure audit schema for pdf-rerender boot recovery")?;
     let mut stmt = conn.prepare(
@@ -734,16 +741,20 @@ async fn write_audit(
     kind: EventKind,
     payload: serde_json::Value,
 ) {
-    let db_path = deps.db_path.clone();
+    let db = deps.db.clone();
     let tenant = deps.tenant.clone();
     let binary_hash = deps.binary_hash;
     let login = deps.operator_login.clone();
     let kind_label = kind.as_str();
     let res = spawn_blocking(move || -> Result<()> {
+        // H3 (ADR-0099): append through the ONE shared Handle; guard-drop
+        // lockstep-syncs the mirror.
         let bytes = serde_json::to_vec(&payload).context("serialize pdf-rerender payload")?;
-        let mut conn = Connection::open(&db_path).context("open DB for pdf-rerender audit")?;
-        aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
-        let tx = conn.transaction().context("begin pdf-rerender audit tx")?;
+        let mut guard = db
+            .write()
+            .context("acquire shared writer for pdf-rerender audit")?;
+        aberp_audit_ledger::ensure_schema(&guard).context("ensure audit schema")?;
+        let tx = guard.transaction().context("begin pdf-rerender audit tx")?;
         let meta = LedgerMeta::new(tenant, binary_hash);
         let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
         append_in_tx(&tx, &meta, kind, bytes, actor, None).context("append pdf-rerender audit")?;
@@ -1212,8 +1223,11 @@ mod tests {
             "https://abenerp.com".to_string(),
             zeroize::Zeroizing::new("bearer-X".to_string()),
         );
+        let db = aberp_db::Handle::open_default(&db_path, TenantId::new("t1").unwrap())
+            .expect("test: open shared aberp-db Handle");
         QuotePdfRerenderDaemonDeps {
             db_path,
+            db,
             tenant: TenantId::new("t1").unwrap(),
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
             operator_login: "op".to_string(),
@@ -1493,8 +1507,11 @@ mod tests {
         );
 
         let queue = QuotePdfRerenderQueue::new();
+        // H3: the Handle opens AFTER the seeding above, so it sees those rows (Q1,
+        // h3_handle_coherence_model); recover then reads its own family via the Handle.
+        let handle = aberp_db::Handle::open_default(&db, TenantId::new("t1").unwrap()).unwrap();
         let recovered =
-            recover_unfinished_rerenders(&db, &TenantId::new("t1").unwrap(), &queue).unwrap();
+            recover_unfinished_rerenders(&handle, &TenantId::new("t1").unwrap(), &queue).unwrap();
 
         assert_eq!(recovered, 2, "only q3 (transient) + q4 (no terminal)");
         assert!(!queue.contains("q1"), "delivered quote not replayed");
@@ -1518,8 +1535,11 @@ mod tests {
         append_rr_event(&db, "t1", EventKind::QuotePdfRerenderEnqueued, "q5", None);
 
         let queue = QuotePdfRerenderQueue::new();
+        // H3: the Handle opens AFTER the seeding above, so it sees those rows (Q1,
+        // h3_handle_coherence_model); recover then reads its own family via the Handle.
+        let handle = aberp_db::Handle::open_default(&db, TenantId::new("t1").unwrap()).unwrap();
         let recovered =
-            recover_unfinished_rerenders(&db, &TenantId::new("t1").unwrap(), &queue).unwrap();
+            recover_unfinished_rerenders(&handle, &TenantId::new("t1").unwrap(), &queue).unwrap();
         assert_eq!(recovered, 1);
         assert!(
             queue.contains("q5"),

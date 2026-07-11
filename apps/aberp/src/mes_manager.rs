@@ -52,7 +52,6 @@ use aberp_mes::{
     AdapterConfigFieldError, AdapterHealth, AdapterKind, AdapterRegistry, LedgerWriterActor,
     LedgerWriterDeps,
 };
-use duckdb::Connection;
 
 use crate::mes_adapters_config;
 use crate::mes_boot::MesBootDeps;
@@ -442,11 +441,17 @@ impl AdapterManager {
             AdapterMutationError::Io(anyhow!("serialize adapter audit payload: {e}"))
         })?;
         let actor = Actor::from_local_cli(Ulid::new().to_string(), &deps.operator_login);
-        let mut conn = Connection::open(&deps.db_path)
-            .map_err(|e| AdapterMutationError::Io(anyhow!("open DuckDB for adapter audit: {e}")))?;
-        aberp_audit_ledger::ensure_schema(&conn)
+        // H3 (ADR-0099): route through the ONE shared Handle instead of an
+        // independent Connection::open write-fork; guard drop lockstep-syncs.
+        let mut guard = deps.db.write().map_err(|e| {
+            AdapterMutationError::Io(anyhow!("shared writer for adapter audit: {e}"))
+        })?;
+        // Idempotent (kept from the pre-H3 audit path): a Handle opened on a DB
+        // whose audit schema was not boot-ensured (e.g. a test fixture) still
+        // gets the table. Runs on the shared writer, so no separate opener.
+        aberp_audit_ledger::ensure_schema(&guard)
             .map_err(|e| AdapterMutationError::Io(anyhow!("ensure audit schema: {e}")))?;
-        let tx = conn
+        let tx = guard
             .transaction()
             .map_err(|e| AdapterMutationError::Io(anyhow!("begin audit tx: {e}")))?;
         let meta = aberp_audit_ledger::LedgerMeta::new(deps.tenant.clone(), deps.binary_hash);
@@ -575,6 +580,11 @@ mod tests {
 
     fn test_deps(dir: &Path) -> MesBootDeps {
         MesBootDeps {
+            db: aberp_db::Handle::open_default(
+                &dir.join("test.duckdb"),
+                TenantId::new("tenant-test").unwrap(),
+            )
+            .expect("test: open shared handle"),
             db_path: dir.join("test.duckdb"),
             tenant: TenantId::new("tenant-test").unwrap(),
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
