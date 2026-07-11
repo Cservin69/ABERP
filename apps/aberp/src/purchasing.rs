@@ -34,8 +34,9 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
 use aberp_compliance::avl::ApprovedStatus;
+use aberp_db::{HandleArc, WriteGuard};
 
 // ── Closed-vocab state enum ─────────────────────────────────────────
 
@@ -614,7 +615,7 @@ fn resolve_avl(
 /// vendor is refused here ([[trust-code-not-operator]]) and fires the S431
 /// `supplier.po_blocked_by_vendor_status` kind.
 pub fn create_po(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -660,15 +661,19 @@ pub fn create_po(
     let now = now_rfc3339();
     let year = OffsetDateTime::now_utc().year();
 
+    // ADR-0099 H3 — the AVL gate read, the PO persist tx, and every audit append
+    // all ride the ONE shared Handle writer guard (no fresh-open truncator).
+    let mut guard = db
+        .write()
+        .map_err(|e| PoError::Other(anyhow::anyhow!("shared writer for PO create: {e}")))?;
+    ensure_schema(&guard)?;
+
     // ── AVL gate ([[trust-code-not-operator]]). A Suspended/Revoked vendor is
     //    refused before any number is burned; the snapshot of an allowed
     //    status rides onto the PO.
     let avl_snapshot: Option<String> = {
-        let conn = Connection::open(db_path)
-            .map_err(|e| PoError::Other(anyhow::anyhow!("open DuckDB for AVL gate: {e}")))?;
-        match resolve_avl(&conn, tenant.as_str(), input.vendor_partner_id.trim())? {
+        match resolve_avl(&guard, tenant.as_str(), input.vendor_partner_id.trim())? {
             Some((vendor, status)) if status.blocks_po() => {
-                drop(conn);
                 let payload = serde_json::json!({
                     "vendor_id": vendor.id,
                     "partner_id": vendor.partner_id,
@@ -676,7 +681,7 @@ pub fn create_po(
                     "attempted_at_utc": now,
                 });
                 append_event(
-                    db_path,
+                    &mut guard,
                     tenant.clone(),
                     binary_hash,
                     operator,
@@ -698,10 +703,7 @@ pub fn create_po(
     let po_number;
     let mut lines_persisted: Vec<PoLine> = Vec::with_capacity(prepared.len());
     {
-        let mut conn = Connection::open(db_path)
-            .map_err(|e| PoError::Other(anyhow::anyhow!("open DuckDB for PO create: {e}")))?;
-        ensure_schema(&conn)?;
-        let tx = conn.transaction().context("begin PO create transaction")?;
+        let tx = guard.transaction().context("begin PO create transaction")?;
         po_number = reserve_po_number(&tx, tenant.as_str(), year, &now)?;
         tx.execute(
             "INSERT INTO purchase_orders (po_id, tenant_id, po_number, vendor_partner_id, currency, \
@@ -777,9 +779,9 @@ pub fn create_po(
         tx.commit().context("commit PO create transaction")?;
     }
 
-    // ── Audit (after the write conn drops — DuckDB single-writer rule).
+    // ── Audit (on the same shared writer guard, after the persist tx committed).
     append_event(
-        db_path,
+        &mut guard,
         tenant.clone(),
         binary_hash,
         operator,
@@ -800,7 +802,7 @@ pub fn create_po(
     )?;
     for l in &lines_persisted {
         append_event(
-            db_path,
+            &mut guard,
             tenant.clone(),
             binary_hash,
             operator,
@@ -819,7 +821,7 @@ pub fn create_po(
         )?;
     }
 
-    reread_po(db_path, tenant, &po_id)
+    reread_po(&guard, tenant.as_str(), &po_id)
 }
 
 /// Apply an operator-driven PO transition (issue / cancel / close). Validates the
@@ -827,7 +829,7 @@ pub fn create_po(
 /// `approved_by_operator` and re-checks the live AVL status
 /// ([[trust-code-not-operator]]). Fires the matching `po.*` event.
 pub fn transition_po(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -836,13 +838,14 @@ pub fn transition_po(
     approved_by_operator: Option<&str>,
 ) -> std::result::Result<PurchaseOrder, PoError> {
     let now = now_rfc3339();
-    // Load + validate + (for issue) AVL re-check, then write, all under a scoped
-    // conn so the audit append opens its own writer afterward.
+    // ADR-0099 H3 — load + validate + (for issue) AVL re-check + write + audit all
+    // on the ONE shared Handle writer guard.
+    let mut guard = db
+        .write()
+        .map_err(|e| PoError::Other(anyhow::anyhow!("shared writer for PO transition: {e}")))?;
+    ensure_schema(&guard)?;
     let (from, po_number, vendor_partner_id, approver) = {
-        let conn = Connection::open(db_path)
-            .map_err(|e| PoError::Other(anyhow::anyhow!("open DuckDB for PO transition: {e}")))?;
-        ensure_schema(&conn)?;
-        let Some(po) = get_po(&conn, tenant.as_str(), po_id)? else {
+        let Some(po) = get_po(&guard, tenant.as_str(), po_id)? else {
             return Err(PoError::NotFound(po_id.to_string()));
         };
         let from = po.state;
@@ -868,7 +871,8 @@ pub fn transition_po(
                 })?;
             // Re-check the live AVL status — a vendor suspended/revoked AFTER
             // create, or still Pending approval, blocks the issue.
-            if let Some((_, status)) = resolve_avl(&conn, tenant.as_str(), &po.vendor_partner_id)? {
+            if let Some((_, status)) = resolve_avl(&guard, tenant.as_str(), &po.vendor_partner_id)?
+            {
                 if status.blocks_po() {
                     return Err(PoError::BlockedByVendorStatus {
                         partner_id: po.vendor_partner_id.clone(),
@@ -886,10 +890,13 @@ pub fn transition_po(
         } else {
             None
         };
-        // Apply the write.
+        // Apply the write under one tx on the shared writer.
+        let tx = guard
+            .transaction()
+            .context("begin PO transition transaction")?;
         match to {
             PoState::IssuedToVendor => {
-                conn.execute(
+                tx.execute(
                     "UPDATE purchase_orders SET state = 'issued_to_vendor', issued_at_utc = ?3, \
                      approved_by_operator = ?4, approved_at_utc = ?3 \
                      WHERE tenant_id = ?1 AND po_id = ?2",
@@ -898,19 +905,20 @@ pub fn transition_po(
                 .context("update po (issued)")?;
             }
             _ => {
-                conn.execute(
+                tx.execute(
                     "UPDATE purchase_orders SET state = ?3 WHERE tenant_id = ?1 AND po_id = ?2",
                     params![tenant.as_str(), po_id, to.as_db_str()],
                 )
                 .context("update po state")?;
             }
         }
+        tx.commit().context("commit PO transition transaction")?;
         (from, po.po_number, po.vendor_partner_id, approver)
     };
 
     match to {
         PoState::IssuedToVendor => append_event(
-            db_path,
+            &mut guard,
             tenant.clone(),
             binary_hash,
             operator,
@@ -924,7 +932,7 @@ pub fn transition_po(
             }),
         )?,
         PoState::Cancelled => append_event(
-            db_path,
+            &mut guard,
             tenant.clone(),
             binary_hash,
             operator,
@@ -938,7 +946,7 @@ pub fn transition_po(
             }),
         )?,
         PoState::Closed => append_event(
-            db_path,
+            &mut guard,
             tenant.clone(),
             binary_hash,
             operator,
@@ -953,7 +961,7 @@ pub fn transition_po(
         _ => unreachable!("allowed_transition only permits issue/cancel/close as targets"),
     }
 
-    reread_po(db_path, tenant, po_id)
+    reread_po(&guard, tenant.as_str(), po_id)
 }
 
 /// One operator-supplied receipt line.
@@ -981,7 +989,7 @@ pub struct NewReceipt {
 /// line whose `inspection_pass == false` ([[trust-code-not-operator]] — a failed
 /// delivery cannot be received without a quality record).
 pub fn record_receipt(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -1004,11 +1012,16 @@ pub fn record_receipt(
         heat_lot: Option<String>,
         line_description: String,
     }
+    // ADR-0099 H3 — read + receipt-write + PO/line audit + the auto-NCR (S439)
+    // all ride the ONE shared Handle writer guard. create_ncr is called BELOW
+    // with `&mut guard` (never a nested `db.write()`), the whole point of its
+    // passed-in-guard contract.
+    let mut guard = db
+        .write()
+        .map_err(|e| PoError::Other(anyhow::anyhow!("shared writer for PO receipt: {e}")))?;
+    ensure_schema(&guard)?;
     let (po_number, vendor_partner_id, applied, new_state) = {
-        let mut conn = Connection::open(db_path)
-            .map_err(|e| PoError::Other(anyhow::anyhow!("open DuckDB for PO receipt: {e}")))?;
-        ensure_schema(&conn)?;
-        let Some(po) = get_po(&conn, tenant.as_str(), po_id)? else {
+        let Some(po) = get_po(&guard, tenant.as_str(), po_id)? else {
             return Err(PoError::NotFound(po_id.to_string()));
         };
         if !po.state.accepts_receipt() {
@@ -1017,7 +1030,7 @@ pub fn record_receipt(
                 po.state.as_db_str()
             )));
         }
-        let mut lines = list_po_lines(&conn, tenant.as_str(), po_id)?;
+        let mut lines = list_po_lines(&guard, tenant.as_str(), po_id)?;
 
         // Validate each receipt line against the live line set.
         let mut applied: Vec<AppliedReceipt> = Vec::new();
@@ -1066,8 +1079,11 @@ pub fn record_receipt(
             ));
         }
 
-        // Write the receipt rows + advance the line counters under one tx.
-        let tx = conn.transaction().context("begin PO receipt transaction")?;
+        // Write the receipt rows + advance the line counters under one tx on the
+        // shared writer.
+        let tx = guard
+            .transaction()
+            .context("begin PO receipt transaction")?;
         for a in &applied {
             tx.execute(
                 "INSERT INTO purchase_order_receipts (por_id, po_id, pol_id, tenant_id, \
@@ -1112,7 +1128,7 @@ pub fn record_receipt(
 
     let any_failed = applied.iter().any(|a| !a.inspection_pass);
     append_event(
-        db_path,
+        &mut guard,
         tenant.clone(),
         binary_hash,
         operator,
@@ -1128,8 +1144,10 @@ pub fn record_receipt(
         }),
     )?;
 
-    // Auto-NCR for each failed inspection (S439). create_ncr opens its own conn,
-    // so this runs after the receipt tx has committed.
+    // Auto-NCR for each failed inspection (S439). create_ncr rides the SAME shared
+    // writer guard (passed in as `&mut guard`) — the receipt tx above already
+    // committed, so no tx is open when it mints the NCR, and it never re-acquires
+    // `db.write()` (the re-entrancy self-deadlock this migration eliminates).
     for a in applied.iter().filter(|a| !a.inspection_pass) {
         let description = format!(
             "Bejövő ellenőrzés FAIL — PO {po_number} tétel „{}” (beszállító {vendor_partner_id}): {} / \
@@ -1140,7 +1158,7 @@ pub fn record_receipt(
             a.inspection_notes,
         );
         let ncr = crate::quality::create_ncr(
-            db_path,
+            &mut guard,
             tenant.clone(),
             binary_hash,
             operator,
@@ -1158,18 +1176,20 @@ pub fn record_receipt(
             crate::quality::QualityError::Other(e) => PoError::Other(e),
             other => PoError::Other(anyhow::anyhow!("auto-NCR failed: {other}")),
         })?;
-        // Stamp the receipt row with its NCR id.
+        // Stamp the receipt row with its NCR id (business tx on the same guard).
         {
-            let conn = Connection::open(db_path)
-                .map_err(|e| PoError::Other(anyhow::anyhow!("reopen DuckDB to link NCR: {e}")))?;
-            conn.execute(
+            let tx = guard
+                .transaction()
+                .context("begin receipt→NCR link transaction")?;
+            tx.execute(
                 "UPDATE purchase_order_receipts SET ncr_id = ?3 WHERE tenant_id = ?1 AND por_id = ?2",
                 params![tenant.as_str(), a.por_id, ncr.ncr_id],
             )
             .context("link receipt row to NCR")?;
+            tx.commit().context("commit receipt→NCR link transaction")?;
         }
         append_event(
-            db_path,
+            &mut guard,
             tenant.clone(),
             binary_hash,
             operator,
@@ -1193,7 +1213,7 @@ pub fn record_receipt(
         _ => EventKind::PoPartiallyReceived,
     };
     append_event(
-        db_path,
+        &mut guard,
         tenant.clone(),
         binary_hash,
         operator,
@@ -1206,39 +1226,45 @@ pub fn record_receipt(
         }),
     )?;
 
-    reread_po(db_path, tenant, po_id)
+    reread_po(&guard, tenant.as_str(), po_id)
 }
 
 fn reread_po(
-    db_path: &std::path::Path,
-    tenant: TenantId,
+    conn: &Connection,
+    tenant: &str,
     po_id: &str,
 ) -> std::result::Result<PurchaseOrder, PoError> {
-    let conn = Connection::open(db_path)
-        .map_err(|e| PoError::Other(anyhow::anyhow!("reopen DuckDB: {e}")))?;
-    get_po(&conn, tenant.as_str(), po_id)?.ok_or_else(|| PoError::NotFound(po_id.to_string()))
+    get_po(conn, tenant, po_id)?.ok_or_else(|| PoError::NotFound(po_id.to_string()))
 }
 
-/// Open a fresh `Ledger` (after the read/write conn drops — DuckDB single-writer
-/// rule) and append one purchasing audit entry.
+/// Append one purchasing audit entry through the shared Handle's PASSED-IN write
+/// guard (ADR-0099 H3) — a short tx on the same serialized writer the caller
+/// already holds, so no fresh-open truncator and no nested `db.write()`.
 fn append_event(
-    db_path: &std::path::Path,
+    guard: &mut WriteGuard<'_>,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
     kind: EventKind,
     payload: serde_json::Value,
 ) -> Result<()> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record purchasing event")?;
-    ledger
-        .append(
-            kind,
-            serde_json::to_vec(&payload).expect("serialize purchasing payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator),
-            None,
-        )
-        .context("append purchasing audit entry")?;
+    aberp_audit_ledger::ensure_schema(guard)
+        .context("ensure audit-ledger schema for purchasing event")?;
+    let tx = guard
+        .transaction()
+        .context("begin DuckDB transaction for purchasing event")?;
+    let meta = LedgerMeta::new(tenant, binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        kind,
+        serde_json::to_vec(&payload).expect("serialize purchasing payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("append purchasing audit entry: {e}"))?;
+    tx.commit()
+        .context("commit DuckDB transaction for purchasing event")?;
     Ok(())
 }
 

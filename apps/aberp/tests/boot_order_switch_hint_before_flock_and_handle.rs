@@ -56,8 +56,9 @@ fn switch_hint_resolves_before_flock_and_handle_open() {
     let switch_hint = find_after(src, "resolve_effective_serve_args(args);", run_start).expect(
         "run() must call resolve_effective_serve_args(args) — the S433 switch-hint override",
     );
-    let rebind = find_after(src, "let args = &effective;", run_start)
-        .expect("run() must rebind `args` to the switched-to `effective` args after the switch-hint");
+    let rebind = find_after(src, "let args = &effective;", run_start).expect(
+        "run() must rebind `args` to the switched-to `effective` args after the switch-hint",
+    );
     let flock = find_after(src, "acquire_or_refuse(", run_start).expect(
         "run() must acquire the whole-DB writer flock (db_writer_lock::acquire_or_refuse, F-E)",
     );

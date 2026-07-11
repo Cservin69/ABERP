@@ -47,6 +47,13 @@ fn setup() -> Fixture {
     }
 }
 
+/// A fresh shared Handle on the fixture DB. Opened per call, AFTER any seed
+/// connection has closed, so it observes the committed state coherently
+/// (ADR-0099 H3 — the migrated purchasing/quality fns route through this).
+fn open_handle(fx: &Fixture) -> aberp_db::HandleArc {
+    aberp::serve::open_tenant_handle(&fx.db_path, fx.tenant.clone()).unwrap()
+}
+
 /// Seed an AVL vendor at a given status for a partner id (the string the PO
 /// references — no partner row is needed, the gate matches by partner_id).
 fn seed_vendor(fx: &Fixture, partner_id: &str, status: &str) {
@@ -110,7 +117,7 @@ fn full_procurement_journey_approved_vendor() {
     seed_vendor(&fx, "ptn_approved", "approved");
 
     let po = create_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -130,7 +137,7 @@ fn full_procurement_journey_approved_vendor() {
 
     // Issue requires an approver.
     let err = transition_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -142,7 +149,7 @@ fn full_procurement_journey_approved_vendor() {
     assert!(matches!(err, PoError::Invalid(_)), "{err:?}");
 
     let issued = transition_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -164,7 +171,7 @@ fn full_procurement_journey_approved_vendor() {
 
     // Receive PART of the bar (4 of 10), passing inspection, with a heat lot.
     let after_partial = record_receipt(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "receiver",
@@ -187,7 +194,7 @@ fn full_procurement_journey_approved_vendor() {
 
     // Receive the REMAINING bar (6) + all fasteners (4) → fully received.
     let after_full = record_receipt(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "receiver",
@@ -218,7 +225,7 @@ fn full_procurement_journey_approved_vendor() {
 
     // Close.
     let closed = transition_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -244,7 +251,7 @@ fn avl_gate_per_status() {
 
     // Suspended → refused at create; PoBlockedByVendorStatus fires.
     let err = create_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -258,7 +265,7 @@ fn avl_gate_per_status() {
 
     // Revoked → refused at create.
     let err = create_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -277,7 +284,7 @@ fn avl_gate_per_status() {
 
     // Pending → create OK (Draft) but issue refused (needs approval first).
     let pending = create_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -286,7 +293,7 @@ fn avl_gate_per_status() {
     .unwrap();
     assert_eq!(pending.vendor_avl_status.as_deref(), Some("pending"));
     let err = transition_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -299,7 +306,7 @@ fn avl_gate_per_status() {
 
     // Conditional → create OK with snapshot, issue OK (flagged yellow in SPA).
     let cond = create_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -308,7 +315,7 @@ fn avl_gate_per_status() {
     .unwrap();
     assert_eq!(cond.vendor_avl_status.as_deref(), Some("conditional"));
     let issued = transition_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -321,7 +328,7 @@ fn avl_gate_per_status() {
 
     // Unlisted partner → no AVL row, no friction; snapshot is None.
     let unlisted = create_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -330,7 +337,7 @@ fn avl_gate_per_status() {
     .unwrap();
     assert_eq!(unlisted.vendor_avl_status, None);
     transition_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -348,7 +355,7 @@ fn failed_inspection_auto_creates_ncr() {
     let fx = setup();
     seed_vendor(&fx, "ptn_approved", "approved");
     let po = create_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -356,7 +363,7 @@ fn failed_inspection_auto_creates_ncr() {
     )
     .unwrap();
     transition_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -371,7 +378,7 @@ fn failed_inspection_auto_creates_ncr() {
 
     // Receive the bar but FAIL inspection.
     record_receipt(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "receiver",
@@ -413,7 +420,7 @@ fn heat_lot_required_on_receipt() {
     let fx = setup();
     seed_vendor(&fx, "ptn_approved", "approved");
     let po = create_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -421,7 +428,7 @@ fn heat_lot_required_on_receipt() {
     )
     .unwrap();
     transition_po(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -436,7 +443,7 @@ fn heat_lot_required_on_receipt() {
 
     // No heat lot on the required line → refused.
     let err = record_receipt(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "receiver",
@@ -457,7 +464,7 @@ fn heat_lot_required_on_receipt() {
 
     // With a heat lot → accepted.
     record_receipt(
-        &fx.db_path,
+        &open_handle(&fx),
         fx.tenant.clone(),
         fx.hash,
         "receiver",
@@ -485,7 +492,7 @@ fn po_numbers_are_sequential_through_create() {
     let mut numbers = Vec::new();
     for _ in 0..3 {
         let po = create_po(
-            &fx.db_path,
+            &open_handle(&fx),
             fx.tenant.clone(),
             fx.hash,
             "buyer",

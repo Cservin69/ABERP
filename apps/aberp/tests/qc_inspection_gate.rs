@@ -162,8 +162,10 @@ fn major_inspection_auto_ncr_blocks_defense_shipment() {
 
     // Operator records 10.025 mm against nominal 10.0 ±0.010 → overage
     // 0.015, ratio 1.5× half-width → MAJOR (verdict computed in code).
+    // ADR-0099 H3 — record through the shared Handle (opened fresh here, after the
+    // seed connections above have closed, so it observes the committed seeds).
     let result = record_manual_inspection(
-        &fx.db_path,
+        &aberp::serve::open_tenant_handle(&fx.db_path, fx.tenant.clone()).unwrap(),
         fx.tenant.clone(),
         fx.hash,
         "ervin",
@@ -223,8 +225,10 @@ fn pass_inspection_does_not_block_shipment() {
     drop(conn);
 
     let plan_id = seed_plan(&fx);
+    // ADR-0099 H3 — record through the shared Handle (opened fresh here, after the
+    // seed connections above have closed, so it observes the committed seeds).
     let result = record_manual_inspection(
-        &fx.db_path,
+        &aberp::serve::open_tenant_handle(&fx.db_path, fx.tenant.clone()).unwrap(),
         fx.tenant.clone(),
         fx.hash,
         "ervin",
@@ -269,8 +273,10 @@ fn calibration_stale_measurement_spawns_no_ncr() {
     let plan_id = seed_plan(&fx);
     // Calibration 2 days old, window 1 day → stale; value 10.5 (way out).
     let stale_cal = "2026-06-15T12:00:00Z".to_string();
+    // ADR-0099 H3 — record through the shared Handle (opened fresh here, after the
+    // seed connections above have closed, so it observes the committed seeds).
     let result = record_manual_inspection(
-        &fx.db_path,
+        &aberp::serve::open_tenant_handle(&fx.db_path, fx.tenant.clone()).unwrap(),
         fx.tenant.clone(),
         fx.hash,
         "ervin",

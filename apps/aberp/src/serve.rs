@@ -2589,11 +2589,11 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             };
             match recovery_state.binary_hash.wait() {
                 Ok(binary_hash) => {
-                    let db_path = (*recovery_state.db_path).clone();
+                    let db = recovery_state.db.clone();
                     let tenant = recovery_state.tenant.clone();
                     let scan = tokio::task::spawn_blocking(move || {
                         crate::quality::escalate_overdue_ncrs(
-                            &db_path,
+                            &db,
                             tenant,
                             binary_hash,
                             &operator_login,
@@ -23441,8 +23441,15 @@ async fn handle_create_ncr(
                 .binary_hash
                 .wait()
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
+            // ADR-0099 H3 — `create_ncr` takes the shared writer guard (the
+            // passed-in-guard contract shared with the re-entrant auto-NCR call
+            // sites). The direct handler holds no prior guard, so it acquires one
+            // here and drops it when the closure returns.
+            let mut guard = state_for_task.db.write().map_err(|e| {
+                crate::quality::QualityError::Other(anyhow!("shared writer for NCR create: {e}"))
+            })?;
             crate::quality::create_ncr(
-                state_for_task.db_path.as_path(),
+                &mut guard,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -23531,7 +23538,7 @@ async fn handle_transition_ncr(
                 .wait()
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::transition_ncr(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -23583,7 +23590,7 @@ async fn handle_create_capa(
                 .wait()
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::create_capa(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -23625,7 +23632,7 @@ async fn handle_approve_capa(
                 .wait()
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::approve_capa(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -23676,7 +23683,7 @@ async fn handle_review_capa(
                 .wait()
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::review_capa_effectiveness(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -23714,7 +23721,7 @@ async fn handle_close_capa(
                 .wait()
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::close_capa(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -24102,7 +24109,7 @@ async fn handle_record_qc_inspection(
             };
             let now = time::OffsetDateTime::now_utc();
             crate::qc_inspection::record_manual_inspection(
-                &state_for_task.db_path,
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -24317,7 +24324,7 @@ async fn handle_create_po(
                 .wait()
                 .map_err(|e| crate::purchasing::PoError::Other(anyhow!("binary hash: {e}")))?;
             crate::purchasing::create_po(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -24398,7 +24405,7 @@ async fn handle_transition_po(
                 .wait()
                 .map_err(|e| crate::purchasing::PoError::Other(anyhow!("binary hash: {e}")))?;
             crate::purchasing::transition_po(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -24437,7 +24444,7 @@ async fn handle_receive_po(
                 .wait()
                 .map_err(|e| crate::purchasing::PoError::Other(anyhow!("binary hash: {e}")))?;
             crate::purchasing::record_receipt(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
