@@ -150,6 +150,159 @@ fn open_ncr_on(fx: &Fixture, part_uids: &[String]) -> String {
     .ncr_id
 }
 
+/// Open one Major/Workmanship NCR on `part_uid` through a PERSISTENT, already-open
+/// Handle (the prod `state.db` shape) — the write guard is acquired from the
+/// passed-in Handle and dropped when the closure returns, exactly as
+/// `handle_create_ncr` does in serve.
+fn new_open_ncr(handle: &aberp_db::HandleArc, fx: &Fixture, part_uid: &str, desc: &str) -> String {
+    let mut guard = handle.write().unwrap();
+    quality::create_ncr(
+        &mut guard,
+        fx.tenant.clone(),
+        fx.hash,
+        "qa",
+        NewNcr {
+            severity: NcrSeverity::Major,
+            category: NcrCategory::Workmanship,
+            description: desc.into(),
+            affected_part_uids: vec![part_uid.to_string()],
+            affected_wo_ids: vec![],
+            affected_heat_lots: vec![],
+            photos: vec![],
+        },
+    )
+    .unwrap()
+    .ncr_id
+}
+
+/// ADR-0099 H3 STEP 2b — PROD-TOPOLOGY coherence pin for the defense open-NCR
+/// shipment gate (the fail-open the step-2 adversarial found).
+///
+/// Step 2 moved quality's WRITERS onto the shared `aberp_db::Handle` (checkpoint
+/// disabled → NCR writes stay WAL-resident) but left the gate's NCR READ on a
+/// fresh `Connection::open`. This test runs the PROD topology — ONE persistent
+/// Handle held live as `state.db` — and pins the exact contrast, deterministically:
+///
+///   * FIX — the gate reads NCRs through the LIVE Handle (`state.db.read()`), so
+///     it SEES a WAL-resident NCR and BLOCKS the defense shipment (does NOT fail
+///     open), even after an interleaved fresh opener has torn the on-disk tail.
+///   * BUG — the pre-fix pattern (the gate's NCR read on a fresh `Connection::open`)
+///     reads the torn on-disk state and MISSES that NCR → the gate would return
+///     `Pass` = FAILS OPEN, shipping a WO with an unresolved Open NCR.
+///
+/// The tear is real and deterministic: a fresh opener's checkpoint-on-close folds
+/// the Handle's uncheckpointed WAL and desyncs it, so a LATER Handle write (NCR-B
+/// below) is silently lost on disk while remaining live in the Handle's own cache
+/// (`SELECT` via `Handle::read` sees it; a fresh `Connection::open` does not).
+///
+/// This is deliberately NOT the serial open→drop→read shape of the sibling tests
+/// above: dropping the writer Handle folds the WAL to disk and MASKS the tear.
+#[test]
+fn open_ncr_gate_reads_through_live_handle_pre_fix_fresh_open_fails_open() {
+    use aberp::part_marking::list_part_marks;
+    use aberp::quality::{list_ncrs, open_ncr_ids_blocking_part_uids, NcrFilter};
+
+    let fx = setup();
+
+    // Seed the fresh-open families (partner/WO/dispatch/parts) on a conn that
+    // DROPS *before* the Handle opens — in prod these are written by their own
+    // fresh opens; the gate reads them via the fresh `conn`, never the Handle
+    // (the Handle would be Q2-blind to their post-boot writes). Two independent
+    // WOs/dispatches so each gate result hinges on exactly one NCR.
+    let uid_a;
+    let uid_b;
+    {
+        let conn = Connection::open(&fx.db_path).unwrap();
+        let buyer =
+            create_partner(&conn, T, &partner_inputs("Def Co", CustomerType::Defense)).unwrap();
+        seed_wo(&conn, "wo-a", "1");
+        seed_dispatch(&conn, "dsp-a", "wo-a", &buyer.id, "drafted");
+        seed_wo(&conn, "wo-b", "1");
+        seed_dispatch(&conn, "dsp-b", "wo-b", &buyer.id, "drafted");
+        uid_a = mark_units(&conn, "wo-a", 1).remove(0);
+        uid_b = mark_units(&conn, "wo-b", 1).remove(0);
+    }
+
+    // ── PROD TOPOLOGY: ONE persistent Handle == state.db, held live throughout ──
+    let handle = open_handle(&fx);
+
+    // NCR-A on wo-a's unit, written THROUGH the live Handle (WAL-resident,
+    // uncheckpointed) — this is the prior WAL write the interleaved tear folds.
+    let ncr_a = new_open_ncr(&handle, &fx, &uid_a, "surface finish out of spec");
+
+    // An interleaved fresh `Connection::open` reader + close — the pre-fix reader
+    // shape, and also what every not-yet-migrated dispatch/part fresh opener does
+    // in prod. Its checkpoint-on-close folds + desyncs the Handle's WAL tail.
+    {
+        let tearing = Connection::open(&fx.db_path).unwrap();
+        let _ = list_ncrs(&tearing, T, &NcrFilter::default()).unwrap();
+    }
+
+    // NCR-B on wo-b's unit, written THROUGH the live Handle AFTER the tear. It is
+    // live in the Handle's cache but silently lost on disk (asserted at the end).
+    let ncr_b = new_open_ncr(&handle, &fx, &uid_b, "second defect");
+
+    // ── THE GATE INSTANT (process still live) — same fresh `conn` for the
+    // fresh-open-family reads; the two paths differ ONLY in where NCRs are read. ──
+    let conn = Connection::open(&fx.db_path).unwrap();
+    let dsp_b = get_dispatch(&conn, "dsp-b");
+
+    // FIX: NCRs read through the LIVE Handle → sees NCR-B → BLOCKS (not fail-open).
+    match resolve_open_ncr_gate(&conn, &handle, T, &dsp_b).unwrap() {
+        OpenNcrGate::Blocked {
+            work_order_id,
+            blocking_ncr_ids,
+            ..
+        } => {
+            assert_eq!(work_order_id, "wo-b");
+            assert_eq!(
+                blocking_ncr_ids,
+                vec![ncr_b.clone()],
+                "the live-Handle gate must SEE the WAL-resident NCR-B and block"
+            );
+        }
+        other => panic!("defense shipment FAILED OPEN through the live Handle: {other:?}"),
+    }
+
+    // PRE-FIX: replicate the gate's NCR read on the fresh `conn`. It reads the torn
+    // on-disk state, MISSES NCR-B, and the pure blocking check comes back empty —
+    // i.e. `resolve_open_ncr_gate` would return `Pass` = FAIL OPEN. This is the
+    // exact code path this step removes; it fails only because of the fix.
+    let part_uids_b: Vec<String> = list_part_marks(&conn, T, "wo-b")
+        .unwrap()
+        .into_iter()
+        .map(|m| m.part_uid)
+        .collect();
+    let stale_ncrs = list_ncrs(&conn, T, &NcrFilter::default()).unwrap();
+    let pre_fix_blocking = open_ncr_ids_blocking_part_uids(&stale_ncrs, &part_uids_b);
+    assert!(
+        pre_fix_blocking.is_empty(),
+        "PRE-FIX: a fresh-open gate read misses the WAL-torn-lost NCR-B → the gate \
+         would return Pass = FAIL OPEN. (If this ever becomes non-empty the tear \
+         hazard no longer reproduces and this pin must be revisited.)"
+    );
+    drop(conn);
+    drop(handle); // end the process; checkpoint-on-shutdown is disabled (F-A)
+
+    // The durable on-disk truth: NCR-A survived (folded by the tear) but NCR-B was
+    // silently lost — the fail-open the Handle read is immune to.
+    let disk = Connection::open(&fx.db_path).unwrap();
+    let on_disk = |id: &str| -> i64 {
+        disk.query_row(
+            "SELECT COUNT(*) FROM ncrs WHERE ncr_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(on_disk(&ncr_a), 1, "the pre-tear NCR-A is durable");
+    assert_eq!(
+        on_disk(&ncr_b),
+        0,
+        "the post-tear NCR-B is silently lost on disk — a fresh-open gate read fails open"
+    );
+}
+
 /// A defense dispatch whose WO has a unit referenced by an Open NCR is BLOCKED;
 /// resolving + closing that NCR unblocks it.
 #[test]
@@ -166,7 +319,7 @@ fn defense_dispatch_blocked_by_open_ncr_then_unblocked_when_closed() {
     let ncr_id = open_ncr_on(&fx, &[uids[0].clone()]);
     let conn = Connection::open(&fx.db_path).unwrap();
     let dispatch = get_dispatch(&conn, "dsp-def");
-    match resolve_open_ncr_gate(&conn, T, &dispatch).unwrap() {
+    match resolve_open_ncr_gate(&conn, &open_handle(&fx), T, &dispatch).unwrap() {
         OpenNcrGate::Blocked {
             work_order_id,
             customer_type,
@@ -193,7 +346,8 @@ fn defense_dispatch_blocked_by_open_ncr_then_unblocked_when_closed() {
     .unwrap();
     let conn = Connection::open(&fx.db_path).unwrap();
     assert!(matches!(
-        resolve_open_ncr_gate(&conn, T, &get_dispatch(&conn, "dsp-def")).unwrap(),
+        resolve_open_ncr_gate(&conn, &open_handle(&fx), T, &get_dispatch(&conn, "dsp-def"))
+            .unwrap(),
         OpenNcrGate::Blocked { .. }
     ));
     drop(conn);
@@ -265,7 +419,8 @@ fn defense_dispatch_blocked_by_open_ncr_then_unblocked_when_closed() {
 
     let conn = Connection::open(&fx.db_path).unwrap();
     assert_eq!(
-        resolve_open_ncr_gate(&conn, T, &get_dispatch(&conn, "dsp-def")).unwrap(),
+        resolve_open_ncr_gate(&conn, &open_handle(&fx), T, &get_dispatch(&conn, "dsp-def"))
+            .unwrap(),
         OpenNcrGate::Pass,
         "closed NCR no longer blocks shipment"
     );
@@ -291,7 +446,8 @@ fn non_defense_dispatch_unaffected_by_open_ncr() {
     open_ncr_on(&fx, &uids);
     let conn = Connection::open(&fx.db_path).unwrap();
     assert_eq!(
-        resolve_open_ncr_gate(&conn, T, &get_dispatch(&conn, "dsp-ind")).unwrap(),
+        resolve_open_ncr_gate(&conn, &open_handle(&fx), T, &get_dispatch(&conn, "dsp-ind"))
+            .unwrap(),
         OpenNcrGate::Pass,
         "non-defense path is never gated by NCRs"
     );
@@ -312,7 +468,8 @@ fn open_ncr_on_other_part_does_not_block() {
     open_ncr_on(&fx, &["dp-0000000000000000000000000Z".to_string()]);
     let conn = Connection::open(&fx.db_path).unwrap();
     assert_eq!(
-        resolve_open_ncr_gate(&conn, T, &get_dispatch(&conn, "dsp-def")).unwrap(),
+        resolve_open_ncr_gate(&conn, &open_handle(&fx), T, &get_dispatch(&conn, "dsp-def"))
+            .unwrap(),
         OpenNcrGate::Pass
     );
 }

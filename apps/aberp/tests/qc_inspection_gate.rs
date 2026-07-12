@@ -60,6 +60,13 @@ fn setup() -> Fixture {
     }
 }
 
+/// A fresh shared Handle on the fixture DB (ADR-0099 H3). The open-NCR gate's
+/// NCR read is routed through this; opened AFTER the seed conn closed so it is
+/// Q1-coherent with the committed NCRs.
+fn open_handle(fx: &Fixture) -> aberp_db::HandleArc {
+    aberp::serve::open_tenant_handle(&fx.db_path, fx.tenant.clone()).unwrap()
+}
+
 fn partner_inputs(name: &str, ct: CustomerType) -> PartnerInputs {
     PartnerInputs {
         display_name: name.to_string(),
@@ -199,7 +206,7 @@ fn major_inspection_auto_ncr_blocks_defense_shipment() {
     // The refuse-Shipment gate now BLOCKS the defense dispatch, naming the
     // auto-spawned NCR.
     let conn = Connection::open(&fx.db_path).unwrap();
-    match resolve_open_ncr_gate(&conn, T, &dispatch(&conn, "dsp-def")).unwrap() {
+    match resolve_open_ncr_gate(&conn, &open_handle(&fx), T, &dispatch(&conn, "dsp-def")).unwrap() {
         OpenNcrGate::Blocked {
             work_order_id,
             customer_type,
@@ -253,7 +260,7 @@ fn pass_inspection_does_not_block_shipment() {
 
     let conn = Connection::open(&fx.db_path).unwrap();
     assert_eq!(
-        resolve_open_ncr_gate(&conn, T, &dispatch(&conn, "dsp-ok")).unwrap(),
+        resolve_open_ncr_gate(&conn, &open_handle(&fx), T, &dispatch(&conn, "dsp-ok")).unwrap(),
         OpenNcrGate::Pass,
     );
 }
@@ -304,7 +311,7 @@ fn calibration_stale_measurement_spawns_no_ncr() {
 
     let conn = Connection::open(&fx.db_path).unwrap();
     assert_eq!(
-        resolve_open_ncr_gate(&conn, T, &dispatch(&conn, "dsp-stale")).unwrap(),
+        resolve_open_ncr_gate(&conn, &open_handle(&fx), T, &dispatch(&conn, "dsp-stale")).unwrap(),
         OpenNcrGate::Pass,
     );
 }

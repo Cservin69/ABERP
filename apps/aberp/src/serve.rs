@@ -15173,6 +15173,7 @@ pub enum OpenNcrGate {
 /// Read-only; no audit, no I/O beyond the supplied conn — unit-testable.
 pub fn resolve_open_ncr_gate(
     conn: &Connection,
+    db: &aberp_db::HandleArc,
     tenant: &str,
     dispatch: &aberp_dispatch::Dispatch,
 ) -> anyhow::Result<OpenNcrGate> {
@@ -15194,7 +15195,21 @@ pub fn resolve_open_ncr_gate(
     if part_uids.is_empty() {
         return Ok(OpenNcrGate::Pass);
     }
-    let ncrs = crate::quality::list_ncrs(conn, tenant, &crate::quality::NcrFilter::default())?;
+    // H3 (ADR-0099) — the NCR read is the coherence-critical read of this gate
+    // and is routed through the shared Handle: quality's WRITERS live on the
+    // Handle (step 2), so a fresh `Connection::open` reader would (a) read a torn
+    // ncrs table and (b) checkpoint-on-close TEAR the Handle's uncheckpointed NCR
+    // WAL, silently dropping later NCR writes — after which this gate reads a
+    // short ledger and FAILS OPEN (ships a WO with an unresolved Open NCR). The
+    // `dispatch` / `partner` / `part_marking` reads above deliberately STAY on the
+    // passed-in fresh `conn`: their writers are NOT yet on the Handle, so a Handle
+    // read would be Q2-BLIND to their post-boot writes (an even worse fail-open).
+    // This is the H3 all-or-nothing corollary — migrate a reader in lockstep with
+    // its family's writers (see tests/h3_handle_coherence_model.rs).
+    let ncr_conn = db
+        .read()
+        .context("acquire shared reader for the open-NCR gate")?;
+    let ncrs = crate::quality::list_ncrs(&ncr_conn, tenant, &crate::quality::NcrFilter::default())?;
     let blocking = crate::quality::open_ncr_ids_blocking_part_uids(&ncrs, &part_uids);
     if blocking.is_empty() {
         Ok(OpenNcrGate::Pass)
@@ -15228,7 +15243,7 @@ fn enforce_open_ncr_gate_for_shipment(
         else {
             return Ok(()); // missing dispatch → defer to the normal 404 path
         };
-        let gate = resolve_open_ncr_gate(&conn, state.tenant.as_str(), &dispatch)
+        let gate = resolve_open_ncr_gate(&conn, &state.db, state.tenant.as_str(), &dispatch)
             .map_err(WorkOrderRouteError::Other)?;
         (gate, dispatch.partner_id)
     };
@@ -23382,7 +23397,10 @@ async fn handle_list_ncrs(
     }
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<crate::quality::Ncr>> {
-        let conn = Connection::open(&*state_for_task.db_path)?;
+        // H3 (ADR-0099) — read through the shared Handle. A fresh
+        // `Connection::open` reader tears the Handle's uncheckpointed WAL
+        // on close (silently dropping later writes); see `list_partners_request`.
+        let conn = state_for_task.db.read()?;
         crate::quality::list_ncrs(&conn, state_for_task.tenant.as_str(), &filter)
     })
     .await;
@@ -23487,7 +23505,10 @@ async fn handle_get_ncr(
     let state_for_task = state.clone();
     let result =
         tokio::task::spawn_blocking(move || -> Result<Option<crate::quality::NcrDetail>> {
-            let conn = Connection::open(&*state_for_task.db_path)?;
+            // H3 (ADR-0099) — read through the shared Handle. A fresh
+            // `Connection::open` reader tears the Handle's uncheckpointed WAL
+            // on close (silently dropping later writes); see `list_partners_request`.
+            let conn = state_for_task.db.read()?;
             crate::quality::get_ncr_detail(&conn, state_for_task.tenant.as_str(), &id)
         })
         .await;
@@ -23748,7 +23769,10 @@ async fn handle_quality_alert(headers: HeaderMap, State(state): State<AppState>)
     }
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
-        let conn = Connection::open(&*state_for_task.db_path)?;
+        // H3 (ADR-0099) — read through the shared Handle. A fresh
+        // `Connection::open` reader tears the Handle's uncheckpointed WAL
+        // on close (silently dropping later writes); see `list_partners_request`.
+        let conn = state_for_task.db.read()?;
         let ncrs = crate::quality::list_ncrs(
             &conn,
             state_for_task.tenant.as_str(),
@@ -24020,7 +24044,10 @@ async fn handle_list_qc_inspections(
     }
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<aberp_qa::QcInspection>> {
-        let conn = Connection::open(&*state_for_task.db_path)?;
+        // H3 (ADR-0099) — read through the shared Handle. A fresh
+        // `Connection::open` reader tears the Handle's uncheckpointed WAL
+        // on close (silently dropping later writes); see `list_partners_request`.
+        let conn = state_for_task.db.read()?;
         let tenant = state_for_task.tenant.as_str();
         let rows = match (&part_uid, &wo_id) {
             (Some(p), _) => aberp_qa::list_inspections_for_part(&conn, tenant, p),
@@ -24171,7 +24198,10 @@ async fn handle_qc_stale_calibration(
     }
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<aberp_qa::QcInspection>> {
-        let conn = Connection::open(&*state_for_task.db_path)?;
+        // H3 (ADR-0099) — read through the shared Handle. A fresh
+        // `Connection::open` reader tears the Handle's uncheckpointed WAL
+        // on close (silently dropping later writes); see `list_partners_request`.
+        let conn = state_for_task.db.read()?;
         // Last 30 days.
         aberp_qa::list_recent_stale_calibration(
             &conn,
@@ -24293,7 +24323,10 @@ async fn handle_list_pos(
     let state_for_task = state.clone();
     let result =
         tokio::task::spawn_blocking(move || -> Result<Vec<crate::purchasing::PurchaseOrder>> {
-            let conn = Connection::open(&*state_for_task.db_path)?;
+            // H3 (ADR-0099) — read through the shared Handle. A fresh
+            // `Connection::open` reader tears the Handle's uncheckpointed WAL
+            // on close (silently dropping later writes); see `list_partners_request`.
+            let conn = state_for_task.db.read()?;
             crate::purchasing::list_pos(&conn, state_for_task.tenant.as_str(), &filter)
         })
         .await;
@@ -24354,7 +24387,10 @@ async fn handle_get_po(
     let state_for_task = state.clone();
     let result =
         tokio::task::spawn_blocking(move || -> Result<Option<crate::purchasing::PoDetail>> {
-            let conn = Connection::open(&*state_for_task.db_path)?;
+            // H3 (ADR-0099) — read through the shared Handle. A fresh
+            // `Connection::open` reader tears the Handle's uncheckpointed WAL
+            // on close (silently dropping later writes); see `list_partners_request`.
+            let conn = state_for_task.db.read()?;
             crate::purchasing::get_po_detail(&conn, state_for_task.tenant.as_str(), &id)
         })
         .await;
