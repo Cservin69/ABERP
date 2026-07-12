@@ -720,4 +720,57 @@ mod tests {
         assert_eq!(one("part.serial_assigned"), 1);
         assert_eq!(one("part.uid_marked"), 1);
     }
+
+    /// ADR-0099 H3 STEP 4 — mark-parts atomicity. The physical `wo_part_marks`
+    /// INSERTs and the `part.*` audit appends must ride ONE tx (as
+    /// `mark_parts_request` now drives them on the shared writer), so an
+    /// audit-append failure rolls the inserts back too — no marked-but-unaudited
+    /// row. Here the audit-ledger schema is deliberately absent, so
+    /// `append_mark_events` errors AFTER `record_part_marks` has already inserted
+    /// inside the SAME tx; dropping the tx without commit must leave zero marks.
+    /// Before the fix `record_part_marks` ran on a bare `&Connection` and
+    /// AUTOCOMMITTED, so the marks would have survived the failed audit.
+    #[test]
+    fn audit_append_failure_rolls_back_physical_marks() {
+        let dir = std::env::temp_dir()
+            .join("aberp-part-mark-atomicity")
+            .join(Ulid::new().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("aberp.duckdb");
+        let tenant = TenantId::new("t").unwrap();
+        let hash = BinaryHash::from_bytes([0u8; 32]);
+        let marks: Vec<_> = (1..=3).map(|i| sample_mark("wo-1", i)).collect();
+
+        let mut conn = Connection::open(&db_path).unwrap();
+        // Part-marks schema committed PRE-tx; the audit-ledger schema is
+        // deliberately NOT created, so the audit append fails inside the tx.
+        ensure_schema(&conn).unwrap();
+        let meta = LedgerMeta::new(tenant, hash);
+        {
+            let tx = conn.transaction().unwrap();
+            // `&tx` deref-coerces to `&Connection` — the inserts land in THIS tx.
+            record_part_marks(&tx, "t", "wo-1", &marks).unwrap();
+            assert_eq!(
+                count_part_marks(&tx, "t", "wo-1").unwrap(),
+                3,
+                "the physical marks are visible inside the open tx"
+            );
+            append_mark_events(
+                &tx,
+                &meta,
+                "wo-1",
+                "op",
+                "2026-06-16T00:00:00Z",
+                Some("HEAT-1234"),
+                &marks,
+            )
+            .expect_err("audit append must fail with no audit_ledger table");
+            // The caller does NOT commit on audit failure — `tx` rolls back on drop.
+        }
+        assert_eq!(
+            count_part_marks(&conn, "t", "wo-1").unwrap(),
+            0,
+            "audit-append failure rolled the physical marks back — no marked-but-unaudited row"
+        );
+    }
 }

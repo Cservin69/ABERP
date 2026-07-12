@@ -168,21 +168,14 @@ async fn nav_off_submit_marks_invoice_local_only() {
 /// reads the prior `InvoiceLocalOnlyEmitted` row as `LocalOnly`, so this
 /// pins the derive ladder too.
 ///
-/// PRE-EXISTING MERGE DEBT (ADR-0099 H3, NOT this create_ncr migration): the
-/// durability×feature merge added `db: HandleArc` to `AppState` but left this
-/// feature-side fixture unset, so this whole file did not compile at the merge
-/// point and this test never ran. Setting the field (done above) lets it
-/// compile, which surfaces a latent incoherence: `submit_invoice_request` →
-/// `emit_invoice_local_only` is still an un-migrated serve-layer write-fork
-/// (`Connection::open` + `Ledger`, serve.rs:~8336 — on the STEP-3 serve-fork
-/// worklist, out of scope for this atomic quality/qc/purchasing migration). Its
-/// own idempotency read is a fresh open that is incoherent against the persistent
-/// shared Handle now held in `AppState`, so the second submit does not observe
-/// the first `InvoiceLocalOnlyEmitted` row and writes a duplicate. The fix is to
-/// migrate `emit_invoice_local_only` onto `state.db` in STEP 3; until then this
-/// stays ignored (the single-submit sibling test above still runs and passes).
-#[ignore = "STEP-3 debt: emit_invoice_local_only is an un-migrated serve write-fork \
-            incoherent with the persistent AppState Handle; migrate it in step 3 (ADR-0099 H3)"]
+/// ADR-0099 H3 STEP 4 — this now runs. `emit_invoice_local_only` was migrated
+/// onto the shared `state.db` writer (serve.rs), so its `InvoiceLocalOnlyEmitted`
+/// row and the re-submit's `derive_state_for` read share the ONE live instance.
+/// Before the migration the write went through a fresh `Ledger::open` that the
+/// persistent `AppState` Handle reader was blind to (coherence-model Q2: the
+/// Handle does not see a separate connection's post-open commit), so the second
+/// submit observed no prior row and wrote a duplicate. The test was `#[ignore]`d
+/// as that STEP-3 debt; un-ignoring it pins the fix.
 #[tokio::test]
 async fn nav_off_resubmit_is_idempotent() {
     let dir = test_dir("nav-off-resubmit");

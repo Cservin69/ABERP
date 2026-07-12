@@ -8320,10 +8320,20 @@ fn submission_gate(tenant: &str, invoice_id: &str) -> Arc<tokio::sync::Mutex<()>
 
 /// S434 — append one `InvoiceLocalOnlyEmitted` row into the tenant's
 /// ledger, marking an invoice issued under a NAV-disabled tenant as
-/// stored local-only. Mirrors the `tenant_registry::emit_tenant_event`
-/// open-by-path + append discipline. The cross-invoice contamination
-/// guard lives in `InvoiceTrace::merge_entry` (it matches the payload's
-/// `invoice_id`).
+/// stored local-only. The cross-invoice contamination guard lives in
+/// `InvoiceTrace::merge_entry` (it matches the payload's `invoice_id`).
+///
+/// ADR-0099 H3 — the append rides the ONE shared Handle writer guard
+/// (was a fresh `Ledger::open` write-fork). The precondition read that
+/// gates a re-submit (`derive_state_for`) reads the audit trace through
+/// `state.db.read()` (the SAME live instance); a fresh-open write was
+/// invisible to it (coherence-model Q2: the Handle is blind to a separate
+/// connection's post-open commit), so a re-submit did not observe the
+/// first `InvoiceLocalOnlyEmitted` row and wrote a duplicate. Now the
+/// write and the read share the instance → the re-submit is idempotent.
+/// The entry is byte-identical (same kind / payload / actor / no
+/// idempotency key); only the connection it lands on changed. Guard drop
+/// lockstep-syncs the mirror.
 fn emit_invoice_local_only(
     state: &AppState,
     invoice_id: &str,
@@ -8333,21 +8343,32 @@ fn emit_invoice_local_only(
         .binary_hash
         .wait()
         .context("await background binary hash for local-only emit")?;
-    let mut ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger to record InvoiceLocalOnlyEmitted")?;
     let payload = audit_payloads::InvoiceLocalOnlyEmittedPayload {
         invoice_id: invoice_id.to_string(),
         operator_login: operator_login.to_string(),
     };
     let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
-    ledger
-        .append(
-            EventKind::InvoiceLocalOnlyEmitted,
-            payload.to_bytes(),
-            actor,
-            None,
-        )
-        .context("append InvoiceLocalOnlyEmitted audit entry")?;
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer to record InvoiceLocalOnlyEmitted")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for InvoiceLocalOnlyEmitted")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .context("begin InvoiceLocalOnlyEmitted transaction on shared writer")?;
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        EventKind::InvoiceLocalOnlyEmitted,
+        payload.to_bytes(),
+        actor,
+        None,
+    )
+    .context("append InvoiceLocalOnlyEmitted audit entry")?;
+    tx.commit()
+        .context("commit InvoiceLocalOnlyEmitted transaction on shared writer")?;
     tracing::info!(
         invoice_id = %invoice_id,
         tenant = %state.tenant.as_str(),
@@ -15086,12 +15107,22 @@ pub fn resolve_part_uid_gate(
     }
 }
 
-/// Read the dispatch row a shipment gate resolves against. Dispatch is a
-/// FRESH-OPEN family (ADR-0099 H3): its writers (`create`/`mark_shipped`/
-/// `cancel`) cannot leave fresh opens without dragging the deferred invoice-audit
-/// family (`mark_shipped`'s invoice-draft spawner) + inventory (`record_movement`)
-/// onto the Handle — out of this step's scope. A FRESH `Connection::open` reads
-/// it coherently; the returned owned `Dispatch` lets the caller drop the opener
+/// Read the dispatch row a shipment gate resolves against. Dispatch stays a
+/// FRESH-OPEN family (ADR-0099 H3 / STEP 4 finding): its writers
+/// (`create_dispatch` / `mark_shipped` / `cancel_dispatch` / `delete_invoice_draft`)
+/// each READ `work_orders` IN-TX — `create`/`mark_shipped` require the WO to exist
+/// (eligibility + `qty_target`), and `mark_shipped`'s spawner + `record_movement`
+/// need it too. `work_orders` is itself a fresh-open family here
+/// (`create_work_order_request` / `transition_work_order_request` both
+/// `Connection::open`), so moving the dispatch writers onto the Handle would make
+/// those in-tx WO reads Q2-BLIND (the Handle does not see a separate connection's
+/// post-open commit — `h3_handle_coherence_model.rs`), i.e. a Handle `mark_shipped`
+/// could not see an operationally-created WO → shipping breaks. By the family
+/// invariant (writers + reader migrate together, never mixed) the READER therefore
+/// also stays a fresh open until `work_orders` migrates — do NOT move this to
+/// `state.db.read()` before then (a Handle read would be blind to fresh-open
+/// dispatch writes → fail-open gate). A FRESH `Connection::open` reads it
+/// coherently (Q3); the returned owned `Dispatch` lets the caller drop the opener
 /// BEFORE it acquires the Handle read/write guard, so no fresh opener colocates
 /// with the block-path Handle audit append (write-fork discipline). Missing
 /// dispatch → `Ok(None)` (the normal mark_shipped path 404s it).
@@ -23206,12 +23237,15 @@ fn mark_parts_request(
         });
     }
 
-    // ADR-0099 H3 — the part-marking read (already-marked guard) + write + audit
-    // ride the ONE shared Handle writer guard: `record_part_marks` autocommits
-    // the inserts on the live instance, then the two `part.*` audit events append
-    // on ONE tx from the SAME guard. No fresh-open truncator, no nested
-    // `db.write()`; the guard drop lockstep-syncs the mirror (was a separate
-    // `Ledger::open` + `sync_audit_mirror_best_effort`).
+    // ADR-0099 H3 — the already-marked read guard, the physical mark INSERTs, and
+    // the two `part.*` audit appends all ride ONE tx on the shared Handle writer
+    // (matching the `create_ncr` recipe). Previously `record_part_marks`
+    // AUTOCOMMITTED the inserts on the live instance and the two audit events rode
+    // a SEPARATE later tx, so a failure between them left marked-but-unaudited
+    // rows; folding them into one tx makes the physical mark + its audit ATOMIC —
+    // an audit-append (or commit) failure rolls the inserts back too. No
+    // fresh-open truncator, no nested `db.write()`; the guard drop lockstep-syncs
+    // the mirror (was a separate `Ledger::open` + `sync_audit_mirror_best_effort`).
     let mut guard = state
         .db
         .write()
@@ -23219,7 +23253,13 @@ fn mark_parts_request(
     crate::part_marking::ensure_schema(&guard).map_err(WorkOrderRouteError::Other)?;
     aberp_audit_ledger::ensure_schema(&guard)
         .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure audit schema: {e}")))?;
-    if crate::part_marking::count_part_marks(&guard, state.tenant.as_str(), wo_id)
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("begin mark-parts tx: {e}")))?;
+    // `&tx` deref-coerces to `&Connection` for the count/record helpers, so their
+    // reads + INSERTs land inside THIS tx (not autocommitted).
+    if crate::part_marking::count_part_marks(&tx, state.tenant.as_str(), wo_id)
         .map_err(WorkOrderRouteError::Other)?
         > 0
     {
@@ -23227,13 +23267,8 @@ fn mark_parts_request(
             "work order is already marked".to_string(),
         ));
     }
-    crate::part_marking::record_part_marks(&guard, state.tenant.as_str(), wo_id, &marks)
+    crate::part_marking::record_part_marks(&tx, state.tenant.as_str(), wo_id, &marks)
         .map_err(map_part_mark_err)?;
-
-    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
-    let tx = guard
-        .transaction()
-        .map_err(|e| WorkOrderRouteError::Other(anyhow!("begin mark-parts audit tx: {e}")))?;
     crate::part_marking::append_mark_events(
         &tx,
         &meta,
@@ -23245,7 +23280,7 @@ fn mark_parts_request(
     )
     .map_err(WorkOrderRouteError::Other)?;
     tx.commit()
-        .map_err(|e| WorkOrderRouteError::Other(anyhow!("commit mark-parts audit tx: {e}")))?;
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("commit mark-parts tx: {e}")))?;
 
     Ok(MarkPartsResponse { part_marks: marks })
 }
