@@ -40,7 +40,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, EventKind, LedgerMeta};
 
 // ── Pure: part UID / serial / DataMatrix payload ────────────────────
 
@@ -244,7 +244,7 @@ pub enum PartMarkError {
 /// Insert the marks for a WO in one batch. Refuses if the WO is already marked.
 /// Validates every part UID + serial before any write so a bad unit aborts the
 /// whole batch (no half-marked WO). Audit emission is the caller's
-/// [`append_mark_events`] (own `Ledger` after the conn drops — S432 pattern).
+/// [`append_mark_events`] on the same shared-Handle transaction (ADR-0099 H3).
 pub fn record_part_marks(
     conn: &Connection,
     tenant: &str,
@@ -292,24 +292,22 @@ pub fn record_part_marks(
     Ok(())
 }
 
-/// Emit the marking audit trail (own `Ledger`, after the read/write conn is
-/// dropped — mirrors `material_inventory::append_heat_lot_events`). Fires ONE
+/// Emit the marking audit trail on the caller's SHARED-Handle transaction
+/// (ADR-0099 H3 — was `Ledger::open`, a fresh-open write-fork). Fires ONE
 /// batch `part.serial_assigned` (the logical serial-assignment record) + ONE
 /// batch `part.uid_marked` (the physical-mark record, the brief's payload).
-/// Both are UNSIGNED (DÁP signature thread is S438+ deferred).
+/// Both are UNSIGNED (DÁP signature thread is S438+ deferred). The caller owns
+/// the write guard, begins the `tx`, and commits — so the two appends ride the
+/// ONE live instance (no truncating fresh open, no nested `db.write()`).
 pub fn append_mark_events(
-    db_path: &std::path::Path,
-    tenant: TenantId,
-    binary_hash: BinaryHash,
+    tx: &duckdb::Transaction<'_>,
+    meta: &LedgerMeta,
     wo_id: &str,
     operator: &str,
     marked_at: &str,
     heat_lot_reference: Option<&str>,
     marks: &[PartMark],
 ) -> Result<usize> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record part marking")?;
-
     let serials: Vec<_> = marks
         .iter()
         .map(|m| serde_json::json!({ "part_uid": m.part_uid, "serial": m.serial_number }))
@@ -321,14 +319,15 @@ pub fn append_mark_events(
         "operator_user_id": operator,
         "assigned_at": marked_at,
     });
-    ledger
-        .append(
-            EventKind::PartSerialAssigned,
-            serde_json::to_vec(&serial_payload).expect("serialize serial-assigned payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator),
-            None,
-        )
-        .context("append part.serial_assigned")?;
+    aberp_audit_ledger::append_in_tx(
+        tx,
+        meta,
+        EventKind::PartSerialAssigned,
+        serde_json::to_vec(&serial_payload).expect("serialize serial-assigned payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        None,
+    )
+    .context("append part.serial_assigned")?;
 
     let parts: Vec<_> = marks
         .iter()
@@ -349,14 +348,15 @@ pub fn append_mark_events(
         "operator_user_id": operator,
         "marked_at": marked_at,
     });
-    ledger
-        .append(
-            EventKind::PartUidMarked,
-            serde_json::to_vec(&uid_payload).expect("serialize uid-marked payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator),
-            None,
-        )
-        .context("append part.uid_marked")?;
+    aberp_audit_ledger::append_in_tx(
+        tx,
+        meta,
+        EventKind::PartUidMarked,
+        serde_json::to_vec(&uid_payload).expect("serialize uid-marked payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        None,
+    )
+    .context("append part.uid_marked")?;
 
     Ok(2)
 }
@@ -545,6 +545,7 @@ pub fn trace_customer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aberp_audit_ledger::{BinaryHash, TenantId};
 
     #[test]
     fn format_and_validate_part_uid_round_trips() {
@@ -684,26 +685,28 @@ mod tests {
             .join(Ulid::new().to_string());
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("aberp.duckdb");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            aberp_audit_ledger::ensure_schema(&conn).unwrap();
-            ensure_schema(&conn).unwrap();
-        }
         let tenant = TenantId::new("t").unwrap();
         let hash = BinaryHash::from_bytes([0u8; 32]);
         let marks: Vec<_> = (1..=2).map(|i| sample_mark("wo-1", i)).collect();
-        let n = append_mark_events(
-            &db_path,
-            tenant,
-            hash,
-            "wo-1",
-            "op",
-            "2026-06-16T00:00:00Z",
-            Some("HEAT-1234"),
-            &marks,
-        )
-        .unwrap();
-        assert_eq!(n, 2);
+        {
+            let mut conn = Connection::open(&db_path).unwrap();
+            aberp_audit_ledger::ensure_schema(&conn).unwrap();
+            ensure_schema(&conn).unwrap();
+            let meta = LedgerMeta::new(tenant, hash);
+            let tx = conn.transaction().unwrap();
+            let n = append_mark_events(
+                &tx,
+                &meta,
+                "wo-1",
+                "op",
+                "2026-06-16T00:00:00Z",
+                Some("HEAT-1234"),
+                &marks,
+            )
+            .unwrap();
+            assert_eq!(n, 2);
+            tx.commit().unwrap();
+        }
 
         let conn = Connection::open(&db_path).unwrap();
         let one = |kind: &str| -> i64 {

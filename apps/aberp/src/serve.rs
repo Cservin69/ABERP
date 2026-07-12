@@ -14685,8 +14685,18 @@ pub fn get_work_order_detail_request(
         state.tenant.as_str(),
         &wo.product_id,
     )?;
-    // S438 — part-UID marking surface for the WO detail page.
-    let part_marks = crate::part_marking::list_part_marks(&conn, state.tenant.as_str(), wo_id)?;
+    // S438 — part-UID marking surface for the WO detail page. H3 (ADR-0099):
+    // part_marking is a Handle family (its writers live on the shared Handle),
+    // so read it through `state.db.read()` — a fresh-open read would miss a
+    // just-marked unit still WAL-resident. The WO / routing / BOM reads above
+    // stay on the fresh `conn` (their families are still fresh-open).
+    let part_marks = {
+        let hc = state
+            .db
+            .read()
+            .context("shared reader for WO-detail part marks")?;
+        crate::part_marking::list_part_marks(&hc, state.tenant.as_str(), wo_id)?
+    };
     let part_units_expected = crate::part_marking::qty_to_units(wo.qty_target);
     let customer_type = resolve_wo_customer_type(&conn, state.tenant.as_str(), &wo)?;
     use crate::partners::CustomerType;
@@ -15076,29 +15086,49 @@ pub fn resolve_part_uid_gate(
     }
 }
 
+/// Read the dispatch row a shipment gate resolves against. Dispatch is a
+/// FRESH-OPEN family (ADR-0099 H3): its writers (`create`/`mark_shipped`/
+/// `cancel`) cannot leave fresh opens without dragging the deferred invoice-audit
+/// family (`mark_shipped`'s invoice-draft spawner) + inventory (`record_movement`)
+/// onto the Handle — out of this step's scope. A FRESH `Connection::open` reads
+/// it coherently; the returned owned `Dispatch` lets the caller drop the opener
+/// BEFORE it acquires the Handle read/write guard, so no fresh opener colocates
+/// with the block-path Handle audit append (write-fork discipline). Missing
+/// dispatch → `Ok(None)` (the normal mark_shipped path 404s it).
+fn read_dispatch_for_gate(
+    state: &AppState,
+    dsp_id: &str,
+) -> std::result::Result<Option<aberp_dispatch::Dispatch>, WorkOrderRouteError> {
+    let conn = Connection::open(&*state.db_path).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for shipment gate: {e}"))
+    })?;
+    aberp_dispatch::ensure_schema(&conn)
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
+    aberp_dispatch::get_dispatch(&conn, state.tenant.as_str(), dsp_id)
+        .map_err(WorkOrderRouteError::Other)
+}
+
 /// Enforce the part-UID gate at the dispatch-ship route. On block, emits one
-/// `part.wo_blocked_no_uid` audit entry (own `Ledger`, after the read conn is
-/// dropped) and returns a 409 naming the first unmarked unit. A missing
-/// dispatch is NOT blocked here — the normal mark_shipped path 404s it.
+/// `part.wo_blocked_no_uid` audit entry on the shared Handle (ADR-0099 H3) and
+/// returns a 409 naming the first unmarked unit. A missing dispatch is NOT
+/// blocked here — the normal mark_shipped path 404s it.
 fn enforce_part_uid_gate_for_shipment(
     state: &AppState,
     dsp_id: &str,
     operator_login: &str,
 ) -> std::result::Result<(), WorkOrderRouteError> {
+    let Some(dispatch) = read_dispatch_for_gate(state, dsp_id)? else {
+        return Ok(()); // missing dispatch → defer to the normal 404 path
+    };
     let (gate, partner_id) = {
-        let conn = Connection::open(&*state.db_path).map_err(|e| {
-            WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for part-UID gate: {e}"))
+        // partner + part_marking are Handle families → read them coherently
+        // through the ONE shared reader (the fresh dispatch opener has dropped).
+        let conn = state.db.read().map_err(|e| {
+            WorkOrderRouteError::Other(anyhow!("shared reader for part-UID gate: {e}"))
         })?;
-        aberp_dispatch::ensure_schema(&conn)
-            .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
-        let Some(dispatch) = aberp_dispatch::get_dispatch(&conn, state.tenant.as_str(), dsp_id)
-            .map_err(WorkOrderRouteError::Other)?
-        else {
-            return Ok(()); // missing dispatch → defer to the normal 404 path
-        };
         let gate = resolve_part_uid_gate(&conn, state.tenant.as_str(), &dispatch)
             .map_err(WorkOrderRouteError::Other)?;
-        (gate, dispatch.partner_id)
+        (gate, dispatch.partner_id.clone())
     };
 
     let PartUidGate::Blocked {
@@ -15129,22 +15159,29 @@ fn enforce_part_uid_gate_for_shipment(
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
     });
-    let mut ledger = aberp_audit_ledger::Ledger::open(
-        state.db_path.as_path(),
-        state.tenant.clone(),
-        binary_hash,
-    )
-    .map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!("open ledger for part-uid-block audit: {e}"))
+    // H3 (ADR-0099) — append the block audit through the ONE shared writer
+    // (the fresh dispatch opener + the Handle read guard have both dropped);
+    // guard drop lockstep-syncs the mirror. Was a fresh `Ledger::open` write-fork.
+    let mut guard = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for part-uid-block audit: {e}"))
     })?;
-    ledger
-        .append(
-            aberp_audit_ledger::EventKind::WoBlockedNoPartUid,
-            serde_json::to_vec(&payload).expect("serialize part-uid-blocked payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
-            None,
-        )
-        .map_err(|e| WorkOrderRouteError::Other(anyhow!("append part-uid-block audit: {e}")))?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure audit schema: {e}")))?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("begin part-uid-block audit tx: {e}")))?;
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        aberp_audit_ledger::EventKind::WoBlockedNoPartUid,
+        serde_json::to_vec(&payload).expect("serialize part-uid-blocked payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        None,
+    )
+    .map_err(|e| WorkOrderRouteError::Other(anyhow!("append part-uid-block audit: {e}")))?;
+    tx.commit()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("commit part-uid-block audit tx: {e}")))?;
 
     // Name the first unmarked unit (1-based) so the operator knows where to look.
     let first_missing = marked_count + 1;
@@ -15171,9 +15208,18 @@ pub enum OpenNcrGate {
 /// (`partner_id`) → `customer_type`, and if defense/aerospace, refuse when any
 /// of the WO's marked part UIDs is referenced by an `Open`/`Contained` NCR.
 /// Read-only; no audit, no I/O beyond the supplied conn — unit-testable.
+///
+/// H3 (ADR-0099) — `conn` is the SHARED Handle read conn (`state.db.read()`):
+/// every family this resolver reads — `partners`, `part_marking`, `quality`
+/// (ncrs) — has its WRITERS on the Handle, so ONE coherent `try_clone` reads
+/// them all with no fresh-open truncator and no WAL tear (step 3 completed the
+/// part-marking migration that step 2b was blocked on). The `dispatch` row is
+/// resolved by the caller and passed in as `dispatch` — dispatch remains a
+/// fresh-open family (its writers cannot leave fresh opens without dragging the
+/// deferred invoice-audit + inventory families onto the Handle; see
+/// `enforce_open_ncr_gate_for_shipment`), so it is deliberately NOT read here.
 pub fn resolve_open_ncr_gate(
     conn: &Connection,
-    db: &aberp_db::HandleArc,
     tenant: &str,
     dispatch: &aberp_dispatch::Dispatch,
 ) -> anyhow::Result<OpenNcrGate> {
@@ -15195,21 +15241,7 @@ pub fn resolve_open_ncr_gate(
     if part_uids.is_empty() {
         return Ok(OpenNcrGate::Pass);
     }
-    // H3 (ADR-0099) — the NCR read is the coherence-critical read of this gate
-    // and is routed through the shared Handle: quality's WRITERS live on the
-    // Handle (step 2), so a fresh `Connection::open` reader would (a) read a torn
-    // ncrs table and (b) checkpoint-on-close TEAR the Handle's uncheckpointed NCR
-    // WAL, silently dropping later NCR writes — after which this gate reads a
-    // short ledger and FAILS OPEN (ships a WO with an unresolved Open NCR). The
-    // `dispatch` / `partner` / `part_marking` reads above deliberately STAY on the
-    // passed-in fresh `conn`: their writers are NOT yet on the Handle, so a Handle
-    // read would be Q2-BLIND to their post-boot writes (an even worse fail-open).
-    // This is the H3 all-or-nothing corollary — migrate a reader in lockstep with
-    // its family's writers (see tests/h3_handle_coherence_model.rs).
-    let ncr_conn = db
-        .read()
-        .context("acquire shared reader for the open-NCR gate")?;
-    let ncrs = crate::quality::list_ncrs(&ncr_conn, tenant, &crate::quality::NcrFilter::default())?;
+    let ncrs = crate::quality::list_ncrs(conn, tenant, &crate::quality::NcrFilter::default())?;
     let blocking = crate::quality::open_ncr_ids_blocking_part_uids(&ncrs, &part_uids);
     if blocking.is_empty() {
         Ok(OpenNcrGate::Pass)
@@ -15224,28 +15256,29 @@ pub fn resolve_open_ncr_gate(
 
 /// S439 (ADR-0090) — enforce the open-NCR shipment gate at the dispatch-ship
 /// route (extends the S438 part-UID gate). On block, emits one
-/// `ncr.wo_blocked_by_open_ncr` audit entry (own `Ledger`, after the read conn
-/// drops) and returns a 409 naming the blocking NCR(s). The non-defense path and
-/// the missing-dispatch path are unaffected.
+/// `ncr.wo_blocked_by_open_ncr` audit entry on the shared Handle (ADR-0099 H3)
+/// and returns a 409 naming the blocking NCR(s). The non-defense path and the
+/// missing-dispatch path are unaffected.
 fn enforce_open_ncr_gate_for_shipment(
     state: &AppState,
     dsp_id: &str,
     operator_login: &str,
 ) -> std::result::Result<(), WorkOrderRouteError> {
+    let Some(dispatch) = read_dispatch_for_gate(state, dsp_id)? else {
+        return Ok(()); // missing dispatch → defer to the normal 404 path
+    };
     let (gate, partner_id) = {
-        let conn = Connection::open(&*state.db_path).map_err(|e| {
-            WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for open-NCR gate: {e}"))
+        // partner + part_marking + ncrs are all Handle families → the gate reads
+        // them coherently through the ONE shared reader (the fresh dispatch opener
+        // has dropped). This closes the step-2b fail-open: the coherence-critical
+        // NCR read AND the part-UID read now ride the live Handle, immune to a
+        // fresh-open WAL tear.
+        let conn = state.db.read().map_err(|e| {
+            WorkOrderRouteError::Other(anyhow!("shared reader for open-NCR gate: {e}"))
         })?;
-        aberp_dispatch::ensure_schema(&conn)
-            .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
-        let Some(dispatch) = aberp_dispatch::get_dispatch(&conn, state.tenant.as_str(), dsp_id)
-            .map_err(WorkOrderRouteError::Other)?
-        else {
-            return Ok(()); // missing dispatch → defer to the normal 404 path
-        };
-        let gate = resolve_open_ncr_gate(&conn, &state.db, state.tenant.as_str(), &dispatch)
+        let gate = resolve_open_ncr_gate(&conn, state.tenant.as_str(), &dispatch)
             .map_err(WorkOrderRouteError::Other)?;
-        (gate, dispatch.partner_id)
+        (gate, dispatch.partner_id.clone())
     };
 
     let OpenNcrGate::Blocked {
@@ -15272,22 +15305,29 @@ fn enforce_open_ncr_gate_for_shipment(
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
     });
-    let mut ledger = aberp_audit_ledger::Ledger::open(
-        state.db_path.as_path(),
-        state.tenant.clone(),
-        binary_hash,
-    )
-    .map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!("open ledger for open-NCR-block audit: {e}"))
+    // H3 (ADR-0099) — append the block audit through the ONE shared writer
+    // (the fresh dispatch opener + the Handle read guard have both dropped);
+    // guard drop lockstep-syncs the mirror. Was a fresh `Ledger::open` write-fork.
+    let mut guard = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for open-NCR-block audit: {e}"))
     })?;
-    ledger
-        .append(
-            aberp_audit_ledger::EventKind::WoBlockedByOpenNcr,
-            serde_json::to_vec(&payload).expect("serialize open-ncr-blocked payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
-            None,
-        )
-        .map_err(|e| WorkOrderRouteError::Other(anyhow!("append open-NCR-block audit: {e}")))?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure audit schema: {e}")))?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("begin open-NCR-block audit tx: {e}")))?;
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        aberp_audit_ledger::EventKind::WoBlockedByOpenNcr,
+        serde_json::to_vec(&payload).expect("serialize open-ncr-blocked payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        None,
+    )
+    .map_err(|e| WorkOrderRouteError::Other(anyhow!("append open-NCR-block audit: {e}")))?;
+    tx.commit()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("commit open-NCR-block audit tx: {e}")))?;
 
     Err(WorkOrderRouteError::Conflict(format!(
         "Shipment blocked: work order has open NCR(s) {} — resolve or escalate first",
@@ -23059,6 +23099,66 @@ async fn handle_mark_parts(
     }
 }
 
+/// The cross-family reads mark-parts needs before it writes: the WO (state +
+/// qty_target) and its consumed heat lot. These live in NON-Handle families
+/// (`work_orders`, `quote_pricing_jobs`, `material_inventory`) whose writers are
+/// still fresh-open, so they are read on a scoped fresh `conn` that DROPS before
+/// the part-marking Handle write — a Handle read here would be Q2-blind to those
+/// fresh-open writers. Returning owned data (not the `Connection`) keeps the
+/// opener out of `mark_parts_request`, so its Handle audit append never
+/// colocates with a fresh opener (ADR-0099 H3 write-fork discipline).
+fn load_mark_parts_context(
+    state: &AppState,
+    wo_id: &str,
+    supplied_serials: usize,
+) -> std::result::Result<(u32, Option<String>), WorkOrderRouteError> {
+    let conn = Connection::open(&*state.db_path).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for mark-parts context: {e}"))
+    })?;
+
+    let Some(wo) = aberp_work_orders::read_work_order(&conn, state.tenant.as_str(), wo_id)
+        .map_err(map_wo_err)?
+    else {
+        return Err(WorkOrderRouteError::NotFound);
+    };
+    // [[trust-code-not-operator]] — only a Completed WO can be marked, and
+    // only for a defense/aerospace customer (the shipment gate's scope).
+    if wo.state != aberp_work_orders::WorkOrderState::Completed {
+        return Err(WorkOrderRouteError::Conflict(
+            "work order must be Completed before marking parts".to_string(),
+        ));
+    }
+    use crate::partners::CustomerType;
+    if !matches!(
+        resolve_wo_customer_type(&conn, state.tenant.as_str(), &wo)
+            .map_err(WorkOrderRouteError::Other)?,
+        Some(CustomerType::Defense | CustomerType::Aerospace)
+    ) {
+        return Err(WorkOrderRouteError::Conflict(
+            "part marking applies to defense/aerospace work orders only".to_string(),
+        ));
+    }
+
+    let expected = crate::part_marking::qty_to_units(wo.qty_target);
+    if expected == 0 {
+        return Err(WorkOrderRouteError::BadInput(
+            "work order qty_target is zero — nothing to mark".to_string(),
+        ));
+    }
+    if supplied_serials > expected as usize {
+        return Err(WorkOrderRouteError::BadInput(format!(
+            "supplied {supplied_serials} serials for {expected} units"
+        )));
+    }
+
+    // Heat lot consumed = the originating quote's grade balance (S432),
+    // snapshotted onto every mark for the DataMatrix material-chain tail.
+    let heat_lot = resolve_wo_heat_lot(&conn, state.tenant.as_str(), &wo)
+        .map_err(WorkOrderRouteError::Other)?;
+    Ok((expected, heat_lot))
+    // conn dropped here — the part-marking write acquires the shared Handle next.
+}
+
 fn mark_parts_request(
     state: &AppState,
     wo_id: &str,
@@ -23070,106 +23170,73 @@ fn mark_parts_request(
         .wait()
         .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
 
-    let (marks, marked_at, heat_lot) = {
-        let conn = Connection::open(&*state.db_path).map_err(|e| {
-            WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for mark-parts: {e}"))
-        })?;
-        crate::part_marking::ensure_schema(&conn).map_err(WorkOrderRouteError::Other)?;
+    let (expected, heat_lot) = load_mark_parts_context(state, wo_id, body.serials.len())?;
 
-        let Some(wo) = aberp_work_orders::read_work_order(&conn, state.tenant.as_str(), wo_id)
-            .map_err(map_wo_err)?
-        else {
-            return Err(WorkOrderRouteError::NotFound);
+    let marked_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+
+    let mut marks = Vec::with_capacity(expected as usize);
+    for i in 1..=expected {
+        let typed = body
+            .serials
+            .get((i - 1) as usize)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        let serial = match typed {
+            Some(s) => {
+                crate::part_marking::validate_serial(s)
+                    .map_err(|e| WorkOrderRouteError::BadInput(format!("unit {i} serial: {e}")))?;
+                s.to_string()
+            }
+            None => crate::part_marking::auto_serial(wo_id, i),
         };
-        // [[trust-code-not-operator]] — only a Completed WO can be marked, and
-        // only for a defense/aerospace customer (the shipment gate's scope).
-        if wo.state != aberp_work_orders::WorkOrderState::Completed {
-            return Err(WorkOrderRouteError::Conflict(
-                "work order must be Completed before marking parts".to_string(),
-            ));
-        }
-        use crate::partners::CustomerType;
-        if !matches!(
-            resolve_wo_customer_type(&conn, state.tenant.as_str(), &wo)
-                .map_err(WorkOrderRouteError::Other)?,
-            Some(CustomerType::Defense | CustomerType::Aerospace)
-        ) {
-            return Err(WorkOrderRouteError::Conflict(
-                "part marking applies to defense/aerospace work orders only".to_string(),
-            ));
-        }
+        let part_uid = crate::part_marking::generate_part_uid();
+        let data_matrix_payload =
+            crate::part_marking::data_matrix_payload(&part_uid, &serial, heat_lot.as_deref());
+        marks.push(crate::part_marking::PartMark {
+            wo_id: wo_id.to_string(),
+            unit_index: i,
+            part_uid,
+            serial_number: serial,
+            data_matrix_payload,
+            heat_lot_reference: heat_lot.clone(),
+            marked_at_utc: marked_at.clone(),
+            marked_by_operator: operator_login.to_string(),
+        });
+    }
 
-        let expected = crate::part_marking::qty_to_units(wo.qty_target);
-        if expected == 0 {
-            return Err(WorkOrderRouteError::BadInput(
-                "work order qty_target is zero — nothing to mark".to_string(),
-            ));
-        }
-        if body.serials.len() > expected as usize {
-            return Err(WorkOrderRouteError::BadInput(format!(
-                "supplied {} serials for {expected} units",
-                body.serials.len()
-            )));
-        }
-        if crate::part_marking::count_part_marks(&conn, state.tenant.as_str(), wo_id)
-            .map_err(WorkOrderRouteError::Other)?
-            > 0
-        {
-            return Err(WorkOrderRouteError::Conflict(
-                "work order is already marked".to_string(),
-            ));
-        }
+    // ADR-0099 H3 — the part-marking read (already-marked guard) + write + audit
+    // ride the ONE shared Handle writer guard: `record_part_marks` autocommits
+    // the inserts on the live instance, then the two `part.*` audit events append
+    // on ONE tx from the SAME guard. No fresh-open truncator, no nested
+    // `db.write()`; the guard drop lockstep-syncs the mirror (was a separate
+    // `Ledger::open` + `sync_audit_mirror_best_effort`).
+    let mut guard = state
+        .db
+        .write()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("shared writer for mark-parts: {e}")))?;
+    crate::part_marking::ensure_schema(&guard).map_err(WorkOrderRouteError::Other)?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure audit schema: {e}")))?;
+    if crate::part_marking::count_part_marks(&guard, state.tenant.as_str(), wo_id)
+        .map_err(WorkOrderRouteError::Other)?
+        > 0
+    {
+        return Err(WorkOrderRouteError::Conflict(
+            "work order is already marked".to_string(),
+        ));
+    }
+    crate::part_marking::record_part_marks(&guard, state.tenant.as_str(), wo_id, &marks)
+        .map_err(map_part_mark_err)?;
 
-        // Heat lot consumed = the originating quote's grade balance (S432),
-        // snapshotted onto every mark for the DataMatrix material-chain tail.
-        let heat_lot = resolve_wo_heat_lot(&conn, state.tenant.as_str(), &wo)
-            .map_err(WorkOrderRouteError::Other)?;
-
-        let marked_at = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default();
-
-        let mut marks = Vec::with_capacity(expected as usize);
-        for i in 1..=expected {
-            let typed = body
-                .serials
-                .get((i - 1) as usize)
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty());
-            let serial = match typed {
-                Some(s) => {
-                    crate::part_marking::validate_serial(s).map_err(|e| {
-                        WorkOrderRouteError::BadInput(format!("unit {i} serial: {e}"))
-                    })?;
-                    s.to_string()
-                }
-                None => crate::part_marking::auto_serial(wo_id, i),
-            };
-            let part_uid = crate::part_marking::generate_part_uid();
-            let data_matrix_payload =
-                crate::part_marking::data_matrix_payload(&part_uid, &serial, heat_lot.as_deref());
-            marks.push(crate::part_marking::PartMark {
-                wo_id: wo_id.to_string(),
-                unit_index: i,
-                part_uid,
-                serial_number: serial,
-                data_matrix_payload,
-                heat_lot_reference: heat_lot.clone(),
-                marked_at_utc: marked_at.clone(),
-                marked_by_operator: operator_login.to_string(),
-            });
-        }
-
-        crate::part_marking::record_part_marks(&conn, state.tenant.as_str(), wo_id, &marks)
-            .map_err(map_part_mark_err)?;
-        (marks, marked_at, heat_lot)
-        // conn dropped here — Ledger opens its own writer next.
-    };
-
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("begin mark-parts audit tx: {e}")))?;
     crate::part_marking::append_mark_events(
-        &state.db_path,
-        state.tenant.clone(),
-        binary_hash,
+        &tx,
+        &meta,
         wo_id,
         operator_login,
         &marked_at,
@@ -23177,7 +23244,8 @@ fn mark_parts_request(
         &marks,
     )
     .map_err(WorkOrderRouteError::Other)?;
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    tx.commit()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("commit mark-parts audit tx: {e}")))?;
 
     Ok(MarkPartsResponse { part_marks: marks })
 }
@@ -23270,22 +23338,32 @@ async fn handle_part_traceability(
                 .binary_hash
                 .wait()
                 .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
-            let report = {
-                let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                    format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-                })?;
-                match kind {
-                    PartTraceQueryKind::PartUid => crate::part_marking::trace_part_uid(
-                        &conn,
-                        state_for_task.tenant.as_str(),
-                        &value,
-                    )?,
-                    PartTraceQueryKind::Customer => crate::part_marking::trace_customer(
-                        &conn,
-                        state_for_task.tenant.as_str(),
-                        &value,
-                    )?,
-                }
+            // ADR-0099 H3 — the trace read (its entry point is the part-marking
+            // row, a Handle family) + the `part.traceability_viewed` audit append
+            // ride the ONE shared Handle writer guard: the part-marking read is
+            // coherent with its Handle writers (a fresh open would miss a
+            // just-marked part), and the audit is no longer a fresh `Ledger::open`
+            // write-fork. The downstream WO/quote/dispatch chain the trace follows
+            // stays in fresh-open families — a narrow same-session Q2 window on a
+            // historical lookup, accepted here (this is an audit trace, not a gate).
+            let mut guard = state_for_task
+                .db
+                .write()
+                .context("shared writer for part-traceability")?;
+            crate::part_marking::ensure_schema(&guard)?;
+            aberp_audit_ledger::ensure_schema(&guard)
+                .map_err(|e| anyhow!("ensure audit schema: {e}"))?;
+            let report = match kind {
+                PartTraceQueryKind::PartUid => crate::part_marking::trace_part_uid(
+                    &guard,
+                    state_for_task.tenant.as_str(),
+                    &value,
+                )?,
+                PartTraceQueryKind::Customer => crate::part_marking::trace_customer(
+                    &guard,
+                    state_for_task.tenant.as_str(),
+                    &value,
+                )?,
             };
             let payload = serde_json::json!({
                 "query_kind": kind.as_str(),
@@ -23300,17 +23378,21 @@ async fn handle_part_traceability(
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_default(),
             });
-            let mut ledger = aberp_audit_ledger::Ledger::open(
-                state_for_task.db_path.as_path(),
-                state_for_task.tenant.clone(),
-                binary_hash,
-            )?;
-            ledger.append(
+            let meta =
+                aberp_audit_ledger::LedgerMeta::new(state_for_task.tenant.clone(), binary_hash);
+            let tx = guard
+                .transaction()
+                .context("begin part-traceability audit tx")?;
+            aberp_audit_ledger::append_in_tx(
+                &tx,
+                &meta,
                 aberp_audit_ledger::EventKind::PartTraceabilityViewed,
                 serde_json::to_vec(&payload).expect("serialize part-traceability-viewed payload"),
                 Actor::from_local_cli(Ulid::new().to_string(), &operator_login),
                 None,
-            )?;
+            )
+            .map_err(|e| anyhow!("append part.traceability_viewed: {e}"))?;
+            tx.commit().context("commit part-traceability audit tx")?;
             Ok(report)
         })
         .await;
@@ -24124,8 +24206,14 @@ async fn handle_record_qc_inspection(
             // time) so the auto-NCR cites the actual lot, not a re-derived one.
             let heat_lot = match (&body.wo_id, &body.part_uid) {
                 (Some(wo), Some(part)) => {
-                    let conn = Connection::open(&*state_for_task.db_path)
-                        .map_err(|e| crate::qc_inspection::QcRecordError::Other(anyhow!("open DuckDB: {e}")))?;
+                    // H3 (ADR-0099) — part_marking is a Handle family; read it
+                    // through the shared reader (a fresh open would miss a
+                    // just-marked unit). The read conn drops before
+                    // `record_manual_inspection` acquires its own write guard.
+                    let conn = state_for_task
+                        .db
+                        .read()
+                        .map_err(|e| crate::qc_inspection::QcRecordError::Other(anyhow!("shared reader for qc heat-lot: {e}")))?;
                     crate::part_marking::list_part_marks(&conn, state_for_task.tenant.as_str(), wo)
                         .map_err(crate::qc_inspection::QcRecordError::Other)?
                         .into_iter()
