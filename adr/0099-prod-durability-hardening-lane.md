@@ -648,6 +648,42 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   QUERY endpoints (`audit_events_request`, `get_audit_for_invoice/quote`) read
   MANY families and are coherent only once ALL audit writers are on the Handle —
   they migrate LAST.
+- **HARD ORDERING — the `work_orders` FUSED CLUSTER (binding; STEP 4b finding,
+  2026-07-12).** STEP 4 deferred the dispatch family because `create_dispatch`/
+  `mark_shipped` read `work_orders` IN-TX (eligibility + `qty_target`) while
+  `work_orders` is fresh-open. STEP 4b traced `work_orders`' OWN in-tx
+  dependencies to migrate it — and hit the SAME blocker one level deeper.
+  `work_orders` is fresh-open (`create_work_order_request` /
+  `transition_work_order_request` / `decide_qa_request` all `Connection::open`;
+  every WO reader — `list_work_orders`/`get_work_order_detail`/dashboard/
+  material-trace — fresh-open too), and its WRITERS are transactionally FUSED,
+  in ONE tx, to **three still-fresh-open BUSINESS families**:
+  1. **products** — `create_work_order` reads the `products` table in-tx (the
+     product-exists gate, `aberp-work-orders/src/repository.rs:363`).
+  2. **inventory** — `transition_work_order` WRITES inventory in-tx via
+     `aberp_inventory::record_movement` (Release → one `BomConsumption` movement
+     per active BOM row, `repository.rs:633`; Complete → one `WoCompletion`
+     movement, `:680`) and READS `current_stock` in-tx (`:639`).
+  3. **qa** — `transition_work_order` (Complete) reads the QA gate in-tx
+     (`aberp_qa::all_live_inspections_passed_for_wo` + `blocking_qa_op_names`,
+     `:588`/`:594`); and `decide_qa_request` runs `decide_qa` + `try_auto_complete_wo`
+     (→ `transition_work_order` Complete → the `WoCompletion` inventory movement)
+     in ONE tx, so **qa + work_orders + inventory co-commit**.
+  So `work_orders` is **NOT independently migratable**. Moving its writers onto
+  the Handle while products/inventory/qa stay fresh-open would (a) **Q2-blind**
+  `create_work_order`'s in-tx products read — a product created via a fresh-open
+  `create_product_request` (post-boot, `serve.rs:13885`) is invisible to the
+  Handle → spurious `ProductNotFound`, WO-create refused; (b) **half-migrate
+  inventory** — WO-transition writes on the Handle vs manual stock movements
+  (`serve.rs:14244`) + every other inventory writer on fresh opens → a CHECK M
+  violation (tears + stale reads); (c) **Q2-blind** the Complete QA gate. And
+  all-or-nothing forbids migrating only the WO readers. The coherent atomic
+  boundary is therefore the **FUSED CLUSTER `{work_orders + products + inventory
+  + qa}`** (writers AND readers), migrated in ONE commit — a much larger step
+  than a lone `work_orders` wave. **STEP 4b outcome: STOP at the `work_orders`
+  boundary — no coherent subset exists, so nothing is migrated (doc-only).**
+  Dispatch (step 4c) stays blocked transitively: dispatch waits on `work_orders`,
+  and `work_orders` waits on this cluster.
 - **CANONICAL RECIPE — a `verify_chain` audit fn on the Handle** (resolved in
   wave-2c; the audit-ledger crate already supports it — `Ledger::from_connection`
   at `crates/audit-ledger/src/storage/mod.rs` + its test
