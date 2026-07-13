@@ -128,9 +128,7 @@
 use std::path::Path;
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
-use aberp_billing::{
-    self as billing, BillingStore, DuckDbBillingStore, IdempotencyKey, InvoiceSeries, ReadyInvoice,
-};
+use aberp_billing::{self as billing, IdempotencyKey, ReadyInvoice};
 use aberp_nav_transport::{
     operations::{
         manage_invoice,
@@ -168,6 +166,17 @@ pub fn run(args: &DrainPendingRetriesArgs) -> Result<()> {
         endpoint = ?args.endpoint,
     )
     .entered();
+
+    // H3 (ADR-0099 F-E) — cross-process whole-DB single-writer lock. This CLI
+    // one-shot opens the tenant DB read-write in a SEPARATE process; if `aberp
+    // serve` (or another DB-mutating command) already holds the whole-DB writer
+    // lock it must REFUSE rather than open a second concurrent writer (the
+    // two-writer ledger-divergence class). Held for the whole command.
+    let _db_writer_lock = crate::db_writer_lock::acquire_or_refuse(
+        &args.db,
+        &args.tenant,
+        "aberp drain-pending-retries",
+    )?;
 
     // 1. Parse + validate CLI args.
     let tenant = TenantId::new(args.tenant.clone()).ok_or_else(|| {
@@ -458,9 +467,24 @@ fn drive_one_retry(
         )));
     }
 
-    // e. Derive the NAV-facing invoice number.
-    let nav_invoice_number = derive_nav_invoice_number(db_path, &ready_invoice)
-        .map_err(|e| DrainRetryError::Application(format!("{e:#}")))?;
+    // e. Resolve the NAV-facing invoice number from the base invoice's
+    //    on-disk NAV XML (ADR-0099 Addendum 2, Defect 1). The Layer-2
+    //    `queryInvoiceCheck` MUST ask NAV about the byte-exact
+    //    `<invoiceNumber>` NAV holds on file — the on-disk XML written
+    //    at issuance and never re-rewritten (S184 discipline, same
+    //    helper `issue_storno` / `issue_modification` /
+    //    `observe_receiver_confirmation` use). Pre-Addendum-2 this
+    //    SYNTHESISED `"{series.code}/{seq:05}"` where `series.code` is
+    //    the legacy `INV-default` literal — a string NAV has never seen
+    //    — so the check always returned Absent and `SkipRePost` was
+    //    unreachable (the Layer-2 duplicate guard never worked).
+    let nav_invoice_number = crate::nav_xml::read_invoice_number_from_xml(Path::new(&xml_path))
+        .map_err(|e| {
+            DrainRetryError::Application(format!(
+                "ADR-0099 Addendum 2 — read NAV invoice number from on-disk XML at {xml_path} \
+                 for drain-pending-retries Layer-2 check: {e:#}"
+            ))
+        })?;
 
     // f. Build tokio runtime + Phase 0: Layer-2 disambiguation.
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -484,8 +508,6 @@ fn drive_one_retry(
         retry.idempotency_key,
         endpoint_audit_label,
         db_path,
-        tenant.clone(),
-        binary_hash_bytes,
     )
     .map_err(|e| DrainRetryError::Application(format!("{e:#}")))?;
     match layer2_decision {
@@ -528,6 +550,7 @@ fn drive_one_retry(
             credentials,
             tax_number_8,
             &invoice_xml,
+            retry.operation,
         ))
         .map_err(classify_nav_error)?;
 
@@ -543,22 +566,22 @@ fn drive_one_retry(
         prepared.request_xml.clone(),
     )
     .map_err(|e| DrainRetryError::Application(format!("{e:#}")))?;
-    drop(conn);
+    // ADR-0099 Addendum 2 (Defect 3) — reuse the open TX1 `conn` for the
+    // mirror sync via the free `sync_mirror` (no second DuckDB
+    // instance), THEN drop it before the wire send + the fresh TX2
+    // connection, so at most ONE live DuckDB handle exists at any point.
+    // Pre-Addendum-2 this dropped `conn` and `Ledger::open`ed a fresh
+    // handle (duckdb#23046 / S332 checkpoint-replay corruption trigger).
     {
-        let ledger_tx1 = Ledger::open(db_path, tenant.clone(), binary_hash_bytes).map_err(|e| {
-            DrainRetryError::Application(format!(
-                "re-open audit ledger after drain-pending-retries TX1 commit for invoice {}: {e}",
-                retry.invoice_id
-            ))
-        })?;
         let mirror_path = audit_ledger::mirror_path_for(db_path);
-        ledger_tx1.sync_mirror(&mirror_path).map_err(|e| {
+        audit_ledger::sync_mirror(&conn, ledger_meta, &mirror_path).map_err(|e| {
             DrainRetryError::Application(format!(
                 "sync audit-ledger mirror after drain-pending-retries TX1 commit for invoice {}: {e}",
                 retry.invoice_id
             ))
         })?;
     }
+    drop(conn);
     tracing::info!(
         invoice_id = %retry.invoice_id,
         "drain-pending-retries TX1 RetryRequested+Attempt audit committed; sending manageInvoice"
@@ -589,26 +612,16 @@ fn drive_one_retry(
                 send_outcome.response_xml,
             )
             .map_err(|e| DrainRetryError::Application(format!("{e:#}")))?;
-            drop(conn);
-            let ledger = Ledger::open(db_path, tenant, binary_hash_bytes).map_err(|e| {
-                DrainRetryError::Application(format!(
-                    "re-open audit ledger after drain-pending-retries TX2 Response commit for invoice {}: {e}",
-                    retry.invoice_id
-                ))
-            })?;
-            let verified = ledger.verify_chain().map_err(|e| {
-                DrainRetryError::Application(format!(
-                    "audit-ledger chain verification failed AFTER drain-pending-retries TX2 Response commit for invoice {}: {e:#}",
-                    retry.invoice_id
-                ))
-            })?;
-            let mirror_path = audit_ledger::mirror_path_for(db_path);
-            ledger.sync_mirror(&mirror_path).map_err(|e| {
-                DrainRetryError::Application(format!(
-                    "sync audit-ledger mirror after drain-pending-retries TX2 Response commit for invoice {}: {e}",
-                    retry.invoice_id
-                ))
-            })?;
+            // ADR-0099 Addendum 2 (Defect 3) — reuse `conn` for the
+            // post-commit verify + mirror sync instead of re-opening.
+            let verified =
+                verify_chain_and_sync_reusing_conn(conn, tenant, binary_hash_bytes, db_path)
+                    .map_err(|e| {
+                        DrainRetryError::Application(format!(
+                            "drain-pending-retries TX2 Response verify/sync for invoice {}: {e:#}",
+                            retry.invoice_id
+                        ))
+                    })?;
             tracing::info!(
                 invoice_id = %retry.invoice_id,
                 transaction_id = %send_outcome.transaction_id,
@@ -637,29 +650,52 @@ fn drive_one_retry(
                 response_xml,
             )
             .map_err(|e| DrainRetryError::Application(format!("{e:#}")))?;
-            drop(conn);
-            let ledger = Ledger::open(db_path, tenant, binary_hash_bytes).map_err(|e| {
-                DrainRetryError::Application(format!(
-                    "re-open audit ledger after drain-pending-retries TX2 AttemptFailed commit for invoice {}: {e}",
-                    retry.invoice_id
-                ))
-            })?;
-            let _ = ledger.verify_chain().map_err(|e| {
-                DrainRetryError::Application(format!(
-                    "audit-ledger chain verification failed AFTER drain-pending-retries TX2 AttemptFailed commit for invoice {}: {e:#}",
-                    retry.invoice_id
-                ))
-            })?;
-            let mirror_path = audit_ledger::mirror_path_for(db_path);
-            ledger.sync_mirror(&mirror_path).map_err(|e| {
-                DrainRetryError::Application(format!(
-                    "sync audit-ledger mirror after drain-pending-retries TX2 AttemptFailed commit for invoice {}: {e}",
-                    retry.invoice_id
-                ))
-            })?;
+            // ADR-0099 Addendum 2 (Defect 3) — reuse `conn` for the
+            // post-commit verify + mirror sync instead of re-opening.
+            let _ = verify_chain_and_sync_reusing_conn(conn, tenant, binary_hash_bytes, db_path)
+                .map_err(|e| {
+                    DrainRetryError::Application(format!(
+                        "drain-pending-retries TX2 AttemptFailed verify/sync for invoice {}: {e:#}",
+                        retry.invoice_id
+                    ))
+                })?;
             Err(classify_nav_error(wire_err))
         }
     }
+}
+
+/// ADR-0099 Addendum 2 (Defect 3) — post-commit chain verification +
+/// mirror sync that REUSES the already-open `Connection` instead of
+/// re-opening the file. Direct mirror of
+/// `submit_invoice::verify_chain_and_sync_reusing_conn` (S388).
+///
+/// The pre-Addendum-2 drain did `drop(conn); Ledger::open(db, …)` in
+/// each TX2 arm — a fresh `Connection::open(path)` that re-runs DuckDB
+/// 1.5.x's LoadCheckpoint/ReadIndex replay, which can trip the
+/// checkpoint/ART corruption assertion on a heavy ledger (duckdb#23046,
+/// S332; `storage/mod.rs` `from_connection`). `Ledger::from_connection`
+/// wraps the live handle so the file is never re-opened. Consumes `conn`
+/// (the drive function's tail — nothing uses it after).
+///
+/// Returns the verified entry count. Extracted as one helper so the
+/// "reuse, never re-open" invariant is testable WITHOUT a live NAV wire
+/// send (the TX2 arms are otherwise reachable only behind a real
+/// manageInvoice round-trip).
+fn verify_chain_and_sync_reusing_conn(
+    conn: Connection,
+    tenant: TenantId,
+    binary_hash: aberp_audit_ledger::BinaryHash,
+    db_path: &Path,
+) -> Result<u64> {
+    let ledger = Ledger::from_connection(conn, tenant, binary_hash);
+    let verified = ledger.verify_chain().context(
+        "audit-ledger chain verification failed AFTER drain-pending-retries TX2 commit (reusing conn)",
+    )?;
+    let mirror_path = audit_ledger::mirror_path_for(db_path);
+    ledger.sync_mirror(&mirror_path).context(
+        "sync audit-ledger mirror file AFTER drain-pending-retries TX2 commit (reusing conn)",
+    )?;
+    Ok(verified)
 }
 
 /// PR-20 / ADR-0033 §1: the three decisions Phase 0 emits. Mirror of
@@ -696,8 +732,6 @@ fn perform_layer_2_check(
     idempotency_key: IdempotencyKey,
     endpoint_audit_label: &'static str,
     db_path: &Path,
-    tenant: TenantId,
-    binary_hash: aberp_audit_ledger::BinaryHash,
 ) -> Result<Layer2Decision> {
     let transport = NavTransport::new(nav_endpoint)
         .context("build NAV transport for Layer-2 queryInvoiceCheck (drain-pending-retries)")?;
@@ -758,28 +792,37 @@ fn perform_layer_2_check(
 
     write_check_performed_audit(conn, ledger_meta, actor, idempotency_key, payload)?;
 
-    {
-        let ledger_tx0 = Ledger::open(db_path, tenant, binary_hash).context(
-            "open audit ledger after drain-pending-retries TX0 InvoiceCheckPerformed commit",
-        )?;
-        let mirror_path = audit_ledger::mirror_path_for(db_path);
-        ledger_tx0.sync_mirror(&mirror_path).context(
-            "sync audit-ledger mirror file after drain-pending-retries TX0 InvoiceCheckPerformed commit",
-        )?;
-    }
+    // ADR-0099 Addendum 2 (Defect 3) — reuse the already-open `conn`
+    // for the post-commit mirror sync instead of `Ledger::open`ing a
+    // SECOND DuckDB instance while `conn` is still alive. The re-open
+    // re-runs DuckDB 1.5.x's LoadCheckpoint/ReadIndex replay, which can
+    // trip the checkpoint/ART corruption assertion (duckdb#23046 / S332;
+    // storage/mod.rs `from_connection`). `write_check_performed_audit`
+    // already committed, so the same handle reads the current head.
+    let mirror_path = audit_ledger::mirror_path_for(db_path);
+    audit_ledger::sync_mirror(&*conn, ledger_meta, &mirror_path).context(
+        "sync audit-ledger mirror file after drain-pending-retries TX0 InvoiceCheckPerformed commit",
+    )?;
 
     Ok(decision)
 }
 
 /// PR-19 / ADR-0032 §1: open transport, tokenExchange, build envelope.
-/// Mirror of `retry_submission::prepare_for_attempt_audit` —
-/// `InvoiceOperation::Create` per the retry surface (chain operations
-/// STORNO / MODIFY are not yet on the retry surface).
+/// Mirror of `submit_invoice::prepare_for_attempt_audit`.
+///
+/// ADR-0099 Addendum 2 (Defect 2) — `operation` is the NAV envelope
+/// operation (CREATE / STORNO / MODIFY) derived from the audit ledger by
+/// `submission_queue::operation_for_invoice` and carried on
+/// [`PendingRetry::operation`]. Pre-Addendum-2 this hardcoded
+/// `InvoiceOperation::Create`, which would re-POST a stuck STORNO as a
+/// CREATE (NAV v3.0 STORNO / MODIFY bodies are byte-identical to CREATE
+/// and cannot be told apart from the body).
 async fn prepare_for_attempt_audit(
     endpoint: NavEndpoint,
     credentials: &NavCredentials,
     tax_number_8: &str,
     invoice_xml: &[u8],
+    operation: InvoiceOperation,
 ) -> Result<PreparedSubmission, NavTransportError> {
     let transport = NavTransport::new(endpoint)?;
     let token = token_exchange::call(&transport, credentials, tax_number_8).await?;
@@ -788,7 +831,7 @@ async fn prepare_for_attempt_audit(
         tax_number_8,
         &token.decoded_token,
         &[ManageInvoiceItem {
-            operation: InvoiceOperation::Create,
+            operation,
             invoice_data_xml: invoice_xml,
         }],
     )?;
@@ -859,35 +902,6 @@ fn load_issued_invoice(
         .ok_or_else(|| anyhow!("no issued invoice with id {invoice_id} in this tenant DB"))?;
     tx.commit().context("commit read transaction")?;
     Ok(pair)
-}
-
-/// Derive the NAV-facing invoice number from the series code +
-/// sequence number. Mirror of
-/// `retry_submission::derive_nav_invoice_number`.
-fn derive_nav_invoice_number(db_path: &Path, invoice: &ReadyInvoice) -> Result<String> {
-    let store = DuckDbBillingStore::open(db_path).with_context(|| {
-        format!(
-            "open billing DuckDB at {} for drain-pending-retries Layer-2 series lookup",
-            db_path.display()
-        )
-    })?;
-    let series: InvoiceSeries = store
-        .find_series_by_id(invoice.series_id)
-        .context("billing::find_series_by_id (drain-pending-retries Layer-2 series lookup)")?
-        .ok_or_else(|| {
-            anyhow!(
-                "invoice {} references series_id {} which is not present in \
-                 invoice_series — tenant DB appears tampered between invoice \
-                 insertion and drain-pending-retries",
-                invoice.id.to_prefixed_string(),
-                invoice.series_id.to_prefixed_string()
-            )
-        })?;
-    Ok(format!(
-        "{}/{:05}",
-        series.code.as_str(),
-        invoice.sequence_number
-    ))
 }
 
 /// TX1 audit-write — RetryRequested + Attempt in one tx. Mirror of
@@ -1167,5 +1181,76 @@ mod tests {
             classify_layer_2_failure("missing <invoiceCheckResult>"),
             DrainRetryError::Application(_)
         ));
+    }
+
+    /// ADR-0099 Addendum 2 (Defect 3) — opener pin. The drain's
+    /// post-commit verify+sync helper REUSES the connection handed to it
+    /// and never re-opens the DB file. Seed a heavy on-disk ledger (the
+    /// depth that historically tripped the re-open ART/checkpoint replay
+    /// crash, S332 / duckdb#23046), hand the helper a live `Connection`
+    /// on that file, and assert it (a) verifies the full chain (returning
+    /// the entry count) and (b) writes the mirror — all through the
+    /// reused handle, with no `Ledger::open` / `Connection::open` inside
+    /// the helper. Direct mirror of `submit_invoice::tests::
+    /// verify_chain_and_sync_reusing_conn_reuses_handle_on_heavy_ledger`
+    /// (S388). Pre-Addendum-2 the drain had no reuse helper and
+    /// re-opened the file per TX2 arm; this is the CI-runnable stand-in
+    /// for the otherwise live-only manageInvoice happy path.
+    #[test]
+    fn verify_chain_and_sync_reusing_conn_reuses_handle_on_heavy_ledger() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db = std::env::temp_dir().join(format!(
+            "aberp-add2-drainreuse-{}-{}-{}.duckdb",
+            std::process::id(),
+            nanos,
+            seq
+        ));
+        let tenant = TenantId::new("t-add2".to_string()).unwrap();
+        let bh = aberp_audit_ledger::BinaryHash::from_bytes([9u8; 32]);
+        let actor = Actor::from_local_cli("sess-add2".to_string(), "test-user");
+
+        // Seed a heavy ledger (the depth that historically tripped the
+        // re-open ART/checkpoint replay crash, S332 / duckdb#23046).
+        const N: usize = 64;
+        {
+            let mut ledger = Ledger::open(&db, tenant.clone(), bh).expect("open ledger to seed");
+            for i in 0..N {
+                let payload = serde_json::to_vec(&serde_json::json!({ "n": i })).unwrap();
+                ledger
+                    .append(
+                        EventKind::InvoiceSubmissionAttempt,
+                        payload,
+                        actor.clone(),
+                        None,
+                    )
+                    .expect("append seed entry");
+            }
+        } // ledger drops → its Connection closes, entries committed.
+
+        // Open a FRESH connection (stands in for the drain's own
+        // post-commit TX2 `conn`) and hand it to the helper, which must
+        // NOT re-open the file.
+        let conn = Connection::open(&db).expect("open post-commit conn");
+        let verified = verify_chain_and_sync_reusing_conn(conn, tenant, bh, &db)
+            .expect("verify+sync must succeed reusing the conn");
+        assert_eq!(verified, N as u64, "all seeded entries must verify");
+
+        // The mirror was written through the reused connection.
+        let mirror_path = audit_ledger::mirror_path_for(&db);
+        assert!(
+            mirror_path.exists(),
+            "mirror file must be synced at {}",
+            mirror_path.display()
+        );
+
+        // Cleanup (best-effort).
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(&mirror_path);
     }
 }

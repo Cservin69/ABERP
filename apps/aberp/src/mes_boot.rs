@@ -81,6 +81,8 @@ const DEFAULT_UR_RTDE_MODEL: &str = "UR";
 #[derive(Debug, Clone)]
 pub struct MesBootDeps {
     pub db_path: PathBuf,
+    /// ADR-0099 H3 — the shared DuckDB Handle; adapter audit appends route through it.
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,

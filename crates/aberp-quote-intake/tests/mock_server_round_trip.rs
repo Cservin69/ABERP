@@ -183,8 +183,19 @@ fn build_service(addr: &SocketAddr, token: &str, db_path: &Path) -> QuoteIntakeS
         poll_interval: std::time::Duration::from_secs(60),
         enabled: true,
     };
+    // ADR-0099 H3 STEP 4d — the daemon now routes through the shared Handle.
+    // Ensure the audit + quote_intake_log schemas on a fresh conn BEFORE the
+    // Handle opens (mirrors serve boot), so the Handle sees them (Q1).
+    {
+        let conn = duckdb::Connection::open(db_path).expect("open test DB for schema");
+        aberp_audit_ledger::ensure_schema(&conn).expect("audit schema");
+        aberp_quote_intake::log_table::ensure_schema(&conn).expect("quote_intake_log schema");
+    }
+    let db =
+        aberp_db::Handle::open_default(db_path, TenantId::new("t1".to_string()).expect("tenant"))
+            .expect("open shared Handle for daemon test");
     let deps = QuoteIntakeDeps {
-        db_path: db_path.to_path_buf(),
+        db,
         tenant: TenantId::new("t1".to_string()).expect("tenant"),
         binary_hash: BinaryHash::from_bytes([0u8; 32]),
         operator_login: "test".to_string(),

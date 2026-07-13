@@ -10,6 +10,7 @@ dependencies = [
  "aberp-billing",
  "aberp-cad-extract-wrapper",
  "aberp-compliance",
+ "aberp-db",
  "aberp-digital-id",
  "aberp-dispatch",
  "aberp-inventory",
@@ -89,6 +90,7 @@ dependencies = [
 name = "aberp-billing"
 version = "0.0.0"
 dependencies = [
+ "aberp-audit-ledger",
  "duckdb",
  "rust_decimal",
  "serde",
@@ -119,6 +121,16 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "aberp-db"
+version = "0.0.0"
+dependencies = [
+ "aberp-audit-ledger",
+ "duckdb",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -277,6 +289,7 @@ version = "0.0.0"
 dependencies = [
  "aberp-audit-ledger",
  "aberp-billing",
+ "aberp-db",
  "duckdb",
  "reqwest 0.13.3",
  "rust_decimal",

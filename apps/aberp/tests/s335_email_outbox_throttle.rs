@@ -182,6 +182,8 @@ fn make_deps(db_path: &PathBuf, addr: SocketAddr, bearer: &str) -> EmailOutboxPo
     let credential = StorefrontCredentialHandle::dormant();
     credential.set(format!("http://{addr}"), Zeroizing::new(bearer.to_string()));
     EmailOutboxPollDaemonDeps {
+        db: aberp::serve::open_tenant_handle(db_path, TenantId::new("test").expect("tenant id"))
+            .expect("open shared handle"),
         db_path: db_path.clone(),
         tenant: TenantId::new("test").expect("tenant id"),
         binary_hash: BinaryHash::from_bytes([0u8; 32]),

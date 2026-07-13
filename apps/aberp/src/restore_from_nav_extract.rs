@@ -90,8 +90,6 @@
 //! cycle-level totals carried back to the operator (`*_errored`
 //! counters) make the silent-skip risk loud per CLAUDE.md rule 12.
 
-use std::path::Path;
-
 use aberp_billing::Currency;
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
@@ -834,21 +832,25 @@ fn local_name_matches(qname: &[u8], target: &str) -> bool {
 // Path-scoped DB handle helper.
 // ──────────────────────────────────────────────────────────────────────
 
-/// Open a fresh DuckDB connection rooted at `db_path` and immediately
-/// ensure both `partners` and `products` schemas. Used by the wizard's
-/// per-invoice extraction step so the surface stays one function call
-/// from `restore_from_nav_outgoing.rs` (mirrors the
-/// `Connection::open` posture inside `process_digest`).
-pub fn open_for_extract(db_path: &Path) -> Result<Connection> {
-    let conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for S196 catalog extraction",
-            db_path.display()
-        )
-    })?;
-    partners::ensure_schema(&conn).context("ensure partners schema for S196 extraction")?;
-    products::ensure_schema(&conn).context("ensure products schema for S196 extraction")?;
-    Ok(conn)
+/// H3 (ADR-0099): ensure the `partners` + `products` extraction schemas on the
+/// caller's OWN shared-`Handle` connection.
+///
+/// Was `open_for_extract`, which returned a fresh `Connection::open` — the very
+/// opener shape H3 eliminates: a separate, un-pragma'd DuckDB instance whose
+/// drop close-folds the shared Handle's WAL and tears the audit ledger for fresh
+/// readers (the reason CHECK M's file-granularity is load-bearing, not
+/// incidental). The caller now owns the `db.write()` guard and passes its
+/// connection in; the partner/product inserts run inside that one write scope,
+/// so nothing but the Handle ever opens the live path.
+///
+/// The schema-ensure is retained (idempotent DDL): serve boot does NOT run
+/// `partners::ensure_schema` before opening the Handle (only a PR-73a comment
+/// claims it), so the extraction path cannot assume the partners table exists
+/// and must ensure it here — which is why the caller takes a WRITE guard.
+pub fn ensure_extract_schemas(conn: &Connection) -> Result<()> {
+    partners::ensure_schema(conn).context("ensure partners schema for S196 extraction")?;
+    products::ensure_schema(conn).context("ensure products schema for S196 extraction")?;
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1167,8 +1169,22 @@ mod tests {
     fn open_db(label: &str) -> (ScopedTempDir, Connection) {
         let tmp = ScopedTempDir::new(label);
         let db_path = tmp.path().join("aberp.duckdb");
-        let conn = open_for_extract(&db_path).expect("open + ensure schemas");
+        // Test fixture: a direct open is fine here (cfg(test) is excluded from
+        // the opener/fork gates). The runtime path routes through the Handle.
+        let conn = Connection::open(&db_path).expect("open tenant db");
+        ensure_extract_schemas(&conn).expect("ensure extract schemas");
         (tmp, conn)
+    }
+
+    /// H3 (ADR-0099): open a shared `Handle` at `db_path` for a readback via the
+    /// migrated `restore_outgoing::list_restored`. Open it AFTER the raw write
+    /// connection has dropped so the fresh open observes the committed rows (Q3).
+    fn ext_handle(db_path: &std::path::Path) -> aberp_db::HandleArc {
+        aberp_db::Handle::open_default(
+            db_path,
+            aberp_audit_ledger::TenantId::new("t1".to_string()).expect("tenant id"),
+        )
+        .expect("open shared handle")
     }
 
     fn domestic_candidate(name: &str, tax: &str) -> CustomerCandidate {
@@ -1516,9 +1532,11 @@ mod tests {
             Currency::Huf,
         );
 
-        // Read the row back via list_restored — the buyer snapshot
-        // must be populated.
-        let list = restore_outgoing::list_restored(&db_path, "t1").expect("list");
+        // Read the row back via list_restored — the buyer snapshot must be
+        // populated. Drop the write conn first, then read through a fresh Handle.
+        drop(conn);
+        let handle = ext_handle(&db_path);
+        let list = restore_outgoing::list_restored(&handle, "t1").expect("list");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].customer_name.as_deref(), Some("Teszt Kft."));
         assert_eq!(
@@ -1563,7 +1581,9 @@ mod tests {
         let cust = private_person_candidate("Kovács Béla", "Árpád út 5.");
         let _delta = apply_candidates(&conn, "t1", "EU/2026/PP", &cust, &[], Currency::Eur);
 
-        let list = restore_outgoing::list_restored(&db_path, "t1").expect("list");
+        drop(conn);
+        let handle = ext_handle(&db_path);
+        let list = restore_outgoing::list_restored(&handle, "t1").expect("list");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].customer_name.as_deref(), Some("Kovács Béla"));
         assert_eq!(
@@ -1631,7 +1651,9 @@ mod tests {
             Currency::Huf,
         );
 
-        let list = restore_outgoing::list_restored(&db_path, "t1").expect("list");
+        drop(conn);
+        let handle = ext_handle(&db_path);
+        let list = restore_outgoing::list_restored(&handle, "t1").expect("list");
         assert_eq!(list.len(), 1);
         assert_eq!(
             list[0].customer_name.as_deref(),
@@ -1690,7 +1712,9 @@ mod tests {
         let lines = parse_invoice_lines(&inner, Currency::Eur).expect("parse lines");
         apply_candidates(&conn, "t1", "EU/2026/001", &customer, &lines, Currency::Eur);
 
-        let list = restore_outgoing::list_restored(&db_path, "t1").expect("list");
+        drop(conn);
+        let handle = ext_handle(&db_path);
+        let list = restore_outgoing::list_restored(&handle, "t1").expect("list");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].customer_name.as_deref(), Some("EU Buyer GmbH"));
         assert_eq!(

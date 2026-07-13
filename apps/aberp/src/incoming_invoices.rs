@@ -446,7 +446,7 @@ static INGEST_SERIALIZER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// stays compact; an inspector can fetch the bytes from the
 /// well-known path.
 pub fn ingest_incoming_invoice(
-    db_path: &Path,
+    db: &aberp_db::Handle,
     tenant: TenantId,
     binary_hash: audit_ledger::BinaryHash,
     operator_login: &str,
@@ -472,14 +472,16 @@ pub fn ingest_incoming_invoice(
         .lock()
         .map_err(|_| anyhow!("ingest serializer mutex poisoned by a prior panic"))?;
 
-    let mut conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for ap_invoice ingestion",
-            db_path.display()
-        )
-    })?;
-    ensure_schema(&conn).context("ensure ap_invoice schema (ingestion)")?;
-    audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema (ingestion)")?;
+    // H3 (ADR-0099) STEP 4e — ingest the row + its audit on the ONE shared Handle
+    // writer (was a fresh `Connection::open` + a SEPARATE post-commit `Ledger::open`
+    // fork). INGEST_SERIALIZER still fences the whole find→insert→audit critical
+    // section; `db.write()` is the single-writer lock underneath it. The guard drop
+    // lockstep-syncs the audit mirror (replacing the explicit post-commit sync).
+    let mut guard = db
+        .write()
+        .context("acquire shared writer for ap_invoice ingestion")?;
+    ensure_schema(&guard).context("ensure ap_invoice schema (ingestion)")?;
+    audit_ledger::ensure_schema(&guard).context("ensure audit-ledger schema (ingestion)")?;
 
     // S410 / [[no-sql-specific]] — THE authoritative dedup gate.
     // This pre-insert probe, run while `INGEST_SERIALIZER` is held for
@@ -493,7 +495,7 @@ pub fn ingest_incoming_invoice(
     // means we never write the artifact file or the audit entry for a row
     // that already exists.
     if let Some(existing_id) = find_existing_id(
-        &conn,
+        &guard,
         tenant.as_str(),
         &input.supplier_tax_number,
         &input.nav_invoice_number,
@@ -551,7 +553,7 @@ pub fn ingest_incoming_invoice(
     // idempotency contract the daemon depends on. (Pre-S186 a racing
     // caller surfaced a 500; the mutex closed that race, and this catch
     // remains the belt to its suspenders.)
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin DuckDB transaction (ap_invoice ingest)")?;
     let insert_result = tx.execute(
@@ -594,7 +596,7 @@ pub fn ingest_incoming_invoice(
                 let _ = std::fs::remove_file(path);
             }
             return match find_existing_id(
-                &conn,
+                &guard,
                 tenant.as_str(),
                 &input.supplier_tax_number,
                 &input.nav_invoice_number,
@@ -638,18 +640,19 @@ pub fn ingest_incoming_invoice(
     tx.commit()
         .context("commit DuckDB transaction (ap_invoice ingest)")?;
 
-    // Mirror sync + chain verify post-commit (same posture as
-    // mark_invoice_paid::mark_paid).
-    drop(conn);
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to verify chain after ap_invoice ingest")?;
-    ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER ap_invoice ingest")?;
-    let mirror_path = audit_ledger::mirror_path_for(db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after ap_invoice ingest")?;
+    // H3 (ADR-0099) STEP 4e — verify the chain on a `try_clone` of the SAME live
+    // shared instance (no reopen → no WAL fold/tear). The explicit `sync_mirror`
+    // is GONE: `WriteGuard::drop` lockstep-syncs the audit mirror on scope exit.
+    Ledger::from_connection(
+        guard
+            .try_clone()
+            .context("try_clone shared writer to verify chain after ap_invoice ingest")?,
+        tenant,
+        binary_hash,
+    )
+    .verify_chain()
+    .context("audit-ledger chain verification failed AFTER ap_invoice ingest")?;
+    drop(guard);
 
     Ok(IngestOutcome::Created { id })
 }
@@ -754,18 +757,17 @@ fn find_existing_id(
 /// values; `None` returns every row. Pagination is offset-based per
 /// the SPA list-view's existing posture (`limit` + `offset`).
 pub fn list_incoming(
-    db_path: &Path,
+    db: &aberp_db::Handle,
     tenant: &str,
     status_filter: Option<IncomingInvoiceStatus>,
     limit: u64,
     offset: u64,
 ) -> Result<Vec<IncomingInvoice>> {
-    let conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for ap_invoice list",
-            db_path.display()
-        )
-    })?;
+    // H3 (ADR-0099) STEP 4e — read on the ONE shared Handle reader (coherent with
+    // the Handle-resident ingest / status writers), not a fresh `Connection::open`.
+    let conn = db
+        .read()
+        .context("acquire shared reader for ap_invoice list")?;
     ensure_schema(&conn).context("ensure ap_invoice schema (list)")?;
 
     let mut rows = Vec::new();
@@ -813,13 +815,15 @@ pub fn list_incoming(
 
 /// Fetch one incoming invoice by id. `None` if the row does not
 /// exist (the route layer maps to 404).
-pub fn get_incoming(db_path: &Path, tenant: &str, id: &str) -> Result<Option<IncomingInvoice>> {
-    let conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for ap_invoice get",
-            db_path.display()
-        )
-    })?;
+pub fn get_incoming(
+    db: &aberp_db::Handle,
+    tenant: &str,
+    id: &str,
+) -> Result<Option<IncomingInvoice>> {
+    // H3 (ADR-0099) STEP 4e — read on the ONE shared Handle reader.
+    let conn = db
+        .read()
+        .context("acquire shared reader for ap_invoice get")?;
     ensure_schema(&conn).context("ensure ap_invoice schema (get)")?;
     let mut stmt = conn.prepare(
         "SELECT id, supplier_tax_number, supplier_name, supplier_address,
@@ -844,16 +848,14 @@ pub fn get_incoming(db_path: &Path, tenant: &str, id: &str) -> Result<Option<Inc
 /// the AP-sync follow-on-fetch caller (which has just inserted /
 /// found the row by id, so absence is unreachable in practice).
 pub fn get_nav_xml_path(
-    db_path: &Path,
+    db: &aberp_db::Handle,
     tenant: &str,
     ap_invoice_id: &str,
 ) -> Result<Option<String>> {
-    let conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for ap_invoice nav_xml_path read",
-            db_path.display()
-        )
-    })?;
+    // H3 (ADR-0099) STEP 4e — read on the ONE shared Handle reader.
+    let conn = db
+        .read()
+        .context("acquire shared reader for ap_invoice nav_xml_path read")?;
     ensure_schema(&conn).context("ensure ap_invoice schema (nav_xml_path read)")?;
     let mut stmt = conn.prepare(
         "SELECT nav_xml_path FROM ap_invoice
@@ -876,22 +878,21 @@ pub fn get_nav_xml_path(
 /// enrichment, not a state change. The row's `updated_at` bumps so
 /// the SPA refresh-time sort surfaces the enrichment.
 pub fn set_nav_xml_path(
-    db_path: &Path,
+    db: &aberp_db::Handle,
     tenant: &str,
     ap_invoice_id: &str,
     xml_path: &str,
 ) -> Result<()> {
-    let conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for ap_invoice nav_xml_path UPDATE",
-            db_path.display()
-        )
-    })?;
-    ensure_schema(&conn).context("ensure ap_invoice schema (nav_xml_path UPDATE)")?;
+    // H3 (ADR-0099) STEP 4e — the enrichment UPDATE rides the ONE shared Handle
+    // writer (no audit entry — operator-invisible per the doc-comment above).
+    let guard = db
+        .write()
+        .context("acquire shared writer for ap_invoice nav_xml_path UPDATE")?;
+    ensure_schema(&guard).context("ensure ap_invoice schema (nav_xml_path UPDATE)")?;
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .context("format updated_at as Rfc3339 (nav_xml_path UPDATE)")?;
-    let affected = conn.execute(
+    let affected = guard.execute(
         "UPDATE ap_invoice
             SET nav_xml_path = ?, updated_at = ?
           WHERE tenant_id = ? AND id = ?",
@@ -954,7 +955,7 @@ fn transition_allowed(from: IncomingInvoiceStatus, to: IncomingInvoiceStatus) ->
 /// alongside the column update. The chain is verified + the mirror is
 /// synced post-commit, mirroring [`crate::mark_invoice_paid::mark_paid`].
 pub fn change_status(
-    db_path: &Path,
+    db: &aberp_db::Handle,
     tenant: TenantId,
     binary_hash: audit_ledger::BinaryHash,
     operator_login: &str,
@@ -971,16 +972,16 @@ pub fn change_status(
         return Err(StatusChangeError::ReasonRequiredForIrrelevant);
     }
 
-    let mut conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for ap_invoice status change",
-            db_path.display()
-        )
-    })?;
-    ensure_schema(&conn).context("ensure ap_invoice schema (status change)")?;
-    audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema (status change)")?;
+    // H3 (ADR-0099) STEP 4e — status UPDATE + its audit on the ONE shared Handle
+    // writer (was a fresh `Connection::open` + a SEPARATE post-commit `Ledger::open`
+    // fork). Guard drop lockstep-syncs the audit mirror.
+    let mut guard = db
+        .write()
+        .context("acquire shared writer for ap_invoice status change")?;
+    ensure_schema(&guard).context("ensure ap_invoice schema (status change)")?;
+    audit_ledger::ensure_schema(&guard).context("ensure audit-ledger schema (status change)")?;
 
-    let current = read_current_status(&conn, tenant.as_str(), ap_invoice_id)?;
+    let current = read_current_status(&guard, tenant.as_str(), ap_invoice_id)?;
     let from_status = match current {
         Some(s) => s,
         None => return Err(StatusChangeError::NotFound),
@@ -998,13 +999,18 @@ pub fn change_status(
     // No-op short-circuit: if from == to, return success without
     // writing anything. The route layer can echo the unchanged row.
     if from_parsed == to_status {
-        // Get the verify count for a coherent echo.
-        drop(conn);
-        let ledger = Ledger::open(db_path, tenant, binary_hash)
-            .context("open audit ledger to count entries for status no-op")?;
-        let verified = ledger
-            .verify_chain()
-            .context("verify chain (status no-op)")?;
+        // Get the verify count for a coherent echo — on a `try_clone` of the SAME
+        // live shared instance (no reopen fork). No write happened; guard drops after.
+        let verified = Ledger::from_connection(
+            guard
+                .try_clone()
+                .context("try_clone shared writer to count entries for status no-op")?,
+            tenant,
+            binary_hash,
+        )
+        .verify_chain()
+        .context("verify chain (status no-op)")?;
+        drop(guard);
         return Ok(StatusChangeOutcome {
             id: ap_invoice_id.to_string(),
             from_status: from_parsed.as_str().to_string(),
@@ -1023,7 +1029,7 @@ pub fn change_status(
         .format(&Rfc3339)
         .context("format updated_at as Rfc3339")?;
 
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin DuckDB transaction (ap_invoice status change)")?;
     // Update local_status + irrelevant_reason atomically.
@@ -1066,16 +1072,18 @@ pub fn change_status(
     tx.commit()
         .context("commit DuckDB transaction (ap_invoice status change)")?;
 
-    drop(conn);
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to verify chain after status change")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER ap_invoice status change")?;
-    let mirror_path = audit_ledger::mirror_path_for(db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after ap_invoice status change")?;
+    // H3 (ADR-0099) STEP 4e — verify on a `try_clone` of the SAME live shared
+    // instance; the explicit `sync_mirror` is GONE (guard drop lockstep-syncs).
+    let verified = Ledger::from_connection(
+        guard
+            .try_clone()
+            .context("try_clone shared writer to verify chain after status change")?,
+        tenant,
+        binary_hash,
+    )
+    .verify_chain()
+    .context("audit-ledger chain verification failed AFTER ap_invoice status change")?;
+    drop(guard);
 
     Ok(StatusChangeOutcome {
         id: ap_invoice_id.to_string(),
@@ -1293,7 +1301,7 @@ mod tests {
         let bh = fixture_binary_hash();
 
         let first = ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1307,7 +1315,7 @@ mod tests {
         };
 
         let second = ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1320,7 +1328,14 @@ mod tests {
             other => panic!("expected AlreadyExists, got {other:?}"),
         }
 
-        let rows = list_incoming(&db_path, tenant.as_str(), None, 100, 0).unwrap();
+        let rows = list_incoming(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.as_str(),
+            None,
+            100,
+            0,
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1, "duplicate insert was suppressed by UNIQUE");
         assert_eq!(rows[0].local_status, "Outstanding");
     }
@@ -1336,7 +1351,7 @@ mod tests {
         let bh = fixture_binary_hash();
 
         ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1348,7 +1363,7 @@ mod tests {
         let mut second = fixture_input();
         second.nav_invoice_number = "SUP-2026/000002".into();
         ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1360,7 +1375,7 @@ mod tests {
         let mut third = fixture_input();
         third.supplier_tax_number = "87654321".into();
         ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1369,7 +1384,14 @@ mod tests {
         )
         .unwrap();
 
-        let rows = list_incoming(&db_path, tenant.as_str(), None, 100, 0).unwrap();
+        let rows = list_incoming(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.as_str(),
+            None,
+            100,
+            0,
+        )
+        .unwrap();
         assert_eq!(rows.len(), 3);
     }
 
@@ -1392,7 +1414,7 @@ mod tests {
         let mut input = fixture_input();
         input.nav_xml = Some(xml_bytes.clone());
         let outcome = ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1436,7 +1458,7 @@ mod tests {
         let bh = fixture_binary_hash();
 
         let outcome = ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1450,7 +1472,7 @@ mod tests {
         };
 
         let result = change_status(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1462,9 +1484,13 @@ mod tests {
         assert_eq!(result.from_status, "Outstanding");
         assert_eq!(result.to_status, "Paid");
 
-        let row = get_incoming(&db_path, tenant.as_str(), &id)
-            .unwrap()
-            .unwrap();
+        let row = get_incoming(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.as_str(),
+            &id,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(row.local_status, "Paid");
         assert_eq!(row.irrelevant_reason, None);
 
@@ -1487,7 +1513,7 @@ mod tests {
         let bh = fixture_binary_hash();
 
         let outcome = ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1502,7 +1528,7 @@ mod tests {
 
         // Missing reason → 400-shaped error.
         let result = change_status(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1517,7 +1543,7 @@ mod tests {
 
         // Whitespace-only reason → same error.
         let result_ws = change_status(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1532,7 +1558,7 @@ mod tests {
 
         // Non-empty reason → succeeds.
         let result_ok = change_status(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1542,9 +1568,13 @@ mod tests {
         )
         .expect("mark irrelevant with reason");
         assert_eq!(result_ok.to_status, "Irrelevant");
-        let row = get_incoming(&db_path, tenant.as_str(), &id)
-            .unwrap()
-            .unwrap();
+        let row = get_incoming(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.as_str(),
+            &id,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(row.local_status, "Irrelevant");
         assert_eq!(
             row.irrelevant_reason.as_deref(),
@@ -1563,7 +1593,7 @@ mod tests {
         let bh = fixture_binary_hash();
 
         let outcome = ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1577,7 +1607,7 @@ mod tests {
         };
 
         change_status(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1588,7 +1618,7 @@ mod tests {
         .unwrap();
 
         let result = change_status(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1617,7 +1647,7 @@ mod tests {
             audit_ledger::ensure_schema(&conn).unwrap();
         }
         let result = change_status(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant,
             bh,
             "operator",
@@ -1765,7 +1795,7 @@ mod tests {
         let bh = fixture_binary_hash();
 
         let first = ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "op",
@@ -1782,7 +1812,7 @@ mod tests {
         // inside the call — the very scenario Part 1 proves the DB does
         // not guard) must dedup via the probe, NOT insert a duplicate.
         let second = ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "op",
@@ -1798,7 +1828,14 @@ mod tests {
             other => panic!("expected AlreadyExists (app-layer gate), got {other:?}"),
         }
 
-        let rows = list_incoming(&db_path, tenant.as_str(), None, 100, 0).unwrap();
+        let rows = list_incoming(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.as_str(),
+            None,
+            100,
+            0,
+        )
+        .unwrap();
         assert_eq!(
             rows.len(),
             1,
@@ -1840,15 +1877,17 @@ mod tests {
         }
 
         // Four threads to up the race-trigger probability across
-        // schedulings.
+        // schedulings. All threads share ONE Handle (the exclusive
+        // file lock is held once); each thread gets a cloned Arc.
+        let shared = aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap();
         let mut handles = Vec::new();
         for i in 0..4 {
-            let db = db_path.clone();
+            let h = shared.clone();
             let art = artifacts_dir.clone();
             let t = tenant.clone();
             let operator = format!("operator-{i}");
             handles.push(std::thread::spawn(move || {
-                ingest_incoming_invoice(&db, t, bh, &operator, &art, fixture_input())
+                ingest_incoming_invoice(&h, t, bh, &operator, &art, fixture_input())
             }));
         }
         let outcomes: Vec<std::result::Result<IngestOutcome, IngestError>> = handles
@@ -1865,8 +1904,10 @@ mod tests {
             );
         }
 
-        // Contract B: exactly one row exists.
-        let rows = list_incoming(&db_path, tenant.as_str(), None, 100, 0).unwrap();
+        // Contract B: exactly one row exists. Read THROUGH the shared
+        // handle (still alive) — a fresh Connection::open on the same
+        // path would contend on the exclusive file lock.
+        let rows = list_incoming(&shared, tenant.as_str(), None, 100, 0).unwrap();
         assert_eq!(
             rows.len(),
             1,
@@ -1899,7 +1940,7 @@ mod tests {
         let bh = fixture_binary_hash();
 
         let outcome_a = ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1914,7 +1955,7 @@ mod tests {
         let mut second = fixture_input();
         second.nav_invoice_number = "SUP-2026/000002".into();
         ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1924,7 +1965,7 @@ mod tests {
         .unwrap();
 
         change_status(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1935,7 +1976,7 @@ mod tests {
         .unwrap();
 
         let outstanding = list_incoming(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.as_str(),
             Some(IncomingInvoiceStatus::Outstanding),
             100,
@@ -1946,7 +1987,7 @@ mod tests {
         assert_eq!(outstanding[0].local_status, "Outstanding");
 
         let paid = list_incoming(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.as_str(),
             Some(IncomingInvoiceStatus::Paid),
             100,
@@ -1970,7 +2011,7 @@ mod tests {
         let bh = fixture_binary_hash();
 
         let outcome = ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -1984,12 +2025,28 @@ mod tests {
         };
 
         // Fresh ingest with `nav_xml: None` writes NULL.
-        let before = get_nav_xml_path(&db_path, tenant.as_str(), &id).unwrap();
+        let before = get_nav_xml_path(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.as_str(),
+            &id,
+        )
+        .unwrap();
         assert_eq!(before, None);
 
         // Set a path; readback matches.
-        set_nav_xml_path(&db_path, tenant.as_str(), &id, "/tmp/example.xml").unwrap();
-        let after = get_nav_xml_path(&db_path, tenant.as_str(), &id).unwrap();
+        set_nav_xml_path(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.as_str(),
+            &id,
+            "/tmp/example.xml",
+        )
+        .unwrap();
+        let after = get_nav_xml_path(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.as_str(),
+            &id,
+        )
+        .unwrap();
         assert_eq!(after.as_deref(), Some("/tmp/example.xml"));
     }
 
@@ -2007,7 +2064,7 @@ mod tests {
             ensure_schema(&conn).unwrap();
         }
         let err = set_nav_xml_path(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.as_str(),
             "apinv_01HRQXYZABCDEFGHJKMNPQRST",
             "/tmp/x.xml",
@@ -2038,7 +2095,7 @@ mod tests {
         let mut input_a = fixture_input();
         input_a.nav_invoice_number = "SUP-2026/A".into();
         ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -2049,7 +2106,7 @@ mod tests {
         let mut input_b = fixture_input();
         input_b.nav_invoice_number = "SUP-2026/B".into();
         ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             bh,
             "operator",
@@ -2061,7 +2118,14 @@ mod tests {
         // The list must return BOTH rows even though their
         // nav_xml_path is NULL — the SPA's IncomingInvoiceList renders
         // them with an "XML pending" affordance, NOT a hidden gate.
-        let rows = list_incoming(&db_path, tenant.as_str(), None, 100, 0).unwrap();
+        let rows = list_incoming(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.as_str(),
+            None,
+            100,
+            0,
+        )
+        .unwrap();
         assert_eq!(rows.len(), 2, "both NULL-xml-path rows must surface");
         for row in &rows {
             assert!(

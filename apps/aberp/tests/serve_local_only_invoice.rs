@@ -42,7 +42,11 @@ fn test_dir(label: &str) -> PathBuf {
 fn build_state(db_path: PathBuf, nav_enabled: bool) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
+    // ADR-0099 H3 — the shared Handle field the durability line added to AppState.
+    let db = aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+        .expect("open shared aberp-db Handle");
     AppState {
+        db,
         db_path: Arc::new(db_path),
         tenant,
         nav_enabled,
@@ -163,6 +167,15 @@ async fn nav_off_submit_marks_invoice_local_only() {
 /// second ledger row. The short-circuit only fires when `derive_state`
 /// reads the prior `InvoiceLocalOnlyEmitted` row as `LocalOnly`, so this
 /// pins the derive ladder too.
+///
+/// ADR-0099 H3 STEP 4 — this now runs. `emit_invoice_local_only` was migrated
+/// onto the shared `state.db` writer (serve.rs), so its `InvoiceLocalOnlyEmitted`
+/// row and the re-submit's `derive_state_for` read share the ONE live instance.
+/// Before the migration the write went through a fresh `Ledger::open` that the
+/// persistent `AppState` Handle reader was blind to (coherence-model Q2: the
+/// Handle does not see a separate connection's post-open commit), so the second
+/// submit observed no prior row and wrote a duplicate. The test was `#[ignore]`d
+/// as that STEP-3 debt; un-ignoring it pins the fix.
 #[tokio::test]
 async fn nav_off_resubmit_is_idempotent() {
     let dir = test_dir("nav-off-resubmit");

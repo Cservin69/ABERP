@@ -672,6 +672,10 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // `system.`-scoped — process-lifecycle telemetry never
         // belongs in a per-invoice export bundle.
         | EventKind::DaemonShutdownCompleted
+        // ADR-0099 H3 — durability auto-recovery event (`db.auto_recovered`).
+        // `db.`-scoped process-durability telemetry — never belongs in a
+        // per-invoice export bundle.
+        | EventKind::DbAutoRecovered
         // S220 / PR-217 — buyer-backfill cycle completion event.
         // `system.`-scoped — recovery cadence telemetry against
         // `restored_invoice`, not a per-OUTGOING-invoice surface.
@@ -1079,7 +1083,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 186,
+        EventKind::ALL_KINDS_COUNT == 187,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1206,6 +1210,19 @@ pub fn run(args: &ExportInvoiceBundleArgs) -> Result<()> {
             args.out.display()
         ));
     }
+
+    // F-E whole-DB writer flock: an export READS the audit ledger, so it must be
+    // mutually exclusive with a running `serve`. aberp-db's single-writer is a
+    // process-LOCAL Mutex and cannot fence this separate CLI process; without the
+    // flock this fresh `Ledger::open` could read a stale main-file head while
+    // serve holds WAL-resident audit (the incident's mis-measurement) and export
+    // an incomplete bundle. Acquiring the flock (refused while serve holds it) is
+    // exactly what makes export-invoice-bundle's CHECK N read-fork exemption sound.
+    let _db_writer_lock = crate::db_writer_lock::acquire_or_refuse(
+        &args.db,
+        &args.tenant,
+        "aberp export-invoice-bundle",
+    )?;
 
     // 2. Compute binary hash.
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;

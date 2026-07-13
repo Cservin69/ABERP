@@ -1,0 +1,145 @@
+# ADR-0099 (PROD SAFE lane) — FROZEN runtime independent-opener census.
+# Ported from the editions ADR-0098 C2 mechanism (CHECK 10i) to the PROD tree.
+# Format: <count> <path>.
+#
+# The gate (tools/cut_gate_opener_census.sh, CHECK P1) re-derives each file's
+# RUNTIME opener count via the shared comment/string/cfg(test)-aware scanner
+# (tools/adr0098_opener_scan.awk: Connection::open(_with_flags)? / Ledger::open /
+# DuckDbBillingStore::open / Database::open / append_reopen; open_in_memory &
+# from_connection excluded) and FAILS if any file EXCEEDS its frozen count, or if
+# a NEW opener-bearing file appears that is not listed here.
+#
+# THIS IS THE PRE-H3 CENSUS. Every opener below is CURRENTLY ALLOWED. The gate
+# does NOT (yet) require zero openers or a shared Handle — that is the durability
+# work (H1 "mirror preserve-and-refuse" + H3 "shared Handle"), a FOLLOW-UP prod
+# session. This gate's sole job right now is to FREEZE the census so the opener
+# surface cannot silently GROW while durability lands. NO seam exclusions:
+# pre-durability there is no aberp-db Handle, so every runtime opener is a frozen
+# residual (contrast editions, which excluded the Handle/snapshot seams).
+#
+# Scope: apps/aberp/src + modules + crates, minus */tests/*. Machine-derived from
+# frozen prod commit f7519b4 (tag PROD_v2.27.76). Re-derive: see cut_gate_opener_census.sh.
+#
+# ADR-0099 H2 (Class 3 atomic-creation + safe-open) legitimately alters the boot
+# open path, so the frozen census is ratcheted +3 (289→292 across 42→43 files):
+#   • apps/aberp/src/serve.rs 144→145 — the atomic-provision seed open
+#     (`DuckDbBillingStore::open(creating)`) that replaces the old implicit
+#     torn-creation of the DB at the live path.
+#   • crates/aberp-snapshot/src/crash_safe.rs +2 (NEW file) — the backported
+#     `checkpoint_file` fold-open + the `probe_open` validated boot safe-open.
+# These are the atomic/probe path G2 permits; NOT new un-gated openers.
+#
+# ADR-0099 Addendum 2 (2026-07-09, owner Ervin) — owner-approved surgical NAV
+# recovery fix (Defect 3) migrates the drain-pending-retries per-invoice openers
+# onto the live handle (free sync_mirror + Ledger::from_connection, both census-
+# excluded), ahead of the wider H3 migration, because the re-open was an active
+# duckdb#23046 corruption hazard on the operator's machine. The census RATCHETS
+# DOWN −7 (292→285 across 43 files, no file dropped to zero): 5 removed from
+# drain_pending_retries.rs (8→3), 1 from recover_from_nav.rs (4→3), 1 from
+# retry_submission.rs (9→8) — the three deleted `derive_nav_invoice_number`
+# billing-store opens (Defect 1) plus the four reused drain Ledger::open sites
+# (Defect 3). Per the H3 "Remainder" note, each opener removal is re-cut into
+# this census + the fingerprint set in the SAME change.
+#
+# ADR-0099 H3 ratchet: serve.rs audit write-forks migrated onto the shared
+# aberp_db::Handle. Census ratcheted DOWN 285->271 / files 43. Re-derive: see
+# cut_gate_opener_census.sh. (P1 already forbids GROWTH; this is a sanctioned shrink.)
+#
+# ADR-0099 H3 ratchet (wave 2a, email_outbox + catalogue_push fully migrated): 267 openers / 41 files.
+#
+# ADR-0099 H3 ratchet (wave 2b, mes_manager): 266 openers / 40 files.
+# ADR-0099 H3 wave-2c (2026-07-09, owner Ervin): the avl_vendors subsystem is
+# fully migrated onto the shared Handle — all 7 serve.rs AVL handlers (create /
+# list / get / update / set-status / screen / po-check), append_vendor_event,
+# and fire_overdue_screening_reminders now route READS and WRITES through the ONE
+# Handle. Re-cut −9 (266→257 openers, 40→39 files; avl_vendors.rs drops off,
+# serve.rs 131→124). Removals-only (0 additions), verified via comm.
+# ADR-0099 H3 wave-2d (2026-07-09): email_invoice::record_email_audit_entry
+# migrated onto the shared Handle via the verify_chain recipe (append + try_clone
+# from_connection verify + guard-drop mirror). email_invoice.rs drops off. Re-cut
+# -2 (257->255 openers, 39->38 files). Removals-only, verified via comm.
+# ADR-0099 H3 wave-2e (2026-07-09): append_machine_event (the CROSS-SUBSYSTEM
+# shared audit helper — 12 callers across machines/partners/margins/lead-time/
+# quote-margin/reprice) migrated AUDIT-ONLY onto the shared Handle. Business opens
+# stay put (coherent [business-fold, audit-append] per handler). Re-cut -1
+# (255->254 openers, 38->37 files; quoting_machines.rs drops off). Removals-only.
+# ADR-0099 H3 wave-3a (ap_sync family, atomic): the IncomingInvoiceSyncCycleCompleted
+# writer (write_cycle_audit_entry_inner, verify_chain recipe) + its sentinel reader
+# (bootstrap_year_already_recorded) both onto the shared Handle in ONE commit
+# (family invariant, [[aberp-h3-handle-coherence-model]]). ap_sync.rs drops off.
+# Removals-only.
+# ADR-0099 H3 wave-3b (quote_pdf_rerender_daemon family, atomic): write_audit (writer)
+# + recover_unfinished_rerenders (raw-SQL FROM audit_ledger reader) onto the Handle.
+# prepare_rerender business open stays. Removals-only.
+# H3 wave-3c (2026-07-10) — re-cut −12 (removals-only, comm-verified 0 additions):
+# restore_from_nav migrated onto the shared Handle (restore_from_nav_outgoing.rs −11,
+# restore_from_nav_extract.rs open_for_extract −1). 249/36 → 237/34.
+# H3 invoice-family (2026-07-10) — re-cut -29 (removals-only, comm-verified 0
+# additions): the invoice-family atomic migration onto the shared Handle. 271-era
+# census 237/34 -> 208/27. 16 writer openers (issue_invoice/issue_storno/
+# issue_modification/submit_invoice/poll_ack/mark_invoice_paid + submission_queue::
+# count_pending) + 13 serve.rs invoice-audit/billing READER openers (list_invoices
+# +billing conn, get_invoice_detail +billing conn, get_audit_for_invoice,
+# list_notes_history_request, derive_state_for, query_non_terminal_invoices,
+# build_poll_daemon_inputs, audit_events_request, audit_event_detail_request,
+# resolve_customer_identity, resolve_invoice_xml_path) removed -> all on the Handle.
+# H3 master-data partners subsystem (2026-07-10) — re-cut -5 (removals-only,
+# comm-verified 0 additions): the /api/partners CRUD surface migrated onto the
+# shared Handle. Writers create/update/delete_partner_request -> state.db.write();
+# readers list_partners_request/get_partner_request -> state.db.read() (a
+# fresh-open reader opens a SEPARATE DuckDB instance that checkpoints on close and
+# truncates the Handle's audit WAL tail — proven a shutdown-tear truncator by the
+# live NAV-off reproducer). serve.rs 111->106. (Products stay fresh-open: their
+# with-inventory reader reads products.stock_qty written by 8 WO/dispatch/QA
+# record_movement callers, so the product closure pulls in the inventory+WO
+# surface — handed off as its own atomic commit.)
+# ── H3 STEP 7 (2026-07-13) — ACCEPTANCE-GATE reconciliation re-cut ─────────────
+# The write-fork + read-fork migration reached ZERO on integrate/dur-feat; the
+# gates flip to ENFORCE this step. The frozen baseline above was pinned pre-H3
+# (f7519b4) AND pre-feature-merge, so it legitimately diverges from the current
+# tree. Full REVIEWED re-cut: 271-era census (see prior notes) → 117 openers / 23
+# files. Reconciled delta vs the immediately-prior frozen set (184/25):
+#   REMOVALS (73, all Handle migrations, comm-verified): incoming_invoices.rs 9→0,
+#     material_inventory.rs 1→0, quote_calibration.rs 2→0,
+#     aberp-quote-intake/service.rs 8→0, serve.rs 106→55 (−51). Each removed opener
+#     now routes through the shared aberp_db::Handle (db.write()/db.read()); the
+#     write-fork CHECK M and read-fork gates independently confirm no half-migration.
+#   ADDITIONS (6, NONE a smuggled fresh-open fork; write-fork & read-fork = 0):
+#     • audit_dap_boot.rs:run_heartbeat_supervised (+1) and
+#       serve.rs:spawn_dap_audit_chain (+1) — the DÁP/QES boot + heartbeat. Both
+#       are cross-fn (open here, append in open_service_session_and_recover /
+#       heartbeat), so the per-fn write-fork scanner is BLIND to them. TRACKED
+#       RESIDUAL, SECURED: a PRODUCTION build refuses to start when dap_enabled=true
+#       (serve.rs DÁP boot arm, build_profile::IS_PRODUCTION_BUILD) → unreachable in
+#       prod. See tools/adr0099_write_fork_allowlist.txt residual note.
+#     • serve.rs:seed_demo_sample_data (+1) — S434 boot-time, best-effort seed of the
+#       SEPARATE bundled-demo DB (not the booted tenant's Handle, not in-serve). A
+#       legitimate boot opener, not a fork.
+#     • tenant_registry.rs ×3 (+3) — openers inside `#[cfg(test)] mod tests`. The
+#       scanner over-counts them (its string tracker mishandles the raw-string
+#       literal r#"ACME "Special" Co \ Ltd"# in that test, losing the cfg(test)
+#       scope). Conservative (over-count never HIDES a fork) and test-only; frozen
+#       here for consistency with what the shared scanner emits on this tree.
+1 apps/aberp/src/audit_dap_boot.rs
+3 apps/aberp/src/drain_pending_retries.rs
+6 apps/aberp/src/drain_submission_queue.rs
+1 apps/aberp/src/export_invoice_bundle.rs
+4 apps/aberp/src/mark_abandoned.rs
+4 apps/aberp/src/observe_receiver_confirmation.rs
+3 apps/aberp/src/poll_annulment_ack.rs
+3 apps/aberp/src/print_invoice.rs
+1 apps/aberp/src/quote_pdf_rerender_daemon.rs
+3 apps/aberp/src/recover_from_nav.rs
+4 apps/aberp/src/reports.rs
+4 apps/aberp/src/request_technical_annulment.rs
+8 apps/aberp/src/retry_submission.rs
+55 apps/aberp/src/serve.rs
+1 apps/aberp/src/snapshot.rs
+3 apps/aberp/src/submit_annulment.rs
+3 apps/aberp/src/tenant_registry.rs
+1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
+1 crates/aberp-mes/src/ledger_writer.rs
+2 crates/aberp-snapshot/src/crash_safe.rs
+2 crates/aberp-snapshot/src/take.rs
+3 crates/audit-ledger/src/storage/mod.rs
+1 modules/billing/src/adapters/duckdb_store.rs

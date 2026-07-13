@@ -45,6 +45,8 @@ fn build_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
     AppState {
+        db: aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+            .expect("test: open shared aberp-db Handle"),
         db_path: Arc::new(db_path),
         tenant,
         nav_enabled: true,
@@ -140,8 +142,11 @@ fn material_edit_entries(db_path: &PathBuf) -> Vec<aberp_audit_ledger::Entry> {
 fn material_edit_happy_path_resets_state_and_writes_audit() {
     let dir = test_dir("happy");
     let db = dir.join("aberp.duckdb");
-    let state = build_state(db.clone());
+    // H3: seed BEFORE build_state so the shared Handle (opened in build_state)
+    // observes the seeded rows (a separate write after the Handle opened would be
+    // invisible to the Handle's cached instance — probe A).
     seed_failed_row(&db, TEST_TENANT, "q-happy-0000-0000-000000000000");
+    let state = build_state(db.clone());
 
     let out = serve::amend_pricing_job_material_request(
         &state,
@@ -174,8 +179,9 @@ fn material_edit_happy_path_resets_state_and_writes_audit() {
 fn material_edit_grade_not_in_catalogue_400_no_change_no_audit() {
     let dir = test_dir("not-in-cat");
     let db = dir.join("aberp.duckdb");
-    let state = build_state(db.clone());
+    // H3: seed BEFORE build_state (see the happy-path note).
     seed_failed_row(&db, TEST_TENANT, "q-badcat-000-0000-000000000000");
+    let state = build_state(db.clone());
 
     let err = serve::amend_pricing_job_material_request(
         &state,
@@ -206,7 +212,6 @@ fn material_edit_grade_not_in_catalogue_400_no_change_no_audit() {
 fn material_edit_terminal_row_409_no_change() {
     let dir = test_dir("terminal");
     let db = dir.join("aberp.duckdb");
-    let state = build_state(db.clone());
     let qid = "q-posted-000-0000-000000000000";
     seed_failed_row(&db, TEST_TENANT, qid);
     // Drive the row to Posted (terminal — not editable).
@@ -240,6 +245,9 @@ fn material_edit_terminal_row_409_no_change() {
             .expect("post");
     }
 
+    // H3: open the shared Handle (build_state) AFTER all separate-connection
+    // setup so it observes the seeded/mutated rows (probe A).
+    let state = build_state(db.clone());
     let err = serve::amend_pricing_job_material_request(&state, qid, VALID_GRADE, "operator-ada")
         .expect_err("a Posted row must refuse the edit");
     match err {
@@ -255,7 +263,6 @@ fn material_edit_terminal_row_409_no_change() {
 fn material_edit_wrong_tenant_is_not_found() {
     let dir = test_dir("wrong-tenant");
     let db = dir.join("aberp.duckdb");
-    let state = build_state(db.clone());
     // The operator's own tenant has a (boot-seeded) catalogue, so the
     // grade is valid — this isolates the tenant check from the catalogue
     // check.
@@ -266,6 +273,8 @@ fn material_edit_wrong_tenant_is_not_found() {
     // Plant the row under a DIFFERENT tenant; the state's tenant is
     // TEST_TENANT, so the request can't see it → NotFound (404).
     seed_failed_row(&db, "some-other-tenant", "q-other-000-0000-000000000000");
+    // H3: open the shared Handle AFTER the separate-connection seeding (probe A).
+    let state = build_state(db.clone());
 
     let err = serve::amend_pricing_job_material_request(
         &state,
@@ -285,9 +294,10 @@ fn material_edit_wrong_tenant_is_not_found() {
 fn material_edit_audit_payload_round_trips() {
     let dir = test_dir("audit-roundtrip");
     let db = dir.join("aberp.duckdb");
-    let state = build_state(db.clone());
     let qid = "q-audit-000-0000-0000-000000000000";
     seed_failed_row(&db, TEST_TENANT, qid);
+    // H3: open the shared Handle AFTER the separate-connection seeding (probe A).
+    let state = build_state(db.clone());
 
     serve::amend_pricing_job_material_request(&state, qid, VALID_GRADE, "operator-bob")
         .expect("edit");

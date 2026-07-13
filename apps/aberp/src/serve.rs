@@ -525,8 +525,13 @@ fn bootstrap_demo_tenant(binary_hash: &BinaryHashHandle) -> Result<()> {
         slug: tenant_registry::DEMO_SLUG.to_string(),
         display_name: tenant_registry::DEMO_DISPLAY_NAME.to_string(),
     };
+    // H3 (ADR-0099) STEP 4e — the demo ledger is a DIFFERENT db file from the
+    // running tenant's; open a short-lived Handle on it (this runs at boot, before
+    // the shared serve Handle opens — no co-residence) and append through it.
+    let demo_db = aberp_db::Handle::open_default(&db, demo_tenant.clone())
+        .context("open demo tenant Handle for TenantDemoSeeded audit")?;
     tenant_registry::emit_tenant_event(
-        &db,
+        &demo_db,
         demo_tenant,
         bh,
         "system-demo-seed",
@@ -534,6 +539,7 @@ fn bootstrap_demo_tenant(binary_hash: &BinaryHashHandle) -> Result<()> {
         payload.to_bytes(),
     )
     .context("record TenantDemoSeeded in demo tenant ledger")?;
+    drop(demo_db);
     reg.add_demo(now)
         .map_err(|e| anyhow!("seed demo tenant: {e}"))?;
     reg.write_to(&path)?;
@@ -669,15 +675,25 @@ fn record_tenant_boot(
                 let payload = audit_payloads::TenantSellerSetupOptionalPayload {
                     slug: args.tenant.clone(),
                 };
-                if let Err(e) = crate::tenant_registry::emit_tenant_event(
-                    &args.db,
-                    tenant.clone(),
-                    bh,
-                    NAV_DISABLED_LOGIN,
-                    EventKind::TenantSellerSetupOptional,
-                    payload.to_bytes(),
-                ) {
-                    tracing::warn!(error = ?e, "could not record TenantSellerSetupOptional audit");
+                // H3 (ADR-0099) STEP 4e — record_tenant_boot runs BEFORE the shared
+                // serve Handle opens, so open a short-lived Handle on the running
+                // tenant's db for the append (no co-residence with the shared Handle).
+                match aberp_db::Handle::open_default(&args.db, tenant.clone()) {
+                    Ok(db) => {
+                        if let Err(e) = crate::tenant_registry::emit_tenant_event(
+                            &db,
+                            tenant.clone(),
+                            bh,
+                            NAV_DISABLED_LOGIN,
+                            EventKind::TenantSellerSetupOptional,
+                            payload.to_bytes(),
+                        ) {
+                            tracing::warn!(error = ?e, "could not record TenantSellerSetupOptional audit");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "could not open Handle for TenantSellerSetupOptional audit")
+                    }
                 }
             }
             Err(e) => {
@@ -694,15 +710,25 @@ fn record_tenant_boot(
                 from_slug: from.to_string(),
                 to_slug: args.tenant.clone(),
             };
-            if let Err(e) = crate::tenant_registry::emit_tenant_event(
-                &args.db,
-                tenant.clone(),
-                bh,
-                "tenant-switch",
-                EventKind::TenantSwitched,
-                payload.to_bytes(),
-            ) {
-                tracing::warn!(error = ?e, "could not record TenantSwitched audit in switched-to tenant ledger");
+            // H3 (ADR-0099) STEP 4e — same boot-phase short-lived Handle as above:
+            // the switched-TO (now running) tenant's ledger, before the shared
+            // serve Handle opens.
+            match aberp_db::Handle::open_default(&args.db, tenant.clone()) {
+                Ok(db) => {
+                    if let Err(e) = crate::tenant_registry::emit_tenant_event(
+                        &db,
+                        tenant.clone(),
+                        bh,
+                        "tenant-switch",
+                        EventKind::TenantSwitched,
+                        payload.to_bytes(),
+                    ) {
+                        tracing::warn!(error = ?e, "could not record TenantSwitched audit in switched-to tenant ledger");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "could not open Handle for TenantSwitched audit")
+                }
             }
         }
         Err(e) => {
@@ -800,6 +826,31 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             args.tenant
         )
     })?;
+
+    // H3 / ADR-0099 F-E — CROSS-PROCESS whole-DB single-writer lock. The shared
+    // in-process `aberp_db::Handle` guarantees one DuckDB instance WITHIN this
+    // process; it cannot see a SEPARATE process. The Defense line's worst
+    // durability incident was TWO `aberp serve` instances on one tenant DB
+    // forking the audit ledger. Acquire the whole-DB writer flock BEFORE any DB
+    // open (before the H2 provision/probe below), and HOLD it for the entire
+    // process lifetime (`_db_writer_lock` lives to the end of `run`): a second
+    // `serve` — or a DB-mutating CLI one-shot — that finds it held REFUSES to
+    // boot rather than opening a second concurrent writer. The lock file lives
+    // next to the tenant DB, so ensure its parent dir exists first (idempotent
+    // with the H2 create_dir_all below).
+    if let Some(parent) = args.db.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create parent directory {} for the whole-DB writer lock",
+                parent.display()
+            )
+        })?;
+    }
+    tracing::info!("boot step: acquiring cross-process whole-DB writer lock (F-E)");
+    let _db_writer_lock =
+        crate::db_writer_lock::acquire_or_refuse(&args.db, tenant.as_str(), "aberp serve")
+            .context("refusing to boot: another writer holds the tenant DB")?;
+
     // PR-46α.1 / session-62-fix — explicit step-entry log so a
     // macOS keychain ACL prompt blocking `entry.get_password()` is
     // visible at the operator-facing layer. The keychain re-prompts
@@ -1065,6 +1116,58 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 )
             })?;
         }
+
+        // H2 / ADR-0099 Class 3 — atomic creation + safe-open-on-boot. This is
+        // the SINGLE guarded chokepoint that runs BEFORE the first
+        // `DuckDbBillingStore::open` below and every subsequent boot open +
+        // daemon spawn (ADR-0095 §1·§2):
+        //   • stale-staging sweep — remove any `<db>.creating-*` litter left by
+        //     a provision a prior crash interrupted (runs on BOTH arms).
+        //   • DB MISSING ⇒ provision the initial DB ATOMICALLY: build it aside
+        //     at `<db>.creating-<tag>.duckdb` (seed the billing schema there),
+        //     fold its WAL, then atomically swap it onto the live path + write a
+        //     verified-good marker. A crash mid-creation leaves only a
+        //     disposable temp, NEVER a torn file at the live path (the exact
+        //     first-launch torn-creation class). The remaining subsystem schemas
+        //     below complete idempotently on the now-safely-present DB.
+        //   • DB PRESENT ⇒ ONE validated probe-open. A torn / unopenable live
+        //     file (the torn-checkpoint signature, "Failed to load metadata
+        //     pointer") is detected HERE — preserved byte-for-byte to
+        //     `<db>.CORRUPT-<ts>` and boot REFUSES (non-zero), so no subsystem
+        //     ever opens a torn file. H2 stops at preserve-and-refuse; the
+        //     guarded auto-recovery is a later durability step (H5).
+        aberp_snapshot::cleanup_stale_staging(&args.db);
+        if !args.db.exists() {
+            tracing::info!(
+                db = %args.db.display(),
+                "boot: tenant DB absent — provisioning atomically (ADR-0095 §2)"
+            );
+            aberp_snapshot::provision_atomic(&args.db, |creating| {
+                let mut store = DuckDbBillingStore::open(creating)?;
+                store.ensure_schema()?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .with_context(|| {
+                format!(
+                    "atomically provision initial tenant DuckDB at {}",
+                    args.db.display()
+                )
+            })?;
+        } else if let Err(e) = aberp_snapshot::probe_open_or_preserve(&args.db) {
+            // Torn/corrupt live DB — the evidence was preserved to
+            // `<db>.CORRUPT-<ts>` inside the probe (or preserving it failed).
+            // Surface one operator-actionable line and REFUSE boot (non-zero),
+            // exactly as H1's mirror arms do. Never auto-recover here (H5).
+            tracing::error!(
+                error = %e,
+                "REFUSING to boot — tenant DB failed its validated probe-open; the corrupt DB \
+                 was preserved to a `<db>.CORRUPT-<ts>` side file. Investigate, then recover from \
+                 a verified snapshot or known-good backup before re-running."
+            );
+            return Err(anyhow::Error::new(e))
+                .context("validated boot probe-open of the tenant DB at serve boot");
+        }
+
         let mut billing_store = DuckDbBillingStore::open(&args.db).with_context(|| {
             format!(
                 "open billing DuckDB at {} for boot migration",
@@ -1269,17 +1372,24 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         }
     }
 
-    // Session 152b — reconcile the audit-ledger mirror against the DB
-    // at boot. The mirror (`<db>.audit.log`) is a derivable cache, not
-    // a source of truth. If the operator nuked the DuckDB per the
-    // dev-DB-disposable rule but left the mirror in place, the mirror
-    // is now AHEAD of the fresh DB; pre-152b the first post-commit
-    // `sync_mirror` 500'd ("mirror is ahead of DB"), skipping the NAV
-    // XML write and cascading into a submit 500. Boot reconciliation
-    // truncates the ahead mirror back to the DB's max seq (and handles
-    // missing / behind / corrupt / hash-mismatch). Idempotent on a
-    // healthy state. Per-write `sync_mirror` still loud-fails on
-    // mid-process divergence — that IS a runtime bug.
+    // H1 / ADR-0099 Class 4 — reconcile the audit-ledger mirror against
+    // the DB at boot. The mirror (`<db>.audit.log`) is a derivable cache
+    // ONLY while it cannot hold entries the DB lacks. Boot reconciliation
+    // handles missing / behind idempotently, and — the durability
+    // hardening — treats DIVERGENCE as evidence to PRESERVE + REFUSE,
+    // never a silent truncate/rebuild:
+    //   (a) mirror AHEAD of the DB (torn-write / lost DB commit
+    //       fingerprint, the 2026-06-22 corruption class, or a dev
+    //       DB-nuke) → preserve to `<mirror>.ahead-<nanos>.bak` + REFUSE;
+    //   (b) a lone torn trailing line COVERED by the DB → preserve +
+    //       trim the torn tail + CONTINUE; a torn-tail prefix still ahead
+    //       of the DB routes to arm (a);
+    //   (c) equal-length head-hash divergence, or corruption deeper than
+    //       a torn tail → preserve `<mirror>.corrupt-<nanos>.bak` + REFUSE.
+    // A refuse arm exits boot NON-ZERO with an operator-actionable message
+    // + recovery pointer (the AppendError Display). Per-write `sync_mirror`
+    // still loud-fails on mid-process divergence — that IS a runtime bug.
+    // (H5 wires the guarded auto-recovery; H1 stops at preserve-and-refuse.)
     tracing::info!("boot step: reconciling audit-ledger mirror with DB (idempotent recovery)");
     {
         let _s = tracing::info_span!("serve.recover_audit_mirror").entered();
@@ -1292,9 +1402,39 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         aberp_audit_ledger::ensure_schema(&conn)
             .context("ensure audit-ledger schema at serve boot")?;
         let mirror_path = aberp_audit_ledger::mirror_path_for(&args.db);
-        let action = aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror_path)
-            .context("reconcile audit-ledger mirror with DB at serve boot")?;
-        tracing::info!(?action, "audit-ledger mirror reconciled at boot");
+        match aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror_path) {
+            Ok(action) => tracing::info!(?action, "audit-ledger mirror reconciled at boot"),
+            Err(e @ aberp_audit_ledger::AppendError::MirrorAheadOfDb { .. }) => {
+                // Arm (a). The ahead mirror was PRESERVED inside the reconcile;
+                // surface one operator-actionable line and REFUSE boot
+                // (non-zero). Never auto-truncate an ahead mirror.
+                tracing::error!(
+                    error = %e,
+                    "REFUSING to boot — audit-ledger mirror is AHEAD of the DB; the ahead mirror \
+                     was preserved to a side file. Investigate (possible lost DB commit) before \
+                     re-running; for an intentional dev DB-nuke, move the stale <db>.audit.log aside."
+                );
+                return Err(anyhow::Error::new(e))
+                    .context("reconcile audit-ledger mirror with DB at serve boot");
+            }
+            Err(e @ aberp_audit_ledger::AppendError::MirrorCorruptPreserved { .. }) => {
+                // Arms (b-deep) / (c). The original was preserved byte-for-byte
+                // inside the reconcile; REFUSE boot (non-zero). Never
+                // rebuild-from-DB, never hand-edit the mirror JSONL.
+                tracing::error!(
+                    error = %e,
+                    "REFUSING to boot — audit-ledger mirror is unrecoverable; the original was \
+                     preserved to a side file. Inspect it and restore from a verified DB snapshot \
+                     or known-good backup before re-running; do NOT hand-edit the mirror JSONL."
+                );
+                return Err(anyhow::Error::new(e))
+                    .context("reconcile audit-ledger mirror with DB at serve boot");
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .context("reconcile audit-ledger mirror with DB at serve boot");
+            }
+        }
     }
 
     // S433 — self-heal the tenant registry with the running tenant and,
@@ -1370,10 +1510,37 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         adapter_registry.clone(),
         shutdown_token_root.clone(),
     ));
+
+    // ADR-0099 H3 — open the ONE process-wide shared DuckDB Handle. The live file
+    // at `args.db` is known-good here (past the H2 provision/probe chokepoint and
+    // the boot schema-ensure block above), and this process holds the whole-DB
+    // writer flock (acquired at boot), so this is the sole runtime opener of the
+    // live path. Runtime checkpoint stays DISABLED in H3 (H4's step).
+    tracing::info!("boot step: opening the shared aberp-db Handle (H3 single-writer)");
+    let db_handle = open_tenant_handle(&args.db, tenant.clone())?;
+
+    // ADR-0099 H3 Addendum 3 — SERVE_HANDLE_LIVE tripwire. Register this tenant DB
+    // as serve-live so that ANY independent open of it (a fresh Ledger::open /
+    // DuckDbBillingStore::open in a dual-context fn wrongly reached in-serve) fails
+    // LOUD in debug/test instead of silently forking the audit ledger. Held for
+    // run()'s lifetime alongside `_db_writer_lock`; drop deregisters. ARMED via the
+    // `ABERP_SERVE_HANDLE_TRIPWIRE` env var — OFF by default so the not-yet-migrated
+    // in-serve forks (the write/read-fork gates still list them) do not trip it
+    // mid-migration; flipped ON as the FINAL step of the invoice-family migration,
+    // the same "arm at zero" posture as `ENFORCE_WRITE_FORK=1`. No-op in release.
+    let _serve_handle_tripwire = std::env::var_os("ABERP_SERVE_HANDLE_TRIPWIRE").map(|_| {
+        tracing::info!(
+            "boot step: SERVE_HANDLE_LIVE tripwire ARMED for {}",
+            args.db.display()
+        );
+        aberp_audit_ledger::serve_tripwire::register_serve_handle(&args.db)
+    });
+
     let state = AppState {
         db_path: Arc::new(args.db.clone()),
         tenant,
         nav_enabled,
+        db: db_handle,
         binary_hash: binary_hash_handle,
         session_token: Arc::new(session_token.clone()),
         boot_state: Arc::new(std::sync::RwLock::new(initial_boot_state)),
@@ -1667,6 +1834,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     let artifacts_dir = ap_artifacts_dir(st.tenant.as_str())?;
                     Ok(ap_sync::CycleInputs {
                         db_path: (*st.db_path).clone(),
+                        db: st.db.clone(),
                         tenant: st.tenant.clone(),
                         binary_hash,
                         operator_login,
@@ -1767,7 +1935,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                         }
                     };
                     restore_outgoing::BackfillInputs {
-                        db_path: (*st.db_path).clone(),
+                        db: st.db.clone(),
                         tenant: st.tenant.clone(),
                         tax_number_8: parsed.taxpayer_id,
                         endpoint,
@@ -1923,6 +2091,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     );
                     let push_deps = crate::catalogue_push::CataloguePushDeps {
                         db_path: (*st.db_path).clone(),
+                        db: st.db.clone(),
                         tenant: st.tenant.clone(),
                         binary_hash,
                         operator_login: operator_login.clone(),
@@ -1931,7 +2100,9 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     let push_handle = st.catalogue_push.clone();
                     let push_credential = st.storefront_credential.clone();
                     let deps = QuoteIntakeDeps {
-                        db_path: (*st.db_path).clone(),
+                        // ADR-0099 H3 STEP 4d — the daemon routes all quote_intake_log
+                        // access through the shared Handle (clone of state.db).
+                        db: st.db.clone(),
                         tenant: st.tenant.clone(),
                         binary_hash,
                         operator_login,
@@ -2026,7 +2197,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     // missing audit row is operator-visible via the SPA
                     // status snapshot).
                     if let Err(e) = crate::quote_pricing_pipeline::emit_python_resolved_audit(
-                        st.db_path.as_path(),
+                        &st.db,
                         st.tenant.as_str(),
                         binary_hash,
                         &pipeline_operator_login,
@@ -2076,7 +2247,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                 };
                             let pipeline_deps =
                                 crate::quote_pricing_pipeline::PricingPipelineDeps {
-                                    db_path: (*st.db_path).clone(),
+                                    db: st.db.clone(),
                                     tenant: st.tenant.clone(),
                                     binary_hash,
                                     operator_login: pipeline_operator_login.clone(),
@@ -2159,7 +2330,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                             );
                                             if let Err(e) =
                                                 crate::quote_pricing_pipeline::emit_index_migrated_audit(
-                                                    st.db_path.as_path(),
+                                                    &st.db,
                                                     st.tenant.as_str(),
                                                     binary_hash,
                                                     &pipeline_operator_login,
@@ -2302,6 +2473,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 .context("await background binary hash for MES adapter boot")?;
             let mes_deps = crate::mes_boot::MesBootDeps {
                 db_path: (*recovery_state.db_path).clone(),
+                db: recovery_state.db.clone(),
                 tenant: recovery_state.tenant.clone(),
                 binary_hash,
                 operator_login,
@@ -2358,7 +2530,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             )
             .context("resolve seller.toml path for email-relay drain")?;
             let relay_deps = crate::email_relay_daemon::EmailRelayDaemonDeps {
-                db_path: (*recovery_state.db_path).clone(),
+                db: recovery_state.db.clone(),
                 tenant: recovery_state.tenant.clone(),
                 binary_hash,
                 operator_login,
@@ -2392,11 +2564,11 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             };
             match recovery_state.binary_hash.wait() {
                 Ok(binary_hash) => {
-                    let db_path = (*recovery_state.db_path).clone();
+                    let db = recovery_state.db.clone();
                     let tenant = recovery_state.tenant.clone();
                     let scan = tokio::task::spawn_blocking(move || {
                         crate::avl_vendors::fire_overdue_screening_reminders(
-                            &db_path,
+                            &db,
                             tenant,
                             binary_hash,
                             &operator_login,
@@ -2445,11 +2617,11 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             };
             match recovery_state.binary_hash.wait() {
                 Ok(binary_hash) => {
-                    let db_path = (*recovery_state.db_path).clone();
+                    let db = recovery_state.db.clone();
                     let tenant = recovery_state.tenant.clone();
                     let scan = tokio::task::spawn_blocking(move || {
                         crate::quality::escalate_overdue_ncrs(
-                            &db_path,
+                            &db,
                             tenant,
                             binary_hash,
                             &operator_login,
@@ -2519,6 +2691,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 });
             let outbox_deps = crate::email_outbox_poll_daemon::EmailOutboxPollDaemonDeps {
                 db_path: (*recovery_state.db_path).clone(),
+                db: recovery_state.db.clone(),
                 tenant: recovery_state.tenant.clone(),
                 binary_hash,
                 operator_login,
@@ -2573,7 +2746,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             // Best-effort: a recovery error is logged, not fatal — the
             // daemon still serves new transitions.
             match crate::quote_pdf_rerender_daemon::recover_unfinished_rerenders(
-                &recovery_state.db_path,
+                &recovery_state.db,
                 &recovery_state.tenant,
                 &recovery_state.quote_pdf_rerender_queue,
             ) {
@@ -2589,6 +2762,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             }
             let rr_deps = crate::quote_pdf_rerender_daemon::QuotePdfRerenderDaemonDeps {
                 db_path: (*recovery_state.db_path).clone(),
+                db: recovery_state.db.clone(),
                 tenant: recovery_state.tenant.clone(),
                 binary_hash: rr_binary_hash,
                 operator_login: rr_operator_login,
@@ -2661,6 +2835,34 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // heartbeat actor. Keychain + TSA only touched on this opt-in path.
         match crate::tenant_registry::tenant_dap_config(recovery_state.tenant.as_str()) {
             Ok((true, heartbeat_secs)) => {
+                // ADR-0099 H3 — DÁP is a TRACKED RESIDUAL, not production-ready.
+                // Its boot open (`spawn_dap_audit_chain`) and its heartbeat
+                // (`audit_dap_boot::run_heartbeat_supervised`) each do a fresh
+                // `Ledger::open` and APPEND from a *different* fn
+                // (`open_service_session_and_recover` / `heartbeat`), so the per-fn
+                // write-fork scanner is structurally BLIND to them: they never enter
+                // the write-fork worklist yet they ride OUTSIDE the shared
+                // `aberp_db::Handle` — a scanner-blind audit-ledger fork armed the
+                // moment a tenant sets `dap_enabled`. Migrating them needs the
+                // Ledger-over-WriteGuard adapter that does not yet exist (Editions never
+                // built it). Until then, a PRODUCTION build REFUSES TO START rather than
+                // arm the latent fork (fail loud — CLAUDE.md rule 11); this makes the
+                // residual UNREACHABLE in prod, so the fork-zero-ENFORCED acceptance
+                // state holds without an allow-list blessing. NetlockTsa is itself
+                // `todo!()`, so a prod DÁP path could not function anyway. Non-production
+                // builds still exercise the DÁP structural floor (MockTsa) under test.
+                // Tracked in tools/adr0099_write_fork_allowlist.txt (residual note).
+                if crate::build_profile::IS_PRODUCTION_BUILD {
+                    return Err(anyhow!(
+                        "tenant '{}' has dap_enabled=true, but this is a PRODUCTION build: the \
+                         DÁP/QES timestamp-anchored audit chain is a tracked ADR-0099 residual, \
+                         NOT production-ready — its boot + heartbeat open a fresh ledger and append \
+                         OUTSIDE the shared aberp_db::Handle (a scanner-blind write-fork not yet \
+                         migrated), and NetlockTsa is unimplemented. Refusing to start. Unset \
+                         dap_enabled for this tenant, or run a non-production build.",
+                        recovery_state.tenant.as_str()
+                    ));
+                }
                 if let Err(e) =
                     spawn_dap_audit_chain(&recovery_state, &mut coordinator, heartbeat_secs)
                 {
@@ -2874,20 +3076,23 @@ fn write_shutdown_audit_entry(state: &AppState, trigger: &str, result: &Shutdown
         elapsed_ms: result.elapsed_ms,
     };
 
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
     let bytes = payload.to_bytes();
 
     let write_outcome = (|| -> Result<()> {
-        let mut conn =
-            Connection::open(&db_path).context("open tenant DuckDB for shutdown audit entry")?;
-        aberp_audit_ledger::ensure_schema(&conn)
-            .context("ensure audit-ledger schema for shutdown audit entry")?;
-        let tx = conn
+        // H3 (ADR-0099): route the shutdown audit through the ONE shared Handle
+        // (still alive during graceful shutdown). The WriteGuard drop runs the
+        // lockstep sync_mirror, so the separate `Ledger::open` mirror pass this
+        // used to do is no longer needed.
+        let mut guard = db
+            .write()
+            .context("acquire shared writer for shutdown audit entry")?;
+        let tx = guard
             .transaction()
             .context("begin DuckDB transaction for shutdown audit entry")?;
-        let ledger_meta = aberp_audit_ledger::LedgerMeta::new(tenant.clone(), binary_hash);
+        let ledger_meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
         aberp_audit_ledger::append_in_tx(
             &tx,
             &ledger_meta,
@@ -2899,12 +3104,6 @@ fn write_shutdown_audit_entry(state: &AppState, trigger: &str, result: &Shutdown
         .context("audit_ledger::append_in_tx DaemonShutdownCompleted")?;
         tx.commit()
             .context("commit DuckDB transaction for shutdown audit entry")?;
-        let mirror_path = aberp_audit_ledger::mirror_path_for(&db_path);
-        let ledger = Ledger::open(&db_path, tenant, binary_hash)
-            .context("open audit ledger after shutdown entry")?;
-        ledger
-            .sync_mirror(&mirror_path)
-            .context("sync audit-ledger mirror after shutdown entry")?;
         Ok(())
     })();
 
@@ -3233,6 +3432,22 @@ fn derive_initial_boot_state_with_seller_check(
 /// flips it to `Ready` after writing the four keychain entries.
 /// Every existing route checks the state via [`require_ready`] and
 /// either pulls `operator_login` OR returns 503 needs-setup.
+///
+/// ADR-0099 H3 — open the process-wide shared DuckDB [`aberp_db::Handle`]. Used at
+/// serve boot (after the H2 provision/probe chokepoint, when the live file is
+/// known-good) and by test fixtures (which bypass the boot path). `open_default`
+/// is the H3 posture: the runtime validated durable checkpoint is DISABLED (H4's
+/// step); the lockstep post-commit mirror is on. The Handle creates the DB file
+/// if absent — callers that must observe pre-existing on-disk state (a route test
+/// asserting "no write yet") key off row-presence, not file-presence.
+pub fn open_tenant_handle(
+    db_path: &std::path::Path,
+    tenant: TenantId,
+) -> anyhow::Result<aberp_db::HandleArc> {
+    aberp_db::Handle::open_default(db_path, tenant)
+        .context("open the shared aberp-db Handle (ADR-0099 H3)")
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db_path: Arc<PathBuf>,
@@ -3244,6 +3459,15 @@ pub struct AppState {
     /// gate was skipped at boot. The [[trust-code-not-operator]] switch
     /// every NAV chokepoint reads.
     pub nav_enabled: bool,
+    /// ADR-0099 H3 — the process-wide shared DuckDB [`aberp_db::Handle`]: the ONE
+    /// runtime writer/reader instance for the live tenant DB. Request handlers and
+    /// daemons route writes through `state.db.write()` (a serialized single writer
+    /// + post-commit lockstep mirror) and reads through `state.db.read()` (a
+    /// coherent `try_clone`), instead of each opening their own `Connection`.
+    /// Cheap to clone (Arc) into every handler and daemon `Deps`. Constructed once
+    /// at boot after the H2 provision/probe chokepoint. Runtime checkpoint stays
+    /// DISABLED in H3 (H4's step); the lockstep mirror is on.
+    pub db: aberp_db::HandleArc,
     /// PR-45a / session-61 — handle to the background-computed binary
     /// hash. Reading a debug `aberp` binary off cold disk + hashing it
     /// took ~7.5s in `aberp serve`'s synchronous boot path, which
@@ -4456,8 +4680,13 @@ fn create_tenant_request(
         created_at: created_at.clone(),
         creator_login: operator_login.to_string(),
     };
+    // H3 (ADR-0099) STEP 4e — the new tenant's ledger is a fresh, DIFFERENT db
+    // file; open a short-lived Handle on it (no co-residence with the running
+    // tenant's shared Handle) and append TenantCreated through it.
+    let new_db = aberp_db::Handle::open_default(&db, new_tenant.clone())
+        .context("open new tenant Handle for TenantCreated audit")?;
     crate::tenant_registry::emit_tenant_event(
-        &db,
+        &new_db,
         new_tenant,
         binary_hash,
         operator_login,
@@ -4465,6 +4694,7 @@ fn create_tenant_request(
         payload.to_bytes(),
     )
     .context("record TenantCreated in new tenant ledger")?;
+    drop(new_db);
 
     // Commit the registry row last.
     reg.add(&req.slug, &req.display_name, now)?;
@@ -4534,7 +4764,7 @@ fn switch_tenant_request(
         operator_login: operator_login.to_string(),
     };
     crate::tenant_registry::emit_tenant_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -4645,7 +4875,7 @@ fn transition_tenant_request(
         .to_bytes(),
     };
     crate::tenant_registry::emit_tenant_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -4726,7 +4956,7 @@ fn toggle_tenant_nav_request(
             operator_login: operator_login.to_string(),
         };
         crate::tenant_registry::emit_tenant_event(
-            &state.db_path,
+            &state.db,
             state.tenant.clone(),
             binary_hash,
             operator_login,
@@ -5239,7 +5469,7 @@ pub fn setup_seller_info_request(
             operator_login: operator_login.clone(),
         };
         if let Err(e) = crate::tenant_registry::emit_tenant_event(
-            &state.db_path,
+            &state.db,
             state.tenant.clone(),
             bh,
             &operator_login,
@@ -5780,7 +6010,7 @@ fn acknowledge_first_prod_launch(state: &AppState, operator_login: &str) -> Resu
         .wait()
         .context("await background binary hash compute for first-launch acknowledgement")?;
     record_first_prod_launch_audit(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -5801,26 +6031,36 @@ fn acknowledge_first_prod_launch(state: &AppState, operator_login: &str) -> Resu
 /// constructing an [`AppState`] or mutating `HOME` (the touchfile-write
 /// half is pinned separately in `crate::first_launch`).
 fn record_first_prod_launch_audit(
-    db_path: &std::path::Path,
+    db: &aberp_db::Handle,
     tenant: TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     operator_login: &str,
     acknowledged_at: &str,
 ) -> Result<()> {
     let tenant_str = tenant.as_str().to_string();
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record first-launch acknowledgement")?;
+    // H3 (ADR-0099): route through the ONE shared Handle instead of an
+    // independent `Ledger::open` write-fork; guard drop lockstep-syncs the mirror.
+    let mut guard = db
+        .write()
+        .context("acquire shared writer to record first-launch acknowledgement")?;
+    let tx = guard
+        .transaction()
+        .context("begin first-launch acknowledgement audit tx")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
     let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
     let payload =
         audit_payloads::FirstProdLaunchAcknowledgedPayload::new(acknowledged_at, tenant_str);
-    ledger
-        .append(
-            EventKind::FirstProdLaunchAcknowledged,
-            payload.to_bytes(),
-            actor,
-            None,
-        )
-        .context("append FirstProdLaunchAcknowledged audit entry")?;
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        EventKind::FirstProdLaunchAcknowledged,
+        payload.to_bytes(),
+        actor,
+        None,
+    )
+    .context("append FirstProdLaunchAcknowledged audit entry")?;
+    tx.commit()
+        .context("commit first-launch acknowledgement audit")?;
     Ok(())
 }
 
@@ -7725,7 +7965,7 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         };
     issue_invoice::issue_from_parsed(
         input,
-        &state.db_path,
+        &state.db,
         state.tenant.as_str(),
         series,
         request.currency,
@@ -8142,10 +8382,20 @@ fn submission_gate(tenant: &str, invoice_id: &str) -> Arc<tokio::sync::Mutex<()>
 
 /// S434 — append one `InvoiceLocalOnlyEmitted` row into the tenant's
 /// ledger, marking an invoice issued under a NAV-disabled tenant as
-/// stored local-only. Mirrors the `tenant_registry::emit_tenant_event`
-/// open-by-path + append discipline. The cross-invoice contamination
-/// guard lives in `InvoiceTrace::merge_entry` (it matches the payload's
-/// `invoice_id`).
+/// stored local-only. The cross-invoice contamination guard lives in
+/// `InvoiceTrace::merge_entry` (it matches the payload's `invoice_id`).
+///
+/// ADR-0099 H3 — the append rides the ONE shared Handle writer guard
+/// (was a fresh `Ledger::open` write-fork). The precondition read that
+/// gates a re-submit (`derive_state_for`) reads the audit trace through
+/// `state.db.read()` (the SAME live instance); a fresh-open write was
+/// invisible to it (coherence-model Q2: the Handle is blind to a separate
+/// connection's post-open commit), so a re-submit did not observe the
+/// first `InvoiceLocalOnlyEmitted` row and wrote a duplicate. Now the
+/// write and the read share the instance → the re-submit is idempotent.
+/// The entry is byte-identical (same kind / payload / actor / no
+/// idempotency key); only the connection it lands on changed. Guard drop
+/// lockstep-syncs the mirror.
 fn emit_invoice_local_only(
     state: &AppState,
     invoice_id: &str,
@@ -8155,21 +8405,32 @@ fn emit_invoice_local_only(
         .binary_hash
         .wait()
         .context("await background binary hash for local-only emit")?;
-    let mut ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger to record InvoiceLocalOnlyEmitted")?;
     let payload = audit_payloads::InvoiceLocalOnlyEmittedPayload {
         invoice_id: invoice_id.to_string(),
         operator_login: operator_login.to_string(),
     };
     let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
-    ledger
-        .append(
-            EventKind::InvoiceLocalOnlyEmitted,
-            payload.to_bytes(),
-            actor,
-            None,
-        )
-        .context("append InvoiceLocalOnlyEmitted audit entry")?;
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer to record InvoiceLocalOnlyEmitted")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for InvoiceLocalOnlyEmitted")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .context("begin InvoiceLocalOnlyEmitted transaction on shared writer")?;
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        EventKind::InvoiceLocalOnlyEmitted,
+        payload.to_bytes(),
+        actor,
+        None,
+    )
+    .context("append InvoiceLocalOnlyEmitted audit entry")?;
+    tx.commit()
+        .context("commit InvoiceLocalOnlyEmitted transaction on shared writer")?;
     tracing::info!(
         invoice_id = %invoice_id,
         tenant = %state.tenant.as_str(),
@@ -8327,7 +8588,7 @@ pub async fn submit_invoice_request(
     let endpoint = build_profile::nav_endpoint();
     build_profile::assert_endpoint_allowed(endpoint).map_err(SubmitRouteError::Other)?;
     submit_invoice::submit_from_inputs(submit_invoice::SubmitFromInputs {
-        db: &state.db_path,
+        db: &state.db,
         tenant_str: state.tenant.as_str(),
         invoice_id_str: invoice_id,
         invoice_xml_origin: nav_xml_path.display().to_string(),
@@ -8463,7 +8724,7 @@ pub async fn poll_ack_request(
     let endpoint = build_profile::nav_endpoint();
     build_profile::assert_endpoint_allowed(endpoint).map_err(SubmitRouteError::Other)?;
     poll_ack::poll_ack_from_inputs(
-        &state.db_path,
+        &state.db,
         state.tenant.as_str(),
         invoice_id,
         &tax_number_8,
@@ -8814,7 +9075,7 @@ pub fn storno_invoice_request(
 
     issue_storno::storno_from_inputs(
         input,
-        &state.db_path,
+        &state.db,
         state.tenant.as_str(),
         DEFAULT_SERIES_CODE,
         invoice_id,
@@ -9227,7 +9488,7 @@ pub fn modification_invoice_request(
     // 6. Dispatch into the library helper.
     issue_modification::modification_from_inputs(
         input,
-        &state.db_path,
+        &state.db,
         state.tenant.as_str(),
         series,
         invoice_id,
@@ -9718,10 +9979,16 @@ fn set_restored_partner_request(
         .wait()
         .map_err(|e| SetRestoredPartnerError::Other(anyhow!("await binary hash: {e}")))?;
     let tenant = state.tenant.clone();
-    let db_path = state.db_path.as_ref().clone();
 
-    let mut conn = duckdb::Connection::open(&db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+    // H3 (ADR-0099): the whole ExtNavPartnerManualLink flow (reads + the business
+    // update + the audit append) runs on the ONE shared writer instead of an
+    // independent `Connection::open` write-fork. Holding the write guard for the
+    // flow is the single-writer discipline; the guard drop lockstep-syncs the
+    // mirror. (`&conn` deref-coerces to `&Connection` for the read helpers.)
+    let mut conn = state
+        .db
+        .write()
+        .context("acquire shared writer for ExtNavPartnerManualLink")?;
     aberp_audit_ledger::ensure_schema(&conn)
         .context("ensure audit-ledger schema for ExtNavPartnerManualLink")?;
     partners::ensure_schema(&conn).context("ensure partners schema for ExtNavPartnerManualLink")?;
@@ -9825,14 +10092,9 @@ fn set_restored_partner_request(
     .map_err(|e| anyhow!("audit_ledger::append_in_tx ExtNavPartnerManualLink: {e}"))?;
     tx.commit()
         .context("commit DuckDB transaction (ExtNavPartnerManualLink)")?;
+    // The WriteGuard drop runs the lockstep sync_mirror, so the explicit
+    // post-commit `Ledger::open` mirror pass this used to do is no longer needed.
     drop(conn);
-
-    let ledger = Ledger::open(&db_path, tenant.clone(), binary_hash)
-        .context("open audit ledger to sync mirror after manual-link entry")?;
-    let mirror_path = aberp_audit_ledger::mirror_path_for(&db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after manual-link entry")?;
 
     Ok(after)
 }
@@ -10052,7 +10314,7 @@ pub fn mark_paid_request(
         }),
     };
     match mark_invoice_paid::mark_paid(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         &operator_login,
@@ -10227,8 +10489,16 @@ pub fn list_partners_request(
     state: &AppState,
     search: Option<&str>,
 ) -> std::result::Result<Vec<Partner>, PartnerRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099) — read through the shared Handle (a `try_clone` of
+    // the boot connection). A fresh `Connection::open` reader opens a
+    // SEPARATE DuckDB instance that checkpoints on close, truncating the
+    // Handle's uncheckpointed audit WAL tail and tearing the mirror on
+    // shutdown (proved deterministically by the live reproducer). All
+    // partner writers are on the Handle, so `db.read()` is coherent.
+    let conn = state
+        .db
+        .read()
+        .context("acquire shared reader to list partners")?;
     let partners = partners::list_partners(&conn, state.tenant.as_str(), search)?;
     Ok(partners)
 }
@@ -10261,8 +10531,12 @@ pub fn get_partner_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<Partner, PartnerRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099) — read through the shared Handle; see
+    // `list_partners_request` for why a fresh open is a truncator.
+    let conn = state
+        .db
+        .read()
+        .context("acquire shared reader to get partner")?;
     match partners::get_partner(&conn, state.tenant.as_str(), id)? {
         Some(p) => Ok(p),
         None => Err(PartnerRouteError::NotFound),
@@ -10312,8 +10586,16 @@ pub fn create_partner_request(
     if let Err(errors) = partners::validate_partner_inputs(inputs) {
         return Err(PartnerRouteError::Validation(errors));
     }
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099) — route the partner business write through the ONE
+    // shared Handle instead of a fresh `Connection::open` truncator. A
+    // fresh-open write across a Handle audit write folds the WAL and
+    // tears the audit mirror on shutdown (the master-data CRUD tear).
+    // `WriteGuard` derefs to `Connection`, so `create_partner` is
+    // unchanged. Guard is dropped at fn return (short guard, no `.await`).
+    let conn = state
+        .db
+        .write()
+        .context("acquire shared writer to create partner")?;
     let partner = partners::create_partner(&conn, state.tenant.as_str(), inputs)?;
     Ok(partner)
 }
@@ -10375,9 +10657,16 @@ pub fn update_partner_request(
     // detect a change and fire `PartnerCustomerTypeChanged`. The write
     // connection is scoped/dropped before the audit append opens its own
     // ledger connection (the S427 single-writer-lock posture).
+    // H3 (ADR-0099) — the business read+write ride the shared Handle
+    // writer (fresh-open truncator eliminated). The guard is scoped to
+    // this block and DROPPED before the audit append below, which
+    // acquires its own `db.write()` inside `append_machine_event`
+    // (nested writes on one thread trip the re-entrancy tripwire).
     let (partner, old_customer_type) = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        let conn = state
+            .db
+            .write()
+            .context("acquire shared writer to update partner")?;
         let old_customer_type =
             partners::get_partner(&conn, state.tenant.as_str(), id)?.map(|p| p.customer_type);
         let updated = match partners::update_partner(&conn, state.tenant.as_str(), id, inputs)? {
@@ -10398,7 +10687,7 @@ pub fn update_partner_request(
         let tenant = TenantId::new(state.tenant.as_str())
             .with_context(|| format!("tenant id {}", state.tenant.as_str()))?;
         crate::quoting_machines::append_machine_event(
-            &state.db_path,
+            &state.db,
             tenant,
             binary_hash,
             operator_login,
@@ -10449,8 +10738,12 @@ pub fn delete_partner_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<(), PartnerRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099) — soft-delete write on the shared Handle (fresh-open
+    // truncator eliminated). Guard dropped at fn return.
+    let conn = state
+        .db
+        .write()
+        .context("acquire shared writer to delete partner")?;
     let deleted = partners::soft_delete_partner(&conn, state.tenant.as_str(), id)?;
     if deleted {
         Ok(())
@@ -10668,7 +10961,7 @@ pub fn create_machine_request(
         buffer_pct: machine.buffer_pct,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -10741,7 +11034,7 @@ pub fn update_machine_request(
         enabled: machine.enabled,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -10804,7 +11097,7 @@ pub fn archive_machine_request(
         archived_at,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -10900,8 +11193,13 @@ async fn handle_list_avl_vendors(headers: HeaderMap, State(state): State<AppStat
 pub fn list_avl_vendors_request(
     state: &AppState,
 ) -> std::result::Result<Vec<crate::avl_vendors::AvlVendor>, VendorRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099): read through the shared Handle's reader so this list sees
+    // the writers' pending WAL rows (a fresh Connection::open would read the
+    // pre-WAL main file → stale under the held Handle).
+    let conn = state
+        .db
+        .read()
+        .context("acquire shared reader to list AVL vendors")?;
     Ok(crate::avl_vendors::list_vendors(
         &conn,
         state.tenant.as_str(),
@@ -10931,8 +11229,12 @@ pub fn get_avl_vendor_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<crate::avl_vendors::AvlVendor, VendorRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099): read through the shared Handle's reader (coherent with the
+    // held Handle's WAL); a fresh Connection::open would see stale main-file data.
+    let conn = state
+        .db
+        .read()
+        .context("acquire shared reader to get AVL vendor")?;
     match crate::avl_vendors::get_vendor(&conn, state.tenant.as_str(), id)? {
         Some(v) => Ok(v),
         None => Err(VendorRouteError::NotFound),
@@ -10981,10 +11283,15 @@ pub fn create_avl_vendor_request(
     if let Err(errors) = crate::avl_vendors::validate_vendor_inputs(inputs) {
         return Err(VendorRouteError::Validation(errors));
     }
-    // Scope the write connection (DuckDB single-writer; see create_machine_request).
+    // H3 (ADR-0099): the business write and its audit row both ride the ONE
+    // shared Handle (two sequential guards — this write guard drops at the end
+    // of the block, before append_vendor_event acquires the next) instead of an
+    // independent Connection::open + Ledger::open pair of write-forks.
     let vendor = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        let conn = state
+            .db
+            .write()
+            .context("acquire shared writer to create AVL vendor")?;
         crate::avl_vendors::create_vendor(&conn, state.tenant.as_str(), inputs, operator_login)?
     };
     let payload = crate::audit_payloads::AvlVendorAddedPayload {
@@ -10995,7 +11302,7 @@ pub fn create_avl_vendor_request(
         reviewer_login: operator_login.to_string(),
     };
     crate::avl_vendors::append_vendor_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -11045,8 +11352,12 @@ pub fn update_avl_vendor_request(
     if let Err(errors) = crate::avl_vendors::validate_vendor_edit(inputs) {
         return Err(VendorRouteError::Validation(errors));
     }
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099): the edit UPDATE rides the shared Handle's writer instead of
+    // an independent Connection::open write-fork; the guard drop syncs the mirror.
+    let conn = state
+        .db
+        .write()
+        .context("acquire shared writer to edit AVL vendor")?;
     match crate::avl_vendors::update_vendor(
         &conn,
         state.tenant.as_str(),
@@ -11111,10 +11422,14 @@ pub fn set_avl_vendor_status_request(
             ),
         }])
     })?;
-    // Scope the write connection (DuckDB single-writer).
+    // H3 (ADR-0099): the status change and its audit row both ride the ONE
+    // shared Handle (sequential guards) instead of an independent
+    // Connection::open + Ledger::open pair of write-forks.
     let change = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        let conn = state
+            .db
+            .write()
+            .context("acquire shared writer to change AVL vendor status")?;
         match crate::avl_vendors::set_vendor_status(
             &conn,
             state.tenant.as_str(),
@@ -11161,7 +11476,7 @@ pub fn set_avl_vendor_status_request(
             reviewer_login: operator_login.to_string(),
         };
         crate::avl_vendors::append_vendor_event(
-            &state.db_path,
+            &state.db,
             state.tenant.clone(),
             binary_hash,
             operator_login,
@@ -11177,7 +11492,7 @@ pub fn set_avl_vendor_status_request(
             reviewer_login: operator_login.to_string(),
         };
         crate::avl_vendors::append_vendor_event(
-            &state.db_path,
+            &state.db,
             state.tenant.clone(),
             binary_hash,
             operator_login,
@@ -11259,10 +11574,14 @@ pub fn screen_avl_vendor_request(
         return Err(VendorRouteError::Validation(errors));
     }
 
-    // Scope the write connection (DuckDB single-writer).
+    // H3 (ADR-0099): the screening write and its audit row both ride the ONE
+    // shared Handle (sequential guards) instead of an independent
+    // Connection::open + Ledger::open pair of write-forks.
     let vendor = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        let conn = state
+            .db
+            .write()
+            .context("acquire shared writer to record AVL screening")?;
         match crate::avl_vendors::record_screening(
             &conn,
             state.tenant.as_str(),
@@ -11289,7 +11608,7 @@ pub fn screen_avl_vendor_request(
         decision_time_utc: now,
     };
     crate::avl_vendors::append_vendor_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -11350,9 +11669,14 @@ pub fn avl_po_check_request(
     operator_login: &str,
     binary_hash: BinaryHash,
 ) -> std::result::Result<(), VendorRouteError> {
+    // H3 (ADR-0099): the eligibility READ rides the shared Handle's reader
+    // (`db.read()` is a coherent try_clone of the one live instance); the
+    // conditional PoBlocked audit below routes through the same Handle's writer.
     let eligibility = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        let conn = state
+            .db
+            .read()
+            .context("acquire shared reader for AVL PO-eligibility check")?;
         crate::avl_vendors::po_eligibility(&conn, state.tenant.as_str(), partner_id)?
     };
     match eligibility {
@@ -11369,7 +11693,7 @@ pub fn avl_po_check_request(
                 attempted_at_utc: now,
             };
             crate::avl_vendors::append_vendor_event(
-                &state.db_path,
+                &state.db,
                 state.tenant.clone(),
                 binary_hash,
                 operator_login,
@@ -11572,7 +11896,7 @@ pub fn create_margin_profile_request(
         min_margin_pct: profile.min_margin_pct,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -11647,7 +11971,7 @@ pub fn update_margin_profile_request(
         enabled: profile.enabled,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -11708,7 +12032,7 @@ pub fn archive_margin_profile_request(
         archived_at,
     };
     crate::quoting_machines::append_machine_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -11772,41 +12096,54 @@ pub fn override_lead_time_request(
     operator_login: &str,
     binary_hash: BinaryHash,
 ) -> std::result::Result<(), MachineRouteError> {
-    // Scope the write connection (see `create_machine_request`); capture
-    // the computed value for the audit payload BEFORE writing.
-    let computed_days = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-        let Some(detail) =
-            crate::quote_pricing_jobs::get_job_detail(&conn, quote_id, state.tenant.as_str())?
-        else {
-            return Err(MachineRouteError::NotFound);
-        };
-        let applied = crate::quote_pricing_jobs::set_lead_time_override(
-            &conn,
-            quote_id,
-            state.tenant.as_str(),
-            override_days,
-            time::OffsetDateTime::now_utc(),
-        )?;
-        if !applied {
-            return Err(MachineRouteError::NotFound);
-        }
-        detail.lead_time_days
+    // H3 (ADR-0099) STEP 4e — the lead-time-override business write and its audit
+    // ride ONE tx on the ONE shared Handle writer (was a fresh `Connection::open`
+    // write-fork + a separate `state.db` audit guard). Capture the computed value
+    // for the audit payload BEFORE writing; the whole quote_pricing_jobs family is
+    // single-instance on the Handle (daemon + serve), so a Handle reader is
+    // coherent with this write.
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer for lead-time override")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for lead-time override")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .context("begin lead-time-override transaction on shared writer")?;
+    let Some(detail) =
+        crate::quote_pricing_jobs::get_job_detail(&tx, quote_id, state.tenant.as_str())?
+    else {
+        return Err(MachineRouteError::NotFound);
     };
+    let applied = crate::quote_pricing_jobs::set_lead_time_override(
+        &tx,
+        quote_id,
+        state.tenant.as_str(),
+        override_days,
+        time::OffsetDateTime::now_utc(),
+    )?;
+    if !applied {
+        return Err(MachineRouteError::NotFound);
+    }
+    let computed_days = detail.lead_time_days;
     let payload = crate::audit_payloads::QuoteLeadTimeOverriddenPayload {
         quote_id: quote_id.to_string(),
         computed_days,
         override_days,
     };
-    crate::quoting_machines::append_machine_event(
-        &state.db_path,
-        state.tenant.clone(),
-        binary_hash,
-        operator_login,
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
         EventKind::QuoteLeadTimeOverridden,
         payload.to_bytes(),
-    )?;
+        Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        None,
+    )
+    .context("append quote.lead_time_overridden audit entry")?;
+    tx.commit()
+        .context("commit lead-time-override transaction on shared writer")?;
     Ok(())
 }
 
@@ -11925,49 +12262,58 @@ pub fn set_quote_buyer_partner_request(
     binary_hash: BinaryHash,
 ) -> std::result::Result<(), QuoteMarginError> {
     let tenant = state.tenant.as_str();
-    // Scope the write connection (S427 single-writer-lock posture).
-    let reprice = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-        let stored_override =
-            match crate::quote_pricing_jobs::get_job_detail(&conn, quote_id, tenant)? {
-                Some(d) => d.margin_override_pct,
-                None => return Err(QuoteMarginError::NotFound),
-            };
-        let applied = crate::quote_pricing_jobs::set_buyer_partner(
-            &conn,
+    // H3 (ADR-0099) STEP 4e — the re-price business writes (buyer-partner +
+    // margin-result flag) and the margin-provenance audit ride ONE tx on the
+    // ONE shared Handle writer. Previously the business UPDATEs ran on a fresh
+    // `Connection::open` write-fork while the audit append rode `state.db`
+    // (`emit_reprice_provenance` → `append_machine_event`) — a split-brain that
+    // left the DEAL saga's Handle-side `margin_below_floor` read BLIND to the
+    // fork's below-floor write (the S428 fail-open, [[trust-code-not-operator]]).
+    // Business-write and audit on ONE guard/tx close it (rule 15).
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer for buyer-partner re-price")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for re-price provenance")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .context("begin buyer-partner re-price transaction on shared writer")?;
+    let stored_override = match crate::quote_pricing_jobs::get_job_detail(&tx, quote_id, tenant)? {
+        Some(d) => d.margin_override_pct,
+        None => return Err(QuoteMarginError::NotFound),
+    };
+    let applied = crate::quote_pricing_jobs::set_buyer_partner(
+        &tx,
+        quote_id,
+        tenant,
+        body.partner_id.as_deref(),
+        time::OffsetDateTime::now_utc(),
+    )?;
+    if !applied {
+        return Err(QuoteMarginError::NotFound);
+    }
+    // Re-price with the new buyer (reads buyer_partner_id from the row).
+    let outcome =
+        crate::quote_pricing_pipeline::reprice_quote(&tx, tenant, quote_id, stored_override)?;
+    if let Some(ref o) = outcome {
+        crate::quote_pricing_jobs::set_margin_result(
+            &tx,
             quote_id,
             tenant,
-            body.partner_id.as_deref(),
+            &o.breakdown_json,
+            o.total_price,
+            o.below_floor,
+            o.floor_pct,
             time::OffsetDateTime::now_utc(),
         )?;
-        if !applied {
-            return Err(QuoteMarginError::NotFound);
-        }
-        // Re-price with the new buyer (reads buyer_partner_id from the row).
-        let outcome =
-            crate::quote_pricing_pipeline::reprice_quote(&conn, tenant, quote_id, stored_override)?;
-        if let Some(ref o) = outcome {
-            crate::quote_pricing_jobs::set_margin_result(
-                &conn,
-                quote_id,
-                tenant,
-                &o.breakdown_json,
-                o.total_price,
-                o.below_floor,
-                o.floor_pct,
-                time::OffsetDateTime::now_utc(),
-            )?;
-        }
-        outcome
-    };
-    emit_reprice_provenance(
-        state,
-        quote_id,
-        operator_login,
-        binary_hash,
-        reprice.as_ref(),
-    )?;
+    }
+    // Margin-provenance audit on the SAME tx (was a forked `append_machine_event`
+    // guard in `emit_reprice_provenance`).
+    emit_reprice_provenance_in_tx(&tx, &meta, quote_id, operator_login, outcome.as_ref())?;
+    tx.commit()
+        .context("commit buyer-partner re-price transaction on shared writer")?;
     Ok(())
 }
 
@@ -12024,18 +12370,33 @@ pub fn override_quote_margin_request(
             ));
         }
     }
+    // H3 (ADR-0099) STEP 4e — one shared-Handle guard/tx for the whole request:
+    // candidate re-price, the state-guarded override + margin-result writes, AND
+    // the audit-of-record, so the business write and its audit commit atomically
+    // (rule 15) and the DEAL saga's Handle-side floor read is coherent with the
+    // write (was a fresh `Connection::open` fork + a separate `state.db` audit
+    // guard — the split-brain S428 fail-open, [[trust-code-not-operator]]).
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer for margin override")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for margin override")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .context("begin margin-override transaction on shared writer")?;
     // Re-price with the candidate override FIRST (no persistence yet) so a
     // below-floor override can be refused before it takes effect.
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let Some(outcome) =
-        crate::quote_pricing_pipeline::reprice_quote(&conn, tenant, quote_id, body.margin_pct)?
+        crate::quote_pricing_pipeline::reprice_quote(&tx, tenant, quote_id, body.margin_pct)?
     else {
         return Err(QuoteMarginError::NotFound);
     };
     // An operator-CHOSEN override that breaches the floor needs explicit
     // confirmation ([[trust-code-not-operator]]: the DEAL block still
     // applies regardless — this gate only governs saving the low margin).
+    // Returning here drops `tx` → rollback, so nothing persists on refusal.
     if body.margin_pct.is_some() && outcome.below_floor && !body.confirm_below_floor {
         return Err(QuoteMarginError::BelowFloorNeedsConfirm {
             realized_pct: outcome.realized_margin_pct,
@@ -12044,7 +12405,7 @@ pub fn override_quote_margin_request(
     }
     let now = time::OffsetDateTime::now_utc();
     let applied = crate::quote_pricing_jobs::set_margin_override(
-        &conn,
+        &tx,
         quote_id,
         tenant,
         body.margin_pct,
@@ -12054,7 +12415,7 @@ pub fn override_quote_margin_request(
         return Err(QuoteMarginError::NotFound);
     }
     crate::quote_pricing_jobs::set_margin_result(
-        &conn,
+        &tx,
         quote_id,
         tenant,
         &outcome.breakdown_json,
@@ -12063,21 +12424,22 @@ pub fn override_quote_margin_request(
         outcome.floor_pct,
         now,
     )?;
-    drop(conn);
 
-    // Audit: the override itself, plus the floor-breach acknowledgement.
+    // Audit on the SAME tx: the override itself, plus the floor-breach
+    // acknowledgement.
     let payload = crate::audit_payloads::QuoteMarginOverriddenPayload {
         quote_id: quote_id.to_string(),
         override_margin_pct: body.margin_pct,
     };
-    crate::quoting_machines::append_machine_event(
-        &state.db_path,
-        state.tenant.clone(),
-        binary_hash,
-        operator_login,
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
         EventKind::QuoteMarginOverridden,
         payload.to_bytes(),
-    )?;
+        Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        None,
+    )
+    .context("append quote.margin_overridden audit entry")?;
     if body.margin_pct.is_some() && outcome.below_floor && body.confirm_below_floor {
         let payload = crate::audit_payloads::QuoteMarginFloorOverriddenPayload {
             quote_id: quote_id.to_string(),
@@ -12085,27 +12447,33 @@ pub fn override_quote_margin_request(
             floor_pct: outcome.floor_pct.unwrap_or(0.0),
             reason: body.reason.unwrap_or_default(),
         };
-        crate::quoting_machines::append_machine_event(
-            &state.db_path,
-            state.tenant.clone(),
-            binary_hash,
-            operator_login,
+        aberp_audit_ledger::append_in_tx(
+            &tx,
+            &meta,
             EventKind::QuoteMarginFloorOverridden,
             payload.to_bytes(),
-        )?;
+            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+            None,
+        )
+        .context("append quote.margin_floor_overridden audit entry")?;
     }
+    tx.commit()
+        .context("commit margin-override transaction on shared writer")?;
     Ok(())
 }
 
 /// Emit the margin-provenance events (global-margin / below-floor) after a
-/// re-price triggered by a buyer-partner change. Mirrors the daemon's
-/// first-pricing emission so an operator-assigned buyer leaves the same
-/// trail. `None` outcome (un-extracted job) emits nothing.
-fn emit_reprice_provenance(
-    state: &AppState,
+/// re-price triggered by a buyer-partner change, ON the caller's shared-writer
+/// transaction. Mirrors the daemon's first-pricing emission so an
+/// operator-assigned buyer leaves the same trail. `None` outcome (un-extracted
+/// job) emits nothing. H3 (ADR-0099) STEP 4e: this rides the SAME tx as the
+/// business re-price write (was a forked `append_machine_event` on a separate
+/// `state.db` guard — the split-brain).
+fn emit_reprice_provenance_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    meta: &aberp_audit_ledger::LedgerMeta,
     quote_id: &str,
     operator_login: &str,
-    binary_hash: BinaryHash,
     outcome: Option<&crate::quote_pricing_pipeline::RepriceOutcome>,
 ) -> std::result::Result<(), QuoteMarginError> {
     let Some(o) = outcome else { return Ok(()) };
@@ -12114,14 +12482,15 @@ fn emit_reprice_provenance(
             quote_id: quote_id.to_string(),
             global_margin_base: o.applied_margin_base,
         };
-        crate::quoting_machines::append_machine_event(
-            &state.db_path,
-            state.tenant.clone(),
-            binary_hash,
-            operator_login,
+        aberp_audit_ledger::append_in_tx(
+            tx,
+            meta,
             EventKind::QuoteUsingGlobalMargin,
             payload.to_bytes(),
-        )?;
+            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+            None,
+        )
+        .context("append quote.using_global_margin audit entry")?;
     }
     if o.below_floor {
         let payload = crate::audit_payloads::QuoteMarginBelowFloorPayload {
@@ -12129,14 +12498,15 @@ fn emit_reprice_provenance(
             realized_margin_pct: o.realized_margin_pct,
             floor_pct: o.floor_pct.unwrap_or(0.0),
         };
-        crate::quoting_machines::append_machine_event(
-            &state.db_path,
-            state.tenant.clone(),
-            binary_hash,
-            operator_login,
+        aberp_audit_ledger::append_in_tx(
+            tx,
+            meta,
             EventKind::QuoteMarginBelowFloor,
             payload.to_bytes(),
-        )?;
+            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+            None,
+        )
+        .context("append quote.margin_below_floor audit entry")?;
     }
     Ok(())
 }
@@ -12194,6 +12564,7 @@ fn mes_deps_for_request(state: &AppState) -> Result<crate::mes_boot::MesBootDeps
         .context("await binary hash for adapter mutation")?;
     Ok(crate::mes_boot::MesBootDeps {
         db_path: (*state.db_path).clone(),
+        db: state.db.clone(),
         tenant: state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -12683,7 +13054,7 @@ async fn handle_test_catalogue_push(headers: HeaderMap, State(state): State<AppS
     let count = rows.len() as i64;
     let body = serde_json::json!({ "materials": rows });
     let url = format!("{}/api/catalogue/materials", credential.base_url);
-    let auth = format!("Bearer {}", &*credential.bearer);
+    let auth = format!("Bearer {}", *credential.bearer);
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -13343,8 +13714,16 @@ pub fn list_notes_history_request(
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for notes-history scan")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle
+    // (`db.read()` = a coherent try_clone), not a fresh `Ledger::open`.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for notes-history scan")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     crate::notes_history::list_notes_history(&ledger, scope, limit)
 }
 
@@ -13483,8 +13862,10 @@ pub fn list_products_request(
     state: &AppState,
     search: Option<&str>,
 ) -> std::result::Result<Vec<Product>, ProductRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4c — products is a Handle family (its writers ride the
+    // shared Handle); read through `state.db.read()` (a coherent try_clone), not a
+    // fresh `Connection::open` that would miss a WAL-resident product write.
+    let conn = state.db.read().context("shared reader for list_products")?;
     let items = products::list_products(&conn, state.tenant.as_str(), search)?;
     Ok(items)
 }
@@ -13498,8 +13879,11 @@ pub fn list_products_with_inventory_request(
     state: &AppState,
     search: Option<&str>,
 ) -> std::result::Result<Vec<ProductWithInventory>, ProductRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4c — products + inventory cache both Handle families.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for list_products_with_inventory")?;
     let items = products::list_products(&conn, state.tenant.as_str(), search)?;
     let fields = aberp_inventory::inventory_fields_for_tenant(&conn, state.tenant.as_str())
         .map_err(ProductRouteError::Other)?;
@@ -13540,8 +13924,8 @@ pub fn get_product_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<Product, ProductRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4c — products is a Handle family; read via the shared Handle.
+    let conn = state.db.read().context("shared reader for get_product")?;
     match products::get_product(&conn, state.tenant.as_str(), id)? {
         Some(p) => Ok(p),
         None => Err(ProductRouteError::NotFound),
@@ -13557,8 +13941,11 @@ pub fn get_product_with_inventory_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<ProductWithInventory, ProductRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4c — products + inventory cache both Handle families.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for get_product_with_inventory")?;
     let product = match products::get_product(&conn, state.tenant.as_str(), id)? {
         Some(p) => p,
         None => return Err(ProductRouteError::NotFound),
@@ -13611,9 +13998,14 @@ pub fn create_product_request(
     if let Err(errors) = products::validate_product_inputs(inputs) {
         return Err(ProductRouteError::Validation(errors));
     }
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    let p = products::create_product(&conn, state.tenant.as_str(), inputs)?;
+    // ADR-0099 H3 STEP 4c — products is a Handle family; the INSERT rides the ONE
+    // shared writer (a co-resident fresh `Connection::open` would tear the Handle
+    // WAL on close). Guard drop lockstep-syncs the mirror.
+    let guard = state
+        .db
+        .write()
+        .context("shared writer for create_product")?;
+    let p = products::create_product(&guard, state.tenant.as_str(), inputs)?;
     Ok(p)
 }
 
@@ -13660,9 +14052,12 @@ pub fn update_product_request(
     if let Err(errors) = products::validate_product_inputs(inputs) {
         return Err(ProductRouteError::Validation(errors));
     }
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    match products::update_product(&conn, state.tenant.as_str(), id, inputs)? {
+    // ADR-0099 H3 STEP 4c — products is a Handle family; UPDATE via the shared writer.
+    let guard = state
+        .db
+        .write()
+        .context("shared writer for update_product")?;
+    match products::update_product(&guard, state.tenant.as_str(), id, inputs)? {
         Some(p) => Ok(p),
         None => Err(ProductRouteError::NotFound),
     }
@@ -13708,9 +14103,12 @@ pub fn delete_product_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<(), ProductRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    let deleted = products::soft_delete_product(&conn, state.tenant.as_str(), id)?;
+    // ADR-0099 H3 STEP 4c — products is a Handle family; soft-delete via the writer.
+    let guard = state
+        .db
+        .write()
+        .context("shared writer for delete_product")?;
+    let deleted = products::soft_delete_product(&guard, state.tenant.as_str(), id)?;
     if deleted {
         Ok(())
     } else {
@@ -13855,8 +14253,12 @@ pub fn list_stock_movements_request(
     limit: u32,
     offset: u32,
 ) -> std::result::Result<Vec<aberp_inventory::StockMovement>, StockMovementRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4c — products + stock_movements are Handle families; read
+    // through the ONE shared reader (a fresh open would miss WAL-resident rows).
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for list_stock_movements")?;
     // Defensive 404 — the SPA path always opens the product detail
     // page first, but a direct curl that names an unknown product
     // should not silently return an empty list.
@@ -13970,12 +14372,17 @@ pub fn create_stock_movement_request(
         }
     }
 
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4c — products + stock_movements are Handle families; the
+    // movement INSERT + products-cache UPDATE + the in-tx audit append all ride
+    // ONE tx on the shared Handle writer (the `create_ncr` recipe).
+    let mut guard = state
+        .db
+        .write()
+        .context("shared writer for create_stock_movement")?;
 
     // 404 if the product is unknown — caught here before opening the
     // tx so we do not waste a transaction on a typo'd id.
-    if products::get_product(&conn, state.tenant.as_str(), product_id)?.is_none() {
+    if products::get_product(&guard, state.tenant.as_str(), product_id)?.is_none() {
         return Err(StockMovementRouteError::NotFound);
     }
 
@@ -13986,7 +14393,7 @@ pub fn create_stock_movement_request(
     let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
 
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin stock-movement transaction")?;
     let ctx = aberp_inventory::RecordMovementContext {
@@ -14012,21 +14419,10 @@ pub fn create_stock_movement_request(
     )
     .map_err(map_inventory_err)?;
     tx.commit().context("commit stock-movement transaction")?;
-
-    // Mirror the audit-ledger sidecar so the per-tenant
-    // `<db>.audit.log` stays in step with the DB row, same posture
-    // every other audit-emitting route uses (PR-209 / S213 graceful
-    // shutdown writer, S177 / PR-177 AP-side ingestion writer).
-    let mirror_path = aberp_audit_ledger::mirror_path_for(&state.db_path);
-    if let Ok(ledger) = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash) {
-        // Best-effort sync — the canonical row already landed in the
-        // DB tx above. A mirror failure should not poison the
-        // operator's response; the next write (or boot) will heal it
-        // per ADR-0030 §6's bootstrap-from-DB posture.
-        if let Err(e) = ledger.sync_mirror(&mirror_path) {
-            tracing::warn!(error = ?e, "stock-movement mirror sync failed; will heal on next write");
-        }
-    }
+    // ADR-0099 H3 — the WriteGuard drop lockstep-syncs the audit mirror; the old
+    // fresh `Ledger::open` + `sync_mirror` write-fork (a co-resident opener that
+    // tears the live Handle WAL) is gone.
+    drop(guard);
 
     Ok(movement)
 }
@@ -14062,8 +14458,11 @@ async fn handle_list_low_stock_products(
 pub fn list_low_stock_products_request(
     state: &AppState,
 ) -> anyhow::Result<Vec<aberp_inventory::LowStockRow>> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4c — inventory (products cache) is a Handle family.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for list_low_stock_products")?;
     aberp_inventory::low_stock_products(&conn, state.tenant.as_str())
 }
 
@@ -14212,8 +14611,11 @@ pub fn list_work_orders_request(
     limit: u32,
     offset: u32,
 ) -> anyhow::Result<Vec<aberp_work_orders::WorkOrder>> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4c — work_orders is a Handle family; read via the shared Handle.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for list_work_orders")?;
     aberp_work_orders::list_work_orders(&conn, state.tenant.as_str(), state_filter, limit, offset)
 }
 
@@ -14314,11 +14716,13 @@ pub fn create_work_order_request(
         })
         .collect::<std::result::Result<_, _>>()?;
 
-    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!(
-            "open tenant DuckDB at {}: {e}",
-            state.db_path.display()
-        ))
+    // ADR-0099 H3 STEP 4c — work_orders is a Handle family. The create (which
+    // reads the `products` gate + INSERTs work_orders/routings + appends the
+    // WorkOrderCreated audit) rides ONE tx on the shared Handle writer. The
+    // in-tx products read is Handle-coherent because products migrated in the
+    // same commit.
+    let mut guard = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for create_work_order: {e}"))
     })?;
 
     let binary_hash = state
@@ -14328,7 +14732,7 @@ pub fn create_work_order_request(
     let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
 
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin work-order create transaction")?;
     let ctx = aberp_work_orders::WoWriteContext {
@@ -14352,8 +14756,9 @@ pub fn create_work_order_request(
         aberp_work_orders::create_work_order(&tx, &ctx, inputs).map_err(map_wo_err)?;
     tx.commit()
         .context("commit work-order create transaction")?;
-
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    // ADR-0099 H3 — guard drop lockstep-syncs the audit mirror (was a fresh
+    // `sync_audit_mirror_best_effort` → `Ledger::open` write-fork).
+    drop(guard);
 
     Ok(CreateWorkOrderResponse {
         work_order: wo,
@@ -14420,8 +14825,15 @@ pub fn get_work_order_detail_request(
     state: &AppState,
     wo_id: &str,
 ) -> anyhow::Result<Option<WorkOrderDetailResponse>> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4c — work_orders migrated to the Handle, so the WO /
+    // routing / BOM reads join the part_marks read (already Handle) on ONE shared
+    // reader. A fresh `Connection::open` would now miss WAL-resident WO writes.
+    // `resolve_wo_customer_type` reads quote_pricing_jobs + partners through the
+    // same reader — the same Handle-coherent read the shipment/heat-lot gates use.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for get_work_order_detail")?;
     let wo = aberp_work_orders::read_work_order(&conn, state.tenant.as_str(), wo_id)
         .map_err(|e| anyhow!("read work order: {e}"))?;
     let wo = match wo {
@@ -14435,7 +14847,6 @@ pub fn get_work_order_detail_request(
         state.tenant.as_str(),
         &wo.product_id,
     )?;
-    // S438 — part-UID marking surface for the WO detail page.
     let part_marks = crate::part_marking::list_part_marks(&conn, state.tenant.as_str(), wo_id)?;
     let part_units_expected = crate::part_marking::qty_to_units(wo.qty_target);
     let customer_type = resolve_wo_customer_type(&conn, state.tenant.as_str(), &wo)?;
@@ -14561,11 +14972,13 @@ pub fn transition_work_order_request(
         enforce_heat_lot_gate_for_start(state, wo_id, operator_login)?;
     }
 
-    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!(
-            "open tenant DuckDB at {}: {e}",
-            state.db_path.display()
-        ))
+    // ADR-0099 H3 STEP 4c — work_orders is a Handle family. The transition (which
+    // in-tx reads the QA gate on Complete, writes inventory via `record_movement`
+    // for Release BOM-consumption / Complete WoCompletion, reads current_stock,
+    // and appends the WorkOrderStateChanged audit) rides ONE tx on the shared
+    // Handle writer — qa + inventory co-commit with the WO flip.
+    let mut guard = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for transition_work_order: {e}"))
     })?;
 
     let binary_hash = state
@@ -14575,7 +14988,7 @@ pub fn transition_work_order_request(
     let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
 
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin work-order transition transaction")?;
     let ctx = aberp_work_orders::WoWriteContext {
@@ -14608,6 +15021,13 @@ pub fn transition_work_order_request(
         aberp_work_orders::transition_work_order(&tx, &ctx, wo_id, inputs).map_err(map_wo_err)?;
     tx.commit()
         .context("commit work-order transition transaction")?;
+    // ADR-0099 H3 — DROP the Handle write guard BEFORE the post-commit calibration
+    // hook below. STEP 4e migrated `record_calibration_for_completed_wo` onto the
+    // SAME shared Handle (`state.db`), so it acquires its OWN `state.db.write()`
+    // guard; dropping this one first is what keeps that from self-deadlocking on
+    // the single writer (rule 13). The guard drop also lockstep-syncs the audit
+    // mirror (replacing the old `sync_audit_mirror_best_effort` `Ledger::open` fork).
+    drop(guard);
 
     // S429 — closed-loop calibration hook. Runs AFTER the Complete commit (the
     // crate can't reach quote_pricing_jobs). Observational: a failure is logged
@@ -14618,7 +15038,7 @@ pub fn transition_work_order_request(
         aberp_work_orders::WorkOrderState::Completed
     ) {
         if let Err(e) = crate::quote_calibration::record_calibration_for_completed_wo(
-            &state.db_path,
+            &state.db,
             &state.tenant,
             binary_hash,
             operator_login,
@@ -14634,7 +15054,6 @@ pub fn transition_work_order_request(
         }
     }
 
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
     Ok(TransitionWorkOrderResponse {
         work_order: outcome.wo,
         warnings: outcome.warnings,
@@ -14710,8 +15129,10 @@ fn enforce_heat_lot_gate_for_start(
     operator_login: &str,
 ) -> std::result::Result<(), WorkOrderRouteError> {
     let gate = {
-        let conn = Connection::open(&*state.db_path).map_err(|e| {
-            WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for heat-lot gate: {e}"))
+        // H3 (ADR-0099): read the gate via the shared Handle's coherent read clone
+        // (try_clone of the one instance) instead of an independent Connection::open.
+        let conn = state.db.read().map_err(|e| {
+            WorkOrderRouteError::Other(anyhow!("shared read handle for heat-lot gate: {e}"))
         })?;
         let Some(wo) = aberp_work_orders::read_work_order(&conn, state.tenant.as_str(), wo_id)
             .map_err(map_wo_err)?
@@ -14747,20 +15168,27 @@ fn enforce_heat_lot_gate_for_start(
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
     });
-    let mut ledger = aberp_audit_ledger::Ledger::open(
-        state.db_path.as_path(),
-        state.tenant.clone(),
-        binary_hash,
+    // H3 (ADR-0099): append the wo-block audit through the ONE shared writer
+    // instead of an independent `Ledger::open` write-fork; guard drop
+    // lockstep-syncs the mirror.
+    let mut guard = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for wo-block audit: {e}"))
+    })?;
+    let tx = guard
+        .transaction()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("begin wo-block audit tx: {e}")))?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        aberp_audit_ledger::EventKind::MaterialWoBlockedNoHeatLot,
+        serde_json::to_vec(&payload).expect("serialize wo-blocked payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        None,
     )
-    .map_err(|e| WorkOrderRouteError::Other(anyhow!("open ledger for wo-block audit: {e}")))?;
-    ledger
-        .append(
-            aberp_audit_ledger::EventKind::MaterialWoBlockedNoHeatLot,
-            serde_json::to_vec(&payload).expect("serialize wo-blocked payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
-            None,
-        )
-        .map_err(|e| WorkOrderRouteError::Other(anyhow!("append wo-block audit: {e}")))?;
+    .map_err(|e| WorkOrderRouteError::Other(anyhow!("append wo-block audit: {e}")))?;
+    tx.commit()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("commit wo-block audit: {e}")))?;
 
     Err(WorkOrderRouteError::Conflict(format!(
         "Material {material_grade} requires heat lot before defense/aerospace WO start"
@@ -14817,29 +15245,51 @@ pub fn resolve_part_uid_gate(
     }
 }
 
+/// Read the dispatch row a shipment gate resolves against. ADR-0099 H3 / STEP 4c:
+/// dispatch (and its in-tx-fused `work_orders` reader) migrated onto the shared
+/// Handle in this cluster, so this read is now Handle-coherent — a fresh
+/// `Connection::open` would MISS a WAL-resident dispatch write (Q3 stale under the
+/// disabled runtime checkpoint) and fail the gate open. The whole shipment gate is
+/// therefore FINALLY fresh-conn-free: `read_dispatch_for_gate` reads dispatch
+/// through `state.db.read()`, and the resolvers read partner / part_marking /
+/// quality / work_orders through the same shared reader. `state.db.read()` returns
+/// an OWNED `try_clone` (the writer mutex is released on return), so holding the
+/// returned `Dispatch` does not block the caller's later block-audit
+/// `state.db.write()`. Missing dispatch → `Ok(None)` (the normal mark_shipped path
+/// 404s it).
+fn read_dispatch_for_gate(
+    state: &AppState,
+    dsp_id: &str,
+) -> std::result::Result<Option<aberp_dispatch::Dispatch>, WorkOrderRouteError> {
+    let conn = state
+        .db
+        .read()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("shared reader for shipment gate: {e}")))?;
+    aberp_dispatch::get_dispatch(&conn, state.tenant.as_str(), dsp_id)
+        .map_err(WorkOrderRouteError::Other)
+}
+
 /// Enforce the part-UID gate at the dispatch-ship route. On block, emits one
-/// `part.wo_blocked_no_uid` audit entry (own `Ledger`, after the read conn is
-/// dropped) and returns a 409 naming the first unmarked unit. A missing
-/// dispatch is NOT blocked here — the normal mark_shipped path 404s it.
+/// `part.wo_blocked_no_uid` audit entry on the shared Handle (ADR-0099 H3) and
+/// returns a 409 naming the first unmarked unit. A missing dispatch is NOT
+/// blocked here — the normal mark_shipped path 404s it.
 fn enforce_part_uid_gate_for_shipment(
     state: &AppState,
     dsp_id: &str,
     operator_login: &str,
 ) -> std::result::Result<(), WorkOrderRouteError> {
+    let Some(dispatch) = read_dispatch_for_gate(state, dsp_id)? else {
+        return Ok(()); // missing dispatch → defer to the normal 404 path
+    };
     let (gate, partner_id) = {
-        let conn = Connection::open(&*state.db_path).map_err(|e| {
-            WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for part-UID gate: {e}"))
+        // partner + part_marking are Handle families → read them coherently
+        // through the ONE shared reader (the fresh dispatch opener has dropped).
+        let conn = state.db.read().map_err(|e| {
+            WorkOrderRouteError::Other(anyhow!("shared reader for part-UID gate: {e}"))
         })?;
-        aberp_dispatch::ensure_schema(&conn)
-            .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
-        let Some(dispatch) = aberp_dispatch::get_dispatch(&conn, state.tenant.as_str(), dsp_id)
-            .map_err(WorkOrderRouteError::Other)?
-        else {
-            return Ok(()); // missing dispatch → defer to the normal 404 path
-        };
         let gate = resolve_part_uid_gate(&conn, state.tenant.as_str(), &dispatch)
             .map_err(WorkOrderRouteError::Other)?;
-        (gate, dispatch.partner_id)
+        (gate, dispatch.partner_id.clone())
     };
 
     let PartUidGate::Blocked {
@@ -14870,22 +15320,29 @@ fn enforce_part_uid_gate_for_shipment(
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
     });
-    let mut ledger = aberp_audit_ledger::Ledger::open(
-        state.db_path.as_path(),
-        state.tenant.clone(),
-        binary_hash,
-    )
-    .map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!("open ledger for part-uid-block audit: {e}"))
+    // H3 (ADR-0099) — append the block audit through the ONE shared writer
+    // (the fresh dispatch opener + the Handle read guard have both dropped);
+    // guard drop lockstep-syncs the mirror. Was a fresh `Ledger::open` write-fork.
+    let mut guard = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for part-uid-block audit: {e}"))
     })?;
-    ledger
-        .append(
-            aberp_audit_ledger::EventKind::WoBlockedNoPartUid,
-            serde_json::to_vec(&payload).expect("serialize part-uid-blocked payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
-            None,
-        )
-        .map_err(|e| WorkOrderRouteError::Other(anyhow!("append part-uid-block audit: {e}")))?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure audit schema: {e}")))?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("begin part-uid-block audit tx: {e}")))?;
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        aberp_audit_ledger::EventKind::WoBlockedNoPartUid,
+        serde_json::to_vec(&payload).expect("serialize part-uid-blocked payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        None,
+    )
+    .map_err(|e| WorkOrderRouteError::Other(anyhow!("append part-uid-block audit: {e}")))?;
+    tx.commit()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("commit part-uid-block audit tx: {e}")))?;
 
     // Name the first unmarked unit (1-based) so the operator knows where to look.
     let first_missing = marked_count + 1;
@@ -14912,6 +15369,16 @@ pub enum OpenNcrGate {
 /// (`partner_id`) → `customer_type`, and if defense/aerospace, refuse when any
 /// of the WO's marked part UIDs is referenced by an `Open`/`Contained` NCR.
 /// Read-only; no audit, no I/O beyond the supplied conn — unit-testable.
+///
+/// H3 (ADR-0099) — `conn` is the SHARED Handle read conn (`state.db.read()`):
+/// every family this resolver reads — `partners`, `part_marking`, `quality`
+/// (ncrs) — has its WRITERS on the Handle, so ONE coherent `try_clone` reads
+/// them all with no fresh-open truncator and no WAL tear (step 3 completed the
+/// part-marking migration that step 2b was blocked on). The `dispatch` row is
+/// resolved by the caller and passed in as `dispatch` — dispatch remains a
+/// fresh-open family (its writers cannot leave fresh opens without dragging the
+/// deferred invoice-audit + inventory families onto the Handle; see
+/// `enforce_open_ncr_gate_for_shipment`), so it is deliberately NOT read here.
 pub fn resolve_open_ncr_gate(
     conn: &Connection,
     tenant: &str,
@@ -14950,28 +15417,29 @@ pub fn resolve_open_ncr_gate(
 
 /// S439 (ADR-0090) — enforce the open-NCR shipment gate at the dispatch-ship
 /// route (extends the S438 part-UID gate). On block, emits one
-/// `ncr.wo_blocked_by_open_ncr` audit entry (own `Ledger`, after the read conn
-/// drops) and returns a 409 naming the blocking NCR(s). The non-defense path and
-/// the missing-dispatch path are unaffected.
+/// `ncr.wo_blocked_by_open_ncr` audit entry on the shared Handle (ADR-0099 H3)
+/// and returns a 409 naming the blocking NCR(s). The non-defense path and the
+/// missing-dispatch path are unaffected.
 fn enforce_open_ncr_gate_for_shipment(
     state: &AppState,
     dsp_id: &str,
     operator_login: &str,
 ) -> std::result::Result<(), WorkOrderRouteError> {
+    let Some(dispatch) = read_dispatch_for_gate(state, dsp_id)? else {
+        return Ok(()); // missing dispatch → defer to the normal 404 path
+    };
     let (gate, partner_id) = {
-        let conn = Connection::open(&*state.db_path).map_err(|e| {
-            WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for open-NCR gate: {e}"))
+        // partner + part_marking + ncrs are all Handle families → the gate reads
+        // them coherently through the ONE shared reader (the fresh dispatch opener
+        // has dropped). This closes the step-2b fail-open: the coherence-critical
+        // NCR read AND the part-UID read now ride the live Handle, immune to a
+        // fresh-open WAL tear.
+        let conn = state.db.read().map_err(|e| {
+            WorkOrderRouteError::Other(anyhow!("shared reader for open-NCR gate: {e}"))
         })?;
-        aberp_dispatch::ensure_schema(&conn)
-            .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
-        let Some(dispatch) = aberp_dispatch::get_dispatch(&conn, state.tenant.as_str(), dsp_id)
-            .map_err(WorkOrderRouteError::Other)?
-        else {
-            return Ok(()); // missing dispatch → defer to the normal 404 path
-        };
         let gate = resolve_open_ncr_gate(&conn, state.tenant.as_str(), &dispatch)
             .map_err(WorkOrderRouteError::Other)?;
-        (gate, dispatch.partner_id)
+        (gate, dispatch.partner_id.clone())
     };
 
     let OpenNcrGate::Blocked {
@@ -14998,22 +15466,29 @@ fn enforce_open_ncr_gate_for_shipment(
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
     });
-    let mut ledger = aberp_audit_ledger::Ledger::open(
-        state.db_path.as_path(),
-        state.tenant.clone(),
-        binary_hash,
-    )
-    .map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!("open ledger for open-NCR-block audit: {e}"))
+    // H3 (ADR-0099) — append the block audit through the ONE shared writer
+    // (the fresh dispatch opener + the Handle read guard have both dropped);
+    // guard drop lockstep-syncs the mirror. Was a fresh `Ledger::open` write-fork.
+    let mut guard = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for open-NCR-block audit: {e}"))
     })?;
-    ledger
-        .append(
-            aberp_audit_ledger::EventKind::WoBlockedByOpenNcr,
-            serde_json::to_vec(&payload).expect("serialize open-ncr-blocked payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
-            None,
-        )
-        .map_err(|e| WorkOrderRouteError::Other(anyhow!("append open-NCR-block audit: {e}")))?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure audit schema: {e}")))?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("begin open-NCR-block audit tx: {e}")))?;
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        aberp_audit_ledger::EventKind::WoBlockedByOpenNcr,
+        serde_json::to_vec(&payload).expect("serialize open-ncr-blocked payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        None,
+    )
+    .map_err(|e| WorkOrderRouteError::Other(anyhow!("append open-NCR-block audit: {e}")))?;
+    tx.commit()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("commit open-NCR-block audit tx: {e}")))?;
 
     Err(WorkOrderRouteError::Conflict(format!(
         "Shipment blocked: work order has open NCR(s) {} — resolve or escalate first",
@@ -15057,8 +15532,12 @@ pub fn get_product_bom_request(
     state: &AppState,
     product_id: &str,
 ) -> anyhow::Result<Vec<aberp_work_orders::BomLine>> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4c — the product BOM lives in the work_orders crate's
+    // Handle family; read via the shared Handle.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for get_product_bom")?;
     aberp_work_orders::list_active_bom_for_product(&conn, state.tenant.as_str(), product_id)
 }
 
@@ -15132,13 +15611,13 @@ pub fn put_product_bom_request(
         })
         .collect::<std::result::Result<_, _>>()?;
 
-    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!(
-            "open tenant DuckDB at {}: {e}",
-            state.db_path.display()
-        ))
-    })?;
-    let tx = conn
+    // ADR-0099 H3 STEP 4c — the product BOM lives in the work_orders Handle
+    // family; the soft-retire + replace ride ONE tx on the shared Handle writer.
+    let mut guard = state
+        .db
+        .write()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("shared writer for replace_bom: {e}")))?;
+    let tx = guard
         .transaction()
         .context("begin BOM replace transaction")?;
     let out =
@@ -15231,11 +15710,11 @@ pub fn transition_routing_op_request(
         ));
     }
 
-    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!(
-            "open tenant DuckDB at {}: {e}",
-            state.db_path.display()
-        ))
+    // ADR-0099 H3 STEP 4c — routing ops are in the work_orders Handle family. The
+    // routing UPDATE + auto-created Pending qa_inspection + audit ride ONE tx on
+    // the shared Handle writer; guard drop lockstep-syncs the mirror.
+    let mut guard = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for transition_routing_op: {e}"))
     })?;
     let binary_hash = state
         .binary_hash
@@ -15244,7 +15723,7 @@ pub fn transition_routing_op_request(
     let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
 
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin routing-op transition transaction")?;
     let ctx = aberp_work_orders::WoWriteContext {
@@ -15264,7 +15743,7 @@ pub fn transition_routing_op_request(
         aberp_work_orders::transition_routing_op(&tx, &ctx, op_id, inputs).map_err(map_wo_err)?;
     tx.commit()
         .context("commit routing-op transition transaction")?;
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    drop(guard);
     Ok(TransitionRoutingOpResponse {
         routing_op: outcome.routing_op,
         next_op_activated: outcome.next_op_activated,
@@ -15377,8 +15856,11 @@ pub fn list_qa_inspections_request(
     limit: u32,
     offset: u32,
 ) -> anyhow::Result<Vec<aberp_qa::QaInspection>> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4c — qa is a Handle family; read via the shared Handle.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for list_qa_inspections")?;
     aberp_qa::list_qa_inspections(&conn, state.tenant.as_str(), state_filter, limit, offset)
 }
 
@@ -15423,8 +15905,11 @@ pub fn get_qa_inspection_request(
     state: &AppState,
     qa_id: &str,
 ) -> anyhow::Result<Option<aberp_qa::QaInspection>> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4c — qa is a Handle family; read via the shared Handle.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for get_qa_inspection")?;
     aberp_qa::get_qa_inspection(&conn, state.tenant.as_str(), qa_id)
 }
 
@@ -15526,12 +16011,17 @@ pub fn decide_qa_inspection_request(
         ));
     }
 
-    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!(
-            "open tenant DuckDB at {}: {e}",
-            state.db_path.display()
-        ))
-    })?;
+    // ADR-0099 H3 STEP 4c — the RE-ENTRANCY-critical chain. The QA decide +
+    // try_auto_complete_wo (→ transition_work_order Complete → WoCompletion
+    // `record_movement`) run in ONE tx on ONE shared Handle write guard, so
+    // qa_inspections + routings + work_orders + stock_movements/products-cache +
+    // audit co-commit. Every crate fn below takes `&tx` and NONE re-acquires
+    // `state.db.write()`/`.read()`, so the non-reentrant writer mutex is never
+    // re-entered (the debug re-entrancy tripwire stays silent). NO nested write().
+    let mut guard = state
+        .db
+        .write()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("shared writer for decide_qa: {e}")))?;
     let binary_hash = state
         .binary_hash
         .wait()
@@ -15546,7 +16036,7 @@ pub fn decide_qa_inspection_request(
     let session_id = Ulid::new().to_string();
     let ledger_actor = Actor::from_local_cli(session_id.clone(), operator_login);
 
-    let tx = conn.transaction().context("begin QA decide transaction")?;
+    let tx = guard.transaction().context("begin QA decide transaction")?;
     let ctx = aberp_qa::QaWriteContext {
         tenant: state.tenant.as_str(),
         actor: aberp_inventory::ActorKind::SpaOperator {
@@ -15613,7 +16103,9 @@ pub fn decide_qa_inspection_request(
     };
 
     tx.commit().context("commit QA decide transaction")?;
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    // ADR-0099 H3 — guard drop lockstep-syncs the audit mirror (was a fresh
+    // `Ledger::open` write-fork).
+    drop(guard);
     Ok(DecideQaInspectionResponse {
         inspection: outcome.inspection,
         superseded_qa_id: outcome.superseded_qa_id,
@@ -15770,9 +16262,13 @@ pub fn list_dispatches_request(
     limit: u32,
     offset: u32,
 ) -> anyhow::Result<Vec<aberp_dispatch::Dispatch>> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    aberp_dispatch::ensure_schema(&conn).context("ensure dispatch schema (defensive)")?;
+    // ADR-0099 H3 STEP 4c — dispatch is a Handle family; read via the shared
+    // Handle (a fresh open would miss WAL-resident dispatch writes). Schema is
+    // ensured at boot (serve boot §dispatch), so no reader-side DDL on the clone.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for list_dispatches")?;
     aberp_dispatch::list_dispatches(&conn, state.tenant.as_str(), state_filter, limit, offset)
 }
 
@@ -15816,9 +16312,8 @@ pub fn get_dispatch_request(
     state: &AppState,
     dsp_id: &str,
 ) -> anyhow::Result<Option<aberp_dispatch::Dispatch>> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    aberp_dispatch::ensure_schema(&conn).context("ensure dispatch schema (defensive)")?;
+    // ADR-0099 H3 STEP 4c — dispatch is a Handle family; read via the shared Handle.
+    let conn = state.db.read().context("shared reader for get_dispatch")?;
     aberp_dispatch::get_dispatch(&conn, state.tenant.as_str(), dsp_id)
 }
 
@@ -15861,9 +16356,13 @@ pub fn list_eligible_work_orders_request(
     state: &AppState,
     limit: u32,
 ) -> anyhow::Result<Vec<aberp_dispatch::EligibleWorkOrder>> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    aberp_dispatch::ensure_schema(&conn).context("ensure dispatch schema (defensive)")?;
+    // ADR-0099 H3 STEP 4c — dispatch + work_orders are both Handle families now,
+    // so the eligible-WO join (dispatch reads work_orders in-tx) is coherent on
+    // the ONE shared reader.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for list_eligible_work_orders")?;
     aberp_dispatch::list_eligible_work_orders(&conn, state.tenant.as_str(), limit)
 }
 
@@ -15904,13 +16403,14 @@ pub fn create_dispatch_request(
     operator_login: &str,
     body: CreateDispatchBody,
 ) -> std::result::Result<aberp_dispatch::Dispatch, WorkOrderRouteError> {
-    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!(
-            "open tenant DuckDB at {}: {e}",
-            state.db_path.display()
-        ))
+    // ADR-0099 H3 STEP 4c — dispatch is a Handle family. create_dispatch reads
+    // work_orders in-tx (eligibility) + INSERTs the dispatch + appends audit, all
+    // on ONE tx on the shared Handle writer; the in-tx WO read is Handle-coherent
+    // because work_orders migrated in the same commit. Guard drop syncs the mirror.
+    let mut guard = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for create_dispatch: {e}"))
     })?;
-    aberp_dispatch::ensure_schema(&conn)
+    aberp_dispatch::ensure_schema(&guard)
         .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
     let binary_hash = state
         .binary_hash
@@ -15919,7 +16419,7 @@ pub fn create_dispatch_request(
     let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
 
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin create_dispatch transaction")
         .map_err(WorkOrderRouteError::Other)?;
@@ -15945,7 +16445,8 @@ pub fn create_dispatch_request(
     tx.commit()
         .context("commit create_dispatch transaction")
         .map_err(WorkOrderRouteError::Other)?;
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    // ADR-0099 H3 — guard drop lockstep-syncs the audit mirror.
+    drop(guard);
     Ok(outcome)
 }
 
@@ -16017,18 +16518,22 @@ pub fn mark_dispatch_shipped_request(
     // resolved or escalated. [[trust-code-not-operator]]; non-defense unaffected.
     enforce_open_ncr_gate_for_shipment(state, dsp_id, operator_login)?;
 
-    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!(
-            "open tenant DuckDB at {}: {e}",
-            state.db_path.display()
-        ))
-    })?;
-    aberp_dispatch::ensure_schema(&conn)
+    // ADR-0099 H3 STEP 4c — dispatch + invoice_draft are both Handle families now.
+    // mark_shipped reads work_orders in-tx (qty_target), flips the dispatch, writes
+    // the Dispatch inventory movement (`record_movement`), and the injected
+    // BillingInvoiceSpawner INSERTs the `invoice_draft` row + one `InvoiceStaged`
+    // audit — ALL on ONE tx on the shared Handle writer (ADR-0064 §"Invariants
+    // pinned" #6). The gate calls above acquired + dropped their own guards before
+    // this, so there is no nested acquire. Guard drop lockstep-syncs the mirror.
+    let mut guard = state
+        .db
+        .write()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("shared writer for mark_shipped: {e}")))?;
+    aberp_dispatch::ensure_schema(&guard)
         .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
-    // PR-230b / S236 — defensive `ensure_schema` for the new
-    // `invoice_draft` table the BillingInvoiceSpawner writes into. Same
-    // posture as the dispatch / WO / QA tables above.
-    crate::invoice_draft::ensure_schema(&conn)
+    // PR-230b / S236 — defensive `ensure_schema` for the `invoice_draft` table the
+    // BillingInvoiceSpawner writes into.
+    crate::invoice_draft::ensure_schema(&guard)
         .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure invoice_draft schema: {e}")))?;
     let binary_hash = state
         .binary_hash
@@ -16037,7 +16542,7 @@ pub fn mark_dispatch_shipped_request(
     let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
 
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin mark_shipped transaction")
         .map_err(WorkOrderRouteError::Other)?;
@@ -16075,7 +16580,8 @@ pub fn mark_dispatch_shipped_request(
     tx.commit()
         .context("commit mark_shipped transaction")
         .map_err(WorkOrderRouteError::Other)?;
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    // ADR-0099 H3 — guard drop lockstep-syncs the audit mirror.
+    drop(guard);
     Ok(MarkDispatchShippedResponse {
         dispatch: outcome.dispatch,
         spawned_invoice_id: outcome.spawned_invoice_id,
@@ -16121,13 +16627,12 @@ pub fn cancel_dispatch_request(
     dsp_id: &str,
     operator_login: &str,
 ) -> std::result::Result<aberp_dispatch::Dispatch, WorkOrderRouteError> {
-    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!(
-            "open tenant DuckDB at {}: {e}",
-            state.db_path.display()
-        ))
+    // ADR-0099 H3 STEP 4c — dispatch is a Handle family; the cancel flip + audit
+    // ride ONE tx on the shared Handle writer. Guard drop syncs the mirror.
+    let mut guard = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for cancel_dispatch: {e}"))
     })?;
-    aberp_dispatch::ensure_schema(&conn)
+    aberp_dispatch::ensure_schema(&guard)
         .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
     let binary_hash = state
         .binary_hash
@@ -16136,7 +16641,7 @@ pub fn cancel_dispatch_request(
     let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
 
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin cancel_dispatch transaction")
         .map_err(WorkOrderRouteError::Other)?;
@@ -16152,7 +16657,8 @@ pub fn cancel_dispatch_request(
     tx.commit()
         .context("commit cancel_dispatch transaction")
         .map_err(WorkOrderRouteError::Other)?;
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    // ADR-0099 H3 — guard drop lockstep-syncs the audit mirror.
+    drop(guard);
     Ok(outcome)
 }
 
@@ -16184,9 +16690,13 @@ async fn handle_list_invoice_drafts(headers: HeaderMap, State(state): State<AppS
 }
 
 pub fn list_invoice_drafts_request(state: &AppState) -> Result<Vec<invoice_draft::InvoiceDraft>> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    invoice_draft::ensure_schema(&conn).context("ensure invoice_draft schema (defensive)")?;
+    // ADR-0099 H3 STEP 4c — invoice_draft is a Handle family (the unified invoice
+    // list at `list_own_invoices` already reads drafts through the Handle); read
+    // via the shared Handle so a WAL-resident BillingInvoiceSpawner draft is seen.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for list_invoice_drafts")?;
     invoice_draft::list_drafts(&conn, state.tenant.as_str())
 }
 
@@ -16231,9 +16741,11 @@ pub fn get_invoice_draft_request(
     state: &AppState,
     drf_id: &str,
 ) -> Result<Option<invoice_draft::InvoiceDraft>> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    invoice_draft::ensure_schema(&conn).context("ensure invoice_draft schema (defensive)")?;
+    // ADR-0099 H3 STEP 4c — invoice_draft is a Handle family; read via the shared Handle.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for get_invoice_draft")?;
     invoice_draft::read_draft(&conn, state.tenant.as_str(), drf_id)
 }
 
@@ -16280,21 +16792,24 @@ pub fn delete_invoice_draft_request(
     operator_login: &str,
     drf_id: &str,
 ) -> Result<invoice_draft::DeleteDraftOutcome> {
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    invoice_draft::ensure_schema(&conn).context("ensure invoice_draft schema (defensive)")?;
-    // S239 / PR-233 — defensive `ensure_schema` for the `dispatches`
-    // table so the in-tx UPDATE of `spawned_invoice_id` doesn't fail
-    // on a fresh tenant whose dispatch-board boot-time migration
-    // hasn't been observed yet.
-    aberp_dispatch::ensure_schema(&conn).context("ensure dispatch schema (defensive)")?;
+    // ADR-0099 H3 STEP 4c — invoice_draft + dispatch are both Handle families. The
+    // draft delete + the in-tx UPDATE nulling `dispatches.spawned_invoice_id` +
+    // audit ride ONE tx on the shared Handle writer. Guard drop syncs the mirror.
+    let mut guard = state
+        .db
+        .write()
+        .context("shared writer for delete_invoice_draft")?;
+    invoice_draft::ensure_schema(&guard).context("ensure invoice_draft schema (defensive)")?;
+    // S239 / PR-233 — defensive `ensure_schema` for the `dispatches` table so the
+    // in-tx UPDATE of `spawned_invoice_id` doesn't fail on a fresh tenant.
+    aberp_dispatch::ensure_schema(&guard).context("ensure dispatch schema (defensive)")?;
     let binary_hash = state
         .binary_hash
         .wait()
         .context("binary hash unavailable")?;
     let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin delete_invoice_draft transaction")?;
     let outcome = invoice_draft::delete_draft_in_tx(
@@ -16308,32 +16823,14 @@ pub fn delete_invoice_draft_request(
         },
     )?;
     tx.commit().context("commit delete_invoice_draft tx")?;
-    if outcome.deleted {
-        sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
-    }
+    // ADR-0099 H3 — guard drop lockstep-syncs the audit mirror.
+    drop(guard);
     Ok(outcome)
 }
 
-/// Best-effort audit-mirror sync after a successful write transaction.
-/// Mirrors the inventory route's posture: the canonical row already
-/// landed in the DB tx; a mirror failure should not poison the
-/// operator's response, and the next write (or boot) will heal per
-/// ADR-0030 §6's bootstrap-from-DB posture.
-fn sync_audit_mirror_best_effort(
-    db_path: &std::path::Path,
-    tenant: aberp_audit_ledger::TenantId,
-    binary_hash: aberp_audit_ledger::BinaryHash,
-) {
-    let mirror_path = aberp_audit_ledger::mirror_path_for(db_path);
-    if let Ok(ledger) = Ledger::open(db_path, tenant, binary_hash) {
-        if let Err(e) = ledger.sync_mirror(&mirror_path) {
-            tracing::warn!(
-                error = ?e,
-                "work-order mirror sync failed; will heal on next write"
-            );
-        }
-    }
-}
+// ADR-0099 H3 STEP 4d — `sync_audit_mirror_best_effort` is gone: every migrated
+// writer now lets the shared `WriteGuard` drop lockstep-sync the mirror, so no
+// route re-opens a fresh `Ledger` for the sync.
 
 // ──────────────────────────────────────────────────────────────────────
 // S177 / PR-177 — AP module v1 BACKEND routes.
@@ -16401,10 +16898,10 @@ async fn handle_list_incoming_invoices(
         .unwrap_or(DEFAULT_INCOMING_LIST_LIMIT)
         .min(MAX_INCOMING_LIST_LIMIT);
     let offset = query.offset.unwrap_or(0);
-    let db_path = state.db_path.clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let result = tokio::task::spawn_blocking(move || {
-        incoming_invoices::list_incoming(&db_path, tenant.as_str(), status_filter, limit, offset)
+        incoming_invoices::list_incoming(&db, tenant.as_str(), status_filter, limit, offset)
     })
     .await;
     match result {
@@ -16428,11 +16925,11 @@ async fn handle_get_incoming_invoice(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = state.db_path.clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let id_for_task = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        incoming_invoices::get_incoming(&db_path, tenant.as_str(), &id_for_task)
+        incoming_invoices::get_incoming(&db, tenant.as_str(), &id_for_task)
     })
     .await;
     match result {
@@ -16480,11 +16977,11 @@ async fn handle_ingest_incoming_invoice(
         Ok(p) => p,
         Err(e) => return internal_error("ingest_incoming_invoice:artifacts_dir", e),
     };
-    let db_path = state.db_path.clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let result = tokio::task::spawn_blocking(move || {
         incoming_invoices::ingest_incoming_invoice(
-            &db_path,
+            &db,
             tenant,
             binary_hash,
             &operator_login,
@@ -16600,12 +17097,12 @@ async fn mark_incoming_status_inner(
         Ok(h) => h,
         Err(e) => return internal_error("mark_incoming_status:binary_hash", anyhow!(e)),
     };
-    let db_path = state.db_path.clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let id_for_task = id.clone();
     let result = tokio::task::spawn_blocking(move || {
         incoming_invoices::change_status(
-            &db_path,
+            &db,
             tenant,
             binary_hash,
             &operator_login,
@@ -16752,11 +17249,11 @@ async fn handle_get_incoming_invoice_xml(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = state.db_path.clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let id_for_task = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        incoming_invoices::get_incoming(&db_path, tenant.as_str(), &id_for_task)
+        incoming_invoices::get_incoming(&db, tenant.as_str(), &id_for_task)
     })
     .await;
     let row = match result {
@@ -16884,6 +17381,7 @@ async fn build_ap_sync_inputs(
     let artifacts_dir = ap_artifacts_dir(state.tenant.as_str())?;
     Ok(ap_sync::CycleInputs {
         db_path: (*state.db_path).clone(),
+        db: state.db.clone(),
         tenant: state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -16971,13 +17469,13 @@ async fn handle_restore_from_nav_outgoing(
         Err(e) => return internal_error("restore_from_nav_outgoing:ts", anyhow!("{e}")),
     };
     {
-        let db_path = (*state.db_path).clone();
+        let db = state.db.clone();
         let tenant = state.tenant.clone();
         let op = operator_login.clone();
         let year = body.year;
         let at = acquired_at.clone();
         let acquired = tokio::task::spawn_blocking(move || {
-            restore_outgoing::acquire_restore_lock_at(&db_path, tenant.as_str(), &op, year, &at)
+            restore_outgoing::acquire_restore_lock_at(&db, tenant.as_str(), &op, year, &at)
         })
         .await;
         match acquired {
@@ -17065,10 +17563,10 @@ impl Drop for RestoreActiveGuard {
 /// itself fail the response (the lock can always be abandoned from the
 /// UI), but the failure must surface per CLAUDE.md rule 12.
 async fn release_restore_lock_best_effort(state: &AppState) {
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let released = tokio::task::spawn_blocking(move || {
-        restore_outgoing::release_restore_lock_at(&db_path, tenant.as_str())
+        restore_outgoing::release_restore_lock_at(&db, tenant.as_str())
     })
     .await;
     match released {
@@ -17091,7 +17589,7 @@ async fn record_restore_from_nav_run_audit(
         .binary_hash
         .wait()
         .context("await binary hash for RestoreFromNavRun audit")?;
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let operator = operator_login.to_string();
     let payload = audit_payloads::RestoreFromNavRunPayload {
@@ -17109,17 +17607,29 @@ async fn record_restore_from_nav_run_audit(
         ts: ts.to_string(),
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut ledger = Ledger::open(&db_path, tenant, binary_hash)
-            .context("open audit ledger to record RestoreFromNavRun")?;
+        // H3 (ADR-0099): route through the ONE shared aberp_db::Handle — a
+        // serialized single-writer + lockstep post-commit mirror on guard drop —
+        // instead of an independent `Ledger::open` write-fork. The writer mutex
+        // subsumes AUDIT_APPEND_LOCK for Handle-routed appends.
+        let mut guard = db
+            .write()
+            .context("acquire shared writer to record RestoreFromNavRun")?;
+        let tx = guard
+            .transaction()
+            .context("begin RestoreFromNavRun audit tx")?;
+        let meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
         let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator);
-        ledger
-            .append(
-                EventKind::RestoreFromNavRun,
-                payload.to_bytes(),
-                actor,
-                None,
-            )
-            .context("append RestoreFromNavRun audit entry")?;
+        aberp_audit_ledger::append_in_tx(
+            &tx,
+            &meta,
+            EventKind::RestoreFromNavRun,
+            payload.to_bytes(),
+            actor,
+            None,
+        )
+        .context("append RestoreFromNavRun audit entry")?;
+        tx.commit().context("commit RestoreFromNavRun audit")?;
+        // guard drops here -> lockstep sync_mirror
         Ok(())
     })
     .await
@@ -17174,10 +17684,10 @@ async fn handle_restore_lock_status(headers: HeaderMap, State(state): State<AppS
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let result = tokio::task::spawn_blocking(move || {
-        restore_outgoing::read_restore_lock_at(&db_path, tenant.as_str())
+        restore_outgoing::read_restore_lock_at(&db, tenant.as_str())
     })
     .await;
     match result {
@@ -17237,10 +17747,10 @@ async fn handle_restore_lock_abandon(
         )
             .into_response();
     }
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let result = tokio::task::spawn_blocking(move || {
-        restore_outgoing::release_restore_lock_at(&db_path, tenant.as_str())
+        restore_outgoing::release_restore_lock_at(&db, tenant.as_str())
     })
     .await;
     match result {
@@ -17260,10 +17770,10 @@ async fn handle_restore_lock_abandon(
 /// must not wedge invoicing, and the per-row idempotency + the confirm-
 /// side acquire remain the hard guarantees.
 async fn restore_lock_block(state: &AppState) -> Option<Response> {
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let result = tokio::task::spawn_blocking(move || {
-        restore_outgoing::read_restore_lock_at(&db_path, tenant.as_str())
+        restore_outgoing::read_restore_lock_at(&db, tenant.as_str())
     })
     .await;
     match result {
@@ -17300,12 +17810,11 @@ async fn handle_list_restored_invoices(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = state.db_path.clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        restore_outgoing::list_restored(&db_path, tenant.as_str())
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || restore_outgoing::list_restored(&db, tenant.as_str()))
+            .await;
     match result {
         Ok(Ok(rows)) => Json(rows).into_response(),
         Ok(Err(e)) => internal_error("list_restored_invoices", e),
@@ -17600,7 +18109,7 @@ fn diff_adapter_health(
 /// conflict. The actor is a system identity — this is a daemon-style
 /// observation, not an operator action.
 fn emit_adapter_health_transition(
-    db_path: &std::path::Path,
+    db: &aberp_db::Handle,
     tenant: &aberp_audit_ledger::TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     t: &AdapterHealthTransition,
@@ -17618,10 +18127,15 @@ fn emit_adapter_health_transition(
         ulid::Ulid::new().to_string(),
         "system:adapter-health",
     );
-    let mut conn =
-        Connection::open(db_path).context("open DuckDB for adapter health transition audit")?;
-    aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
-    let tx = conn.transaction().context("begin transition audit tx")?;
+    // H3 (ADR-0099): route through the ONE shared aberp_db::Handle instead of an
+    // independent `Connection::open` write-fork. The dashboard's read Connection
+    // is now a `db.read()` try_clone of the same instance, so this composes with
+    // it coherently; the writer mutex serializes and the guard drop lockstep-syncs
+    // the mirror.
+    let mut guard = db
+        .write()
+        .context("acquire shared writer for adapter health transition audit")?;
+    let tx = guard.transaction().context("begin transition audit tx")?;
     let meta = aberp_audit_ledger::LedgerMeta::new(tenant.clone(), binary_hash);
     aberp_audit_ledger::append_in_tx(
         &tx,
@@ -17875,8 +18389,17 @@ fn compute_workshop_dashboard(
     today: time::Date,
     binary_hash: aberp_audit_ledger::BinaryHash,
 ) -> anyhow::Result<WorkshopDashboard> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4c — the dashboard reads across the whole fused cluster
+    // (work_orders, inventory, qa, dispatch) + partners + the audit ledger, all
+    // now Handle families; read through the ONE shared reader. `state.db.read()`
+    // returns an OWNED try_clone (the writer mutex is released on return), so the
+    // mid-function `emit_adapter_health_transition(&state.db, …)` Handle WRITE
+    // below neither trips the re-entrancy tripwire nor deadlocks — and
+    // `build_adapter_transitions` afterward now sees that just-emitted row.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for workshop dashboard")?;
     let tenant_str = state.tenant.as_str();
     // ISO 8601 date `YYYY-MM-DD`. `time::Date`'s default Display is
     // already this shape; explicit formatter avoids any future Display
@@ -17973,9 +18496,7 @@ fn compute_workshop_dashboard(
         diff_adapter_health(&mut guard, &adapters)
     };
     for t in &transitions_to_emit {
-        if let Err(e) =
-            emit_adapter_health_transition(&state.db_path, &state.tenant, binary_hash, t)
-        {
+        if let Err(e) = emit_adapter_health_transition(&state.db, &state.tenant, binary_hash, t) {
             tracing::error!(
                 adapter_id = %t.adapter_id,
                 from = t.from_state,
@@ -18323,7 +18844,7 @@ async fn build_restore_inputs(
     let endpoint = build_profile::nav_endpoint();
     build_profile::assert_endpoint_allowed(endpoint)?;
     Ok(restore_outgoing::RestoreInputs {
-        db_path: (*state.db_path).clone(),
+        db: state.db.clone(),
         tenant: state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -19214,7 +19735,7 @@ pub fn put_seller_numbering_request(
         .wait()
         .context("await background binary hash for numbering-change audit")?;
     record_numbering_change_audit(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -19236,7 +19757,7 @@ pub fn put_seller_numbering_request(
 /// [`NumberingTemplate::render`] (no build-profile `TEST-` prefix) so the
 /// record is stable across dev/prod binaries.
 fn record_numbering_change_audit(
-    db_path: &std::path::Path,
+    db: &aberp_db::Handle,
     tenant: TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     operator_login: &str,
@@ -19251,8 +19772,15 @@ fn record_numbering_change_audit(
         .context("format numbering-change timestamp")?;
     let rendered_preview = template.render(now.year(), template.start_value);
     let tenant_str = tenant.as_str().to_string();
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record numbering-template change")?;
+    // H3 (ADR-0099): route through the ONE shared Handle instead of an
+    // independent `Ledger::open` write-fork; guard drop lockstep-syncs the mirror.
+    let mut guard = db
+        .write()
+        .context("acquire shared writer to record numbering-template change")?;
+    let tx = guard
+        .transaction()
+        .context("begin numbering-template change audit tx")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
     let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
     let payload = serde_json::json!({
         "tenant_id": tenant_str,
@@ -19264,9 +19792,17 @@ fn record_numbering_change_audit(
         "changed_at": changed_at,
     });
     let bytes = serde_json::to_vec(&payload).context("encode numbering-change audit payload")?;
-    ledger
-        .append(EventKind::NumberingTemplateChanged, bytes, actor, None)
-        .context("append NumberingTemplateChanged audit entry")?;
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        EventKind::NumberingTemplateChanged,
+        bytes,
+        actor,
+        None,
+    )
+    .context("append NumberingTemplateChanged audit entry")?;
+    tx.commit()
+        .context("commit numbering-template change audit")?;
     Ok(())
 }
 
@@ -19868,7 +20404,7 @@ fn finalize_email_audit(
     };
     let mut body = body;
     if let Err(e) = email_invoice::record_email_audit_entry(
-        state.db_path.as_path(),
+        &state.db,
         state.tenant.clone(),
         binary_hash_bytes,
         actor,
@@ -19999,15 +20535,22 @@ fn resolve_customer_identity(
     state: &AppState,
     invoice_id: &str,
 ) -> Result<(Option<String>, String)> {
-    let ledger = Ledger::open(
-        &*state.db_path,
+    // H3 (ADR-0099): read the invoice audit chain through the shared Handle
+    // (`db.read()` = a coherent try_clone), not a fresh `Ledger::open` — the
+    // read-fork gate's curated-helper heuristic is BLIND to this reader (it
+    // reads via `find_draft_xml_path`/`chain_link_base_for`), but it reads
+    // invoice audit rows the issuing writers now keep WAL-resident.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader to resolve customer identity")?,
         state.tenant.clone(),
         state
             .binary_hash
             .wait()
             .map_err(|e| anyhow!("binary hash: {e}"))?,
-    )
-    .with_context(|| format!("open audit ledger at {}", state.db_path.display()))?;
+    );
     // S184 — walk chain children up to the first ancestor whose
     // sibling input.json actually exists on disk. Bounded depth: in
     // practice chain depth is 1 (storno of a base) or 2 (storno of an
@@ -20098,15 +20641,21 @@ fn chain_link_base_for(ledger: &Ledger, invoice_id: &str) -> Result<Option<Strin
 }
 
 fn resolve_invoice_xml_path(state: &AppState, invoice_id: &str) -> Result<PathBuf> {
-    let ledger = Ledger::open(
-        &*state.db_path,
+    // H3 (ADR-0099): read the invoice audit chain through the shared Handle —
+    // same read-fork-gate blind spot as `resolve_customer_identity` (reads via
+    // `find_draft_xml_path`), migrated for coherence with the WAL-resident
+    // issuing writers.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader to resolve invoice XML path")?,
         state.tenant.clone(),
         state
             .binary_hash
             .wait()
             .map_err(|e| anyhow!("binary hash: {e}"))?,
-    )
-    .with_context(|| format!("open audit ledger at {}", state.db_path.display()))?;
+    );
     find_draft_xml_path(&ledger, invoice_id)
 }
 
@@ -20238,8 +20787,15 @@ fn derive_state_for(
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for serve mutation precondition")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for serve mutation precondition")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger
         .entries()
         .context("read audit ledger entries for precondition")?;
@@ -20766,7 +21322,7 @@ async fn handle_list_quote_intake(headers: HeaderMap, State(state): State<AppSta
         Ok(h) => h,
         Err(e) => return internal_error("handle_list_quote_intake:binary_hash", anyhow!(e)),
     };
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant_id_string = state.tenant.as_str().to_string();
     let tenant_for_ledger = state.tenant.clone();
     // S325 / PR-25 — the read-side seam pushes any FALSE→TRUE stock_alert
@@ -20776,20 +21332,21 @@ async fn handle_list_quote_intake(headers: HeaderMap, State(state): State<AppSta
     // task so the enqueue does not block the list response.
     let rerender_queue = state.quote_pdf_rerender_queue.clone();
     let rows = match tokio::task::spawn_blocking(move || -> Result<_> {
-        let mut conn = duckdb::Connection::open(&db_path)
-            .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
-        let listing = quote_intake_query_mod::list_quote_intake_rows(&conn, &tenant_id_string)?;
+        // ADR-0099 H3 STEP 4d — quote_intake_log is a Handle family. The list
+        // read AND the stock-alert flip (`flip_and_audit_in_tx`) ride the ONE
+        // shared writer, so the read sees WAL-resident intake writes and the
+        // flip UPDATE + audit stay atomic on the live instance. Guard drop syncs.
+        let mut guard = db.write().context("shared writer for quote-intake list")?;
+        let listing = quote_intake_query_mod::list_quote_intake_rows(&guard, &tenant_id_string)?;
         // S275 / PR-264 / F2 + F16 — persist + audit one entry per
         // newly-triggered alert via `flip_and_audit_in_tx`. The flip
         // (guarded UPDATE) and the `QuoteStockAlertTriggered` audit append
         // share ONE tx; either both land or neither does.
         // S325 / PR-25 — the same tx now also appends
         // `QuotePdfRerenderEnqueued` and (post-commit) pushes the quote
-        // into `rerender_queue`. Extracted into
-        // `persist_alerts_and_enqueue_rerender` so the detection→enqueue
-        // path is unit-testable without an HTTP server.
+        // into `rerender_queue`.
         quote_intake_query_mod::persist_alerts_and_enqueue_rerender(
-            &mut conn,
+            &mut guard,
             &tenant_for_ledger,
             binary_hash,
             &operator_login,
@@ -20870,8 +21427,8 @@ pub fn pickup_quote_as_draft_request(
     operator_login: &str,
     quote_id: &str,
 ) -> Result<quote_pickup::PickupQuoteOutcome> {
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4d — the pickup saga writes invoice_draft + quote_intake_log
+    // + audit in ONE tx; both are Handle families, so it rides the shared writer.
     let binary_hash = state
         .binary_hash
         .wait()
@@ -20879,18 +21436,28 @@ pub fn pickup_quote_as_draft_request(
     let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
 
-    // Compute retry counter via an audit-walk so the F8 anchor stays
-    // fresh on a re-pickup after S239 delete. Open a separate Ledger
-    // handle for the read — the route's tx hasn't started yet so
-    // there's no contention.
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open ledger for pickup retry-count walk")?;
-    let prior = quote_pickup::count_prior_pickups(&ledger, quote_id)
-        .context("count prior InvoicePickedUpFromQuote entries")?;
+    // Compute retry counter via an audit-walk so the F8 anchor stays fresh on a
+    // re-pickup after S239 delete. Read the ledger through the shared Handle
+    // (`Ledger::from_connection` on a `db.read()` try_clone) — a fresh
+    // `Ledger::open` would truncate/tear the live Handle WAL. The owned read
+    // clone drops before the write guard is acquired below.
+    let prior = {
+        let ledger = Ledger::from_connection(
+            state
+                .db
+                .read()
+                .context("shared reader for pickup retry-count walk")?,
+            state.tenant.clone(),
+            binary_hash,
+        );
+        quote_pickup::count_prior_pickups(&ledger, quote_id)
+            .context("count prior InvoicePickedUpFromQuote entries")?
+    };
     let idempotency_key = quote_pickup::pickup_idempotency_key(quote_id, prior);
 
+    let mut guard = state.db.write().context("shared writer for pickup saga")?;
     let outcome = quote_pickup::pickup_quote_as_draft(
-        &mut conn,
+        &mut guard,
         &ledger_meta,
         ledger_actor,
         quote_pickup::PickupQuoteInputs {
@@ -20900,9 +21467,9 @@ pub fn pickup_quote_as_draft_request(
             idempotency_key,
         },
     )?;
-    if !outcome.was_existing {
-        sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
-    }
+    // Guard drop lockstep-syncs the audit mirror (was a conditional
+    // `sync_audit_mirror_best_effort`).
+    drop(guard);
     Ok(outcome)
 }
 
@@ -20921,8 +21488,17 @@ fn latest_quote_intake_poll(state: &AppState) -> Result<Option<QuoteIntakeLastPo
         .binary_hash
         .wait()
         .context("await background binary hash for quote-intake poll lookup")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for quote-intake poll lookup")?;
+    // ADR-0099 H3 STEP 4d — read the audit ledger through the shared Handle
+    // (`Ledger::from_connection` on a `db.read()` try_clone), not a fresh
+    // `Ledger::open` that would fold/tear the live Handle WAL.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("shared reader for quote-intake poll lookup")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger
         .entries()
         .context("read audit ledger entries for quote-intake poll lookup")?;
@@ -20971,8 +21547,15 @@ fn quote_intake_auth_paused(state: &AppState) -> Result<bool> {
         .binary_hash
         .wait()
         .context("await binary hash for quote-intake auth-paused lookup")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open ledger for quote-intake auth-paused lookup")?;
+    // ADR-0099 H3 STEP 4d — read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("shared reader for quote-intake auth-paused lookup")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger
         .entries()
         .context("read entries for quote-intake auth-paused lookup")?;
@@ -21053,10 +21636,14 @@ async fn handle_list_quote_pricing_jobs(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = (*state.db_path).clone();
+    // H3 (ADR-0099) STEP 4e — read on the ONE shared Handle reader so the list
+    // is coherent with the Handle-resident writers (daemon + serve routes).
+    let db = state.db.clone();
     let tenant_id = state.tenant.as_str().to_string();
     let rows = match tokio::task::spawn_blocking(move || -> Result<Vec<_>> {
-        let conn = duckdb::Connection::open(&db_path).context("open DB")?;
+        let conn = db
+            .read()
+            .context("acquire shared reader for pricing-jobs list")?;
         crate::quote_pricing_jobs::list_jobs(&conn, &tenant_id)
     })
     .await
@@ -21117,13 +21704,18 @@ async fn handle_retry_quote_pricing_job(
         )
             .into_response();
     }
-    let db_path = (*state.db_path).clone();
+    // H3 (ADR-0099) STEP 4e — the retry state-bump rides the ONE shared Handle
+    // writer (was a fresh `Connection::open` write-fork); retry_job self-manages
+    // its own DuckDB tx on the guard connection (no audit append here).
+    let db = state.db.clone();
     let tenant_id = state.tenant.as_str().to_string();
     let qid = quote_id.clone();
     let new_n = match tokio::task::spawn_blocking(move || -> Result<u32> {
-        let mut conn = duckdb::Connection::open(&db_path).context("open DB")?;
+        let mut guard = db
+            .write()
+            .context("acquire shared writer for pricing-job retry")?;
         let now = time::OffsetDateTime::now_utc();
-        crate::quote_pricing_jobs::retry_job(&mut conn, &qid, &tenant_id, now)
+        crate::quote_pricing_jobs::retry_job(&mut guard, &qid, &tenant_id, now)
     })
     .await
     {
@@ -21234,12 +21826,17 @@ async fn handle_get_quote_pricing_job_detail(
         )
             .into_response();
     }
-    let db_path = (*state.db_path).clone();
+    // H3 (ADR-0099) STEP 4e — read the detail on the ONE shared Handle reader so
+    // margin_below_floor / lead-time / buyer fields are coherent with the
+    // Handle-resident writers (daemon + serve routes).
+    let db = state.db.clone();
     let tenant_id = state.tenant.as_str().to_string();
     let qid = quote_id.clone();
     let detail = match tokio::task::spawn_blocking(
         move || -> Result<Option<crate::quote_pricing_jobs::JobDetail>> {
-            let conn = duckdb::Connection::open(&db_path).context("open DB")?;
+            let conn = db
+                .read()
+                .context("acquire shared reader for pricing-job detail")?;
             crate::quote_pricing_jobs::get_job_detail(&conn, &qid, &tenant_id)
         },
     )
@@ -21388,11 +21985,15 @@ async fn handle_get_quote_pricing_job_pdf(
         )
             .into_response();
     }
-    let db_path = (*state.db_path).clone();
+    // H3 (ADR-0099) STEP 4e — read the PDF-presence row on the ONE shared Handle
+    // reader (was a fresh `Connection::open`), coherent with the daemon's writes.
+    let db = state.db.clone();
     let tenant_id = state.tenant.as_str().to_string();
     let qid = quote_id.clone();
     let outcome = match tokio::task::spawn_blocking(move || -> Result<PricingJobPdfOutcome> {
-        let conn = duckdb::Connection::open(&db_path).context("open DB")?;
+        let conn = db
+            .read()
+            .context("acquire shared reader for pricing-job PDF")?;
         read_pricing_job_pdf(&conn, &qid, &tenant_id)
     })
     .await
@@ -21592,8 +22193,13 @@ pub fn amend_pricing_job_material_request(
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099): the catalogue read + the state-guarded mutation + the audit
+    // append all run on the ONE shared writer instead of an independent
+    // Connection::open write-fork; guard drop lockstep-syncs the mirror.
+    let mut conn = state
+        .db
+        .write()
+        .context("acquire shared writer for pricing-job material edit")?;
     let tenant = state.tenant.as_str().to_string();
 
     // 1. Catalogue membership — refuse a grade outside the snapshot
@@ -21791,8 +22397,13 @@ pub fn delete_pricing_job_request(
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099): the guarded delete + its audit row run on the ONE shared
+    // writer instead of an independent Connection::open write-fork; guard drop
+    // lockstep-syncs the mirror.
+    let mut conn = state
+        .db
+        .write()
+        .context("acquire shared writer for pricing-job delete")?;
     let tenant = state.tenant.as_str().to_string();
 
     crate::quote_pricing_jobs::ensure_schema(&conn).context("ensure quote_pricing_jobs schema")?;
@@ -22012,8 +22623,14 @@ fn get_audit_for_quote(
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for quote audit")?;
+    // ADR-0099 H3 STEP 4d — read the audit ledger through the shared Handle
+    // (quote_intake writers are on the Handle now, so a fresh `Ledger::open` here
+    // would read a folded subset).
+    let ledger = Ledger::from_connection(
+        state.db.read().context("shared reader for quote audit")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger.entries().context("read audit ledger entries")?;
     let (page, total) = paginate_quote_audit_entries(&entries, quote_id, limit, offset);
     let views = page.into_iter().map(audit_view_of).collect();
@@ -22231,7 +22848,7 @@ async fn handle_quote_intake_notifications(
     let live_ready = boundary != i64::MAX;
     let auth_paused = quote_intake_auth_paused(&state).unwrap_or(false);
 
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.as_str().to_string();
     let binary_hash = match state.binary_hash.wait() {
         Ok(h) => h,
@@ -22240,12 +22857,14 @@ async fn handle_quote_intake_notifications(
         }
     };
     let tenant_for_ledger = state.tenant.clone();
-    let db_for_ledger = (*state.db_path).clone();
 
     let result =
         tokio::task::spawn_blocking(move || -> Result<QuoteIntakeNotifications> {
-            let conn = duckdb::Connection::open(&db_path)
-                .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
+            // ADR-0099 H3 STEP 4d — quote_intake_log + the audit ledger are Handle
+            // families; read both through the shared Handle (owned try_clones).
+            let conn = db
+                .read()
+                .context("shared reader for quote-intake notifications")?;
             let unpicked_count = aberp_quote_intake::log_table::count_unpicked(&conn, &tenant)
                 .context("count un-picked quotes")?;
             let errored_count = aberp_quote_intake::log_table::count_errored(&conn, &tenant)
@@ -22260,8 +22879,12 @@ async fn handle_quote_intake_notifications(
             // boundary whose quote is still staged + un-picked.
             let mut live_arrivals: Vec<QuoteArrival> = Vec::new();
             if live_ready {
-                let ledger = Ledger::open(&db_for_ledger, tenant_for_ledger, binary_hash)
-                    .context("open ledger for quote-intake arrivals")?;
+                let ledger = Ledger::from_connection(
+                    db.read()
+                        .context("shared reader for quote-intake arrivals")?,
+                    tenant_for_ledger,
+                    binary_hash,
+                );
                 let entries = ledger.entries().context("read entries for arrivals")?;
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for entry in entries {
@@ -22325,14 +22948,17 @@ async fn handle_quote_intake_retry_parse(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.as_str().to_string();
     let quote_id_task = quote_id.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<RetryParseResult> {
-        let conn = duckdb::Connection::open(&db_path)
-            .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
+        // ADR-0099 H3 STEP 4d — quote_intake_log is a Handle family; the raw-read
+        // + the retry-parse UPDATE ride the ONE shared writer.
+        let guard = db
+            .write()
+            .context("shared writer for quote-intake retry-parse")?;
         let Some((raw, _state)) =
-            aberp_quote_intake::log_table::read_raw_and_state(&conn, &tenant, &quote_id_task)
+            aberp_quote_intake::log_table::read_raw_and_state(&guard, &tenant, &quote_id_task)
                 .context("read raw payload for retry-parse")?
         else {
             return Ok(RetryParseResult::NotFound);
@@ -22352,7 +22978,7 @@ async fn handle_quote_intake_retry_parse(
                     .context("serialize re-parsed prepared draft")?;
                 let invoice_id = outcome.invoice_id.to_prefixed_string();
                 let n = aberp_quote_intake::log_table::retry_parse_intake(
-                    &conn,
+                    &guard,
                     &tenant,
                     &quote_id_task,
                     &invoice_id,
@@ -22417,13 +23043,16 @@ async fn handle_quote_intake_mark_irrelevant(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.as_str().to_string();
     let quote_id_task = quote_id.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<usize> {
-        let conn = duckdb::Connection::open(&db_path)
-            .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
-        aberp_quote_intake::log_table::mark_irrelevant(&conn, &tenant, &quote_id_task)
+        // ADR-0099 H3 STEP 4d — quote_intake_log is a Handle family; the flip
+        // UPDATE rides the shared writer.
+        let guard = db
+            .write()
+            .context("shared writer for quote-intake mark-irrelevant")?;
+        aberp_quote_intake::log_table::mark_irrelevant(&guard, &tenant, &quote_id_task)
             .context("mark quote irrelevant")
     })
     .await;
@@ -22465,9 +23094,12 @@ async fn handle_list_inventory_balances(
     let state_for_task = state.clone();
     let result =
         tokio::task::spawn_blocking(move || -> Result<Vec<crate::material_inventory::Balance>> {
-            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // ADR-0099 H3 STEP 4d — material_inventory is a Handle family; read via
+            // the shared Handle (a fresh open would miss WAL-resident heat-lot writes).
+            let conn = state_for_task
+                .db
+                .read()
+                .context("shared reader for list_inventory_balances")?;
             crate::material_inventory::list_balances_for_tenant(
                 &conn,
                 state_for_task.tenant.as_str(),
@@ -22518,31 +23150,31 @@ async fn handle_assign_heat_lot(
                 .binary_hash
                 .wait()
                 .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
-            let assignment = {
-                let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                    format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-                })?;
-                crate::material_inventory::assign_heat_lot(
-                    &conn,
-                    state_for_task.tenant.as_str(),
-                    &grade,
-                    &body.heat_lot_number,
-                    body.mill_test_report_url.as_deref().unwrap_or(""),
-                    &operator_login,
-                )?
-                // conn dropped here — Ledger opens its own writer next.
-            };
-            crate::material_inventory::append_heat_lot_events(
-                &state_for_task.db_path,
-                state_for_task.tenant.clone(),
-                binary_hash,
-                &assignment,
+            // ADR-0099 H3 STEP 4d — material_inventory is a Handle family. The
+            // `inventory_balances` heat-lot UPDATE and the heat-lot audit ride ONE
+            // tx on the shared Handle writer (was a fresh `Connection::open` UPDATE
+            // + a SEPARATE fresh `Ledger::open` append — the rule-15 tear). Guard
+            // drop lockstep-syncs the mirror.
+            let mut guard = state_for_task
+                .db
+                .write()
+                .map_err(|e| anyhow!("shared writer for assign_heat_lot: {e}"))?;
+            let meta =
+                aberp_audit_ledger::LedgerMeta::new(state_for_task.tenant.clone(), binary_hash);
+            let tx = guard
+                .transaction()
+                .context("begin assign_heat_lot transaction")?;
+            let assignment = crate::material_inventory::assign_heat_lot(
+                &tx,
+                state_for_task.tenant.as_str(),
+                &grade,
+                &body.heat_lot_number,
+                body.mill_test_report_url.as_deref().unwrap_or(""),
+                &operator_login,
             )?;
-            sync_audit_mirror_best_effort(
-                &state_for_task.db_path,
-                state_for_task.tenant.clone(),
-                binary_hash,
-            );
+            crate::material_inventory::append_heat_lot_events(&tx, &meta, &assignment)?;
+            tx.commit().context("commit assign_heat_lot transaction")?;
+            drop(guard);
             Ok(assignment)
         },
     )
@@ -22622,9 +23254,12 @@ async fn handle_material_traceability(
                 .wait()
                 .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
             let report = {
-                let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                    format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-                })?;
+                // H3 (ADR-0099): read the chain via the shared Handle's coherent
+                // read clone instead of an independent Connection::open.
+                let conn = state_for_task
+                    .db
+                    .read()
+                    .context("shared read handle for material traceability")?;
                 crate::material_traceability::trace(
                     &conn,
                     state_for_task.tenant.as_str(),
@@ -22642,17 +23277,27 @@ async fn handle_material_traceability(
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_default(),
             });
-            let mut ledger = aberp_audit_ledger::Ledger::open(
-                state_for_task.db_path.as_path(),
-                state_for_task.tenant.clone(),
-                binary_hash,
-            )?;
-            ledger.append(
+            // H3 (ADR-0099): append the traceability-view audit through the ONE
+            // shared writer instead of an independent Ledger::open write-fork;
+            // guard drop lockstep-syncs the mirror.
+            let mut guard = state_for_task
+                .db
+                .write()
+                .context("shared writer for material traceability audit")?;
+            let tx = guard
+                .transaction()
+                .context("begin material traceability audit tx")?;
+            let meta =
+                aberp_audit_ledger::LedgerMeta::new(state_for_task.tenant.clone(), binary_hash);
+            aberp_audit_ledger::append_in_tx(
+                &tx,
+                &meta,
                 aberp_audit_ledger::EventKind::MaterialTraceabilityViewed,
                 serde_json::to_vec(&payload).expect("serialize traceability-viewed payload"),
                 Actor::from_local_cli(Ulid::new().to_string(), &operator_login),
                 None,
             )?;
+            tx.commit().context("commit material traceability audit")?;
             Ok(report)
         },
     )
@@ -22712,6 +23357,72 @@ async fn handle_mark_parts(
     }
 }
 
+/// The cross-family reads mark-parts needs before it writes: the WO (state +
+/// qty_target) and its consumed heat lot. These live in NON-Handle families
+/// (`work_orders`, `quote_pricing_jobs`, `material_inventory`) whose writers are
+/// still fresh-open, so they are read on a scoped fresh `conn` that DROPS before
+/// the part-marking Handle write — a Handle read here would be Q2-blind to those
+/// fresh-open writers. Returning owned data (not the `Connection`) keeps the
+/// opener out of `mark_parts_request`, so its Handle audit append never
+/// colocates with a fresh opener (ADR-0099 H3 write-fork discipline).
+fn load_mark_parts_context(
+    state: &AppState,
+    wo_id: &str,
+    supplied_serials: usize,
+) -> std::result::Result<(u32, Option<String>), WorkOrderRouteError> {
+    // ADR-0099 H3 STEP 4c — work_orders is a Handle family now, so read the WO
+    // (and resolve customer_type / heat_lot, the same Handle-coherent reads the
+    // shipment/heat-lot gates use) through the ONE shared reader. `state.db.read()`
+    // returns an OWNED try_clone dropped at fn end, BEFORE `mark_parts_request`
+    // acquires the part-marking `state.db.write()` — no guard is held across.
+    let conn = state.db.read().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared reader for mark-parts context: {e}"))
+    })?;
+
+    let Some(wo) = aberp_work_orders::read_work_order(&conn, state.tenant.as_str(), wo_id)
+        .map_err(map_wo_err)?
+    else {
+        return Err(WorkOrderRouteError::NotFound);
+    };
+    // [[trust-code-not-operator]] — only a Completed WO can be marked, and
+    // only for a defense/aerospace customer (the shipment gate's scope).
+    if wo.state != aberp_work_orders::WorkOrderState::Completed {
+        return Err(WorkOrderRouteError::Conflict(
+            "work order must be Completed before marking parts".to_string(),
+        ));
+    }
+    use crate::partners::CustomerType;
+    if !matches!(
+        resolve_wo_customer_type(&conn, state.tenant.as_str(), &wo)
+            .map_err(WorkOrderRouteError::Other)?,
+        Some(CustomerType::Defense | CustomerType::Aerospace)
+    ) {
+        return Err(WorkOrderRouteError::Conflict(
+            "part marking applies to defense/aerospace work orders only".to_string(),
+        ));
+    }
+
+    let expected = crate::part_marking::qty_to_units(wo.qty_target);
+    if expected == 0 {
+        return Err(WorkOrderRouteError::BadInput(
+            "work order qty_target is zero — nothing to mark".to_string(),
+        ));
+    }
+    if supplied_serials > expected as usize {
+        return Err(WorkOrderRouteError::BadInput(format!(
+            "supplied {supplied_serials} serials for {expected} units"
+        )));
+    }
+
+    // Heat lot consumed = the originating quote's grade balance (S432),
+    // snapshotted onto every mark for the DataMatrix material-chain tail.
+    let heat_lot = resolve_wo_heat_lot(&conn, state.tenant.as_str(), &wo)
+        .map_err(WorkOrderRouteError::Other)?;
+    Ok((expected, heat_lot))
+    // read clone dropped here — `mark_parts_request` acquires the shared Handle
+    // write guard next (no guard held across → the re-entrancy tripwire stays silent).
+}
+
 fn mark_parts_request(
     state: &AppState,
     wo_id: &str,
@@ -22723,106 +23434,77 @@ fn mark_parts_request(
         .wait()
         .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
 
-    let (marks, marked_at, heat_lot) = {
-        let conn = Connection::open(&*state.db_path).map_err(|e| {
-            WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for mark-parts: {e}"))
-        })?;
-        crate::part_marking::ensure_schema(&conn).map_err(WorkOrderRouteError::Other)?;
+    let (expected, heat_lot) = load_mark_parts_context(state, wo_id, body.serials.len())?;
 
-        let Some(wo) = aberp_work_orders::read_work_order(&conn, state.tenant.as_str(), wo_id)
-            .map_err(map_wo_err)?
-        else {
-            return Err(WorkOrderRouteError::NotFound);
+    let marked_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+
+    let mut marks = Vec::with_capacity(expected as usize);
+    for i in 1..=expected {
+        let typed = body
+            .serials
+            .get((i - 1) as usize)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        let serial = match typed {
+            Some(s) => {
+                crate::part_marking::validate_serial(s)
+                    .map_err(|e| WorkOrderRouteError::BadInput(format!("unit {i} serial: {e}")))?;
+                s.to_string()
+            }
+            None => crate::part_marking::auto_serial(wo_id, i),
         };
-        // [[trust-code-not-operator]] — only a Completed WO can be marked, and
-        // only for a defense/aerospace customer (the shipment gate's scope).
-        if wo.state != aberp_work_orders::WorkOrderState::Completed {
-            return Err(WorkOrderRouteError::Conflict(
-                "work order must be Completed before marking parts".to_string(),
-            ));
-        }
-        use crate::partners::CustomerType;
-        if !matches!(
-            resolve_wo_customer_type(&conn, state.tenant.as_str(), &wo)
-                .map_err(WorkOrderRouteError::Other)?,
-            Some(CustomerType::Defense | CustomerType::Aerospace)
-        ) {
-            return Err(WorkOrderRouteError::Conflict(
-                "part marking applies to defense/aerospace work orders only".to_string(),
-            ));
-        }
+        let part_uid = crate::part_marking::generate_part_uid();
+        let data_matrix_payload =
+            crate::part_marking::data_matrix_payload(&part_uid, &serial, heat_lot.as_deref());
+        marks.push(crate::part_marking::PartMark {
+            wo_id: wo_id.to_string(),
+            unit_index: i,
+            part_uid,
+            serial_number: serial,
+            data_matrix_payload,
+            heat_lot_reference: heat_lot.clone(),
+            marked_at_utc: marked_at.clone(),
+            marked_by_operator: operator_login.to_string(),
+        });
+    }
 
-        let expected = crate::part_marking::qty_to_units(wo.qty_target);
-        if expected == 0 {
-            return Err(WorkOrderRouteError::BadInput(
-                "work order qty_target is zero — nothing to mark".to_string(),
-            ));
-        }
-        if body.serials.len() > expected as usize {
-            return Err(WorkOrderRouteError::BadInput(format!(
-                "supplied {} serials for {expected} units",
-                body.serials.len()
-            )));
-        }
-        if crate::part_marking::count_part_marks(&conn, state.tenant.as_str(), wo_id)
-            .map_err(WorkOrderRouteError::Other)?
-            > 0
-        {
-            return Err(WorkOrderRouteError::Conflict(
-                "work order is already marked".to_string(),
-            ));
-        }
-
-        // Heat lot consumed = the originating quote's grade balance (S432),
-        // snapshotted onto every mark for the DataMatrix material-chain tail.
-        let heat_lot = resolve_wo_heat_lot(&conn, state.tenant.as_str(), &wo)
-            .map_err(WorkOrderRouteError::Other)?;
-
-        let marked_at = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default();
-
-        let mut marks = Vec::with_capacity(expected as usize);
-        for i in 1..=expected {
-            let typed = body
-                .serials
-                .get((i - 1) as usize)
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty());
-            let serial = match typed {
-                Some(s) => {
-                    crate::part_marking::validate_serial(s).map_err(|e| {
-                        WorkOrderRouteError::BadInput(format!("unit {i} serial: {e}"))
-                    })?;
-                    s.to_string()
-                }
-                None => crate::part_marking::auto_serial(wo_id, i),
-            };
-            let part_uid = crate::part_marking::generate_part_uid();
-            let data_matrix_payload =
-                crate::part_marking::data_matrix_payload(&part_uid, &serial, heat_lot.as_deref());
-            marks.push(crate::part_marking::PartMark {
-                wo_id: wo_id.to_string(),
-                unit_index: i,
-                part_uid,
-                serial_number: serial,
-                data_matrix_payload,
-                heat_lot_reference: heat_lot.clone(),
-                marked_at_utc: marked_at.clone(),
-                marked_by_operator: operator_login.to_string(),
-            });
-        }
-
-        crate::part_marking::record_part_marks(&conn, state.tenant.as_str(), wo_id, &marks)
-            .map_err(map_part_mark_err)?;
-        (marks, marked_at, heat_lot)
-        // conn dropped here — Ledger opens its own writer next.
-    };
-
+    // ADR-0099 H3 — the already-marked read guard, the physical mark INSERTs, and
+    // the two `part.*` audit appends all ride ONE tx on the shared Handle writer
+    // (matching the `create_ncr` recipe). Previously `record_part_marks`
+    // AUTOCOMMITTED the inserts on the live instance and the two audit events rode
+    // a SEPARATE later tx, so a failure between them left marked-but-unaudited
+    // rows; folding them into one tx makes the physical mark + its audit ATOMIC —
+    // an audit-append (or commit) failure rolls the inserts back too. No
+    // fresh-open truncator, no nested `db.write()`; the guard drop lockstep-syncs
+    // the mirror (was a separate `Ledger::open` + `sync_audit_mirror_best_effort`).
+    let mut guard = state
+        .db
+        .write()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("shared writer for mark-parts: {e}")))?;
+    crate::part_marking::ensure_schema(&guard).map_err(WorkOrderRouteError::Other)?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure audit schema: {e}")))?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("begin mark-parts tx: {e}")))?;
+    // `&tx` deref-coerces to `&Connection` for the count/record helpers, so their
+    // reads + INSERTs land inside THIS tx (not autocommitted).
+    if crate::part_marking::count_part_marks(&tx, state.tenant.as_str(), wo_id)
+        .map_err(WorkOrderRouteError::Other)?
+        > 0
+    {
+        return Err(WorkOrderRouteError::Conflict(
+            "work order is already marked".to_string(),
+        ));
+    }
+    crate::part_marking::record_part_marks(&tx, state.tenant.as_str(), wo_id, &marks)
+        .map_err(map_part_mark_err)?;
     crate::part_marking::append_mark_events(
-        &state.db_path,
-        state.tenant.clone(),
-        binary_hash,
+        &tx,
+        &meta,
         wo_id,
         operator_login,
         &marked_at,
@@ -22830,7 +23512,8 @@ fn mark_parts_request(
         &marks,
     )
     .map_err(WorkOrderRouteError::Other)?;
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    tx.commit()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("commit mark-parts tx: {e}")))?;
 
     Ok(MarkPartsResponse { part_marks: marks })
 }
@@ -22923,22 +23606,32 @@ async fn handle_part_traceability(
                 .binary_hash
                 .wait()
                 .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
-            let report = {
-                let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                    format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-                })?;
-                match kind {
-                    PartTraceQueryKind::PartUid => crate::part_marking::trace_part_uid(
-                        &conn,
-                        state_for_task.tenant.as_str(),
-                        &value,
-                    )?,
-                    PartTraceQueryKind::Customer => crate::part_marking::trace_customer(
-                        &conn,
-                        state_for_task.tenant.as_str(),
-                        &value,
-                    )?,
-                }
+            // ADR-0099 H3 — the trace read (its entry point is the part-marking
+            // row, a Handle family) + the `part.traceability_viewed` audit append
+            // ride the ONE shared Handle writer guard: the part-marking read is
+            // coherent with its Handle writers (a fresh open would miss a
+            // just-marked part), and the audit is no longer a fresh `Ledger::open`
+            // write-fork. The downstream WO/quote/dispatch chain the trace follows
+            // stays in fresh-open families — a narrow same-session Q2 window on a
+            // historical lookup, accepted here (this is an audit trace, not a gate).
+            let mut guard = state_for_task
+                .db
+                .write()
+                .context("shared writer for part-traceability")?;
+            crate::part_marking::ensure_schema(&guard)?;
+            aberp_audit_ledger::ensure_schema(&guard)
+                .map_err(|e| anyhow!("ensure audit schema: {e}"))?;
+            let report = match kind {
+                PartTraceQueryKind::PartUid => crate::part_marking::trace_part_uid(
+                    &guard,
+                    state_for_task.tenant.as_str(),
+                    &value,
+                )?,
+                PartTraceQueryKind::Customer => crate::part_marking::trace_customer(
+                    &guard,
+                    state_for_task.tenant.as_str(),
+                    &value,
+                )?,
             };
             let payload = serde_json::json!({
                 "query_kind": kind.as_str(),
@@ -22953,17 +23646,21 @@ async fn handle_part_traceability(
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_default(),
             });
-            let mut ledger = aberp_audit_ledger::Ledger::open(
-                state_for_task.db_path.as_path(),
-                state_for_task.tenant.clone(),
-                binary_hash,
-            )?;
-            ledger.append(
+            let meta =
+                aberp_audit_ledger::LedgerMeta::new(state_for_task.tenant.clone(), binary_hash);
+            let tx = guard
+                .transaction()
+                .context("begin part-traceability audit tx")?;
+            aberp_audit_ledger::append_in_tx(
+                &tx,
+                &meta,
                 aberp_audit_ledger::EventKind::PartTraceabilityViewed,
                 serde_json::to_vec(&payload).expect("serialize part-traceability-viewed payload"),
                 Actor::from_local_cli(Ulid::new().to_string(), &operator_login),
                 None,
-            )?;
+            )
+            .map_err(|e| anyhow!("append part.traceability_viewed: {e}"))?;
+            tx.commit().context("commit part-traceability audit tx")?;
             Ok(report)
         })
         .await;
@@ -23050,7 +23747,10 @@ async fn handle_list_ncrs(
     }
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<crate::quality::Ncr>> {
-        let conn = Connection::open(&*state_for_task.db_path)?;
+        // H3 (ADR-0099) — read through the shared Handle. A fresh
+        // `Connection::open` reader tears the Handle's uncheckpointed WAL
+        // on close (silently dropping later writes); see `list_partners_request`.
+        let conn = state_for_task.db.read()?;
         crate::quality::list_ncrs(&conn, state_for_task.tenant.as_str(), &filter)
     })
     .await;
@@ -23109,8 +23809,15 @@ async fn handle_create_ncr(
                 .binary_hash
                 .wait()
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
+            // ADR-0099 H3 — `create_ncr` takes the shared writer guard (the
+            // passed-in-guard contract shared with the re-entrant auto-NCR call
+            // sites). The direct handler holds no prior guard, so it acquires one
+            // here and drops it when the closure returns.
+            let mut guard = state_for_task.db.write().map_err(|e| {
+                crate::quality::QualityError::Other(anyhow!("shared writer for NCR create: {e}"))
+            })?;
             crate::quality::create_ncr(
-                state_for_task.db_path.as_path(),
+                &mut guard,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -23148,7 +23855,10 @@ async fn handle_get_ncr(
     let state_for_task = state.clone();
     let result =
         tokio::task::spawn_blocking(move || -> Result<Option<crate::quality::NcrDetail>> {
-            let conn = Connection::open(&*state_for_task.db_path)?;
+            // H3 (ADR-0099) — read through the shared Handle. A fresh
+            // `Connection::open` reader tears the Handle's uncheckpointed WAL
+            // on close (silently dropping later writes); see `list_partners_request`.
+            let conn = state_for_task.db.read()?;
             crate::quality::get_ncr_detail(&conn, state_for_task.tenant.as_str(), &id)
         })
         .await;
@@ -23199,7 +23909,7 @@ async fn handle_transition_ncr(
                 .wait()
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::transition_ncr(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -23251,7 +23961,7 @@ async fn handle_create_capa(
                 .wait()
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::create_capa(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -23293,7 +24003,7 @@ async fn handle_approve_capa(
                 .wait()
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::approve_capa(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -23344,7 +24054,7 @@ async fn handle_review_capa(
                 .wait()
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::review_capa_effectiveness(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -23382,7 +24092,7 @@ async fn handle_close_capa(
                 .wait()
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::close_capa(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -23409,7 +24119,10 @@ async fn handle_quality_alert(headers: HeaderMap, State(state): State<AppState>)
     }
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
-        let conn = Connection::open(&*state_for_task.db_path)?;
+        // H3 (ADR-0099) — read through the shared Handle. A fresh
+        // `Connection::open` reader tears the Handle's uncheckpointed WAL
+        // on close (silently dropping later writes); see `list_partners_request`.
+        let conn = state_for_task.db.read()?;
         let ncrs = crate::quality::list_ncrs(
             &conn,
             state_for_task.tenant.as_str(),
@@ -23470,7 +24183,10 @@ async fn handle_list_inspection_plans(
     }
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<aberp_qa::InspectionPlan>> {
-        let conn = Connection::open(&*state_for_task.db_path)?;
+        // ADR-0099 H3 STEP 4d — inspection_plans is a Handle family (the qc
+        // record-inspection path reads plans through the Handle write guard); read
+        // via the shared Handle so a WAL-resident plan write is visible.
+        let conn = state_for_task.db.read()?;
         aberp_qa::list_inspection_plans(
             &conn,
             state_for_task.tenant.as_str(),
@@ -23540,10 +24256,14 @@ async fn handle_create_inspection_plan(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<aberp_qa::InspectionPlan, aberp_qa::QcError> {
-            let conn = Connection::open(&*state_for_task.db_path)
-                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
+            // ADR-0099 H3 STEP 4d — inspection_plans is a Handle family; the INSERT
+            // rides the shared Handle writer (a fresh open would tear its WAL).
+            let guard = state_for_task
+                .db
+                .write()
+                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("shared writer: {e}")))?;
             aberp_qa::create_inspection_plan(
-                &conn,
+                &guard,
                 state_for_task.tenant.as_str(),
                 aberp_qa::NewInspectionPlan {
                     product_id: body.product_id,
@@ -23584,10 +24304,13 @@ async fn handle_update_inspection_plan(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<aberp_qa::InspectionPlan, aberp_qa::QcError> {
-            let conn = Connection::open(&*state_for_task.db_path)
-                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
+            // ADR-0099 H3 STEP 4d — inspection_plans is a Handle family.
+            let guard = state_for_task
+                .db
+                .write()
+                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("shared writer: {e}")))?;
             aberp_qa::update_inspection_plan(
-                &conn,
+                &guard,
                 state_for_task.tenant.as_str(),
                 &plan_id,
                 aberp_qa::NewInspectionPlan {
@@ -23628,9 +24351,12 @@ async fn handle_archive_inspection_plan(
     let state_for_task = state.clone();
     let result =
         tokio::task::spawn_blocking(move || -> std::result::Result<(), aberp_qa::QcError> {
-            let conn = Connection::open(&*state_for_task.db_path)
-                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
-            aberp_qa::archive_inspection_plan(&conn, state_for_task.tenant.as_str(), &plan_id)
+            // ADR-0099 H3 STEP 4d — inspection_plans is a Handle family.
+            let guard = state_for_task
+                .db
+                .write()
+                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("shared writer: {e}")))?;
+            aberp_qa::archive_inspection_plan(&guard, state_for_task.tenant.as_str(), &plan_id)
         })
         .await;
     match result {
@@ -23681,7 +24407,10 @@ async fn handle_list_qc_inspections(
     }
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<aberp_qa::QcInspection>> {
-        let conn = Connection::open(&*state_for_task.db_path)?;
+        // H3 (ADR-0099) — read through the shared Handle. A fresh
+        // `Connection::open` reader tears the Handle's uncheckpointed WAL
+        // on close (silently dropping later writes); see `list_partners_request`.
+        let conn = state_for_task.db.read()?;
         let tenant = state_for_task.tenant.as_str();
         let rows = match (&part_uid, &wo_id) {
             (Some(p), _) => aberp_qa::list_inspections_for_part(&conn, tenant, p),
@@ -23758,8 +24487,14 @@ async fn handle_record_qc_inspection(
             // time) so the auto-NCR cites the actual lot, not a re-derived one.
             let heat_lot = match (&body.wo_id, &body.part_uid) {
                 (Some(wo), Some(part)) => {
-                    let conn = Connection::open(&*state_for_task.db_path)
-                        .map_err(|e| crate::qc_inspection::QcRecordError::Other(anyhow!("open DuckDB: {e}")))?;
+                    // H3 (ADR-0099) — part_marking is a Handle family; read it
+                    // through the shared reader (a fresh open would miss a
+                    // just-marked unit). The read conn drops before
+                    // `record_manual_inspection` acquires its own write guard.
+                    let conn = state_for_task
+                        .db
+                        .read()
+                        .map_err(|e| crate::qc_inspection::QcRecordError::Other(anyhow!("shared reader for qc heat-lot: {e}")))?;
                     crate::part_marking::list_part_marks(&conn, state_for_task.tenant.as_str(), wo)
                         .map_err(crate::qc_inspection::QcRecordError::Other)?
                         .into_iter()
@@ -23770,7 +24505,7 @@ async fn handle_record_qc_inspection(
             };
             let now = time::OffsetDateTime::now_utc();
             crate::qc_inspection::record_manual_inspection(
-                &state_for_task.db_path,
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -23832,7 +24567,10 @@ async fn handle_qc_stale_calibration(
     }
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<aberp_qa::QcInspection>> {
-        let conn = Connection::open(&*state_for_task.db_path)?;
+        // H3 (ADR-0099) — read through the shared Handle. A fresh
+        // `Connection::open` reader tears the Handle's uncheckpointed WAL
+        // on close (silently dropping later writes); see `list_partners_request`.
+        let conn = state_for_task.db.read()?;
         // Last 30 days.
         aberp_qa::list_recent_stale_calibration(
             &conn,
@@ -23954,7 +24692,10 @@ async fn handle_list_pos(
     let state_for_task = state.clone();
     let result =
         tokio::task::spawn_blocking(move || -> Result<Vec<crate::purchasing::PurchaseOrder>> {
-            let conn = Connection::open(&*state_for_task.db_path)?;
+            // H3 (ADR-0099) — read through the shared Handle. A fresh
+            // `Connection::open` reader tears the Handle's uncheckpointed WAL
+            // on close (silently dropping later writes); see `list_partners_request`.
+            let conn = state_for_task.db.read()?;
             crate::purchasing::list_pos(&conn, state_for_task.tenant.as_str(), &filter)
         })
         .await;
@@ -23985,7 +24726,7 @@ async fn handle_create_po(
                 .wait()
                 .map_err(|e| crate::purchasing::PoError::Other(anyhow!("binary hash: {e}")))?;
             crate::purchasing::create_po(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -24015,7 +24756,10 @@ async fn handle_get_po(
     let state_for_task = state.clone();
     let result =
         tokio::task::spawn_blocking(move || -> Result<Option<crate::purchasing::PoDetail>> {
-            let conn = Connection::open(&*state_for_task.db_path)?;
+            // H3 (ADR-0099) — read through the shared Handle. A fresh
+            // `Connection::open` reader tears the Handle's uncheckpointed WAL
+            // on close (silently dropping later writes); see `list_partners_request`.
+            let conn = state_for_task.db.read()?;
             crate::purchasing::get_po_detail(&conn, state_for_task.tenant.as_str(), &id)
         })
         .await;
@@ -24066,7 +24810,7 @@ async fn handle_transition_po(
                 .wait()
                 .map_err(|e| crate::purchasing::PoError::Other(anyhow!("binary hash: {e}")))?;
             crate::purchasing::transition_po(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -24105,7 +24849,7 @@ async fn handle_receive_po(
                 .wait()
                 .map_err(|e| crate::purchasing::PoError::Other(anyhow!("binary hash: {e}")))?;
             crate::purchasing::record_receipt(
-                state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -24277,8 +25021,13 @@ pub fn run_deal_saga_request(
     deal_token: String,
     refresh_ack: Option<String>,
 ) -> Result<crate::quote_deal::DealSagaOutcome> {
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4d — the DEAL saga writes quote_intake_log +
+    // inventory_balances/reservations + audit in ONE tx (and cross-reads
+    // quote_pricing_jobs' margin flag), so it rides the shared Handle writer.
+    // quote_intake_log + material_inventory + invoice_draft are all Handle
+    // families now; the margin cross-read is Handle-coherent with the (already
+    // Handle) pricing pipeline. Guard drop lockstep-syncs the audit mirror.
+    let mut guard = state.db.write().context("shared writer for DEAL saga")?;
     let binary_hash = state
         .binary_hash
         .wait()
@@ -24287,7 +25036,7 @@ pub fn run_deal_saga_request(
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
 
     crate::quote_deal::run_deal_saga(
-        &mut conn,
+        &mut guard,
         &ledger_meta,
         ledger_actor,
         crate::quote_deal::DealSagaInputs {
@@ -24491,8 +25240,10 @@ pub fn run_refuse_saga_request(
     quote_id: &str,
     reason: String,
 ) -> Result<crate::quote_refuse::RefuseOutcome> {
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4d — the refuse saga writes quote_intake_log + audit in ONE
+    // tx; quote_intake_log is a Handle family, so it rides the shared writer.
+    // Guard drop lockstep-syncs the audit mirror.
+    let mut guard = state.db.write().context("shared writer for refuse saga")?;
     let binary_hash = state
         .binary_hash
         .wait()
@@ -24501,7 +25252,7 @@ pub fn run_refuse_saga_request(
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
 
     crate::quote_refuse::run_refuse_saga(
-        &mut conn,
+        &mut guard,
         &ledger_meta,
         ledger_actor,
         crate::quote_refuse::RefuseSagaInputs {
@@ -24584,8 +25335,15 @@ fn query_non_terminal_invoices(state: &AppState) -> Result<Vec<String>> {
         .binary_hash
         .wait()
         .context("await background binary hash compute for boot-recovery scan")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for boot-recovery scan")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for boot-recovery scan")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger
         .entries()
         .context("read audit ledger entries for boot-recovery scan")?;
@@ -24620,8 +25378,15 @@ async fn build_poll_daemon_inputs(
         .binary_hash
         .wait()
         .context("await background binary hash compute for poll daemon inputs")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger to build poll daemon inputs")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader to build poll daemon inputs")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger
         .entries()
         .context("read audit ledger entries to build poll daemon inputs")?;
@@ -24669,7 +25434,9 @@ async fn build_poll_daemon_inputs(
     build_profile::assert_endpoint_allowed(endpoint)?;
 
     Ok(poll_ack::PollDaemonInputs {
-        db: (*state.db_path).clone(),
+        // H3 (ADR-0099): the daemon owns an Arc-clone of the shared Handle and
+        // routes 100% of its DB access through it (CHECK M whole-subsystem rule).
+        db: state.db.clone(),
         tenant: state.tenant.clone(),
         binary_hash,
         invoice_id: invoice_id.to_string(),
@@ -24838,8 +25605,15 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for serve list")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for serve list")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger.entries().context("read audit ledger entries")?;
 
     // PR-65 / session-86 — sidecar map from invoice_id to the
@@ -24900,8 +25674,13 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
 
     // Load billing details for each invoice id.
     let mut items: Vec<InvoiceListItem> = Vec::new();
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099): read the invoice billing row through the shared Handle
+    // (`db.read()` = a coherent try_clone), not a fresh `Connection::open` —
+    // `allocate_in_tx` now writes these billing rows WAL-resident via the Handle.
+    let mut conn = state
+        .db
+        .read()
+        .context("acquire shared reader for invoice billing rows (list)")?;
     // S242 / PR-236 — same `YYYY-MM-DD` format the detail-modal
     // path emits (`get_invoice_detail` uses an identical descriptor);
     // both surfaces feed the SPA's `formatInvoiceDate` HU display
@@ -24961,7 +25740,7 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
     // (`HUF`/`EUR`); the app-layer `parse_digest_currency` gate
     // (S410 / [[no-sql-specific]] — no DB CHECK) makes any other value a
     // bug we surface loudly per CLAUDE.md rule 12.
-    let restored = restore_outgoing::list_restored(&state.db_path, state.tenant.as_str())
+    let restored = restore_outgoing::list_restored(&state.db, state.tenant.as_str())
         .context("read restored_invoice mirror for unified list")?;
     for ext in restored {
         items.push(restored_to_list_item(ext)?);
@@ -25147,8 +25926,15 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for serve detail")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for serve detail")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger.entries().context("read audit ledger entries")?;
 
     let mut trace = InvoiceTrace::default();
@@ -25229,8 +26015,11 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         }
     }
 
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099): read the invoice billing row through the shared Handle.
+    let mut conn = state
+        .db
+        .read()
+        .context("acquire shared reader for invoice billing row (detail)")?;
     let billing = read_invoice_row(&mut conn, invoice_id)?;
 
     if !found_any && billing.is_none() {
@@ -25362,8 +26151,15 @@ fn get_audit_for_invoice(state: &AppState, invoice_id: &str) -> Result<Vec<Audit
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for serve audit")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for serve audit")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger.entries().context("read audit ledger entries")?;
     let mut out = Vec::new();
     for entry in &entries {
@@ -26223,8 +27019,15 @@ fn audit_events_request(state: &AppState, query: &AuditEventsQuery) -> Result<Au
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for audit-events")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for audit-events")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger.entries().context("read audit ledger entries")?;
 
     // ── Whole-chain verdict (design §3.4). head_seq is the max seq. ──
@@ -26397,8 +27200,15 @@ fn audit_event_detail_request(state: &AppState, seq: u64) -> Result<Option<Audit
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for audit-event detail")?;
+    // H3 (ADR-0099): read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("acquire shared reader for audit-event detail")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger.entries().context("read audit ledger entries")?;
     let entry = match entries.iter().find(|e| e.seq.as_u64() == seq) {
         Some(e) => e,
@@ -26961,7 +27771,7 @@ async fn handle_relay_send_email(
     //    on audit-write failure so a corrupted ledger surfaces in
     //    tracing.
     let deps = crate::email_relay_daemon::EmailRelayDaemonDeps {
-        db_path: (*state.db_path).clone(),
+        db: state.db.clone(),
         tenant: state.tenant.clone(),
         binary_hash: match state.binary_hash.wait() {
             Ok(b) => b,
@@ -27412,14 +28222,18 @@ mod tests {
 
         let tenant = TenantId::new("test").expect("tenant id");
         let bh = BinaryHash::from_bytes([0u8; 32]);
+        let handle = open_tenant_handle(&db_path, tenant.clone()).expect("open handle");
         record_first_prod_launch_audit(
-            &db_path,
+            &handle,
             tenant.clone(),
             bh,
             "operator-login",
             "2026-06-01T08:00:00Z",
         )
         .expect("record audit entry");
+        // Drop the Handle so the fresh Ledger::open below replays the WAL-only
+        // append (checkpoint disabled in H3 keeps the write WAL-resident).
+        drop(handle);
 
         let ledger = Ledger::open(&db_path, tenant, bh).expect("reopen ledger");
         let entries = ledger.entries().expect("read entries");
@@ -27471,8 +28285,11 @@ mod tests {
             reset_policy: crate::numbering::ResetPolicy::OnYearChange,
             start_value: 56,
         };
-        record_numbering_change_audit(&db_path, tenant.clone(), bh, "operator-login", 1, &template)
+        let handle = open_tenant_handle(&db_path, tenant.clone()).expect("open handle");
+        record_numbering_change_audit(&handle, tenant.clone(), bh, "operator-login", 1, &template)
             .expect("record numbering-change audit entry");
+        // Drop the Handle so the fresh Ledger::open replays the WAL-only append.
+        drop(handle);
 
         let ledger = Ledger::open(&db_path, tenant, bh).expect("reopen ledger");
         let entries = ledger.entries().expect("read entries");
@@ -30007,6 +30824,8 @@ mod tests {
         }
 
         let state = AppState {
+            db: open_tenant_handle(&db_path, tenant.clone())
+                .expect("test: open shared aberp-db Handle"),
             db_path: std::sync::Arc::new(db_path),
             tenant,
             nav_enabled: true,
@@ -30131,6 +30950,8 @@ mod tests {
         }
 
         let state = AppState {
+            db: open_tenant_handle(&db_path, tenant.clone())
+                .expect("test: open shared aberp-db Handle"),
             db_path: std::sync::Arc::new(db_path),
             tenant,
             nav_enabled: true,
@@ -30658,7 +31479,11 @@ mod tests {
             .expect("INSERT restored_invoice");
         }
 
-        let restored = restore_outgoing::list_restored(&db_path, tenant).expect("list_restored");
+        // H3: the raw seed conn dropped with its block above; open the shared
+        // Handle now (fresh open sees the committed rows, Q3) and read through it.
+        let handle = open_tenant_handle(&db_path, TenantId::new(tenant.to_string()).unwrap())
+            .expect("open shared handle");
+        let restored = restore_outgoing::list_restored(&handle, tenant).expect("list_restored");
         assert_eq!(restored.len(), 2, "two rows MUST come back");
         let synthesized: Vec<InvoiceListItem> = restored
             .into_iter()
@@ -30900,6 +31725,11 @@ mod tests {
     /// `restore_active`); the rest are inert defaults.
     fn abandon_test_state(db_path: std::path::PathBuf, tenant: &str) -> AppState {
         AppState {
+            db: open_tenant_handle(
+                &db_path,
+                TenantId::new(tenant.to_string()).expect("tenant id"),
+            )
+            .expect("test: open shared aberp-db Handle"),
             db_path: std::sync::Arc::new(db_path),
             tenant: TenantId::new(tenant.to_string()).expect("tenant id"),
             nav_enabled: true,
@@ -30992,7 +31822,7 @@ mod tests {
 
         // Acquire a lock so there is something to abandon.
         restore_outgoing::acquire_restore_lock_at(
-            &db_path,
+            &state.db,
             "abandon-test",
             "ervin",
             2026,
@@ -31019,7 +31849,7 @@ mod tests {
 
         // The lock must still be held (abandon did NOT delete it).
         assert!(
-            restore_outgoing::read_restore_lock_at(&db_path, "abandon-test")
+            restore_outgoing::read_restore_lock_at(&state.db, "abandon-test")
                 .expect("read lock")
                 .is_some(),
             "a refused abandon must leave the live restore's lock intact"
@@ -31043,7 +31873,7 @@ mod tests {
             "abandon must succeed once no restore is live"
         );
         assert!(
-            restore_outgoing::read_restore_lock_at(&db_path, "abandon-test")
+            restore_outgoing::read_restore_lock_at(&state.db, "abandon-test")
                 .expect("read lock")
                 .is_none(),
             "a successful abandon must clear the stale lock"

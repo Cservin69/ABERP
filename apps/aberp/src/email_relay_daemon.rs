@@ -27,12 +27,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use duckdb::Connection;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 use zeroize::Zeroizing;
 
 use aberp_audit_ledger::{append_in_tx, Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
+use aberp_db::HandleArc;
 use lettre::{
     message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart},
     transport::smtp::{authentication::Credentials, client::Tls, client::TlsParameters},
@@ -41,8 +41,8 @@ use lettre::{
 
 use crate::audit_payloads::EmailRelayAuditPayload;
 use crate::email_relay_queue::{
-    self, claim_next_queued, mark_failed, mark_sent, read_row, reconcile_orphaned_sending,
-    requeue_for_retry, OutboundEmailRow,
+    self, claim_next_queued, mark_failed, mark_sent, reconcile_orphaned_sending, requeue_for_retry,
+    OutboundEmailRow,
 };
 use crate::secrets_cache::SecretsCache;
 use crate::smtp_config::{self, SmtpConfig, SmtpSecurity};
@@ -61,7 +61,10 @@ pub(crate) const SMTP_SEND_TIMEOUT_SECS: u64 = 30;
 /// Dependencies the daemon needs threaded from `AppState`.
 #[derive(Clone)]
 pub struct EmailRelayDaemonDeps {
-    pub db_path: PathBuf,
+    /// H3 (ADR-0099): the process-wide shared DuckDB [`aberp_db::Handle`]. The
+    /// drain daemon routes 100% of its per-tick queue + audit writes through it
+    /// (the whole-subsystem-daemon rule); serve clones it from `state.db`.
+    pub db: HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -129,12 +132,12 @@ pub async fn run_drain_loop(deps: EmailRelayDaemonDeps, cancel: CancellationToke
 /// `Ok(false)` when the queue was empty. Errors propagate to the
 /// caller for logging; the loop keeps running.
 async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
-    let db_path = deps.db_path.clone();
+    let db = deps.db.clone();
     let now = time::OffsetDateTime::now_utc();
     let claimed = tokio::task::spawn_blocking(move || -> Result<Option<OutboundEmailRow>> {
-        let conn = Connection::open(&db_path).with_context(|| {
-            format!("open DuckDB at {} for email-relay drain", db_path.display())
-        })?;
+        let conn = db
+            .write()
+            .context("acquire shared writer for email-relay drain")?;
         email_relay_queue::ensure_schema(&conn)?;
         claim_next_queued(&conn, now)
     })
@@ -152,10 +155,10 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
     match smtp_outcome {
         Ok(()) => {
             let id = row.id.clone();
-            let db_path2 = deps.db_path.clone();
+            let db2 = deps.db.clone();
             let now2 = time::OffsetDateTime::now_utc();
             tokio::task::spawn_blocking(move || -> Result<()> {
-                let conn = Connection::open(&db_path2).context("open DB to mark Sent")?;
+                let conn = db2.write().context("acquire shared writer to mark Sent")?;
                 mark_sent(&conn, &id, now2)
             })
             .await
@@ -181,10 +184,12 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
             let detail = scrub_for_audit(&e.to_string());
             if attempt_n >= MAX_ATTEMPTS_PER_ROW {
                 let id = row.id.clone();
-                let db_path2 = deps.db_path.clone();
+                let db2 = deps.db.clone();
                 let detail_for_db = detail.clone();
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    let conn = Connection::open(&db_path2).context("open DB to mark Failed")?;
+                    let conn = db2
+                        .write()
+                        .context("acquire shared writer to mark Failed")?;
                     mark_failed(&conn, &id, &detail_for_db)
                 })
                 .await
@@ -210,10 +215,10 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
                 );
             } else {
                 let id = row.id.clone();
-                let db_path2 = deps.db_path.clone();
+                let db2 = deps.db.clone();
                 let detail_for_db = detail.clone();
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    let conn = Connection::open(&db_path2).context("open DB to requeue")?;
+                    let conn = db2.write().context("acquire shared writer to requeue")?;
                     requeue_for_retry(&conn, &id, &detail_for_db)
                 })
                 .await
@@ -233,15 +238,12 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
 /// Opens its own short-lived connection (mirrors the per-op connection
 /// posture of [`process_one_row`]). Returns the count reconciled.
 async fn reconcile_startup(deps: &EmailRelayDaemonDeps) -> Result<u64> {
-    let db_path = deps.db_path.clone();
+    let db = deps.db.clone();
     let now = time::OffsetDateTime::now_utc();
     tokio::task::spawn_blocking(move || -> Result<u64> {
-        let conn = Connection::open(&db_path).with_context(|| {
-            format!(
-                "open DuckDB at {} for email-relay startup reconcile",
-                db_path.display()
-            )
-        })?;
+        let conn = db
+            .write()
+            .context("acquire shared writer for email-relay startup reconcile")?;
         reconcile_orphaned_sending(&conn, now)
     })
     .await
@@ -410,12 +412,14 @@ pub(crate) async fn write_relay_audit(
     kind: EventKind,
     payload: EmailRelayAuditPayload,
 ) {
-    let db_path = deps.db_path.clone();
+    let db = deps.db.clone();
     let tenant = deps.tenant.clone();
     let binary_hash = deps.binary_hash;
     let login = deps.operator_login.clone();
     let res = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = Connection::open(&db_path).context("open DB for email-relay audit")?;
+        let mut conn = db
+            .write()
+            .context("acquire shared writer for email-relay audit")?;
         aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
         let bytes = payload.to_bytes();
         let tx = conn.transaction().context("begin email-relay audit tx")?;
@@ -431,15 +435,6 @@ pub(crate) async fn write_relay_audit(
         Ok(Err(e)) => tracing::error!(error = ?e, "email-relay audit write failed"),
         Err(join) => tracing::error!(%join, "email-relay audit task panicked"),
     }
-}
-
-#[allow(dead_code)]
-pub(crate) fn read_row_helper(
-    db_path: &std::path::Path,
-    id: &str,
-) -> Result<Option<OutboundEmailRow>> {
-    let conn = Connection::open(db_path).context("open DB")?;
-    read_row(&conn, id)
 }
 
 #[cfg(test)]

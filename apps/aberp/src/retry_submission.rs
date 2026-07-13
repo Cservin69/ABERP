@@ -31,7 +31,9 @@
 //!      same `--invoice-xml` file).
 //!   6. Build a tokio current-thread runtime and drive the NAV
 //!      prepare phase (`tokenExchange` + `manage_invoice::build_request`
-//!      for `operation = CREATE`, same shape as
+//!      for the ledger-derived `operation` — CREATE / STORNO / MODIFY,
+//!      resolved in step 4 via `submission_queue::operation_for_invoice`
+//!      per ADR-0099 Addendum 2 Defect 2; same shape as
 //!      `submit_invoice::prepare_for_attempt_audit`). NO wire send
 //!      yet — that happens in step 8 after TX1 commit.
 //!   7. **TX1 — RetryRequested + Attempt-before-call** (PR-19 /
@@ -166,9 +168,7 @@
 //!     fact lives in the audit ledger per A5/A6.
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
-use aberp_billing::{
-    self as billing, BillingStore, DuckDbBillingStore, IdempotencyKey, InvoiceSeries, ReadyInvoice,
-};
+use aberp_billing::{self as billing, IdempotencyKey, ReadyInvoice};
 use aberp_nav_transport::{
     operations::{
         manage_invoice,
@@ -196,6 +196,13 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
         endpoint = ?args.endpoint,
     )
     .entered();
+
+    // H3 (ADR-0099 F-E) — cross-process whole-DB single-writer lock. A separate
+    // process opening the tenant DB read-write must REFUSE if `aberp serve` (or
+    // another DB-mutating command) holds the whole-DB writer lock, rather than
+    // opening a second concurrent writer. Held for the whole command.
+    let _db_writer_lock =
+        crate::db_writer_lock::acquire_or_refuse(&args.db, &args.tenant, "aberp retry-submission")?;
 
     // 1. Parse + validate CLI args.
     let tenant = TenantId::new(args.tenant.clone()).ok_or_else(|| {
@@ -272,7 +279,7 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
     //    committed in load_issued_invoice); we open a fresh Ledger
     //    handle which uses its own duckdb::Connection.
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
-    let stuck = resolve_stuck_or_loud_fail(
+    let (stuck, nav_operation) = resolve_stuck_or_loud_fail(
         &args.db,
         tenant.clone(),
         binary_hash_bytes,
@@ -333,7 +340,22 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
     //     proceeds (Absent), skips re-POST (Exists), or aborts
     //     (Failure per ADR-0033 §"Surfaced conflict 1 Reading A").
     if stuck.stage == StuckStage::Pending {
-        let nav_invoice_number = derive_nav_invoice_number(&args.db, &ready_invoice)?;
+        // ADR-0099 Addendum 2 (Defect 1) — resolve the NAV-facing
+        // invoice number from the base invoice's on-disk NAV XML (the
+        // byte-exact `<invoiceNumber>` NAV holds on file, written at
+        // issuance and never re-rewritten; S184 discipline). Pre-
+        // Addendum-2 this SYNTHESISED `"{series.code}/{seq:05}"` where
+        // `series.code` is the legacy `INV-default` literal — a string
+        // NAV has never seen — so the Layer-2 `queryInvoiceCheck`
+        // always returned Absent and `SkipRePost` was unreachable.
+        let nav_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&args.invoice_xml)
+            .with_context(|| {
+                format!(
+                    "ADR-0099 Addendum 2 — read NAV invoice number from on-disk XML at {} \
+                     for retry-submission Layer-2 check",
+                    args.invoice_xml.display()
+                )
+            })?;
         tracing::info!(
             nav_invoice_number = %nav_invoice_number,
             "state-2 retry: performing Layer-2 queryInvoiceCheck per ADR-0033 §1"
@@ -449,6 +471,7 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
         &credentials,
         &tax_number_8,
         &invoice_xml,
+        nav_operation,
     ))?;
     tracing::info!(
         request_bytes = prepared.request_xml.len(),
@@ -607,15 +630,28 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
 /// retry-submission command shape; only the
 /// `prior_transaction_id` field on the `InvoiceRetryRequestedPayload`
 /// differs (`None` for state-2 because no prior Response exists).
+///
+/// ADR-0099 Addendum 2 (Defect 2) — ALSO derives the NAV envelope
+/// operation (CREATE / STORNO / MODIFY) from the same ledger entries via
+/// [`submission_queue::operation_for_invoice`], returning it alongside
+/// the precondition so `prepare_for_attempt_audit` no longer hardcodes
+/// `InvoiceOperation::Create` (which would re-POST a stuck STORNO as a
+/// CREATE). Reuses the ledger already opened here — no extra opener.
 fn resolve_stuck_or_loud_fail(
     db_path: &std::path::Path,
     tenant: TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     invoice_id: &str,
     issuance_idempotency_key: &IdempotencyKey,
-) -> Result<StuckPrecondition> {
+) -> Result<(StuckPrecondition, InvoiceOperation)> {
     let ledger = Ledger::open(db_path, tenant, binary_hash)
         .context("open audit ledger to resolve retry-submission precondition")?;
+    let operation = submission_queue::operation_for_invoice(
+        &ledger
+            .entries()
+            .context("read audit ledger entries to derive retry-submission NAV operation")?,
+        invoice_id,
+    )?;
     match audit_query::stuck_precondition(&ledger, invoice_id)? {
         StuckOutcome::Stuck(p) => {
             if p.idempotency_key != *issuance_idempotency_key {
@@ -627,7 +663,7 @@ fn resolve_stuck_or_loud_fail(
                     issuance_idempotency_key.to_canonical_string(),
                 ));
             }
-            Ok(p)
+            Ok((p, operation))
         }
         StuckOutcome::NotStuck(reason) => Err(anyhow!(
             "cannot retry invoice {}: {}",
@@ -646,15 +682,21 @@ struct PreparedSubmission {
 
 /// PR-19 / ADR-0032 §1 + §3: open transport, tokenExchange, build
 /// envelope. Mirror of `submit_invoice::prepare_for_attempt_audit`
-/// per the operator-facing-twin posture. The retry path always uses
-/// `InvoiceOperation::Create` (same as the pre-PR-19 retry-submission
-/// shape) — chain operations (STORNO / MODIFY) are not yet on the
-/// retry surface (separate trigger).
+/// per the operator-facing-twin posture.
+///
+/// ADR-0099 Addendum 2 (Defect 2) — `operation` is the NAV envelope
+/// operation (CREATE / STORNO / MODIFY) derived from the audit ledger by
+/// `submission_queue::operation_for_invoice` (threaded from
+/// `resolve_stuck_or_loud_fail`). Pre-Addendum-2 this hardcoded
+/// `InvoiceOperation::Create`, which would re-POST a stuck STORNO as a
+/// CREATE (NAV v3.0 STORNO / MODIFY bodies are byte-identical to CREATE
+/// and cannot be told apart from the body).
 async fn prepare_for_attempt_audit(
     endpoint: NavEndpoint,
     credentials: &NavCredentials,
     tax_number_8: &str,
     invoice_xml: &[u8],
+    operation: InvoiceOperation,
 ) -> Result<PreparedSubmission> {
     let transport = NavTransport::new(endpoint).context("build NAV transport")?;
     let token = token_exchange::call(&transport, credentials, tax_number_8)
@@ -665,7 +707,7 @@ async fn prepare_for_attempt_audit(
         tax_number_8,
         &token.decoded_token,
         &[ManageInvoiceItem {
-            operation: InvoiceOperation::Create,
+            operation,
             invoice_data_xml: invoice_xml,
         }],
     )
@@ -871,42 +913,6 @@ enum Layer2Decision {
     /// payload's `failure_message` field by the time this decision
     /// is returned).
     Abort(String),
-}
-
-/// PR-20 / ADR-0033 §1: derive the NAV-facing invoice number
-/// string (`"{series_code}/{seq:05}"`) from the loaded ReadyInvoice.
-/// Mirror of `observe_receiver_confirmation::load_base_nav_invoice_number`
-/// — the same canonical NAV-facing invoice number shape per
-/// ADR-0009 §3 and `nav_xml::render_invoice_data`.
-///
-/// Opens a fresh `DuckDbBillingStore` to consult the
-/// `find_series_by_id` port. The caller already has the `ReadyInvoice`
-/// in hand (loaded by `load_issued_invoice`); the only missing piece
-/// is the series code, which the billing store resolves by ULID.
-fn derive_nav_invoice_number(db_path: &std::path::Path, invoice: &ReadyInvoice) -> Result<String> {
-    let store = DuckDbBillingStore::open(db_path).with_context(|| {
-        format!(
-            "open billing DuckDB at {} for Layer-2 series lookup",
-            db_path.display()
-        )
-    })?;
-    let series: InvoiceSeries = store
-        .find_series_by_id(invoice.series_id)
-        .context("billing::find_series_by_id (retry-submission Layer-2 series lookup)")?
-        .ok_or_else(|| {
-            anyhow!(
-                "invoice {} references series_id {} which is not present in \
-                 invoice_series — tenant DB appears tampered between invoice \
-                 insertion and retry-submission",
-                invoice.id.to_prefixed_string(),
-                invoice.series_id.to_prefixed_string()
-            )
-        })?;
-    Ok(format!(
-        "{}/{:05}",
-        series.code.as_str(),
-        invoice.sequence_number
-    ))
 }
 
 /// PR-20 / ADR-0033 §1: perform Phase 0 — the Layer-2

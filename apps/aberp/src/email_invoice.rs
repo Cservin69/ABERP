@@ -65,10 +65,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
 use aberp_billing::IdempotencyKey;
 use anyhow::{anyhow, Context, Result};
-use duckdb::Connection;
 use lettre::{
     message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart},
     transport::smtp::{authentication::Credentials, client::Tls, client::TlsParameters},
@@ -688,24 +687,27 @@ pub fn load_smtp_credentials(
 /// the operator-twin record never has gaps. Returns the entry-count
 /// for parity with mark-paid's response shape.
 pub fn record_email_audit_entry(
-    db_path: &Path,
+    db: &aberp_db::Handle,
     tenant: TenantId,
     binary_hash_bytes: BinaryHash,
     actor: Actor,
     invoice_id: &str,
     payload: InvoiceEmailedSentPayload,
 ) -> Result<u64> {
-    let mut conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for InvoiceEmailedSent audit append",
-            db_path.display()
-        )
-    })?;
+    // H3 (ADR-0099): append + verify on the ONE shared Handle instead of two
+    // independent opens (Connection::open + a fresh Ledger::open). The guard drop
+    // runs a lockstep sync_mirror (aberp-db WriteGuard::Drop), so the old explicit
+    // sync_mirror is gone; the chain verify runs off a try_clone of the SAME live
+    // instance — NO reopen, so it cannot fold the WAL and tear the ledger (the
+    // Ledger::from_connection post-commit path, audit-ledger storage/mod.rs).
+    let mut guard = db
+        .write()
+        .context("acquire shared writer for InvoiceEmailedSent audit append")?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
-    aberp_audit_ledger::ensure_schema(&conn)
+    aberp_audit_ledger::ensure_schema(&guard)
         .context("ensure audit-ledger schema for emailed-sent")?;
     let idempotency_key_str = payload.idempotency_key.clone();
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin DuckDB transaction (emailed-sent audit append)")?;
     aberp_audit_ledger::append_in_tx(
@@ -719,16 +721,15 @@ pub fn record_email_audit_entry(
     .map_err(|e| anyhow!("audit_ledger::append_in_tx InvoiceEmailedSent: {e}"))?;
     tx.commit()
         .context("commit DuckDB transaction (emailed-sent audit append)")?;
-    drop(conn);
-    let ledger = Ledger::open(db_path, tenant, binary_hash_bytes)
-        .context("open audit ledger to verify chain after emailed-sent")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER emailed-sent")?;
-    let mirror_path = aberp_audit_ledger::mirror_path_for(db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after emailed-sent commit")?;
+    let verified = aberp_audit_ledger::Ledger::from_connection(
+        guard
+            .try_clone()
+            .context("try_clone shared handle for post-emailed-sent chain verify")?,
+        tenant,
+        binary_hash_bytes,
+    )
+    .verify_chain()
+    .context("audit-ledger chain verification failed AFTER emailed-sent")?;
     let _ = invoice_id; // present for future per-invoice mirror-locking;
                         // currently the global mirror is the unit.
     Ok(verified)

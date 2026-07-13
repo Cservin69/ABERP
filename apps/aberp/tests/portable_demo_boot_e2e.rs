@@ -55,7 +55,11 @@ use aberp::serve::{self, AppState};
 fn demo_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new("demo".to_string()).expect("demo tenant id");
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
+    // ADR-0099 H3 — the shared Handle field the durability line added to AppState.
+    let db = aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+        .expect("open shared aberp-db Handle");
     AppState {
+        db,
         db_path: Arc::new(db_path),
         tenant,
         // The whole point of the Portable line: NAV submission is off.

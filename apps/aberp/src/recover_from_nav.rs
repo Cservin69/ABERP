@@ -48,11 +48,15 @@
 //!      The F8 idempotency-key cross-check happens inside
 //!      `audit_query::stuck_precondition` consumption (mirror of
 //!      `retry_submission::resolve_stuck_or_loud_fail`).
-//!   5. Construct the NAV-facing invoice number string
-//!      (`"{series_code}/{seq:05}"`) — same canonical shape per
-//!      ADR-0009 §3 / `nav_xml::render_invoice_data`. Mirror of
-//!      `observe_receiver_confirmation::load_base_nav_invoice_number`
-//!      and `retry_submission::derive_nav_invoice_number`.
+//!   5. Read the NAV-facing invoice number from the base invoice's
+//!      on-disk NAV XML via `nav_xml::read_invoice_number_from_xml`
+//!      (ADR-0099 Addendum 2, Defect 1) — the byte-exact
+//!      `<invoiceNumber>` NAV holds on file, resolved through the same
+//!      ledger scope as the precondition. Mirror of
+//!      `observe_receiver_confirmation::load_base_nav_invoice_number`.
+//!      Pre-Addendum-2 this SYNTHESISED `"{series_code}/{seq:05}"`,
+//!      which NAV never saw (the `INV-default` literal), so both the
+//!      `queryInvoiceData` lookup and the drift check were wrong.
 //!   6. Build a tokio current-thread runtime and drive ONE
 //!      `queryInvoiceData` call (one-shot per ADR-0028 §4 / ADR-
 //!      0034 §2; no loop).
@@ -122,12 +126,10 @@
 //!     conflict 3 Reading B".
 //!   - It does NOT mutate any billing row.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
-use aberp_billing::{
-    self as billing, BillingStore, DuckDbBillingStore, IdempotencyKey, InvoiceSeries, ReadyInvoice,
-};
+use aberp_billing::{self as billing, IdempotencyKey, ReadyInvoice};
 use aberp_nav_transport::{
     operations::query_invoice_data::{self, QueryInvoiceDataOutcome},
     soap::InvoiceDirection,
@@ -150,6 +152,13 @@ pub fn run(args: &RecoverFromNavArgs) -> Result<()> {
         endpoint = ?args.endpoint,
     )
     .entered();
+
+    // H3 (ADR-0099 F-E) — cross-process whole-DB single-writer lock. A separate
+    // process opening the tenant DB read-write must REFUSE if `aberp serve` (or
+    // another DB-mutating command) holds the whole-DB writer lock, rather than
+    // opening a second concurrent writer. Held for the whole command.
+    let _db_writer_lock =
+        crate::db_writer_lock::acquire_or_refuse(&args.db, &args.tenant, "aberp recover-from-nav")?;
 
     // 1. Parse + validate CLI args.
     let tenant = TenantId::new(args.tenant.clone()).ok_or_else(|| {
@@ -201,7 +210,7 @@ pub fn run(args: &RecoverFromNavArgs) -> Result<()> {
     //    uses the billing-row key from load_issued_invoice (already
     //    proven to match per the cross-check).
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
-    let nav_invoice_number_from_check = resolve_recovery_precondition(
+    let (nav_invoice_number_from_check, base_nav_xml_path) = resolve_recovery_precondition(
         &args.db,
         tenant.clone(),
         binary_hash_bytes,
@@ -209,29 +218,45 @@ pub fn run(args: &RecoverFromNavArgs) -> Result<()> {
         &idempotency_key,
     )?;
 
-    // 5. Derive the NAV-facing invoice number from the loaded
-    //    ReadyInvoice. Same canonical NAV-facing invoice number
-    //    shape per ADR-0009 §3 — `"{series_code}/{seq:05}"`.
-    let nav_invoice_number = derive_nav_invoice_number(&args.db, &ready_invoice)?;
+    // 5. ADR-0099 Addendum 2 (Defect 1) — read the NAV-facing invoice
+    //    number from the base invoice's on-disk NAV XML: the byte-exact
+    //    `<invoiceNumber>` NAV holds on file, written at issuance and
+    //    never re-rewritten (S184 discipline; same helper `issue_storno`
+    //    / `observe_receiver_confirmation` use). Pre-Addendum-2 this
+    //    SYNTHESISED `"{series.code}/{seq:05}"` where `series.code` is
+    //    the legacy `INV-default` literal — a string NAV has never seen
+    //    — so BOTH the `queryInvoiceData` lookup AND the drift check
+    //    below used the wrong number (and, being derived the same wrong
+    //    way as the recorded value, the drift check silently agreed).
+    let nav_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path)
+        .with_context(|| {
+            format!(
+                "ADR-0099 Addendum 2 — read NAV invoice number from on-disk XML at {} \
+                 for recover-from-nav queryInvoiceData",
+                base_nav_xml_path.display()
+            )
+        })?;
     tracing::info!(
         nav_invoice_number = %nav_invoice_number,
         nav_invoice_number_from_check = %nav_invoice_number_from_check,
-        "NAV-facing invoice number constructed for queryInvoiceData"
+        "NAV-facing invoice number read from on-disk XML for queryInvoiceData"
     );
 
-    // 5a. Defence-in-depth: the NAV-facing invoice number we
-    //     derived from the loaded ReadyInvoice MUST match the one
-    //     the prior InvoiceCheckPerformed entry recorded. Drift
-    //     between the two indicates ledger tampering or a
-    //     billing-row mutation between the prior retry-submission
-    //     and this recovery — both classes of failure CLAUDE.md
-    //     rule 12 names. Loud-fail rather than recover an
+    // 5a. Defence-in-depth: the NAV-facing invoice number read from the
+    //     base invoice's on-disk NAV XML MUST match the one the prior
+    //     InvoiceCheckPerformed entry recorded. With Defect 1 fixed both
+    //     sources are now NAV-authoritative (the check entry records the
+    //     XML-read number too), so this drift check is genuinely load-
+    //     bearing: disagreement indicates the on-disk XML was edited or
+    //     the audit ledger was tampered between the prior retry-
+    //     submission Layer-2 check and this recovery — both classes
+    //     CLAUDE.md rule 12 names. Loud-fail rather than recover an
     //     ambiguous identifier.
     if nav_invoice_number != nav_invoice_number_from_check {
         return Err(anyhow!(
-            "NAV-facing invoice number derived from billing row ('{}') does not match the \
-             prior InvoiceCheckPerformed entry's nav_invoice_number ('{}') — the audit \
-             ledger or billing row appears tampered between the prior retry-submission \
+            "NAV-facing invoice number read from the base invoice's on-disk NAV XML ('{}') does \
+             not match the prior InvoiceCheckPerformed entry's nav_invoice_number ('{}') — the \
+             on-disk XML or the audit ledger appears tampered between the prior retry-submission \
              Layer-2 check and this recover-from-nav run",
             nav_invoice_number,
             nav_invoice_number_from_check,
@@ -362,13 +387,20 @@ pub fn run(args: &RecoverFromNavArgs) -> Result<()> {
 /// match) so the key does not need to flow back out here —
 /// CLAUDE.md rule 2 (minimum code, no speculative
 /// abstractions).
+///
+/// ADR-0099 Addendum 2 (Defect 1) — ALSO resolves the base invoice's
+/// on-disk NAV XML path (via
+/// [`crate::issue_storno::find_base_nav_xml_path_for_chain`], the same
+/// ledger-walk `observe_receiver_confirmation` uses) within this same
+/// ledger scope, so the caller can read the NAV-authoritative
+/// `<invoiceNumber>` from it without opening a second ledger.
 fn resolve_recovery_precondition(
     db_path: &Path,
     tenant: TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     invoice_id: &str,
     issuance_idempotency_key: &IdempotencyKey,
-) -> Result<String> {
+) -> Result<(String, PathBuf)> {
     let ledger = Ledger::open(db_path, tenant, binary_hash)
         .context("open audit ledger to resolve recover-from-nav precondition")?;
     let stuck = match audit_query::stuck_precondition(&ledger, invoice_id)? {
@@ -460,7 +492,17 @@ fn resolve_recovery_precondition(
         },
     };
 
-    Ok(nav_invoice_number_from_check)
+    // ADR-0099 Addendum 2 (Defect 1) — resolve the base invoice's
+    // on-disk NAV XML path from the same ledger scope so the caller reads
+    // the NAV-authoritative `<invoiceNumber>` from it.
+    let base_nav_xml_path = crate::issue_storno::find_base_nav_xml_path_for_chain(
+        &ledger, invoice_id,
+    )
+    .context(
+        "ADR-0099 Addendum 2 — resolve base invoice's on-disk NAV XML path for recover-from-nav",
+    )?;
+
+    Ok((nav_invoice_number_from_check, base_nav_xml_path))
 }
 
 /// Most-recent (highest-seq) `InvoiceCheckPerformed` entry for this
@@ -514,37 +556,6 @@ fn load_issued_invoice(
         .ok_or_else(|| anyhow!("no issued invoice with id {invoice_id} in this tenant DB"))?;
     tx.commit().context("commit read transaction")?;
     Ok(pair)
-}
-
-/// Derive the NAV-facing invoice number string
-/// (`"{series_code}/{seq:05}"`) from the loaded `ReadyInvoice`.
-/// Mirror of `retry_submission::derive_nav_invoice_number` and
-/// `observe_receiver_confirmation::load_base_nav_invoice_number` —
-/// same canonical NAV-facing invoice number shape per ADR-0009 §3
-/// and `nav_xml::render_invoice_data`.
-fn derive_nav_invoice_number(db_path: &Path, invoice: &ReadyInvoice) -> Result<String> {
-    let store = DuckDbBillingStore::open(db_path).with_context(|| {
-        format!(
-            "open billing DuckDB at {} for recover-from-nav series lookup",
-            db_path.display()
-        )
-    })?;
-    let series: InvoiceSeries = store
-        .find_series_by_id(invoice.series_id)
-        .context("billing::find_series_by_id (recover-from-nav series lookup)")?
-        .ok_or_else(|| {
-            anyhow!(
-                "invoice {} references series_id {} which is not present in invoice_series — \
-                 tenant DB appears tampered between invoice insertion and recover-from-nav",
-                invoice.id.to_prefixed_string(),
-                invoice.series_id.to_prefixed_string()
-            )
-        })?;
-    Ok(format!(
-        "{}/{:05}",
-        series.code.as_str(),
-        invoice.sequence_number
-    ))
 }
 
 /// Drive one `queryInvoiceData` call. Mirror of

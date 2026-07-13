@@ -4,7 +4,6 @@
 //! inserted this cycle aren't double-attempted (brief §5 honors
 //! "next cycle retries").
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,7 +48,12 @@ pub struct PollSummary {
 
 #[derive(Debug, Clone)]
 pub struct QuoteIntakeDeps {
-    pub db_path: PathBuf,
+    /// ADR-0099 H3 STEP 4d — the process-wide shared DuckDB [`aberp_db::Handle`]
+    /// (serve: cloned from `state.db`). The daemon routes 100% of its per-quote
+    /// reads + writes + audit appends through it (the whole-subsystem-daemon
+    /// rule); a separate `Connection::open` would close-fold the shared WAL and
+    /// tear the DEAL/pickup sagas' `quote_intake_log` writes.
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -148,15 +152,15 @@ impl QuoteIntakeService {
 
     async fn process_one_quote(&self, quote: &Quote, summary: &mut PollSummary) {
         let tenant_id = self.deps.tenant.as_str().to_string();
-        let db_path = self.deps.db_path.clone();
         let quote_id = quote.id.clone();
 
         let quote_id_for_check = quote_id.clone();
         let tenant_for_check = tenant_id.clone();
-        let db_for_check = db_path.clone();
+        let db_for_check = self.deps.db.clone();
         let precheck = spawn_blocking(move || {
-            let conn = duckdb::Connection::open(&db_for_check).map_err(|e| {
-                QuoteIntakeError::Storage(format!("open tenant DB for precheck: {e}"))
+            // ADR-0099 H3 STEP 4d — read quote_intake_log through the shared Handle.
+            let conn = db_for_check.read().map_err(|e| {
+                QuoteIntakeError::Storage(format!("shared reader for precheck: {e}"))
             })?;
             log_table::already_intook(&conn, &tenant_for_check, &quote_id_for_check)
         })
@@ -198,14 +202,16 @@ impl QuoteIntakeService {
                 let tenant_for_err = tenant_id.clone();
                 let quote_id_for_err = quote.id.clone();
                 let received_at_for_err = quote.received_at.clone();
-                let db_for_err = db_path.clone();
+                let db_for_err = self.deps.db.clone();
                 let msg_for_err = msg.clone();
                 let insert_err = spawn_blocking(move || {
-                    let conn = duckdb::Connection::open(&db_for_err).map_err(|e| {
-                        QuoteIntakeError::Storage(format!("open DB for error-row insert: {e}"))
+                    // ADR-0099 H3 STEP 4d — the error-row INSERT rides the shared
+                    // Handle writer (quote_intake_log is a Handle family).
+                    let guard = db_for_err.write().map_err(|e| {
+                        QuoteIntakeError::Storage(format!("shared writer for error-row: {e}"))
                     })?;
                     log_table::insert_error_intake(
-                        &conn,
+                        &guard,
                         &tenant_for_err,
                         &quote_id_for_err,
                         &received_at_for_err,
@@ -250,14 +256,33 @@ impl QuoteIntakeService {
         let received_at = quote.received_at.clone();
         let tenant_for_insert = tenant_id.clone();
         let quote_id_for_insert = quote_id.clone();
-        let db_for_insert = db_path.clone();
+        let db_for_insert = self.deps.db.clone();
         let invoice_id_for_insert = invoice_id.clone();
-        let insert_outcome = spawn_blocking(move || {
-            let conn = duckdb::Connection::open(&db_for_insert).map_err(|e| {
-                QuoteIntakeError::Storage(format!("open tenant DB for insert: {e}"))
-            })?;
+        // ADR-0099 H3 STEP 4d — the intake-row INSERT and its `QuoteIntakeRowAdded`
+        // audit ride ONE tx on the shared Handle writer (was a business INSERT on a
+        // fresh conn + a SEPARATE fresh-conn audit tx — the rule-15 written-but-
+        // unaudited tear). An audit failure now rolls the row back; the precheck
+        // makes the next cycle re-attempt idempotently.
+        let row_added_payload = QuoteIntakeRowAddedPayload {
+            idempotency_key: format!("quote_intake_row_added:{}", quote_id),
+            quote_id: quote_id.clone(),
+            invoice_id: invoice_id.clone(),
+            intake_at: now
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string()),
+        };
+        let tenant_for_meta = self.deps.tenant.clone();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+        let insert_outcome = spawn_blocking(move || -> Result<(), QuoteIntakeError> {
+            let mut guard = db_for_insert
+                .write()
+                .map_err(|e| QuoteIntakeError::Storage(format!("shared writer for insert: {e}")))?;
+            let tx = guard
+                .transaction()
+                .map_err(|e| QuoteIntakeError::Storage(format!("open intake insert tx: {e}")))?;
             log_table::insert_intake(
-                &conn,
+                &tx,
                 &tenant_for_insert,
                 &quote_id_for_insert,
                 &invoice_id_for_insert,
@@ -265,7 +290,14 @@ impl QuoteIntakeService {
                 now,
                 &raw_payload_json,
                 &prepared_draft_json,
-            )
+            )?;
+            // Fuse the arrival audit into the SAME tx.
+            let meta = LedgerMeta::new(tenant_for_meta, binary_hash);
+            let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+            write_row_added_entry(&tx, &meta, actor, &row_added_payload)?;
+            tx.commit()
+                .map_err(|e| QuoteIntakeError::Storage(format!("commit intake insert tx: {e}")))?;
+            Ok(())
         })
         .await;
 
@@ -283,13 +315,9 @@ impl QuoteIntakeService {
             }
         }
         summary.created += 1;
-
-        // S256 / PR-245 (brief §A.2) — emit a per-row arrival entry
-        // carrying the customer's source `quote_id` so the SPA badge +
-        // arrival toast can key on it and the arrival is traceable
-        // end-to-end. Best-effort: a failure here is logged, not fatal
-        // (the row is already staged; the badge re-derives from DB).
-        self.write_row_added(quote, &invoice_id, now).await;
+        // ADR-0099 H3 STEP 4d — the `QuoteIntakeRowAdded` arrival audit now rides
+        // the SAME tx as the intake INSERT above (rule-15 atomic), so there is no
+        // longer a separate best-effort `write_row_added` call here.
 
         let writeback_note = format!(
             "ABERP draft invoice {} created at {}",
@@ -305,13 +333,15 @@ impl QuoteIntakeService {
             Ok(()) => {
                 let tenant_for_mark = tenant_id.clone();
                 let quote_id_for_mark = quote.id.clone();
-                let db_for_mark = db_path.clone();
+                let db_for_mark = self.deps.db.clone();
                 let mark_outcome = spawn_blocking(move || {
-                    let conn = duckdb::Connection::open(&db_for_mark).map_err(|e| {
-                        QuoteIntakeError::Storage(format!("open DB for mark writeback: {e}"))
+                    // ADR-0099 H3 STEP 4d — the writeback-complete UPDATE rides the
+                    // shared Handle writer.
+                    let guard = db_for_mark.write().map_err(|e| {
+                        QuoteIntakeError::Storage(format!("shared writer for mark writeback: {e}"))
                     })?;
                     log_table::mark_writeback_complete(
-                        &conn,
+                        &guard,
                         &tenant_for_mark,
                         &quote_id_for_mark,
                         now,
@@ -345,10 +375,12 @@ impl QuoteIntakeService {
 
     async fn snapshot_pending_writebacks(&self) -> Result<Vec<String>, QuoteIntakeError> {
         let tenant_for_list = self.deps.tenant.as_str().to_string();
-        let db_for_list = self.deps.db_path.clone();
+        let db_for_list = self.deps.db.clone();
         match spawn_blocking(move || {
-            let conn = duckdb::Connection::open(&db_for_list)
-                .map_err(|e| QuoteIntakeError::Storage(format!("open DB for pending list: {e}")))?;
+            // ADR-0099 H3 STEP 4d — read quote_intake_log through the shared Handle.
+            let conn = db_for_list.read().map_err(|e| {
+                QuoteIntakeError::Storage(format!("shared reader for pending list: {e}"))
+            })?;
             log_table::list_pending_writebacks(&conn, &tenant_for_list)
         })
         .await
@@ -363,7 +395,6 @@ impl QuoteIntakeService {
 
     async fn retry_pending_writebacks(&self, pending: &[String], summary: &mut PollSummary) {
         let tenant_id = self.deps.tenant.as_str().to_string();
-        let db_path = self.deps.db_path.clone();
 
         for quote_id in pending {
             let note = "ABERP writeback retry";
@@ -376,14 +407,15 @@ impl QuoteIntakeService {
                     let now = OffsetDateTime::now_utc();
                     let tenant_for_mark = tenant_id.clone();
                     let qid = quote_id.clone();
-                    let db_for_mark = db_path.clone();
+                    let db_for_mark = self.deps.db.clone();
                     let _ = spawn_blocking(move || {
-                        let conn = duckdb::Connection::open(&db_for_mark).map_err(|e| {
+                        // ADR-0099 H3 STEP 4d — retry-mark UPDATE on the shared writer.
+                        let guard = db_for_mark.write().map_err(|e| {
                             QuoteIntakeError::Storage(format!(
-                                "open DB for retry-mark writeback: {e}"
+                                "shared writer for retry-mark writeback: {e}"
                             ))
                         })?;
-                        log_table::mark_writeback_complete(&conn, &tenant_for_mark, &qid, now)
+                        log_table::mark_writeback_complete(&guard, &tenant_for_mark, &qid, now)
                     })
                     .await;
                     summary.writeback_retried += 1;
@@ -434,17 +466,16 @@ impl QuoteIntakeService {
                 elapsed_ms: summary.elapsed_ms,
             }
         });
-        let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant = self.deps.tenant.clone();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
         let outcome = spawn_blocking(move || -> Result<(), QuoteIntakeError> {
-            let mut conn = duckdb::Connection::open(&db_path)
-                .map_err(|e| QuoteIntakeError::Storage(format!("open DB for audit append: {e}")))?;
-            aberp_audit_ledger::ensure_schema(&conn).map_err(|e| {
-                QuoteIntakeError::Storage(format!("ensure audit-ledger schema: {e}"))
+            // ADR-0099 H3 STEP 4d — the cycle audit rides the shared Handle writer.
+            let mut guard = db.write().map_err(|e| {
+                QuoteIntakeError::Storage(format!("shared writer for audit append: {e}"))
             })?;
-            let tx = conn
+            let tx = guard
                 .transaction()
                 .map_err(|e| QuoteIntakeError::Storage(format!("open audit tx: {e}")))?;
             let meta = LedgerMeta::new(tenant.clone(), binary_hash);
@@ -470,50 +501,11 @@ impl QuoteIntakeService {
         }
     }
 
-    /// S256 / PR-245 — emit one `QuoteIntakeRowAdded` entry. Best-effort:
-    /// a failure is logged but never aborts the cycle (the row is already
-    /// staged in `quote_intake_log`; the badge re-derives from DB).
-    async fn write_row_added(&self, quote: &Quote, invoice_id: &str, now: OffsetDateTime) {
-        let payload = QuoteIntakeRowAddedPayload {
-            idempotency_key: format!("quote_intake_row_added:{}", quote.id),
-            quote_id: quote.id.clone(),
-            invoice_id: invoice_id.to_string(),
-            intake_at: now
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_else(|_| "unknown".to_string()),
-        };
-        let db_path = self.deps.db_path.clone();
-        let tenant = self.deps.tenant.clone();
-        let binary_hash = self.deps.binary_hash;
-        let login = self.deps.operator_login.clone();
-        let outcome = spawn_blocking(move || -> Result<(), QuoteIntakeError> {
-            let mut conn = duckdb::Connection::open(&db_path).map_err(|e| {
-                QuoteIntakeError::Storage(format!("open DB for row-added append: {e}"))
-            })?;
-            aberp_audit_ledger::ensure_schema(&conn).map_err(|e| {
-                QuoteIntakeError::Storage(format!("ensure audit-ledger schema: {e}"))
-            })?;
-            let tx = conn
-                .transaction()
-                .map_err(|e| QuoteIntakeError::Storage(format!("open row-added tx: {e}")))?;
-            let meta = LedgerMeta::new(tenant.clone(), binary_hash);
-            let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
-            write_row_added_entry(&tx, &meta, actor, &payload)?;
-            tx.commit()
-                .map_err(|e| QuoteIntakeError::Storage(format!("commit row-added tx: {e}")))?;
-            Ok(())
-        })
-        .await;
-        match outcome {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(quote_id = %quote.id, error = %e, "QuoteIntakeRowAdded write failed")
-            }
-            Err(e) => {
-                tracing::warn!(quote_id = %quote.id, error = %e, "QuoteIntakeRowAdded task panicked")
-            }
-        }
-    }
+    // ADR-0099 H3 STEP 4d — `write_row_added` is gone: its `QuoteIntakeRowAdded`
+    // append now rides the SAME Handle tx as the intake-row INSERT in
+    // `process_one_quote` (rule-15 atomic), so there is no longer a separate
+    // best-effort audit writer. `write_row_added_entry` (the free fn) is called
+    // there directly.
 
     pub fn poll_interval(&self) -> Duration {
         self.config.poll_interval

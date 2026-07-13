@@ -43,6 +43,8 @@ fn build_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
     AppState {
+        db: aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+            .expect("test: open shared aberp-db Handle"),
         db_path: Arc::new(db_path),
         tenant,
         nav_enabled: true,
@@ -97,12 +99,17 @@ fn nav_pieces(name: &str) -> ProductInputs {
 
 fn create_with_min_stock(state: &AppState, name: &str, min_stock: &str) -> String {
     let p = serve::create_product_request(state, &nav_pieces(name)).expect("create product");
-    let conn = duckdb::Connection::open(&*state.db_path).unwrap();
-    conn.execute(
-        "UPDATE products SET min_stock = ? WHERE id = ? AND tenant_id = ?;",
-        duckdb::params![min_stock, &p.id, TEST_TENANT],
-    )
-    .unwrap();
+    // ADR-0099 H3 STEP 4c — write the min_stock tweak through the SHARED Handle
+    // writer, not a fresh `Connection::open` (which, co-resident with the Handle,
+    // would checkpoint-tear the Handle's WAL on close). `products` is now a Handle
+    // family; a fresh-open write would also be invisible to the Handle (Q2).
+    let guard = state.db.write().expect("shared writer for min_stock tweak");
+    guard
+        .execute(
+            "UPDATE products SET min_stock = ? WHERE id = ? AND tenant_id = ?;",
+            duckdb::params![min_stock, &p.id, TEST_TENANT],
+        )
+        .unwrap();
     p.id
 }
 
@@ -114,8 +121,12 @@ fn create_with_min_stock(state: &AppState, name: &str, min_stock: &str) -> Strin
 fn post_then_list_stock_movements_round_trips() {
     let dir = test_dir("happy");
     let db_path = dir.join("aberp.duckdb");
-    let state = build_state(db_path.clone());
+    // ADR-0099 H3 STEP 4c — products / inventory now ride the shared Handle, so
+    // the schema MUST exist on disk BEFORE the Handle opens (build_state); a
+    // fresh-conn schema-create co-resident with an already-open Handle tears the
+    // WAL on replay. Seed first, then open the Handle (Q1 sees the tables).
     ensure_inventory_schema(&db_path);
+    let state = build_state(db_path.clone());
     let pid = create_with_min_stock(&state, "Widget", "5");
 
     serve::create_stock_movement_request(
@@ -159,8 +170,12 @@ fn post_then_list_stock_movements_round_trips() {
 fn post_refuses_wrong_sign_per_reason() {
     let dir = test_dir("wrong-sign");
     let db_path = dir.join("aberp.duckdb");
-    let state = build_state(db_path.clone());
+    // ADR-0099 H3 STEP 4c — products / inventory now ride the shared Handle, so
+    // the schema MUST exist on disk BEFORE the Handle opens (build_state); a
+    // fresh-conn schema-create co-resident with an already-open Handle tears the
+    // WAL on replay. Seed first, then open the Handle (Q1 sees the tables).
     ensure_inventory_schema(&db_path);
+    let state = build_state(db_path.clone());
     let pid = create_with_min_stock(&state, "BadSign", "0");
 
     let err = serve::create_stock_movement_request(
@@ -205,8 +220,12 @@ fn post_refuses_wrong_sign_per_reason() {
 fn post_refuses_upstream_only_reasons() {
     let dir = test_dir("upstream");
     let db_path = dir.join("aberp.duckdb");
-    let state = build_state(db_path.clone());
+    // ADR-0099 H3 STEP 4c — products / inventory now ride the shared Handle, so
+    // the schema MUST exist on disk BEFORE the Handle opens (build_state); a
+    // fresh-conn schema-create co-resident with an already-open Handle tears the
+    // WAL on replay. Seed first, then open the Handle (Q1 sees the tables).
     ensure_inventory_schema(&db_path);
+    let state = build_state(db_path.clone());
     let pid = create_with_min_stock(&state, "Upstream", "0");
 
     for upstream in ["bom_consumption", "wo_completion", "dispatch"] {
@@ -237,8 +256,12 @@ fn post_refuses_upstream_only_reasons() {
 fn low_stock_view_surfaces_products_below_min() {
     let dir = test_dir("low-stock");
     let db_path = dir.join("aberp.duckdb");
-    let state = build_state(db_path.clone());
+    // ADR-0099 H3 STEP 4c — products / inventory now ride the shared Handle, so
+    // the schema MUST exist on disk BEFORE the Handle opens (build_state); a
+    // fresh-conn schema-create co-resident with an already-open Handle tears the
+    // WAL on replay. Seed first, then open the Handle (Q1 sees the tables).
     ensure_inventory_schema(&db_path);
+    let state = build_state(db_path.clone());
 
     let below = create_with_min_stock(&state, "Below", "10");
     let _above = create_with_min_stock(&state, "Above", "1");
@@ -269,8 +292,12 @@ fn low_stock_view_surfaces_products_below_min() {
 fn post_with_duplicate_idempotency_key_surfaces_conflict() {
     let dir = test_dir("idem");
     let db_path = dir.join("aberp.duckdb");
-    let state = build_state(db_path.clone());
+    // ADR-0099 H3 STEP 4c — products / inventory now ride the shared Handle, so
+    // the schema MUST exist on disk BEFORE the Handle opens (build_state); a
+    // fresh-conn schema-create co-resident with an already-open Handle tears the
+    // WAL on replay. Seed first, then open the Handle (Q1 sees the tables).
     ensure_inventory_schema(&db_path);
+    let state = build_state(db_path.clone());
     let pid = create_with_min_stock(&state, "Idem", "0");
 
     serve::create_stock_movement_request(

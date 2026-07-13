@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
 use aberp_quote_engine::FeatureGraph;
 use ulid::Ulid;
 
@@ -42,6 +42,8 @@ fn test_dir(label: &str) -> PathBuf {
 fn build_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     AppState {
+        db: aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+            .expect("test: open shared aberp-db Handle"),
         db_path: Arc::new(db_path),
         tenant,
         nav_enabled: true,
@@ -105,10 +107,19 @@ fn partner_inputs(name: &str, ct: CustomerType) -> PartnerInputs {
     }
 }
 
-fn ledger_kinds(db_path: &PathBuf) -> Vec<EventKind> {
+// H3 (ADR-0099): read audit through the SAME shared Handle the handlers wrote
+// through — the margin/partner/quote-margin events now land in the Handle's audit
+// WAL (via append_machine_event), which a fresh `Ledger::open` cannot coherently
+// see while the Handle holds it. `try_clone` (F-C) shares the live instance.
+fn ledger_kinds(state: &AppState) -> Vec<EventKind> {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
-    let ledger = Ledger::open(db_path, tenant, TEST_HASH).expect("open ledger");
-    ledger
+    // Write guard so an as-yet-unwritten ledger still reads as [] (the old
+    // `Ledger::open` ensured the schema; `from_connection` does not); read the
+    // entries off a try_clone of the SAME live instance.
+    let guard = state.db.write().expect("shared write guard");
+    aberp_audit_ledger::ensure_schema(&guard).expect("ensure audit-ledger schema");
+    let owned = guard.try_clone().expect("clone shared conn");
+    aberp_audit_ledger::Ledger::from_connection(owned, tenant, TEST_HASH)
         .entries()
         .expect("read entries")
         .into_iter()
@@ -161,7 +172,7 @@ fn profile_crud_emits_three_event_kinds_and_blocks_duplicate() {
         .expect("list")
         .is_empty());
 
-    let kinds = ledger_kinds(&db);
+    let kinds = ledger_kinds(&state);
     assert!(
         kinds.contains(&EventKind::MarginProfileCreated),
         "{kinds:?}"
@@ -195,7 +206,7 @@ fn partner_customer_type_change_emits_audit() {
     )
     .expect("noop update");
     assert!(
-        !ledger_kinds(&db).contains(&EventKind::PartnerCustomerTypeChanged),
+        !ledger_kinds(&state).contains(&EventKind::PartnerCustomerTypeChanged),
         "no-op edit must not fire the customer-type audit"
     );
 
@@ -209,7 +220,7 @@ fn partner_customer_type_change_emits_audit() {
     )
     .expect("type change");
     assert!(
-        ledger_kinds(&db).contains(&EventKind::PartnerCustomerTypeChanged),
+        ledger_kinds(&state).contains(&EventKind::PartnerCustomerTypeChanged),
         "customer-type change must fire the audit"
     );
 }
@@ -239,12 +250,16 @@ fn sample_feature_graph_json() -> String {
 
 /// Seed the catalogue + one extracted job (with a feature graph) so the
 /// re-price engine call succeeds.
-fn seed_job(db: &PathBuf, quote_id: &str) {
-    let mut conn = duckdb::Connection::open(db).expect("open");
-    aberp::quoting_tunables::ensure_schema(&mut conn, TEST_TENANT).expect("tunables");
-    aberp::quoting_materials::seed_if_empty(&mut conn, TEST_TENANT).expect("materials");
+// H3 (ADR-0099) STEP 4e — seed THROUGH the shared Handle (`state.db`), the same
+// instance the migrated re-price routes read/write, so the seed is coherent with
+// them (a fresh `Connection::open` seed on the same path while the Handle is live
+// would be invisible to the Handle).
+fn seed_job(state: &AppState, quote_id: &str) {
+    let mut guard = state.db.write().expect("shared writer");
+    aberp::quoting_tunables::ensure_schema(&mut guard, TEST_TENANT).expect("tunables");
+    aberp::quoting_materials::seed_if_empty(&mut guard, TEST_TENANT).expect("materials");
     aberp::quote_pricing_jobs::insert_fetched_job(
-        &conn,
+        &guard,
         quote_id,
         TEST_TENANT,
         "buyer@example.com",
@@ -257,18 +272,19 @@ fn seed_job(db: &PathBuf, quote_id: &str) {
         fixed_ts(),
     )
     .expect("insert job");
-    conn.execute(
-        "UPDATE quote_pricing_jobs SET state = 'rendering', feature_graph_json = ? \
-         WHERE quote_id = ? AND tenant_id = ?",
-        duckdb::params![sample_feature_graph_json(), quote_id, TEST_TENANT],
-    )
-    .expect("set feature graph");
+    guard
+        .execute(
+            "UPDATE quote_pricing_jobs SET state = 'rendering', feature_graph_json = ? \
+             WHERE quote_id = ? AND tenant_id = ?",
+            duckdb::params![sample_feature_graph_json(), quote_id, TEST_TENANT],
+        )
+        .expect("set feature graph");
 }
 
-fn stage_intake(db: &PathBuf, quote_id: &str) {
-    let conn = duckdb::Connection::open(db).expect("open");
+fn stage_intake(state: &AppState, quote_id: &str) {
+    let guard = state.db.write().expect("shared writer");
     log_table::insert_intake(
-        &conn,
+        &guard,
         TEST_TENANT,
         quote_id,
         "inv_x",
@@ -284,26 +300,36 @@ fn stage_intake(db: &PathBuf, quote_id: &str) {
 fn customer_journey_partner_profile_quote_margin_floor_refuse() {
     let dir = test_dir("e2e");
     let db = dir.join("aberp.duckdb");
+
+    // 2. margin-profile-create — target BELOW the floor so any priced quote for
+    //    this segment trips the floor. H3 (ADR-0099) STEP 4e: the margin-profile
+    //    family's serve routes still fork a fresh `Connection::open` (its Handle
+    //    migration is a later H3 step, like `quoting_materials`/`quoting_tunables`
+    //    — the pricing daemon already re-prices on the Handle reading these). The
+    //    STEP-4e re-price routes now read the profile through the shared Handle, so
+    //    seed it BEFORE the Handle opens (the coherent Q1 direction), mirroring
+    //    production where margin config pre-exists the re-price session.
+    {
+        let conn = duckdb::Connection::open(&db).expect("open");
+        aberp::margin_profiles::create_profile(
+            &conn,
+            TEST_TENANT,
+            &profile_inputs("defense", 0.04, 0.10),
+        )
+        .expect("seed profile");
+    }
+
     let state = build_state(db.clone());
 
-    // 1. partner-create (defense).
+    // 1. partner-create (defense) — the partners family IS on the shared Handle,
+    //    so creating it after the Handle opens is coherent.
     let partner =
         serve::create_partner_request(&state, &partner_inputs("Aegis", CustomerType::Defense))
             .expect("partner");
 
-    // 2. margin-profile-create — target BELOW the floor so any priced
-    //    quote for this segment trips the floor.
-    serve::create_margin_profile_request(
-        &state,
-        &profile_inputs("defense", 0.04, 0.10),
-        "op",
-        TEST_HASH,
-    )
-    .expect("profile");
-
     // 3. quote-create (an extracted job) + assign the buyer → re-price.
     let quote_id = "5a5a5a5a-5a5a-5a5a-5a5a-5a5a5a5a5a5a";
-    seed_job(&db, quote_id);
+    seed_job(&state, quote_id);
     serve::set_quote_buyer_partner_request(
         &state,
         quote_id,
@@ -315,34 +341,44 @@ fn customer_journey_partner_profile_quote_margin_floor_refuse() {
     )
     .expect("assign buyer + reprice");
 
-    // The re-price flagged the job below the floor + emitted the event.
-    let conn = duckdb::Connection::open(&db).expect("open");
+    // The re-price flagged the job below the floor + emitted the event. Read the
+    // flag back through the SAME shared Handle (a fresh `Connection::open` would be
+    // blind to the Handle-WAL-resident write).
+    let flagged = {
+        let conn = state.db.read().expect("shared reader");
+        aberp::quote_pricing_jobs::margin_below_floor(&conn, quote_id, TEST_TENANT).expect("flag")
+    };
     assert!(
-        aberp::quote_pricing_jobs::margin_below_floor(&conn, quote_id, TEST_TENANT).expect("flag"),
+        flagged,
         "defense profile (gross 4% < floor 10%) must trip the floor"
     );
     assert!(
-        ledger_kinds(&db).contains(&EventKind::QuoteMarginBelowFloor),
+        ledger_kinds(&state).contains(&EventKind::QuoteMarginBelowFloor),
         "below-floor event must fire on the re-price"
     );
 
-    // 4. margin-floor-refuse: the DEAL saga is hard-blocked.
-    stage_intake(&db, quote_id);
-    let mut saga_conn = duckdb::Connection::open(&db).expect("open saga conn");
+    // 4. margin-floor-refuse: the DEAL saga is hard-blocked. The saga runs on the
+    // shared Handle writer — the SAME instance the re-price wrote the floor flag
+    // on — so its `margin_below_floor` read observes it and blocks (this is the
+    // exact coherence the STEP 4e fix guarantees).
+    stage_intake(&state, quote_id);
     let meta = LedgerMeta::new(TenantId::new(TEST_TENANT).unwrap(), TEST_HASH);
-    let err = run_deal_saga(
-        &mut saga_conn,
-        &meta,
-        Actor::from_local_cli(Ulid::new().to_string(), "op"),
-        DealSagaInputs {
-            tenant: TEST_TENANT.to_string(),
-            quote_id: quote_id.to_string(),
-            actor: "op".to_string(),
-            deal_token: quote_id[..8].to_string(),
-            refresh_ack: None,
-        },
-    )
-    .expect_err("DEAL must be refused below floor");
+    let err = {
+        let mut guard = state.db.write().expect("shared writer");
+        run_deal_saga(
+            &mut guard,
+            &meta,
+            Actor::from_local_cli(Ulid::new().to_string(), "op"),
+            DealSagaInputs {
+                tenant: TEST_TENANT.to_string(),
+                quote_id: quote_id.to_string(),
+                actor: "op".to_string(),
+                deal_token: quote_id[..8].to_string(),
+                refresh_ack: None,
+            },
+        )
+        .expect_err("DEAL must be refused below floor")
+    };
     let saga = err.downcast::<DealSagaError>().expect("typed saga error");
     assert_eq!(saga.machine_code(), "below_margin_floor");
 }
@@ -357,7 +393,7 @@ fn margin_override_below_floor_needs_confirmation() {
 
     // A job with NO buyer (global default ~26% realized) prices fine.
     let quote_id = "6b6b6b6b-6b6b-6b6b-6b6b-6b6b6b6b6b6b";
-    seed_job(&db, quote_id);
+    seed_job(&state, quote_id);
 
     // An aggressive 1% markup override → realized ≈ 1% < global floor 10%.
     let unconfirmed = serve::override_quote_margin_request(
@@ -378,12 +414,12 @@ fn margin_override_below_floor_needs_confirmation() {
         ),
         "below-floor override without confirm must be refused"
     );
-    // ...and nothing was persisted.
-    let conn = duckdb::Connection::open(&db).expect("open");
-    assert!(
-        !aberp::quote_pricing_jobs::margin_below_floor(&conn, quote_id, TEST_TENANT).expect("flag"),
-        "rejected override must not flag the job"
-    );
+    // ...and nothing was persisted (read back through the shared Handle).
+    let rejected_flag = {
+        let conn = state.db.read().expect("shared reader");
+        aberp::quote_pricing_jobs::margin_below_floor(&conn, quote_id, TEST_TENANT).expect("flag")
+    };
+    assert!(!rejected_flag, "rejected override must not flag the job");
 
     // Confirming proceeds: persists + flags + fires BOTH audit kinds.
     serve::override_quote_margin_request(
@@ -398,12 +434,15 @@ fn margin_override_below_floor_needs_confirmation() {
         TEST_HASH,
     )
     .expect("confirmed override");
-    let conn2 = duckdb::Connection::open(&db).expect("open");
+    let confirmed_flag = {
+        let conn = state.db.read().expect("shared reader");
+        aberp::quote_pricing_jobs::margin_below_floor(&conn, quote_id, TEST_TENANT).expect("flag")
+    };
     assert!(
-        aberp::quote_pricing_jobs::margin_below_floor(&conn2, quote_id, TEST_TENANT).expect("flag"),
+        confirmed_flag,
         "confirmed below-floor override flags the job"
     );
-    let kinds = ledger_kinds(&db);
+    let kinds = ledger_kinds(&state);
     assert!(
         kinds.contains(&EventKind::QuoteMarginOverridden),
         "{kinds:?}"

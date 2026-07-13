@@ -32,8 +32,9 @@ fn sql_quote(path: &Path) -> String {
 }
 
 /// Hex SHA-256 of a file's bytes. Reads the whole file into memory — fine
-/// at tenant scale (S393 `copy_atomic` does the same).
-fn sha256_file(path: &Path) -> Result<String> {
+/// at tenant scale (S393 `copy_atomic` does the same). `pub(crate)` so the
+/// ADR-0095 §4 marker (`crash_safe`) records the same file identity.
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).map_err(|e| SnapshotError::io(path, e))?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);

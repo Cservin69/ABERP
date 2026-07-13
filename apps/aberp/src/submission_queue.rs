@@ -71,11 +71,11 @@
 //! `InvoiceQueuedForSubmissionPayload` variant. The ritual remains
 //! at its ninth landing.
 
-use std::path::Path;
 use std::time::Duration;
 
 use aberp_audit_ledger::{BinaryHash, Entry, EventKind, Ledger, TenantId};
 use aberp_billing::IdempotencyKey;
+use aberp_db::Handle;
 use aberp_nav_transport::{soap::InvoiceOperation, NavTransportError};
 use anyhow::{anyhow, Context, Result};
 use time::OffsetDateTime;
@@ -172,13 +172,20 @@ pub fn pending_from_ledger(ledger: &Ledger) -> Result<Vec<PendingInvoice>> {
 /// metadata. Used by `issue-invoice`'s pre-allocation cap check
 /// (ADR-0031 §5).
 ///
-/// Opens its own `Ledger` from the supplied DB path. The signature
-/// takes the same `(db_path, tenant, binary_hash)` triple every
-/// other call site already builds; this keeps the cap check a one-
-/// liner at the `issue-*` orchestration boundaries.
-pub fn count_pending(db_path: &Path, tenant: TenantId, binary_hash: BinaryHash) -> Result<usize> {
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to count pending submissions")?;
+/// H3 (ADR-0099): reads the audit ledger through the shared `Handle`
+/// (`db.read()` = a coherent try_clone), not a fresh `Ledger::open`. The
+/// invoice `issue-*` handlers/one-shots hold no write guard when they run this
+/// pre-allocation cap check, so the read never re-enters the writer mutex. The
+/// signature takes the same `(db, tenant, binary_hash)` triple every call site
+/// already threads; this keeps the cap check a one-liner at the `issue-*`
+/// orchestration boundaries.
+pub fn count_pending(db: &Handle, tenant: TenantId, binary_hash: BinaryHash) -> Result<usize> {
+    let ledger = Ledger::from_connection(
+        db.read()
+            .context("acquire shared reader to count pending submissions")?,
+        tenant,
+        binary_hash,
+    );
     Ok(pending_from_ledger(&ledger)?.len())
 }
 
@@ -397,6 +404,17 @@ pub struct PendingRetry {
     /// FIFO ordering across pending retries (oldest stuck invoice
     /// retries first; matches the `pending_from_ledger` posture).
     pub issue_date: OffsetDateTime,
+    /// ADR-0099 Addendum 2 (Defect 2) — the NAV `manageInvoice`
+    /// envelope operation for this invoice (CREATE / STORNO / MODIFY),
+    /// derived from the audit ledger's chain-link entries at classify
+    /// time via [`operation_for_invoice`], exactly like
+    /// [`PendingInvoice::operation`]. The drain worker
+    /// (`drain_pending_retries`) passes this straight onto the retry
+    /// envelope. Pre-Addendum-2 the drain hardcoded
+    /// `InvoiceOperation::Create`, which would have re-POSTed a stuck
+    /// STORNO as a CREATE (NAV v3.0 STORNO / MODIFY bodies are
+    /// byte-identical to CREATE and cannot be told apart from the body).
+    pub operation: InvoiceOperation,
 }
 
 /// Walk the audit ledger once and return every state-2 Pending
@@ -477,6 +495,14 @@ fn classify_pending_retries(entries: &[Entry]) -> Result<Vec<PendingRetry>> {
         }
     }
 
+    // ADR-0099 Addendum 2 (Defect 2) — pre-pass: which invoice_ids are
+    // STORNO / MODIFY chain children, so each PendingRetry carries its
+    // NAV envelope operation. Mirrors `classify_pending`'s pre-pass so
+    // the drain retry surface stamps the operation the same way the
+    // drain submission surface does (the drain worker must NOT hardcode
+    // CREATE — that would re-POST a stuck STORNO as a CREATE).
+    let (storno_ids, modify_ids) = chain_operation_sets(entries)?;
+
     // Second pass: collect every Attempt's invoice_id (deduplicated),
     // then build PendingRetry rows for those not excluded.
     let mut seen: HashSet<String> = HashSet::new();
@@ -519,11 +545,19 @@ fn classify_pending_retries(entries: &[Entry]) -> Result<Vec<PendingRetry>> {
                 ));
             }
         };
+        let operation = if modify_ids.contains(&payload.invoice_id) {
+            InvoiceOperation::Modify
+        } else if storno_ids.contains(&payload.invoice_id) {
+            InvoiceOperation::Storno
+        } else {
+            InvoiceOperation::Create
+        };
         pending.push(PendingRetry {
             invoice_id: payload.invoice_id,
             idempotency_key,
             nav_xml_path,
             issue_date,
+            operation,
         });
     }
 
@@ -1384,6 +1418,51 @@ mod tests {
         assert_eq!(pending[0].invoice_id, "inv_A");
         assert_eq!(pending[0].nav_xml_path.as_deref(), Some("/tmp/A.xml"));
         assert_eq!(pending[0].idempotency_key, idem);
+    }
+
+    /// ADR-0099 Addendum 2 (Defect 2) — the drain-pending-retries worker
+    /// reads the NAV envelope operation off [`PendingRetry::operation`];
+    /// `classify_pending_retries` must stamp it from the chain-link
+    /// entries, exactly like `classify_pending` does for
+    /// `PendingInvoice`. A stuck STORNO child (Draft + Attempt, no
+    /// Response / Abandon) MUST carry `Storno` — pre-Addendum-2 the drain
+    /// hardcoded `InvoiceOperation::Create`, which would re-POST the
+    /// stuck STORNO to NAV as a CREATE (NAV v3.0 STORNO / MODIFY bodies
+    /// are byte-identical to CREATE and cannot be told apart from the
+    /// body). RED before the fix (`PendingRetry` had no `operation`
+    /// field), GREEN after.
+    #[test]
+    fn pending_retry_carries_storno_operation_from_chain_entries() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_draft_created(
+            &mut ledger,
+            &actor,
+            "inv_STORNO",
+            idem,
+            Some("/x/storno.xml"),
+        );
+        write_storno_issued(&mut ledger, &actor, "inv_STORNO", "inv_BASE", 1);
+        write_submission_attempt(&mut ledger, &actor, "inv_STORNO", idem);
+        let pending = pending_retries_from_ledger(&ledger).unwrap();
+        let storno = pending
+            .iter()
+            .find(|p| p.invoice_id == "inv_STORNO")
+            .expect("stuck storno child is a pending retry");
+        assert_eq!(storno.operation, InvoiceOperation::Storno);
+    }
+
+    /// ADR-0099 Addendum 2 (Defect 2) — a plain CREATE (no chain-link
+    /// entry for its id) still carries `Create`. Guards the else-arm of
+    /// the operation stamp against an over-eager regression.
+    #[test]
+    fn pending_retry_carries_create_operation_for_plain_invoice() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_draft_created(&mut ledger, &actor, "inv_A", idem, Some("/tmp/A.xml"));
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        let pending = pending_retries_from_ledger(&ledger).unwrap();
+        assert_eq!(pending[0].operation, InvoiceOperation::Create);
     }
 
     /// Draft + Attempt + Response is NOT pending — the Response

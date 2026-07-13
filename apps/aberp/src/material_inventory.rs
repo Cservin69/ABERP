@@ -104,9 +104,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{
-    append_in_tx, Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId,
-};
+use aberp_audit_ledger::{append_in_tx, Actor, EventKind, LedgerMeta};
 use aberp_compliance::lot_heat::{validate_mtr_url, LotId};
 
 /// `kg` is the default UoM for material-side balances. The catalogue
@@ -826,18 +824,18 @@ pub fn assign_heat_lot(
 }
 
 /// Append the heat-lot audit trail: one `material.heat_lot_assigned` always,
-/// plus one `material.mtr_uploaded` when an MTR URL was recorded. Mirrors
-/// `avl_vendors::append_vendor_event` (opens its own `Ledger` after the write
-/// conn is dropped — DuckDB rejects a second writer). Returns the count of
-/// entries appended so a caller / test can assert the MTR branch fired.
+/// plus one `material.mtr_uploaded` when an MTR URL was recorded. Returns the
+/// count of entries appended so a caller / test can assert the MTR branch fired.
+///
+/// ADR-0099 H3 STEP 4d — appends on the caller's SHARED-Handle transaction (the
+/// `create_ncr` recipe), so the `inventory_balances` heat-lot UPDATE
+/// ([`assign_heat_lot`]) and this audit ride ONE tx on the ONE live instance —
+/// no truncating fresh `Ledger::open`, no split business-then-audit tear.
 pub fn append_heat_lot_events(
-    db_path: &std::path::Path,
-    tenant: TenantId,
-    binary_hash: BinaryHash,
+    tx: &Transaction<'_>,
+    meta: &LedgerMeta,
     assignment: &HeatLotAssignment,
 ) -> Result<usize> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record heat-lot assignment")?;
     let operator = assignment.heat_assigned_by_operator.clone();
 
     let assigned_payload = serde_json::json!({
@@ -848,14 +846,15 @@ pub fn append_heat_lot_events(
         "assigned_at": assignment.heat_assigned_at_utc,
         "operator_user_id": operator,
     });
-    ledger
-        .append(
-            EventKind::MaterialHeatLotAssigned,
-            serde_json::to_vec(&assigned_payload).expect("serialize heat-lot payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), &operator),
-            None,
-        )
-        .context("append material.heat_lot_assigned")?;
+    append_in_tx(
+        tx,
+        meta,
+        EventKind::MaterialHeatLotAssigned,
+        serde_json::to_vec(&assigned_payload).expect("serialize heat-lot payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), &operator),
+        None,
+    )
+    .context("append material.heat_lot_assigned")?;
     let mut appended = 1;
 
     if let Some(mtr) = assignment.mill_test_report_url.as_deref() {
@@ -866,14 +865,15 @@ pub fn append_heat_lot_events(
             "operator_user_id": operator,
             "recorded_at": assignment.heat_assigned_at_utc,
         });
-        ledger
-            .append(
-                EventKind::MaterialMtrUploaded,
-                serde_json::to_vec(&mtr_payload).expect("serialize mtr payload"),
-                Actor::from_local_cli(Ulid::new().to_string(), &operator),
-                None,
-            )
-            .context("append material.mtr_uploaded")?;
+        append_in_tx(
+            tx,
+            meta,
+            EventKind::MaterialMtrUploaded,
+            serde_json::to_vec(&mtr_payload).expect("serialize mtr payload"),
+            Actor::from_local_cli(Ulid::new().to_string(), &operator),
+            None,
+        )
+        .context("append material.mtr_uploaded")?;
         appended += 1;
     }
 
@@ -884,6 +884,7 @@ pub fn append_heat_lot_events(
 mod tests {
     use super::*;
     use aberp_audit_ledger::ensure_schema as audit_ensure_schema;
+    use aberp_audit_ledger::{BinaryHash, TenantId};
 
     fn open_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
@@ -1357,14 +1358,14 @@ mod tests {
             .join(Ulid::new().to_string());
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("aberp.duckdb");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            audit_ensure_schema(&conn).unwrap();
-            ensure_schema(&conn).unwrap();
-            seed_balance_at(&conn, "t", "Ti-6Al-4V");
-        }
+        let mut conn = Connection::open(&db_path).unwrap();
+        audit_ensure_schema(&conn).unwrap();
+        ensure_schema(&conn).unwrap();
+        seed_balance_at(&conn, "t", "Ti-6Al-4V");
         let tenant = TenantId::new("t").unwrap();
         let hash = BinaryHash::from_bytes([0u8; 32]);
+        // ADR-0099 H3 STEP 4d — append_heat_lot_events now rides the caller's tx.
+        let meta = LedgerMeta::new(tenant, hash);
 
         // No MTR → 1 event.
         let a1 = HeatLotAssignment {
@@ -1374,22 +1375,23 @@ mod tests {
             heat_assigned_at_utc: "2026-06-16T00:00:00Z".into(),
             heat_assigned_by_operator: "op".into(),
         };
-        assert_eq!(
-            append_heat_lot_events(&db_path, tenant.clone(), hash, &a1).unwrap(),
-            1
-        );
+        {
+            let tx = conn.transaction().unwrap();
+            assert_eq!(append_heat_lot_events(&tx, &meta, &a1).unwrap(), 1);
+            tx.commit().unwrap();
+        }
 
         // With MTR → 2 events.
         let a2 = HeatLotAssignment {
             mill_test_report_url: Some("file:///c.pdf".into()),
             ..a1.clone()
         };
-        assert_eq!(
-            append_heat_lot_events(&db_path, tenant, hash, &a2).unwrap(),
-            2
-        );
+        {
+            let tx = conn.transaction().unwrap();
+            assert_eq!(append_heat_lot_events(&tx, &meta, &a2).unwrap(), 2);
+            tx.commit().unwrap();
+        }
 
-        let conn = Connection::open(&db_path).unwrap();
         let assigned: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'material.heat_lot_assigned'",

@@ -37,7 +37,8 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
+use aberp_db::{HandleArc, WriteGuard};
 
 // ── Closed-vocab enums ──────────────────────────────────────────────
 
@@ -640,8 +641,17 @@ fn now_rfc3339() -> String {
 
 /// Create an NCR (state `Open`), seed its transition log (`"" → open`), and fire
 /// `ncr.created`. Returns the persisted NCR.
+///
+/// ADR-0099 H3 — takes a PASSED-IN [`WriteGuard`] (the shared Handle's serialized
+/// writer) rather than self-opening a `Connection`/`Ledger`. This is the whole
+/// point of the re-entrant call sites: `create_ncr` fires from three contexts that
+/// ALREADY hold the guard — `qc_inspection::record_manual_inspection`,
+/// `purchasing::record_receipt`, and the direct serve handler — so if it re-acquired
+/// `db.write()` it would deadlock the non-reentrant writer mutex (the single-writer
+/// self-deadlock the Editions line hit + fixed). The two business inserts + the
+/// `ncr.created` audit append all ride ONE transaction on the passed-in guard.
 pub fn create_ncr(
-    db_path: &std::path::Path,
+    guard: &mut WriteGuard<'_>,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -667,38 +677,10 @@ pub fn create_ncr(
         closed_at_utc: None,
         closed_by_operator: None,
     };
-    {
-        let conn = Connection::open(db_path)
-            .map_err(|e| QualityError::Other(anyhow::anyhow!("open DuckDB for NCR create: {e}")))?;
-        ensure_schema(&conn)?;
-        conn.execute(
-            "INSERT INTO ncrs (ncr_id, tenant_id, discovered_at_utc, discovered_by_operator, \
-             severity, category, description, affected_part_uids, affected_wo_ids, \
-             affected_heat_lots, photos, state, closed_at_utc, closed_by_operator) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,NULL)",
-            params![
-                ncr.ncr_id,
-                tenant.as_str(),
-                ncr.discovered_at_utc,
-                ncr.discovered_by_operator,
-                ncr.severity.as_db_str(),
-                ncr.category.as_db_str(),
-                ncr.description,
-                encode_array(&ncr.affected_part_uids),
-                encode_array(&ncr.affected_wo_ids),
-                encode_array(&ncr.affected_heat_lots),
-                encode_array(&ncr.photos),
-                ncr.state.as_db_str(),
-            ],
-        )
-        .context("insert ncr row")?;
-        conn.execute(
-            "INSERT INTO ncr_transitions (tenant_id, ncr_id, seq, from_state, to_state, operator, at_utc, note) \
-             VALUES (?1,?2,0,'','open',?3,?4,'opened')",
-            params![tenant.as_str(), ncr.ncr_id, operator, ncr.discovered_at_utc],
-        )
-        .context("insert ncr opening transition")?;
-    }
+    // Both the business tables and the audit-ledger table on the shared writer.
+    ensure_schema(guard)?;
+    aberp_audit_ledger::ensure_schema(guard)
+        .context("ensure audit-ledger schema for ncr.created")?;
     let payload = serde_json::json!({
         "ncr_id": ncr.ncr_id,
         "severity": ncr.severity.as_db_str(),
@@ -709,14 +691,48 @@ pub fn create_ncr(
         "affected_wo_ids": ncr.affected_wo_ids,
         "operator_user_id": operator,
     });
-    append_event(
-        db_path,
-        tenant,
-        binary_hash,
-        operator,
+    let tx = guard
+        .transaction()
+        .context("begin ncr-create transaction on shared writer")?;
+    tx.execute(
+        "INSERT INTO ncrs (ncr_id, tenant_id, discovered_at_utc, discovered_by_operator, \
+         severity, category, description, affected_part_uids, affected_wo_ids, \
+         affected_heat_lots, photos, state, closed_at_utc, closed_by_operator) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,NULL)",
+        params![
+            ncr.ncr_id,
+            tenant.as_str(),
+            ncr.discovered_at_utc,
+            ncr.discovered_by_operator,
+            ncr.severity.as_db_str(),
+            ncr.category.as_db_str(),
+            ncr.description,
+            encode_array(&ncr.affected_part_uids),
+            encode_array(&ncr.affected_wo_ids),
+            encode_array(&ncr.affected_heat_lots),
+            encode_array(&ncr.photos),
+            ncr.state.as_db_str(),
+        ],
+    )
+    .context("insert ncr row")?;
+    tx.execute(
+        "INSERT INTO ncr_transitions (tenant_id, ncr_id, seq, from_state, to_state, operator, at_utc, note) \
+         VALUES (?1,?2,0,'','open',?3,?4,'opened')",
+        params![tenant.as_str(), ncr.ncr_id, operator, ncr.discovered_at_utc],
+    )
+    .context("insert ncr opening transition")?;
+    let meta = LedgerMeta::new(tenant, binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
         EventKind::NcrCreated,
-        payload,
-    )?;
+        serde_json::to_vec(&payload).expect("serialize quality payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        None,
+    )
+    .map_err(|e| QualityError::Other(anyhow::anyhow!("append ncr.created audit entry: {e}")))?;
+    tx.commit()
+        .context("commit ncr-create transaction on shared writer")?;
     Ok(ncr)
 }
 
@@ -725,7 +741,7 @@ pub fn create_ncr(
 /// [`Capa::permits_ncr_close`] ([[trust-code-not-operator]]). Appends the
 /// transition log row and fires `ncr.state_changed` (+ `ncr.closed` on close).
 pub fn transition_ncr(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -734,12 +750,14 @@ pub fn transition_ncr(
     note: &str,
 ) -> std::result::Result<Ncr, QualityError> {
     let now = now_rfc3339();
+    // ADR-0099 H3 — read + validate + business write + audit append all ride the
+    // ONE shared Handle writer guard (no fresh-open truncator, no nested acquire).
+    let mut guard = db.write().map_err(|e| {
+        QualityError::Other(anyhow::anyhow!("shared writer for NCR transition: {e}"))
+    })?;
+    ensure_schema(&guard)?;
     let (from, capa_id_for_close) = {
-        let conn = Connection::open(db_path).map_err(|e| {
-            QualityError::Other(anyhow::anyhow!("open DuckDB for NCR transition: {e}"))
-        })?;
-        ensure_schema(&conn)?;
-        let Some(ncr) = get_ncr(&conn, tenant.as_str(), ncr_id)? else {
+        let Some(ncr) = get_ncr(&guard, tenant.as_str(), ncr_id)? else {
             return Err(QualityError::NcrNotFound(ncr_id.to_string()));
         };
         let from = ncr.state;
@@ -759,7 +777,7 @@ pub fn transition_ncr(
         // Close gate: a verified, approved CAPA must exist.
         let capa_id_for_close =
             if to == NcrState::Closed {
-                let capas = list_capas(&conn, tenant.as_str(), ncr_id)?;
+                let capas = list_capas(&guard, tenant.as_str(), ncr_id)?;
                 match capas.iter().find(|c| c.permits_ncr_close()) {
                     Some(c) => Some(c.capa_id.clone()),
                     None => return Err(QualityError::IllegalTransition(
@@ -770,15 +788,18 @@ pub fn transition_ncr(
             } else {
                 None
             };
-        // Write the transition + new state.
-        let seq: i64 = conn
+        // Write the transition + new state under one tx on the shared writer.
+        let tx = guard
+            .transaction()
+            .context("begin ncr-transition transaction on shared writer")?;
+        let seq: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(seq), -1) + 1 FROM ncr_transitions WHERE tenant_id = ?1 AND ncr_id = ?2",
                 params![tenant.as_str(), ncr_id],
                 |r| r.get(0),
             )
             .context("next transition seq")?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO ncr_transitions (tenant_id, ncr_id, seq, from_state, to_state, operator, at_utc, note) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
@@ -794,24 +815,26 @@ pub fn transition_ncr(
         )
         .context("insert ncr transition")?;
         if to == NcrState::Closed {
-            conn.execute(
+            tx.execute(
                 "UPDATE ncrs SET state = ?3, closed_at_utc = ?4, closed_by_operator = ?5 \
                  WHERE tenant_id = ?1 AND ncr_id = ?2",
                 params![tenant.as_str(), ncr_id, to.as_db_str(), now, operator],
             )
             .context("update ncr state (closed)")?;
         } else {
-            conn.execute(
+            tx.execute(
                 "UPDATE ncrs SET state = ?3 WHERE tenant_id = ?1 AND ncr_id = ?2",
                 params![tenant.as_str(), ncr_id, to.as_db_str()],
             )
             .context("update ncr state")?;
         }
+        tx.commit()
+            .context("commit ncr-transition transaction on shared writer")?;
         (from, capa_id_for_close)
     };
 
     append_event(
-        db_path,
+        &mut guard,
         tenant.clone(),
         binary_hash,
         operator,
@@ -827,7 +850,7 @@ pub fn transition_ncr(
     )?;
     if to == NcrState::Closed {
         append_event(
-            db_path,
+            &mut guard,
             tenant.clone(),
             binary_hash,
             operator,
@@ -840,9 +863,7 @@ pub fn transition_ncr(
             }),
         )?;
     }
-    let conn = Connection::open(db_path)
-        .map_err(|e| QualityError::Other(anyhow::anyhow!("reopen DuckDB: {e}")))?;
-    get_ncr(&conn, tenant.as_str(), ncr_id)?
+    get_ncr(&guard, tenant.as_str(), ncr_id)?
         .ok_or_else(|| QualityError::NcrNotFound(ncr_id.to_string()))
 }
 
@@ -851,55 +872,61 @@ pub fn transition_ncr(
 /// transition log row, and fires `ncr.escalated`. Returns the escalated count.
 /// Non-fatal at boot — the caller logs, never `?`-fails boot.
 pub fn escalate_overdue_ncrs(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
     now: OffsetDateTime,
 ) -> Result<usize> {
-    let due: Vec<Ncr> = {
-        let conn = Connection::open(db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
-        list_ncrs(&conn, tenant.as_str(), &NcrFilter::default())?
-            .into_iter()
-            .filter(|n| {
-                OffsetDateTime::parse(&n.discovered_at_utc, &Rfc3339)
-                    .map(|d| escalation_overdue(n.severity, n.state, d, now))
-                    .unwrap_or(false)
-            })
-            .collect()
-    };
+    // ADR-0099 H3 — the whole scan (read + per-row escalation write + audit) rides
+    // the ONE shared Handle writer guard.
+    let mut guard = db
+        .write()
+        .map_err(|e| anyhow::anyhow!("shared writer for NCR escalation scan: {e}"))?;
+    ensure_schema(&guard)?;
+    let due: Vec<Ncr> = list_ncrs(&guard, tenant.as_str(), &NcrFilter::default())?
+        .into_iter()
+        .filter(|n| {
+            OffsetDateTime::parse(&n.discovered_at_utc, &Rfc3339)
+                .map(|d| escalation_overdue(n.severity, n.state, d, now))
+                .unwrap_or(false)
+        })
+        .collect();
     let now_str = now.format(&Rfc3339).context("format escalation stamp")?;
     for n in &due {
-        // Each escalation is its own short transaction; a failure on one NCR
-        // must not abort the rest of the scan (fail-loud per row, not the batch).
+        // Each escalation is its own short transaction on the shared writer; a
+        // failure on one NCR must not abort the rest of the scan (fail-loud per
+        // row, not the batch).
         {
-            let conn = Connection::open(db_path)
-                .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
-            let seq: i64 = conn
+            let tx = guard
+                .transaction()
+                .context("begin escalation transaction on shared writer")?;
+            let seq: i64 = tx
                 .query_row(
                     "SELECT COALESCE(MAX(seq), -1) + 1 FROM ncr_transitions WHERE tenant_id = ?1 AND ncr_id = ?2",
                     params![tenant.as_str(), n.ncr_id],
                     |r| r.get(0),
                 )
                 .context("next escalation transition seq")?;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO ncr_transitions (tenant_id, ncr_id, seq, from_state, to_state, operator, at_utc, note) \
                  VALUES (?1,?2,?3,?4,'escalated',?5,?6,'auto-escalated: critical SLA breach')",
                 params![tenant.as_str(), n.ncr_id, seq, n.state.as_db_str(), operator, now_str],
             )
             .context("insert escalation transition")?;
-            conn.execute(
+            tx.execute(
                 "UPDATE ncrs SET state = 'escalated' WHERE tenant_id = ?1 AND ncr_id = ?2",
                 params![tenant.as_str(), n.ncr_id],
             )
             .context("update ncr state (escalated)")?;
+            tx.commit()
+                .context("commit escalation transaction on shared writer")?;
         }
         let hours = OffsetDateTime::parse(&n.discovered_at_utc, &Rfc3339)
             .map(|d| (now - d).whole_hours())
             .unwrap_or_default();
         append_event(
-            db_path,
+            &mut guard,
             tenant.clone(),
             binary_hash,
             operator,
@@ -931,7 +958,7 @@ pub struct NewCapa {
 
 /// Create a CAPA for a parent NCR (verdict `Pending`); fire `capa.created`.
 pub fn create_capa(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -964,15 +991,20 @@ pub fn create_capa(
         created_at_utc: now.clone(),
         created_by_operator: operator.to_string(),
     };
+    // ADR-0099 H3 — existence check (read) + insert + audit all on the ONE shared
+    // Handle writer guard.
+    let mut guard = db
+        .write()
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("shared writer for CAPA create: {e}")))?;
+    ensure_schema(&guard)?;
+    if get_ncr(&guard, tenant.as_str(), &capa.ncr_id)?.is_none() {
+        return Err(QualityError::NcrNotFound(capa.ncr_id.clone()));
+    }
     {
-        let conn = Connection::open(db_path).map_err(|e| {
-            QualityError::Other(anyhow::anyhow!("open DuckDB for CAPA create: {e}"))
-        })?;
-        ensure_schema(&conn)?;
-        if get_ncr(&conn, tenant.as_str(), &capa.ncr_id)?.is_none() {
-            return Err(QualityError::NcrNotFound(capa.ncr_id.clone()));
-        }
-        conn.execute(
+        let tx = guard
+            .transaction()
+            .context("begin capa-create transaction on shared writer")?;
+        tx.execute(
             "INSERT INTO capas (capa_id, ncr_id, tenant_id, corrective_action_text, \
              preventive_action_text, responsible_operator, target_close_date, actual_close_date, \
              effectiveness_review_at_utc, effectiveness_verdict, effectiveness_comment, \
@@ -991,9 +1023,11 @@ pub fn create_capa(
             ],
         )
         .context("insert capa row")?;
+        tx.commit()
+            .context("commit capa-create transaction on shared writer")?;
     }
     append_event(
-        db_path,
+        &mut guard,
         tenant,
         binary_hash,
         operator,
@@ -1012,19 +1046,19 @@ pub fn create_capa(
 
 /// Approve a CAPA's plan; fire `capa.approved`.
 pub fn approve_capa(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
     capa_id: &str,
 ) -> std::result::Result<Capa, QualityError> {
     let now = now_rfc3339();
+    let mut guard = db
+        .write()
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("shared writer for CAPA approve: {e}")))?;
+    ensure_schema(&guard)?;
     let ncr_id = {
-        let conn = Connection::open(db_path).map_err(|e| {
-            QualityError::Other(anyhow::anyhow!("open DuckDB for CAPA approve: {e}"))
-        })?;
-        ensure_schema(&conn)?;
-        let Some(capa) = get_capa(&conn, tenant.as_str(), capa_id)? else {
+        let Some(capa) = get_capa(&guard, tenant.as_str(), capa_id)? else {
             return Err(QualityError::CapaNotFound(capa_id.to_string()));
         };
         if capa.approved_at_utc.is_some() {
@@ -1032,16 +1066,21 @@ pub fn approve_capa(
                 "CAPA already approved".to_string(),
             ));
         }
-        conn.execute(
+        let tx = guard
+            .transaction()
+            .context("begin capa-approve transaction on shared writer")?;
+        tx.execute(
             "UPDATE capas SET approved_by_operator = ?3, approved_at_utc = ?4 \
              WHERE tenant_id = ?1 AND capa_id = ?2",
             params![tenant.as_str(), capa_id, operator, now],
         )
         .context("update capa (approved)")?;
+        tx.commit()
+            .context("commit capa-approve transaction on shared writer")?;
         capa.ncr_id
     };
     append_event(
-        db_path,
+        &mut guard,
         tenant.clone(),
         binary_hash,
         operator,
@@ -1053,13 +1092,13 @@ pub fn approve_capa(
             "approved_at_utc": now,
         }),
     )?;
-    reread_capa(db_path, tenant, capa_id)
+    reread_capa(&guard, tenant.as_str(), capa_id)
 }
 
 /// Record a CAPA effectiveness verdict + comment; fire
 /// `capa.effectiveness_reviewed`.
 pub fn review_capa_effectiveness(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -1068,15 +1107,18 @@ pub fn review_capa_effectiveness(
     comment: &str,
 ) -> std::result::Result<Capa, QualityError> {
     let now = now_rfc3339();
+    let mut guard = db
+        .write()
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("shared writer for CAPA review: {e}")))?;
+    ensure_schema(&guard)?;
     let ncr_id = {
-        let conn = Connection::open(db_path).map_err(|e| {
-            QualityError::Other(anyhow::anyhow!("open DuckDB for CAPA review: {e}"))
-        })?;
-        ensure_schema(&conn)?;
-        let Some(capa) = get_capa(&conn, tenant.as_str(), capa_id)? else {
+        let Some(capa) = get_capa(&guard, tenant.as_str(), capa_id)? else {
             return Err(QualityError::CapaNotFound(capa_id.to_string()));
         };
-        conn.execute(
+        let tx = guard
+            .transaction()
+            .context("begin capa-review transaction on shared writer")?;
+        tx.execute(
             "UPDATE capas SET effectiveness_verdict = ?3, effectiveness_comment = ?4, \
              effectiveness_review_at_utc = ?5 WHERE tenant_id = ?1 AND capa_id = ?2",
             params![
@@ -1088,10 +1130,12 @@ pub fn review_capa_effectiveness(
             ],
         )
         .context("update capa (effectiveness)")?;
+        tx.commit()
+            .context("commit capa-review transaction on shared writer")?;
         capa.ncr_id
     };
     append_event(
-        db_path,
+        &mut guard,
         tenant.clone(),
         binary_hash,
         operator,
@@ -1105,23 +1149,24 @@ pub fn review_capa_effectiveness(
             "operator_user_id": operator,
         }),
     )?;
-    reread_capa(db_path, tenant, capa_id)
+    reread_capa(&guard, tenant.as_str(), capa_id)
 }
 
 /// Stamp a CAPA's actual close date; fire `capa.closed`.
 pub fn close_capa(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
     capa_id: &str,
 ) -> std::result::Result<Capa, QualityError> {
     let now = now_rfc3339();
+    let mut guard = db
+        .write()
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("shared writer for CAPA close: {e}")))?;
+    ensure_schema(&guard)?;
     let ncr_id = {
-        let conn = Connection::open(db_path)
-            .map_err(|e| QualityError::Other(anyhow::anyhow!("open DuckDB for CAPA close: {e}")))?;
-        ensure_schema(&conn)?;
-        let Some(capa) = get_capa(&conn, tenant.as_str(), capa_id)? else {
+        let Some(capa) = get_capa(&guard, tenant.as_str(), capa_id)? else {
             return Err(QualityError::CapaNotFound(capa_id.to_string()));
         };
         if capa.actual_close_date.is_some() {
@@ -1129,15 +1174,20 @@ pub fn close_capa(
                 "CAPA already closed".to_string(),
             ));
         }
-        conn.execute(
+        let tx = guard
+            .transaction()
+            .context("begin capa-close transaction on shared writer")?;
+        tx.execute(
             "UPDATE capas SET actual_close_date = ?3 WHERE tenant_id = ?1 AND capa_id = ?2",
             params![tenant.as_str(), capa_id, now],
         )
         .context("update capa (closed)")?;
+        tx.commit()
+            .context("commit capa-close transaction on shared writer")?;
         capa.ncr_id
     };
     append_event(
-        db_path,
+        &mut guard,
         tenant.clone(),
         binary_hash,
         operator,
@@ -1149,40 +1199,46 @@ pub fn close_capa(
             "operator_user_id": operator,
         }),
     )?;
-    reread_capa(db_path, tenant, capa_id)
+    reread_capa(&guard, tenant.as_str(), capa_id)
 }
 
 fn reread_capa(
-    db_path: &std::path::Path,
-    tenant: TenantId,
+    conn: &Connection,
+    tenant: &str,
     capa_id: &str,
 ) -> std::result::Result<Capa, QualityError> {
-    let conn = Connection::open(db_path)
-        .map_err(|e| QualityError::Other(anyhow::anyhow!("reopen DuckDB: {e}")))?;
-    get_capa(&conn, tenant.as_str(), capa_id)?
-        .ok_or_else(|| QualityError::CapaNotFound(capa_id.to_string()))
+    get_capa(conn, tenant, capa_id)?.ok_or_else(|| QualityError::CapaNotFound(capa_id.to_string()))
 }
 
-/// Open a fresh `Ledger` (after the read/write conn drops — DuckDB single-writer
-/// rule) and append one quality audit entry.
+/// Append one quality audit entry through the shared Handle's PASSED-IN write
+/// guard (ADR-0099 H3) — a short tx on the same serialized writer the caller
+/// already holds, so no fresh-open truncator and no nested `db.write()`
+/// re-acquire. The caller runs its business writes on the same guard.
 fn append_event(
-    db_path: &std::path::Path,
+    guard: &mut WriteGuard<'_>,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
     kind: EventKind,
     payload: serde_json::Value,
 ) -> Result<()> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record quality event")?;
-    ledger
-        .append(
-            kind,
-            serde_json::to_vec(&payload).expect("serialize quality payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator),
-            None,
-        )
-        .context("append quality audit entry")?;
+    aberp_audit_ledger::ensure_schema(guard)
+        .context("ensure audit-ledger schema for quality event")?;
+    let tx = guard
+        .transaction()
+        .context("begin DuckDB transaction for quality event")?;
+    let meta = LedgerMeta::new(tenant, binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        kind,
+        serde_json::to_vec(&payload).expect("serialize quality payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("append quality audit entry: {e}"))?;
+    tx.commit()
+        .context("commit DuckDB transaction for quality event")?;
     Ok(())
 }
 
@@ -1413,26 +1469,35 @@ mod tests {
         );
     }
 
-    fn temp_db() -> (std::path::PathBuf, TenantId, BinaryHash) {
+    /// ADR-0099 H3 — the whole test rides the ONE shared Handle (like prod): the
+    /// migrated fns take `&HandleArc` / a `&mut WriteGuard`, reads go through
+    /// `handle.read()`. No stray `Connection::open` coexisting with the Handle.
+    fn temp_db() -> (HandleArc, TenantId, BinaryHash) {
         let dir = std::env::temp_dir()
             .join("aberp-quality-test")
             .join(Ulid::new().to_string());
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("aberp.duckdb");
+        let tenant = TenantId::new("t").unwrap();
+        let handle = aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap();
         {
-            let conn = Connection::open(&db_path).unwrap();
-            aberp_audit_ledger::ensure_schema(&conn).unwrap();
-            ensure_schema(&conn).unwrap();
+            let guard = handle.write().unwrap();
+            aberp_audit_ledger::ensure_schema(&guard).unwrap();
+            ensure_schema(&guard).unwrap();
         }
-        (
-            db_path,
-            TenantId::new("t").unwrap(),
-            BinaryHash::from_bytes([0u8; 32]),
-        )
+        (handle, tenant, BinaryHash::from_bytes([0u8; 32]))
     }
 
-    fn count_kind(db_path: &std::path::Path, kind: &str) -> i64 {
-        let conn = Connection::open(db_path).unwrap();
+    /// Acquire the shared writer and mint an NCR through it (the passed-in-guard
+    /// contract), mirroring how `record_receipt` / `record_manual_inspection`
+    /// call `create_ncr` under a held guard.
+    fn open_ncr(handle: &HandleArc, tenant: TenantId, hash: BinaryHash, input: NewNcr) -> Ncr {
+        let mut guard = handle.write().unwrap();
+        create_ncr(&mut guard, tenant, hash, "op", input).unwrap()
+    }
+
+    fn count_kind(handle: &HandleArc, kind: &str) -> i64 {
+        let conn = handle.read().unwrap();
         conn.query_row(
             "SELECT COUNT(*) FROM audit_ledger WHERE kind = ?1",
             params![kind],
@@ -1456,17 +1521,15 @@ mod tests {
     #[test]
     fn create_ncr_fires_event_and_seeds_transition() {
         let (db, tenant, hash) = temp_db();
-        let ncr = create_ncr(
+        let ncr = open_ncr(
             &db,
             tenant.clone(),
             hash,
-            "op",
             sample_new_ncr(NcrSeverity::Major, &["dp-A"]),
-        )
-        .unwrap();
+        );
         assert_eq!(ncr.state, NcrState::Open);
         assert_eq!(count_kind(&db, "ncr.created"), 1);
-        let conn = Connection::open(&db).unwrap();
+        let conn = db.read().unwrap();
         let t = list_transitions(&conn, tenant.as_str(), &ncr.ncr_id).unwrap();
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].to_state, "open");
@@ -1475,14 +1538,12 @@ mod tests {
     #[test]
     fn close_is_refused_without_verified_capa_then_succeeds() {
         let (db, tenant, hash) = temp_db();
-        let ncr = create_ncr(
+        let ncr = open_ncr(
             &db,
             tenant.clone(),
             hash,
-            "op",
             sample_new_ncr(NcrSeverity::Major, &["dp-A"]),
-        )
-        .unwrap();
+        );
         let id = &ncr.ncr_id;
         // Walk to CorrectionApplied.
         transition_ncr(&db, tenant.clone(), hash, "op", id, NcrState::Contained, "").unwrap();
@@ -1558,14 +1619,12 @@ mod tests {
     #[test]
     fn illegal_transition_is_refused_at_db_layer() {
         let (db, tenant, hash) = temp_db();
-        let ncr = create_ncr(
+        let ncr = open_ncr(
             &db,
             tenant.clone(),
             hash,
-            "op",
             sample_new_ncr(NcrSeverity::Minor, &[]),
-        )
-        .unwrap();
+        );
         let err = transition_ncr(
             &db,
             tenant.clone(),
@@ -1583,43 +1642,42 @@ mod tests {
     fn escalate_overdue_flips_only_late_critical() {
         let (db, tenant, hash) = temp_db();
         // A critical NCR, then back-date its discovered_at to 2 days ago.
-        let crit = create_ncr(
+        let crit = open_ncr(
             &db,
             tenant.clone(),
             hash,
-            "op",
             sample_new_ncr(NcrSeverity::Critical, &["dp-A"]),
-        )
-        .unwrap();
-        let major = create_ncr(
+        );
+        let major = open_ncr(
             &db,
             tenant.clone(),
             hash,
-            "op",
             sample_new_ncr(NcrSeverity::Major, &["dp-B"]),
-        )
-        .unwrap();
+        );
         let old = (OffsetDateTime::UNIX_EPOCH + Duration::days(100))
             .format(&Rfc3339)
             .unwrap();
         {
-            let conn = Connection::open(&db).unwrap();
-            conn.execute(
-                "UPDATE ncrs SET discovered_at_utc = ?2 WHERE ncr_id = ?1",
-                params![crit.ncr_id, old],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE ncrs SET discovered_at_utc = ?2 WHERE ncr_id = ?1",
-                params![major.ncr_id, old],
-            )
-            .unwrap();
+            // Back-date on the shared writer (autocommit business update).
+            let guard = db.write().unwrap();
+            guard
+                .execute(
+                    "UPDATE ncrs SET discovered_at_utc = ?2 WHERE ncr_id = ?1",
+                    params![crit.ncr_id, old],
+                )
+                .unwrap();
+            guard
+                .execute(
+                    "UPDATE ncrs SET discovered_at_utc = ?2 WHERE ncr_id = ?1",
+                    params![major.ncr_id, old],
+                )
+                .unwrap();
         }
         let now = OffsetDateTime::UNIX_EPOCH + Duration::days(200);
         let n = escalate_overdue_ncrs(&db, tenant.clone(), hash, "boot", now).unwrap();
         assert_eq!(n, 1, "only the critical escalates");
         assert_eq!(count_kind(&db, "ncr.escalated"), 1);
-        let conn = Connection::open(&db).unwrap();
+        let conn = db.read().unwrap();
         assert_eq!(
             get_ncr(&conn, tenant.as_str(), &crit.ncr_id)
                 .unwrap()

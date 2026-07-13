@@ -14,8 +14,14 @@
 //! ([[no-sql-specific]]), archive-not-delete soft lifecycle (the `Revoked`
 //! status + `revoked_reason`, NOT a hard delete). CRUD fires audit via
 //! [`append_vendor_event`] called by the serve request wrappers after the DB
-//! write (the write conn is scoped/dropped first — DuckDB rejects a second
-//! writer; same split as `create_machine_request`).
+//! write. H3 (ADR-0099): the whole subsystem — every serve AVL handler's READ
+//! and WRITE, [`append_vendor_event`], and [`fire_overdue_screening_reminders`]
+//! — routes through the ONE shared `aberp_db::Handle`. The pure-storage helpers
+//! below still take a `&Connection` (unit-testable without a ledger); the serve
+//! wrappers hand them a guard from the Handle. Half-migrating (writes on the
+//! Handle, reads on a fresh `Connection::open`) would tear the ledger for a
+//! fresh reader — the all-or-nothing rule the write-fork gate's CHECK M
+//! enforces; same split as `create_machine_request`.
 //!
 //! ## The PO gate ([[trust-code-not-operator]])
 //!
@@ -32,7 +38,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, TenantId};
 use aberp_compliance::avl::{
     render_categories, ApprovalCategory, ApprovedStatus, AvlScreeningResult,
 };
@@ -569,19 +575,27 @@ pub fn vendor_is_overdue(vendor: &AvlVendor, now: OffsetDateTime) -> bool {
 /// Append an AVL-lifecycle audit entry. Split from the DB write so the write
 /// half stays unit-testable without a ledger (mirrors `append_machine_event`).
 pub fn append_vendor_event(
-    db_path: &std::path::Path,
+    db: &aberp_db::Handle,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator_login: &str,
     kind: EventKind,
     payload: Vec<u8>,
 ) -> Result<()> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record AVL vendor event")?;
+    // H3 (ADR-0099): route the audit append through the ONE shared Handle
+    // instead of an independent `Ledger::open` write-fork; the guard drop
+    // lockstep-syncs the mirror. `Ledger::open` used to ensure the schema, so we
+    // keep an idempotent ensure for not-yet-booted test DBs (mirrors mes_manager).
+    let mut guard = db
+        .write()
+        .context("acquire shared writer to record AVL vendor event")?;
+    aberp_audit_ledger::ensure_schema(&guard).context("ensure audit-ledger schema")?;
+    let tx = guard.transaction().context("begin AVL vendor audit tx")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
     let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
-    ledger
-        .append(kind, payload, actor, None)
+    aberp_audit_ledger::append_in_tx(&tx, &meta, kind, payload, actor, None)
         .context("append AVL vendor audit entry")?;
+    tx.commit().context("commit AVL vendor audit entry")?;
     Ok(())
 }
 
@@ -593,17 +607,22 @@ pub fn append_vendor_event(
 /// "Exactly once" = once per overdue vendor per boot scan (the natural reminder
 /// cadence; a restart reminds again), pinned by `avl_vendors_route.rs`.
 pub fn fire_overdue_screening_reminders(
-    db_path: &std::path::Path,
+    db: &aberp_db::Handle,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator_login: &str,
     now: OffsetDateTime,
 ) -> Result<usize> {
-    // Scope the read conn so it is dropped before the per-row audit append
-    // opens its own writer (DuckDB single-writer rule).
+    // H3 (ADR-0099): the overdue scan reads through the ONE shared Handle
+    // (`db.read()` is a try_clone of the single instance → always coherent),
+    // and each per-row audit append routes through the same Handle's writer.
+    // A separate `Connection::open` read here would close-fold the Handle's
+    // pending WAL and tear the ledger for a later fresh reader. Scope the read
+    // guard so it drops before the per-row writers acquire (single-writer rule).
     let overdue: Vec<AvlVendor> = {
-        let conn = Connection::open(db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+        let conn = db
+            .read()
+            .context("acquire shared reader for overdue AVL scan")?;
         list_vendors(&conn, tenant.as_str())?
             .into_iter()
             .filter(|v| vendor_is_overdue(v, now))
@@ -618,7 +637,7 @@ pub fn fire_overdue_screening_reminders(
             decision_time_utc: now_str.clone(),
         };
         append_vendor_event(
-            db_path,
+            db,
             tenant.clone(),
             binary_hash,
             operator_login,

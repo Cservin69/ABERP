@@ -148,6 +148,11 @@ fn build_state_for(tenant: &str, db_path: PathBuf) -> AppState {
     let tenant_id = TenantId::new(tenant.to_string()).expect("tenant id");
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
     AppState {
+        db: aberp::serve::open_tenant_handle(
+            &db_path,
+            TenantId::new(tenant.to_string()).expect("tenant id"),
+        )
+        .expect("test: open shared aberp-db Handle"),
         db_path: Arc::new(db_path),
         tenant: tenant_id,
         nav_enabled: true,

@@ -21,11 +21,9 @@
 //! — ADR-0092 §Decision). When a real `ProbeIngestionSource` lands it
 //! feeds this same path with `QcSource::Probe`.
 
-use std::path::Path;
-
 use aberp_audit_ledger::{Actor, BinaryHash, LedgerMeta, TenantId};
+use aberp_db::HandleArc;
 use aberp_inventory::ActorKind;
-use duckdb::Connection;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
@@ -107,7 +105,7 @@ fn severity_for(verdict: Verdict) -> Option<crate::quality::NcrSeverity> {
 /// supplied by the caller so the verdict is deterministic (the route
 /// passes `OffsetDateTime::now_utc()` + the tenant's configured window).
 pub fn record_manual_inspection(
-    db_path: &Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -115,10 +113,12 @@ pub fn record_manual_inspection(
     stale_window_seconds: u64,
     req: ManualInspectionRequest,
 ) -> Result<InspectionResult, QcRecordError> {
-    // DuckDB allows ONE read-write handle per file. `create_ncr` opens its
-    // own connection, so the inspection-record + link phases each open AND
-    // DROP their connection in a scope — never holding two handles to the
-    // same file at once (the S427 "scope the write conn" lesson).
+    // ADR-0099 H3 — the inspection-record phase, the auto-NCR (via
+    // `create_ncr`), and the NCR-link phase all ride the ONE shared Handle
+    // writer guard. The prior "scope + reopen a fresh Connection per phase"
+    // dance (three separate opens) collapses to a single guard: `create_ncr`
+    // takes it as `&mut guard`, never re-acquiring `db.write()`, so the
+    // non-reentrant writer mutex never self-deadlocks.
     let last_calibration_at = match req.last_calibration_at.as_deref() {
         Some(s) => Some(
             OffsetDateTime::parse(s.trim(), &Rfc3339)
@@ -127,12 +127,13 @@ pub fn record_manual_inspection(
         None => None,
     };
     let session_id = Ulid::new().to_string();
+    let mut guard = db.write().map_err(|e| {
+        QcRecordError::Other(anyhow::anyhow!("shared writer for QC inspection: {e}"))
+    })?;
 
-    // ── Phase 1: record the row + verdict events (own connection) ──
+    // ── Phase 1: record the row + verdict events (on the shared writer) ──
     let (recorded, plan) = {
-        let mut conn = Connection::open(db_path)
-            .map_err(|e| QcRecordError::Other(anyhow::anyhow!("open DuckDB: {e}")))?;
-        let plan = get_inspection_plan(&conn, tenant.as_str(), &req.plan_id)?
+        let plan = get_inspection_plan(&guard, tenant.as_str(), &req.plan_id)?
             .ok_or(QcRecordError::PlanNotFound)?;
         if plan.archived_at.is_some() {
             return Err(QcRecordError::Validation(
@@ -149,7 +150,7 @@ pub fn record_manual_inspection(
             ledger_meta: &ledger_meta,
             ledger_actor: Actor::from_local_cli(session_id.clone(), operator),
         };
-        let tx = conn
+        let tx = guard
             .transaction()
             .map_err(|e| QcRecordError::Other(anyhow::anyhow!("begin inspection tx: {e}")))?;
         let recorded = record_inspection(
@@ -195,7 +196,7 @@ pub fn record_manual_inspection(
             qci = inspection.qci_id,
         );
         let ncr = crate::quality::create_ncr(
-            db_path,
+            &mut guard,
             tenant.clone(),
             binary_hash,
             operator,
@@ -211,11 +212,10 @@ pub fn record_manual_inspection(
         )
         .map_err(map_quality_err)?;
 
-        // Link the NCR back onto the inspection row + emit QcAutoNcrCreated
-        // (own connection, opened only after create_ncr's handle is gone).
+        // Link the NCR back onto the inspection row + emit QcAutoNcrCreated on the
+        // SAME shared writer guard (create_ncr's tx has committed, so tx2 is a
+        // fresh short tx — no nested tx, no reopened connection).
         {
-            let mut conn = Connection::open(db_path)
-                .map_err(|e| QcRecordError::Other(anyhow::anyhow!("open DuckDB for link: {e}")))?;
             let link_meta = LedgerMeta::new(tenant.clone(), binary_hash);
             let link_ctx = QcWriteContext {
                 tenant: tenant.as_str(),
@@ -225,7 +225,7 @@ pub fn record_manual_inspection(
                 ledger_meta: &link_meta,
                 ledger_actor: Actor::from_local_cli(session_id.clone(), operator),
             };
-            let tx2 = conn
+            let tx2 = guard
                 .transaction()
                 .map_err(|e| QcRecordError::Other(anyhow::anyhow!("begin link tx: {e}")))?;
             link_auto_ncr(

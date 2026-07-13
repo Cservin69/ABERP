@@ -32,7 +32,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
 use anyhow::{anyhow, Context, Result};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -786,26 +786,38 @@ pub fn consume_next_tenant_hint() -> Result<Option<String>> {
 
 // ── Per-tenant audit emit ────────────────────────────────────────────
 
-/// Append a `tenant.*` lifecycle event into the ledger at `db_path` for
-/// `tenant`. Opening the ledger by path (not the running connection)
-/// lets the create + switch paths write into a DIFFERENT tenant's chain
-/// than the one the binary booted with — `TenantCreated` lands in the new
-/// tenant's ledger, `TenantSwitched` in the switched-to tenant's, never in
-/// the caller's. Mirrors `avl_vendors::append_vendor_event`.
+/// Append a `tenant.*` lifecycle event into the audit ledger of `tenant`,
+/// through the caller-supplied shared `aberp_db::Handle`. The create + switch
+/// paths write into a DIFFERENT tenant's chain than the one the binary booted
+/// with — `TenantCreated` lands in the new tenant's ledger, `TenantSwitched` in
+/// the switched-to tenant's, never in the caller's — so those callers pass a
+/// short-lived `Handle` opened on the TARGET tenant's db file (a different file
+/// from the running tenant's shared Handle, so no co-residence tear); same-tenant
+/// callers pass the running `state.db`. H3 (ADR-0099) STEP 4e: the `Ledger::open`
+/// write-fork is GONE — this routes the append through the ONE shared Handle
+/// (`db.write()` + `append_in_tx`), mirroring `avl_vendors::append_vendor_event`.
+/// The guard drop lockstep-syncs the target ledger's mirror.
 pub fn emit_tenant_event(
-    db_path: &Path,
+    db: &aberp_db::Handle,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator_login: &str,
     kind: EventKind,
     payload: Vec<u8>,
 ) -> Result<()> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record tenant lifecycle event")?;
+    let mut guard = db
+        .write()
+        .context("acquire shared writer to record tenant lifecycle event")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for tenant lifecycle event")?;
+    let tx = guard
+        .transaction()
+        .context("begin tenant lifecycle audit tx")?;
+    let meta = LedgerMeta::new(tenant, binary_hash);
     let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
-    ledger
-        .append(kind, payload, actor, None)
+    aberp_audit_ledger::append_in_tx(&tx, &meta, kind, payload, actor, None)
         .context("append tenant lifecycle audit entry")?;
+    tx.commit().context("commit tenant lifecycle audit entry")?;
     Ok(())
 }
 
@@ -867,6 +879,7 @@ fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aberp_audit_ledger::Ledger;
 
     fn dt(s: &str) -> OffsetDateTime {
         OffsetDateTime::parse(s, &Rfc3339).unwrap()
@@ -1273,7 +1286,7 @@ created_at = \"2026-06-16T00:00:00Z\"
             creator_login: "op".to_string(),
         };
         emit_tenant_event(
-            &db_new,
+            &aberp_db::Handle::open_default(&db_new, TenantId::new("acme").unwrap()).unwrap(),
             TenantId::new("acme").unwrap(),
             bh,
             "op",

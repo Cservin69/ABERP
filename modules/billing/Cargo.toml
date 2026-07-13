@@ -11,6 +11,12 @@ publish.workspace = true
 
 # Per ADR-0021 Part A item 2: library crates use thiserror, not anyhow.
 [dependencies]
+# ADR-0099 H3 Addendum 3 — the SERVE_HANDLE_LIVE tripwire lives in the audit-ledger
+# leaf crate; `DuckDbBillingStore::open` calls its debug/test-only check so the
+# invoice store-shape fork (open + into_connection + append) trips at runtime while
+# serve holds the shared Handle. Acyclic: audit-ledger depends on neither billing
+# nor aberp-db.
+aberp-audit-ledger = { path = "../../crates/audit-ledger" }
 duckdb = { workspace = true }
 # PR-44γ — first arithmetic consumer of `rust_decimal` per A135's
 # "deferred-to-arithmetic-consumer" trigger. Round-half-even HUF

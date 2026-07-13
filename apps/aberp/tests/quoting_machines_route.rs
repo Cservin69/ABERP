@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aberp_audit_ledger::{BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{BinaryHash, EventKind, TenantId};
 use ulid::Ulid;
 
 use aberp::quoting_machines::MachineInputs;
@@ -30,6 +30,8 @@ fn test_dir(label: &str) -> PathBuf {
 fn build_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     AppState {
+        db: aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+            .expect("test: open shared aberp-db Handle"),
         db_path: Arc::new(db_path),
         tenant,
         nav_enabled: true,
@@ -75,10 +77,21 @@ fn inputs(name: &str, family: &str, daily: f64, buffer: f64, enabled: bool) -> M
 }
 
 /// Every entry kind currently in the ledger (read-back for audit pins).
-fn ledger_kinds(db_path: &PathBuf) -> Vec<EventKind> {
+///
+/// H3 (ADR-0099): reads through the SAME shared Handle the handlers wrote through.
+/// A fresh `Ledger::open` here would read the pre-WAL main file (a folded subset)
+/// because these handlers' interleaved business `Connection::open`s leave the
+/// Handle's audit WAL unfolded — post-checkpoint-disable, the read contract is
+/// "audit reads go through the Handle". `try_clone` (F-C) shares the live instance.
+fn ledger_kinds(state: &AppState) -> Vec<EventKind> {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
-    let ledger = Ledger::open(db_path, tenant, TEST_HASH).expect("open ledger");
-    ledger
+    // Write guard so an as-yet-unwritten ledger still reads as [] (the old
+    // `Ledger::open` ensured the schema; `from_connection` does not); read the
+    // entries off a try_clone of the SAME live instance.
+    let guard = state.db.write().expect("shared write guard");
+    aberp_audit_ledger::ensure_schema(&guard).expect("ensure audit-ledger schema");
+    let owned = guard.try_clone().expect("clone shared conn");
+    aberp_audit_ledger::Ledger::from_connection(owned, tenant, TEST_HASH)
         .entries()
         .expect("read entries")
         .into_iter()
@@ -192,7 +205,7 @@ fn machine_crud_emits_the_three_event_kinds() {
     .expect("update");
     serve::archive_machine_request(&state, &m.id, "op", TEST_HASH).expect("archive");
 
-    let kinds = ledger_kinds(&db);
+    let kinds = ledger_kinds(&state);
     assert!(
         kinds.contains(&EventKind::MachineCreated),
         "created: {kinds:?}"
@@ -352,8 +365,12 @@ fn capacity_wiring_writes_lead_time_and_effective_reads_it() {
 fn override_persists_and_emits_event() {
     let dir = test_dir("override");
     let db = dir.join("aberp.duckdb");
-    let state = build_state(db.clone());
     let qid = "44444444-4444-4444-4444-444444444444";
+    // H3 (ADR-0099) STEP 4e — `override_lead_time_request` now reads+writes through
+    // the shared Handle, so the seed MUST be visible to it. Seed via fresh conns
+    // BEFORE `build_state` opens the Handle (the coherent Q1 direction: a fresh
+    // writer that closes before the Handle opens IS visible to it); a fresh
+    // `Connection::open` seed AFTER the Handle is live would be invisible to it.
     seed_posted(&db, qid, 600.0, 1, false);
     {
         // Give it a computed value first so the override payload's
@@ -362,25 +379,32 @@ fn override_persists_and_emits_event() {
         aberp::quote_pricing_jobs::set_computed_lead_time(&conn, qid, TEST_TENANT, 4)
             .expect("comp");
     }
+    let state = build_state(db.clone());
 
     // Operator overrides to 10 days.
     serve::override_lead_time_request(&state, qid, Some(10), "op", TEST_HASH).expect("override");
 
-    let conn = duckdb::Connection::open(&db).expect("open");
-    let eff = aberp::quote_pricing_jobs::get_effective_lead_time_days(&conn, qid, TEST_TENANT)
-        .expect("effective");
+    // Read back through the SAME shared Handle (a fresh `Connection::open` here
+    // would be blind to the Handle-WAL-resident override write).
+    let eff = {
+        let conn = state.db.read().expect("shared reader");
+        aberp::quote_pricing_jobs::get_effective_lead_time_days(&conn, qid, TEST_TENANT)
+            .expect("effective")
+    };
     assert_eq!(eff, Some(10), "override wins over computed");
 
     assert!(
-        ledger_kinds(&db).contains(&EventKind::QuoteLeadTimeOverridden),
+        ledger_kinds(&state).contains(&EventKind::QuoteLeadTimeOverridden),
         "override event emitted"
     );
 
     // Clearing the override reverts to the computed value.
     serve::override_lead_time_request(&state, qid, None, "op", TEST_HASH).expect("clear");
-    let conn2 = duckdb::Connection::open(&db).expect("open");
-    let eff2 = aberp::quote_pricing_jobs::get_effective_lead_time_days(&conn2, qid, TEST_TENANT)
-        .expect("effective2");
+    let eff2 = {
+        let conn = state.db.read().expect("shared reader");
+        aberp::quote_pricing_jobs::get_effective_lead_time_days(&conn, qid, TEST_TENANT)
+            .expect("effective2")
+    };
     assert_eq!(eff2, Some(4), "cleared override → computed value");
 }
 

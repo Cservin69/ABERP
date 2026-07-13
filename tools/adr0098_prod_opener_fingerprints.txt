@@ -1,0 +1,168 @@
+# ADR-0099 (PROD SAFE lane) — FROZEN per-opener fingerprint set (gate CHECK P2).
+# Ported from editions ADR-0098 R4 (CHECK 10k). Format: <path>|<fname>:<opener-text>.
+# Line numbers are DROPPED so a benign line-shift does not churn the set; any add,
+# removal, or content-change of an opener flips the set -> RED. P1 (count) is the
+# coarse backstop; P2 (this) also catches a COUNT-PRESERVING intra-file swap.
+# Machine-derived from frozen prod commit f7519b4 (tag PROD_v2.27.76).
+# ADR-0099 Addendum 2 (2026-07-09, owner Ervin) — re-cut −7: the three deleted
+# `derive_nav_invoice_number` billing-store opens (Defect 1) + the four drain
+# Ledger::open sites reused via free sync_mirror / Ledger::from_connection
+# (Defect 3). See adr0098_prod_frozen_residuals.txt header for the full rationale.
+#
+# ADR-0099 H3 ratchet: 271 openers after the serve.rs write-fork migration.
+#
+# ADR-0099 H3 ratchet (wave 2a): 267 openers.
+#
+# ADR-0099 H3 ratchet (wave 2b): 266 openers.
+# ADR-0099 H3 wave-2c (2026-07-09): re-cut −9 — the avl_vendors subsystem's 9
+# opener fingerprints (7 serve.rs AVL handlers + append_vendor_event Ledger::open
+# + fire_overdue Connection::open) removed; every one now routes through the
+# shared Handle (db.write()/db.read()). Removals-only, verified via comm -13.
+# ADR-0099 H3 wave-2d (2026-07-09): re-cut -2 — email_invoice record_email_audit_entry
+# 2 opener fingerprints (Connection::open + Ledger::open) removed; both now the
+# shared Handle. Removals-only, verified via comm -13.
+# ADR-0099 H3 wave-2e (2026-07-09): re-cut -1 — append_machine_event Ledger::open
+# removed (now the shared Handle). Removals-only, verified via comm -13.
+# ADR-0099 H3 wave-3a: re-cut - the 3 ap_sync.rs openers (write_cycle Connection+Ledger,
+# bootstrap Ledger) removed; all on the shared Handle now. Removals-only, comm-verified.
+# ADR-0099 H3 wave-3b: re-cut - write_audit Connection + recover Connection removed. Removals-only.
+# H3 wave-3c (2026-07-10) — re-cut −12 (removals-only, comm-verified 0 additions):
+# restore_from_nav migrated onto the shared Handle (restore_from_nav_outgoing.rs −11,
+# restore_from_nav_extract.rs open_for_extract −1). 249/36 → 237/34.
+# H3 invoice-family (2026-07-10) — re-cut -29 (removals-only, comm-verified 0
+# additions): the invoice-family atomic migration onto the shared Handle. 271-era
+# census 237/34 -> 208/27. 16 writer openers (issue_invoice/issue_storno/
+# issue_modification/submit_invoice/poll_ack/mark_invoice_paid + submission_queue::
+# count_pending) + 13 serve.rs invoice-audit/billing READER openers (list_invoices
+# +billing conn, get_invoice_detail +billing conn, get_audit_for_invoice,
+# list_notes_history_request, derive_state_for, query_non_terminal_invoices,
+# build_poll_daemon_inputs, audit_events_request, audit_event_detail_request,
+# resolve_customer_identity, resolve_invoice_xml_path) removed -> all on the Handle.
+# ── H3 STEP 7 (2026-07-13) — ACCEPTANCE-GATE reconciliation re-cut ─────────────
+# Full REVIEWED re-cut of the fingerprint set to match the frozen count re-cut in
+# adr0098_prod_frozen_residuals.txt (271-era → 117 openers / 23 files). Delta vs
+# the immediately-prior frozen set (184 fingerprints): −73 removed (all Handle
+# migrations, comm-verified) and +6 added, NONE a smuggled fresh-open fork
+# (write-fork & read-fork gates = 0). The 6 adds: DÁP boot + heartbeat
+# (scanner-blind, SECURED by the prod refuse-to-start guard — tracked residual),
+# serve.rs:seed_demo_sample_data (boot-time seed of the separate demo DB, S434),
+# and 3 tenant_registry.rs `#[cfg(test)] mod tests` openers the scanner
+# over-counts (raw-string parsing limitation; test-only, conservative). See the
+# frozen-residuals header for the itemised per-file rationale.
+apps/aberp/src/audit_dap_boot.rs|run_heartbeat_supervised:let mut ledger = Ledger::open(&db, tn, binary_hash)
+apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
+apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
+apps/aberp/src/drain_pending_retries.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+apps/aberp/src/drain_submission_queue.rs|drive_one_invoice:let ledger = Ledger::open(db_path, tenant, binary_hash_bytes).map_err(|e| {
+apps/aberp/src/drain_submission_queue.rs|drive_one_invoice:let ledger = Ledger::open(db_path, tenant, binary_hash_bytes).map_err(|e| {
+apps/aberp/src/drain_submission_queue.rs|drive_one_invoice:let ledger_tx1 = Ledger::open(db_path, tenant.clone(), binary_hash_bytes).ma
+apps/aberp/src/drain_submission_queue.rs|drive_one_invoice:let mut conn = Connection::open(db_path).map_err(|e| {
+apps/aberp/src/drain_submission_queue.rs|drive_one_invoice:let mut conn = Connection::open(db_path).map_err(|e| {
+apps/aberp/src/drain_submission_queue.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+apps/aberp/src/export_invoice_bundle.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+apps/aberp/src/mark_abandoned.rs|resolve_stuck_or_loud_fail:let ledger = Ledger::open(db_path, tenant, binary_hash)
+apps/aberp/src/mark_abandoned.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes).context("open
+apps/aberp/src/mark_abandoned.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+apps/aberp/src/mark_abandoned.rs|run:let mut conn = Connection::open(&args.db)
+apps/aberp/src/observe_receiver_confirmation.rs|load_base_nav_invoice_number:let store = DuckDbBillingStore::open(db_path)
+apps/aberp/src/observe_receiver_confirmation.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
+apps/aberp/src/observe_receiver_confirmation.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+apps/aberp/src/observe_receiver_confirmation.rs|run:let mut conn = Connection::open(&args.db)
+apps/aberp/src/poll_annulment_ack.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
+apps/aberp/src/poll_annulment_ack.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+apps/aberp/src/poll_annulment_ack.rs|run:let mut conn = Connection::open(&args.db)
+apps/aberp/src/print_invoice.rs|load_invoice_bank_snapshot:let mut conn = Connection::open(db)
+apps/aberp/src/print_invoice.rs|load_invoice_notes:let mut conn = Connection::open(db)
+apps/aberp/src/print_invoice.rs|render_to_bytes:let ledger = Ledger::open(db, tenant_id, binary_hash_bytes)
+apps/aberp/src/quote_pdf_rerender_daemon.rs|prepare_rerender:let conn = Connection::open(db_path)
+apps/aberp/src/recover_from_nav.rs|resolve_recovery_precondition:let ledger = Ledger::open(db_path, tenant, binary_hash)
+apps/aberp/src/recover_from_nav.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
+apps/aberp/src/recover_from_nav.rs|run:let mut conn = Connection::open(&args.db)
+apps/aberp/src/reports.rs|compute_financial_report:let conn = Connection::open(db_path)
+apps/aberp/src/reports.rs|compute_financial_report:let conn = Connection::open(db_path).with_context(|| {
+apps/aberp/src/reports.rs|compute_financial_report:let ledger = Ledger::open(db_path, tenant.clone(), binary_hash)
+apps/aberp/src/reports.rs|compute_financial_report:let mut store = aberp_billing::DuckDbBillingStore::open(db_path)
+apps/aberp/src/request_technical_annulment.rs|load_base_invoice_issue_year:let store = DuckDbBillingStore::open(db_path)
+apps/aberp/src/request_technical_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
+apps/aberp/src/request_technical_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+apps/aberp/src/request_technical_annulment.rs|run:let mut conn = Connection::open(&args.db)
+apps/aberp/src/retry_submission.rs|perform_layer_2_check:let ledger_tx0 = Ledger::open(db_path, tenant, binary_hash)
+apps/aberp/src/retry_submission.rs|resolve_stuck_or_loud_fail:let ledger = Ledger::open(db_path, tenant, binary_hash)
+apps/aberp/src/retry_submission.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
+apps/aberp/src/retry_submission.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
+apps/aberp/src/retry_submission.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+apps/aberp/src/retry_submission.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+apps/aberp/src/retry_submission.rs|run:let ledger_tx1 = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+apps/aberp/src/retry_submission.rs|run:let mut conn = Connection::open(&args.db)
+apps/aberp/src/serve.rs|archive_machine_request:let conn = Connection::open(&*state.db_path)
+apps/aberp/src/serve.rs|archive_margin_profile_request:let conn = Connection::open(&*state.db_path)
+apps/aberp/src/serve.rs|calibration_overview_request:let conn = Connection::open(&*state.db_path)
+apps/aberp/src/serve.rs|create_machine_request:let conn = Connection::open(&*state.db_path)
+apps/aberp/src/serve.rs|create_margin_profile_request:let conn = Connection::open(&*state.db_path)
+apps/aberp/src/serve.rs|get_machine_request:let conn = Connection::open(&*state.db_path)
+apps/aberp/src/serve.rs|handle_create_complexity_rule:let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_create_quoting_material:let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_create_stock_adjustment:let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_delete_complexity_rule:let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_delete_quoting_material:let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_delete_stock_adjustment:let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_get_email_relay_row:let conn = duckdb::Connection::open(&db_path)
+apps/aberp/src/serve.rs|handle_get_margin_profile:let conn = match Connection::open(&*state.db_path) {
+apps/aberp/src/serve.rs|handle_get_parameters:let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_list_complexity_rules:let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_list_email_relay_queue:let conn = duckdb::Connection::open(&db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_list_quoting_materials:let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_list_stock_adjustments:let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_list_tolerance_multipliers:let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_quote_pipeline_status:let conn = duckdb::Connection::open(&db_path).context("open DB for daemon-pa
+apps/aberp/src/serve.rs|handle_relay_send_email:let conn = duckdb::Connection::open(&db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_test_catalogue_push:let conn = Connection::open(&db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_update_complexity_rule:let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_update_parameters:let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_update_quoting_material:let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_update_stock_adjustment:let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|handle_update_tolerance_multiplier:let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+apps/aberp/src/serve.rs|list_machines_request:let conn = Connection::open(&*state.db_path)
+apps/aberp/src/serve.rs|list_margin_profiles_request:let conn = Connection::open(&*state.db_path)
+apps/aberp/src/serve.rs|read_base_currency:let mut conn = Connection::open(db_path)
+apps/aberp/src/serve.rs|read_invoice_currency:let mut conn = Connection::open(db_path).with_context(|| {
+apps/aberp/src/serve.rs|read_invoice_total_gross_minor:let mut conn = Connection::open(db_path).with_context(|| {
+apps/aberp/src/serve.rs|record_upgrade_snapshot_mismatch_audit:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
+apps/aberp/src/serve.rs|resolve_recipient_email:let mut conn = Connection::open(&*state.db_path)
+apps/aberp/src/serve.rs|run:duckdb::Connection::open(&cad_db_path).context(
+apps/aberp/src/serve.rs|run:duckdb::Connection::open(&count_db_path)
+apps/aberp/src/serve.rs|run:duckdb::Connection::open(&migrate_db_path)
+apps/aberp/src/serve.rs|run:let conn = Connection::open(&args.db).with_context(|| {
+apps/aberp/src/serve.rs|run:let conn = Connection::open(&args.db).with_context(|| {
+apps/aberp/src/serve.rs|run:let conn = Connection::open(&args.db).with_context(|| {
+apps/aberp/src/serve.rs|run:let conn = Connection::open(&args.db).with_context(|| {
+apps/aberp/src/serve.rs|run:let conn = Connection::open(&args.db).with_context(|| {
+apps/aberp/src/serve.rs|run:let conn = Connection::open(&args.db).with_context(|| {
+apps/aberp/src/serve.rs|run:let conn = Connection::open(&args.db).with_context(|| {
+apps/aberp/src/serve.rs|run:let conn = Connection::open(&args.db).with_context(|| {
+apps/aberp/src/serve.rs|run:let conn = Connection::open(&args.db).with_context(|| {
+apps/aberp/src/serve.rs|run:let mut billing_store = DuckDbBillingStore::open(&args.db).with_context(|| {
+apps/aberp/src/serve.rs|run:let mut conn = Connection::open(&args.db).with_context(|| {
+apps/aberp/src/serve.rs|run:let mut conn = Connection::open(&args.db).with_context(|| {
+apps/aberp/src/serve.rs|run:let mut store = DuckDbBillingStore::open(creating)?;
+apps/aberp/src/serve.rs|seed_demo_sample_data:let conn = Connection::open(db)
+apps/aberp/src/serve.rs|spawn_dap_audit_chain:let mut ledger = aberp_audit_ledger::Ledger::open(&db_path, tenant.clone(), 
+apps/aberp/src/serve.rs|update_machine_request:let conn = Connection::open(&*state.db_path)
+apps/aberp/src/serve.rs|update_margin_profile_request:let conn = Connection::open(&*state.db_path)
+apps/aberp/src/snapshot.rs|open_ledger:Ledger::open(db_path, tenant.clone(), binary_hash)
+apps/aberp/src/submit_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
+apps/aberp/src/submit_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+apps/aberp/src/submit_annulment.rs|run:let mut conn = Connection::open(&args.db)
+apps/aberp/src/tenant_registry.rs|tenant_created_lands_in_new_tenant_ledger_not_caller:Ledger::open(&db_caller, TenantId::new("prod").unwrap(), bh)
+apps/aberp/src/tenant_registry.rs|tenant_created_lands_in_new_tenant_ledger_not_caller:Ledger::open(&db_caller, TenantId::new("prod").unwrap(), bh).unwrap();
+apps/aberp/src/tenant_registry.rs|tenant_created_lands_in_new_tenant_ledger_not_caller:let new_kinds: Vec<EventKind> = Ledger::open(&db_new, TenantId::new("acme").
+crates/aberp-inventory/src/bin/rebuild_stock_cache.rs|run:let mut conn = Connection::open(&db_path)
+crates/aberp-mes/src/ledger_writer.rs|write_one:let mut conn = duckdb::Connection::open(&db_path)
+crates/aberp-snapshot/src/crash_safe.rs|checkpoint_file:let conn = Connection::open(db)?;
+crates/aberp-snapshot/src/crash_safe.rs|probe_open:let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+crates/aberp-snapshot/src/take.rs|restore_into:let conn = Connection::open(&staging)?;
+crates/aberp-snapshot/src/take.rs|take_snapshot:let conn = Connection::open(db_path)?;
+crates/audit-ledger/src/storage/mod.rs|append_reopen:let mut conn = Connection::open(db_path)?;
+crates/audit-ledger/src/storage/mod.rs|append_reopen:pub fn append_reopen(
+crates/audit-ledger/src/storage/mod.rs|open:let conn = Connection::open(path)?;
+modules/billing/src/adapters/duckdb_store.rs|open:conn: Connection::open(path)?,
