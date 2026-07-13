@@ -11,11 +11,13 @@
 # fresh read-back saw 1 of 3 events; the Handle read saw all 3. A gate that cannot
 # see a bug class does not protect against it — this closes that gap.
 #
-# MODE:
-#   default             — INFORMATIONAL: print the in-serve read-forks (the CHECK N
-#                         migration worklist) + count, exit 0.
-#   ENFORCE_READ_FORK=1 — ENFORCING: exit non-zero if ANY non-allow-listed in-serve
-#                         read-fork remains. Flip ON when the worklist hits zero.
+# MODE (H3 STEP 7 acceptance — the worklist hit ZERO, so ENFORCE is now the
+# DEFAULT; the acceptance state is fork-zero-ENFORCED):
+#   default             — ENFORCING: exit non-zero if ANY non-allow-listed in-serve
+#                         read-fork remains. Also set explicitly in cut-gate.yml so
+#                         the flip is visible at the CI surface.
+#   ENFORCE_READ_FORK=0 — INFORMATIONAL: print the in-serve read-forks + count,
+#                         exit 0. Retained only as a local diagnostic probe.
 #
 # Scope: apps/aberp/src + modules + crates, minus */tests/* and /aberp-db/.
 # Allow-listed (tools/adr0099_read_fork_allowlist.txt): SEPARATE-PROCESS CLI
@@ -37,7 +39,7 @@ for req in "$SCAN" "$ALLOW"; do
   [[ -f "$req" ]] || { echo "✗ FAIL: required gate asset missing: $req"; exit 1; }
 done
 
-enforce="${ENFORCE_READ_FORK:-0}"
+enforce="${ENFORCE_READ_FORK:-1}"
 echo "ADR-0099 H3 read-fork gate (CHECK N) — root: $ROOT  (mode: $([[ "$enforce" == "1" ]] && echo ENFORCING || echo informational))"
 
 scope_files() { find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/|/aberp-db/' | sort; }

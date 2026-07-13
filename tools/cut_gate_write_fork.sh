@@ -23,14 +23,15 @@
 # flock, and pre-serve boot openers). NO frozen-residual ledger, NO deferrals —
 # prod diverges from the editions shrinking-residual (locked plan §"Prod divergence").
 #
-# MODE:
-#   default              — INFORMATIONAL: print the remaining in-serve write-forks
-#                          (the H3 migration worklist) + count, exit 0. Used while
-#                          the opener migration is in progress so the branch stays
-#                          green and the remainder is visible in CI.
-#   ENFORCE_WRITE_FORK=1  — ENFORCING: exit non-zero if ANY non-allow-listed fork
-#                          remains. Flip this ON in ci.yml + cut-gate.yml the moment
-#                          the migration reaches zero (that is the H3 acceptance cut).
+# MODE (H3 STEP 7 acceptance — the migration reached ZERO, so ENFORCE is now the
+# DEFAULT; the acceptance state is fork-zero-ENFORCED):
+#   default               — ENFORCING: exit non-zero if ANY non-allow-listed fork
+#                          remains. Also set explicitly in cut-gate.yml so the flip
+#                          is visible at the CI surface and cannot be silently
+#                          weakened by a one-line script edit.
+#   ENFORCE_WRITE_FORK=0  — INFORMATIONAL: print the remaining in-serve write-forks
+#                          + count, exit 0. Retained only as a local diagnostic
+#                          probe (e.g. to re-print a worklist during a future wave).
 #
 # Seam-excluded: crates/aberp-db (the shared Handle) and */tests/*.
 
@@ -45,7 +46,7 @@ for req in "$SCAN" "$ALLOW" "$OPENSCAN"; do
   [[ -f "$req" ]] || { echo "✗ FAIL: required gate asset missing: $req"; exit 1; }
 done
 
-enforce="${ENFORCE_WRITE_FORK:-0}"
+enforce="${ENFORCE_WRITE_FORK:-1}"
 echo "ADR-0099 H3 write-fork gate — root: $ROOT  (mode: $([[ "$enforce" == "1" ]] && echo ENFORCING || echo informational))"
 
 scope_files() { find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/|/aberp-db/' | sort; }

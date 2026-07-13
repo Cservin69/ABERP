@@ -48,14 +48,17 @@ jobs:
         # green gate above is a meaningful signal, not a gate that can't go red.
         run: bash tools/cut_gate_negative_probes.sh
 
-      - name: ADR-0099 H3 write-fork migration tracker (informational)
+      - name: ADR-0099 H3 write-fork gate (ENFORCING)
         # The corrected zero-residual fork gate (CHECK 10M): every in-serve
-        # audit write-fork must route through the shared aberp_db::Handle. While
-        # the H3 opener migration is in progress this runs INFORMATIONAL (prints
-        # the remaining forks + count, exits 0) so the branch stays green and the
-        # exact remainder is visible in CI. It flips to ENFORCING (fail on any
-        # remaining fork) by setting ENFORCE_WRITE_FORK=1 here the moment the
-        # migration reaches zero — that flip is the H3 acceptance cut.
+        # audit write-fork must route through the shared aberp_db::Handle. The H3
+        # opener migration reached ZERO (STEP 7 acceptance), so this is now
+        # ENFORCING — it FAILS on ANY non-allow-listed in-serve write-fork. The
+        # flag is explicit here as well as defaulted in the script so enforcement
+        # is visible at the CI surface and cannot be silently weakened by a
+        # one-line script edit. (The scanner-blind DÁP residual is secured by the
+        # prod refuse-to-start guard — see tools/adr0099_write_fork_allowlist.txt.)
+        env:
+          ENFORCE_WRITE_FORK: "1"
         run: bash tools/cut_gate_write_fork.sh
 
       - name: Prove the write-fork gate has teeth (negative probes)
@@ -69,14 +72,18 @@ jobs:
         # fail is decoration.
         run: bash tools/cut_gate_write_fork_probes.sh
 
-      - name: ADR-0099 H3 READ-fork migration tracker (CHECK N, informational)
+      - name: ADR-0099 H3 READ-fork gate (CHECK N, ENFORCING)
         # The DUAL of the write-fork gate. CHECK 10M is structurally blind to an
         # independent opener that READS the audit ledger: once any writer is on
         # the shared Handle (checkpoint disabled), a fresh Ledger::open reader
         # sees only the folded SUBSET — a silent torn read (proved in wave-2e).
-        # INFORMATIONAL while the in-serve readers migrate to Handle reads; flips
-        # to ENFORCING via ENFORCE_READ_FORK=1 at zero. See ADR-0099 §CHECK N for
-        # the static limitation (dual-context fns) + the runtime-tripwire backstop.
+        # The in-serve readers all migrated to Handle reads (STEP 7 acceptance),
+        # so this is now ENFORCING — it FAILS on ANY non-allow-listed in-serve
+        # read-fork. Flag explicit here as well as defaulted in the script. See
+        # ADR-0099 §CHECK N for the static limitation (dual-context fns) + the
+        # runtime-tripwire backstop.
+        env:
+          ENFORCE_READ_FORK: "1"
         run: bash tools/cut_gate_read_fork.sh
 
       - name: Prove the read-fork gate has teeth (negative probes)

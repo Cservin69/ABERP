@@ -2835,6 +2835,34 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // heartbeat actor. Keychain + TSA only touched on this opt-in path.
         match crate::tenant_registry::tenant_dap_config(recovery_state.tenant.as_str()) {
             Ok((true, heartbeat_secs)) => {
+                // ADR-0099 H3 — DÁP is a TRACKED RESIDUAL, not production-ready.
+                // Its boot open (`spawn_dap_audit_chain`) and its heartbeat
+                // (`audit_dap_boot::run_heartbeat_supervised`) each do a fresh
+                // `Ledger::open` and APPEND from a *different* fn
+                // (`open_service_session_and_recover` / `heartbeat`), so the per-fn
+                // write-fork scanner is structurally BLIND to them: they never enter
+                // the write-fork worklist yet they ride OUTSIDE the shared
+                // `aberp_db::Handle` — a scanner-blind audit-ledger fork armed the
+                // moment a tenant sets `dap_enabled`. Migrating them needs the
+                // Ledger-over-WriteGuard adapter that does not yet exist (Editions never
+                // built it). Until then, a PRODUCTION build REFUSES TO START rather than
+                // arm the latent fork (fail loud — CLAUDE.md rule 11); this makes the
+                // residual UNREACHABLE in prod, so the fork-zero-ENFORCED acceptance
+                // state holds without an allow-list blessing. NetlockTsa is itself
+                // `todo!()`, so a prod DÁP path could not function anyway. Non-production
+                // builds still exercise the DÁP structural floor (MockTsa) under test.
+                // Tracked in tools/adr0099_write_fork_allowlist.txt (residual note).
+                if crate::build_profile::IS_PRODUCTION_BUILD {
+                    return Err(anyhow!(
+                        "tenant '{}' has dap_enabled=true, but this is a PRODUCTION build: the \
+                         DÁP/QES timestamp-anchored audit chain is a tracked ADR-0099 residual, \
+                         NOT production-ready — its boot + heartbeat open a fresh ledger and append \
+                         OUTSIDE the shared aberp_db::Handle (a scanner-blind write-fork not yet \
+                         migrated), and NetlockTsa is unimplemented. Refusing to start. Unset \
+                         dap_enabled for this tenant, or run a non-production build.",
+                        recovery_state.tenant.as_str()
+                    ));
+                }
                 if let Err(e) =
                     spawn_dap_audit_chain(&recovery_state, &mut coordinator, heartbeat_secs)
                 {

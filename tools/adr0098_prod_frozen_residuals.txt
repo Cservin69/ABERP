@@ -93,27 +93,52 @@
 # with-inventory reader reads products.stock_qty written by 8 WO/dispatch/QA
 # record_movement callers, so the product closure pulls in the inventory+WO
 # surface — handed off as its own atomic commit.)
+# ── H3 STEP 7 (2026-07-13) — ACCEPTANCE-GATE reconciliation re-cut ─────────────
+# The write-fork + read-fork migration reached ZERO on integrate/dur-feat; the
+# gates flip to ENFORCE this step. The frozen baseline above was pinned pre-H3
+# (f7519b4) AND pre-feature-merge, so it legitimately diverges from the current
+# tree. Full REVIEWED re-cut: 271-era census (see prior notes) → 117 openers / 23
+# files. Reconciled delta vs the immediately-prior frozen set (184/25):
+#   REMOVALS (73, all Handle migrations, comm-verified): incoming_invoices.rs 9→0,
+#     material_inventory.rs 1→0, quote_calibration.rs 2→0,
+#     aberp-quote-intake/service.rs 8→0, serve.rs 106→55 (−51). Each removed opener
+#     now routes through the shared aberp_db::Handle (db.write()/db.read()); the
+#     write-fork CHECK M and read-fork gates independently confirm no half-migration.
+#   ADDITIONS (6, NONE a smuggled fresh-open fork; write-fork & read-fork = 0):
+#     • audit_dap_boot.rs:run_heartbeat_supervised (+1) and
+#       serve.rs:spawn_dap_audit_chain (+1) — the DÁP/QES boot + heartbeat. Both
+#       are cross-fn (open here, append in open_service_session_and_recover /
+#       heartbeat), so the per-fn write-fork scanner is BLIND to them. TRACKED
+#       RESIDUAL, SECURED: a PRODUCTION build refuses to start when dap_enabled=true
+#       (serve.rs DÁP boot arm, build_profile::IS_PRODUCTION_BUILD) → unreachable in
+#       prod. See tools/adr0099_write_fork_allowlist.txt residual note.
+#     • serve.rs:seed_demo_sample_data (+1) — S434 boot-time, best-effort seed of the
+#       SEPARATE bundled-demo DB (not the booted tenant's Handle, not in-serve). A
+#       legitimate boot opener, not a fork.
+#     • tenant_registry.rs ×3 (+3) — openers inside `#[cfg(test)] mod tests`. The
+#       scanner over-counts them (its string tracker mishandles the raw-string
+#       literal r#"ACME "Special" Co \ Ltd"# in that test, losing the cfg(test)
+#       scope). Conservative (over-count never HIDES a fork) and test-only; frozen
+#       here for consistency with what the shared scanner emits on this tree.
+1 apps/aberp/src/audit_dap_boot.rs
 3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
 1 apps/aberp/src/export_invoice_bundle.rs
-9 apps/aberp/src/incoming_invoices.rs
 4 apps/aberp/src/mark_abandoned.rs
-1 apps/aberp/src/material_inventory.rs
 4 apps/aberp/src/observe_receiver_confirmation.rs
 3 apps/aberp/src/poll_annulment_ack.rs
 3 apps/aberp/src/print_invoice.rs
-2 apps/aberp/src/quote_calibration.rs
 1 apps/aberp/src/quote_pdf_rerender_daemon.rs
 3 apps/aberp/src/recover_from_nav.rs
 4 apps/aberp/src/reports.rs
 4 apps/aberp/src/request_technical_annulment.rs
 8 apps/aberp/src/retry_submission.rs
-106 apps/aberp/src/serve.rs
+55 apps/aberp/src/serve.rs
 1 apps/aberp/src/snapshot.rs
 3 apps/aberp/src/submit_annulment.rs
+3 apps/aberp/src/tenant_registry.rs
 1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
 1 crates/aberp-mes/src/ledger_writer.rs
-8 crates/aberp-quote-intake/src/service.rs
 2 crates/aberp-snapshot/src/crash_safe.rs
 2 crates/aberp-snapshot/src/take.rs
 3 crates/audit-ledger/src/storage/mod.rs
