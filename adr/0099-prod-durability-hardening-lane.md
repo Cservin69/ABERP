@@ -714,6 +714,54 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
     (`material_inventory.rs:839` remains; `incoming_invoices`×2, `quote_calibration`,
     `tenant_registry` are the rest) — this cluster does not reach the write-fork
     residual floor, only the census drops (serve.rs runtime openers 114→81).
+- **STEP 4d OUTCOME (2026-07-13) — the FULL write-fusion closure MIGRATED
+  (directive: land the whole cluster, pull in every fused family).** The 4c
+  cross-touched families are now on the Handle too, closing the transitive
+  write-fusion closure: **`material_inventory`** (`inventory_balances` /
+  `inventory_reservations`) and **`quote_intake_log`** (+ **`inspection_plans`** for
+  full qc coherence). The forcing edge: the DEAL saga writes
+  `quote_intake_log` + `inventory_balances` in ONE tx, so migrating
+  `material_inventory` forces the DEAL saga onto the Handle, which forces the WHOLE
+  `quote_intake_log` family (all-or-nothing on the table).
+  - **Sites:** serve.rs sagas `run_deal_saga_request` / `pickup_quote_as_draft_request`
+    (+ its `Ledger::open` retry-count walk → `Ledger::from_connection`) /
+    `run_refuse_saga_request`; the intake routes `handle_list_quote_intake` (list +
+    `flip_and_audit_in_tx` alert-flip on ONE write guard), retry-parse, mark-irrelevant,
+    notifications, `latest_quote_intake_poll` / `quote_intake_auth_paused` /
+    `get_audit_for_quote` (audit reads → `Ledger::from_connection`);
+    `handle_assign_heat_lot` + `handle_list_inventory_balances`; the 4 inspection_plan
+    CRUD/list handlers. **The whole intake DAEMON** (`crates/aberp-quote-intake`
+    gains an `aberp-db` dep; `QuoteIntakeDeps` carries the shared `Handle`; every
+    `Connection::open` in `service.rs` → `db.write()`/`db.read()`).
+  - **Two rule-15 fusions (the substantive part, not a mechanical swap):**
+    `assign_heat_lot`'s `inventory_balances` UPDATE + its heat-lot audit now ride ONE
+    guard tx (`append_heat_lot_events` re-signed to `(&tx, &meta, …)`, was a fresh
+    `Ledger::open`); and the daemon's intake-row INSERT + its `QuoteIntakeRowAdded`
+    audit now ride ONE guard tx (was a business INSERT + a separate best-effort audit
+    tx on two fresh conns — an audit failure now rolls the row back, and the precheck
+    makes the next cycle re-attempt idempotently). `sync_audit_mirror_best_effort` is
+    deleted entirely (every writer lets the WriteGuard drop lockstep-sync the mirror).
+  - **`quote_pricing_jobs` / `quote_calibration` confirmed OUT** (traced, not
+    guessed): no writer of `quote_intake_log` / `inventory_balances` co-writes
+    `quote_pricing_jobs` in any tx — it is cross-READ only (DEAL-saga margin gate +
+    the WO gate resolvers), and the pricing pipeline already writes it on the Handle,
+    so the DEAL saga's Handle read is coherent (this actually FIXES a pre-existing
+    fresh-read-vs-Handle-write margin staleness). `quote_calibration` is a standalone
+    post-commit fresh write (residual floor). `quote_pricing_jobs`' own serve-route
+    writers remain a SEPARATE pre-existing half-migration (pipeline-Handle vs
+    serve-fresh), out of this closure.
+  - **Pinned** by `step4d_intake_material_handle.rs` (tripwire armed): the heat-lot
+    rule-15 fusion appends with no forked `Ledger`, and a Handle-written intake row
+    co-committed with an `inventory_balances` UPDATE is visible to a Handle reader.
+    The daemon-on-Handle round-trip is pinned by the crate's
+    `mock_server_round_trip.rs`. Informational censuses: write-fork 5→**4**
+    (`material_inventory.rs:839` gone) — this HITS the write-fork residual floor
+    `{incoming_invoices×2, quote_calibration, tenant_registry}` (all genuinely
+    out-of-closure: AP-side ingest, the standalone post-commit calibration hook, and
+    tenant-registry). **read-fork 5→0** — EVERY in-serve audit reader is now on the
+    Handle (the quote-intake poll/auth-paused/notifications/get-audit reads +
+    the deleted mirror-sync helper). serve.rs runtime openers 81→**62**;
+    `service.rs` (the intake daemon) drops to **0** openers.
 - **CANONICAL RECIPE — a `verify_chain` audit fn on the Handle** (resolved in
   wave-2c; the audit-ledger crate already supports it — `Ledger::from_connection`
   at `crates/audit-ledger/src/storage/mod.rs` + its test

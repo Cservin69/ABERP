@@ -2074,7 +2074,9 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     let push_handle = st.catalogue_push.clone();
                     let push_credential = st.storefront_credential.clone();
                     let deps = QuoteIntakeDeps {
-                        db_path: (*st.db_path).clone(),
+                        // ADR-0099 H3 STEP 4d — the daemon routes all quote_intake_log
+                        // access through the shared Handle (clone of state.db).
+                        db: st.db.clone(),
                         tenant: st.tenant.clone(),
                         binary_hash,
                         operator_login,
@@ -16719,26 +16721,9 @@ pub fn delete_invoice_draft_request(
     Ok(outcome)
 }
 
-/// Best-effort audit-mirror sync after a successful write transaction.
-/// Mirrors the inventory route's posture: the canonical row already
-/// landed in the DB tx; a mirror failure should not poison the
-/// operator's response, and the next write (or boot) will heal per
-/// ADR-0030 §6's bootstrap-from-DB posture.
-fn sync_audit_mirror_best_effort(
-    db_path: &std::path::Path,
-    tenant: aberp_audit_ledger::TenantId,
-    binary_hash: aberp_audit_ledger::BinaryHash,
-) {
-    let mirror_path = aberp_audit_ledger::mirror_path_for(db_path);
-    if let Ok(ledger) = Ledger::open(db_path, tenant, binary_hash) {
-        if let Err(e) = ledger.sync_mirror(&mirror_path) {
-            tracing::warn!(
-                error = ?e,
-                "work-order mirror sync failed; will heal on next write"
-            );
-        }
-    }
-}
+// ADR-0099 H3 STEP 4d — `sync_audit_mirror_best_effort` is gone: every migrated
+// writer now lets the shared `WriteGuard` drop lockstep-sync the mirror, so no
+// route re-opens a fresh `Ledger` for the sync.
 
 // ──────────────────────────────────────────────────────────────────────
 // S177 / PR-177 — AP module v1 BACKEND routes.
@@ -21230,7 +21215,7 @@ async fn handle_list_quote_intake(headers: HeaderMap, State(state): State<AppSta
         Ok(h) => h,
         Err(e) => return internal_error("handle_list_quote_intake:binary_hash", anyhow!(e)),
     };
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant_id_string = state.tenant.as_str().to_string();
     let tenant_for_ledger = state.tenant.clone();
     // S325 / PR-25 — the read-side seam pushes any FALSE→TRUE stock_alert
@@ -21240,20 +21225,21 @@ async fn handle_list_quote_intake(headers: HeaderMap, State(state): State<AppSta
     // task so the enqueue does not block the list response.
     let rerender_queue = state.quote_pdf_rerender_queue.clone();
     let rows = match tokio::task::spawn_blocking(move || -> Result<_> {
-        let mut conn = duckdb::Connection::open(&db_path)
-            .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
-        let listing = quote_intake_query_mod::list_quote_intake_rows(&conn, &tenant_id_string)?;
+        // ADR-0099 H3 STEP 4d — quote_intake_log is a Handle family. The list
+        // read AND the stock-alert flip (`flip_and_audit_in_tx`) ride the ONE
+        // shared writer, so the read sees WAL-resident intake writes and the
+        // flip UPDATE + audit stay atomic on the live instance. Guard drop syncs.
+        let mut guard = db.write().context("shared writer for quote-intake list")?;
+        let listing = quote_intake_query_mod::list_quote_intake_rows(&guard, &tenant_id_string)?;
         // S275 / PR-264 / F2 + F16 — persist + audit one entry per
         // newly-triggered alert via `flip_and_audit_in_tx`. The flip
         // (guarded UPDATE) and the `QuoteStockAlertTriggered` audit append
         // share ONE tx; either both land or neither does.
         // S325 / PR-25 — the same tx now also appends
         // `QuotePdfRerenderEnqueued` and (post-commit) pushes the quote
-        // into `rerender_queue`. Extracted into
-        // `persist_alerts_and_enqueue_rerender` so the detection→enqueue
-        // path is unit-testable without an HTTP server.
+        // into `rerender_queue`.
         quote_intake_query_mod::persist_alerts_and_enqueue_rerender(
-            &mut conn,
+            &mut guard,
             &tenant_for_ledger,
             binary_hash,
             &operator_login,
@@ -21334,8 +21320,8 @@ pub fn pickup_quote_as_draft_request(
     operator_login: &str,
     quote_id: &str,
 ) -> Result<quote_pickup::PickupQuoteOutcome> {
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4d — the pickup saga writes invoice_draft + quote_intake_log
+    // + audit in ONE tx; both are Handle families, so it rides the shared writer.
     let binary_hash = state
         .binary_hash
         .wait()
@@ -21343,18 +21329,28 @@ pub fn pickup_quote_as_draft_request(
     let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
 
-    // Compute retry counter via an audit-walk so the F8 anchor stays
-    // fresh on a re-pickup after S239 delete. Open a separate Ledger
-    // handle for the read — the route's tx hasn't started yet so
-    // there's no contention.
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open ledger for pickup retry-count walk")?;
-    let prior = quote_pickup::count_prior_pickups(&ledger, quote_id)
-        .context("count prior InvoicePickedUpFromQuote entries")?;
+    // Compute retry counter via an audit-walk so the F8 anchor stays fresh on a
+    // re-pickup after S239 delete. Read the ledger through the shared Handle
+    // (`Ledger::from_connection` on a `db.read()` try_clone) — a fresh
+    // `Ledger::open` would truncate/tear the live Handle WAL. The owned read
+    // clone drops before the write guard is acquired below.
+    let prior = {
+        let ledger = Ledger::from_connection(
+            state
+                .db
+                .read()
+                .context("shared reader for pickup retry-count walk")?,
+            state.tenant.clone(),
+            binary_hash,
+        );
+        quote_pickup::count_prior_pickups(&ledger, quote_id)
+            .context("count prior InvoicePickedUpFromQuote entries")?
+    };
     let idempotency_key = quote_pickup::pickup_idempotency_key(quote_id, prior);
 
+    let mut guard = state.db.write().context("shared writer for pickup saga")?;
     let outcome = quote_pickup::pickup_quote_as_draft(
-        &mut conn,
+        &mut guard,
         &ledger_meta,
         ledger_actor,
         quote_pickup::PickupQuoteInputs {
@@ -21364,9 +21360,9 @@ pub fn pickup_quote_as_draft_request(
             idempotency_key,
         },
     )?;
-    if !outcome.was_existing {
-        sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
-    }
+    // Guard drop lockstep-syncs the audit mirror (was a conditional
+    // `sync_audit_mirror_best_effort`).
+    drop(guard);
     Ok(outcome)
 }
 
@@ -21385,8 +21381,17 @@ fn latest_quote_intake_poll(state: &AppState) -> Result<Option<QuoteIntakeLastPo
         .binary_hash
         .wait()
         .context("await background binary hash for quote-intake poll lookup")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for quote-intake poll lookup")?;
+    // ADR-0099 H3 STEP 4d — read the audit ledger through the shared Handle
+    // (`Ledger::from_connection` on a `db.read()` try_clone), not a fresh
+    // `Ledger::open` that would fold/tear the live Handle WAL.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("shared reader for quote-intake poll lookup")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger
         .entries()
         .context("read audit ledger entries for quote-intake poll lookup")?;
@@ -21435,8 +21440,15 @@ fn quote_intake_auth_paused(state: &AppState) -> Result<bool> {
         .binary_hash
         .wait()
         .context("await binary hash for quote-intake auth-paused lookup")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open ledger for quote-intake auth-paused lookup")?;
+    // ADR-0099 H3 STEP 4d — read the audit ledger through the shared Handle.
+    let ledger = Ledger::from_connection(
+        state
+            .db
+            .read()
+            .context("shared reader for quote-intake auth-paused lookup")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger
         .entries()
         .context("read entries for quote-intake auth-paused lookup")?;
@@ -22486,8 +22498,14 @@ fn get_audit_for_quote(
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for quote audit")?;
+    // ADR-0099 H3 STEP 4d — read the audit ledger through the shared Handle
+    // (quote_intake writers are on the Handle now, so a fresh `Ledger::open` here
+    // would read a folded subset).
+    let ledger = Ledger::from_connection(
+        state.db.read().context("shared reader for quote audit")?,
+        state.tenant.clone(),
+        binary_hash,
+    );
     let entries = ledger.entries().context("read audit ledger entries")?;
     let (page, total) = paginate_quote_audit_entries(&entries, quote_id, limit, offset);
     let views = page.into_iter().map(audit_view_of).collect();
@@ -22705,7 +22723,7 @@ async fn handle_quote_intake_notifications(
     let live_ready = boundary != i64::MAX;
     let auth_paused = quote_intake_auth_paused(&state).unwrap_or(false);
 
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.as_str().to_string();
     let binary_hash = match state.binary_hash.wait() {
         Ok(h) => h,
@@ -22714,12 +22732,14 @@ async fn handle_quote_intake_notifications(
         }
     };
     let tenant_for_ledger = state.tenant.clone();
-    let db_for_ledger = (*state.db_path).clone();
 
     let result =
         tokio::task::spawn_blocking(move || -> Result<QuoteIntakeNotifications> {
-            let conn = duckdb::Connection::open(&db_path)
-                .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
+            // ADR-0099 H3 STEP 4d — quote_intake_log + the audit ledger are Handle
+            // families; read both through the shared Handle (owned try_clones).
+            let conn = db
+                .read()
+                .context("shared reader for quote-intake notifications")?;
             let unpicked_count = aberp_quote_intake::log_table::count_unpicked(&conn, &tenant)
                 .context("count un-picked quotes")?;
             let errored_count = aberp_quote_intake::log_table::count_errored(&conn, &tenant)
@@ -22734,8 +22754,12 @@ async fn handle_quote_intake_notifications(
             // boundary whose quote is still staged + un-picked.
             let mut live_arrivals: Vec<QuoteArrival> = Vec::new();
             if live_ready {
-                let ledger = Ledger::open(&db_for_ledger, tenant_for_ledger, binary_hash)
-                    .context("open ledger for quote-intake arrivals")?;
+                let ledger = Ledger::from_connection(
+                    db.read()
+                        .context("shared reader for quote-intake arrivals")?,
+                    tenant_for_ledger,
+                    binary_hash,
+                );
                 let entries = ledger.entries().context("read entries for arrivals")?;
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for entry in entries {
@@ -22799,14 +22823,17 @@ async fn handle_quote_intake_retry_parse(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.as_str().to_string();
     let quote_id_task = quote_id.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<RetryParseResult> {
-        let conn = duckdb::Connection::open(&db_path)
-            .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
+        // ADR-0099 H3 STEP 4d — quote_intake_log is a Handle family; the raw-read
+        // + the retry-parse UPDATE ride the ONE shared writer.
+        let guard = db
+            .write()
+            .context("shared writer for quote-intake retry-parse")?;
         let Some((raw, _state)) =
-            aberp_quote_intake::log_table::read_raw_and_state(&conn, &tenant, &quote_id_task)
+            aberp_quote_intake::log_table::read_raw_and_state(&guard, &tenant, &quote_id_task)
                 .context("read raw payload for retry-parse")?
         else {
             return Ok(RetryParseResult::NotFound);
@@ -22826,7 +22853,7 @@ async fn handle_quote_intake_retry_parse(
                     .context("serialize re-parsed prepared draft")?;
                 let invoice_id = outcome.invoice_id.to_prefixed_string();
                 let n = aberp_quote_intake::log_table::retry_parse_intake(
-                    &conn,
+                    &guard,
                     &tenant,
                     &quote_id_task,
                     &invoice_id,
@@ -22891,13 +22918,16 @@ async fn handle_quote_intake_mark_irrelevant(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = (*state.db_path).clone();
+    let db = state.db.clone();
     let tenant = state.tenant.as_str().to_string();
     let quote_id_task = quote_id.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<usize> {
-        let conn = duckdb::Connection::open(&db_path)
-            .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
-        aberp_quote_intake::log_table::mark_irrelevant(&conn, &tenant, &quote_id_task)
+        // ADR-0099 H3 STEP 4d — quote_intake_log is a Handle family; the flip
+        // UPDATE rides the shared writer.
+        let guard = db
+            .write()
+            .context("shared writer for quote-intake mark-irrelevant")?;
+        aberp_quote_intake::log_table::mark_irrelevant(&guard, &tenant, &quote_id_task)
             .context("mark quote irrelevant")
     })
     .await;
@@ -22939,9 +22969,12 @@ async fn handle_list_inventory_balances(
     let state_for_task = state.clone();
     let result =
         tokio::task::spawn_blocking(move || -> Result<Vec<crate::material_inventory::Balance>> {
-            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // ADR-0099 H3 STEP 4d — material_inventory is a Handle family; read via
+            // the shared Handle (a fresh open would miss WAL-resident heat-lot writes).
+            let conn = state_for_task
+                .db
+                .read()
+                .context("shared reader for list_inventory_balances")?;
             crate::material_inventory::list_balances_for_tenant(
                 &conn,
                 state_for_task.tenant.as_str(),
@@ -22992,31 +23025,31 @@ async fn handle_assign_heat_lot(
                 .binary_hash
                 .wait()
                 .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
-            let assignment = {
-                let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                    format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-                })?;
-                crate::material_inventory::assign_heat_lot(
-                    &conn,
-                    state_for_task.tenant.as_str(),
-                    &grade,
-                    &body.heat_lot_number,
-                    body.mill_test_report_url.as_deref().unwrap_or(""),
-                    &operator_login,
-                )?
-                // conn dropped here — Ledger opens its own writer next.
-            };
-            crate::material_inventory::append_heat_lot_events(
-                &state_for_task.db_path,
-                state_for_task.tenant.clone(),
-                binary_hash,
-                &assignment,
+            // ADR-0099 H3 STEP 4d — material_inventory is a Handle family. The
+            // `inventory_balances` heat-lot UPDATE and the heat-lot audit ride ONE
+            // tx on the shared Handle writer (was a fresh `Connection::open` UPDATE
+            // + a SEPARATE fresh `Ledger::open` append — the rule-15 tear). Guard
+            // drop lockstep-syncs the mirror.
+            let mut guard = state_for_task
+                .db
+                .write()
+                .map_err(|e| anyhow!("shared writer for assign_heat_lot: {e}"))?;
+            let meta =
+                aberp_audit_ledger::LedgerMeta::new(state_for_task.tenant.clone(), binary_hash);
+            let tx = guard
+                .transaction()
+                .context("begin assign_heat_lot transaction")?;
+            let assignment = crate::material_inventory::assign_heat_lot(
+                &tx,
+                state_for_task.tenant.as_str(),
+                &grade,
+                &body.heat_lot_number,
+                body.mill_test_report_url.as_deref().unwrap_or(""),
+                &operator_login,
             )?;
-            sync_audit_mirror_best_effort(
-                &state_for_task.db_path,
-                state_for_task.tenant.clone(),
-                binary_hash,
-            );
+            crate::material_inventory::append_heat_lot_events(&tx, &meta, &assignment)?;
+            tx.commit().context("commit assign_heat_lot transaction")?;
+            drop(guard);
             Ok(assignment)
         },
     )
@@ -24025,7 +24058,10 @@ async fn handle_list_inspection_plans(
     }
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<aberp_qa::InspectionPlan>> {
-        let conn = Connection::open(&*state_for_task.db_path)?;
+        // ADR-0099 H3 STEP 4d — inspection_plans is a Handle family (the qc
+        // record-inspection path reads plans through the Handle write guard); read
+        // via the shared Handle so a WAL-resident plan write is visible.
+        let conn = state_for_task.db.read()?;
         aberp_qa::list_inspection_plans(
             &conn,
             state_for_task.tenant.as_str(),
@@ -24095,10 +24131,14 @@ async fn handle_create_inspection_plan(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<aberp_qa::InspectionPlan, aberp_qa::QcError> {
-            let conn = Connection::open(&*state_for_task.db_path)
-                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
+            // ADR-0099 H3 STEP 4d — inspection_plans is a Handle family; the INSERT
+            // rides the shared Handle writer (a fresh open would tear its WAL).
+            let guard = state_for_task
+                .db
+                .write()
+                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("shared writer: {e}")))?;
             aberp_qa::create_inspection_plan(
-                &conn,
+                &guard,
                 state_for_task.tenant.as_str(),
                 aberp_qa::NewInspectionPlan {
                     product_id: body.product_id,
@@ -24139,10 +24179,13 @@ async fn handle_update_inspection_plan(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<aberp_qa::InspectionPlan, aberp_qa::QcError> {
-            let conn = Connection::open(&*state_for_task.db_path)
-                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
+            // ADR-0099 H3 STEP 4d — inspection_plans is a Handle family.
+            let guard = state_for_task
+                .db
+                .write()
+                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("shared writer: {e}")))?;
             aberp_qa::update_inspection_plan(
-                &conn,
+                &guard,
                 state_for_task.tenant.as_str(),
                 &plan_id,
                 aberp_qa::NewInspectionPlan {
@@ -24183,9 +24226,12 @@ async fn handle_archive_inspection_plan(
     let state_for_task = state.clone();
     let result =
         tokio::task::spawn_blocking(move || -> std::result::Result<(), aberp_qa::QcError> {
-            let conn = Connection::open(&*state_for_task.db_path)
-                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
-            aberp_qa::archive_inspection_plan(&conn, state_for_task.tenant.as_str(), &plan_id)
+            // ADR-0099 H3 STEP 4d — inspection_plans is a Handle family.
+            let guard = state_for_task
+                .db
+                .write()
+                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("shared writer: {e}")))?;
+            aberp_qa::archive_inspection_plan(&guard, state_for_task.tenant.as_str(), &plan_id)
         })
         .await;
     match result {
@@ -24850,8 +24896,13 @@ pub fn run_deal_saga_request(
     deal_token: String,
     refresh_ack: Option<String>,
 ) -> Result<crate::quote_deal::DealSagaOutcome> {
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4d — the DEAL saga writes quote_intake_log +
+    // inventory_balances/reservations + audit in ONE tx (and cross-reads
+    // quote_pricing_jobs' margin flag), so it rides the shared Handle writer.
+    // quote_intake_log + material_inventory + invoice_draft are all Handle
+    // families now; the margin cross-read is Handle-coherent with the (already
+    // Handle) pricing pipeline. Guard drop lockstep-syncs the audit mirror.
+    let mut guard = state.db.write().context("shared writer for DEAL saga")?;
     let binary_hash = state
         .binary_hash
         .wait()
@@ -24860,7 +24911,7 @@ pub fn run_deal_saga_request(
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
 
     crate::quote_deal::run_deal_saga(
-        &mut conn,
+        &mut guard,
         &ledger_meta,
         ledger_actor,
         crate::quote_deal::DealSagaInputs {
@@ -25064,8 +25115,10 @@ pub fn run_refuse_saga_request(
     quote_id: &str,
     reason: String,
 ) -> Result<crate::quote_refuse::RefuseOutcome> {
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0099 H3 STEP 4d — the refuse saga writes quote_intake_log + audit in ONE
+    // tx; quote_intake_log is a Handle family, so it rides the shared writer.
+    // Guard drop lockstep-syncs the audit mirror.
+    let mut guard = state.db.write().context("shared writer for refuse saga")?;
     let binary_hash = state
         .binary_hash
         .wait()
@@ -25074,7 +25127,7 @@ pub fn run_refuse_saga_request(
     let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
 
     crate::quote_refuse::run_refuse_saga(
-        &mut conn,
+        &mut guard,
         &ledger_meta,
         ledger_actor,
         crate::quote_refuse::RefuseSagaInputs {

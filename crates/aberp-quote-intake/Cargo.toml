@@ -28,6 +28,11 @@ tracing = { workspace = true }
 ulid = { workspace = true }
 aberp-audit-ledger = { path = "../audit-ledger" }
 aberp-billing = { path = "../../modules/billing" }
+# ADR-0099 H3 STEP 4d — the daemon routes all quote_intake_log writes/reads
+# through the shared process-wide DuckDB Handle (the whole-subsystem-daemon rule),
+# so quote_intake_log stays a single-instance family alongside the DEAL/pickup
+# sagas that also write it. A fresh `Connection::open` here would tear the WAL.
+aberp-db = { path = "../aberp-db" }
 duckdb = { workspace = true }
 time = { workspace = true }
 rust_decimal = { workspace = true }
