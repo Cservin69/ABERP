@@ -446,7 +446,9 @@ async fn run_cycle_inner(
         // returns so the queryInvoiceData HTTP calls are NOT held on
         // the blocking pool.
         let digests = page_result.digests;
-        let db_path = inputs.db_path.clone();
+        // H3 (ADR-0099) STEP 4e — ingest through the ONE shared Handle (clone the
+        // Arc into the blocking task), not a fresh `Connection::open` per digest.
+        let db = inputs.db.clone();
         let tenant = inputs.tenant.clone();
         let binary_hash = inputs.binary_hash;
         let operator_login = inputs.operator_login.clone();
@@ -459,7 +461,7 @@ async fn run_cycle_inner(
                 match digest_to_ingestion_input(&digest) {
                     Ok(input) => {
                         match incoming_invoices::ingest_incoming_invoice(
-                            &db_path,
+                            &db,
                             tenant.clone(),
                             binary_hash,
                             &operator_login,
@@ -481,7 +483,7 @@ async fn run_cycle_inner(
                                 // here is non-fatal: surface as warn
                                 // and skip the row this cycle.
                                 match incoming_invoices::get_nav_xml_path(
-                                    &db_path,
+                                    &db,
                                     tenant.as_str(),
                                     &id,
                                 ) {
@@ -545,7 +547,7 @@ async fn run_cycle_inner(
                 &transport,
                 &inputs.credentials,
                 &inputs.tax_number_8,
-                &inputs.db_path,
+                &inputs.db,
                 &inputs.tenant,
                 &inputs.ap_artifacts_dir,
                 &target,
@@ -601,7 +603,7 @@ async fn fetch_and_persist_xml_for_row(
     transport: &NavTransport,
     credentials: &NavCredentials,
     tax_number_8: &str,
-    db_path: &std::path::Path,
+    db: &aberp_db::HandleArc,
     tenant: &TenantId,
     ap_artifacts_dir: &std::path::Path,
     target: &XmlFetchTarget,
@@ -622,7 +624,7 @@ async fn fetch_and_persist_xml_for_row(
     })?;
 
     let response_xml = outcome.response_xml;
-    let db_path_owned = db_path.to_path_buf();
+    let db_owned = db.clone();
     let tenant_owned = tenant.clone();
     let artifacts_dir_owned = ap_artifacts_dir.to_path_buf();
     let target_id = target.id.clone();
@@ -630,7 +632,7 @@ async fn fetch_and_persist_xml_for_row(
     tokio::task::spawn_blocking(move || -> Result<()> {
         persist_xml_for_row(
             &response_xml,
-            &db_path_owned,
+            &db_owned,
             tenant_owned.as_str(),
             &artifacts_dir_owned,
             &target_id,
@@ -667,7 +669,7 @@ async fn fetch_and_persist_xml_for_row(
 ///                                           worth surfacing for triage).
 fn persist_xml_for_row(
     response_xml: &[u8],
-    db_path: &std::path::Path,
+    db: &aberp_db::Handle,
     tenant: &str,
     ap_artifacts_dir: &std::path::Path,
     ap_invoice_id: &str,
@@ -733,18 +735,13 @@ fn persist_xml_for_row(
     let file_path = ap_artifacts_dir.join(format!("{}.xml", ap_invoice_id));
     std::fs::write(&file_path, &inner)
         .with_context(|| format!("write AP NAV XML artifact to {}", file_path.display()))?;
-    incoming_invoices::set_nav_xml_path(
-        db_path,
-        tenant,
-        ap_invoice_id,
-        &file_path.to_string_lossy(),
-    )
-    .with_context(|| {
-        format!(
-            "UPDATE ap_invoice.nav_xml_path for ap_invoice_id={}",
-            ap_invoice_id
-        )
-    })?;
+    incoming_invoices::set_nav_xml_path(db, tenant, ap_invoice_id, &file_path.to_string_lossy())
+        .with_context(|| {
+            format!(
+                "UPDATE ap_invoice.nav_xml_path for ap_invoice_id={}",
+                ap_invoice_id
+            )
+        })?;
     Ok(())
 }
 
@@ -1691,7 +1688,7 @@ mod tests {
             nav_xml: None,
         };
         let outcome = incoming_invoices::ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             binary_hash,
             "operator",
@@ -1705,7 +1702,12 @@ mod tests {
         };
         // Pre-condition — fresh ingest has no XML path.
         assert_eq!(
-            incoming_invoices::get_nav_xml_path(&db_path, tenant.as_str(), &id).unwrap(),
+            incoming_invoices::get_nav_xml_path(
+                &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+                tenant.as_str(),
+                &id
+            )
+            .unwrap(),
             None
         );
 
@@ -1719,7 +1721,7 @@ mod tests {
 
         persist_xml_for_row(
             response_xml.as_bytes(),
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.as_str(),
             &artifacts_dir,
             &id,
@@ -1733,9 +1735,13 @@ mod tests {
         assert_eq!(bytes, inner);
 
         // The row's nav_xml_path now points at the file.
-        let path = incoming_invoices::get_nav_xml_path(&db_path, tenant.as_str(), &id)
-            .unwrap()
-            .expect("nav_xml_path must be populated");
+        let path = incoming_invoices::get_nav_xml_path(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.as_str(),
+            &id,
+        )
+        .unwrap()
+        .expect("nav_xml_path must be populated");
         assert_eq!(path, file_path.to_string_lossy());
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1777,7 +1783,11 @@ mod tests {
         </QueryInvoiceDataResponse>";
         persist_xml_for_row(
             response_xml,
-            &db_path,
+            &aberp_db::Handle::open_default(
+                &db_path,
+                aberp_audit_ledger::TenantId::new("t1".to_string()).unwrap(),
+            )
+            .unwrap(),
             "t1",
             &artifacts_dir,
             "apinv_01HRQXYZABCDEFGHJKMNPQRST",
@@ -1827,7 +1837,11 @@ mod tests {
         </QueryInvoiceDataResponse>";
         persist_xml_for_row(
             response_xml,
-            &db_path,
+            &aberp_db::Handle::open_default(
+                &db_path,
+                aberp_audit_ledger::TenantId::new("t1".to_string()).unwrap(),
+            )
+            .unwrap(),
             "t1",
             &artifacts_dir,
             id,
@@ -1873,7 +1887,11 @@ mod tests {
 
         persist_xml_for_row(
             response_xml,
-            &db_path,
+            &aberp_db::Handle::open_default(
+                &db_path,
+                aberp_audit_ledger::TenantId::new("t1".to_string()).unwrap(),
+            )
+            .unwrap(),
             "t1",
             &artifacts_dir,
             id,
@@ -1924,7 +1942,11 @@ mod tests {
 
         persist_xml_for_row(
             response_xml,
-            &db_path,
+            &aberp_db::Handle::open_default(
+                &db_path,
+                aberp_audit_ledger::TenantId::new("t1".to_string()).unwrap(),
+            )
+            .unwrap(),
             "t1",
             &artifacts_dir,
             id,
@@ -1975,7 +1997,11 @@ mod tests {
         </QueryInvoiceDataResponse>";
         let err = persist_xml_for_row(
             response_xml,
-            &db_path,
+            &aberp_db::Handle::open_default(
+                &db_path,
+                aberp_audit_ledger::TenantId::new("t1".to_string()).unwrap(),
+            )
+            .unwrap(),
             "t1",
             &artifacts_dir,
             id,
@@ -2035,7 +2061,7 @@ mod tests {
             nav_xml: None,
         };
         let outcome = incoming_invoices::ingest_incoming_invoice(
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.clone(),
             binary_hash,
             "operator",
@@ -2055,7 +2081,7 @@ mod tests {
         );
         persist_xml_for_row(
             response_xml.as_bytes(),
-            &db_path,
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
             tenant.as_str(),
             &artifacts_dir,
             &id,

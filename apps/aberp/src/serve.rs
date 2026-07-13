@@ -525,8 +525,13 @@ fn bootstrap_demo_tenant(binary_hash: &BinaryHashHandle) -> Result<()> {
         slug: tenant_registry::DEMO_SLUG.to_string(),
         display_name: tenant_registry::DEMO_DISPLAY_NAME.to_string(),
     };
+    // H3 (ADR-0099) STEP 4e — the demo ledger is a DIFFERENT db file from the
+    // running tenant's; open a short-lived Handle on it (this runs at boot, before
+    // the shared serve Handle opens — no co-residence) and append through it.
+    let demo_db = aberp_db::Handle::open_default(&db, demo_tenant.clone())
+        .context("open demo tenant Handle for TenantDemoSeeded audit")?;
     tenant_registry::emit_tenant_event(
-        &db,
+        &demo_db,
         demo_tenant,
         bh,
         "system-demo-seed",
@@ -534,6 +539,7 @@ fn bootstrap_demo_tenant(binary_hash: &BinaryHashHandle) -> Result<()> {
         payload.to_bytes(),
     )
     .context("record TenantDemoSeeded in demo tenant ledger")?;
+    drop(demo_db);
     reg.add_demo(now)
         .map_err(|e| anyhow!("seed demo tenant: {e}"))?;
     reg.write_to(&path)?;
@@ -669,15 +675,25 @@ fn record_tenant_boot(
                 let payload = audit_payloads::TenantSellerSetupOptionalPayload {
                     slug: args.tenant.clone(),
                 };
-                if let Err(e) = crate::tenant_registry::emit_tenant_event(
-                    &args.db,
-                    tenant.clone(),
-                    bh,
-                    NAV_DISABLED_LOGIN,
-                    EventKind::TenantSellerSetupOptional,
-                    payload.to_bytes(),
-                ) {
-                    tracing::warn!(error = ?e, "could not record TenantSellerSetupOptional audit");
+                // H3 (ADR-0099) STEP 4e — record_tenant_boot runs BEFORE the shared
+                // serve Handle opens, so open a short-lived Handle on the running
+                // tenant's db for the append (no co-residence with the shared Handle).
+                match aberp_db::Handle::open_default(&args.db, tenant.clone()) {
+                    Ok(db) => {
+                        if let Err(e) = crate::tenant_registry::emit_tenant_event(
+                            &db,
+                            tenant.clone(),
+                            bh,
+                            NAV_DISABLED_LOGIN,
+                            EventKind::TenantSellerSetupOptional,
+                            payload.to_bytes(),
+                        ) {
+                            tracing::warn!(error = ?e, "could not record TenantSellerSetupOptional audit");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "could not open Handle for TenantSellerSetupOptional audit")
+                    }
                 }
             }
             Err(e) => {
@@ -694,15 +710,25 @@ fn record_tenant_boot(
                 from_slug: from.to_string(),
                 to_slug: args.tenant.clone(),
             };
-            if let Err(e) = crate::tenant_registry::emit_tenant_event(
-                &args.db,
-                tenant.clone(),
-                bh,
-                "tenant-switch",
-                EventKind::TenantSwitched,
-                payload.to_bytes(),
-            ) {
-                tracing::warn!(error = ?e, "could not record TenantSwitched audit in switched-to tenant ledger");
+            // H3 (ADR-0099) STEP 4e — same boot-phase short-lived Handle as above:
+            // the switched-TO (now running) tenant's ledger, before the shared
+            // serve Handle opens.
+            match aberp_db::Handle::open_default(&args.db, tenant.clone()) {
+                Ok(db) => {
+                    if let Err(e) = crate::tenant_registry::emit_tenant_event(
+                        &db,
+                        tenant.clone(),
+                        bh,
+                        "tenant-switch",
+                        EventKind::TenantSwitched,
+                        payload.to_bytes(),
+                    ) {
+                        tracing::warn!(error = ?e, "could not record TenantSwitched audit in switched-to tenant ledger");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "could not open Handle for TenantSwitched audit")
+                }
             }
         }
         Err(e) => {
@@ -4626,8 +4652,13 @@ fn create_tenant_request(
         created_at: created_at.clone(),
         creator_login: operator_login.to_string(),
     };
+    // H3 (ADR-0099) STEP 4e — the new tenant's ledger is a fresh, DIFFERENT db
+    // file; open a short-lived Handle on it (no co-residence with the running
+    // tenant's shared Handle) and append TenantCreated through it.
+    let new_db = aberp_db::Handle::open_default(&db, new_tenant.clone())
+        .context("open new tenant Handle for TenantCreated audit")?;
     crate::tenant_registry::emit_tenant_event(
-        &db,
+        &new_db,
         new_tenant,
         binary_hash,
         operator_login,
@@ -4635,6 +4666,7 @@ fn create_tenant_request(
         payload.to_bytes(),
     )
     .context("record TenantCreated in new tenant ledger")?;
+    drop(new_db);
 
     // Commit the registry row last.
     reg.add(&req.slug, &req.display_name, now)?;
@@ -4704,7 +4736,7 @@ fn switch_tenant_request(
         operator_login: operator_login.to_string(),
     };
     crate::tenant_registry::emit_tenant_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -4815,7 +4847,7 @@ fn transition_tenant_request(
         .to_bytes(),
     };
     crate::tenant_registry::emit_tenant_event(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -4896,7 +4928,7 @@ fn toggle_tenant_nav_request(
             operator_login: operator_login.to_string(),
         };
         crate::tenant_registry::emit_tenant_event(
-            &state.db_path,
+            &state.db,
             state.tenant.clone(),
             binary_hash,
             operator_login,
@@ -5409,7 +5441,7 @@ pub fn setup_seller_info_request(
             operator_login: operator_login.clone(),
         };
         if let Err(e) = crate::tenant_registry::emit_tenant_event(
-            &state.db_path,
+            &state.db,
             state.tenant.clone(),
             bh,
             &operator_login,
@@ -12036,41 +12068,54 @@ pub fn override_lead_time_request(
     operator_login: &str,
     binary_hash: BinaryHash,
 ) -> std::result::Result<(), MachineRouteError> {
-    // Scope the write connection (see `create_machine_request`); capture
-    // the computed value for the audit payload BEFORE writing.
-    let computed_days = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-        let Some(detail) =
-            crate::quote_pricing_jobs::get_job_detail(&conn, quote_id, state.tenant.as_str())?
-        else {
-            return Err(MachineRouteError::NotFound);
-        };
-        let applied = crate::quote_pricing_jobs::set_lead_time_override(
-            &conn,
-            quote_id,
-            state.tenant.as_str(),
-            override_days,
-            time::OffsetDateTime::now_utc(),
-        )?;
-        if !applied {
-            return Err(MachineRouteError::NotFound);
-        }
-        detail.lead_time_days
+    // H3 (ADR-0099) STEP 4e — the lead-time-override business write and its audit
+    // ride ONE tx on the ONE shared Handle writer (was a fresh `Connection::open`
+    // write-fork + a separate `state.db` audit guard). Capture the computed value
+    // for the audit payload BEFORE writing; the whole quote_pricing_jobs family is
+    // single-instance on the Handle (daemon + serve), so a Handle reader is
+    // coherent with this write.
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer for lead-time override")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for lead-time override")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .context("begin lead-time-override transaction on shared writer")?;
+    let Some(detail) =
+        crate::quote_pricing_jobs::get_job_detail(&tx, quote_id, state.tenant.as_str())?
+    else {
+        return Err(MachineRouteError::NotFound);
     };
+    let applied = crate::quote_pricing_jobs::set_lead_time_override(
+        &tx,
+        quote_id,
+        state.tenant.as_str(),
+        override_days,
+        time::OffsetDateTime::now_utc(),
+    )?;
+    if !applied {
+        return Err(MachineRouteError::NotFound);
+    }
+    let computed_days = detail.lead_time_days;
     let payload = crate::audit_payloads::QuoteLeadTimeOverriddenPayload {
         quote_id: quote_id.to_string(),
         computed_days,
         override_days,
     };
-    crate::quoting_machines::append_machine_event(
-        &state.db,
-        state.tenant.clone(),
-        binary_hash,
-        operator_login,
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
         EventKind::QuoteLeadTimeOverridden,
         payload.to_bytes(),
-    )?;
+        Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        None,
+    )
+    .context("append quote.lead_time_overridden audit entry")?;
+    tx.commit()
+        .context("commit lead-time-override transaction on shared writer")?;
     Ok(())
 }
 
@@ -12189,49 +12234,58 @@ pub fn set_quote_buyer_partner_request(
     binary_hash: BinaryHash,
 ) -> std::result::Result<(), QuoteMarginError> {
     let tenant = state.tenant.as_str();
-    // Scope the write connection (S427 single-writer-lock posture).
-    let reprice = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-        let stored_override =
-            match crate::quote_pricing_jobs::get_job_detail(&conn, quote_id, tenant)? {
-                Some(d) => d.margin_override_pct,
-                None => return Err(QuoteMarginError::NotFound),
-            };
-        let applied = crate::quote_pricing_jobs::set_buyer_partner(
-            &conn,
+    // H3 (ADR-0099) STEP 4e — the re-price business writes (buyer-partner +
+    // margin-result flag) and the margin-provenance audit ride ONE tx on the
+    // ONE shared Handle writer. Previously the business UPDATEs ran on a fresh
+    // `Connection::open` write-fork while the audit append rode `state.db`
+    // (`emit_reprice_provenance` → `append_machine_event`) — a split-brain that
+    // left the DEAL saga's Handle-side `margin_below_floor` read BLIND to the
+    // fork's below-floor write (the S428 fail-open, [[trust-code-not-operator]]).
+    // Business-write and audit on ONE guard/tx close it (rule 15).
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer for buyer-partner re-price")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for re-price provenance")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .context("begin buyer-partner re-price transaction on shared writer")?;
+    let stored_override = match crate::quote_pricing_jobs::get_job_detail(&tx, quote_id, tenant)? {
+        Some(d) => d.margin_override_pct,
+        None => return Err(QuoteMarginError::NotFound),
+    };
+    let applied = crate::quote_pricing_jobs::set_buyer_partner(
+        &tx,
+        quote_id,
+        tenant,
+        body.partner_id.as_deref(),
+        time::OffsetDateTime::now_utc(),
+    )?;
+    if !applied {
+        return Err(QuoteMarginError::NotFound);
+    }
+    // Re-price with the new buyer (reads buyer_partner_id from the row).
+    let outcome =
+        crate::quote_pricing_pipeline::reprice_quote(&tx, tenant, quote_id, stored_override)?;
+    if let Some(ref o) = outcome {
+        crate::quote_pricing_jobs::set_margin_result(
+            &tx,
             quote_id,
             tenant,
-            body.partner_id.as_deref(),
+            &o.breakdown_json,
+            o.total_price,
+            o.below_floor,
+            o.floor_pct,
             time::OffsetDateTime::now_utc(),
         )?;
-        if !applied {
-            return Err(QuoteMarginError::NotFound);
-        }
-        // Re-price with the new buyer (reads buyer_partner_id from the row).
-        let outcome =
-            crate::quote_pricing_pipeline::reprice_quote(&conn, tenant, quote_id, stored_override)?;
-        if let Some(ref o) = outcome {
-            crate::quote_pricing_jobs::set_margin_result(
-                &conn,
-                quote_id,
-                tenant,
-                &o.breakdown_json,
-                o.total_price,
-                o.below_floor,
-                o.floor_pct,
-                time::OffsetDateTime::now_utc(),
-            )?;
-        }
-        outcome
-    };
-    emit_reprice_provenance(
-        state,
-        quote_id,
-        operator_login,
-        binary_hash,
-        reprice.as_ref(),
-    )?;
+    }
+    // Margin-provenance audit on the SAME tx (was a forked `append_machine_event`
+    // guard in `emit_reprice_provenance`).
+    emit_reprice_provenance_in_tx(&tx, &meta, quote_id, operator_login, outcome.as_ref())?;
+    tx.commit()
+        .context("commit buyer-partner re-price transaction on shared writer")?;
     Ok(())
 }
 
@@ -12288,18 +12342,33 @@ pub fn override_quote_margin_request(
             ));
         }
     }
+    // H3 (ADR-0099) STEP 4e — one shared-Handle guard/tx for the whole request:
+    // candidate re-price, the state-guarded override + margin-result writes, AND
+    // the audit-of-record, so the business write and its audit commit atomically
+    // (rule 15) and the DEAL saga's Handle-side floor read is coherent with the
+    // write (was a fresh `Connection::open` fork + a separate `state.db` audit
+    // guard — the split-brain S428 fail-open, [[trust-code-not-operator]]).
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer for margin override")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for margin override")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .context("begin margin-override transaction on shared writer")?;
     // Re-price with the candidate override FIRST (no persistence yet) so a
     // below-floor override can be refused before it takes effect.
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let Some(outcome) =
-        crate::quote_pricing_pipeline::reprice_quote(&conn, tenant, quote_id, body.margin_pct)?
+        crate::quote_pricing_pipeline::reprice_quote(&tx, tenant, quote_id, body.margin_pct)?
     else {
         return Err(QuoteMarginError::NotFound);
     };
     // An operator-CHOSEN override that breaches the floor needs explicit
     // confirmation ([[trust-code-not-operator]]: the DEAL block still
     // applies regardless — this gate only governs saving the low margin).
+    // Returning here drops `tx` → rollback, so nothing persists on refusal.
     if body.margin_pct.is_some() && outcome.below_floor && !body.confirm_below_floor {
         return Err(QuoteMarginError::BelowFloorNeedsConfirm {
             realized_pct: outcome.realized_margin_pct,
@@ -12308,7 +12377,7 @@ pub fn override_quote_margin_request(
     }
     let now = time::OffsetDateTime::now_utc();
     let applied = crate::quote_pricing_jobs::set_margin_override(
-        &conn,
+        &tx,
         quote_id,
         tenant,
         body.margin_pct,
@@ -12318,7 +12387,7 @@ pub fn override_quote_margin_request(
         return Err(QuoteMarginError::NotFound);
     }
     crate::quote_pricing_jobs::set_margin_result(
-        &conn,
+        &tx,
         quote_id,
         tenant,
         &outcome.breakdown_json,
@@ -12327,21 +12396,22 @@ pub fn override_quote_margin_request(
         outcome.floor_pct,
         now,
     )?;
-    drop(conn);
 
-    // Audit: the override itself, plus the floor-breach acknowledgement.
+    // Audit on the SAME tx: the override itself, plus the floor-breach
+    // acknowledgement.
     let payload = crate::audit_payloads::QuoteMarginOverriddenPayload {
         quote_id: quote_id.to_string(),
         override_margin_pct: body.margin_pct,
     };
-    crate::quoting_machines::append_machine_event(
-        &state.db,
-        state.tenant.clone(),
-        binary_hash,
-        operator_login,
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
         EventKind::QuoteMarginOverridden,
         payload.to_bytes(),
-    )?;
+        Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        None,
+    )
+    .context("append quote.margin_overridden audit entry")?;
     if body.margin_pct.is_some() && outcome.below_floor && body.confirm_below_floor {
         let payload = crate::audit_payloads::QuoteMarginFloorOverriddenPayload {
             quote_id: quote_id.to_string(),
@@ -12349,27 +12419,33 @@ pub fn override_quote_margin_request(
             floor_pct: outcome.floor_pct.unwrap_or(0.0),
             reason: body.reason.unwrap_or_default(),
         };
-        crate::quoting_machines::append_machine_event(
-            &state.db,
-            state.tenant.clone(),
-            binary_hash,
-            operator_login,
+        aberp_audit_ledger::append_in_tx(
+            &tx,
+            &meta,
             EventKind::QuoteMarginFloorOverridden,
             payload.to_bytes(),
-        )?;
+            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+            None,
+        )
+        .context("append quote.margin_floor_overridden audit entry")?;
     }
+    tx.commit()
+        .context("commit margin-override transaction on shared writer")?;
     Ok(())
 }
 
 /// Emit the margin-provenance events (global-margin / below-floor) after a
-/// re-price triggered by a buyer-partner change. Mirrors the daemon's
-/// first-pricing emission so an operator-assigned buyer leaves the same
-/// trail. `None` outcome (un-extracted job) emits nothing.
-fn emit_reprice_provenance(
-    state: &AppState,
+/// re-price triggered by a buyer-partner change, ON the caller's shared-writer
+/// transaction. Mirrors the daemon's first-pricing emission so an
+/// operator-assigned buyer leaves the same trail. `None` outcome (un-extracted
+/// job) emits nothing. H3 (ADR-0099) STEP 4e: this rides the SAME tx as the
+/// business re-price write (was a forked `append_machine_event` on a separate
+/// `state.db` guard — the split-brain).
+fn emit_reprice_provenance_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    meta: &aberp_audit_ledger::LedgerMeta,
     quote_id: &str,
     operator_login: &str,
-    binary_hash: BinaryHash,
     outcome: Option<&crate::quote_pricing_pipeline::RepriceOutcome>,
 ) -> std::result::Result<(), QuoteMarginError> {
     let Some(o) = outcome else { return Ok(()) };
@@ -12378,14 +12454,15 @@ fn emit_reprice_provenance(
             quote_id: quote_id.to_string(),
             global_margin_base: o.applied_margin_base,
         };
-        crate::quoting_machines::append_machine_event(
-            &state.db,
-            state.tenant.clone(),
-            binary_hash,
-            operator_login,
+        aberp_audit_ledger::append_in_tx(
+            tx,
+            meta,
             EventKind::QuoteUsingGlobalMargin,
             payload.to_bytes(),
-        )?;
+            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+            None,
+        )
+        .context("append quote.using_global_margin audit entry")?;
     }
     if o.below_floor {
         let payload = crate::audit_payloads::QuoteMarginBelowFloorPayload {
@@ -12393,14 +12470,15 @@ fn emit_reprice_provenance(
             realized_margin_pct: o.realized_margin_pct,
             floor_pct: o.floor_pct.unwrap_or(0.0),
         };
-        crate::quoting_machines::append_machine_event(
-            &state.db,
-            state.tenant.clone(),
-            binary_hash,
-            operator_login,
+        aberp_audit_ledger::append_in_tx(
+            tx,
+            meta,
             EventKind::QuoteMarginBelowFloor,
             payload.to_bytes(),
-        )?;
+            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+            None,
+        )
+        .context("append quote.margin_below_floor audit entry")?;
     }
     Ok(())
 }
@@ -14916,10 +14994,11 @@ pub fn transition_work_order_request(
     tx.commit()
         .context("commit work-order transition transaction")?;
     // ADR-0099 H3 — DROP the Handle write guard BEFORE the post-commit calibration
-    // hook below, which fresh-opens `state.db_path` (quote_calibration is a
-    // deferred residual family). The guard drop lockstep-syncs the audit mirror
-    // (replacing the old `sync_audit_mirror_best_effort` `Ledger::open` fork), and
-    // dropping it first keeps the two writers from co-residing.
+    // hook below. STEP 4e migrated `record_calibration_for_completed_wo` onto the
+    // SAME shared Handle (`state.db`), so it acquires its OWN `state.db.write()`
+    // guard; dropping this one first is what keeps that from self-deadlocking on
+    // the single writer (rule 13). The guard drop also lockstep-syncs the audit
+    // mirror (replacing the old `sync_audit_mirror_best_effort` `Ledger::open` fork).
     drop(guard);
 
     // S429 — closed-loop calibration hook. Runs AFTER the Complete commit (the
@@ -14931,7 +15010,7 @@ pub fn transition_work_order_request(
         aberp_work_orders::WorkOrderState::Completed
     ) {
         if let Err(e) = crate::quote_calibration::record_calibration_for_completed_wo(
-            &state.db_path,
+            &state.db,
             &state.tenant,
             binary_hash,
             operator_login,
@@ -16791,10 +16870,10 @@ async fn handle_list_incoming_invoices(
         .unwrap_or(DEFAULT_INCOMING_LIST_LIMIT)
         .min(MAX_INCOMING_LIST_LIMIT);
     let offset = query.offset.unwrap_or(0);
-    let db_path = state.db_path.clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let result = tokio::task::spawn_blocking(move || {
-        incoming_invoices::list_incoming(&db_path, tenant.as_str(), status_filter, limit, offset)
+        incoming_invoices::list_incoming(&db, tenant.as_str(), status_filter, limit, offset)
     })
     .await;
     match result {
@@ -16818,11 +16897,11 @@ async fn handle_get_incoming_invoice(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = state.db_path.clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let id_for_task = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        incoming_invoices::get_incoming(&db_path, tenant.as_str(), &id_for_task)
+        incoming_invoices::get_incoming(&db, tenant.as_str(), &id_for_task)
     })
     .await;
     match result {
@@ -16870,11 +16949,11 @@ async fn handle_ingest_incoming_invoice(
         Ok(p) => p,
         Err(e) => return internal_error("ingest_incoming_invoice:artifacts_dir", e),
     };
-    let db_path = state.db_path.clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let result = tokio::task::spawn_blocking(move || {
         incoming_invoices::ingest_incoming_invoice(
-            &db_path,
+            &db,
             tenant,
             binary_hash,
             &operator_login,
@@ -16990,12 +17069,12 @@ async fn mark_incoming_status_inner(
         Ok(h) => h,
         Err(e) => return internal_error("mark_incoming_status:binary_hash", anyhow!(e)),
     };
-    let db_path = state.db_path.clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let id_for_task = id.clone();
     let result = tokio::task::spawn_blocking(move || {
         incoming_invoices::change_status(
-            &db_path,
+            &db,
             tenant,
             binary_hash,
             &operator_login,
@@ -17142,11 +17221,11 @@ async fn handle_get_incoming_invoice_xml(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = state.db_path.clone();
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let id_for_task = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        incoming_invoices::get_incoming(&db_path, tenant.as_str(), &id_for_task)
+        incoming_invoices::get_incoming(&db, tenant.as_str(), &id_for_task)
     })
     .await;
     let row = match result {
@@ -21529,10 +21608,14 @@ async fn handle_list_quote_pricing_jobs(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = (*state.db_path).clone();
+    // H3 (ADR-0099) STEP 4e — read on the ONE shared Handle reader so the list
+    // is coherent with the Handle-resident writers (daemon + serve routes).
+    let db = state.db.clone();
     let tenant_id = state.tenant.as_str().to_string();
     let rows = match tokio::task::spawn_blocking(move || -> Result<Vec<_>> {
-        let conn = duckdb::Connection::open(&db_path).context("open DB")?;
+        let conn = db
+            .read()
+            .context("acquire shared reader for pricing-jobs list")?;
         crate::quote_pricing_jobs::list_jobs(&conn, &tenant_id)
     })
     .await
@@ -21593,13 +21676,18 @@ async fn handle_retry_quote_pricing_job(
         )
             .into_response();
     }
-    let db_path = (*state.db_path).clone();
+    // H3 (ADR-0099) STEP 4e — the retry state-bump rides the ONE shared Handle
+    // writer (was a fresh `Connection::open` write-fork); retry_job self-manages
+    // its own DuckDB tx on the guard connection (no audit append here).
+    let db = state.db.clone();
     let tenant_id = state.tenant.as_str().to_string();
     let qid = quote_id.clone();
     let new_n = match tokio::task::spawn_blocking(move || -> Result<u32> {
-        let mut conn = duckdb::Connection::open(&db_path).context("open DB")?;
+        let mut guard = db
+            .write()
+            .context("acquire shared writer for pricing-job retry")?;
         let now = time::OffsetDateTime::now_utc();
-        crate::quote_pricing_jobs::retry_job(&mut conn, &qid, &tenant_id, now)
+        crate::quote_pricing_jobs::retry_job(&mut guard, &qid, &tenant_id, now)
     })
     .await
     {
@@ -21710,12 +21798,17 @@ async fn handle_get_quote_pricing_job_detail(
         )
             .into_response();
     }
-    let db_path = (*state.db_path).clone();
+    // H3 (ADR-0099) STEP 4e — read the detail on the ONE shared Handle reader so
+    // margin_below_floor / lead-time / buyer fields are coherent with the
+    // Handle-resident writers (daemon + serve routes).
+    let db = state.db.clone();
     let tenant_id = state.tenant.as_str().to_string();
     let qid = quote_id.clone();
     let detail = match tokio::task::spawn_blocking(
         move || -> Result<Option<crate::quote_pricing_jobs::JobDetail>> {
-            let conn = duckdb::Connection::open(&db_path).context("open DB")?;
+            let conn = db
+                .read()
+                .context("acquire shared reader for pricing-job detail")?;
             crate::quote_pricing_jobs::get_job_detail(&conn, &qid, &tenant_id)
         },
     )
@@ -21864,11 +21957,15 @@ async fn handle_get_quote_pricing_job_pdf(
         )
             .into_response();
     }
-    let db_path = (*state.db_path).clone();
+    // H3 (ADR-0099) STEP 4e — read the PDF-presence row on the ONE shared Handle
+    // reader (was a fresh `Connection::open`), coherent with the daemon's writes.
+    let db = state.db.clone();
     let tenant_id = state.tenant.as_str().to_string();
     let qid = quote_id.clone();
     let outcome = match tokio::task::spawn_blocking(move || -> Result<PricingJobPdfOutcome> {
-        let conn = duckdb::Connection::open(&db_path).context("open DB")?;
+        let conn = db
+            .read()
+            .context("acquire shared reader for pricing-job PDF")?;
         read_pricing_job_pdf(&conn, &qid, &tenant_id)
     })
     .await

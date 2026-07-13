@@ -24,7 +24,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
 use aberp_quote_engine::{
     coefficient, CalibrationSample, CalibrationTable, MachineFamily, QuoteBreakdown,
 };
@@ -180,27 +180,23 @@ fn read_quote_estimate(
     Ok(Some((family, estimated_total)))
 }
 
-/// Append calibration audit entries through one ledger open. Mirrors
-/// [`crate::quoting_machines::append_machine_event`] but batches the (recorded
-/// + possible shift) pair. The caller MUST drop its DuckDB write connection
-/// before calling this — opening the ledger is a second connection to the same
-/// file and a held write conn silently loses the append (the S427 bug).
-fn append_calibration_events(
-    db_path: &std::path::Path,
-    tenant: TenantId,
-    binary_hash: BinaryHash,
+/// Append calibration audit entries ON the caller's shared-writer transaction.
+/// Mirrors [`crate::quoting_machines::append_machine_event`] but batches the
+/// (recorded + possible shift) pair. H3 (ADR-0099) STEP 4e: was a forked
+/// `Ledger::open` (a SECOND connection that silently lost the append if the
+/// business write conn was still held — the S427 bug the old doc-comment
+/// warned about). Now it rides the SAME tx as the sample INSERT, so the
+/// business row and its audit-of-record are atomic (rule 15) and the fork is
+/// gone.
+fn append_calibration_events_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    meta: &LedgerMeta,
     operator_login: &str,
     events: Vec<(EventKind, Vec<u8>)>,
 ) -> Result<()> {
-    if events.is_empty() {
-        return Ok(());
-    }
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record calibration event")?;
     for (kind, payload) in events {
         let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
-        ledger
-            .append(kind, payload, actor, None)
+        aberp_audit_ledger::append_in_tx(tx, meta, kind, payload, actor, None)
             .context("append calibration audit entry")?;
     }
     Ok(())
@@ -217,7 +213,7 @@ fn append_calibration_events(
 /// Calibration is observational: a failure here is logged loud but never
 /// unwinds the WO Complete (that already committed).
 pub fn record_calibration_for_completed_wo(
-    db_path: &std::path::Path,
+    db: &aberp_db::Handle,
     tenant: &TenantId,
     binary_hash: BinaryHash,
     operator_login: &str,
@@ -230,48 +226,65 @@ pub fn record_calibration_for_completed_wo(
         return Ok(());
     };
 
-    let conn = Connection::open(db_path).context("open tenant DuckDB for calibration hook")?;
+    // H3 (ADR-0099) STEP 4e — the quote-estimate read, the sample INSERT, the
+    // before/after coefficient reads, AND the calibration audit all ride ONE tx
+    // on the ONE shared Handle writer (was a fresh `Connection::open` + a
+    // SEPARATE `Ledger::open` fork — the exact write-fork the old skip/drop
+    // choreography tiptoed around). Business row + audit are now atomic and the
+    // fork is gone. The caller drops its own WO-Complete guard before invoking
+    // this, so `db.write()` here does not self-deadlock (rule 13).
+    let mut guard = db
+        .write()
+        .context("acquire shared writer for calibration hook")?;
+    ensure_schema(&guard)?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for calibration hook")?;
+    let meta = LedgerMeta::new(tenant.clone(), binary_hash);
+    let tx = guard
+        .transaction()
+        .context("begin calibration transaction on shared writer")?;
 
-    let estimate = read_quote_estimate(&conn, tenant.as_str(), job_id)?;
+    let estimate = read_quote_estimate(&tx, tenant.as_str(), job_id)?;
 
-    // Skip helper: emit one skip audit and return. The conn is dropped first so
-    // the ledger append cannot race the write connection.
-    let skip = |conn: Connection, reason: &str| -> Result<()> {
-        drop(conn);
+    // Skip helper: emit one skip audit on the given tx and commit. `tx` is a
+    // PARAMETER (not captured) so the non-skip path keeps ownership of `tx`.
+    let commit_skip = |tx: duckdb::Transaction<'_>, reason: &str| -> Result<()> {
         let payload = QuoteCalibrationSampleSkippedPayload {
             quote_id: job_id.to_string(),
             work_order_id: work_order_id.to_string(),
             reason: reason.to_string(),
         };
-        append_calibration_events(
-            db_path,
-            tenant.clone(),
-            binary_hash,
+        append_calibration_events_in_tx(
+            &tx,
+            &meta,
             operator_login,
             vec![(EventKind::QuoteCalibrationSampleSkipped, payload.to_bytes())],
-        )
+        )?;
+        tx.commit()
+            .context("commit calibration skip on shared writer")
     };
 
     let Some((family, estimated_total)) = estimate else {
-        return skip(
-            conn,
+        return commit_skip(
+            tx,
             "linked quote has no priced breakdown to calibrate against",
         );
     };
 
     let Some(actual) = actual_machining_minutes else {
-        return skip(
-            conn,
+        return commit_skip(
+            tx,
             "work order completed without a recorded actual machining time",
         );
     };
 
     // Coefficient BEFORE this sample, then INSERT, then AFTER — so a shift is
-    // detectable. All DuckDB work finishes before the ledger is opened.
-    let before = coefficient(family, &load_samples(&conn, tenant.as_str())?);
+    // detectable. All of it runs inside the single shared-writer tx (DuckDB
+    // sees its own uncommitted INSERT for the AFTER read).
+    let before = coefficient(family, &load_samples(&tx, tenant.as_str())?);
     let now = OffsetDateTime::now_utc();
     let sample_id = insert_sample(
-        &conn,
+        &tx,
         tenant.as_str(),
         job_id,
         family,
@@ -279,8 +292,7 @@ pub fn record_calibration_for_completed_wo(
         actual,
         now,
     )?;
-    let after = coefficient(family, &load_samples(&conn, tenant.as_str())?);
-    drop(conn);
+    let after = coefficient(family, &load_samples(&tx, tenant.as_str())?);
 
     let mut events: Vec<(EventKind, Vec<u8>)> = Vec::with_capacity(2);
     events.push((
@@ -306,7 +318,9 @@ pub fn record_calibration_for_completed_wo(
             .to_bytes(),
         ));
     }
-    append_calibration_events(db_path, tenant.clone(), binary_hash, operator_login, events)
+    append_calibration_events_in_tx(&tx, &meta, operator_login, events)?;
+    tx.commit()
+        .context("commit calibration sample + audit on shared writer")
 }
 
 // ── SPA read model ──────────────────────────────────────────────────
@@ -606,16 +620,21 @@ mod tests {
         let s = Scratch::new();
         setup_file_db(&s.db());
         seed_priced_quote(&s.db(), "q1", 10.0, 4); // base = 40 min
-        record_calibration_for_completed_wo(
-            &s.db(),
-            &tenant(),
-            BinaryHash::from_bytes([0u8; 32]),
-            "op",
-            "wo1",
-            Some("q1"),
-            Some(48.0),
-        )
-        .unwrap();
+                                                   // Handle scoped + dropped before the fresh-conn count reads below (a fresh
+                                                   // `Connection::open` while the Handle holds the file lock would deadlock).
+        {
+            let handle = aberp_db::Handle::open_default(&s.db(), tenant()).unwrap();
+            record_calibration_for_completed_wo(
+                &handle,
+                &tenant(),
+                BinaryHash::from_bytes([0u8; 32]),
+                "op",
+                "wo1",
+                Some("q1"),
+                Some(48.0),
+            )
+            .unwrap();
+        }
         assert_eq!(sample_count(&s.db()), 1);
         assert_eq!(audit_count(&s.db(), "quote.calibration_sample_recorded"), 1);
         assert_eq!(audit_count(&s.db(), "quote.calibration_sample_skipped"), 0);
@@ -630,16 +649,19 @@ mod tests {
         let s = Scratch::new();
         setup_file_db(&s.db());
         seed_priced_quote(&s.db(), "q1", 10.0, 4);
-        record_calibration_for_completed_wo(
-            &s.db(),
-            &tenant(),
-            BinaryHash::from_bytes([0u8; 32]),
-            "op",
-            "wo1",
-            Some("q1"),
-            None,
-        )
-        .unwrap();
+        {
+            let handle = aberp_db::Handle::open_default(&s.db(), tenant()).unwrap();
+            record_calibration_for_completed_wo(
+                &handle,
+                &tenant(),
+                BinaryHash::from_bytes([0u8; 32]),
+                "op",
+                "wo1",
+                Some("q1"),
+                None,
+            )
+            .unwrap();
+        }
         assert_eq!(sample_count(&s.db()), 0);
         assert_eq!(audit_count(&s.db(), "quote.calibration_sample_skipped"), 1);
         assert_eq!(audit_count(&s.db(), "quote.calibration_sample_recorded"), 0);
@@ -649,16 +671,19 @@ mod tests {
     fn hook_does_nothing_when_not_linked() {
         let s = Scratch::new();
         setup_file_db(&s.db());
-        record_calibration_for_completed_wo(
-            &s.db(),
-            &tenant(),
-            BinaryHash::from_bytes([0u8; 32]),
-            "op",
-            "wo1",
-            None, // not linked to a quote
-            Some(48.0),
-        )
-        .unwrap();
+        {
+            let handle = aberp_db::Handle::open_default(&s.db(), tenant()).unwrap();
+            record_calibration_for_completed_wo(
+                &handle,
+                &tenant(),
+                BinaryHash::from_bytes([0u8; 32]),
+                "op",
+                "wo1",
+                None, // not linked to a quote
+                Some(48.0),
+            )
+            .unwrap();
+        }
         assert_eq!(sample_count(&s.db()), 0);
         assert_eq!(audit_count(&s.db(), "quote.calibration_sample_skipped"), 0);
         assert_eq!(audit_count(&s.db(), "quote.calibration_sample_recorded"), 0);
@@ -675,17 +700,21 @@ mod tests {
         setup_file_db(&s.db());
         seed_priced_quote(&s.db(), "q1", 10.0, 4); // base = 40 min
 
-        for i in 0..5 {
-            record_calibration_for_completed_wo(
-                &s.db(),
-                &tenant(),
-                BinaryHash::from_bytes([0u8; 32]),
-                "op",
-                &format!("wo{i}"),
-                Some("q1"),
-                Some(48.0), // ratio 48/40 = 1.2
-            )
-            .unwrap();
+        // ONE Handle across the five closes, dropped before the fresh-conn reads.
+        {
+            let handle = aberp_db::Handle::open_default(&s.db(), tenant()).unwrap();
+            for i in 0..5 {
+                record_calibration_for_completed_wo(
+                    &handle,
+                    &tenant(),
+                    BinaryHash::from_bytes([0u8; 32]),
+                    "op",
+                    &format!("wo{i}"),
+                    Some("q1"),
+                    Some(48.0), // ratio 48/40 = 1.2
+                )
+                .unwrap();
+            }
         }
 
         assert_eq!(sample_count(&s.db()), 5);
