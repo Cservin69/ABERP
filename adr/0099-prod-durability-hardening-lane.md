@@ -684,6 +684,36 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   boundary — no coherent subset exists, so nothing is migrated (doc-only).**
   Dispatch (step 4c) stays blocked transitively: dispatch waits on `work_orders`,
   and `work_orders` waits on this cluster.
+- **STEP 4c OUTCOME (2026-07-13) — the fused cluster MIGRATED.** The full cluster
+  `{work_orders + products + inventory(stock_movements + products-cache) + qa +
+  dispatch + invoice_draft}` moved onto the shared Handle in ONE commit — every
+  writer AND reader (≈32 serve.rs sites, no crate change; the family crates already
+  take `&Transaction`/`&Connection` and never self-open). The re-entrancy chain
+  `decide_qa → try_auto_complete_wo → transition_work_order Complete → WoCompletion
+  record_movement` rides ONE `db.write()` guard/tx with NO nested acquire (pinned
+  by `step4c_wo_cluster_handle.rs`, tripwire armed). The shipment gate is FINALLY
+  fresh-conn-free: `read_dispatch_for_gate` reads dispatch via `db.read()`, and the
+  resolvers read partner/part_marking/quality/work_orders through the same reader.
+  `sync_audit_mirror_best_effort` dropped at every migrated writer (guard-drop
+  lockstep-syncs the mirror); the `create_stock_movement` mirror `Ledger::open`
+  read-fork is gone (read-fork 6→5). The post-commit calibration hook stays a fresh
+  open (quote_calibration residual) — the guard is dropped BEFORE it runs.
+  - **BOUNDARY HELD at six families — `material_inventory` NOT dragged in.** The
+    write boundary is genuinely closed: `record_movement` writes `stock_movements`
+    + the `products` cache, NOT `inventory_balances`; and the DEAL saga
+    (`run_deal_saga`) writes `quote_intake_log` + `inventory_balances` + audit but
+    does NOT write the `work_orders` table (it only mints an id + emits
+    `QuoteWorkOrderCreated`). So `material_inventory` (`inventory_balances` +
+    `inventory_reservations`, written fresh by `assign_heat_lot` and the DEAL saga
+    `commit_material_in_tx`) is a SEPARATE write boundary, fused to `quote_intake_log`
+    + sales-orders — migrating it would cascade into the deferred quote pipeline.
+    Its writers stay fresh; the cluster's Handle reads of it (heat-lot gate,
+    mark-parts context, material-traceability) are coherent because those fresh
+    writers fully close+checkpoint (the same read-on-Handle precedent step 3 set for
+    the heat-lot gate). Consequence: the informational write-fork census stays at 5
+    (`material_inventory.rs:839` remains; `incoming_invoices`×2, `quote_calibration`,
+    `tenant_registry` are the rest) — this cluster does not reach the write-fork
+    residual floor, only the census drops (serve.rs runtime openers 114→81).
 - **CANONICAL RECIPE — a `verify_chain` audit fn on the Handle** (resolved in
   wave-2c; the audit-ledger crate already supports it — `Ledger::from_connection`
   at `crates/audit-ledger/src/storage/mod.rs` + its test
