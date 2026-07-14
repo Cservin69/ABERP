@@ -120,6 +120,27 @@
 #       literal r#"ACME "Special" Co \ Ltd"# in that test, losing the cfg(test)
 #       scope). Conservative (over-count never HIDES a fork) and test-only; frozen
 #       here for consistency with what the shared scanner emits on this tree.
+# ── H4 backlog-2 (2026-07-14) — pricing-config family onto the shared Handle ───
+# margin_profiles / quoting_materials / quoting_tunables: the 22 CRUD+list serve
+# handlers (create/update/archive/list/get margin profiles; create/update/delete/
+# list materials + the test-push list_public read; create/update/delete/list
+# complexity rules, list/update tolerance multipliers, get/update parameters,
+# create/update/delete/list stock adjustments) migrated off fresh Connection::open
+# onto state.db.write()/.read(). Writers fuse the business INSERT/UPDATE + audit
+# append in ONE Handle tx (canonical recipe, rule 15; margins previously did a
+# business-commit-then-append_machine_event split). Closes a real Q2-stale
+# fail-open: the pricing pipeline reads this config THROUGH the Handle, so a fresh
+# writer's edit was invisible to it (margin floor priced on stale/empty config).
+# Re-cut −22 (removals-only, comm-verified 0 additions): serve.rs 55→33; census
+# 117→95 openers, files unchanged (23). write-fork & read-fork gates stay = 0.
+# Same session folded in quoting_machines (the IDENTICAL half-migration — pipeline
+# reads list_enabled_capacities via the Handle while serve wrote machine CRUD fresh
+# → lead-time on stale capacity; do-not-defer a known fork per 4e). Writers
+# create/update/archive_machine_request fuse business+audit on ONE Handle guard
+# (was Connection::open + a separate append_machine_event guard); readers list/
+# get_machine_request → db.read(). calibration_overview_request STAYS fresh (reads
+# quote_calibration, a fresh-open residual-floor family — migrating its read alone
+# would open a NEW half-migration). Re-cut −5 more: serve.rs 33→28; census 95→90.
 1 apps/aberp/src/audit_dap_boot.rs
 3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
@@ -133,7 +154,7 @@
 4 apps/aberp/src/reports.rs
 4 apps/aberp/src/request_technical_annulment.rs
 8 apps/aberp/src/retry_submission.rs
-55 apps/aberp/src/serve.rs
+28 apps/aberp/src/serve.rs
 1 apps/aberp/src/snapshot.rs
 3 apps/aberp/src/submit_annulment.rs
 3 apps/aberp/src/tenant_registry.rs

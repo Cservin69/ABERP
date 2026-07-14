@@ -78,11 +78,12 @@ fn inputs(name: &str, family: &str, daily: f64, buffer: f64, enabled: bool) -> M
 
 /// Every entry kind currently in the ledger (read-back for audit pins).
 ///
-/// H3 (ADR-0099): reads through the SAME shared Handle the handlers wrote through.
-/// A fresh `Ledger::open` here would read the pre-WAL main file (a folded subset)
-/// because these handlers' interleaved business `Connection::open`s leave the
-/// Handle's audit WAL unfolded — post-checkpoint-disable, the read contract is
-/// "audit reads go through the Handle". `try_clone` (F-C) shares the live instance.
+/// H4 (ADR-0099): reads through the SAME shared Handle the handlers wrote through.
+/// The machine CRUD handlers now fuse their business write + audit append on ONE
+/// Handle guard tx, so the audit lands in the Handle's WAL; a fresh `Ledger::open`
+/// here would read the pre-WAL main file (a folded subset). Post-checkpoint-disable
+/// the read contract is "audit reads go through the Handle". `try_clone` (F-C)
+/// shares the live instance.
 fn ledger_kinds(state: &AppState) -> Vec<EventKind> {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     // Write guard so an as-yet-unwritten ledger still reads as [] (the old

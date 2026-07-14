@@ -302,13 +302,12 @@ fn customer_journey_partner_profile_quote_margin_floor_refuse() {
     let db = dir.join("aberp.duckdb");
 
     // 2. margin-profile-create — target BELOW the floor so any priced quote for
-    //    this segment trips the floor. H3 (ADR-0099) STEP 4e: the margin-profile
-    //    family's serve routes still fork a fresh `Connection::open` (its Handle
-    //    migration is a later H3 step, like `quoting_materials`/`quoting_tunables`
-    //    — the pricing daemon already re-prices on the Handle reading these). The
-    //    STEP-4e re-price routes now read the profile through the shared Handle, so
-    //    seed it BEFORE the Handle opens (the coherent Q1 direction), mirroring
-    //    production where margin config pre-exists the re-price session.
+    //    this segment trips the floor. H4 (ADR-0099) backlog-2: the margin-profile
+    //    family's serve routes now read/write through the shared Handle (like the
+    //    re-price routes and the pricing daemon). Seed the profile BEFORE the Handle
+    //    opens (the coherent Q1 direction — a fresh writer that closes before the
+    //    Handle opens IS visible to it), mirroring production where margin config
+    //    pre-exists the re-price session.
     {
         let conn = duckdb::Connection::open(&db).expect("open");
         aberp::margin_profiles::create_profile(
