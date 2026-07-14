@@ -524,7 +524,53 @@
          declaration in <script>. -->
     <h1 class="wordmark">
       {#if logoFailed}
-        ABERP
+        <!-- Default Áben brand lockup: the gold mark + ABERP wordmark. Shown
+             whenever no operator logo is present (the editions default). The
+             mark is the real Á-built-X-like logomark — armL / armR / accent
+             facets, the upper-right arm escaping into the acute accent. Paths
+             and per-facet gold gradients are byte-identical to
+             static/brand-mark.svg (the overlay-verified trace); the viewBox
+             tightly frames the letterform for topbar height. `aria-hidden` on
+             the SVG keeps the `<h1>` text ("ABERP") the single screen-reader
+             source of truth. -->
+        <svg
+          class="wordmark__mark"
+          viewBox="160 352 612 438"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+        >
+          <defs>
+            <linearGradient id="wm-armL" gradientUnits="userSpaceOnUse" x1="382" y1="360" x2="250" y2="790">
+              <stop offset="0" stop-color="#fffdcd" />
+              <stop offset="0.12" stop-color="#fcf2b1" />
+              <stop offset="0.35" stop-color="#d7bf7b" />
+              <stop offset="0.55" stop-color="#ac8e51" />
+              <stop offset="0.75" stop-color="#866832" />
+              <stop offset="0.9" stop-color="#755726" />
+              <stop offset="1" stop-color="#54472c" />
+            </linearGradient>
+            <linearGradient id="wm-accent" gradientUnits="userSpaceOnUse" x1="767" y1="378" x2="330" y2="655">
+              <stop offset="0" stop-color="#816b30" />
+              <stop offset="0.22" stop-color="#b09450" />
+              <stop offset="0.4" stop-color="#ebd48c" />
+              <stop offset="0.55" stop-color="#fefdcf" />
+              <stop offset="0.68" stop-color="#f4df9c" />
+              <stop offset="0.85" stop-color="#cbaa63" />
+              <stop offset="1" stop-color="#b39455" />
+            </linearGradient>
+            <linearGradient id="wm-armR" gradientUnits="userSpaceOnUse" x1="490" y1="585" x2="545" y2="778">
+              <stop offset="0" stop-color="#f7e9b0" />
+              <stop offset="0.3" stop-color="#dec683" />
+              <stop offset="0.55" stop-color="#c5ab69" />
+              <stop offset="0.78" stop-color="#b69a59" />
+              <stop offset="1" stop-color="#786a4c" />
+            </linearGradient>
+          </defs>
+          <path fill="url(#wm-armL)" d="M166.8,778.3C167.9,776.2 174.0,762.6 180.5,748.0C186.9,733.4 194.2,717.2 196.7,712.0C199.2,706.8 202.5,699.4 204.0,695.5C205.5,691.6 208.4,685.1 210.3,681.0C212.3,676.9 216.3,667.9 219.3,661.0C224.3,649.5 229.8,637.1 252.0,587.0C256.6,576.8 262.9,562.6 266.0,555.5C269.2,548.4 275.2,534.7 279.4,525.3C283.6,515.8 287.0,507.8 287.0,507.6C287.0,507.4 288.8,503.3 291.1,498.5C293.3,493.7 298.4,482.1 302.5,472.7C306.5,463.2 314.9,444.0 321.1,430.0C327.2,416.0 336.7,394.4 342.1,382.0L351.9,359.5L375.7,359.0C388.8,358.7 399.6,358.6 399.8,358.6C400.1,358.8 431.8,429.7 441.5,452.0C445.0,460.0 450.5,472.6 453.9,480.0C458.6,490.4 459.7,493.7 458.7,494.6C458.1,495.2 451.4,499.4 444.0,504.0C436.6,508.6 424.1,517.0 416.3,522.7C408.5,528.4 401.5,533.3 400.7,533.6C399.7,533.9 396.1,526.4 387.0,505.0C380.2,489.1 374.6,476.0 374.4,476.0C374.3,476.0 372.7,479.5 371.0,483.8C365.5,497.0 333.2,572.8 326.5,588.0C320.5,601.8 300.7,647.3 293.3,664.5C291.4,668.9 288.3,676.1 286.5,680.5C284.7,684.9 280.6,694.4 277.5,701.5C272.1,713.9 267.5,724.6 250.8,764.0L243.3,781.5L204.1,781.8L164.9,782.0L166.8,778.3Z" />
+          <path fill="url(#wm-armR)" d="M495.5,753.2C488.5,737.4 475.6,708.4 466.9,688.7C458.2,668.9 448.7,647.8 445.8,641.8L440.5,630.7L467.9,603.8C482.9,589.0 495.6,577.0 496.1,577.2C497.0,577.5 509.4,604.4 516.9,622.0C518.4,625.6 523.8,637.5 528.8,648.5C541.4,676.3 558.4,714.4 570.2,741.0C575.7,753.4 581.9,767.4 584.1,772.1C586.2,776.8 588.0,781.0 588.0,781.3C588.0,781.7 570.1,782.0 548.2,782.0L508.4,782.0L495.5,753.2Z" />
+          <path fill="url(#wm-accent)" d="M390.3,712.7C387.1,709.8 379.1,702.9 372.5,697.4C365.9,691.9 352.2,680.5 342.0,672.0C331.8,663.5 321.8,655.1 319.7,653.5L316.0,650.5L328.7,636.5C350.7,612.3 376.8,587.1 405.4,562.5C414.0,555.2 455.9,523.8 467.5,516.0C562.2,452.6 657.9,407.4 765.8,375.5C767.9,374.9 768.0,375.2 768.0,379.7L768.0,384.5L762.7,386.7C730.5,400.3 718.0,405.9 697.0,416.1C671.5,428.6 645.0,442.5 629.5,451.5C624.5,454.4 616.5,459.1 611.5,462.0C564.0,489.6 498.6,537.6 460.2,572.9C436.0,595.2 396.2,637.4 390.7,646.7C390.2,647.5 396.2,653.9 406.7,664.2C442.5,698.9 460.6,717.0 460.2,717.5C459.9,717.8 445.4,718.0 427.9,718.0L396.1,718.0L390.3,712.7Z" />
+        </svg>
+        <span class="wordmark__text">ABERP</span>
       {:else}
         <img
           src="/aberp-logo.png"
@@ -1025,7 +1071,7 @@
     padding: var(--space-1) var(--space-3);
     background: transparent;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-secondary);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-xs);
@@ -1059,11 +1105,28 @@
 
   .wordmark {
     margin: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-lg);
     font-weight: 600;
     letter-spacing: 0.06em;
     color: var(--color-text-strong);
+  }
+
+  /* The gold mark in the default lockup. Height-matched to the operator
+   * logo (32px) so switching between them doesn't reflow the topbar; the
+   * mark's framed viewBox (612×438) gives it an intrinsic ~1.4:1 aspect so
+   * width follows. */
+  .wordmark__mark {
+    display: block;
+    height: 30px;
+    width: auto;
+  }
+
+  .wordmark__text {
+    line-height: 1;
   }
 
   /* PR-188 / session 188 — operator-supplied SPA wordmark image. The
@@ -1089,7 +1152,7 @@
   .dot {
     width: 8px;
     height: 8px;
-    border-radius: 50%;
+    border-radius: var(--radius-full);
     background: var(--color-signal-muted);
   }
 
@@ -1251,7 +1314,7 @@
     flex: 0 0 auto;
     min-width: 1.25rem;
     padding: 0 var(--space-1);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--color-signal-positive);
     color: var(--color-surface-base);
     font-size: var(--type-size-xs);
@@ -1370,7 +1433,7 @@
     margin: var(--space-5) auto;
     padding: var(--space-5);
     background: var(--color-surface-raised);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     border: 1px solid var(--color-surface-divider);
   }
 
@@ -1407,7 +1470,7 @@
     width: 16px;
     height: 16px;
     margin: 0 0 var(--space-3) 0;
-    border-radius: 50%;
+    border-radius: var(--radius-full);
     border: 2px solid var(--color-surface-divider);
     border-top-color: var(--color-signal-muted);
     animation: aberp-spin 1s linear infinite;
@@ -1422,7 +1485,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-strong);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     cursor: pointer;
   }
@@ -1527,7 +1590,7 @@
     right: 2px;
     min-width: 1.1rem;
     padding: 0 4px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--color-signal-positive);
     color: var(--color-surface-base);
     font-size: var(--type-size-xs);
