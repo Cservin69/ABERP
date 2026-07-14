@@ -10835,8 +10835,13 @@ async fn handle_list_machines(headers: HeaderMap, State(state): State<AppState>)
 pub fn list_machines_request(
     state: &AppState,
 ) -> std::result::Result<Vec<crate::quoting_machines::QuotingMachine>, MachineRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H4 (ADR-0099): read via the shared Handle's coherent try_clone so this list
+    // observes Handle-committed machine writes; a fresh `Connection::open` would
+    // read stale + close-fold the Handle's pending audit WAL on drop (CHECK M).
+    let conn = state
+        .db
+        .read()
+        .context("acquire shared reader for machine list")?;
     Ok(crate::quoting_machines::list_machines(
         &conn,
         state.tenant.as_str(),
@@ -10895,8 +10900,11 @@ pub fn get_machine_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<crate::quoting_machines::QuotingMachine, MachineRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H4 (ADR-0099): read via the shared Handle's coherent try_clone.
+    let conn = state
+        .db
+        .read()
+        .context("acquire shared reader for get_machine")?;
     match crate::quoting_machines::get_machine(&conn, state.tenant.as_str(), id)? {
         Some(m) => Ok(m),
         None => Err(MachineRouteError::NotFound),
@@ -10945,14 +10953,23 @@ pub fn create_machine_request(
     if let Err(errors) = crate::quoting_machines::validate_machine_inputs(inputs) {
         return Err(MachineRouteError::Validation(errors));
     }
-    // Scope the write connection so it is dropped before the audit append
-    // opens its own connection — DuckDB rejects a second writer to the
-    // same file while the first is still held.
-    let machine = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-        crate::quoting_machines::create_machine(&conn, state.tenant.as_str(), inputs)?
-    };
+    // H4 (ADR-0099): business INSERT + audit append on the ONE shared Handle, in a
+    // SINGLE tx (canonical recipe, rule 15). Was a fresh `Connection::open`
+    // write-fork + a SEPARATE `append_machine_event` Handle guard (a business-
+    // commit-then-audit split). Routing the capacity write through the one instance
+    // also makes the pricing pipeline's Handle read (`list_enabled_capacities` in
+    // `advance_price`) coherent — the fork's write was Q2-invisible to the Handle,
+    // so lead-time was computed on STALE machine capacity.
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer for machine create")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for machine create")?;
+    let tx = guard
+        .transaction()
+        .context("begin machine create tx on shared writer")?;
+    let machine = crate::quoting_machines::create_machine(&tx, state.tenant.as_str(), inputs)?;
     let payload = crate::audit_payloads::MachineCreatedPayload {
         machine_id: machine.id.clone(),
         name: machine.name.clone(),
@@ -10960,14 +10977,18 @@ pub fn create_machine_request(
         daily_hours_avail: machine.daily_hours_avail,
         buffer_pct: machine.buffer_pct,
     };
-    crate::quoting_machines::append_machine_event(
-        &state.db,
-        state.tenant.clone(),
-        binary_hash,
-        operator_login,
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
         EventKind::MachineCreated,
         payload.to_bytes(),
-    )?;
+        actor,
+        None,
+    )
+    .context("append MachineCreated audit entry")?;
+    tx.commit().context("commit machine create")?;
     Ok(machine)
 }
 
@@ -11016,15 +11037,22 @@ pub fn update_machine_request(
     if let Err(errors) = crate::quoting_machines::validate_machine_inputs(inputs) {
         return Err(MachineRouteError::Validation(errors));
     }
-    // Scope the write connection (see `create_machine_request`).
-    let machine = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-        match crate::quoting_machines::update_machine(&conn, state.tenant.as_str(), id, inputs)? {
+    // H4 (ADR-0099): business UPDATE + audit append on ONE shared-Handle tx
+    // (canonical recipe, rule 15) — see `create_machine_request`.
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer for machine update")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for machine update")?;
+    let tx = guard
+        .transaction()
+        .context("begin machine update tx on shared writer")?;
+    let machine =
+        match crate::quoting_machines::update_machine(&tx, state.tenant.as_str(), id, inputs)? {
             Some(m) => m,
             None => return Err(MachineRouteError::NotFound),
-        }
-    };
+        };
     let payload = crate::audit_payloads::MachineEditedPayload {
         machine_id: machine.id.clone(),
         name: machine.name.clone(),
@@ -11033,14 +11061,18 @@ pub fn update_machine_request(
         buffer_pct: machine.buffer_pct,
         enabled: machine.enabled,
     };
-    crate::quoting_machines::append_machine_event(
-        &state.db,
-        state.tenant.clone(),
-        binary_hash,
-        operator_login,
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
         EventKind::MachineEdited,
         payload.to_bytes(),
-    )?;
+        actor,
+        None,
+    )
+    .context("append MachineEdited audit entry")?;
+    tx.commit().context("commit machine update")?;
     Ok(machine)
 }
 
@@ -11083,27 +11115,38 @@ pub fn archive_machine_request(
     operator_login: &str,
     binary_hash: BinaryHash,
 ) -> std::result::Result<(), MachineRouteError> {
-    // Scope the write connection (see `create_machine_request`).
-    let archived_at = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-        match crate::quoting_machines::archive_machine(&conn, state.tenant.as_str(), id)? {
+    // H4 (ADR-0099): business archive UPDATE + audit append on ONE shared-Handle
+    // tx (canonical recipe, rule 15) — see `create_machine_request`.
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer for machine archive")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for machine archive")?;
+    let tx = guard
+        .transaction()
+        .context("begin machine archive tx on shared writer")?;
+    let archived_at =
+        match crate::quoting_machines::archive_machine(&tx, state.tenant.as_str(), id)? {
             Some(ts) => ts,
             None => return Err(MachineRouteError::NotFound),
-        }
-    };
+        };
     let payload = crate::audit_payloads::MachineArchivedPayload {
         machine_id: id.to_string(),
         archived_at,
     };
-    crate::quoting_machines::append_machine_event(
-        &state.db,
-        state.tenant.clone(),
-        binary_hash,
-        operator_login,
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
         EventKind::MachineArchived,
         payload.to_bytes(),
-    )?;
+        actor,
+        None,
+    )
+    .context("append MachineArchived audit entry")?;
+    tx.commit().context("commit machine archive")?;
     Ok(())
 }
 
@@ -11804,8 +11847,14 @@ async fn handle_list_margin_profiles(
 pub fn list_margin_profiles_request(
     state: &AppState,
 ) -> std::result::Result<Vec<crate::margin_profiles::MarginProfile>, MarginProfileRouteError> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // H3 (ADR-0099): read via the shared Handle's coherent try_clone (`db.read()`)
+    // so this list observes Handle-committed profile writes. A fresh
+    // `Connection::open` would read a stale main-file view AND close-fold the
+    // Handle's pending audit WAL on drop (CHECK M / all-or-nothing).
+    let conn = state
+        .db
+        .read()
+        .context("acquire shared reader for margin-profile list")?;
     Ok(crate::margin_profiles::list_profiles(
         &conn,
         state.tenant.as_str(),
@@ -11824,9 +11873,14 @@ async fn handle_get_margin_profile(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let conn = match Connection::open(&*state.db_path) {
+    // H3 (ADR-0099): read the profile via the shared Handle's coherent try_clone.
+    let conn = match state
+        .db
+        .read()
+        .context("acquire shared reader for get_margin_profile")
+    {
         Ok(c) => c,
-        Err(e) => return internal_error("get_margin_profile:open", e.into()),
+        Err(e) => return internal_error("get_margin_profile:open", e),
     };
     match crate::margin_profiles::get_profile(&conn, state.tenant.as_str(), &id) {
         Ok(Some(p)) => Json(p).into_response(),
@@ -11876,16 +11930,27 @@ pub fn create_margin_profile_request(
     if let Err(errors) = crate::margin_profiles::validate_profile_inputs(inputs) {
         return Err(MarginProfileRouteError::Validation(errors));
     }
-    // Scope the write connection so it is dropped before the audit append
-    // opens its own ledger connection (S427 single-writer-lock posture).
-    let profile = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-        match crate::margin_profiles::create_profile(&conn, state.tenant.as_str(), inputs)? {
-            crate::margin_profiles::CreateOutcome::Created(p) => p,
-            crate::margin_profiles::CreateOutcome::DuplicateActiveType => {
-                return Err(MarginProfileRouteError::DuplicateActiveType)
-            }
+    // H3 (ADR-0099): business INSERT + audit append on the ONE shared Handle, in a
+    // SINGLE tx (canonical `create_ncr` recipe, rule 15). This replaces the fresh
+    // `Connection::open` write-fork followed by a SEPARATE `append_machine_event`
+    // Handle guard — a business-commit-then-audit split that left a torn, unaudited
+    // row on any audit error. Routing the write through the one instance also makes
+    // the pricing pipeline's Handle read of this profile coherent (the fork's write
+    // was Q2-invisible to the Handle → quotes priced on a stale margin floor).
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer for margin-profile create")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for margin-profile create")?;
+    let tx = guard
+        .transaction()
+        .context("begin margin-profile create tx on shared writer")?;
+    let profile = match crate::margin_profiles::create_profile(&tx, state.tenant.as_str(), inputs)?
+    {
+        crate::margin_profiles::CreateOutcome::Created(p) => p,
+        crate::margin_profiles::CreateOutcome::DuplicateActiveType => {
+            return Err(MarginProfileRouteError::DuplicateActiveType)
         }
     };
     let payload = crate::audit_payloads::MarginProfileCreatedPayload {
@@ -11895,14 +11960,18 @@ pub fn create_margin_profile_request(
         gross_margin_pct: profile.gross_margin_pct,
         min_margin_pct: profile.min_margin_pct,
     };
-    crate::quoting_machines::append_machine_event(
-        &state.db,
-        state.tenant.clone(),
-        binary_hash,
-        operator_login,
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
         EventKind::MarginProfileCreated,
         payload.to_bytes(),
-    )?;
+        actor,
+        None,
+    )
+    .context("append MarginProfileCreated audit entry")?;
+    tx.commit().context("commit margin-profile create")?;
     Ok(profile)
 }
 
@@ -11949,10 +12018,19 @@ pub fn update_margin_profile_request(
     if let Err(errors) = crate::margin_profiles::validate_profile_inputs(inputs) {
         return Err(MarginProfileRouteError::Validation(errors));
     }
-    let profile = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-        match crate::margin_profiles::update_profile(&conn, state.tenant.as_str(), id, inputs)? {
+    // H3 (ADR-0099): business UPDATE + audit append on ONE shared-Handle tx
+    // (canonical recipe, rule 15) — see `create_margin_profile_request`.
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer for margin-profile update")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for margin-profile update")?;
+    let tx = guard
+        .transaction()
+        .context("begin margin-profile update tx on shared writer")?;
+    let profile =
+        match crate::margin_profiles::update_profile(&tx, state.tenant.as_str(), id, inputs)? {
             crate::margin_profiles::UpdateOutcome::Updated(p) => p,
             crate::margin_profiles::UpdateOutcome::NotFound => {
                 return Err(MarginProfileRouteError::NotFound)
@@ -11960,8 +12038,7 @@ pub fn update_margin_profile_request(
             crate::margin_profiles::UpdateOutcome::DuplicateActiveType => {
                 return Err(MarginProfileRouteError::DuplicateActiveType)
             }
-        }
-    };
+        };
     let payload = crate::audit_payloads::MarginProfileEditedPayload {
         profile_id: profile.id.clone(),
         name: profile.name.clone(),
@@ -11970,14 +12047,18 @@ pub fn update_margin_profile_request(
         min_margin_pct: profile.min_margin_pct,
         enabled: profile.enabled,
     };
-    crate::quoting_machines::append_machine_event(
-        &state.db,
-        state.tenant.clone(),
-        binary_hash,
-        operator_login,
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
         EventKind::MarginProfileEdited,
         payload.to_bytes(),
-    )?;
+        actor,
+        None,
+    )
+    .context("append MarginProfileEdited audit entry")?;
+    tx.commit().context("commit margin-profile update")?;
     Ok(profile)
 }
 
@@ -12019,26 +12100,38 @@ pub fn archive_margin_profile_request(
     operator_login: &str,
     binary_hash: BinaryHash,
 ) -> std::result::Result<(), MarginProfileRouteError> {
-    let archived_at = {
-        let conn = Connection::open(&*state.db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-        match crate::margin_profiles::archive_profile(&conn, state.tenant.as_str(), id)? {
-            Some(ts) => ts,
-            None => return Err(MarginProfileRouteError::NotFound),
-        }
+    // H3 (ADR-0099): business archive UPDATE + audit append on ONE shared-Handle
+    // tx (canonical recipe, rule 15) — see `create_margin_profile_request`.
+    let mut guard = state
+        .db
+        .write()
+        .context("acquire shared writer for margin-profile archive")?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for margin-profile archive")?;
+    let tx = guard
+        .transaction()
+        .context("begin margin-profile archive tx on shared writer")?;
+    let archived_at = match crate::margin_profiles::archive_profile(&tx, state.tenant.as_str(), id)?
+    {
+        Some(ts) => ts,
+        None => return Err(MarginProfileRouteError::NotFound),
     };
     let payload = crate::audit_payloads::MarginProfileArchivedPayload {
         profile_id: id.to_string(),
         archived_at,
     };
-    crate::quoting_machines::append_machine_event(
-        &state.db,
-        state.tenant.clone(),
-        binary_hash,
-        operator_login,
+    let meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
         EventKind::MarginProfileArchived,
         payload.to_bytes(),
-    )?;
+        actor,
+        None,
+    )
+    .context("append MarginProfileArchived audit entry")?;
+    tx.commit().context("commit margin-profile archive")?;
     Ok(())
 }
 
@@ -12812,9 +12905,13 @@ async fn handle_list_quoting_materials(
     let state_for_task = state.clone();
     let result =
         tokio::task::spawn_blocking(move || -> Result<Vec<crate::quoting_materials::Material>> {
-            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): read via the shared Handle's coherent try_clone so this
+            // observes Handle-committed config writes; a fresh `Connection::open`
+            // would read stale + close-fold the Handle's pending audit WAL on drop.
+            let conn = state_for_task
+                .db
+                .read()
+                .context("acquire shared reader for quoting-config read")?;
             crate::quoting_materials::list_materials(&conn, state_for_task.tenant.as_str())
         })
         .await;
@@ -12847,9 +12944,14 @@ async fn handle_create_quoting_material(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<_, crate::quoting_materials::MaterialWriteError> {
-            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): business write + audit append fuse in ONE tx INSIDE the
+            // module fn; route it through the ONE shared Handle (was a fresh
+            // `Connection::open` write-fork that close-folded the Handle's audit WAL
+            // and left the pricing pipeline's Handle read of this config stale).
+            let mut conn = state_for_task
+                .db
+                .write()
+                .context("acquire shared writer for quoting-config edit")?;
             let meta = material_ledger_meta(&state_for_task)?;
             crate::quoting_materials::create_material(
                 &mut conn,
@@ -12891,9 +12993,14 @@ async fn handle_update_quoting_material(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<_, crate::quoting_materials::MaterialWriteError> {
-            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): business write + audit append fuse in ONE tx INSIDE the
+            // module fn; route it through the ONE shared Handle (was a fresh
+            // `Connection::open` write-fork that close-folded the Handle's audit WAL
+            // and left the pricing pipeline's Handle read of this config stale).
+            let mut conn = state_for_task
+                .db
+                .write()
+                .context("acquire shared writer for quoting-config edit")?;
             let meta = material_ledger_meta(&state_for_task)?;
             crate::quoting_materials::update_material(
                 &mut conn,
@@ -12934,9 +13041,14 @@ async fn handle_delete_quoting_material(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<(), crate::quoting_materials::MaterialWriteError> {
-            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): business write + audit append fuse in ONE tx INSIDE the
+            // module fn; route it through the ONE shared Handle (was a fresh
+            // `Connection::open` write-fork that close-folded the Handle's audit WAL
+            // and left the pricing pipeline's Handle read of this config stale).
+            let mut conn = state_for_task
+                .db
+                .write()
+                .context("acquire shared writer for quoting-config edit")?;
             let meta = material_ledger_meta(&state_for_task)?;
             crate::quoting_materials::delete_material(
                 &mut conn,
@@ -13016,16 +13128,16 @@ async fn handle_test_catalogue_push(headers: HeaderMap, State(state): State<AppS
     };
 
     // Read the public catalogue off the DB (same projection the daemon
-    // uses) on a blocking task.
-    let db_path = (*state.db_path).clone();
+    // uses) on a blocking task. H3 (ADR-0099): read via the shared Handle's
+    // coherent try_clone — the same posture the live catalogue-push daemon uses
+    // (`catalogue_push.rs`); a fresh `Connection::open` here would close-fold the
+    // Handle's pending audit WAL and tear the ledger for fresh readers.
+    let db = state.db.clone();
     let tenant_str = state.tenant.as_str().to_string();
     let rows = match tokio::task::spawn_blocking(move || {
-        let conn = Connection::open(&db_path).with_context(|| {
-            format!(
-                "open DuckDB at {} for test-push catalogue read",
-                db_path.display()
-            )
-        })?;
+        let conn = db
+            .read()
+            .context("acquire shared reader for test-push catalogue read")?;
         crate::quoting_materials::list_public(&conn, &tenant_str)
     })
     .await
@@ -13209,9 +13321,13 @@ async fn handle_list_complexity_rules(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> Result<Vec<crate::quoting_tunables::ComplexityRule>> {
-            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): read via the shared Handle's coherent try_clone so this
+            // observes Handle-committed config writes; a fresh `Connection::open`
+            // would read stale + close-fold the Handle's pending audit WAL on drop.
+            let conn = state_for_task
+                .db
+                .read()
+                .context("acquire shared reader for quoting-config read")?;
             crate::quoting_tunables::list_complexity_rules(&conn, state_for_task.tenant.as_str())
         },
     )
@@ -13241,9 +13357,14 @@ async fn handle_create_complexity_rule(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
-            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): business write + audit append fuse in ONE tx INSIDE the
+            // module fn; route it through the ONE shared Handle (was a fresh
+            // `Connection::open` write-fork that close-folded the Handle's audit WAL
+            // and left the pricing pipeline's Handle read of this config stale).
+            let mut conn = state_for_task
+                .db
+                .write()
+                .context("acquire shared writer for quoting-config edit")?;
             let meta = tunable_ledger_meta(&state_for_task)?;
             crate::quoting_tunables::create_complexity_rule(
                 &mut conn,
@@ -13281,9 +13402,14 @@ async fn handle_update_complexity_rule(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
-            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): business write + audit append fuse in ONE tx INSIDE the
+            // module fn; route it through the ONE shared Handle (was a fresh
+            // `Connection::open` write-fork that close-folded the Handle's audit WAL
+            // and left the pricing pipeline's Handle read of this config stale).
+            let mut conn = state_for_task
+                .db
+                .write()
+                .context("acquire shared writer for quoting-config edit")?;
             let meta = tunable_ledger_meta(&state_for_task)?;
             crate::quoting_tunables::update_complexity_rule(
                 &mut conn,
@@ -13321,9 +13447,14 @@ async fn handle_delete_complexity_rule(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<(), crate::quoting_tunables::TunableWriteError> {
-            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): business write + audit append fuse in ONE tx INSIDE the
+            // module fn; route it through the ONE shared Handle (was a fresh
+            // `Connection::open` write-fork that close-folded the Handle's audit WAL
+            // and left the pricing pipeline's Handle read of this config stale).
+            let mut conn = state_for_task
+                .db
+                .write()
+                .context("acquire shared writer for quoting-config edit")?;
             let meta = tunable_ledger_meta(&state_for_task)?;
             crate::quoting_tunables::delete_complexity_rule(
                 &mut conn,
@@ -13360,9 +13491,13 @@ async fn handle_list_tolerance_multipliers(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> Result<Vec<crate::quoting_tunables::ToleranceMultiplier>> {
-            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): read via the shared Handle's coherent try_clone so this
+            // observes Handle-committed config writes; a fresh `Connection::open`
+            // would read stale + close-fold the Handle's pending audit WAL on drop.
+            let conn = state_for_task
+                .db
+                .read()
+                .context("acquire shared reader for quoting-config read")?;
             crate::quoting_tunables::list_tolerance_multipliers(
                 &conn,
                 state_for_task.tenant.as_str(),
@@ -13396,9 +13531,14 @@ async fn handle_update_tolerance_multiplier(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
-            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): business write + audit append fuse in ONE tx INSIDE the
+            // module fn; route it through the ONE shared Handle (was a fresh
+            // `Connection::open` write-fork that close-folded the Handle's audit WAL
+            // and left the pricing pipeline's Handle read of this config stale).
+            let mut conn = state_for_task
+                .db
+                .write()
+                .context("acquire shared writer for quoting-config edit")?;
             let meta = tunable_ledger_meta(&state_for_task)?;
             crate::quoting_tunables::update_tolerance_multiplier(
                 &mut conn,
@@ -13433,9 +13573,13 @@ async fn handle_get_parameters(headers: HeaderMap, State(state): State<AppState>
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> Result<crate::quoting_tunables::QuotingParameters> {
-            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): read via the shared Handle's coherent try_clone so this
+            // observes Handle-committed config writes; a fresh `Connection::open`
+            // would read stale + close-fold the Handle's pending audit WAL on drop.
+            let conn = state_for_task
+                .db
+                .read()
+                .context("acquire shared reader for quoting-config read")?;
             crate::quoting_tunables::get_parameters(&conn, state_for_task.tenant.as_str())
         },
     )
@@ -13465,9 +13609,14 @@ async fn handle_update_parameters(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
-            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): business write + audit append fuse in ONE tx INSIDE the
+            // module fn; route it through the ONE shared Handle (was a fresh
+            // `Connection::open` write-fork that close-folded the Handle's audit WAL
+            // and left the pricing pipeline's Handle read of this config stale).
+            let mut conn = state_for_task
+                .db
+                .write()
+                .context("acquire shared writer for quoting-config edit")?;
             let meta = tunable_ledger_meta(&state_for_task)?;
             crate::quoting_tunables::update_parameters(
                 &mut conn,
@@ -13504,9 +13653,13 @@ async fn handle_list_stock_adjustments(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> Result<Vec<crate::quoting_tunables::StockAdjustment>> {
-            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): read via the shared Handle's coherent try_clone so this
+            // observes Handle-committed config writes; a fresh `Connection::open`
+            // would read stale + close-fold the Handle's pending audit WAL on drop.
+            let conn = state_for_task
+                .db
+                .read()
+                .context("acquire shared reader for quoting-config read")?;
             crate::quoting_tunables::list_stock_adjustments(&conn, state_for_task.tenant.as_str())
         },
     )
@@ -13536,9 +13689,14 @@ async fn handle_create_stock_adjustment(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
-            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): business write + audit append fuse in ONE tx INSIDE the
+            // module fn; route it through the ONE shared Handle (was a fresh
+            // `Connection::open` write-fork that close-folded the Handle's audit WAL
+            // and left the pricing pipeline's Handle read of this config stale).
+            let mut conn = state_for_task
+                .db
+                .write()
+                .context("acquire shared writer for quoting-config edit")?;
             let meta = tunable_ledger_meta(&state_for_task)?;
             crate::quoting_tunables::create_stock_adjustment(
                 &mut conn,
@@ -13576,9 +13734,14 @@ async fn handle_update_stock_adjustment(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
-            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): business write + audit append fuse in ONE tx INSIDE the
+            // module fn; route it through the ONE shared Handle (was a fresh
+            // `Connection::open` write-fork that close-folded the Handle's audit WAL
+            // and left the pricing pipeline's Handle read of this config stale).
+            let mut conn = state_for_task
+                .db
+                .write()
+                .context("acquire shared writer for quoting-config edit")?;
             let meta = tunable_ledger_meta(&state_for_task)?;
             crate::quoting_tunables::update_stock_adjustment(
                 &mut conn,
@@ -13616,9 +13779,14 @@ async fn handle_delete_stock_adjustment(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<(), crate::quoting_tunables::TunableWriteError> {
-            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
-                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
-            })?;
+            // H3 (ADR-0099): business write + audit append fuse in ONE tx INSIDE the
+            // module fn; route it through the ONE shared Handle (was a fresh
+            // `Connection::open` write-fork that close-folded the Handle's audit WAL
+            // and left the pricing pipeline's Handle read of this config stale).
+            let mut conn = state_for_task
+                .db
+                .write()
+                .context("acquire shared writer for quoting-config edit")?;
             let meta = tunable_ledger_meta(&state_for_task)?;
             crate::quoting_tunables::delete_stock_adjustment(
                 &mut conn,
