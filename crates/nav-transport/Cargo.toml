@@ -32,8 +32,11 @@ reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 
-# OS keychain — credential loader per ADR-0020 §3.
-keyring = { workspace = true }
+# OS keychain — credential loader per ADR-0020 §3. ADR-0100 Phase 1 —
+# every keychain read/write/delete now funnels through the shared
+# `SecretStore` seam (keychain-backed, no behaviour change), so the
+# direct `keyring` dependency is gone; the seam owns it.
+aberp-secret-store = { path = "../aberp-secret-store" }
 
 # In-memory secret protection per ADR-0007 §Secrets.
 zeroize = { workspace = true }

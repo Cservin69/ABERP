@@ -72,13 +72,16 @@ pub enum NavTransportError {
     /// The keychain backend itself failed (locked keychain, permission
     /// denied, unsupported platform). Distinct from `KeychainItemMissing`
     /// — that one is a populated-keychain-but-missing-entry case, this
-    /// one is a keychain-itself-failed case. The `#[source]` preserves
-    /// the underlying `keyring::Error` for triage.
+    /// one is a keychain-itself-failed case. ADR-0100 Phase 1 — the
+    /// `#[source]` now preserves the `SecretStore` backend diagnostic
+    /// (`aberp_secret_store::SecretStoreError`), which carries the
+    /// non-secret service/account + backend cause; the keychain access
+    /// itself moved behind the shared seam.
     #[error("keychain backend failure for item `{item}`: {source}")]
     KeychainBackend {
         item: &'static str,
         #[source]
-        source: keyring::Error,
+        source: aberp_secret_store::SecretStoreError,
     },
 
     /// PR-57 / session-77 — the consolidated `nav_credentials_blob`

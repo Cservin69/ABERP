@@ -74,6 +74,7 @@ pub mod material_inventory;
 pub mod material_traceability;
 // S438 (ADR-0089) — per-unit part UID / serial marking + Part UID Lookup.
 pub mod part_marking;
+pub mod paths;
 // S439 (ADR-0090) — defense quality management: NCR + CAPA workflow.
 pub mod quality;
 // S443 (ADR-0092) — QC dimensional inspection orchestrator (verdict +

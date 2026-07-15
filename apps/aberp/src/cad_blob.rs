@@ -43,7 +43,6 @@ use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key};
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
-use keyring::Entry;
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -197,11 +196,17 @@ pub enum KeyProvision {
 /// error rather than a silent re-mint, because re-minting would orphan
 /// every blob the old key encrypted.
 pub fn load_or_provision_key(tenant_id: &str) -> Result<(CadBlobKey, KeyProvision)> {
+    // ADR-0100 Phase 1 — through the shared `SecretStore` seam. The
+    // symmetric CAD key is one of the 8 categories Phase 3's self-hosted
+    // backend must carry (a snapshot cannot decrypt CAD blobs without it).
+    use aberp_secret_store::SecretStore as _;
     let service = service_name(tenant_id);
-    let entry =
-        Entry::new(&service, ITEM_CAD_BLOB_KEY).context("open CAD-blob-key keychain entry")?;
-    match entry.get_password() {
-        Ok(b64) => {
+    let store = aberp_secret_store::keychain_store();
+    match store
+        .get(&service, ITEM_CAD_BLOB_KEY)
+        .map_err(|e| anyhow!("CAD-blob-key keychain backend error for tenant {tenant_id}: {e}"))?
+    {
+        Some(b64) => {
             let raw = base64::engine::general_purpose::STANDARD
                 .decode(b64.trim())
                 .context("decode stored CAD-blob key (base64)")?;
@@ -214,18 +219,15 @@ pub fn load_or_provision_key(tenant_id: &str) -> Result<(CadBlobKey, KeyProvisio
             })?;
             Ok((CadBlobKey::from_bytes(bytes), KeyProvision::Loaded))
         }
-        Err(keyring::Error::NoEntry) => {
+        None => {
             let key_arr = Aes256Gcm::generate_key(&mut OsRng);
             let bytes: [u8; KEY_LEN] = key_arr.into();
             let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-            entry
-                .set_password(&b64)
+            store
+                .set(&service, ITEM_CAD_BLOB_KEY, &b64)
                 .context("store freshly-minted CAD-blob key in keychain")?;
             Ok((CadBlobKey::from_bytes(bytes), KeyProvision::Minted))
         }
-        Err(other) => Err(anyhow!(
-            "CAD-blob-key keychain backend error for tenant {tenant_id}: {other}"
-        )),
     }
 }
 

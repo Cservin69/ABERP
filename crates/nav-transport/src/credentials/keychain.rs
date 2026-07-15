@@ -35,7 +35,7 @@
 //! Credential Manager the mapping is analogous and handled by
 //! `keyring`.
 
-use keyring::Entry;
+use aberp_secret_store::{keychain_store, SecretStore};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -139,18 +139,18 @@ pub fn read_secret(
     tenant_id: &str,
     item: &'static str,
 ) -> Result<Zeroizing<String>, NavTransportError> {
+    // ADR-0100 Phase 1 — through the shared `SecretStore` seam. The
+    // seam collapses "absent" to `Ok(None)`; we map it back to the typed
+    // `KeychainItemMissing` so the NeedsSetup semantics are unchanged.
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, item)
-        .map_err(|e| NavTransportError::KeychainBackend { item, source: e })?;
-    match entry.get_password() {
-        Ok(secret) => Ok(Zeroizing::new(secret)),
-        Err(keyring::Error::NoEntry) => Err(NavTransportError::KeychainItemMissing {
+    match keychain_store()
+        .get(&service, item)
+        .map_err(|source| NavTransportError::KeychainBackend { item, source })?
+    {
+        Some(secret) => Ok(secret),
+        None => Err(NavTransportError::KeychainItemMissing {
             tenant_id: tenant_id.to_string(),
             item,
-        }),
-        Err(other) => Err(NavTransportError::KeychainBackend {
-            item,
-            source: other,
         }),
     }
 }
@@ -181,17 +181,11 @@ pub fn write_blob(
             detail: format!("serialize NAV credentials blob to JSON: {e}"),
         })?;
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_NAV_CREDENTIALS_BLOB).map_err(|e| {
-        NavTransportError::KeychainBackend {
+    keychain_store()
+        .set(&service, ITEM_NAV_CREDENTIALS_BLOB, &json)
+        .map_err(|source| NavTransportError::KeychainBackend {
             item: ITEM_NAV_CREDENTIALS_BLOB,
-            source: e,
-        }
-    })?;
-    entry
-        .set_password(&json)
-        .map_err(|e| NavTransportError::KeychainBackend {
-            item: ITEM_NAV_CREDENTIALS_BLOB,
-            source: e,
+            source,
         })
 }
 
@@ -202,21 +196,14 @@ pub fn write_blob(
 /// the blob is malformed (both loud per rule 12).
 pub(crate) fn read_blob(tenant_id: &str) -> Result<Option<LoadedBlob>, NavTransportError> {
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_NAV_CREDENTIALS_BLOB).map_err(|e| {
-        NavTransportError::KeychainBackend {
+    let raw = match keychain_store()
+        .get(&service, ITEM_NAV_CREDENTIALS_BLOB)
+        .map_err(|source| NavTransportError::KeychainBackend {
             item: ITEM_NAV_CREDENTIALS_BLOB,
-            source: e,
-        }
-    })?;
-    let raw = match entry.get_password() {
-        Ok(s) => Zeroizing::new(s),
-        Err(keyring::Error::NoEntry) => return Ok(None),
-        Err(other) => {
-            return Err(NavTransportError::KeychainBackend {
-                item: ITEM_NAV_CREDENTIALS_BLOB,
-                source: other,
-            });
-        }
+            source,
+        })? {
+        Some(s) => s,
+        None => return Ok(None),
     };
     let parsed: NavCredentialsBlob = serde_json::from_str(raw.as_str()).map_err(|e| {
         NavTransportError::KeychainBlobMalformed {
@@ -240,17 +227,13 @@ pub(crate) fn delete_legacy_item(
     tenant_id: &str,
     item: &'static str,
 ) -> Result<bool, NavTransportError> {
+    // ADR-0100 Phase 1 — through the shared `SecretStore` seam. `delete`
+    // already returns Ok(true)=deleted / Ok(false)=absent, matching this
+    // function's idempotent-migration contract exactly.
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, item)
-        .map_err(|e| NavTransportError::KeychainBackend { item, source: e })?;
-    match entry.delete_password() {
-        Ok(()) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(other) => Err(NavTransportError::KeychainBackend {
-            item,
-            source: other,
-        }),
-    }
+    keychain_store()
+        .delete(&service, item)
+        .map_err(|source| NavTransportError::KeychainBackend { item, source })
 }
 
 /// PR-57 / session-77 — read all four legacy per-artifact entries and

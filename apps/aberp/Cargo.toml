@@ -32,6 +32,11 @@ path = "src/main.rs"
 [features]
 default = []
 production = []
+# ADR-0100 Phase 1 — cloud build switch. Compiles in but is
+# behaviour-neutral in Phase 1 (the desktop and `saas` binaries are
+# byte-behaviour-identical on loopback). `build_profile::IS_SAAS_BUILD`
+# is the single source of truth; later phases (2/4/6) fill the arms.
+saas = []
 
 [dependencies]
 # Workspace siblings — production deps. `aberp-audit-ledger` is included
@@ -41,6 +46,10 @@ production = []
 aberp-audit-ledger = { path = "../../crates/audit-ledger" }
 # ADR-0099 H3 — the process-wide shared DuckDB Handle (single in-process writer).
 aberp-db = { path = "../../crates/aberp-db" }
+# ADR-0100 Phase 1 — the `SecretStore` seam over every OS-keychain
+# access. The keychain-backed impl is the only one today (zero
+# behaviour change); Phase 3 adds a self-hosted backend behind it.
+aberp-secret-store = { path = "../../crates/aberp-secret-store" }
 # S426 / ADR-0082 — periodic validated logical DuckDB snapshot subsystem.
 aberp-snapshot = { path = "../../crates/aberp-snapshot" }
 # S344 / PR-38 — DigitalIdProvider swap-point. Boot constructs the mock
@@ -233,6 +242,12 @@ hex = { workspace = true }
 base64 = { workspace = true }
 tar = { workspace = true }
 zstd = { workspace = true }
+# ADR-0100 Phase 1 — OS CSPRNG for the session-token mint
+# (`generate_session_token`). 32 bytes from `getrandom` → base64url,
+# replacing the pre-Phase-1 `SHA-256(time‖ULID‖PID)` non-crypto
+# derivation. Workspace already pins `getrandom` (used by aes-gcm and
+# audit-service key mint); adding it direct here costs no build time.
+getrandom = { workspace = true }
 
 # PR-92 additions — SMTP email delivery per ADR-0047.
 #

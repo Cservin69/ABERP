@@ -282,17 +282,21 @@ pub fn run(args: &SetupNavCredentialsArgs) -> Result<()> {
 /// situation as a successful overwrite of a credential the operator
 /// thought was protected.
 fn blob_already_populated(tenant: &str) -> Result<bool> {
+    // ADR-0100 Phase 1 — this probe (the 10th keychain site, one the
+    // task's "9" omitted) also funnels through the shared `SecretStore`
+    // seam so NO direct `keyring::Entry` access remains outside it. The
+    // seam's `get` collapses "absent" to `Ok(None)`; a backend failure is
+    // still loud (rule 12).
+    use aberp_secret_store::SecretStore as _;
     let service = service_name(tenant);
-    let entry = keyring::Entry::new(&service, ITEM_NAV_CREDENTIALS_BLOB).with_context(|| {
-        format!("probe keychain entry for service `{service}` item `{ITEM_NAV_CREDENTIALS_BLOB}`")
-    })?;
-    match entry.get_password() {
-        Ok(_) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(other) => Err(anyhow!(
-            "keychain probe failed for service `{service}` item `{ITEM_NAV_CREDENTIALS_BLOB}`: {other}"
-        )),
-    }
+    Ok(aberp_secret_store::keychain_store()
+        .get(&service, ITEM_NAV_CREDENTIALS_BLOB)
+        .with_context(|| {
+            format!(
+                "probe keychain entry for service `{service}` item `{ITEM_NAV_CREDENTIALS_BLOB}`"
+            )
+        })?
+        .is_some())
 }
 
 #[cfg(test)]

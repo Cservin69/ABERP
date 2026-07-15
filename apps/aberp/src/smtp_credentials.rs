@@ -28,7 +28,7 @@
 //! - No `Debug` impl on the password string — accidental
 //!   `tracing::debug!(?password)` would not compile.
 
-use keyring::Entry;
+use aberp_secret_store::{keychain_store, SecretStore};
 use zeroize::Zeroizing;
 
 /// Item-name for the SMTP password keychain entry. Named here (not
@@ -90,12 +90,13 @@ impl std::error::Error for SmtpCredentialsError {}
 /// regardless. The caller is responsible for not retaining the
 /// string after this returns.
 pub fn write_password(tenant_id: &str, password: &str) -> Result<(), SmtpCredentialsError> {
+    // ADR-0100 Phase 1 — through the shared `SecretStore` seam. This
+    // stays the SMTP write surface; the single boot-time READ still
+    // funnels through `read_password` into `SecretsCache` (SPOC intact).
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_SMTP_PASSWORD)
-        .map_err(|e| SmtpCredentialsError::Backend(format!("Entry::new: {e}")))?;
-    entry
-        .set_password(password)
-        .map_err(|e| SmtpCredentialsError::Backend(format!("set_password: {e}")))
+    keychain_store()
+        .set(&service, ITEM_SMTP_PASSWORD, password)
+        .map_err(|e| SmtpCredentialsError::Backend(e.to_string()))
 }
 
 /// Read the SMTP password from the OS keychain for `tenant_id`. The
@@ -112,17 +113,17 @@ pub fn write_password(tenant_id: &str, password: &str) -> Result<(), SmtpCredent
 /// CLAUDE.md rule 12 (fail loud): there is NO third path that returns
 /// an empty string or a default. Missing means missing.
 pub fn read_password(tenant_id: &str) -> Result<Zeroizing<String>, SmtpCredentialsError> {
+    // ADR-0100 Phase 1 — the SINGLE SMTP keychain read (SPOC), called
+    // once at boot by `SecretsCache::init_at_boot`, through the seam.
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_SMTP_PASSWORD)
-        .map_err(|e| SmtpCredentialsError::Backend(format!("Entry::new: {e}")))?;
-    match entry.get_password() {
-        Ok(s) => Ok(Zeroizing::new(s)),
-        Err(keyring::Error::NoEntry) => Err(SmtpCredentialsError::Missing {
+    match keychain_store()
+        .get(&service, ITEM_SMTP_PASSWORD)
+        .map_err(|e| SmtpCredentialsError::Backend(e.to_string()))?
+    {
+        Some(s) => Ok(s),
+        None => Err(SmtpCredentialsError::Missing {
             tenant_id: tenant_id.to_string(),
         }),
-        Err(other) => Err(SmtpCredentialsError::Backend(format!(
-            "get_password: {other}"
-        ))),
     }
 }
 
@@ -133,15 +134,10 @@ pub fn read_password(tenant_id: &str) -> Result<Zeroizing<String>, SmtpCredentia
 /// would mask a locked keychain as "password not set".
 pub fn password_is_set(tenant_id: &str) -> Result<bool, SmtpCredentialsError> {
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_SMTP_PASSWORD)
-        .map_err(|e| SmtpCredentialsError::Backend(format!("Entry::new: {e}")))?;
-    match entry.get_password() {
-        Ok(_) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(other) => Err(SmtpCredentialsError::Backend(format!(
-            "get_password: {other}"
-        ))),
-    }
+    Ok(keychain_store()
+        .get(&service, ITEM_SMTP_PASSWORD)
+        .map_err(|e| SmtpCredentialsError::Backend(e.to_string()))?
+        .is_some())
 }
 
 /// Delete the SMTP password keychain entry for `tenant_id`. Used by
@@ -150,15 +146,9 @@ pub fn password_is_set(tenant_id: &str) -> Result<bool, SmtpCredentialsError> {
 #[allow(dead_code)]
 pub fn delete_password(tenant_id: &str) -> Result<bool, SmtpCredentialsError> {
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_SMTP_PASSWORD)
-        .map_err(|e| SmtpCredentialsError::Backend(format!("Entry::new: {e}")))?;
-    match entry.delete_password() {
-        Ok(()) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(other) => Err(SmtpCredentialsError::Backend(format!(
-            "delete_password: {other}"
-        ))),
-    }
+    keychain_store()
+        .delete(&service, ITEM_SMTP_PASSWORD)
+        .map_err(|e| SmtpCredentialsError::Backend(e.to_string()))
 }
 
 #[cfg(test)]

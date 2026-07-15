@@ -31,6 +31,10 @@ path = "src/main.rs"
 [features]
 default = []
 production = []
+# ADR-0100 Phase 1 — mirror of the backend `saas` switch. Compiles in
+# but is behaviour-neutral in Phase 1; the Tauri detachment (Phase 6)
+# fills the arm.
+saas = []
 
 [build-dependencies]
 # Tauri 2 build step: parses tauri.conf.json + capabilities/*.json and
@@ -88,11 +92,13 @@ rustls = { workspace = true }
 # `#[derive(Serialize)]` is the day it joins this Cargo.toml.
 serde_json = { workspace = true }
 
-# OS keychain — reads the session_token entry that `aberp serve`
-# minted on first launch (service `aberp.nav.<tenant>`, account
-# `session_token`). The Tauri shell does NOT mint tokens itself; the
-# CLI owns that side per A28.
-keyring = { workspace = true }
+# OS keychain — reads the session_token entry that `aberp serve` minted
+# on first launch (service `aberp.nav.<tenant>`, account `session_token`).
+# The Tauri shell does NOT mint tokens itself; the CLI owns that side per
+# A28. ADR-0100 Phase 1 — this read goes through the shared `SecretStore`
+# seam (same keychain backend, zero behaviour change), so the direct
+# `keyring` dependency is gone; the seam owns it.
+aberp-secret-store = { path = "../../crates/aberp-secret-store" }
 
 # Hex decode of the fingerprint that `aberp serve` prints (lower-case,
 # no colons, matching `compute_cert_fingerprint`'s output).
