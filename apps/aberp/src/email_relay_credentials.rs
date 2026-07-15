@@ -17,7 +17,7 @@
 //! `submitter` field in the audit log; conflating them would tie
 //! rotation of one to the other.
 
-use keyring::Entry;
+use aberp_secret_store::{keychain_store, SecretStore};
 use zeroize::Zeroizing;
 
 /// Item-name for the email-relay bearer-token keychain entry.
@@ -55,27 +55,24 @@ impl std::error::Error for EmailRelayCredentialsError {}
 /// (non-empty) happens at the route layer; this seam writes whatever
 /// it's given so the rotation surface stays simple.
 pub fn write_token(tenant_id: &str, token: &str) -> Result<(), EmailRelayCredentialsError> {
+    // ADR-0100 Phase 1 — through the shared `SecretStore` seam.
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_EMAIL_RELAY_TOKEN)
-        .map_err(|e| EmailRelayCredentialsError::Backend(format!("Entry::new: {e}")))?;
-    entry
-        .set_password(token)
-        .map_err(|e| EmailRelayCredentialsError::Backend(format!("set_password: {e}")))
+    keychain_store()
+        .set(&service, ITEM_EMAIL_RELAY_TOKEN, token)
+        .map_err(|e| EmailRelayCredentialsError::Backend(e.to_string()))
 }
 
 /// Read the bearer token from the OS keychain. Wrapped in `Zeroizing`.
 pub fn read_token(tenant_id: &str) -> Result<Zeroizing<String>, EmailRelayCredentialsError> {
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_EMAIL_RELAY_TOKEN)
-        .map_err(|e| EmailRelayCredentialsError::Backend(format!("Entry::new: {e}")))?;
-    match entry.get_password() {
-        Ok(s) => Ok(Zeroizing::new(s)),
-        Err(keyring::Error::NoEntry) => Err(EmailRelayCredentialsError::Missing {
+    match keychain_store()
+        .get(&service, ITEM_EMAIL_RELAY_TOKEN)
+        .map_err(|e| EmailRelayCredentialsError::Backend(e.to_string()))?
+    {
+        Some(s) => Ok(s),
+        None => Err(EmailRelayCredentialsError::Missing {
             tenant_id: tenant_id.to_string(),
         }),
-        Err(other) => Err(EmailRelayCredentialsError::Backend(format!(
-            "get_password: {other}"
-        ))),
     }
 }
 
@@ -83,15 +80,9 @@ pub fn read_token(tenant_id: &str) -> Result<Zeroizing<String>, EmailRelayCreden
 #[allow(dead_code)]
 pub fn delete_token(tenant_id: &str) -> Result<bool, EmailRelayCredentialsError> {
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_EMAIL_RELAY_TOKEN)
-        .map_err(|e| EmailRelayCredentialsError::Backend(format!("Entry::new: {e}")))?;
-    match entry.delete_password() {
-        Ok(()) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(other) => Err(EmailRelayCredentialsError::Backend(format!(
-            "delete_password: {other}"
-        ))),
-    }
+    keychain_store()
+        .delete(&service, ITEM_EMAIL_RELAY_TOKEN)
+        .map_err(|e| EmailRelayCredentialsError::Backend(e.to_string()))
 }
 
 #[cfg(test)]

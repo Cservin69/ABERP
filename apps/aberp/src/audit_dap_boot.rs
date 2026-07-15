@@ -24,7 +24,6 @@ use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::OsRng;
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
-use keyring::Entry;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
@@ -55,11 +54,16 @@ pub const ITEM_AUDIT_SERVICE_KEY: &str = "audit_service_signing_key";
 /// record linking the key to its operator (ADR-0088, same posture as the
 /// CAD key in ADR-0083).
 pub fn load_or_provision_service_key(tenant_id: &str) -> Result<SessionKey> {
+    // ADR-0100 Phase 1 — through the shared `SecretStore` seam. Like the
+    // CAD key, this symmetric signing seed is one of the 8 categories
+    // Phase 3's self-hosted backend must carry.
+    use aberp_secret_store::SecretStore as _;
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_AUDIT_SERVICE_KEY)
-        .context("open audit-service-key keychain entry")?;
-    match entry.get_password() {
-        Ok(b64) => {
+    let store = aberp_secret_store::keychain_store();
+    match store.get(&service, ITEM_AUDIT_SERVICE_KEY).map_err(|e| {
+        anyhow!("audit-service-key keychain backend error for tenant {tenant_id}: {e}")
+    })? {
+        Some(b64) => {
             let raw = Zeroizing::new(
                 base64::engine::general_purpose::STANDARD
                     .decode(b64.trim())
@@ -75,18 +79,15 @@ pub fn load_or_provision_service_key(tenant_id: &str) -> Result<SessionKey> {
             })?;
             Ok(SessionKey::from_seed(&seed))
         }
-        Err(keyring::Error::NoEntry) => {
+        None => {
             let mut seed = Zeroizing::new([0u8; SERVICE_KEY_LEN]);
             OsRng.fill_bytes(seed.as_mut());
             let b64 = base64::engine::general_purpose::STANDARD.encode(seed.as_ref());
-            entry
-                .set_password(&b64)
+            store
+                .set(&service, ITEM_AUDIT_SERVICE_KEY, &b64)
                 .context("store freshly-minted audit-service key in keychain")?;
             Ok(SessionKey::from_seed(&seed))
         }
-        Err(other) => Err(anyhow!(
-            "audit-service-key keychain backend error for tenant {tenant_id}: {other}"
-        )),
     }
 }
 

@@ -1,0 +1,29 @@
+[package]
+name = "aberp-secret-store"
+description = "SecretStore seam over the OS keychain (ADR-0100 Phase 1). One trait, one keychain-backed impl; the Phase-3 swap point for a self-hosted secrets backend."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_secret_store"
+path = "src/lib.rs"
+
+[dependencies]
+# OS keychain — the ONLY backend today (keyring v2, unchanged from every
+# pre-Phase-1 call site). ADR-0100 §5 item 2.
+keyring = { workspace = true }
+
+# In-memory secret protection — every `get` returns `Zeroizing<String>`
+# so the buffer is wiped on drop. ADR-0007 §Secrets.
+zeroize = { workspace = true }
+
+# Library boundary error type per ADR-0021 Part A item 2.
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

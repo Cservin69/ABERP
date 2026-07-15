@@ -171,8 +171,11 @@ fn keychain_service_for(tenant: &str) -> String {
 /// per-OS path if needed; for now the user-home posture works on all
 /// three platforms.
 fn serve_artifacts_dir(tenant: &str) -> Result<PathBuf> {
-    let home = dirs_home_or_loud_fail()?;
-    Ok(home.join(".aberp").join("serve").join(tenant))
+    // ADR-0100 Phase 1 — resolved through the storage-path seam
+    // (`crate::paths`). Byte-identical to the previous
+    // `$HOME/.aberp/serve/<tenant>` computation; Phase 4 relocates the
+    // root there without touching this call site.
+    crate::paths::serve_root(tenant)
 }
 
 /// S291 / PR-272 — env-var override for the loopback HTTPS port. The
@@ -189,6 +192,19 @@ fn serve_artifacts_dir(tenant: &str) -> Result<PathBuf> {
 /// sets a known-good value and the operator pathway with `--port`
 /// keeps working unchanged. A typo'd env in some unrelated shell
 /// shouldn't deny boot.
+/// ADR-0100 Phase 1 — the transport-bind seam. The listener host is
+/// `127.0.0.1` (loopback) in EVERY build today, INCLUDING `--features
+/// saas`: Phase 1's hard invariant is that nothing binds beyond loopback
+/// yet (no `0.0.0.0`, no public exposure). ADR-0100 Phase 6 fills the
+/// public-edge arm (serve behind the TLS edge) gated on
+/// [`crate::build_profile::IS_SAAS_BUILD`]; this is the single chokepoint
+/// so that flip is a one-line change, not a scattered edit. Deliberately
+/// unconditional now — a `saas`-vs-desktop branch here would violate the
+/// desktop-identical invariant.
+fn transport_bind_host() -> &'static str {
+    "127.0.0.1"
+}
+
 pub(crate) fn resolve_listener_port(args_port: u16) -> u16 {
     match std::env::var("ABERP_HTTPS_PORT") {
         Ok(s) => match s.trim().parse::<u16>() {
@@ -205,24 +221,12 @@ pub(crate) fn resolve_listener_port(args_port: u16) -> u16 {
     }
 }
 
-/// We deliberately do NOT import the `dirs` crate (one more dep, one
-/// more supply-chain surface). `std::env::var("HOME")` covers macOS
-/// and Linux; `USERPROFILE` covers Windows. Loud-fail if neither is
-/// set per CLAUDE.md rule 12.
+/// Home-directory resolver. ADR-0100 Phase 1 — delegates to the single
+/// home-detection point in [`crate::paths::home_dir`] (which owns the
+/// `HOME`/`USERPROFILE` logic) so there is one source of truth for the
+/// data-root seam.
 fn dirs_home_or_loud_fail() -> Result<PathBuf> {
-    if let Ok(h) = std::env::var("HOME") {
-        if !h.is_empty() {
-            return Ok(PathBuf::from(h));
-        }
-    }
-    if let Ok(h) = std::env::var("USERPROFILE") {
-        if !h.is_empty() {
-            return Ok(PathBuf::from(h));
-        }
-    }
-    Err(anyhow!(
-        "neither HOME nor USERPROFILE is set — cannot locate ~/.aberp/serve/<tenant>/"
-    ))
+    crate::paths::home_dir()
 }
 
 /// S165 / deliverable #5 — the hülye-biztos cross-stream guard. A
@@ -1603,14 +1607,16 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         from_env = effective_port != args.port,
         "boot step: binding loopback TCP listener"
     );
-    let bind_addr: SocketAddr =
-        format!("127.0.0.1:{effective_port}")
-            .parse()
-            .with_context(|| {
-                format!(
-                    "parse loopback socket address 127.0.0.1:{effective_port} (port out of range?)"
-                )
-            })?;
+    // ADR-0100 Phase 1 — host comes from the transport-bind seam, which
+    // is `127.0.0.1` in every build today (loopback-only invariant).
+    let bind_host = transport_bind_host();
+    let bind_addr: SocketAddr = format!("{bind_host}:{effective_port}")
+        .parse()
+        .with_context(|| {
+            format!(
+                "parse loopback socket address {bind_host}:{effective_port} (port out of range?)"
+            )
+        })?;
     let listener = {
         let _s = tracing::info_span!("serve.tcp_bind").entered();
         TcpListener::bind(bind_addr).with_context(|| format!("bind TCP listener at {bind_addr}"))?
@@ -3227,53 +3233,56 @@ fn build_rustls_config(cert_pem: &str, key_pem: &str) -> Result<(Vec<Vec<u8>>, V
 /// absent, generate a fresh 256-bit random token (hex-encoded) and
 /// persist it.
 fn load_or_create_session_token(tenant: &str) -> Result<String> {
+    use aberp_secret_store::SecretStore as _;
     let service = keychain_service_for(tenant);
-    let entry = keyring::Entry::new(&service, SESSION_TOKEN_ACCOUNT)
-        .context("build keyring::Entry for session token")?;
-    match entry.get_password() {
-        Ok(existing) if !existing.is_empty() => Ok(existing),
-        Ok(_) | Err(keyring::Error::NoEntry) => {
-            let fresh = generate_session_token();
-            entry
-                .set_password(&fresh)
-                .context("write fresh session token to OS keychain")?;
+    // ADR-0100 Phase 1 — the session token is read/written through the
+    // shared `SecretStore` seam like every other keychain secret. The
+    // keychain-backed store is the only impl; behaviour is unchanged.
+    let store = aberp_secret_store::keychain_store();
+    match store
+        .get(&service, SESSION_TOKEN_ACCOUNT)
+        .map_err(|e| anyhow!("keychain access for session token failed: {e}"))?
+    {
+        // An empty stored value is treated as absent → re-mint (unchanged
+        // from the pre-seam behaviour).
+        Some(existing) if !existing.is_empty() => Ok(existing.to_string()),
+        _ => {
+            let fresh = generate_session_token()?;
+            store
+                .set(&service, SESSION_TOKEN_ACCOUNT, &fresh)
+                .map_err(|e| anyhow!("write fresh session token to OS keychain: {e}"))?;
             tracing::info!(
                 tenant = tenant,
                 "minted fresh session token in OS keychain (account `session_token`)"
             );
             Ok(fresh)
         }
-        Err(e) => Err(anyhow!("keychain access for session token failed: {e}")),
     }
 }
 
-/// 32 random bytes from the OS RNG, hex-encoded. We do not pull in
-/// `rand` for this — `std::time::SystemTime::now()` is the cheap
-/// source for one-shot key material on a single workstation, mixed
-/// with a per-process ULID. A proper rotation flow with a real RNG
-/// can land when the operator-action surface needs it; for the first
-/// MVP token a 256-bit value derived from system entropy is
-/// sufficient.
+/// Mint a fresh session bearer token: 32 bytes (256 bits) drawn from the
+/// OS CSPRNG (`getrandom`), rendered as a URL-safe base64 string with no
+/// padding (43 chars).
 ///
-/// Per CLAUDE.md rule 12, we name the trade-off loud: this is NOT a
-/// cryptographic key. It is a single-workstation bearer secret that
-/// gates one local HTTPS endpoint behind the OS-keychain trust
-/// boundary the rest of ABERP already lives behind. A future
-/// PR-9-1.5 (or session 12) can swap this for a `rand`-sourced
-/// equivalent.
-fn generate_session_token() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0u128);
-    let ulid_bytes = ulid::Ulid::new().to_bytes();
-    let pid = std::process::id();
-    let mut hasher = Sha256::new();
-    hasher.update(now_nanos.to_le_bytes());
-    hasher.update(ulid_bytes);
-    hasher.update(pid.to_le_bytes());
-    hex::encode(hasher.finalize())
+/// ADR-0100 Phase 1 — this replaces the pre-Phase-1
+/// `SHA-256(SystemTime nanos ‖ per-process ULID ‖ PID)` derivation,
+/// which was explicitly NOT a cryptographic value: boot time and PID are
+/// low-entropy and partly observable, so the old token was guessable in
+/// principle. The new value is unguessable OS entropy.
+///
+/// The token stays an **opaque** keychain string that is re-read (never
+/// re-derived) on every boot, so existing tokens keep validating
+/// unchanged — only a freshly-minted token draws from the CSPRNG. No
+/// forced re-mint, no lockout (the shell reads whatever string is
+/// stored; the constant-time compare is length-agnostic). This is the
+/// single most urgent pre-exposure fix on the SaaS path and is a pure
+/// security win on loopback too.
+fn generate_session_token() -> Result<String> {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| anyhow!("draw 32 bytes from OS CSPRNG for session token: {e}"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
 // ── Axum router + handlers ───────────────────────────────────────────
@@ -28671,6 +28680,76 @@ mod tests {
         // failure mode session 87 closed.
         aberp_nav_xsd_validator::validate_invoice_data(&xml)
             .expect("v3.0 invariant check must pass on the same bytes the extractor accepts");
+    }
+
+    // ADR-0100 Phase 1 — the session token is now an OS-CSPRNG draw.
+    // These pins guard the entropy + opacity properties an adversarial
+    // review checks (unguessable, unique, decodes to 256 bits).
+    #[test]
+    fn session_token_is_high_entropy_and_unique() {
+        use base64::Engine as _;
+
+        let a = generate_session_token().expect("CSPRNG draw a");
+        let b = generate_session_token().expect("CSPRNG draw b");
+
+        // Two independent draws must differ — a deterministic or
+        // low-entropy source (the old SHA-256(time‖ULID‖PID)) would risk
+        // collision; OS entropy does not.
+        assert_ne!(a, b, "two CSPRNG token draws must not collide");
+
+        // The rendered form is URL-safe base64 with no padding (43 chars
+        // for 32 bytes) and decodes back to exactly 256 bits.
+        assert_eq!(a.len(), 43, "32 bytes base64url-nopad is 43 chars");
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(a.as_bytes())
+            .expect("token must be valid URL-safe base64");
+        assert_eq!(decoded.len(), 32, "token must carry 256 bits of entropy");
+
+        // Charset guard: URL-safe base64 alphabet only (no '+', '/', '=').
+        assert!(
+            a.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+            "token must be URL-safe (no +, /, or = padding)"
+        );
+
+        // A larger batch: all draws distinct (entropy sanity, not a
+        // statistical test — collisions here would mean a broken RNG).
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            assert!(
+                seen.insert(generate_session_token().expect("CSPRNG draw")),
+                "CSPRNG produced a duplicate token in 256 draws"
+            );
+        }
+    }
+
+    // ADR-0100 Phase 1 hard invariant — the desktop build binds loopback
+    // ONLY and is NOT a `saas` build. This is the "bind + backend
+    // unchanged" guard the deliverable asks for; it fails loud if a later
+    // edit flips the transport seam or the feature default. Gated to the
+    // default build (like build_profile's arm pins) since `--features
+    // saas` legitimately flips IS_SAAS_BUILD.
+    #[cfg(not(feature = "saas"))]
+    #[test]
+    #[allow(clippy::assertions_on_constants)] // pinning the compile-time saas gate is the point.
+    fn desktop_build_binds_loopback_and_is_not_saas() {
+        assert_eq!(
+            transport_bind_host(),
+            "127.0.0.1",
+            "the transport-bind seam must stay loopback in the default build"
+        );
+        // The seam host must parse as a loopback IPv4 address.
+        let ip: std::net::IpAddr = transport_bind_host().parse().expect("bind host is an IP");
+        assert!(ip.is_loopback(), "bind host must be loopback");
+        assert!(
+            matches!(ip, std::net::IpAddr::V4(_)),
+            "bind host must be IPv4"
+        );
+        // The default build is not `saas` (single source of truth).
+        assert!(
+            !crate::build_profile::IS_SAAS_BUILD,
+            "the default (desktop) build must not be a saas build"
+        );
     }
 
     #[test]

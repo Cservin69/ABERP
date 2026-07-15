@@ -20,7 +20,7 @@
 //! - No `Debug` impl on the token string — accidental
 //!   `tracing::debug!(?token)` would not compile.
 
-use keyring::Entry;
+use aberp_secret_store::{keychain_store, SecretStore};
 use zeroize::Zeroizing;
 
 /// Item-name for the quote-intake bearer-token keychain entry.
@@ -58,27 +58,24 @@ impl std::error::Error for QuoteIntakeCredentialsError {}
 /// (non-empty) happens at the route layer; this seam writes whatever
 /// it's given so the rotation surface stays simple.
 pub fn write_token(tenant_id: &str, token: &str) -> Result<(), QuoteIntakeCredentialsError> {
+    // ADR-0100 Phase 1 — through the shared `SecretStore` seam.
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_QUOTE_INTAKE_TOKEN)
-        .map_err(|e| QuoteIntakeCredentialsError::Backend(format!("Entry::new: {e}")))?;
-    entry
-        .set_password(token)
-        .map_err(|e| QuoteIntakeCredentialsError::Backend(format!("set_password: {e}")))
+    keychain_store()
+        .set(&service, ITEM_QUOTE_INTAKE_TOKEN, token)
+        .map_err(|e| QuoteIntakeCredentialsError::Backend(e.to_string()))
 }
 
 /// Read the bearer token from the OS keychain. Wrapped in `Zeroizing`.
 pub fn read_token(tenant_id: &str) -> Result<Zeroizing<String>, QuoteIntakeCredentialsError> {
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_QUOTE_INTAKE_TOKEN)
-        .map_err(|e| QuoteIntakeCredentialsError::Backend(format!("Entry::new: {e}")))?;
-    match entry.get_password() {
-        Ok(s) => Ok(Zeroizing::new(s)),
-        Err(keyring::Error::NoEntry) => Err(QuoteIntakeCredentialsError::Missing {
+    match keychain_store()
+        .get(&service, ITEM_QUOTE_INTAKE_TOKEN)
+        .map_err(|e| QuoteIntakeCredentialsError::Backend(e.to_string()))?
+    {
+        Some(s) => Ok(s),
+        None => Err(QuoteIntakeCredentialsError::Missing {
             tenant_id: tenant_id.to_string(),
         }),
-        Err(other) => Err(QuoteIntakeCredentialsError::Backend(format!(
-            "get_password: {other}"
-        ))),
     }
 }
 
@@ -86,15 +83,9 @@ pub fn read_token(tenant_id: &str) -> Result<Zeroizing<String>, QuoteIntakeCrede
 #[allow(dead_code)]
 pub fn delete_token(tenant_id: &str) -> Result<bool, QuoteIntakeCredentialsError> {
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_QUOTE_INTAKE_TOKEN)
-        .map_err(|e| QuoteIntakeCredentialsError::Backend(format!("Entry::new: {e}")))?;
-    match entry.delete_password() {
-        Ok(()) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(other) => Err(QuoteIntakeCredentialsError::Backend(format!(
-            "delete_password: {other}"
-        ))),
-    }
+    keychain_store()
+        .delete(&service, ITEM_QUOTE_INTAKE_TOKEN)
+        .map_err(|e| QuoteIntakeCredentialsError::Backend(e.to_string()))
 }
 
 #[cfg(test)]

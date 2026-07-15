@@ -92,3 +92,27 @@ jobs:
         # allow-list, and prove fail-closed (a de-gated scanner passes the real
         # read-forks). A negative probe that cannot fail is decoration.
         run: bash tools/cut_gate_read_fork_probes.sh
+
+      - name: ADR-0100 Phase 1 keychain-seam gate (ENFORCING)
+        # Every keychain access must route through the aberp-secret-store
+        # SecretStore seam (ADR-0100 §5). Phase 1 reached ZERO direct keychain
+        # sites outside the seam crate + its designated test mocks, so this is
+        # ENFORCING — it FAILS on ANY direct keyring access (keyring::, aliased
+        # `use keyring::Entry as X`, wildcard `use keyring::*`, `::keyring::`,
+        # `.get/.set/.delete_password(`, `Entry::new_with_target`) in runtime
+        # code outside the seam. Flag explicit here as well as defaulted in the
+        # script so enforcement is visible at the CI surface and cannot be
+        # silently weakened by a one-line script edit. (cargo test also runs this
+        # gate via apps/aberp/tests/keychain_seam_gate.rs.)
+        env:
+          ENFORCE_KEYCHAIN_SEAM: "1"
+        run: bash tools/cut_gate_keychain_seam.sh
+
+      - name: Prove the keychain-seam gate has teeth (negative probes)
+        # Synthetic scratch-file probes: plant each bypass form (qualified /
+        # aliased / wildcard keyring import, `.get_password(`, `new_with_target`)
+        # and assert RED; assert a comment/string mention and a #[cfg(test)]
+        # inline mock stay GREEN; exclude the seam crate + tests/ mocks; and prove
+        # fail-closed (a de-gated scanner passes the real bypass). A negative
+        # probe that cannot fail is decoration.
+        run: bash tools/cut_gate_keychain_seam_probes.sh

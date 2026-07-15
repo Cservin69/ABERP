@@ -29,6 +29,24 @@ pub const IS_PRODUCTION_BUILD: bool = true;
 #[cfg(not(feature = "production"))]
 pub const IS_PRODUCTION_BUILD: bool = false;
 
+/// ADR-0100 Phase 1 — `true` iff this binary was compiled with
+/// `--features saas`. Mirrors [`IS_PRODUCTION_BUILD`] as the single
+/// compile-time source of truth for cloud-vs-desktop behaviour, so
+/// every later-phase seam (transport bind, storage roots, auth
+/// middleware) reads ONE constant.
+///
+/// **Phase 1 is deliberately behaviour-neutral in every build.** The
+/// `saas` feature compiles in but changes nothing yet: the desktop
+/// binary and a `--features saas` binary are byte-behaviour-identical
+/// on loopback. Later phases (2/4/6) fill the `saas` arms. Under the
+/// default (desktop) build this is `false` and every seam resolves to
+/// today's value.
+#[cfg(feature = "saas")]
+pub const IS_SAAS_BUILD: bool = true;
+/// `false` for every non-`saas` build (the default).
+#[cfg(not(feature = "saas"))]
+pub const IS_SAAS_BUILD: bool = false;
+
 /// Render prefix prepended to every emitted invoice number on dev/test
 /// builds, empty on production builds. `TEST-` is NAV-`invoiceNumber`
 /// charset-legal (`[0-9A-Za-z\-/]`, hyphen — NOT underscore, which the
@@ -157,5 +175,24 @@ mod tests {
         // The gate is LIFTED on a production build.
         assert!(assert_endpoint_allowed(NavEndpoint::Production).is_ok());
         assert!(assert_endpoint_allowed(NavEndpoint::Test).is_ok());
+    }
+
+    // ADR-0100 Phase 1 — the default (desktop) build MUST have `saas`
+    // off. `cargo test --workspace` runs this arm; a `--features saas`
+    // build would compile the const to `true` and this test would not
+    // pin it (the `saas`-on arm below does). Together they guarantee the
+    // desktop-identical invariant at the single source of truth.
+    #[cfg(not(feature = "saas"))]
+    #[test]
+    #[allow(clippy::assertions_on_constants)] // pinning the compile-time gate is the test's purpose.
+    fn default_build_is_not_saas() {
+        assert!(!IS_SAAS_BUILD);
+    }
+
+    #[cfg(feature = "saas")]
+    #[test]
+    #[allow(clippy::assertions_on_constants)] // pinning the compile-time gate is the test's purpose.
+    fn saas_build_is_saas() {
+        assert!(IS_SAAS_BUILD);
     }
 }

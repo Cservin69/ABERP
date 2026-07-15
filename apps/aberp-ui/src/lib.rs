@@ -855,18 +855,21 @@ pub fn mark_post_setup_state(handle: &tauri::AppHandle, next_state: &str) {
 /// absent we loud-fail and ask the operator to run `aberp serve`
 /// once first (which mints the entry as a side effect).
 fn load_session_token(tenant: &str) -> Result<String> {
+    // ADR-0100 Phase 1 — the shell's one keychain read goes through the
+    // shared `SecretStore` seam, same keychain backend as the CLI mint.
+    use aberp_secret_store::SecretStore as _;
     let service = format!("aberp.nav.{tenant}");
-    let entry = keyring::Entry::new(&service, "session_token")
-        .context("build keyring::Entry for session_token")?;
-    match entry.get_password() {
-        Ok(t) if !t.is_empty() => Ok(t),
-        Ok(_) => Err(anyhow!(
+    match aberp_secret_store::keychain_store()
+        .get(&service, "session_token")
+        .map_err(|e| anyhow!("OS keychain access failed: {e}"))?
+    {
+        Some(t) if !t.is_empty() => Ok(t.to_string()),
+        Some(_) => Err(anyhow!(
             "OS keychain entry `{service}` / `session_token` is empty — run `aberp serve --tenant {tenant}` once to mint it"
         )),
-        Err(keyring::Error::NoEntry) => Err(anyhow!(
+        None => Err(anyhow!(
             "OS keychain has no `{service}` / `session_token` entry — run `aberp serve --tenant {tenant}` once to mint it"
         )),
-        Err(e) => Err(anyhow!("OS keychain access failed: {e}")),
     }
 }
 

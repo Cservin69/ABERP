@@ -42,7 +42,7 @@
 //!
 //! Env override (highest precedence): `ABERP_STOREFRONT_ORIGIN_SECRET`.
 
-use keyring::Entry;
+use aberp_secret_store::{keychain_store, SecretStore};
 use zeroize::Zeroizing;
 
 /// Item-name for the origin-secret keychain entry.
@@ -80,27 +80,20 @@ impl std::error::Error for StorefrontOriginSecretError {}
 /// job (matches `quote_intake_credentials::write_token`).
 #[allow(dead_code)]
 pub fn write_secret(tenant_id: &str, secret: &str) -> Result<(), StorefrontOriginSecretError> {
+    // ADR-0100 Phase 1 — through the shared `SecretStore` seam.
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_ORIGIN_SECRET)
-        .map_err(|e| StorefrontOriginSecretError::Backend(format!("Entry::new: {e}")))?;
-    entry
-        .set_password(secret)
-        .map_err(|e| StorefrontOriginSecretError::Backend(format!("set_password: {e}")))
+    keychain_store()
+        .set(&service, ITEM_ORIGIN_SECRET, secret)
+        .map_err(|e| StorefrontOriginSecretError::Backend(e.to_string()))
 }
 
 /// Delete the origin-secret keychain entry. Idempotent.
 #[allow(dead_code)]
 pub fn delete_secret(tenant_id: &str) -> Result<bool, StorefrontOriginSecretError> {
     let service = service_name(tenant_id);
-    let entry = Entry::new(&service, ITEM_ORIGIN_SECRET)
-        .map_err(|e| StorefrontOriginSecretError::Backend(format!("Entry::new: {e}")))?;
-    match entry.delete_password() {
-        Ok(()) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(other) => Err(StorefrontOriginSecretError::Backend(format!(
-            "delete_password: {other}"
-        ))),
-    }
+    keychain_store()
+        .delete(&service, ITEM_ORIGIN_SECRET)
+        .map_err(|e| StorefrontOriginSecretError::Backend(e.to_string()))
 }
 
 /// Resolve the optional origin secret for `tenant_id`. Precedence:
@@ -118,26 +111,16 @@ pub fn resolve(tenant_id: &str) -> Option<Zeroizing<String>> {
             return Some(Zeroizing::new(v));
         }
     }
+    // ADR-0100 Phase 1 — through the shared `SecretStore` seam. Soft-fail
+    // posture preserved: a backend error degrades to `None` with a WARN,
+    // never aborts the catalogue-push daemon.
     let service = service_name(tenant_id);
-    let entry = match Entry::new(&service, ITEM_ORIGIN_SECRET) {
-        Ok(e) => e,
+    match keychain_store().get(&service, ITEM_ORIGIN_SECRET) {
+        Ok(Some(s)) if !s.is_empty() => Some(s),
+        Ok(_) => None,
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "storefront origin-secret keychain Entry::new failed; \
-                 catalogue push will not send X-CloudFront-Secret \
-                 (relying on CloudFront injection)"
-            );
-            return None;
-        }
-    };
-    match entry.get_password() {
-        Ok(s) if !s.is_empty() => Some(Zeroizing::new(s)),
-        Ok(_) => None,
-        Err(keyring::Error::NoEntry) => None,
-        Err(other) => {
-            tracing::warn!(
-                error = %other,
                 "storefront origin-secret keychain read failed; \
                  catalogue push will not send X-CloudFront-Secret \
                  (relying on CloudFront injection)"

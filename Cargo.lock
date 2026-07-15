@@ -23,6 +23,7 @@ dependencies = [
  "aberp-quote-engine",
  "aberp-quote-intake",
  "aberp-quote-pdf",
+ "aberp-secret-store",
  "aberp-snapshot",
  "aberp-verify",
  "aberp-work-orders",
@@ -36,6 +37,7 @@ dependencies = [
  "clap",
  "duckdb",
  "fs2",
+ "getrandom 0.2.17",
  "hex",
  "keyring",
  "lettre",
@@ -229,9 +231,9 @@ name = "aberp-nav-transport"
 version = "0.0.0"
 dependencies = [
  "aberp-nav-transport",
+ "aberp-secret-store",
  "aes",
  "base64 0.22.1",
- "keyring",
  "quick-xml 0.36.2",
  "reqwest 0.13.3",
  "rustls",
@@ -316,6 +318,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aberp-secret-store"
+version = "0.0.0"
+dependencies = [
+ "keyring",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "aberp-snapshot"
 version = "0.0.0"
 dependencies = [
@@ -334,9 +345,9 @@ dependencies = [
 name = "aberp-ui"
 version = "0.0.0"
 dependencies = [
+ "aberp-secret-store",
  "anyhow",
  "hex",
- "keyring",
  "reqwest 0.13.3",
  "rustls",
  "serde_json",

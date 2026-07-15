@@ -134,6 +134,13 @@ pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 /// short-circuits (lengths are not secret here — the mock's MAC is always
 /// 32 bytes), but for equal-length inputs the loop is mismatch-position
 /// independent.
+///
+/// **ADR-0100 Phase-6 must-fix (public-exposure).** The early length-mismatch
+/// return leaks input length via timing. Acceptable on loopback / for the
+/// fixed-width mock MAC today; before ABERP is exposed on the public internet
+/// (ADR-0100 Phase 6 — public-edge review) this must become fully
+/// length-independent (e.g. `subtle::ConstantTimeEq` / a padded compare).
+/// Tracked in ADR-0100 §5 so the finding is not lost.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
