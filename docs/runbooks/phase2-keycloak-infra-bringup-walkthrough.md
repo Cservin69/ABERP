@@ -1,9 +1,11 @@
 # Phase 2 infra bring-up — stand up Keycloak (OIDC identity) from zero
 
-**Audience:** Ervin / first-time operator. No prior server-admin assumed.
+**Audience:** first-time operator / self-hoster. No prior server-admin assumed.
 **Time:** ~90 min the first time (most of it is waiting on DNS + Let's Encrypt).
 **Cost:** ~€4–5/month (one Hetzner CX22) + your existing domain. Needs a credit/debit card once.
 **Grounded in:** ADR-0100 §0 (decided stack) + §4 forks (Hetzner CX22 / sops+age / Keycloak+Postgres / TOTP+WebAuthn / Caddy+Cloudflare).
+
+> **📌 Substitute your own domain.** This walkthrough uses `example.com` as a placeholder throughout — `auth.example.com` for Keycloak and `app.example.com` for the application host. Replace **every** occurrence of `example.com` with your real domain before running any command.
 
 ---
 
@@ -15,7 +17,7 @@ This stands up the **infrastructure prerequisite** for ADR-0100 **Phase 2** (ide
 
 - a hardened Hetzner server on the public internet,
 - a self-hosted **sops + age** secrets store on it,
-- a **Keycloak** container (with its own private Postgres) reachable over **real HTTPS** at `auth.abenerp.com`,
+- a **Keycloak** container (with its own private Postgres) reachable over **real HTTPS** at `auth.example.com`,
 - a Keycloak **realm** + an **ABERP OIDC client** ready for ABERP to authenticate against,
 - **TOTP required** as the MFA baseline, and a note on where WebAuthn step-up gets configured later,
 - scheduled encrypted backups + a restore drill.
@@ -26,15 +28,15 @@ This stands up the **infrastructure prerequisite** for ADR-0100 **Phase 2** (ide
 - ❌ **It does not write a single line of ABERP↔Keycloak code.** No OIDC relying-party code, no callback handler, no token validation. That is the **Phase-2 code session**, done after this infra exists. This walkthrough *ends* by handing that session the four values it needs (§11).
 - ❌ **It does not touch `main`, the desktop build, or the `run/` launch scripts.** Nothing here changes `run_prod.sh` / `run_portable.sh` / `upgrade_prod.sh`. The desktop binary stays the rollback target (ADR-0100 §6).
 
-If you only remember one thing: **this session's deliverable is a working Keycloak login page at `https://auth.abenerp.com`.** Nothing about ABERP itself changes yet.
+If you only remember one thing: **this session's deliverable is a working Keycloak login page at `https://auth.example.com`.** Nothing about ABERP itself changes yet.
 
 ### 🚩 Flagged assumptions (conservative defaults taken; correct me if wrong)
 
 | # | Assumption | Why this default | How to change |
 | --- | --- | --- | --- |
-| A1 ✅ | **Subdomain = `auth.abenerp.com`** for Keycloak. **CONFIRMED by Ervin 2026-07-15 (route assumptions approved).** | ADR-0100 never fixes an auth hostname; `auth.` is the conventional IdP subdomain and keeps the storefront (`abenerp.com`) and the future ABERP app (`invoicing.abenerp.com`, per ADR-0059/0100) cleanly separated. | Pick any subdomain in Step 12; substitute it everywhere `auth.abenerp.com` appears. |
-| A2 ✅ | **ABERP will live at `invoicing.abenerp.com`** (the OIDC redirect target). **CONFIRMED by Ervin 2026-07-15 (route assumptions approved).** | That is the SaaS app hostname decided in ADR-0059 §4 and carried into ADR-0100. | If ABERP gets a different hostname, fix the redirect URI in Step 33. |
-| A3 ✅ | **OIDC callback path = `/auth/callback`.** **CONFIRMED by Ervin 2026-07-15 (route assumptions approved).** | The Phase-2 code session owns the real path; `/auth/callback` is the conventional placeholder so the client isn't empty. | The code session updates the client redirect URI (Keycloak admin console, no infra change). |
+| A1 ✅ | **Subdomain = `auth.example.com`** for Keycloak. **CONFIRMED (2026-07-15, route assumptions approved).** | ADR-0100 never fixes an auth hostname; `auth.` is the conventional IdP subdomain and keeps the storefront (`example.com`) and the future ABERP app (`app.example.com`, per ADR-0059/0100) cleanly separated. | Pick any subdomain in Step 12; substitute it everywhere `auth.example.com` appears. |
+| A2 ✅ | **ABERP will live at `app.example.com`** (the OIDC redirect target). **CONFIRMED (2026-07-15, route assumptions approved).** | That is the SaaS app hostname decided in ADR-0059 §4 and carried into ADR-0100. | If ABERP gets a different hostname, fix the redirect URI in Step 33. |
+| A3 ✅ | **OIDC callback path = `/auth/callback`.** **CONFIRMED (2026-07-15, route assumptions approved).** | The Phase-2 code session owns the real path; `/auth/callback` is the conventional placeholder so the client isn't empty. | The code session updates the client redirect URI (Keycloak admin console, no infra change). |
 | A4 | **Region = Falkenstein (`fsn1`), Ubuntu 24.04 LTS.** | ADR-0100 says EU-Falkenstein; 24.04 is the current Ubuntu LTS. | Choose another EU location / LTS in Step 2. |
 | A5 | **Keycloak `26.x`, Postgres `16`** (pinned image tags). | Current stable Keycloak major + its supported Postgres. | Bump the tags in the compose file (Step 26). Never use `:latest`. |
 | A6 | **Firewall opens 22, 80, 443** — not just 22+443. | Port **80** is mandatory for Let's Encrypt HTTP-01 challenge and the HTTP→HTTPS redirect. The ADR brief said "22+443"; 80 is a hard requirement for automatic TLS. No plaintext app traffic ever rides 80 — Caddy 301-redirects it. | If you switch Caddy to the DNS-01 ACME challenge you may close 80; that's more setup, not done here. |
@@ -49,10 +51,10 @@ If you only remember one thing: **this session's deliverable is a working Keyclo
 Before any command, confirm you have all three. Missing one blocks everything downstream.
 
 1. **A payment card** — Hetzner requires a card (or PayPal) to create an account. Expect ~€4.50/mo for the CX22 plus a few cents for the assigned IPv4. This is real money leaving monthly; that's expected (ADR-0100 §6: "~€8–12/mo OpEx from €0").
-2. **Control of the `abenerp.com` DNS zone** — you must be able to add an **A record**. (Per project memory the zone is managed at your DNS provider / Cloudflare; you'll use it in Step 12.)
+2. **Control of the `example.com` DNS zone** — you must be able to add an **A record**. (Per project memory the zone is managed at your DNS provider / Cloudflare; you'll use it in Step 12.)
 3. **An SSH keypair on your Mac** — created in Step 2 if you don't have one.
 
-**✅ Success check:** you can log into your DNS provider's dashboard and see the `abenerp.com` zone, and you have a card ready. Do not proceed otherwise.
+**✅ Success check:** you can log into your DNS provider's dashboard and see the `example.com` zone, and you have a card ready. Do not proceed otherwise.
 
 ---
 
@@ -260,14 +262,14 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 ## PART 2 — DNS + Docker (Steps 12–14)
 
-## 12. [your DNS provider — YOU do this by hand] Point `auth.abenerp.com` at the server
+## 12. [your DNS provider — YOU do this by hand] Point `auth.example.com` at the server
 
-In your DNS dashboard for `abenerp.com`, add **one A record**:
+In your DNS dashboard for `example.com`, add **one A record**:
 
 | Field | Value |
 | --- | --- |
 | Type | **A** |
-| Name / Host | `auth` (some providers want `auth.abenerp.com`) |
+| Name / Host | `auth` (some providers want `auth.example.com`) |
 | Value / Points to | `<SERVER_IP>` (from Step 4) |
 | TTL | Auto / 300 |
 | Proxy status (Cloudflare) | **DNS only — grey cloud** 🚩A7 |
@@ -276,7 +278,7 @@ In your DNS dashboard for `abenerp.com`, add **one A record**:
 
 **✅ Success check (from your Mac):**
 ```bash
-dig +short auth.abenerp.com
+dig +short auth.example.com
 ```
 must return exactly `<SERVER_IP>`. DNS can take a few minutes to an hour to propagate — re-run until it matches. **Do not proceed to TLS (Step 30) until this returns the right IP**, or Let's Encrypt will fail.
 
@@ -481,7 +483,7 @@ Internet ──443──► Caddy (host) ──► Keycloak container ──► 
 ```
 
 - **Postgres** is on an internal docker network only — no `ports:` mapping, so it is unreachable from the host or the internet. Only Keycloak can reach it.
-- **Keycloak** listens on `8080` **bound to `127.0.0.1`** on the host — only Caddy (running on the host) reaches it. It is told it sits behind a proxy (`KC_PROXY_HEADERS=xforwarded`) and that its public URL is `https://auth.abenerp.com`.
+- **Keycloak** listens on `8080` **bound to `127.0.0.1`** on the host — only Caddy (running on the host) reaches it. It is told it sits behind a proxy (`KC_PROXY_HEADERS=xforwarded`) and that its public URL is `https://auth.example.com`.
 - **Caddy** (Step 30) is the only thing the firewall exposes (443/80), and it terminates real TLS.
 
 ---
@@ -514,7 +516,7 @@ services:
     environment:
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
-      KC_HOSTNAME: https://auth.abenerp.com   # 🚩A1
+      KC_HOSTNAME: https://auth.example.com   # 🚩A1
       KC_HTTP_ENABLED: "true"                  # plaintext INSIDE the box only; Caddy adds TLS
       KC_PROXY_HEADERS: xforwarded             # trust X-Forwarded-* from Caddy
       KC_HEALTH_ENABLED: "true"
@@ -714,7 +716,7 @@ Write the Caddyfile. This is **not** a bare reverse-proxy: it fences off the adm
 
 ```bash
 sudo tee /etc/caddy/Caddyfile > /dev/null <<'EOF'
-auth.abenerp.com {
+auth.example.com {
     encode gzip
 
     # Admin surface (Keycloak /admin + the master realm) — operator IP only.
@@ -742,26 +744,26 @@ Replace `<YOUR_HOME_IP>` with the address from `ifconfig.me` above (keep the `/3
 > 🚩 **This closes a real hole:** a bare `reverse_proxy` exposes `/admin` and the brute-forceable `master` realm login to the entire internet. The IP fence shuts that down now, not "later."
 > 🚩 **If your home IP is dynamic** (most consumer ISPs): the `/32` allow-rule will start 403-ing *you* when your IP rotates — you'd re-run `ifconfig.me` and update the Caddyfile. If that's too fragile, the fallback is to **also enable Keycloak brute-force detection on the `master` realm** (Step 34 only turns it on for `aberp`): in the admin console pick the **master** realm → **Realm settings → Security defenses → Brute force detection → ON**. Do that *in addition to* (not instead of) the IP fence if you can hold a static IP; do it as the primary defense if you genuinely can't.
 
-Caddy now: answers `:80` and 301-redirects to `:443`, obtains a Let's Encrypt cert for `auth.abenerp.com` over HTTP-01 (this is why port 80 + the DNS A-record had to be right first), terminates TLS, and forwards to Keycloak with the `X-Forwarded-*` headers Keycloak trusts (`KC_PROXY_HEADERS=xforwarded`).
+Caddy now: answers `:80` and 301-redirects to `:443`, obtains a Let's Encrypt cert for `auth.example.com` over HTTP-01 (this is why port 80 + the DNS A-record had to be right first), terminates TLS, and forwards to Keycloak with the `X-Forwarded-*` headers Keycloak trusts (`KC_PROXY_HEADERS=xforwarded`).
 
 **✅ Success check:** watch the cert get issued:
 ```bash
 sudo journalctl -u caddy -f | grep -i 'certificate obtained\|serving initial configuration'
 ```
-Within ~30 s you should see `certificate obtained successfully` for `auth.abenerp.com`. `Ctrl-C` to stop. If it errors about the challenge, re-verify Step 12 (`dig +short auth.abenerp.com` = `<SERVER_IP>`) and Step 8 (port 80 open) and Cloudflare grey-cloud (🚩A7).
+Within ~30 s you should see `certificate obtained successfully` for `auth.example.com`. `Ctrl-C` to stop. If it errors about the challenge, re-verify Step 12 (`dig +short auth.example.com` = `<SERVER_IP>`) and Step 8 (port 80 open) and Cloudflare grey-cloud (🚩A7).
 
 ---
 
 ## 31. [your Mac — Terminal] Verify HTTPS from the outside world
 
 ```bash
-curl -sI https://auth.abenerp.com/ | head -5
-curl -s https://auth.abenerp.com/realms/master/.well-known/openid-configuration | head -c 200 ; echo
+curl -sI https://auth.example.com/ | head -5
+curl -s https://auth.example.com/realms/master/.well-known/openid-configuration | head -c 200 ; echo
 ```
 
-**✅ Success check:** the first prints an HTTP `200`/`302` with a valid TLS handshake (no cert warning). The second prints JSON starting `{"issuer":"https://auth.abenerp.com/realms/master",...`. If you see the OIDC discovery JSON over HTTPS, **the infrastructure is up** — this is the milestone from the §0 box.
+**✅ Success check:** the first prints an HTTP `200`/`302` with a valid TLS handshake (no cert warning). The second prints JSON starting `{"issuer":"https://auth.example.com/realms/master",...`. If you see the OIDC discovery JSON over HTTPS, **the infrastructure is up** — this is the milestone from the §0 box.
 
-> Also verify plaintext is refused-upgraded: `curl -sI http://auth.abenerp.com/ | grep -i location` shows a `Location: https://…` 301. No app traffic rides HTTP.
+> Also verify plaintext is refused-upgraded: `curl -sI http://auth.example.com/ | grep -i location` shows a `Location: https://…` 301. No app traffic rides HTTP.
 
 ---
 
@@ -774,7 +776,7 @@ curl -s https://auth.abenerp.com/realms/master/.well-known/openid-configuration 
    sudo SOPS_AGE_KEY_FILE=/etc/aberp/age.key sops --decrypt /opt/aberp-auth/secrets/keycloak.env | grep KEYCLOAK_ADMIN_PASSWORD
    ```
    Copy the value (everything after `=`).
-2. In your **browser**, go to **https://auth.abenerp.com/admin/**. Log in with username `admin` and that password. *(Entering the admin password into the login form is yours to do by hand — I never type credentials into fields.)*
+2. In your **browser**, go to **https://auth.example.com/admin/**. Log in with username `admin` and that password. *(Entering the admin password into the login form is yours to do by hand — I never type credentials into fields.)*
 3. Top-left realm dropdown (says **Keycloak** / **master**) → **Create realm**. Name it **`aberp`**. Create.
 
 > 🚩 Do your realm work in the **`aberp`** realm, never `master`. `master` is only for the admin account. The admin console (`/admin*`) and the `master` realm are **already IP-fenced at Caddy to your operator IP** (Step 30) — that restriction is live, not deferred. If your login here 403s, it's because your public IP changed; re-run `curl -s ifconfig.me` and update the `<YOUR_HOME_IP>/32` line in the Caddyfile (see the dynamic-IP note in Step 30).
@@ -796,10 +798,10 @@ Still in the **`aberp`** realm:
    - **Authentication flow:** tick **Standard flow** (authorization code). Leave Direct access grants **off**.
    - Next.
 3. **Login settings:**
-   - **Valid redirect URIs:** `https://invoicing.abenerp.com/auth/callback` 🚩A2 🚩A3
+   - **Valid redirect URIs:** `https://app.example.com/auth/callback` 🚩A2 🚩A3
      - Add a second for local dev: `http://localhost:8080/*` — note Keycloak only honours a `*` wildcard **at the end** of the URI, so a mid-path form like `http://localhost:*/auth/callback` may silently fail to match. Use a trailing-`*` form (e.g. `http://localhost:8080/*`, dev only) or pin the exact dev callback URL.
-   - **Valid post-logout redirect URIs:** `https://invoicing.abenerp.com/*`
-   - **Web origins:** `https://invoicing.abenerp.com`
+   - **Valid post-logout redirect URIs:** `https://app.example.com/*`
+   - **Web origins:** `https://app.example.com`
    - Save.
 4. **Set the client secret to the value we generated (so it matches sops):** go to the client → **Credentials** tab. You can either (a) copy the Keycloak-shown secret and re-encrypt it into sops, or (b) paste our pre-generated `ABERP_OIDC_CLIENT_SECRET`. The clean path is **(a)** — let Keycloak be the source of truth for its own client secret:
    - On the **Credentials** tab, copy the **Client secret** Keycloak shows.
@@ -875,7 +877,7 @@ Run it once now to prove it works:
 
 ## 36. [reference] Restore drill (one paragraph — read it before you need it)
 
-**To restore Keycloak from a dump:** on a server that has the **age private key** at `/etc/aberp/age.key` and the stack deployed (Steps 13–29), decrypt and load the dump into a *fresh* Postgres. Bring the stack down and wipe the volume first so you import into a clean DB: `cd /opt/aberp-auth && docker compose down && docker volume rm aberp-auth_pgdata && docker compose up -d postgres` (wait for `healthy`), then `sudo age -d -i /etc/aberp/age.key backups/keycloak-<stamp>.sql.age | docker compose exec -T postgres psql -U keycloak -d keycloak`, then `docker compose up -d keycloak`. Verify by logging into `https://auth.abenerp.com/admin/` and confirming the `aberp` realm + `aberp-backend` client are present. **Note the `sudo` on `age -d`:** the private key is `0400 root` (Step 16), so decrypting as `aberp` without `sudo` fails with permission-denied — exactly when you can least afford it. **The volume name** `aberp-auth_pgdata` is `<compose-project>_<volume>`; the project defaults to the directory name (`aberp-auth`), and `postgres` is the compose *service* name used by `docker compose exec` — both hold as long as you run these from `/opt/aberp-auth` with the Step 22 compose file unchanged (confirm with `docker volume ls | grep pgdata`). **The drill's whole point:** if you cannot decrypt the dump, you've lost the age key — which is why Step 18 (offline age-key backup) is the most important backup in this system. Rehearse this restore **once** on a throwaway Hetzner box before you rely on it in anger.
+**To restore Keycloak from a dump:** on a server that has the **age private key** at `/etc/aberp/age.key` and the stack deployed (Steps 13–29), decrypt and load the dump into a *fresh* Postgres. Bring the stack down and wipe the volume first so you import into a clean DB: `cd /opt/aberp-auth && docker compose down && docker volume rm aberp-auth_pgdata && docker compose up -d postgres` (wait for `healthy`), then `sudo age -d -i /etc/aberp/age.key backups/keycloak-<stamp>.sql.age | docker compose exec -T postgres psql -U keycloak -d keycloak`, then `docker compose up -d keycloak`. Verify by logging into `https://auth.example.com/admin/` and confirming the `aberp` realm + `aberp-backend` client are present. **Note the `sudo` on `age -d`:** the private key is `0400 root` (Step 16), so decrypting as `aberp` without `sudo` fails with permission-denied — exactly when you can least afford it. **The volume name** `aberp-auth_pgdata` is `<compose-project>_<volume>`; the project defaults to the directory name (`aberp-auth`), and `postgres` is the compose *service* name used by `docker compose exec` — both hold as long as you run these from `/opt/aberp-auth` with the Step 22 compose file unchanged (confirm with `docker volume ls | grep pgdata`). **The drill's whole point:** if you cannot decrypt the dump, you've lost the age key — which is why Step 18 (offline age-key backup) is the most important backup in this system. Rehearse this restore **once** on a throwaway Hetzner box before you rely on it in anger.
 
 ---
 
@@ -885,16 +887,16 @@ The later ABERP↔Keycloak OIDC code session (a **separate** session — no ABER
 
 | Value | What it is | Where to get it |
 | --- | --- | --- |
-| **Issuer URL** | `https://auth.abenerp.com/realms/aberp` | Fixed by 🚩A1 + the realm name (Step 32). Confirm via `curl -s https://auth.abenerp.com/realms/aberp/.well-known/openid-configuration` |
+| **Issuer URL** | `https://auth.example.com/realms/aberp` | Fixed by 🚩A1 + the realm name (Step 32). Confirm via `curl -s https://auth.example.com/realms/aberp/.well-known/openid-configuration` |
 | **Client ID** | `aberp-backend` | Set in Step 33. |
 | **Client secret** | the confidential-client secret | In sops on the server: `sudo SOPS_AGE_KEY_FILE=/etc/aberp/age.key sops --decrypt /opt/aberp-auth/secrets/keycloak.env \| grep ABERP_OIDC_CLIENT_SECRET`. Behind the ADR-0100 Phase-1 `SecretStore` seam when ABERP consumes it — never in the compose file, never in `seller.toml`. |
 | **Realm name** | `aberp` | Step 32. |
 
 Plus two facts the code session must honor (from ADR-0100 §3 Phase 2):
-- The **redirect URI** it registers must match the client (🚩A3 `https://invoicing.abenerp.com/auth/callback`) — update the Keycloak client (Step 33) if the code chooses a different path.
+- The **redirect URI** it registers must match the client (🚩A3 `https://app.example.com/auth/callback`) — update the Keycloak client (Step 33) if the code chooses a different path.
 - **TOTP is enforced at the IdP** (Step 34); **WebAuthn step-up** for NAV-irreversible routes is requested by ABERP via `acr_values` and enforced by checking the returned `acr` claim — that Keycloak flow is configured *together with* the code that requests it (Step 34's flagged deferral).
 
-**✅ Success check (the whole walkthrough):** from any browser, `https://auth.abenerp.com/realms/aberp/.well-known/openid-configuration` returns OIDC discovery JSON with `"issuer":"https://auth.abenerp.com/realms/aberp"`, and the `aberp-backend` client + TOTP-required action exist in the realm. That is a working Keycloak, ready for the Phase-2 code session. **Nothing about the ABERP desktop deployment changed.**
+**✅ Success check (the whole walkthrough):** from any browser, `https://auth.example.com/realms/aberp/.well-known/openid-configuration` returns OIDC discovery JSON with `"issuer":"https://auth.example.com/realms/aberp"`, and the `aberp-backend` client + TOTP-required action exist in the realm. That is a working Keycloak, ready for the Phase-2 code session. **Nothing about the ABERP desktop deployment changed.**
 
 ---
 
