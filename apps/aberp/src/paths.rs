@@ -15,11 +15,12 @@
 //! the desktop build keeps returning `$HOME/.aberp`. No behaviour changes
 //! here and now.
 //!
-//! Phase 1 wires the two `serve.rs` roots (`serve_artifacts_dir`, the
-//! ap-artifacts dir) through this module as the anchor consumers; the
-//! remaining scattered roots (`email_relay_queue`, `first_launch`,
-//! `incoming_invoices`, `issue_invoice`, …) are routed in Phase 4 —
-//! surgical Phase-1 scope keeps them untouched (CLAUDE.md rule 3).
+//! Phase 1 wires ONE `serve.rs` root — `serve_artifacts_dir` (via
+//! [`serve_root`]) — through this module as the anchor consumer; the
+//! remaining scattered roots (`ap_artifacts_dir` — which still hand-builds
+//! `~/.aberp/<tenant>/ap-artifacts` off [`home_dir`] — `email_relay_queue`,
+//! `first_launch`, `incoming_invoices`, `issue_invoice`, …) are routed in
+//! Phase 4 — surgical Phase-1 scope keeps them untouched (CLAUDE.md rule 3).
 
 use std::path::PathBuf;
 
@@ -62,12 +63,6 @@ pub fn serve_root(tenant: &str) -> Result<PathBuf> {
     Ok(aberp_data_root()?.join("serve").join(tenant))
 }
 
-/// The per-tenant `<tenant>/` root — `seller.toml`, `ap-artifacts/`,
-/// touchfiles. Resolves through [`aberp_data_root`].
-pub fn tenant_root(tenant: &str) -> Result<PathBuf> {
-    Ok(aberp_data_root()?.join(tenant))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,10 +76,6 @@ mod tests {
         assert_eq!(
             serve_root("prod").unwrap(),
             home.join(".aberp").join("serve").join("prod")
-        );
-        assert_eq!(
-            tenant_root("prod").unwrap(),
-            home.join(".aberp").join("prod")
         );
     }
 }
