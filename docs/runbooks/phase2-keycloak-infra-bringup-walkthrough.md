@@ -32,9 +32,9 @@ If you only remember one thing: **this session's deliverable is a working Keyclo
 
 | # | Assumption | Why this default | How to change |
 | --- | --- | --- | --- |
-| A1 | **Subdomain = `auth.abenerp.com`** for Keycloak. | ADR-0100 never fixes an auth hostname; `auth.` is the conventional IdP subdomain and keeps the storefront (`abenerp.com`) and the future ABERP app (`invoicing.abenerp.com`, per ADR-0059/0100) cleanly separated. | Pick any subdomain in Step 12; substitute it everywhere `auth.abenerp.com` appears. |
-| A2 | **ABERP will live at `invoicing.abenerp.com`** (the OIDC redirect target). | That is the SaaS app hostname decided in ADR-0059 §4 and carried into ADR-0100. | If ABERP gets a different hostname, fix the redirect URI in Step 33. |
-| A3 | **OIDC callback path = `/auth/callback`.** | The Phase-2 code session owns the real path; `/auth/callback` is the conventional placeholder so the client isn't empty. | The code session updates the client redirect URI (Keycloak admin console, no infra change). |
+| A1 ✅ | **Subdomain = `auth.abenerp.com`** for Keycloak. **CONFIRMED by Ervin 2026-07-15 (route assumptions approved).** | ADR-0100 never fixes an auth hostname; `auth.` is the conventional IdP subdomain and keeps the storefront (`abenerp.com`) and the future ABERP app (`invoicing.abenerp.com`, per ADR-0059/0100) cleanly separated. | Pick any subdomain in Step 12; substitute it everywhere `auth.abenerp.com` appears. |
+| A2 ✅ | **ABERP will live at `invoicing.abenerp.com`** (the OIDC redirect target). **CONFIRMED by Ervin 2026-07-15 (route assumptions approved).** | That is the SaaS app hostname decided in ADR-0059 §4 and carried into ADR-0100. | If ABERP gets a different hostname, fix the redirect URI in Step 33. |
+| A3 ✅ | **OIDC callback path = `/auth/callback`.** **CONFIRMED by Ervin 2026-07-15 (route assumptions approved).** | The Phase-2 code session owns the real path; `/auth/callback` is the conventional placeholder so the client isn't empty. | The code session updates the client redirect URI (Keycloak admin console, no infra change). |
 | A4 | **Region = Falkenstein (`fsn1`), Ubuntu 24.04 LTS.** | ADR-0100 says EU-Falkenstein; 24.04 is the current Ubuntu LTS. | Choose another EU location / LTS in Step 2. |
 | A5 | **Keycloak `26.x`, Postgres `16`** (pinned image tags). | Current stable Keycloak major + its supported Postgres. | Bump the tags in the compose file (Step 26). Never use `:latest`. |
 | A6 | **Firewall opens 22, 80, 443** — not just 22+443. | Port **80** is mandatory for Let's Encrypt HTTP-01 challenge and the HTTP→HTTPS redirect. The ADR brief said "22+443"; 80 is a hard requirement for automatic TLS. No plaintext app traffic ever rides 80 — Caddy 301-redirects it. | If you switch Caddy to the DNS-01 ACME challenge you may close 80; that's more setup, not done here. |
@@ -179,7 +179,7 @@ ufw --force enable
 ```
 
 > 🚩A6 Port **80** is open on purpose — Let's Encrypt's HTTP-01 challenge and the HTTP→HTTPS redirect both need it. No unencrypted application traffic uses it; Caddy answers 80 only to redirect to 443.
-> ⚠️ Postgres (5432) is deliberately **absent** — it must never be reachable from the internet. Docker keeps it on a private network (Step 26); ufw is the belt to that suspenders.
+> ⚠️ Postgres (5432) is deliberately **absent** from this ufw allow-list — but do **not** rely on ufw to protect a database container. **Docker inserts its own iptables rules ahead of ufw**, so any container port published to `0.0.0.0` is internet-reachable *regardless of what ufw says*. What actually keeps Postgres safe is that it has **no `ports:` mapping at all** (internal docker network only, Step 22). Keycloak is safe because it is bound to **`127.0.0.1:8080`** (Step 22), not `0.0.0.0`. Rule of thumb: **never publish a container to `0.0.0.0` and expect ufw to save you** — it won't.
 
 **✅ Success check:** `ufw status verbose` shows `Status: active`, default `deny (incoming)`, and the three allow rules. Now confirm you are **not** locked out: from your Mac Terminal, `ssh aberp@<SERVER_IP> "echo STILL_IN"` must print `STILL_IN`. If it does, your root session has done its job.
 
@@ -215,13 +215,23 @@ systemctl reload ssh || systemctl reload sshd
 Log in as `aberp` now (`ssh aberp@<SERVER_IP>`). Install the two low-effort hardening services.
 
 ```bash
-sudo apt update && sudo apt upgrade -y
+sudo apt update
+sudo NEEDRESTART_MODE=a apt upgrade -y      # NEEDRESTART_MODE=a auto-restarts services, no interactive prompt
 sudo apt install -y fail2ban unattended-upgrades
 sudo systemctl enable --now fail2ban
 sudo dpkg-reconfigure -f noninteractive unattended-upgrades
 ```
 
+> On 24.04 `apt upgrade` otherwise pops an interactive `needrestart` dialog that stalls the non-interactive run; `NEEDRESTART_MODE=a` makes it auto-restart affected services.
+
 fail2ban ships with an SSH jail enabled by default on Ubuntu, which is all we need (it bans IPs after repeated failed logins — though with password auth off, the exposure is already small).
+
+> 🚩 **Don't ban yourself.** Add your own IP to fail2ban's ignore list so a fat-fingered SSH attempt can't lock you out. Edit `/etc/fail2ban/jail.local` (create it if absent) with a `[DEFAULT]` block:
+> ```
+> [DEFAULT]
+> ignoreip = 127.0.0.1/8 <YOUR_HOME_IP>
+> ```
+> Replace `<YOUR_HOME_IP>` with your current public IP (`curl -s ifconfig.me` from your Mac — the same value used in Step 30), then `sudo systemctl restart fail2ban`. If you *do* get banned mid-setup, un-ban from the server console: `sudo fail2ban-client set sshd unbanip <YOUR_IP>`.
 
 **✅ Success check:**
 ```bash
@@ -241,6 +251,8 @@ sudo timedatectl set-timezone Europe/Budapest
 sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 ```
+
+> If `fallocate` fails (some filesystems don't support it), use the portable `dd` form instead: `sudo dd if=/dev/zero of=/swapfile bs=1M count=2048` — then the same `chmod 600` / `mkswap` / `swapon` / fstab lines.
 
 **✅ Success check:** `free -h` shows a `Swap:` line of ~2.0Gi; `timedatectl` shows your timezone and `System clock synchronized: yes`. (An accurate clock is a hard requirement for TOTP in Step 32 — a skewed clock breaks every 30-second code.)
 
@@ -406,6 +418,8 @@ echo "Generated. (Values are NOT printed. They go straight into the encrypted fi
 
 **✅ Success check:** `echo "${#KC_DB_PASSWORD} ${#KC_ADMIN_PASSWORD} ${#ABERP_CLIENT_SECRET}"` prints three numbers ~`40 40 60`. (We check lengths, not values.)
 
+> ⚠️ **Run Steps 19 and 20 back-to-back in the same SSH session** — the three variables live only in this shell's memory. If you log out (or the session drops) between them, the variables vanish and Step 20 would write an empty-password secrets file. Step 20 opens with a guard that aborts loudly if that happened, so you can't silently ship blank secrets — but the clean path is one uninterrupted block.
+
 ---
 
 ## 20. [on the server — SSH] Write the secrets file and encrypt it with sops
@@ -415,19 +429,29 @@ Write the plaintext env, then encrypt it **in place** with sops (which uses `.so
 ```bash
 cd /opt/aberp-auth
 umask 077
+# Fail loud if Step 19's variables didn't survive into this shell (logged out between steps, etc.)
+: "${KC_DB_PASSWORD:?run Step 19 first — variable is empty}" "${KC_ADMIN_PASSWORD:?run Step 19 first}" "${ABERP_CLIENT_SECRET:?run Step 19 first}"
 cat > secrets/keycloak.env <<EOF
 POSTGRES_USER=keycloak
+POSTGRES_PASSWORD=${KC_DB_PASSWORD}
 POSTGRES_DB=keycloak
 KC_DB_USERNAME=keycloak
 KC_DB_PASSWORD=${KC_DB_PASSWORD}
 KEYCLOAK_ADMIN=admin
 KEYCLOAK_ADMIN_PASSWORD=${KC_ADMIN_PASSWORD}
+KC_BOOTSTRAP_ADMIN_USERNAME=admin
+KC_BOOTSTRAP_ADMIN_PASSWORD=${KC_ADMIN_PASSWORD}
 ABERP_OIDC_CLIENT_SECRET=${ABERP_CLIENT_SECRET}
 EOF
 
 sops --encrypt --in-place secrets/keycloak.env
 unset KC_DB_PASSWORD KC_ADMIN_PASSWORD ABERP_CLIENT_SECRET
 ```
+
+> **Why these keys:**
+> - `POSTGRES_PASSWORD` is **mandatory** — the `postgres:16` image *aborts on startup* if it's unset. It must equal `KC_DB_PASSWORD` (the password Keycloak uses to connect), so both reference the same generated value.
+> - Both admin pairs are set on purpose. **Keycloak 26 renamed** `KEYCLOAK_ADMIN`/`KEYCLOAK_ADMIN_PASSWORD` → `KC_BOOTSTRAP_ADMIN_USERNAME`/`KC_BOOTSTRAP_ADMIN_PASSWORD`. Setting **both** (harmless overlap) makes this work on any 26.x minor regardless of which names that build honours. 🚩 **MUST verify against the docs for the exact image tag you pinned** (Step 22, `26.0`) — if that minor only reads the new names, the legacy pair is simply ignored.
+> - ⚠️ The bootstrap admin is created **only on the very first boot into an empty Postgres volume.** Changing `KC_ADMIN_PASSWORD` in sops *later* will **not** rotate an already-created admin — you'd change it in the Keycloak admin console (or wipe the pg volume and re-bootstrap). Treat the first-boot value as the one you'll actually use.
 
 **✅ Success check:**
 ```bash
@@ -437,9 +461,10 @@ The file must now look like ciphertext — you'll see `POSTGRES_USER=ENC[AES256_
 ```bash
 sudo SOPS_AGE_KEY_FILE=/etc/aberp/age.key sops --decrypt secrets/keycloak.env | grep -c '='
 ```
-prints `7` (seven key=value lines recovered). This encrypted file is now **safe to commit / back up**; the plaintext is gone.
+prints `10` (ten `key=value` lines recovered: 3 postgres + 2 KC-DB + 2 legacy-admin + 2 bootstrap-admin + 1 client-secret). This encrypted file is now **safe to commit / back up**; the plaintext is gone.
 
 > ⚠️ **Never** `git commit` the age.key, and **never** write decrypted secrets to disk outside `tmpfs` (Step 27 handles the runtime decrypt into RAM).
+> 🔓 **Honest scope of this protection:** sops protects these secrets **at rest** (on-disk ciphertext) and tmpfs keeps the decrypted copy **in RAM only** (Steps 24/27). At *runtime* the same values live in the containers' environment, readable by anyone who is already local `root` or in the `docker` group. That's inherent to env-file config, not a leak — the threat model this defends is disk theft / backup exfiltration / accidental `git commit`, not a compromised root on the box.
 
 ---
 
@@ -499,12 +524,13 @@ services:
       postgres:
         condition: service_healthy
     networks: [internal]
-    healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '\"status\": \"UP\"'"]
-      interval: 15s
-      timeout: 5s
-      retries: 20
-      start_period: 60s
+    # NO container healthcheck on Keycloak: the obvious /dev/tcp probe needs bash,
+    # which the minimal Keycloak 26 image likely does NOT ship — the check would sit
+    # `unhealthy` forever even while Keycloak is perfectly up, stranding you at Step 26.
+    # Nothing depends on Keycloak's health, so we drop it and prove liveness externally
+    # with `curl 127.0.0.1:8080` (Step 26) and the public HTTPS probe (Step 31) instead.
+    # 🚩 If you ever re-add a container healthcheck, MUST verify which shell the pinned
+    # image actually provides (`docker run --rm --entrypoint sh quay.io/keycloak/keycloak:26.0 -c 'echo ok'`).
 
 networks:
   internal:
@@ -564,11 +590,14 @@ cat > deploy.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 cd /opt/aberp-auth
-# Decrypt secrets into tmpfs (RAM only), root-readable only
-sudo install -d -m 700 /run/aberp
+# Decrypt secrets into tmpfs (RAM only). sops must read the age key as root, so we
+# decrypt as root — then hand the file to aberp, because `docker compose` runs as
+# aberp and reads env_file: as that user (NOT via the daemon). Without the chown,
+# aberp gets EACCES on the root:0600 file and the first `up` fails.
+sudo install -d -m 700 -o aberp -g aberp /run/aberp
 sudo SOPS_AGE_KEY_FILE=/etc/aberp/age.key sops --decrypt secrets/keycloak.env | sudo tee /run/aberp/keycloak.env > /dev/null
+sudo chown aberp:aberp /run/aberp/keycloak.env
 sudo chmod 600 /run/aberp/keycloak.env
-# docker (compose) reads the env_file as root via the daemon
 docker compose up -d
 echo "Deployed. Watch: docker compose logs -f keycloak"
 EOF
@@ -598,11 +627,11 @@ Wait for a line like `Keycloak 26.x on JVM … started in …s. Listening on: ht
 ```bash
 docker compose ps
 ```
-both `postgres` and `keycloak` show `running` and (after the start period) `healthy`. Then confirm Keycloak answers locally (still no TLS — that's Step 30):
+`postgres` should show `running` and (after its start period) `healthy`. `keycloak` has **no container healthcheck** (dropped in Step 22), so it will just show `running` (or briefly `health: starting` if you left one in) — that is expected, **not** a failure. The real liveness proof is the external probe: confirm Keycloak answers locally (still no TLS — that's Step 30):
 ```bash
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/
 ```
-prints `200` or `302`. If it does, Keycloak is alive on the box.
+prints `200` or `302`. **That HTTP code — not the `ps` health column — is the authoritative "Keycloak is alive" signal.** If it returns `000`/connection-refused, tail `docker compose logs -f keycloak` and wait for the `started in …s` line.
 
 ---
 
@@ -616,7 +645,7 @@ curl -s -m 3 http://127.0.0.1:5432 ; echo "exit=$?"      # connection refused ex
 sudo ss -tlnp | grep 5432 || echo "5432 not listening on host — GOOD"
 ```
 
-**✅ Success check:** prints `5432 not listening on host — GOOD`. Postgres is only on the internal docker network. (From the internet it's also blocked by ufw's default-deny — two independent barriers.)
+**✅ Success check:** prints `5432 not listening on host — GOOD`. Postgres is safe because it has **no `ports:` mapping** — it exists only on the internal docker network, so there is nothing published for anyone (host or internet) to reach. Note this is **not** because of ufw: Docker's iptables rules sit *ahead* of ufw, so if Postgres *did* publish a port to `0.0.0.0`, ufw's default-deny would **not** stop it. The no-`ports:` design is the real guarantee.
 
 ---
 
@@ -628,7 +657,7 @@ Keycloak is bound to `127.0.0.1:8080` — not `0.0.0.0`. From the internet it's 
 sudo ss -tlnp | grep 8080
 ```
 
-**✅ Success check:** the `Local Address` shows `127.0.0.1:8080`, **not** `0.0.0.0:8080` or `*:8080`. If it shows `0.0.0.0`, the `ports:` line in Step 22 lost its `127.0.0.1:` prefix — fix it and redeploy. (Exposing the Keycloak admin console directly to the internet is a top-tier footgun; the loopback bind + ufw prevent it.)
+**✅ Success check:** the `Local Address` shows `127.0.0.1:8080`, **not** `0.0.0.0:8080` or `*:8080`. If it shows `0.0.0.0`, the `ports:` line in Step 22 lost its `127.0.0.1:` prefix — fix it and redeploy. (Exposing the Keycloak admin console directly to the internet is a top-tier footgun. What prevents it is the **`127.0.0.1:` loopback bind** — *not* ufw, which Docker's iptables rules would bypass if the bind were `0.0.0.0`. The loopback prefix is load-bearing; guard it.)
 
 ---
 
@@ -646,7 +675,7 @@ After=local-fs.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'install -d -m 700 /run/aberp && SOPS_AGE_KEY_FILE=/etc/aberp/age.key /usr/local/bin/sops --decrypt /opt/aberp-auth/secrets/keycloak.env > /run/aberp/keycloak.env && chmod 600 /run/aberp/keycloak.env'
+ExecStart=/bin/sh -c 'install -d -m 700 -o aberp -g aberp /run/aberp && SOPS_AGE_KEY_FILE=/etc/aberp/age.key /usr/local/bin/sops --decrypt /opt/aberp-auth/secrets/keycloak.env > /run/aberp/keycloak.env && chown aberp:aberp /run/aberp/keycloak.env && chmod 600 /run/aberp/keycloak.env'
 
 [Install]
 WantedBy=multi-user.target
@@ -655,7 +684,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now aberp-secrets.service
 ```
 
-**✅ Success check:** `sudo systemctl status aberp-secrets.service` shows `active (exited)`. Optionally rehearse a reboot: `sudo reboot`, wait ~30 s, `ssh aberp@<SERVER_IP>`, then `docker compose -f /opt/aberp-auth/docker-compose.yml ps` shows both containers back `running`/`healthy` with no manual step. That proves reboot-safety.
+**✅ Success check:** `sudo systemctl status aberp-secrets.service` shows `active (exited)`. Optionally rehearse a reboot: `sudo reboot`, wait ~30 s, `ssh aberp@<SERVER_IP>`, then `docker compose -f /opt/aberp-auth/docker-compose.yml ps` shows both containers back up with no manual step (`postgres` `healthy`, `keycloak` `running` — it has no healthcheck, see Step 22). That proves reboot-safety.
 
 ---
 
@@ -673,12 +702,33 @@ sudo apt update
 sudo apt install -y caddy
 ```
 
-Write the Caddyfile — 6 lines is all it takes:
+**First, get your own public IP** — the admin surface is locked to it. From **your Mac** (the machine you administer from):
+
+```bash
+curl -s ifconfig.me ; echo
+```
+
+Note that address — call it `<YOUR_HOME_IP>`. You'll paste it into the Caddyfile below (as `<YOUR_HOME_IP>/32`).
+
+Write the Caddyfile. This is **not** a bare reverse-proxy: it fences off the admin console and the `master` realm so only your IP can reach them — everyone else on the internet gets a `403` *before* the request ever touches Keycloak. The public OIDC endpoints (the `aberp` realm) stay open, as they must:
 
 ```bash
 sudo tee /etc/caddy/Caddyfile > /dev/null <<'EOF'
 auth.abenerp.com {
     encode gzip
+
+    # Admin surface (Keycloak /admin + the master realm) — operator IP only.
+    # Everyone else gets 403 before the request reaches Keycloak.
+    @admin path /admin* /realms/master/*
+    handle @admin {
+        @blocked not remote_ip <YOUR_HOME_IP>/32
+        respond @blocked 403
+        reverse_proxy 127.0.0.1:8080 {
+            header_up X-Forwarded-Proto https
+        }
+    }
+
+    # Everything else (the aberp realm's public OIDC endpoints) — open to all.
     reverse_proxy 127.0.0.1:8080 {
         header_up X-Forwarded-Proto https
     }
@@ -686,6 +736,11 @@ auth.abenerp.com {
 EOF
 sudo systemctl reload caddy
 ```
+
+Replace `<YOUR_HOME_IP>` with the address from `ifconfig.me` above (keep the `/32`). Validate before trusting it: `sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile` should print `Valid configuration`.
+
+> 🚩 **This closes a real hole:** a bare `reverse_proxy` exposes `/admin` and the brute-forceable `master` realm login to the entire internet. The IP fence shuts that down now, not "later."
+> 🚩 **If your home IP is dynamic** (most consumer ISPs): the `/32` allow-rule will start 403-ing *you* when your IP rotates — you'd re-run `ifconfig.me` and update the Caddyfile. If that's too fragile, the fallback is to **also enable Keycloak brute-force detection on the `master` realm** (Step 34 only turns it on for `aberp`): in the admin console pick the **master** realm → **Realm settings → Security defenses → Brute force detection → ON**. Do that *in addition to* (not instead of) the IP fence if you can hold a static IP; do it as the primary defense if you genuinely can't.
 
 Caddy now: answers `:80` and 301-redirects to `:443`, obtains a Let's Encrypt cert for `auth.abenerp.com` over HTTP-01 (this is why port 80 + the DNS A-record had to be right first), terminates TLS, and forwards to Keycloak with the `X-Forwarded-*` headers Keycloak trusts (`KC_PROXY_HEADERS=xforwarded`).
 
@@ -722,7 +777,7 @@ curl -s https://auth.abenerp.com/realms/master/.well-known/openid-configuration 
 2. In your **browser**, go to **https://auth.abenerp.com/admin/**. Log in with username `admin` and that password. *(Entering the admin password into the login form is yours to do by hand — I never type credentials into fields.)*
 3. Top-left realm dropdown (says **Keycloak** / **master**) → **Create realm**. Name it **`aberp`**. Create.
 
-> 🚩 Do your realm work in the **`aberp`** realm, never `master`. `master` is only for the admin account. Keep the admin console reachable **only** at `/admin/` over HTTPS — never expose it more broadly, and consider IP-allowlisting `/admin` at Caddy later if you want defense-in-depth.
+> 🚩 Do your realm work in the **`aberp`** realm, never `master`. `master` is only for the admin account. The admin console (`/admin*`) and the `master` realm are **already IP-fenced at Caddy to your operator IP** (Step 30) — that restriction is live, not deferred. If your login here 403s, it's because your public IP changed; re-run `curl -s ifconfig.me` and update the `<YOUR_HOME_IP>/32` line in the Caddyfile (see the dynamic-IP note in Step 30).
 
 **✅ Success check:** the realm dropdown now shows **`aberp`** selected, and the left nav shows Clients / Users / Authentication for that realm.
 
@@ -742,7 +797,7 @@ Still in the **`aberp`** realm:
    - Next.
 3. **Login settings:**
    - **Valid redirect URIs:** `https://invoicing.abenerp.com/auth/callback` 🚩A2 🚩A3
-     - Add a second for local dev: `http://localhost:*/auth/callback`
+     - Add a second for local dev: `http://localhost:8080/*` — note Keycloak only honours a `*` wildcard **at the end** of the URI, so a mid-path form like `http://localhost:*/auth/callback` may silently fail to match. Use a trailing-`*` form (e.g. `http://localhost:8080/*`, dev only) or pin the exact dev callback URL.
    - **Valid post-logout redirect URIs:** `https://invoicing.abenerp.com/*`
    - **Web origins:** `https://invoicing.abenerp.com`
    - Save.
@@ -751,8 +806,8 @@ Still in the **`aberp`** realm:
    - On the server, update sops so ABERP later reads the same value:
      ```bash
      cd /opt/aberp-auth
-     sudo SOPS_AGE_KEY_FILE=/etc/aberp/age.key sops secrets/keycloak.env
-     # in the editor, set ABERP_OIDC_CLIENT_SECRET=<the secret you copied>, save & quit
+     sudo EDITOR=nano SOPS_AGE_KEY_FILE=/etc/aberp/age.key sops secrets/keycloak.env
+     # in the editor (nano; ^O to save, ^X to exit), set ABERP_OIDC_CLIENT_SECRET=<the secret you copied>, save & quit
      ```
      (`sops secrets/keycloak.env` opens the decrypted file in an editor and re-encrypts on save.)
 
@@ -820,7 +875,7 @@ Run it once now to prove it works:
 
 ## 36. [reference] Restore drill (one paragraph — read it before you need it)
 
-**To restore Keycloak from a dump:** on a server that has the **age private key** at `/etc/aberp/age.key` and the stack deployed (Steps 13–29), decrypt and load the dump into a *fresh* Postgres. Bring the stack down and wipe the volume first so you import into a clean DB: `cd /opt/aberp-auth && docker compose down && docker volume rm aberp-auth_pgdata && docker compose up -d postgres` (wait for `healthy`), then `age -d -i /etc/aberp/age.key backups/keycloak-<stamp>.sql.age | docker compose exec -T postgres psql -U keycloak -d keycloak`, then `docker compose up -d keycloak`. Verify by logging into `https://auth.abenerp.com/admin/` and confirming the `aberp` realm + `aberp-backend` client are present. **The drill's whole point:** if you cannot decrypt the dump, you've lost the age key — which is why Step 18 (offline age-key backup) is the most important backup in this system. Rehearse this restore **once** on a throwaway Hetzner box before you rely on it in anger.
+**To restore Keycloak from a dump:** on a server that has the **age private key** at `/etc/aberp/age.key` and the stack deployed (Steps 13–29), decrypt and load the dump into a *fresh* Postgres. Bring the stack down and wipe the volume first so you import into a clean DB: `cd /opt/aberp-auth && docker compose down && docker volume rm aberp-auth_pgdata && docker compose up -d postgres` (wait for `healthy`), then `sudo age -d -i /etc/aberp/age.key backups/keycloak-<stamp>.sql.age | docker compose exec -T postgres psql -U keycloak -d keycloak`, then `docker compose up -d keycloak`. Verify by logging into `https://auth.abenerp.com/admin/` and confirming the `aberp` realm + `aberp-backend` client are present. **Note the `sudo` on `age -d`:** the private key is `0400 root` (Step 16), so decrypting as `aberp` without `sudo` fails with permission-denied — exactly when you can least afford it. **The volume name** `aberp-auth_pgdata` is `<compose-project>_<volume>`; the project defaults to the directory name (`aberp-auth`), and `postgres` is the compose *service* name used by `docker compose exec` — both hold as long as you run these from `/opt/aberp-auth` with the Step 22 compose file unchanged (confirm with `docker volume ls | grep pgdata`). **The drill's whole point:** if you cannot decrypt the dump, you've lost the age key — which is why Step 18 (offline age-key backup) is the most important backup in this system. Rehearse this restore **once** on a throwaway Hetzner box before you rely on it in anger.
 
 ---
 
@@ -849,8 +904,9 @@ Plus two facts the code session must honor (from ADR-0100 §3 Phase 2):
 - ✅ **Proved `aberp` login + sudo** (Step 7) **before** disabling root/passwords (Step 9).
 - ✅ **age private key backed up OFFLINE** (Step 18). Losing it = losing every secret, permanently.
 - ✅ **age.key never committed**, decrypted secrets only ever on **tmpfs** (`/run/aberp`, Steps 24/27).
-- ✅ **Postgres has no `ports:`** and is on an internal network (Steps 22/27) — never internet-reachable.
-- ✅ **Keycloak bound to `127.0.0.1:8080`** (Step 28) — admin console never exposed except via Caddy TLS at `/admin/`.
+- ✅ **Postgres has no `ports:`** and is on an internal network (Steps 22/27) — never internet-reachable. This is the *real* guarantee; **not** ufw (Docker's iptables sit ahead of ufw — never publish a container to `0.0.0.0` expecting ufw to save you).
+- ✅ **Keycloak bound to `127.0.0.1:8080`** (Step 28) — the loopback bind (not ufw) is what keeps it off the internet.
+- ✅ **Admin surface IP-fenced at Caddy** (Step 30): `/admin*` + `/realms/master/*` 403 for any IP but yours. If dynamic, also enable master-realm brute-force detection.
 - ✅ **Real Let's Encrypt TLS** (Step 30); HTTP 301-redirects to HTTPS; no plaintext app traffic.
 - ✅ **Strong generated passwords** (Step 19), retrieved from sops, never typed/reused.
 - ✅ **Cloudflare grey-cloud** during bring-up (🚩A7) so ACME HTTP-01 works.
