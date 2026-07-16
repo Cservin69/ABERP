@@ -1586,20 +1586,63 @@ mod tests {
         );
     }
 
+    /// ADR-0102 — an `Other` (foreign-EU) partner REQUIRES a
+    /// structurally-valid EU VAT number (the reused `eu_vat_number`
+    /// column) and MUST NOT carry a Hungarian ADÓSZÁM.
     #[test]
-    fn validate_partner_inputs_rejects_other_status_in_v1() {
-        // v1 named-defers OTHER per ADR-0048 §7; the gate fires a
-        // typed validation error pointing at the radio.
-        let inputs = PartnerInputs {
+    fn validate_partner_inputs_other_requires_eu_vat_and_no_hu_tax() {
+        // Missing EU VAT number → flag eu_vat_number.
+        let missing = PartnerInputs {
             customer_vat_status: CustomerVatStatus::Other,
             tax_number: None,
+            eu_vat_number: None,
             ..minimal_valid_inputs()
         };
-        let errors = validate_partner_inputs(&inputs)
-            .expect_err("Other status must surface the v1-deferred error");
+        let errors =
+            validate_partner_inputs(&missing).expect_err("Other without EU VAT must reject");
         assert!(
-            errors.iter().any(|e| e.field == "customer_vat_status"),
-            "must flag customer_vat_status; got {errors:?}"
+            errors.iter().any(|e| e.field == "eu_vat_number"),
+            "must flag eu_vat_number; got {errors:?}"
+        );
+
+        // Malformed EU VAT number → flag eu_vat_number.
+        let malformed = PartnerInputs {
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            eu_vat_number: Some("ZZ9".to_string()),
+            ..minimal_valid_inputs()
+        };
+        let errors = validate_partner_inputs(&malformed)
+            .expect_err("Other with malformed EU VAT must reject");
+        assert!(
+            errors.iter().any(|e| e.field == "eu_vat_number"),
+            "must flag eu_vat_number for malformed value; got {errors:?}"
+        );
+
+        // Valid EU VAT + a stray HU tax number → flag tax_number.
+        let with_hu_tax = PartnerInputs {
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: Some("24904362-2-41".to_string()),
+            eu_vat_number: Some("ATU12345678".to_string()),
+            ..minimal_valid_inputs()
+        };
+        let errors = validate_partner_inputs(&with_hu_tax)
+            .expect_err("Other with a HU tax number must reject");
+        assert!(
+            errors.iter().any(|e| e.field == "tax_number"),
+            "must flag tax_number; got {errors:?}"
+        );
+
+        // Well-formed Other partner → accepts.
+        let ok = PartnerInputs {
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            eu_vat_number: Some("ATU12345678".to_string()),
+            ..minimal_valid_inputs()
+        };
+        assert!(
+            validate_partner_inputs(&ok).is_ok(),
+            "well-formed Other partner must validate"
         );
     }
 

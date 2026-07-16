@@ -817,63 +817,66 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     //    a 6-decimal `<exchangeRate>`, and per-VAT-rate `*HUF` amounts
     //    computed from the stamped MNB rate (NOT re-fetched). HUF invoices
     //    serialize `<exchangeRate>1.000000` (uniformly 6-decimal per C11).
-    let parties = NavParties {
-        supplier: SupplierInfo {
-            tax_number: input.supplier.tax_number,
-            name: input.supplier.name,
-            address_country_code: input.supplier.address.country_code,
-            address_postal_code: input.supplier.address.postal_code,
-            address_city: input.supplier.address.city,
-            address_street: input.supplier.address.street,
-        },
-        customer: CustomerInfo {
-            // PR-97 / ADR-0048 — closed-vocab buyer-kind threaded
-            // from wire body through to NAV emit. Preflight gates the
-            // per-status invariants upstream; the emitter conditions
-            // `<customerVatData>` emission on this value.
-            customer_vat_status: input.customer.vat_status,
-            // PR-97 / ADR-0048 — `Option<String>`. Empty-after-trim
-            // collapses to `None` so PrivatePerson bodies that arrive
-            // with an empty-string tax_number do not synthesise a
-            // malformed `<customerVatData>` block downstream.
-            tax_number: {
-                let trimmed = input.customer.tax_number.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
+    let parties =
+        NavParties {
+            supplier: SupplierInfo {
+                tax_number: input.supplier.tax_number,
+                name: input.supplier.name,
+                address_country_code: input.supplier.address.country_code,
+                address_postal_code: input.supplier.address.postal_code,
+                address_city: input.supplier.address.city,
+                address_street: input.supplier.address.street,
             },
-            // ADR-0102 — EU community VAT number, threaded from the wire
-            // body for `Other` buyers. Empty-after-trim collapses to
-            // `None` so a Domestic/PrivatePerson body carrying an empty
-            // `communityVatNumber` does not synthesise an empty
-            // `<customerVatData>` block. Preflight guarantees `Some(_)`
-            // for `Other` before the sequence is burned.
-            community_vat_number: input.customer.community_vat_number.as_deref().and_then(|s| {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            }),
-            name: input.customer.name,
-            // PR-77 / session-101 — `<customerAddress>` is required for
-            // DOMESTIC (non-PRIVATE_PERSON) customerVatStatus and
-            // optional for PrivatePerson per ADR-0048. The wire body's
-            // `customer.address` is `Option<_>` so pre-PR-77 CLI-issued
-            // bodies still parse; preflight gates the
-            // required-when-Domestic case BEFORE the sequence is
-            // burned.
-            address: input.customer.address.map(|a| CustomerAddress {
-                country_code: a.country_code,
-                postal_code: a.postal_code,
-                city: a.city,
-                street: a.street,
-            }),
-        },
-    };
+            customer: CustomerInfo {
+                // PR-97 / ADR-0048 — closed-vocab buyer-kind threaded
+                // from wire body through to NAV emit. Preflight gates the
+                // per-status invariants upstream; the emitter conditions
+                // `<customerVatData>` emission on this value.
+                customer_vat_status: input.customer.vat_status,
+                // PR-97 / ADR-0048 — `Option<String>`. Empty-after-trim
+                // collapses to `None` so PrivatePerson bodies that arrive
+                // with an empty-string tax_number do not synthesise a
+                // malformed `<customerVatData>` block downstream.
+                tax_number: {
+                    let trimmed = input.customer.tax_number.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                },
+                // ADR-0102 — EU community VAT number, threaded from the wire
+                // body for `Other` buyers. Empty-after-trim collapses to
+                // `None` so a Domestic/PrivatePerson body carrying an empty
+                // `communityVatNumber` does not synthesise an empty
+                // `<customerVatData>` block. Preflight guarantees `Some(_)`
+                // for `Other` before the sequence is burned.
+                community_vat_number: input.customer.community_vat_number.as_deref().and_then(
+                    |s| {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    },
+                ),
+                name: input.customer.name,
+                // PR-77 / session-101 — `<customerAddress>` is required for
+                // DOMESTIC (non-PRIVATE_PERSON) customerVatStatus and
+                // optional for PrivatePerson per ADR-0048. The wire body's
+                // `customer.address` is `Option<_>` so pre-PR-77 CLI-issued
+                // bodies still parse; preflight gates the
+                // required-when-Domestic case BEFORE the sequence is
+                // burned.
+                address: input.customer.address.map(|a| CustomerAddress {
+                    country_code: a.country_code,
+                    postal_code: a.postal_code,
+                    city: a.city,
+                    street: a.street,
+                }),
+            },
+        };
     let render_currency = currency;
     let render_rate_metadata = rate_metadata.clone();
     let render_payment_method = input.payment_method;

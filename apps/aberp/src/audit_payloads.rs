@@ -3130,6 +3130,36 @@ mod tests {
         }
     }
 
+    /// ADR-0102 — the EU community VAT number is snapshotted onto the
+    /// tamper-evident audit payload and survives a JSON round-trip. This
+    /// is the audit-trail half of the per-invoice snapshot (the wire-body
+    /// input.json + on-disk NAV XML are the other two immutable copies);
+    /// because it is captured at issuance on the payload, a LATER edit to
+    /// `partners.eu_vat_number` cannot rewrite this issued invoice's
+    /// record. The builder is a no-op for `None` (Domestic/PrivatePerson)
+    /// so the byte-identical back-compat path keeps the field absent.
+    #[test]
+    fn draft_created_round_trip_with_customer_community_vat_number() {
+        let invoice = fixture_invoice();
+        let idem = IdempotencyKey::new();
+        let original = InvoiceDraftCreatedPayload::from_invoice(&invoice, idem)
+            .with_customer_vat_status(crate::nav_xml::CustomerVatStatus::Other)
+            .with_customer_community_vat_number(Some("ATU12345678"));
+        let bytes = original.to_bytes();
+        let decoded: InvoiceDraftCreatedPayload =
+            serde_json::from_slice(&bytes).expect("decode must succeed");
+        assert_eq!(
+            decoded.customer_community_vat_number.as_deref(),
+            Some("ATU12345678"),
+        );
+        assert_eq!(decoded, original, "full round-trip equality must hold");
+
+        // Builder is a no-op for None (Domestic/PrivatePerson path).
+        let domestic = InvoiceDraftCreatedPayload::from_invoice(&invoice, idem)
+            .with_customer_community_vat_number(None);
+        assert_eq!(domestic.customer_community_vat_number, None);
+    }
+
     /// PR-97 / ADR-0048 — pre-PR-97 wire bytes (no
     /// `customer_vat_status` field) deserialise cleanly via
     /// `#[serde(default)]`. The field defaults to `None` — the

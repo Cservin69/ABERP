@@ -756,3 +756,72 @@ fn emitter_loud_fails_when_other_status_materialises_without_community_vat() {
         "loud-fail message must name the missing community VAT number; got: {msg}"
     );
 }
+
+/// ADR-0102 — THE END-TO-END EU-0 ROUND-TRIP. An intra-Community 0%
+/// invoice (KBAET goods line) with an `Other` (foreign-EU) buyer emits
+/// `customerVatStatus=OTHER` + `<customerVatData><communityVatNumber>`
+/// + the `<vatExemption><case>KBAET</case>` line, and the emitted body
+/// validates cleanly against the NAV XSD structural recogniser. This is
+/// the invoice shape ADR-0101 could emit at the line but ADR-0048 left
+/// un-assemblable at the buyer — the gap this ADR closes.
+#[test]
+fn eu0_intra_community_invoice_with_other_buyer_round_trips() {
+    let mut invoice = build_minimal_invoice();
+    // Single KBAET (intra-Community goods) line at 0%.
+    invoice.lines = vec![LineItem {
+        description: "Exported widgets".to_string(),
+        quantity: rust_decimal::Decimal::from(3),
+        unit_price: Huf(10000),
+        vat_rate_basis_points: 0,
+        vat_rate_kind: aberp_billing::VatRateKind::IntraCommunityGoods,
+        note: None,
+        unit: None,
+    }];
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = NavParties {
+        supplier: SupplierInfo {
+            tax_number: "24904362-2-41".to_string(),
+            name: "Aben Consulting Kft".to_string(),
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatero koz 6".to_string(),
+        },
+        customer: CustomerInfo {
+            community_vat_number: Some("ATU12345678".to_string()),
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            name: "Wiener Handels GmbH".to_string(),
+            address: Some(CustomerAddress {
+                country_code: "AT".to_string(),
+                postal_code: "1010".to_string(),
+                city: "Wien".to_string(),
+                street: "Stephansplatz 1".to_string(),
+            }),
+        },
+    };
+
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("EU-0 Other-buyer invoice must render");
+    let body = std::str::from_utf8(&xml).expect("UTF-8");
+
+    // Buyer side: OTHER + communityVatNumber, no structured HU tax block.
+    assert!(
+        body.contains("<customerVatStatus>OTHER</customerVatStatus>"),
+        "body:\n{body}"
+    );
+    // Emitter pretty-prints (newlines/indent), so check the elements
+    // individually rather than as a contiguous block.
+    assert!(body.contains("<customerVatData>"), "body:\n{body}");
+    assert!(
+        body.contains("<communityVatNumber>ATU12345678</communityVatNumber>"),
+        "body:\n{body}"
+    );
+    assert!(!body.contains("<customerTaxNumber>"), "body:\n{body}");
+    // Line side: KBAET exemption, not a numeric vatPercentage.
+    assert!(body.contains("<case>KBAET</case>"), "body:\n{body}");
+
+    // The whole thing validates against the NAV XSD structural recogniser.
+    validate_invoice_data(&xml)
+        .expect("EU-0 Other-buyer body must validate against the NAV XSD recogniser");
+}

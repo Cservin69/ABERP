@@ -327,9 +327,7 @@ impl InvoicePreflightError {
             InvoicePreflightError::CommunityVatNumberMalformed { .. } => {
                 "CommunityVatNumberMalformed"
             }
-            InvoicePreflightError::VatKindRequiresOtherBuyer { .. } => {
-                "VatKindRequiresOtherBuyer"
-            }
+            InvoicePreflightError::VatKindRequiresOtherBuyer { .. } => "VatKindRequiresOtherBuyer",
             InvoicePreflightError::VatKindRequiresDomesticBuyer { .. } => {
                 "VatKindRequiresDomesticBuyer"
             }
@@ -665,7 +663,11 @@ impl InvoicePreflightError {
                      (Structural check only — no live VIES lookup is performed.)"
                 )
             }
-            InvoicePreflightError::VatKindRequiresOtherBuyer { line_index, kind, actual_status } => {
+            InvoicePreflightError::VatKindRequiresOtherBuyer {
+                line_index,
+                kind,
+                actual_status,
+            } => {
                 format!(
                     "Line {} VAT type ({kind:?}) is an intra-Community 0% transaction that \
                      requires a foreign-EU (OTHER) buyer — the current buyer is {}. Pick an EU \
@@ -674,7 +676,11 @@ impl InvoicePreflightError {
                     actual_status.as_nav_token()
                 )
             }
-            InvoicePreflightError::VatKindRequiresDomesticBuyer { line_index, kind, actual_status } => {
+            InvoicePreflightError::VatKindRequiresDomesticBuyer {
+                line_index,
+                kind,
+                actual_status,
+            } => {
                 format!(
                     "Line {} VAT type ({kind:?}) is a domestic transaction that requires a \
                      Domestic buyer — the current buyer is {}. Pick a domestic buyer, or change \
@@ -991,27 +997,27 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
         {
             let status = request.customer.vat_status;
             match line.vat_rate_kind {
-                VatRateKind::IntraCommunityGoods | VatRateKind::IntraCommunityServiceReverse => {
-                    if status != CustomerVatStatus::Other {
-                        errors.push(InvoicePreflightError::VatKindRequiresOtherBuyer {
-                            line_index,
-                            kind: line.vat_rate_kind,
-                            actual_status: status,
-                        });
-                    }
+                VatRateKind::IntraCommunityGoods | VatRateKind::IntraCommunityServiceReverse
+                    if status != CustomerVatStatus::Other =>
+                {
+                    errors.push(InvoicePreflightError::VatKindRequiresOtherBuyer {
+                        line_index,
+                        kind: line.vat_rate_kind,
+                        actual_status: status,
+                    });
                 }
-                VatRateKind::AamExempt | VatRateKind::DomesticReverseCharge => {
-                    if status != CustomerVatStatus::Domestic {
-                        errors.push(InvoicePreflightError::VatKindRequiresDomesticBuyer {
-                            line_index,
-                            kind: line.vat_rate_kind,
-                            actual_status: status,
-                        });
-                    }
+                VatRateKind::AamExempt | VatRateKind::DomesticReverseCharge
+                    if status != CustomerVatStatus::Domestic =>
+                {
+                    errors.push(InvoicePreflightError::VatKindRequiresDomesticBuyer {
+                        line_index,
+                        kind: line.vat_rate_kind,
+                        actual_status: status,
+                    });
                 }
-                // Percent never reaches here (find skips is_percent); the
-                // named-deferred kinds were already rejected loud above by
-                // `VatRateKindNotSupportedYet` — no buyer constraint added.
+                // Matching-buyer cases fall through (accepted). Percent never
+                // reaches here (find skips is_percent); named-deferred kinds
+                // were already rejected loud above by `VatRateKindNotSupportedYet`.
                 _ => {}
             }
         }
@@ -1097,12 +1103,15 @@ mod tests {
         assert!(validate_invoice_preflight(&good_request()).is_empty());
     }
 
-    /// ADR-0101 §4 (DOOR OPEN) — each of the four FULLY-WIRED kinds is
-    /// ACCEPTED when the line is 0%. This is the compliance-load-bearing
-    /// flip: a real invoice can now carry these kinds. Proven kind-by-kind
-    /// so a regression that re-shut one specific kind fails loudly.
+    /// ADR-0101 §4 (DOOR OPEN) + ADR-0102 §4 — each of the four
+    /// FULLY-WIRED kinds is ACCEPTED when the line is 0% AND the buyer
+    /// matches the cross-field matrix (AAM / domestic reverse-charge
+    /// require a Domestic buyer; the intra-Community 0% kinds require an
+    /// `Other` (EU) buyer with a valid EU VAT number). Proven
+    /// kind-by-kind so a regression that re-shut one specific kind — or
+    /// broke its buyer-matrix cell — fails loudly.
     #[test]
-    fn wired_kinds_accepted_at_zero_rate() {
+    fn wired_kinds_accepted_at_zero_rate_with_matching_buyer() {
         use aberp_billing::VatRateKind::*;
         for kind in [
             AamExempt,
@@ -1113,10 +1122,15 @@ mod tests {
             let mut r = good_request();
             r.lines[0].vat_rate_kind = kind;
             r.lines[0].vat_rate_percent = 0; // exempt / reverse-charge is 0%
+                                             // ADR-0102 — the EU-0 kinds need an Other buyer; the domestic
+                                             // kinds keep good_request's Domestic buyer.
+            if matches!(kind, IntraCommunityGoods | IntraCommunityServiceReverse) {
+                make_other_buyer(&mut r);
+            }
             let errs = validate_invoice_preflight(&r);
             assert!(
                 errs.is_empty(),
-                "wired kind {kind:?} at 0% must be accepted (empty preflight); got {errs:?}"
+                "wired kind {kind:?} at 0% + matching buyer must be accepted; got {errs:?}"
             );
         }
     }
@@ -2026,6 +2040,96 @@ mod tests {
         r.customer.community_vat_number = Some("ATU12345678".to_string());
         let errs = validate_invoice_preflight(&r);
         assert!(errs.is_empty(), "expected no errors, got {errs:?}");
+    }
+
+    /// ADR-0102 — helper: a well-formed `Other` (EU) buyer.
+    fn make_other_buyer(r: &mut IssueInvoiceRequest) {
+        r.customer.vat_status = CustomerVatStatus::Other;
+        r.customer.tax_number = "".to_string();
+        r.customer.community_vat_number = Some("ATU12345678".to_string());
+    }
+
+    /// ADR-0102 §4(a) — THE CROSS-FIELD MATRIX. One row per compliance
+    /// case; the dangerous direction (EU-0 line + domestic buyer) MUST
+    /// reject, and the correct EU-0 assembly (EU-0 line + Other buyer +
+    /// EU VAT) MUST accept.
+    #[test]
+    fn cross_field_matrix_eu0_requires_other_buyer() {
+        use aberp_billing::VatRateKind::*;
+
+        // EU-0 goods + Domestic buyer → reject VatKindRequiresOtherBuyer.
+        for kind in [IntraCommunityGoods, IntraCommunityServiceReverse] {
+            let mut r = good_request();
+            r.lines[0].vat_rate_kind = kind;
+            r.lines[0].vat_rate_percent = 0;
+            // buyer stays Domestic (good_request default)
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    InvoicePreflightError::VatKindRequiresOtherBuyer { kind: k, .. } if *k == kind
+                )),
+                "{kind:?} + Domestic must fire VatKindRequiresOtherBuyer; got {errs:?}"
+            );
+        }
+
+        // EU-0 goods + Other buyer w/ EU VAT → accept.
+        for kind in [IntraCommunityGoods, IntraCommunityServiceReverse] {
+            let mut r = good_request();
+            make_other_buyer(&mut r);
+            r.lines[0].vat_rate_kind = kind;
+            r.lines[0].vat_rate_percent = 0;
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.is_empty(),
+                "{kind:?} + well-formed Other buyer must accept; got {errs:?}"
+            );
+        }
+    }
+
+    /// ADR-0102 §4(a) — AAM / DomesticReverseCharge REQUIRE a Domestic
+    /// buyer; pairing either with an `Other` buyer rejects.
+    #[test]
+    fn cross_field_matrix_domestic_kinds_require_domestic_buyer() {
+        use aberp_billing::VatRateKind::*;
+
+        for kind in [AamExempt, DomesticReverseCharge] {
+            let mut r = good_request();
+            make_other_buyer(&mut r);
+            r.lines[0].vat_rate_kind = kind;
+            r.lines[0].vat_rate_percent = 0;
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    InvoicePreflightError::VatKindRequiresDomesticBuyer { kind: k, .. } if *k == kind
+                )),
+                "{kind:?} + Other must fire VatKindRequiresDomesticBuyer; got {errs:?}"
+            );
+        }
+
+        // AAM + Domestic buyer → accept (the happy path stays green).
+        let mut r = good_request();
+        r.lines[0].vat_rate_kind = AamExempt;
+        r.lines[0].vat_rate_percent = 0;
+        let errs = validate_invoice_preflight(&r);
+        assert!(errs.is_empty(), "AAM + Domestic must accept; got {errs:?}");
+    }
+
+    /// ADR-0102 §4(b) — an `Other` buyer with a malformed EU VAT number
+    /// fires `CommunityVatNumberMalformed` (structural VIES shape).
+    #[test]
+    fn other_buyer_with_malformed_eu_vat_rejects() {
+        let mut r = good_request();
+        r.customer.vat_status = CustomerVatStatus::Other;
+        r.customer.tax_number = "".to_string();
+        r.customer.community_vat_number = Some("ZZ99".to_string());
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InvoicePreflightError::CommunityVatNumberMalformed { .. })),
+            "malformed EU VAT must fire CommunityVatNumberMalformed; got {errs:?}"
+        );
     }
 
     /// Domestic buyer's pre-PR-97 invariants still hold — sanity pin

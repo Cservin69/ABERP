@@ -27,6 +27,7 @@ import {
   paymentDeadlineFromOffset,
   resolveBankForCurrency,
   targetForFieldPath,
+  vatKindBuyerMismatch,
   VAT_KIND_OPTIONS,
   vatKindLocksRate,
   type InvoicePreflightErrorKind,
@@ -1064,6 +1065,42 @@ describe("targetForFieldPath — closed-vocab router", () => {
     expect(targetForFieldPath("bankAccountId")).toEqual({
       kind: "bankAccountId",
     });
+  });
+
+  // ADR-0102 — EU community VAT input + buyer-type control routing.
+  it("routes the ADR-0102 customer paths", () => {
+    expect(targetForFieldPath("customer.communityVatNumber")).toEqual({
+      kind: "customer",
+      field: "communityVatNumber",
+    });
+    expect(targetForFieldPath("customer.vatStatus")).toEqual({
+      kind: "customer",
+      field: "vatStatus",
+    });
+  });
+});
+
+// ADR-0102 — cross-field kind↔buyer guidance helper.
+describe("vatKindBuyerMismatch — cross-field guidance", () => {
+  it("flags an EU-0 kind against a non-Other buyer", () => {
+    expect(vatKindBuyerMismatch("IntraCommunityGoods", "Domestic")).not.toBeNull();
+    expect(
+      vatKindBuyerMismatch("IntraCommunityServiceReverse", "PrivatePerson"),
+    ).not.toBeNull();
+    // ...and clears once the buyer is Other.
+    expect(vatKindBuyerMismatch("IntraCommunityGoods", "Other")).toBeNull();
+  });
+
+  it("flags a domestic kind against a non-Domestic buyer", () => {
+    expect(vatKindBuyerMismatch("AamExempt", "Other")).not.toBeNull();
+    expect(vatKindBuyerMismatch("DomesticReverseCharge", "Other")).not.toBeNull();
+    expect(vatKindBuyerMismatch("AamExempt", "Domestic")).toBeNull();
+  });
+
+  it("never flags Percent (buyer-agnostic)", () => {
+    for (const s of ["Domestic", "PrivatePerson", "Other"] as const) {
+      expect(vatKindBuyerMismatch("Percent", s)).toBeNull();
+    }
   });
 });
 

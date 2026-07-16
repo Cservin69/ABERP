@@ -248,6 +248,25 @@ describe("buyerFieldsFromPartner", () => {
     expect(fields.customerTaxNumber).toBe("");
   });
 
+  // ADR-0102 — an Other (foreign-EU) partner surfaces its eu_vat_number
+  // as the community VAT number AND passes its actual address country
+  // through (not forced to HU) so an EU buyer's <customerAddress> is
+  // correct.
+  it("surfaces eu_vat_number + foreign country for an Other partner", () => {
+    const other: Partner = {
+      ...SAMPLE_PARTNER,
+      customer_vat_status: "Other",
+      tax_number: null,
+      eu_vat_number: "ATU12345678",
+      address_country: "AT",
+    };
+    const fields = buyerFieldsFromPartner(other);
+    expect(fields.customerVatStatus).toBe("Other");
+    expect(fields.customerCommunityVatNumber).toBe("ATU12345678");
+    expect(fields.customerCountryCode).toBe("AT");
+    expect(fields.customerTaxNumber).toBe("");
+  });
+
   // Session-148 (Ervin override 3) — selecting a PrivatePerson partner
   // must populate the IssueInvoice form's buyer-name field from the
   // partner's legal_name (non-empty). This is the load-bearing seam

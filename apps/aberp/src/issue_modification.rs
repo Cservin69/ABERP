@@ -408,52 +408,55 @@ pub fn modification_from_inputs(
 
     // S375 — build the modification's NAV parties BEFORE the tx; the
     // render closure captures them by move.
-    let parties = NavParties {
-        supplier: SupplierInfo {
-            tax_number: input.supplier.tax_number,
-            name: input.supplier.name,
-            address_country_code: input.supplier.address.country_code,
-            address_postal_code: input.supplier.address.postal_code,
-            address_city: input.supplier.address.city,
-            address_street: input.supplier.address.street,
-        },
-        customer: CustomerInfo {
-            // PR-97 / ADR-0048 — inherit the base invoice's
-            // `customer.vat_status` so the modification's wire body
-            // mirrors the base's PRIVATE_PERSON / DOMESTIC shape. Same
-            // back-compat posture as the storno path.
-            customer_vat_status: input.customer.vat_status,
-            tax_number: {
-                let trimmed = input.customer.tax_number.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
+    let parties =
+        NavParties {
+            supplier: SupplierInfo {
+                tax_number: input.supplier.tax_number,
+                name: input.supplier.name,
+                address_country_code: input.supplier.address.country_code,
+                address_postal_code: input.supplier.address.postal_code,
+                address_city: input.supplier.address.city,
+                address_street: input.supplier.address.street,
             },
-            // ADR-0102 — inherit the base's EU community VAT number
-            // verbatim (same back-compat posture as the storno path).
-            community_vat_number: input.customer.community_vat_number.as_deref().and_then(|s| {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            }),
-            name: input.customer.name,
-            // PR-77 / session-101 — same `customerAddress` inheritance
-            // posture as the storno path; the modification's parties
-            // come from the operator-supplied (or reconstructed) base
-            // invoice content, which now carries the address shape.
-            address: input.customer.address.map(|a| CustomerAddress {
-                country_code: a.country_code,
-                postal_code: a.postal_code,
-                city: a.city,
-                street: a.street,
-            }),
-        },
-    };
+            customer: CustomerInfo {
+                // PR-97 / ADR-0048 — inherit the base invoice's
+                // `customer.vat_status` so the modification's wire body
+                // mirrors the base's PRIVATE_PERSON / DOMESTIC shape. Same
+                // back-compat posture as the storno path.
+                customer_vat_status: input.customer.vat_status,
+                tax_number: {
+                    let trimmed = input.customer.tax_number.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                },
+                // ADR-0102 — inherit the base's EU community VAT number
+                // verbatim (same back-compat posture as the storno path).
+                community_vat_number: input.customer.community_vat_number.as_deref().and_then(
+                    |s| {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    },
+                ),
+                name: input.customer.name,
+                // PR-77 / session-101 — same `customerAddress` inheritance
+                // posture as the storno path; the modification's parties
+                // come from the operator-supplied (or reconstructed) base
+                // invoice content, which now carries the address shape.
+                address: input.customer.address.map(|a| CustomerAddress {
+                    country_code: a.country_code,
+                    postal_code: a.postal_code,
+                    city: a.city,
+                    street: a.street,
+                }),
+            },
+        };
     let render_series_code = series_code.clone();
     let render_payment_method = input.payment_method;
     let render_nav_out = nav_xml_out.clone();

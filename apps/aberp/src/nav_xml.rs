@@ -2843,6 +2843,109 @@ mod tests {
         );
     }
 
+    /// ADR-0102 — an `Other` (foreign-EU) buyer emits
+    /// `<customerVatData><communityVatNumber>` (flat, data namespace —
+    /// NO `common:` prefix) plus name + address, and does NOT emit the
+    /// structured `<customerTaxNumber>` block.
+    #[test]
+    fn write_customer_emits_community_vat_number_for_other() {
+        let c = CustomerInfo {
+            community_vat_number: Some("ATU12345678".to_string()),
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            name: "Wiener Handels GmbH".to_string(),
+            address: Some(CustomerAddress {
+                country_code: "AT".to_string(),
+                postal_code: "1010".to_string(),
+                city: "Wien".to_string(),
+                street: "Stephansplatz 1".to_string(),
+            }),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            write_customer(&mut w, &c).expect("write_customer");
+        }
+        let xml = String::from_utf8(buf).expect("utf8");
+        assert!(
+            xml.contains("<customerVatStatus>OTHER</customerVatStatus>"),
+            "OTHER status token; got: {xml}"
+        );
+        assert!(
+            xml.contains("<customerVatData><communityVatNumber>ATU12345678</communityVatNumber></customerVatData>"),
+            "OTHER must emit flat communityVatNumber inside customerVatData; got: {xml}"
+        );
+        assert!(
+            !xml.contains("<customerTaxNumber>"),
+            "OTHER must NOT emit the structured customerTaxNumber; got: {xml}"
+        );
+        assert!(
+            xml.contains("<customerName>Wiener Handels GmbH</customerName>"),
+            "OTHER wire body must carry <customerName>; got: {xml}"
+        );
+        assert!(
+            xml.contains("<customerAddress>"),
+            "OTHER wire body must carry <customerAddress>; got: {xml}"
+        );
+    }
+
+    /// ADR-0102 — the VIES structural validator accepts well-shaped EU
+    /// VAT numbers (incl. `EL`/Greece + a letter-bearing body) and
+    /// rejects an unknown prefix, an empty body, and a non-alphanumeric
+    /// body. NOT a live VIES lookup (§8.2) — structural only.
+    #[test]
+    fn validate_community_vat_number_shape() {
+        // Accept.
+        assert!(validate_community_vat_number("ATU12345678").is_ok());
+        assert!(validate_community_vat_number("HU12345678").is_ok());
+        assert!(validate_community_vat_number("EL123456789").is_ok());
+        // Space + lowercase tolerated (VIES prints spaces).
+        assert!(validate_community_vat_number("at U1234 5678").is_ok());
+        assert!(validate_community_vat_number("IE1234567FA").is_ok());
+        // Reject.
+        assert!(validate_community_vat_number("").is_err(), "empty");
+        assert!(
+            validate_community_vat_number("ZZ12345678").is_err(),
+            "bad prefix"
+        );
+        assert!(validate_community_vat_number("AT").is_err(), "empty body");
+        assert!(
+            validate_community_vat_number("AT!!!!").is_err(),
+            "non-alnum body"
+        );
+        assert!(
+            validate_community_vat_number("ATU1234567890123").is_err(),
+            "body too long (>12)"
+        );
+    }
+
+    /// ADR-0102 — an `Other` buyer that reaches the emitter WITHOUT a
+    /// community VAT number is a programmer error (preflight guarantees
+    /// it upstream) and loud-fails rather than emitting an empty
+    /// `<customerVatData>`.
+    #[test]
+    fn write_customer_loud_fails_other_without_community_vat() {
+        let c = CustomerInfo {
+            community_vat_number: None,
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            name: "No VAT GmbH".to_string(),
+            address: Some(CustomerAddress {
+                country_code: "AT".to_string(),
+                postal_code: "1010".to_string(),
+                city: "Wien".to_string(),
+                street: "Ring 1".to_string(),
+            }),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        let mut w = Writer::new(&mut buf);
+        let err = write_customer(&mut w, &c).expect_err("must loud-fail");
+        assert!(
+            err.to_string().contains("community_vat_number"),
+            "message must name the missing field; got: {err}"
+        );
+    }
+
     #[test]
     fn supplier_config_error_display_names_the_input() {
         let err = SupplierConfigError::MalformedTaxNumber {
