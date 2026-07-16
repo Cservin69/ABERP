@@ -141,7 +141,12 @@
     number,
     Partial<
       Record<
-        "description" | "quantity" | "unitPrice" | "vatRatePercent",
+        // ADR-0101 — `vatRateKind` added for type-compat with the shared
+        // `targetForFieldPath` (which can now return that line field). The
+        // modification flow never emits a kind-level error today (all its
+        // lines are Percent), but the Record must accept the field so the
+        // routing code type-checks.
+        "description" | "quantity" | "unitPrice" | "vatRatePercent" | "vatRateKind",
         InvoicePreflightErrorItem
       >
     >
@@ -246,6 +251,10 @@
           // wire-side minor units at compose time.
           unitPriceInput: "",
           vatRatePercent: 27,
+          // ADR-0101 — a fresh modification line defaults to the numeric
+          // `Percent` path (the modification SPA does not expose a VAT-kind
+          // selector — out of scope this session; see modification.ts FLAG).
+          vatRateKind: "Percent",
           // PR-82 — fresh line has no buyer note; operator opt-in.
           note: "",
         },

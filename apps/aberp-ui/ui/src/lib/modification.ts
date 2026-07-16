@@ -97,6 +97,17 @@ export function formFromIssuanceInput(
     // trips both back to the same minor count on submit.
     unitPriceInput: formatMinorToInput(l.unitPrice, baseCurrency),
     vatRatePercent: l.vatRatePercent,
+    // ADR-0101 — inherit the base's per-line VAT rate-kind from the
+    // side-stored issuance input (default `"Percent"` for pre-0101 bases,
+    // mirroring the backend serde default). This keeps the shared
+    // `LineFormState` type-complete. NOTE (FLAG for adversarial review):
+    // the modification SPA does NOT yet expose a VAT-kind selector and
+    // `ModificationInvoiceRequest` carries NO `vatRateKind` field, so a
+    // modification of a (future) NEW-KIND invoice would not thread the kind
+    // through the modification wire path — a named-deferred follow-up. There
+    // is ZERO current exposure: no non-`Percent` invoice can exist until this
+    // session opens the issue door, so every real base inherits `"Percent"`.
+    vatRateKind: l.vatRateKind ?? "Percent",
     // PR-82 — inherit any per-line note recorded on the base's
     // side-stored issuance input. The modification form keeps the
     // operator's freedom to edit; the textarea pre-fills with the
