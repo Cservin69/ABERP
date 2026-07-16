@@ -1255,8 +1255,9 @@ fn load_invoice(
         // loud, CLAUDE.md rule 11 — no silent default to Percent).
         let vat_rate_kind = match vat_rate_kind_str {
             None => VatRateKind::Percent,
-            Some(s) => VatRateKind::from_db_str(&s)
-                .ok_or(BillingError::Invalid("stored invoice_line.vat_rate_kind is not a known kind"))?,
+            Some(s) => VatRateKind::from_db_str(&s).ok_or(BillingError::Invalid(
+                "stored invoice_line.vat_rate_kind is not a known kind",
+            ))?,
         };
         lines.push(LineItem {
             description,

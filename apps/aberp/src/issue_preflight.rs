@@ -712,6 +712,7 @@ mod tests {
             quantity: Decimal::from(1),
             unit_price: 10_000,
             vat_rate_percent: 27,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }
@@ -760,6 +761,83 @@ mod tests {
     #[test]
     fn golden_valid_request_returns_empty_vec() {
         assert!(validate_invoice_preflight(&good_request()).is_empty());
+    }
+
+    /// ADR-0101 §9 — THE SHUT DOOR. Every non-`Percent` `vat_rate_kind`
+    /// must be rejected at preflight so NO invoice can be issued in a new
+    /// NAV shape during Session 1. This is the proof that the risky
+    /// invoice→NAV/ÁFA machinery ships dormant with zero prod exposure.
+    /// Session 2 replaces this with the §4 accept/reject matrix behind the
+    /// mandatory NAV-category adversarial review.
+    #[test]
+    fn shut_door_rejects_every_non_percent_kind() {
+        use aberp_billing::VatRateKind::*;
+        let kinds = [
+            AamExempt,
+            DomesticReverseCharge,
+            IntraCommunityGoods,
+            IntraCommunityServiceReverse,
+            TamExempt,
+            ExportGoods,
+            OtherInternational,
+            NewTransportIntraCommunity,
+            OutOfScopeThirdCountry,
+            MarginScheme,
+            NoVatCharge,
+            VatContent,
+        ];
+        for kind in kinds {
+            let mut r = good_request();
+            r.lines[0].vat_rate_kind = kind;
+            r.lines[0].vat_rate_percent = 0; // exempt/reverse-charge lines are 0%
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    InvoicePreflightError::LineItemVatRateKindNotYetIssuable { kind: k, .. }
+                        if *k == kind
+                )),
+                "kind {kind:?} must be rejected as not-yet-issuable (shut door); got {errs:?}"
+            );
+            // One precise error — the non-`Percent` guard short-circuits the
+            // numeric-rate gate, so `LineItemVatRateUnknown` must NOT co-fire.
+            assert!(
+                !errs
+                    .iter()
+                    .any(|e| matches!(e, InvoicePreflightError::LineItemVatRateUnknown { .. })),
+                "non-Percent kind must not ALSO trip LineItemVatRateUnknown; got {errs:?}"
+            );
+        }
+    }
+
+    /// The shut-door variant's discriminant + field_path + bilingual
+    /// messages are stable (the SPA renderer routes on the first two).
+    #[test]
+    fn shut_door_variant_discriminant_field_path_and_messages() {
+        let e = InvoicePreflightError::LineItemVatRateKindNotYetIssuable {
+            line_index: 2,
+            kind: aberp_billing::VatRateKind::AamExempt,
+        };
+        assert_eq!(e.kind(), "LineItemVatRateKindNotYetIssuable");
+        assert_eq!(e.field_path(), "lines[2].vatRateKind");
+        assert!(e.message_hu().contains("AamExempt"));
+        assert!(e.message_en().contains("AamExempt"));
+    }
+
+    /// The shut door did not swallow the existing numeric gate: a
+    /// `Percent` line with an out-of-vocab rate still trips
+    /// `LineItemVatRateUnknown` (unchanged behaviour).
+    #[test]
+    fn percent_kind_still_numeric_gated() {
+        let mut r = good_request();
+        r.lines[0].vat_rate_kind = aberp_billing::VatRateKind::Percent;
+        r.lines[0].vat_rate_percent = 9; // not in {0,5,18,27}
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InvoicePreflightError::LineItemVatRateUnknown { .. })),
+            "Percent + out-of-vocab rate must still trip LineItemVatRateUnknown; got {errs:?}"
+        );
     }
 
     #[test]
@@ -1020,6 +1098,7 @@ mod tests {
                     quantity: Decimal::ZERO,     // zero
                     unit_price: -1,              // negative
                     vat_rate_percent: 12,        // off-vocab
+                    vat_rate_kind: aberp_billing::VatRateKind::Percent,
                     note: None,
                     unit: None,
                 },
@@ -1029,6 +1108,7 @@ mod tests {
                     quantity: Decimal::from(1),
                     unit_price: 10,
                     vat_rate_percent: 99, // off-vocab
+                    vat_rate_kind: aberp_billing::VatRateKind::Percent,
                     note: None,
                     unit: None,
                 },
