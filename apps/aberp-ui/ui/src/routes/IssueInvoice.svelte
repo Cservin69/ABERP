@@ -62,6 +62,7 @@
   } from "../lib/api";
   import {
     applyProductPick,
+    applyVatKind,
     cannotIssueDueToBank,
     composeIssueInvoiceBody,
     deliveryDateOverrideFor,
@@ -73,11 +74,14 @@
     paymentDeadlineFromOffset,
     resolveBankForCurrency,
     targetForFieldPath,
+    VAT_KIND_OPTIONS,
+    vatKindLocksRate,
     type InvoicePreflightErrorBody,
     type InvoicePreflightErrorItem,
     type IssueInvoiceFormState,
     type MissingSellerConfigError,
   } from "../lib/issue-invoice";
+  import type { VatRateKindBody } from "../lib/api";
   import { daysBetween } from "../lib/invoice-dates";
   import { paymentMethodOptions } from "../lib/payment-method";
   import { buyerFieldsFromPartner } from "../lib/partners";
@@ -167,7 +171,7 @@
     address: InvoicePreflightErrorItem | null;
   } = $state({ name: null, taxNumber: null, address: null });
   let linesContainerError: InvoicePreflightErrorItem | null = $state(null);
-  let lineErrors: Record<number, Partial<Record<"description" | "quantity" | "unitPrice" | "vatRatePercent", InvoicePreflightErrorItem>>> =
+  let lineErrors: Record<number, Partial<Record<"description" | "quantity" | "unitPrice" | "vatRatePercent" | "vatRateKind", InvoicePreflightErrorItem>>> =
     $state({});
   let unroutedPreflightErrors: InvoicePreflightErrorItem[] = $state([]);
 
@@ -696,6 +700,14 @@
 
   function addLine() {
     form = { ...form, lines: [...form.lines, emptyLine()] };
+  }
+
+  // ADR-0101 — operator picked a VAT rate-kind for a line. Route through
+  // `applyVatKind` so the rate-lock invariant (non-`Percent` ⇒ rate 0)
+  // lives in exactly one place; reassign `form` so Svelte re-renders the
+  // (now possibly disabled) VAT% input.
+  function onVatKindChange(index: number, kind: VatRateKindBody) {
+    form = applyVatKind(form, index, kind);
   }
 
   function removeLine(index: number) {
@@ -1463,6 +1475,30 @@
               data-testid={`line-${index}-unit-price-input`}
             />
           </label>
+          <!-- ADR-0101 — per-line VAT-type (ÁFA-típus) selector. Picking a
+               non-percentage kind (exempt / reverse-charge / intra-Community)
+               LOCKS the VAT% input to 0 via `onVatKindChange` → `applyVatKind`
+               and disables it, so the operator cannot form an invalid
+               kind+rate combination (HÜLYE-BIZTOS). Options + labels come from
+               the single-source `VAT_KIND_OPTIONS`. -->
+          <label class="narrow">
+            <span>ÁFA-típus / VAT type</span>
+            <select
+              value={line.vatRateKind}
+              onchange={(e) =>
+                onVatKindChange(
+                  index,
+                  (e.currentTarget as HTMLSelectElement).value as VatRateKindBody,
+                )}
+              class:input-invalid={lineErrors[index]?.vatRateKind !== undefined}
+              aria-invalid={lineErrors[index]?.vatRateKind !== undefined}
+              data-testid={`line-${index}-vat-kind-select`}
+            >
+              {#each VAT_KIND_OPTIONS as opt (opt.value)}
+                <option value={opt.value}>{opt.labelHu}</option>
+              {/each}
+            </select>
+          </label>
           <label class="narrow">
             <span>VAT %</span>
             <input
@@ -1472,6 +1508,10 @@
               step="1"
               bind:value={line.vatRatePercent}
               required
+              disabled={vatKindLocksRate(line.vatRateKind)}
+              title={vatKindLocksRate(line.vatRateKind)
+                ? "Adómentes / fordított adózású típusnál az ÁFA kötelezően 0% — exempt / reverse-charge lines are 0%"
+                : undefined}
               class:input-invalid={lineErrors[index]?.vatRatePercent !== undefined}
               aria-invalid={lineErrors[index]?.vatRatePercent !== undefined}
               data-testid={`line-${index}-vat-input`}
@@ -1490,6 +1530,19 @@
             ✕
           </button>
         </div>
+        <!-- ADR-0101 — plain-language explanation of the selected VAT type
+             so the operator knows what AAM / reverse-charge / KBAET /
+             EUFAD37 actually mean (HÜLYE-BIZTOS). Shown for every kind,
+             including Percent, from the single-source `VAT_KIND_OPTIONS`. -->
+        {@const vatKindOpt = VAT_KIND_OPTIONS.find(
+          (o) => o.value === line.vatRateKind,
+        )}
+        {#if vatKindOpt}
+          <p class="vat-kind-hint" data-testid={`line-${index}-vat-kind-hint`}>
+            <span class="inline-error-hu">{vatKindOpt.hintHu}</span>
+            <span class="inline-error-en">{vatKindOpt.hintEn}</span>
+          </p>
+        {/if}
         <!-- PR-82 — per-line buyer note ("Megjegyzés"). Compact
              always-visible textarea below each line so the operator
              can annotate without an extra "+ note" click. Blank
@@ -1888,6 +1941,21 @@
 
   .line-errors {
     margin-bottom: var(--space-2);
+  }
+
+  /* ADR-0101 — per-line VAT-type explanation. Muted (informational, not an
+   * error), bilingual, sized to match the note/hint density so the line
+   * table stays readable. Overrides the negative colour the shared
+   * `.inline-error-hu` child would otherwise carry — this is a hint. */
+  .vat-kind-hint {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 2px 0 var(--space-2) 0;
+    font-size: var(--type-size-xs);
+  }
+  .vat-kind-hint .inline-error-hu {
+    color: var(--color-text-muted);
   }
 
   /* PR-82 — per-line buyer note. Inline under the line row, sized

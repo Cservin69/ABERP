@@ -139,20 +139,57 @@ pub enum InvoicePreflightError {
         actual: u16,
         allowed: &'static [u16],
     },
-    /// ADR-0101 §9 — the Session-1 SHUT DOOR. `lines[line_index]` carries
-    /// a `vat_rate_kind` other than `Percent`. The NAV machinery for the
-    /// 0%/exempt/reverse-charge kinds (model → schema → emit → validator)
-    /// ships in Session 1 but stays DORMANT: no invoice may actually be
-    /// issued in a new shape until Session 2 opens this gate behind the
-    /// mandatory NAV-category adversarial review. Until then every
-    /// non-`Percent` kind is rejected here, so the risky invoice→NAV/ÁFA
-    /// path has zero production exposure. Carries the rejected kind so the
-    /// message names it. When Session 2 lands, this variant is REPLACED by
-    /// the §4 accept/reject matrix (accept the four wired kinds when the
-    /// line is 0%, keep rejecting the named-deferred remainder).
-    LineItemVatRateKindNotYetIssuable {
+    /// ADR-0101 §4 (Session 2 — DOOR OPEN). `lines[line_index]` carries a
+    /// FULLY-WIRED non-`Percent` kind (AAM / domestic reverse-charge /
+    /// intra-Community goods / intra-Community service reverse) but a
+    /// **non-zero** `vat_rate_percent`. A reverse-charge / exempt line's
+    /// VAT is always 0 (the buyer self-assesses; the exemption carries no
+    /// rate); a non-zero rate on such a line is a category/rate
+    /// contradiction NAV would reject. The SPA selector LOCKS the rate to 0
+    /// for these kinds, so this fires only for a non-UI caller (CLI / API)
+    /// — a defence-in-depth gate, not an operator-reachable state through
+    /// the form. Carries the kind + the offending rate so the message names
+    /// both.
+    NonZeroPercentForExemptKind {
         line_index: usize,
         kind: VatRateKind,
+        actual: u16,
+    },
+    /// ADR-0101 §4 — `lines[line_index]` carries a NAMED-DEFERRED
+    /// `vat_rate_kind` (TAM / EAM / NAM / KBAUK / HO / marginScheme /
+    /// noVatCharge / vatContent). These are enum-known so the vocab is
+    /// closed + complete-in-intent, but v1 wires only the four Ervin-
+    /// confirmed kinds; the remainder are explicit not-yet markers
+    /// (ADR-0048 pattern / CLAUDE.md rule 12). Rejected LOUDLY at preflight
+    /// (and, in defence-in-depth, `anyhow!`ed at NAV emit) so no
+    /// unconfirmed-code body can reach the wire. Wiring one is a separate
+    /// PR that first confirms its NAV case code.
+    VatRateKindNotSupportedYet {
+        line_index: usize,
+        kind: VatRateKind,
+    },
+    /// ADR-0101 (Session-2 conservative guard — FLAGGED). The invoice mixes
+    /// a non-`Percent` `vat_rate_kind` with a DIFFERENT kind on another
+    /// line. The NAV emitter's `summaryByVatRate` is single-bucket, keyed
+    /// on the FIRST line's kind/rate (`nav_xml.rs::write_summary`), so a
+    /// mixed-kind invoice would emit a summary whose category does not
+    /// cover every line — a NAV cross-field rejection at best, a silently
+    /// mis-categorised filing at worst. Until the summary emitter groups by
+    /// (kind, rate) — a separate follow-up — an invoice that carries ANY
+    /// non-`Percent` line must have EVERY line on that same kind. All-
+    /// `Percent` invoices are unaffected (byte-identical backward-compat);
+    /// this guard fires only once a non-`Percent` kind is present. Carries
+    /// the two disagreeing kinds + the line that first differs.
+    ///
+    /// FLAG (for the NAV-category adversarial review): this enforces the
+    /// invariant `write_summary` already assumes but never checked. The
+    /// pre-existing mixed-`Percent`-RATE single-bucket gap (e.g. a 27% line
+    /// + a 5% line) is untouched here — out of ADR-0101 scope — and remains
+    /// a NAV-reject-on-submit rather than a preflight catch.
+    MixedVatRateKindsUnsupported {
+        line_index: usize,
+        first_kind: VatRateKind,
+        other_kind: VatRateKind,
     },
     /// PR-73 / ADR-0040 §addendum — `bank_account_id` omitted (or
     /// `None`) AND `seller_banks.default_bank_for(invoice.currency)`
@@ -222,8 +259,14 @@ impl InvoicePreflightError {
                 "LineItemUnitPriceNonPositive"
             }
             InvoicePreflightError::LineItemVatRateUnknown { .. } => "LineItemVatRateUnknown",
-            InvoicePreflightError::LineItemVatRateKindNotYetIssuable { .. } => {
-                "LineItemVatRateKindNotYetIssuable"
+            InvoicePreflightError::NonZeroPercentForExemptKind { .. } => {
+                "NonZeroPercentForExemptKind"
+            }
+            InvoicePreflightError::VatRateKindNotSupportedYet { .. } => {
+                "VatRateKindNotSupportedYet"
+            }
+            InvoicePreflightError::MixedVatRateKindsUnsupported { .. } => {
+                "MixedVatRateKindsUnsupported"
             }
             InvoicePreflightError::SellerBankMissingForCurrency { .. } => {
                 "SellerBankMissingForCurrency"
@@ -265,7 +308,12 @@ impl InvoicePreflightError {
             InvoicePreflightError::LineItemVatRateUnknown { line_index, .. } => {
                 format!("lines[{line_index}].vatRatePercent")
             }
-            InvoicePreflightError::LineItemVatRateKindNotYetIssuable { line_index, .. } => {
+            // All three ADR-0101 kind-level errors route to the per-line
+            // `vatRateKind` selector so the SPA renders them beneath the
+            // VAT-type dropdown (the control that drives the discriminant).
+            InvoicePreflightError::NonZeroPercentForExemptKind { line_index, .. }
+            | InvoicePreflightError::VatRateKindNotSupportedYet { line_index, .. }
+            | InvoicePreflightError::MixedVatRateKindsUnsupported { line_index, .. } => {
                 format!("lines[{line_index}].vatRateKind")
             }
             InvoicePreflightError::SellerBankMissingForCurrency { .. }
@@ -332,16 +380,39 @@ impl InvoicePreflightError {
                 allowed,
             } => {
                 format!(
-                    "A(z) {}. tételsor ÁFA-kulcsa ({actual}%) nem szerepel a magyar szabványos kulcsok között ({}). Speciális kategóriák (AAM/TAM/TAH) jelenleg nem támogatottak.",
+                    "A(z) {}. tételsor ÁFA-kulcsa ({actual}%) nem szerepel a magyar szabványos kulcsok között ({}). Adómentes / fordított adózású tételhez válassza a megfelelő ÁFA-típust (AAM, belföldi fordított adózás, Közösségen belüli) a legördülő menüből.",
                     line_index + 1,
                     format_percent_list(allowed)
                 )
             }
-            InvoicePreflightError::LineItemVatRateKindNotYetIssuable { line_index, kind } => {
+            InvoicePreflightError::NonZeroPercentForExemptKind {
+                line_index,
+                kind,
+                actual,
+            } => {
                 format!(
-                    "A(z) {}. tételsor ÁFA-típusa ({}) még nem bocsátható ki. A 0%-os / adómentes / fordított adózású típusok NAV-gépezete készen áll, de átmenetileg zárolva van (ADR-0101). Használjon százalékos (Percent) ÁFA-kulcsot.",
+                    "A(z) {}. tételsor ÁFA-típusa ({}) adómentes / fordított adózású, ezért az ÁFA-kulcs kötelezően 0% (kapott: {actual}%). A vevő önadózik / az ügylet adómentes — állítsa 0%-ra.",
                     line_index + 1,
                     kind.as_str()
+                )
+            }
+            InvoicePreflightError::VatRateKindNotSupportedYet { line_index, kind } => {
+                format!(
+                    "A(z) {}. tételsor ÁFA-típusa ({}) még nincs bekötve (ADR-0101 named-deferred). Jelenleg a Százalékos (Percent), AAM, belföldi fordított adózás, valamint a Közösségen belüli termékértékesítés / szolgáltatás típusok bocsáthatók ki. Válasszon ezek közül.",
+                    line_index + 1,
+                    kind.as_str()
+                )
+            }
+            InvoicePreflightError::MixedVatRateKindsUnsupported {
+                line_index,
+                first_kind,
+                other_kind,
+            } => {
+                format!(
+                    "A(z) {}. tételsor ÁFA-típusa ({}) eltér a számla első tételsorának típusától ({}). Egy adómentes / fordított adózású számlán minden tételsornak azonos ÁFA-típusúnak kell lennie (a NAV összesítő egyetlen kategóriát tartalmaz). Bontsa külön számlára a különböző ÁFA-típusú tételeket.",
+                    line_index + 1,
+                    other_kind.as_str(),
+                    first_kind.as_str()
                 )
             }
             InvoicePreflightError::SellerBankMissingForCurrency { currency } => {
@@ -422,16 +493,39 @@ impl InvoicePreflightError {
                 allowed,
             } => {
                 format!(
-                    "Line {} VAT rate ({actual}%) is not a Hungarian standard rate (allowed: {}). Special categories (AAM/TAM/TAH) are not supported on this wire shape today.",
+                    "Line {} VAT rate ({actual}%) is not a Hungarian standard rate (allowed: {}). For an exempt / reverse-charge line, pick the matching VAT type (AAM, domestic reverse-charge, intra-Community) from the VAT-type selector instead.",
                     line_index + 1,
                     format_percent_list(allowed)
                 )
             }
-            InvoicePreflightError::LineItemVatRateKindNotYetIssuable { line_index, kind } => {
+            InvoicePreflightError::NonZeroPercentForExemptKind {
+                line_index,
+                kind,
+                actual,
+            } => {
                 format!(
-                    "Line {} VAT kind ({}) is not issuable yet. The NAV machinery for the 0%/exempt/reverse-charge kinds is in place but is deliberately gated shut (ADR-0101 Session 1); use a Percent VAT rate. Session 2 opens this behind the NAV-category adversarial review.",
+                    "Line {} VAT kind ({}) is exempt / reverse-charge, so its VAT rate must be 0% (got {actual}%). The buyer self-assesses / the supply is exempt — set the rate to 0.",
                     line_index + 1,
                     kind.as_str()
+                )
+            }
+            InvoicePreflightError::VatRateKindNotSupportedYet { line_index, kind } => {
+                format!(
+                    "Line {} VAT kind ({}) is not wired yet (ADR-0101 named-deferred). Issuable kinds today: Percent, AamExempt, DomesticReverseCharge, IntraCommunityGoods, IntraCommunityServiceReverse — pick one of those. Wiring another is a later PR that first confirms its NAV case code.",
+                    line_index + 1,
+                    kind.as_str()
+                )
+            }
+            InvoicePreflightError::MixedVatRateKindsUnsupported {
+                line_index,
+                first_kind,
+                other_kind,
+            } => {
+                format!(
+                    "Line {} VAT kind ({}) differs from the invoice's first line kind ({}). An invoice carrying any exempt / reverse-charge line must have EVERY line on the same VAT kind — NAV's summaryByVatRate is single-bucket, so a mixed-kind invoice mis-categorises the summary. Split differing VAT kinds onto separate invoices.",
+                    line_index + 1,
+                    other_kind.as_str(),
+                    first_kind.as_str()
                 )
             }
             InvoicePreflightError::SellerBankMissingForCurrency { currency } => {
@@ -663,23 +757,67 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
                     actual: line.unit_price,
                 });
             }
-            // ADR-0101 §9 — SHUT DOOR. Reject every non-`Percent` kind
-            // BEFORE the numeric-rate gate so a non-`Percent` line's
-            // (meaningless) `vat_rate_percent` does not ALSO trip
-            // `LineItemVatRateUnknown` — the operator sees the one precise
-            // "kind not issuable yet" error, not two. Session 2 replaces
-            // this branch with the §4 accept/reject matrix.
-            if !line.vat_rate_kind.is_percent() {
-                errors.push(InvoicePreflightError::LineItemVatRateKindNotYetIssuable {
+            // ADR-0101 §4 — the per-line VAT rate-kind accept/reject matrix
+            // (Session 2, DOOR OPEN). Branch on the kind FIRST so a
+            // non-`Percent` line's (meaningless) `vat_rate_percent` cannot
+            // ALSO trip `LineItemVatRateUnknown` — the operator sees the one
+            // precise kind-level error.
+            //
+            //   Percent        → numeric-rate gate (unchanged): rate ∈ {0,5,18,27}
+            //   wired non-Pct  → accept iff rate == 0, else NonZeroPercentForExemptKind
+            //   named-deferred → VatRateKindNotSupportedYet (loud not-yet)
+            if line.vat_rate_kind.is_percent() {
+                if !ALLOWED_VAT_RATES_PERCENT.contains(&line.vat_rate_percent) {
+                    errors.push(InvoicePreflightError::LineItemVatRateUnknown {
+                        line_index,
+                        actual: line.vat_rate_percent,
+                        allowed: ALLOWED_VAT_RATES_PERCENT,
+                    });
+                }
+            } else if line.vat_rate_kind.is_wired() {
+                // AAM / domestic reverse-charge / intra-Community goods /
+                // intra-Community service reverse: the line VAT amount is 0
+                // (buyer self-assesses / exempt), so a non-zero rate is a
+                // category/rate contradiction. Accept only rate 0.
+                if line.vat_rate_percent != 0 {
+                    errors.push(InvoicePreflightError::NonZeroPercentForExemptKind {
+                        line_index,
+                        kind: line.vat_rate_kind,
+                        actual: line.vat_rate_percent,
+                    });
+                }
+            } else {
+                // Named-deferred remainder — enum-known, not yet wired.
+                errors.push(InvoicePreflightError::VatRateKindNotSupportedYet {
                     line_index,
                     kind: line.vat_rate_kind,
                 });
-            } else if !ALLOWED_VAT_RATES_PERCENT.contains(&line.vat_rate_percent) {
-                errors.push(InvoicePreflightError::LineItemVatRateUnknown {
-                    line_index,
-                    actual: line.vat_rate_percent,
-                    allowed: ALLOWED_VAT_RATES_PERCENT,
-                });
+            }
+        }
+
+        // ADR-0101 conservative mixed-kind guard (FLAGGED). The NAV emitter's
+        // `summaryByVatRate` is single-bucket, keyed on the FIRST line's kind
+        // (`nav_xml.rs::write_summary`). Once ANY line carries a non-`Percent`
+        // kind, every line must share that exact kind or the emitted summary
+        // would not cover every line's category — a NAV cross-field mismatch.
+        // All-`Percent` invoices skip this guard entirely (the `any`
+        // short-circuits false), so backward-compat is byte-identical. The
+        // pre-existing mixed-`Percent`-RATE single-bucket gap is out of
+        // ADR-0101 scope and intentionally NOT gated here.
+        let any_non_percent = request
+            .lines
+            .iter()
+            .any(|l| !l.vat_rate_kind.is_percent());
+        if any_non_percent {
+            let first_kind = request.lines[0].vat_rate_kind;
+            for (line_index, line) in request.lines.iter().enumerate() {
+                if line.vat_rate_kind != first_kind {
+                    errors.push(InvoicePreflightError::MixedVatRateKindsUnsupported {
+                        line_index,
+                        first_kind,
+                        other_kind: line.vat_rate_kind,
+                    });
+                }
             }
         }
     }
@@ -763,20 +901,71 @@ mod tests {
         assert!(validate_invoice_preflight(&good_request()).is_empty());
     }
 
-    /// ADR-0101 §9 — THE SHUT DOOR. Every non-`Percent` `vat_rate_kind`
-    /// must be rejected at preflight so NO invoice can be issued in a new
-    /// NAV shape during Session 1. This is the proof that the risky
-    /// invoice→NAV/ÁFA machinery ships dormant with zero prod exposure.
-    /// Session 2 replaces this with the §4 accept/reject matrix behind the
-    /// mandatory NAV-category adversarial review.
+    /// ADR-0101 §4 (DOOR OPEN) — each of the four FULLY-WIRED kinds is
+    /// ACCEPTED when the line is 0%. This is the compliance-load-bearing
+    /// flip: a real invoice can now carry these kinds. Proven kind-by-kind
+    /// so a regression that re-shut one specific kind fails loudly.
     #[test]
-    fn shut_door_rejects_every_non_percent_kind() {
+    fn wired_kinds_accepted_at_zero_rate() {
         use aberp_billing::VatRateKind::*;
-        let kinds = [
+        for kind in [
             AamExempt,
             DomesticReverseCharge,
             IntraCommunityGoods,
             IntraCommunityServiceReverse,
+        ] {
+            let mut r = good_request();
+            r.lines[0].vat_rate_kind = kind;
+            r.lines[0].vat_rate_percent = 0; // exempt / reverse-charge is 0%
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.is_empty(),
+                "wired kind {kind:?} at 0% must be accepted (empty preflight); got {errs:?}"
+            );
+        }
+    }
+
+    /// ADR-0101 §4 — a wired kind with a NON-ZERO rate trips
+    /// `NonZeroPercentForExemptKind` (and NOT the numeric `LineItemVatRateUnknown`
+    /// — the kind branch is taken first, so the operator sees one precise
+    /// error). A reverse-charge / exempt line's VAT is always 0.
+    #[test]
+    fn wired_kind_with_nonzero_rate_rejected_non_zero_percent() {
+        use aberp_billing::VatRateKind::*;
+        for kind in [
+            AamExempt,
+            DomesticReverseCharge,
+            IntraCommunityGoods,
+            IntraCommunityServiceReverse,
+        ] {
+            let mut r = good_request();
+            r.lines[0].vat_rate_kind = kind;
+            r.lines[0].vat_rate_percent = 27; // contradiction: exempt kind + rate
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    InvoicePreflightError::NonZeroPercentForExemptKind { kind: k, actual: 27, .. }
+                        if *k == kind
+                )),
+                "wired kind {kind:?} + 27% must trip NonZeroPercentForExemptKind; got {errs:?}"
+            );
+            assert!(
+                !errs
+                    .iter()
+                    .any(|e| matches!(e, InvoicePreflightError::LineItemVatRateUnknown { .. })),
+                "the kind branch is taken first — LineItemVatRateUnknown must NOT co-fire; got {errs:?}"
+            );
+        }
+    }
+
+    /// ADR-0101 §4 — every NAMED-DEFERRED kind stays rejected (loud)
+    /// `VatRateKindNotSupportedYet`, at any rate. This is the closed-vocab
+    /// not-yet marker: no unconfirmed-code body reaches the wire.
+    #[test]
+    fn named_deferred_kinds_rejected_not_supported_yet() {
+        use aberp_billing::VatRateKind::*;
+        for kind in [
             TamExempt,
             ExportGoods,
             OtherInternational,
@@ -785,46 +974,98 @@ mod tests {
             MarginScheme,
             NoVatCharge,
             VatContent,
-        ];
-        for kind in kinds {
-            let mut r = good_request();
-            r.lines[0].vat_rate_kind = kind;
-            r.lines[0].vat_rate_percent = 0; // exempt/reverse-charge lines are 0%
-            let errs = validate_invoice_preflight(&r);
-            assert!(
-                errs.iter().any(|e| matches!(
-                    e,
-                    InvoicePreflightError::LineItemVatRateKindNotYetIssuable { kind: k, .. }
-                        if *k == kind
-                )),
-                "kind {kind:?} must be rejected as not-yet-issuable (shut door); got {errs:?}"
-            );
-            // One precise error — the non-`Percent` guard short-circuits the
-            // numeric-rate gate, so `LineItemVatRateUnknown` must NOT co-fire.
-            assert!(
-                !errs
-                    .iter()
-                    .any(|e| matches!(e, InvoicePreflightError::LineItemVatRateUnknown { .. })),
-                "non-Percent kind must not ALSO trip LineItemVatRateUnknown; got {errs:?}"
-            );
+        ] {
+            for rate in [0u16, 27] {
+                let mut r = good_request();
+                r.lines[0].vat_rate_kind = kind;
+                r.lines[0].vat_rate_percent = rate;
+                let errs = validate_invoice_preflight(&r);
+                assert!(
+                    errs.iter().any(|e| matches!(
+                        e,
+                        InvoicePreflightError::VatRateKindNotSupportedYet { kind: k, .. }
+                            if *k == kind
+                    )),
+                    "named-deferred kind {kind:?} @ {rate}% must be rejected VatRateKindNotSupportedYet; got {errs:?}"
+                );
+            }
         }
     }
 
-    /// The shut-door variant's discriminant + field_path + bilingual
-    /// messages are stable (the SPA renderer routes on the first two).
+    /// ADR-0101 conservative guard (FLAGGED) — an invoice mixing a
+    /// non-`Percent` kind with a DIFFERENT kind trips
+    /// `MixedVatRateKindsUnsupported` (the summary emitter is single-bucket).
+    /// A Percent line beside an AAM line is a mix; two AAM lines are not.
     #[test]
-    fn shut_door_variant_discriminant_field_path_and_messages() {
-        let e = InvoicePreflightError::LineItemVatRateKindNotYetIssuable {
-            line_index: 2,
-            kind: aberp_billing::VatRateKind::AamExempt,
-        };
-        assert_eq!(e.kind(), "LineItemVatRateKindNotYetIssuable");
-        assert_eq!(e.field_path(), "lines[2].vatRateKind");
-        assert!(e.message_hu().contains("AamExempt"));
-        assert!(e.message_en().contains("AamExempt"));
+    fn mixed_kinds_rejected_but_uniform_non_percent_accepted() {
+        use aberp_billing::VatRateKind::*;
+        // Percent line 0 + AAM line 1 → mix (line 1 differs from first).
+        let mut mixed = good_request();
+        mixed.lines = vec![good_line(), good_line()];
+        mixed.lines[1].vat_rate_kind = AamExempt;
+        mixed.lines[1].vat_rate_percent = 0;
+        let errs = validate_invoice_preflight(&mixed);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                InvoicePreflightError::MixedVatRateKindsUnsupported {
+                    line_index: 1,
+                    first_kind: Percent,
+                    other_kind: AamExempt,
+                }
+            )),
+            "Percent + AAM mix must trip MixedVatRateKindsUnsupported at line 1; got {errs:?}"
+        );
+
+        // Two AAM lines → uniform, accepted (no mix error).
+        let mut uniform = good_request();
+        uniform.lines = vec![good_line(), good_line()];
+        for l in uniform.lines.iter_mut() {
+            l.vat_rate_kind = AamExempt;
+            l.vat_rate_percent = 0;
+        }
+        let errs = validate_invoice_preflight(&uniform);
+        assert!(
+            errs.is_empty(),
+            "a uniform all-AAM invoice must be accepted; got {errs:?}"
+        );
     }
 
-    /// The shut door did not swallow the existing numeric gate: a
+    /// The three ADR-0101 kind variants' discriminant + field_path route to
+    /// the per-line `vatRateKind` selector (the SPA renderer keys on the
+    /// first two) and the bilingual messages name the offending kind.
+    #[test]
+    fn adr0101_kind_variants_discriminant_field_path_and_messages() {
+        let nonzero = InvoicePreflightError::NonZeroPercentForExemptKind {
+            line_index: 2,
+            kind: aberp_billing::VatRateKind::AamExempt,
+            actual: 27,
+        };
+        assert_eq!(nonzero.kind(), "NonZeroPercentForExemptKind");
+        assert_eq!(nonzero.field_path(), "lines[2].vatRateKind");
+        assert!(nonzero.message_hu().contains("AamExempt"));
+        assert!(nonzero.message_en().contains("AamExempt"));
+
+        let deferred = InvoicePreflightError::VatRateKindNotSupportedYet {
+            line_index: 0,
+            kind: aberp_billing::VatRateKind::TamExempt,
+        };
+        assert_eq!(deferred.kind(), "VatRateKindNotSupportedYet");
+        assert_eq!(deferred.field_path(), "lines[0].vatRateKind");
+        assert!(deferred.message_hu().contains("TamExempt"));
+        assert!(deferred.message_en().contains("TamExempt"));
+
+        let mixed = InvoicePreflightError::MixedVatRateKindsUnsupported {
+            line_index: 1,
+            first_kind: aberp_billing::VatRateKind::Percent,
+            other_kind: aberp_billing::VatRateKind::AamExempt,
+        };
+        assert_eq!(mixed.kind(), "MixedVatRateKindsUnsupported");
+        assert_eq!(mixed.field_path(), "lines[1].vatRateKind");
+        assert!(mixed.message_en().contains("AamExempt"));
+    }
+
+    /// The kind branch did not swallow the existing numeric gate: a
     /// `Percent` line with an out-of-vocab rate still trips
     /// `LineItemVatRateUnknown` (unchanged behaviour).
     #[test]

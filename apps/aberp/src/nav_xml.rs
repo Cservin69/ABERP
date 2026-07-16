@@ -1611,6 +1611,40 @@ fn vat_rate_choice(kind: VatRateKind) -> Result<VatRateChoice> {
     })
 }
 
+/// ADR-0101 storno fold — the INVERSE of [`vat_rate_choice`]: given the
+/// `<lineVatRate>` choice `element` name and its optional `<case>` code
+/// (read back from an on-disk NAV XML), recover the [`VatRateKind`] that
+/// emitted it. Returns `None` for any (element, case) pair no WIRED kind
+/// produces — the caller loud-fails rather than silently mis-categorising
+/// a storno line (CLAUDE.md rule 11).
+///
+/// Derived by iterating the four wired kinds and comparing against their
+/// forward `vat_rate_choice` output, so the two directions CANNOT drift:
+/// `vat_rate_choice` stays the single source of truth for the
+/// `(element, case, reason)` triple, and a change there is automatically
+/// reflected here. `Percent` is intentionally NOT in the search set — the
+/// numeric path is recovered from `<vatPercentage>`, not a wrapper element.
+fn vat_rate_kind_from_choice(element: &str, case: Option<&str>) -> Option<VatRateKind> {
+    const WIRED: [VatRateKind; 4] = [
+        VatRateKind::AamExempt,
+        VatRateKind::DomesticReverseCharge,
+        VatRateKind::IntraCommunityGoods,
+        VatRateKind::IntraCommunityServiceReverse,
+    ];
+    WIRED.into_iter().find(|&k| match vat_rate_choice(k) {
+        Ok(VatRateChoice::Exemption { case: c, .. }) => {
+            element == "vatExemption" && case == Some(c)
+        }
+        Ok(VatRateChoice::OutOfScope { case: c, .. }) => {
+            element == "vatOutOfScope" && case == Some(c)
+        }
+        Ok(VatRateChoice::DomesticReverseCharge) => element == "vatDomesticReverseCharge",
+        // Unreachable for the WIRED set (no wired kind maps to Percentage),
+        // and a named-deferred kind's `anyhow!` never matches an element.
+        Ok(VatRateChoice::Percentage) | Err(_) => false,
+    })
+}
+
 /// Write the inner choice element of a `<lineVatRate>` / `<vatRate>`.
 /// Shared so the per-line emit and the summary mirror stay in lock-step.
 fn write_vat_rate_choice(
@@ -2173,6 +2207,28 @@ pub fn read_invoice_lines_from_xml(path: &std::path::Path) -> Result<Vec<LineIte
             Event::Start(e) if e.name().local_name().as_ref() == b"line" => {
                 cur = Some(XmlLineAcc::default());
             }
+            // ADR-0101 storno fold — a `<lineVatRate>` choice WRAPPER
+            // (`vatExemption` / `vatOutOfScope` / `vatDomesticReverseCharge`)
+            // has children (case/reason, or a bool text), so we record which
+            // wrapper this line carries and DO NOT `read_text` it (that would
+            // consume the interior). The inner `<case>` is captured as a leaf
+            // in the branch below; `<reason>` is intentionally ignored (the
+            // kind is reconstructed from element + case, not the free-text
+            // reason). Only ever reached while inside a `<line>`, so the
+            // summary `<vatRate>` block (outside any `<line>`) can't spoof it.
+            Event::Start(e)
+                if cur.is_some()
+                    && matches!(
+                        e.name().local_name().as_ref(),
+                        b"vatExemption" | b"vatOutOfScope" | b"vatDomesticReverseCharge"
+                    ) =>
+            {
+                let local = e.name().local_name();
+                if let Some(a) = cur.as_mut() {
+                    a.vat_choice_element =
+                        Some(String::from_utf8_lossy(local.as_ref()).into_owned());
+                }
+            }
             Event::Start(e) if cur.is_some() => {
                 let local = e.name().local_name();
                 let field: Option<&mut Option<String>> = match local.as_ref() {
@@ -2186,6 +2242,12 @@ pub fn read_invoice_lines_from_xml(path: &std::path::Path) -> Result<Vec<LineIte
                     // `<vatRate>` block is outside any `<line>`), so
                     // capturing it unconditionally here is safe.
                     b"vatPercentage" => cur.as_mut().map(|a| &mut a.vat_percentage),
+                    // ADR-0101 — the `<case>` code inside a `vatExemption` /
+                    // `vatOutOfScope` wrapper. Same bounded-to-`<line>`
+                    // reasoning as `vatPercentage` (a `<case>` only appears
+                    // inside those wrappers, which only appear in a line's
+                    // `<lineVatRate>` here).
+                    b"case" => cur.as_mut().map(|a| &mut a.vat_case),
                     _ => None,
                 };
                 if let Some(slot) = field {
@@ -2231,6 +2293,19 @@ struct XmlLineAcc {
     unit_of_measure_own: Option<String>,
     unit_price: Option<String>,
     vat_percentage: Option<String>,
+    /// ADR-0101 storno fold — the `<lineVatRate>` choice WRAPPER element
+    /// this line carried (`vatExemption` / `vatOutOfScope` /
+    /// `vatDomesticReverseCharge`), captured on its Start event. `None`
+    /// for a numeric `Percent` line (which carries `<vatPercentage>`
+    /// instead). Exactly one of `vat_percentage` / `vat_choice_element` is
+    /// set per NAV's `LineVatRateType` choice.
+    vat_choice_element: Option<String>,
+    /// ADR-0101 storno fold — the `<case>` code inside a `vatExemption` /
+    /// `vatOutOfScope` wrapper (`AAM` / `KBAET` / `EUFAD37` / …). `None`
+    /// for the numeric path and for the boolean `vatDomesticReverseCharge`
+    /// (which carries no case). Paired with `vat_choice_element` to
+    /// reconstruct the `VatRateKind` via `vat_rate_kind_from_choice`.
+    vat_case: Option<String>,
 }
 
 /// Build a [`LineItem`] from the leaf strings captured for one `<line>`.
@@ -2266,19 +2341,48 @@ fn line_item_from_acc(acc: &XmlLineAcc, path: &std::path::Path) -> Result<LineIt
         )
     })?);
 
-    let vat_str = acc.vat_percentage.as_deref().ok_or_else(|| {
-        anyhow!(
-            "<line> missing <vatPercentage> in {} (S384/F5)",
-            path.display()
-        )
-    })?;
-    let vat_rate_basis_points =
-        parse_vat_percentage_to_basis_points(vat_str).with_context(|| {
-            format!(
-                "parse <vatPercentage> '{vat_str}' to basis points in {} (S384/F5)",
-                path.display()
-            )
-        })?;
+    // ADR-0101 storno fold — reconstruct the (vat_rate_kind,
+    // vat_rate_basis_points) pair from whichever `<lineVatRate>` choice the
+    // on-disk XML carried (NAV's `LineVatRateType` is a choice — exactly one
+    // member per line). A numeric `<vatPercentage>` recovers `Percent` + its
+    // basis points (the pre-0101 path, byte-identical). A choice WRAPPER
+    // (`vatExemption` / `vatOutOfScope` / `vatDomesticReverseCharge`) recovers
+    // the wired kind via the `vat_rate_choice` inverse, with a 0 line rate
+    // (exempt / reverse-charge VAT is always 0). This is what makes a storno
+    // / modification of a NEW-KIND invoice fold correctly: the reversed body
+    // re-emits the SAME choice element, not a stale `<vatPercentage>0.00`.
+    let (vat_rate_kind, vat_rate_basis_points) = match acc.vat_choice_element.as_deref() {
+        None => {
+            // Numeric path — `Percent`.
+            let vat_str = acc.vat_percentage.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "<line> has neither <vatPercentage> nor a lineVatRate choice wrapper in {} (S384/F5 / ADR-0101)",
+                    path.display()
+                )
+            })?;
+            let bp = parse_vat_percentage_to_basis_points(vat_str).with_context(|| {
+                format!(
+                    "parse <vatPercentage> '{vat_str}' to basis points in {} (S384/F5)",
+                    path.display()
+                )
+            })?;
+            (VatRateKind::Percent, bp)
+        }
+        Some(element) => {
+            // Choice wrapper — a wired non-`Percent` kind, 0% line VAT.
+            let kind = vat_rate_kind_from_choice(element, acc.vat_case.as_deref())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "unrecognised <lineVatRate> choice <{element}> (case {:?}) in {} — \
+                         cannot reconstruct VatRateKind for the storno/modification fold (ADR-0101). \
+                         Only the wired kinds (AAM / KBAET / EUFAD37 / vatDomesticReverseCharge) are foldable.",
+                        acc.vat_case,
+                        path.display()
+                    )
+                })?;
+            (kind, 0u16)
+        }
+    };
 
     let unit = match acc.unit_of_measure.as_deref() {
         Some("OWN") => acc.unit_of_measure_own.clone().map(ProductUnit::Own),
@@ -2291,17 +2395,11 @@ fn line_item_from_acc(acc: &XmlLineAcc, path: &std::path::Path) -> Result<LineIt
         quantity,
         unit_price,
         vat_rate_basis_points,
-        // ADR-0101 / Session-1 shut door — every invoice on disk is a
-        // `Percent` line (preflight rejects every other kind), so this
-        // XML-reconstruction path only ever sees `<vatPercentage>` and
-        // `Percent` is exact. ⚠ Session-2 FLAG: when preflight opens to the
-        // non-`Percent` kinds, a chain-member XML that renders `vatExemption`
-        // / `vatOutOfScope` / `vatDomesticReverseCharge` instead of
-        // `<vatPercentage>` would loud-fail the `parse_vat_percentage…`
-        // step above (no silent mis-categorisation — acceptable, but the
-        // storno-of-modification fold must then reconstruct the kind from
-        // the choice element here, or replay the side-store `input.json`).
-        vat_rate_kind: VatRateKind::Percent,
+        // ADR-0101 Session 2 — reconstructed above from the on-disk
+        // `<lineVatRate>` choice, so a storno / modification of a
+        // NEW-KIND invoice folds correctly (was hardcoded `Percent`
+        // behind the Session-1 shut door).
+        vat_rate_kind,
         // ADR-0042 — per-line notes are never in the NAV XML, so a
         // chain-member reversal carries none.
         note: None,

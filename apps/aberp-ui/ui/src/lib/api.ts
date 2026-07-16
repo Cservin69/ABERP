@@ -713,6 +713,27 @@ export interface CustomerAddressBody {
  * `CustomerVatStatusOtherNotSupportedV1`). */
 export type CustomerVatStatusBody = "Domestic" | "PrivatePerson" | "Other";
 
+/** ADR-0101 — per-line VAT rate-kind wire mirror. Mirrors the backend
+ * `aberp_billing::VatRateKind` (serde PascalCase). Only the five OPERATOR-
+ * SELECTABLE kinds appear here: `Percent` (the default numeric path) plus
+ * the four Ervin-confirmed non-`Percent` kinds Session 2 opened —
+ * `AamExempt` (alanyi adómentesség), `DomesticReverseCharge` (belföldi
+ * fordított adózás), `IntraCommunityGoods` (Közösségen belüli
+ * termékértékesítés, 0%), and `IntraCommunityServiceReverse` (Közösségen
+ * belüli, fordított adózású szolgáltatás).
+ *
+ * The backend enum ALSO knows eight named-deferred kinds (TAM/EAM/…), but
+ * the SPA deliberately does NOT expose them — they are not issuable
+ * (preflight rejects `VatRateKindNotSupportedYet`), so surfacing them in a
+ * selector would be a dead option. If the operator's data ever carries one
+ * (it can't through this form), the backend rejects it loudly. */
+export type VatRateKindBody =
+  | "Percent"
+  | "AamExempt"
+  | "DomesticReverseCharge"
+  | "IntraCommunityGoods"
+  | "IntraCommunityServiceReverse";
+
 export interface IssueInvoiceRequest {
   customer: {
     /** PR-97 / ADR-0048 — closed-vocab buyer kind. Optional on the
@@ -750,6 +771,14 @@ export interface IssueInvoiceRequest {
     quantity: string;
     unitPrice: number;
     vatRatePercent: number;
+    /** ADR-0101 — per-line VAT rate-kind discriminant. Optional on the
+     * wire so pre-0101 callers (CLI / fixtures) still type-check; the
+     * backend's serde `#[serde(default)]` resolves an absent value to
+     * `"Percent"` (byte-identical backward-compat). The SPA always emits
+     * an explicit value so the operator's VAT-type choice rides on the
+     * audit trail. For any non-`Percent` kind the backend forces the line
+     * VAT to 0 (the composer also sends `vatRatePercent: 0`). */
+    vatRateKind?: VatRateKindBody;
     /** PR-82 — buyer-facing per-line note ("Megjegyzés"). Optional;
      * the SPA emits `null` for unannotated lines so the backend
      * sees a clean "no note" signal. NEVER reaches the NAV
