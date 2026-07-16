@@ -804,10 +804,7 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
         // short-circuits false), so backward-compat is byte-identical. The
         // pre-existing mixed-`Percent`-RATE single-bucket gap is out of
         // ADR-0101 scope and intentionally NOT gated here.
-        let any_non_percent = request
-            .lines
-            .iter()
-            .any(|l| !l.vat_rate_kind.is_percent());
+        let any_non_percent = request.lines.iter().any(|l| !l.vat_rate_kind.is_percent());
         if any_non_percent {
             let first_kind = request.lines[0].vat_rate_kind;
             for (line_index, line) in request.lines.iter().enumerate() {
