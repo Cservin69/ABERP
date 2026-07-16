@@ -825,3 +825,78 @@ fn eu0_intra_community_invoice_with_other_buyer_round_trips() {
     validate_invoice_data(&xml)
         .expect("EU-0 Other-buyer body must validate against the NAV XSD recogniser");
 }
+
+/// ADR-0102 (NAV-adversarial SHOULD-ADD) — the EUFAD37 (intra-Community
+/// SERVICE, reverse-charge) sibling of the KBAET round-trip above. The
+/// adversarial noted the service kind was only line-level-covered with no
+/// customer+line combined round-trip. An `Other` (foreign-EU) buyer +
+/// an `IntraCommunityServiceReverse` line emits `customerVatStatus=OTHER`
+/// + `<customerVatData><communityVatNumber>` + the
+/// `<vatOutOfScope><case>EUFAD37</case>` line (a `vatOutOfScope`, NOT a
+/// `vatExemption` — §37 places the supply out of the Hungarian VAT
+/// territory), and the whole body validates against the NAV XSD.
+#[test]
+fn eu0_intra_community_service_reverse_with_other_buyer_round_trips() {
+    let mut invoice = build_minimal_invoice();
+    // Single EUFAD37 (intra-Community service, reverse-charge) line at 0%.
+    invoice.lines = vec![LineItem {
+        description: "Cross-border engineering service".to_string(),
+        quantity: rust_decimal::Decimal::from(1),
+        unit_price: Huf(50000),
+        vat_rate_basis_points: 0,
+        vat_rate_kind: aberp_billing::VatRateKind::IntraCommunityServiceReverse,
+        note: None,
+        unit: None,
+    }];
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = NavParties {
+        supplier: SupplierInfo {
+            tax_number: "24904362-2-41".to_string(),
+            name: "Aben Consulting Kft".to_string(),
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatero koz 6".to_string(),
+        },
+        customer: CustomerInfo {
+            community_vat_number: Some("DE123456789".to_string()),
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            name: "Muenchner Technik GmbH".to_string(),
+            address: Some(CustomerAddress {
+                country_code: "DE".to_string(),
+                postal_code: "80331".to_string(),
+                city: "Muenchen".to_string(),
+                street: "Marienplatz 1".to_string(),
+            }),
+        },
+    };
+
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("EUFAD37 Other-buyer invoice must render");
+    let body = std::str::from_utf8(&xml).expect("UTF-8");
+
+    // Buyer side: OTHER + communityVatNumber (DE), no structured HU tax block.
+    assert!(
+        body.contains("<customerVatStatus>OTHER</customerVatStatus>"),
+        "body:\n{body}"
+    );
+    assert!(body.contains("<customerVatData>"), "body:\n{body}");
+    assert!(
+        body.contains("<communityVatNumber>DE123456789</communityVatNumber>"),
+        "body:\n{body}"
+    );
+    assert!(!body.contains("<customerTaxNumber>"), "body:\n{body}");
+    // Line side: EUFAD37 out-of-scope, NOT a numeric vatPercentage and NOT
+    // the KBAET vatExemption wrapper (service reverse-charge is vatOutOfScope).
+    assert!(body.contains("<vatOutOfScope>"), "body:\n{body}");
+    assert!(body.contains("<case>EUFAD37</case>"), "body:\n{body}");
+    assert!(
+        !body.contains("<vatExemption>"),
+        "EUFAD37 is vatOutOfScope, NOT vatExemption; body:\n{body}"
+    );
+
+    // The whole thing validates against the NAV XSD structural recogniser.
+    validate_invoice_data(&xml)
+        .expect("EUFAD37 Other-buyer body must validate against the NAV XSD recogniser");
+}

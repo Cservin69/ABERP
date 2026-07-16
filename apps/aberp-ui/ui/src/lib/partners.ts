@@ -299,18 +299,23 @@ export function hungarianCountryAliasToCode(
 
 /** ADR-0102 — best-effort ISO 3166-1 alpha-2 code for a FOREIGN
  * (`Other`) buyer's address country. Unlike `hungarianCountryAliasToCode`
- * (which forces `HU`), this passes the partner's country through: if the
- * value already looks like a 2-letter code, uppercase it; otherwise
- * uppercase + trim whatever the operator typed (the country input on the
- * form is editable so they can correct it before issuing). A full
- * closed-vocab country validator is deferred (ADR-0102 §8.3); this keeps
- * an EU buyer's `<customerAddress>` from silently emitting `HU`. */
+ * (which forces `HU`), this passes the partner's country through: trim +
+ * uppercase whatever the operator typed (the country input on the form is
+ * editable so they can correct it before issuing). A full closed-vocab
+ * country validator is deferred (ADR-0102 §8.3); the Rust preflight
+ * `validate_country_code` guard (NAV-adversarial FIX #1) is the load-
+ * bearing `[A-Z]{2}` gate that turns a bad country into an operator error
+ * rather than a NAV bounce. This keeps an EU buyer's `<customerAddress>`
+ * from silently emitting `HU`. */
 export function foreignCountryToCode(
   country: string | null | undefined,
 ): string {
-  const trimmed = (country ?? "").trim();
-  if (/^[A-Za-z]{2}$/.test(trimmed)) return trimmed.toUpperCase();
-  return trimmed.toUpperCase();
+  // A prior version branched on `/^[A-Za-z]{2}$/` but BOTH arms returned
+  // `trimmed.toUpperCase()` — a dead branch (NAV-adversarial FIX #1). The
+  // uppercase is unconditional; the structural `[A-Z]{2}` validation lives
+  // in the Rust preflight, not here (a partner-typed "Austria" must surface
+  // as a fixable preflight error, not be silently mangled client-side).
+  return (country ?? "").trim().toUpperCase();
 }
 
 /** PR-54 / session-74 — client-side admin-mode filter for the

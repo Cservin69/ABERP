@@ -171,6 +171,17 @@ The two combine so the dangerous state — *EU-0 line assembled against a domest
 
 This ADR is the **buyer-side** half of the ADR-0101 VAT feature; it stacks on `vat-rate-kind-s2-modguard` so the whole feature (line kinds + EU buyer) cuts together. **Next (separate effort): a NAV-category adversarial on the complete EU-0 path** — confirm the `communityVatNumber` element name/namespace and the §10.2 AAM-strictness against the published NAV OSA 3.0 code list — **then the cut.** Porting the feature to the Defense line (ABERP-Editions.git) is a later, separate effort.
 
+## 9a. Amendment 2026-07-16 — NAV-category adversarial fixes (branch `vat-rate-kind-s4-eu0fixes` off `07d8aca`)
+
+The NAV-category adversarial (§9) CONFIRMED the `customerVatData` / `communityVatNumber` element-and-namespace mapping correct against the authoritative NAV OSA 3.0 XSD (`CustomerVatDataType` is an `xs:choice`; `communityVatNumber` is a flat, data-ns element — the repo's shape is exactly right). It surfaced two loud-fail defects (neither a silent wrong-ÁFA), both fixed here:
+
+- **FIX #1 (must — before the first real EU-0 submit): structural ISO-alpha-2 guard on the `Other` buyer's `country_code`.** NAV's `CountryCodeType` is `[A-Z]{2}`; an `Other` buyer's country flows from the free-form partner record, so a partner saved as "Austria"/"Ausztria" would emit `<countryCode>AUSTRIA</>` and bounce at submit (burning a sequence). Added `nav_xml::validate_country_code` (verbatim-strict `[A-Z]{2}`) + a new preflight variant `CustomerCountryCodeInvalid` in the `Other` branch (symmetric with `validate_community_vat_number`), turning a NAV bounce into an operator-correctable preflight error. Deleted the DEAD `/^[A-Za-z]{2}$/` branch in SPA `partners.ts::foreignCountryToCode` (both arms returned `trimmed.toUpperCase()`). Scoped to `Other` only — Domestic buyers are HU-forced by the SPA (backward-compat). Full closed-vocab country list stays deferred (§8.3); structural `[A-Z]{2}` is enough.
+- **FIX #2 (correctness): `AamExempt` is now BUYER-AGNOSTIC.** AAM (alanyi adómentesség §187) is a SELLER-side exemption — NAV binds no `customerVatStatus` to it — so the §4(a) "AAM requires Domestic" rule (flagged strict in §10.2 below) wrongly blocked the common legitimate case (exempt small business → magánszemély, or → EU buyer). AAM now accepts any buyer status, like `Percent`. **`DomesticReverseCharge` stays Domestic-only** (§142 belföldi = two domestic taxable persons — genuinely buyer-constrained). The §4(a) matrix table row for AAM should read **any** (like `Percent`); only DRC + the two intra-Community kinds remain buyer-constrained.
+
+Also added (adversarial SHOULD-ADD, test coverage): an EUFAD37 (intra-Community SERVICE reverse-charge) customer+line combined round-trip (`vatOutOfScope`/EUFAD37), sibling to the existing KBAET round-trip. A full serve-route EU-0 end-to-end issuance test remains a flagged follow-up (the render→validate combined round-trip + the preflight unit suite cover emit and gate; the serve harness (DB Handle + router) is heavier than this pre-cut fix warrants).
+
+Backward-compat unchanged for Domestic / PrivatePerson / Percent and every existing invoice.
+
 ## 10. Flagged assumptions (conservative; no AskUserQuestion per session constraint)
 
 1. **`communityVatNumber` element name + data-namespace placement** are best-knowledge NAV OSA 3.0, not repo-verified (no vendored XSD). Primary adversarial item.

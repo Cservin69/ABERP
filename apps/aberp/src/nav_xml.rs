@@ -374,6 +374,35 @@ pub fn validate_community_vat_number(input: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// ADR-0102 (NAV-adversarial FIX #1) — STRUCTURAL ISO 3166-1 alpha-2
+/// validation of a buyer address `country_code`, applied at invoice
+/// preflight for an `Other` (foreign-EU) buyer. NAV's `CountryCodeType`
+/// is `xs:pattern [A-Z]{2}`; an `Other` buyer's country flows from the
+/// (free-form) partner record, so a partner stored as "Austria" /
+/// "Ausztria" — or a lowercase "at" — would emit a `<countryCode>` NAV
+/// bounces with `INVALID_CUSTOMER_COUNTRY` at submit time (burning a
+/// sequence). This turns that NAV bounce into an operator-correctable
+/// ABERP preflight error, symmetric with [`validate_community_vat_number`].
+///
+/// Deliberately STRUCTURAL only — exactly two ASCII A–Z uppercase
+/// letters. A full closed-vocab country list stays deferred (ADR-0102
+/// §8.3); `[A-Z]{2}` is the shape NAV's XSD enforces and is enough here.
+/// VERBATIM-strict (no trim, no case-fold): `write_customer_address`
+/// emits `country_code` byte-for-byte, so anything the wire would reject
+/// — a trailing space, a lowercase letter — must reject here too, or the
+/// guard would pass a value NAV still bounces. Bilingual, operator-
+/// actionable message on rejection (CLAUDE.md rule 12).
+pub fn validate_country_code(input: &str) -> Result<(), String> {
+    if input.len() == 2 && input.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Ok(());
+    }
+    Err(format!(
+        "Az országkód „{input}” nem érvényes ISO 3166-1 alpha-2 kód \
+         (pontosan két nagybetű, pl. AT, DE) / country code \"{input}\" is not a \
+         valid ISO 3166-1 alpha-2 code (exactly two A–Z uppercase letters, e.g. AT, DE)"
+    ))
+}
+
 /// PR-50 / session-70 — supplier-info shape guard, called from
 /// `issue_from_parsed` BEFORE any DB write and from
 /// `serve::handle_issue_invoice` BEFORE dispatching to the issuance
@@ -2917,6 +2946,44 @@ mod tests {
             validate_community_vat_number("ATU1234567890123").is_err(),
             "body too long (>12)"
         );
+    }
+
+    /// ADR-0102 (NAV-adversarial FIX #1) — the structural country-code
+    /// guard accepts a well-formed ISO 3166-1 alpha-2 code and rejects
+    /// everything the NAV `CountryCodeType [A-Z]{2}` pattern rejects: a
+    /// full country NAME, a lowercase code, a trailing space, a
+    /// one-letter stub, and a digit-bearing value. VERBATIM-strict — no
+    /// trim, no case-fold — because the emitter writes `country_code`
+    /// byte-for-byte.
+    #[test]
+    fn validate_country_code_shape() {
+        // Accept — exactly two uppercase A–Z.
+        assert!(validate_country_code("AT").is_ok());
+        assert!(validate_country_code("DE").is_ok());
+        assert!(validate_country_code("HU").is_ok());
+        // Reject — the exact classes that would bounce at NAV.
+        assert!(
+            validate_country_code("Austria").is_err(),
+            "a country name must reject (the FIX #1 headline case)"
+        );
+        assert!(
+            validate_country_code("Ausztria").is_err(),
+            "the Hungarian country name must reject too"
+        );
+        assert!(
+            validate_country_code("at").is_err(),
+            "lowercase must reject"
+        );
+        assert!(
+            validate_country_code("AT ").is_err(),
+            "trailing space must reject"
+        );
+        assert!(
+            validate_country_code("A").is_err(),
+            "one letter must reject"
+        );
+        assert!(validate_country_code("").is_err(), "empty must reject");
+        assert!(validate_country_code("A1").is_err(), "digit must reject");
     }
 
     /// ADR-0102 — an `Other` buyer that reaches the emitter WITHOUT a
