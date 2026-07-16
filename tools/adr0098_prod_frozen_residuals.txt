@@ -141,6 +141,17 @@
 # get_machine_request → db.read(). calibration_overview_request STAYS fresh (reads
 # quote_calibration, a fresh-open residual-floor family — migrating its read alone
 # would open a NEW half-migration). Re-cut −5 more: serve.rs 33→28; census 95→90.
+# ── VAT stack (ADR-0101 + ADR-0102, 2026-07-16) — REVIEWED census GROWTH +1 ────
+# The vat-rate-kind feature adds exactly ONE new prod DB opener across the scoped
+# tree: serve.rs:read_base_line_vat_kinds (ADR-0101 S2 modification-guard, reads the
+# persisted invoice_line.vat_rate_kind to reject in-app modification of a non-Percent
+# base). Pattern-identical twin of the frozen billing reader read_invoice_total_gross_minor
+# (same fresh Connection::open + scoped read-tx, same billing::load_ready_invoice_by_id,
+# BILLING data — its own DuckDbBillingStore, NOT the shared audit Handle, READ-ONLY).
+# A like-for-like add to the census-approved fresh-open billing-reader residual family,
+# NOT a fork: write-fork & read-fork ENFORCE gates stay = 0. Re-cut +1: serve.rs 28→29;
+# census 90→91 openers, files unchanged (23). See the fingerprint-set header for the
+# per-opener rationale. (The ADR-0102 EU-partner base read reuses existing openers.)
 1 apps/aberp/src/audit_dap_boot.rs
 3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
@@ -154,7 +165,7 @@
 4 apps/aberp/src/reports.rs
 4 apps/aberp/src/request_technical_annulment.rs
 8 apps/aberp/src/retry_submission.rs
-28 apps/aberp/src/serve.rs
+29 apps/aberp/src/serve.rs
 1 apps/aberp/src/snapshot.rs
 3 apps/aberp/src/submit_annulment.rs
 3 apps/aberp/src/tenant_registry.rs
