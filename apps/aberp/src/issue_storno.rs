@@ -538,6 +538,18 @@ pub fn storno_from_inputs(
                     Some(trimmed.to_string())
                 }
             },
+            // ADR-0102 — inherit the base's EU community VAT number so the
+            // storno wire body mirrors the base's `Other` shape verbatim.
+            // Pre-ADR-0102 bases omit it (serde default `None` → Domestic
+            // path) so chain ops on pre-0102 bases are byte-identical.
+            community_vat_number: input.customer.community_vat_number.as_deref().and_then(|s| {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }),
             name: input.customer.name,
             // PR-77 / session-101 — inherit `customerAddress` from the
             // base invoice's side-stored `input.json`. Pre-PR-97 chain

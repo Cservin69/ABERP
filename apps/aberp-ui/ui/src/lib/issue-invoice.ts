@@ -145,6 +145,14 @@ export interface IssueInvoiceFormState {
   customerPostalCode: string;
   customerCity: string;
   customerStreet: string;
+  /** ADR-0102 — the buyer's EU community VAT number. Shown + required
+   * ONLY when `customerVatStatus === "Other"` (a foreign-EU business
+   * buyer); empty for Domestic/PrivatePerson. Populated from the picked
+   * partner's `eu_vat_number` via `buyerFieldsFromPartner`; the composer
+   * emits it on the wire body (snapshotted onto the issued invoice) only
+   * for Other. Structurally validated (VIES shape) at the backend
+   * preflight + partner-form gate. */
+  customerCommunityVatNumber: string;
   currency: Currency;
   lines: LineFormState[];
   /** PR-73 / ADR-0040 §addendum — operator-selected bank account id
@@ -253,6 +261,9 @@ export function emptyForm(): IssueInvoiceFormState {
     customerPostalCode: "",
     customerCity: "",
     customerStreet: "",
+    // ADR-0102 — empty until an Other (EU) partner is picked / the
+    // operator types an EU VAT number.
+    customerCommunityVatNumber: "",
     currency: "HUF",
     lines: [emptyLine()],
     // PR-73 — `null` means "use the per-currency default"; the
@@ -442,6 +453,40 @@ export const VAT_KIND_OPTIONS: readonly VatKindOption[] = [
  * predicate the selector, the composer, and the vitest pin all share. */
 export function vatKindLocksRate(kind: VatRateKindBody): boolean {
   return kind !== "Percent";
+}
+
+/** ADR-0102 — HÜLYE-BIZTOS cross-field guidance: does the selected VAT
+ * kind require a different buyer type than the one currently chosen?
+ * Returns a bilingual hint when there's a mismatch, or `null` when the
+ * kind + buyer are compatible. The backend preflight is the hard gate
+ * (`VatKindRequiresOtherBuyer` / `VatKindRequiresDomesticBuyer`); this
+ * pure helper lets the form warn the operator inline BEFORE they submit,
+ * so they don't assemble an invalid EU-0 + domestic-buyer invoice.
+ *
+ *   IntraCommunity* (KBAET/EUFAD37) → REQUIRES an `Other` (EU) buyer.
+ *   AamExempt / DomesticReverseCharge → REQUIRES a `Domestic` buyer.
+ *   Percent → any buyer (no hint). */
+export function vatKindBuyerMismatch(
+  kind: VatRateKindBody,
+  vatStatus: CustomerVatStatusBody,
+): { hu: string; en: string } | null {
+  const needsOther =
+    kind === "IntraCommunityGoods" || kind === "IntraCommunityServiceReverse";
+  const needsDomestic =
+    kind === "AamExempt" || kind === "DomesticReverseCharge";
+  if (needsOther && vatStatus !== "Other") {
+    return {
+      hu: "Ez a Közösségen belüli 0%-os ÁFA-típus külföldi EU-s (Külföldi) vevőt igényel EU adószámmal. Válasszon EU-s vevőt, vagy módosítsa az ÁFA-típust.",
+      en: "This intra-Community 0% VAT type requires a foreign-EU (Other) buyer with an EU VAT number. Pick an EU buyer, or change the VAT type.",
+    };
+  }
+  if (needsDomestic && vatStatus !== "Domestic") {
+    return {
+      hu: "Ez a belföldi ÁFA-típus belföldi (Adóalany) vevőt igényel. Válasszon belföldi vevőt, vagy módosítsa az ÁFA-típust.",
+      en: "This domestic VAT type requires a Domestic buyer. Pick a domestic buyer, or change the VAT type.",
+    };
+  }
+  return null;
 }
 
 /** ADR-0101 — apply an operator VAT-kind pick to one line, HÜLYE-BIZTOS.
@@ -671,7 +716,15 @@ export type InvoicePreflightErrorKind =
   // paths the session-150 address gate now exercises. Added alongside
   // CustomerAddressMissing to restore the documented exhaustive vocab.
   | "CustomerTaxNumberPresentForPrivatePerson"
-  | "CustomerVatStatusOtherNotSupportedV1"
+  // ADR-0102 — EU-partner (Other) customer type + cross-field VAT
+  // matrix. The Other buyer requires a valid communityVatNumber and no
+  // HU tax number; the intra-Community 0% kinds require an Other buyer
+  // and the domestic kinds require a Domestic buyer.
+  | "CustomerTaxNumberPresentForOther"
+  | "CommunityVatNumberMissing"
+  | "CommunityVatNumberMalformed"
+  | "VatKindRequiresOtherBuyer"
+  | "VatKindRequiresDomesticBuyer"
   | "InvoiceLinesEmpty"
   | "LineItemDescriptionEmpty"
   | "LineItemQuantityZero"
@@ -788,7 +841,11 @@ function isKnownPreflightKind(s: string): s is InvoicePreflightErrorKind {
     case "CustomerTaxNumberMalformed":
     case "CustomerAddressMissing":
     case "CustomerTaxNumberPresentForPrivatePerson":
-    case "CustomerVatStatusOtherNotSupportedV1":
+    case "CustomerTaxNumberPresentForOther":
+    case "CommunityVatNumberMissing":
+    case "CommunityVatNumberMalformed":
+    case "VatKindRequiresOtherBuyer":
+    case "VatKindRequiresDomesticBuyer":
     case "InvoiceLinesEmpty":
     case "LineItemDescriptionEmpty":
     case "LineItemQuantityZero":
@@ -816,7 +873,17 @@ function isKnownPreflightKind(s: string): s is InvoicePreflightErrorKind {
  * than dropping it. Same posture as the closed-vocab kind guard
  * above. */
 export type PreflightFieldTarget =
-  | { kind: "customer"; field: "name" | "taxNumber" | "address" }
+  | {
+      kind: "customer";
+      // ADR-0102 — `communityVatNumber` (the EU VAT input) + `vatStatus`
+      // (the buyer-type control the cross-field matrix errors route to).
+      field:
+        | "name"
+        | "taxNumber"
+        | "address"
+        | "communityVatNumber"
+        | "vatStatus";
+    }
   | { kind: "lines" }
   | { kind: "bankAccountId" }
   | {
@@ -847,6 +914,14 @@ export function targetForFieldPath(
   // shows the HU message only).
   if (fieldPath === "customer.address") {
     return { kind: "customer", field: "address" };
+  }
+  // ADR-0102 — the EU community VAT input + the buyer-type control (the
+  // cross-field kind↔buyer mismatches route to `vatStatus`).
+  if (fieldPath === "customer.communityVatNumber") {
+    return { kind: "customer", field: "communityVatNumber" };
+  }
+  if (fieldPath === "customer.vatStatus") {
+    return { kind: "customer", field: "vatStatus" };
   }
   if (fieldPath === "lines") {
     return { kind: "lines" };
@@ -903,6 +978,15 @@ export function composeIssueInvoiceBody(
       // CustomerTaxNumberPresentForPrivatePerson gate fires only on
       // a non-empty value).
       taxNumber: form.customerTaxNumber.trim(),
+      // ADR-0102 — snapshot the EU community VAT number onto the wire
+      // body for Other (foreign-EU) buyers only. Trim; omit (undefined)
+      // for non-Other or when blank so the backend's serde default
+      // (None → Domestic path) keeps every non-Other body byte-identical.
+      communityVatNumber:
+        form.customerVatStatus === "Other" &&
+        form.customerCommunityVatNumber.trim().length > 0
+          ? form.customerCommunityVatNumber.trim()
+          : undefined,
       name: form.customerName.trim(),
       // PR-77 / session-101 — customer address quartet. Always emit
       // the field when ANY of the four sub-strings is non-empty after

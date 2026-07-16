@@ -142,6 +142,11 @@ export function formFromIssuanceInput(
     customerPostalCode: input.customer.address?.postalCode ?? "",
     customerCity: input.customer.address?.city ?? "",
     customerStreet: input.customer.address?.street ?? "",
+    // ADR-0102 — inherit the base's EU community VAT number (Other
+    // buyers). Pre-0102 bases omit it → empty string. In-app modification
+    // of a non-`Percent` (EU-0) base is blocked backend-side, but an
+    // Other + Percent base is modifiable, so the number must round-trip.
+    customerCommunityVatNumber: input.customer.communityVatNumber ?? "",
     currency: baseCurrency,
     lines,
     modificationDate: todayIsoDate(),
@@ -216,6 +221,12 @@ export function composeModificationBody(
       // modification's wire body.
       vatStatus: form.customerVatStatus,
       taxNumber: form.customerTaxNumber.trim(),
+      // ADR-0102 — propagate the EU community VAT number for Other buyers.
+      communityVatNumber:
+        form.customerVatStatus === "Other" &&
+        form.customerCommunityVatNumber.trim().length > 0
+          ? form.customerCommunityVatNumber.trim()
+          : undefined,
       name: form.customerName.trim(),
       address: composeCustomerAddress(form),
     },

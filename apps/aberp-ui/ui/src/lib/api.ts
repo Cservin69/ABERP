@@ -706,11 +706,13 @@ export interface CustomerAddressBody {
 }
 
 /** PR-97 / ADR-0048 — closed-vocab buyer-kind discriminator wire mirror.
- * Mirrors backend `nav_xml::CustomerVatStatus` (serde PascalCase). v1
- * ships `Domestic` + `PrivatePerson`; `Other` is named-deferred per
- * ADR-0048 §7 (the SPA disables the Külföldi radio option with a v2
- * hint, and the backend's preflight loud-fails an Other body with
- * `CustomerVatStatusOtherNotSupportedV1`). */
+ * Mirrors backend `nav_xml::CustomerVatStatus` (serde PascalCase).
+ * ADR-0102 wires `Other` (foreign-EU business) end-to-end: the SPA
+ * enables the Külföldi radio option and shows a required
+ * `communityVatNumber` input; the backend preflight requires + validates
+ * the EU VAT number and binds the intra-Community 0% VAT kinds to this
+ * status. The non-EU third-state-tax-id sub-shape stays named-deferred
+ * (ADR-0102 §8.1). */
 export type CustomerVatStatusBody = "Domestic" | "PrivatePerson" | "Other";
 
 /** ADR-0101 — per-line VAT rate-kind wire mirror. Mirrors the backend
@@ -753,6 +755,13 @@ export interface IssueInvoiceRequest {
      * `xxxxxxxx-y-zz` for `Domestic`. Held as `string` (not
      * `string | null`) for wire-compat with pre-PR-97 fixtures. */
     taxNumber: string;
+    /** ADR-0102 — EU community VAT number for an `Other` (foreign-EU
+     * business) buyer, snapshotted onto the wire body from the picked
+     * partner's `eu_vat_number`. Optional: the SPA composer emits it
+     * ONLY for `Other` buyers; the backend serde-defaults absent to
+     * `None` (Domestic path) for byte-identical backward-compat.
+     * Preflight requires + structurally-validates it under `Other`. */
+    communityVatNumber?: string;
     name: string;
     /** PR-77 / session-101 — full customer address; required for any
      * Hungarian-business buyer (the DOMESTIC customerVatStatus branch).
@@ -1128,6 +1137,11 @@ export interface ModificationInvoiceRequest {
      * per ADR-0024 §4 and inherits the base invoice's buyer kind. */
     vatStatus?: CustomerVatStatusBody;
     taxNumber: string;
+    /** ADR-0102 — inherited EU community VAT number for an `Other`
+     * buyer. In-app modification of a non-`Percent` (EU-0) base is
+     * blocked backend-side, but an `Other` + `Percent` base is
+     * modifiable, so the number must round-trip on the wire. */
+    communityVatNumber?: string;
     name: string;
     /** PR-77 / session-101 — same address surface as
      * [`IssueInvoiceRequest.customer.address`]. The modification's

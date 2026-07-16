@@ -616,17 +616,30 @@ describe("composeIssueInvoiceBody", () => {
       expect(body.customer.name).not.toBe("");
     });
 
-    it("emits vatStatus=Other if the form somehow carries it (preflight gate behind)", () => {
+    it("emits vatStatus=Other + communityVatNumber for an Other (EU) buyer", () => {
       const body = composeIssueInvoiceBody({
         ...emptyForm(),
         customerVatStatus: "Other",
         customerName: "Foreign Buyer",
         customerTaxNumber: "",
+        customerCommunityVatNumber: "ATU12345678",
       });
-      // The composer is pure — Other passes through here so the
-      // backend's preflight can surface the typed
-      // CustomerVatStatusOtherNotSupportedV1 error.
+      // ADR-0102 — the composer snapshots the EU VAT number onto the
+      // wire body for Other buyers; the backend preflight requires +
+      // validates it.
       expect(body.customer.vatStatus).toBe("Other");
+      expect(body.customer.communityVatNumber).toBe("ATU12345678");
+    });
+
+    it("omits communityVatNumber for a non-Other buyer", () => {
+      const body = composeIssueInvoiceBody({
+        ...emptyForm(),
+        customerVatStatus: "Domestic",
+        customerCommunityVatNumber: "ATU12345678",
+      });
+      // ADR-0102 — the number rides on the wire ONLY for Other buyers,
+      // so a Domestic body stays byte-identical (undefined → serde None).
+      expect(body.customer.communityVatNumber).toBeUndefined();
     });
   });
 });
@@ -766,11 +779,18 @@ describe("parseInvoicePreflightErrors — per-variant rendering pins", () => {
       message_en:
         "A private-person buyer must not carry a tax number (got `12345678-2-13`).",
     },
+    // ADR-0102 — EU-partner (Other) customer type + cross-field matrix.
     {
-      kind: "CustomerVatStatusOtherNotSupportedV1",
+      kind: "CommunityVatNumberMissing",
+      field_path: "customer.communityVatNumber",
+      message_hu: "Külföldi (OTHER) vevőhöz kötelező az EU adószám.",
+      message_en: "Foreign-EU (OTHER) buyers require an EU VAT number.",
+    },
+    {
+      kind: "VatKindRequiresOtherBuyer",
       field_path: "customer.vatStatus",
-      message_hu: "Külföldi (OTHER) vevő kibocsátása későbbi verzióban érkezik.",
-      message_en: "Foreign (OTHER) buyer issuance lands in a later version.",
+      message_hu: "A(z) 1. sor ÁFA-típusa külföldi EU-s vevőt igényel.",
+      message_en: "Line 1 VAT type requires a foreign-EU buyer.",
     },
     {
       kind: "InvoiceLinesEmpty",

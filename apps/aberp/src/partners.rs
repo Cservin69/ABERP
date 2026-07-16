@@ -61,7 +61,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use crate::nav_xml::CustomerVatStatus;
+use crate::nav_xml::{validate_community_vat_number, CustomerVatStatus};
 
 // ──────────────────────────────────────────────────────────────────────
 // PartnerId — prefixed-ULID newtype.
@@ -550,20 +550,45 @@ pub fn validate_partner_inputs(inputs: &PartnerInputs) -> Result<(), Vec<Validat
             }
         }
         CustomerVatStatus::Other => {
-            // v1 named-deferred per ADR-0048 §7. The SPA disables the
-            // Külföldi radio option with an inline v2 hint; if a wire
-            // body still arrives with Other (CLI / integration test
-            // / non-SPA client) surface a typed validation error so the
-            // operator sees the explicit "not yet supported" signal
-            // rather than an opaque downstream NAV reject.
-            errors.push(ValidationError {
-                field: "customer_vat_status",
-                message: "Külföldi vevő (OTHER) támogatása későbbi verzióban érkezik (v2). \
-                          Jelenleg csak Adóalany / Magánszemély választható. \
-                          / Foreign-buyer (OTHER) support is named-deferred to v2; \
-                          please pick Domestic or PrivatePerson for now."
-                    .to_string(),
-            });
+            // ADR-0102 — foreign-EU business buyer. The EU community VAT
+            // number lives on the reused `eu_vat_number` column (NOT a new
+            // column — ADR-0102 §1/§3.1); it becomes REQUIRED + structurally
+            // (VIES-shape) validated for `Other`. A Hungarian ADÓSZÁM is
+            // forbidden (an EU buyer carries an EU VAT number, not a HU one)
+            // — symmetric with the PrivatePerson tax-number rule above.
+            match inputs
+                .eu_vat_number
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None => errors.push(ValidationError {
+                    field: "eu_vat_number",
+                    message: "Külföldi (OTHER) vevőhöz kötelező az EU adószám. \
+                              / EU VAT number is required for a foreign (OTHER) buyer."
+                        .to_string(),
+                }),
+                Some(raw) => {
+                    if let Err(msg) = validate_community_vat_number(raw) {
+                        errors.push(ValidationError {
+                            field: "eu_vat_number",
+                            message: msg,
+                        });
+                    }
+                }
+            }
+            if inputs
+                .tax_number
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                errors.push(ValidationError {
+                    field: "tax_number",
+                    message: "Külföldi (OTHER) vevőhöz nem tartozhat magyar adószám. \
+                              / Foreign (OTHER) buyers must NOT carry a Hungarian tax number."
+                        .to_string(),
+                });
+            }
         }
     }
     if errors.is_empty() {

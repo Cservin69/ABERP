@@ -76,6 +76,7 @@
     targetForFieldPath,
     VAT_KIND_OPTIONS,
     vatKindLocksRate,
+    vatKindBuyerMismatch,
     type InvoicePreflightErrorBody,
     type InvoicePreflightErrorItem,
     type IssueInvoiceFormState,
@@ -169,7 +170,16 @@
     name: InvoicePreflightErrorItem | null;
     taxNumber: InvoicePreflightErrorItem | null;
     address: InvoicePreflightErrorItem | null;
-  } = $state({ name: null, taxNumber: null, address: null });
+    // ADR-0102 — EU community VAT input + buyer-type control slots.
+    communityVatNumber: InvoicePreflightErrorItem | null;
+    vatStatus: InvoicePreflightErrorItem | null;
+  } = $state({
+    name: null,
+    taxNumber: null,
+    address: null,
+    communityVatNumber: null,
+    vatStatus: null,
+  });
   let linesContainerError: InvoicePreflightErrorItem | null = $state(null);
   let lineErrors: Record<number, Partial<Record<"description" | "quantity" | "unitPrice" | "vatRatePercent" | "vatRateKind", InvoicePreflightErrorItem>>> =
     $state({});
@@ -409,7 +419,7 @@
   });
 
   function routePreflightErrors(body: InvoicePreflightErrorBody) {
-    customerErrors = { name: null, taxNumber: null, address: null };
+    customerErrors = { name: null, taxNumber: null, address: null, communityVatNumber: null, vatStatus: null };
     linesContainerError = null;
     lineErrors = {};
     unroutedPreflightErrors = [];
@@ -442,7 +452,7 @@
 
   function clearPreflightErrors() {
     preflightErrors = null;
-    customerErrors = { name: null, taxNumber: null, address: null };
+    customerErrors = { name: null, taxNumber: null, address: null, communityVatNumber: null, vatStatus: null };
     linesContainerError = null;
     lineErrors = {};
     unroutedPreflightErrors = [];
@@ -525,6 +535,8 @@
       customerPostalCode: fields.customerPostalCode,
       customerCity: fields.customerCity,
       customerStreet: fields.customerStreet,
+      // ADR-0102 — pre-fill the EU community VAT number for Other buyers.
+      customerCommunityVatNumber: fields.customerCommunityVatNumber,
       // PR-203 / S203 — pre-fill the per-invoice email recipient override
       // from the partner master's `contact_email`. Editable for THIS
       // invoice only; the operator can add / remove / replace addresses
@@ -989,20 +1001,26 @@
             />
             <span>Magánszemély / Natural person</span>
           </label>
-          <label class="vat-radio vat-radio--disabled">
+          <label class="vat-radio">
             <input
               type="radio"
               name="customerVatStatus"
               value="Other"
-              disabled
+              bind:group={form.customerVatStatus}
               data-testid="customer-vat-status-other"
             />
             <span>
               Külföldi / Foreign
-              <span class="vat-radio__hint">v2-ben jön / Coming in v2</span>
+              <span class="vat-radio__hint">EU-s vevő / EU business (EU VAT)</span>
             </span>
           </label>
         </fieldset>
+      {/if}
+      {#if customerErrors.vatStatus}
+        <p class="inline-error" data-testid="customer-vat-status-error" data-kind={customerErrors.vatStatus.kind}>
+          <span class="inline-error-hu">{customerErrors.vatStatus.message_hu}</span>
+          <span class="inline-error-en">{customerErrors.vatStatus.message_en}</span>
+        </p>
       {/if}
       <label>
         <span>
@@ -1011,6 +1029,11 @@
             <span class="vat-radio__hint">
               Magánszemély vevő esetén nem kell adószám /
               no tax number for natural persons
+            </span>
+          {:else if form.customerVatStatus === "Other"}
+            <span class="vat-radio__hint">
+              Külföldi vevőnél EU adószám kell (lent) / EU buyers use an EU
+              VAT number (below)
             </span>
           {/if}
         </span>
@@ -1031,6 +1054,38 @@
           </p>
         {/if}
       </label>
+      <!-- ADR-0102 — EU community VAT number. Shown + required ONLY for an
+           Other (foreign-EU business) buyer; the backend preflight requires
+           + structurally-validates it (VIES shape). Pre-filled from the
+           picked partner's eu_vat_number; snapshotted onto the issued
+           invoice at compose time. -->
+      {#if form.customerVatStatus === "Other"}
+        <label>
+          <span>
+            EU adószám / EU VAT number
+            <span class="vat-radio__hint">
+              pl. ATU12345678 — országkód + törzsszám / country prefix + body
+            </span>
+          </span>
+          <input
+            type="text"
+            bind:value={form.customerCommunityVatNumber}
+            required
+            placeholder="ATU12345678"
+            autocomplete="off"
+            spellcheck="false"
+            class:input-invalid={customerErrors.communityVatNumber !== null}
+            aria-invalid={customerErrors.communityVatNumber !== null}
+            data-testid="customer-community-vat-input"
+          />
+          {#if customerErrors.communityVatNumber}
+            <p class="inline-error" data-testid="customer-community-vat-error" data-kind={customerErrors.communityVatNumber.kind}>
+              <span class="inline-error-hu">{customerErrors.communityVatNumber.message_hu}</span>
+              <span class="inline-error-en">{customerErrors.communityVatNumber.message_en}</span>
+            </p>
+          {/if}
+        </label>
+      {/if}
       <!-- PR-77 / session-101 + session-150 — customer address quartet.
            Áfa tv. §169 mandates the buyer address on the printed invoice
            for ALL customer types (Domestic AND PrivatePerson; ADR-0048
@@ -1044,7 +1099,7 @@
         <input
           type="text"
           bind:value={form.customerCountryCode}
-          required={form.customerVatStatus !== "Other"}
+          required
           placeholder="HU"
           maxlength="2"
           data-testid="customer-country-input"
@@ -1055,7 +1110,7 @@
         <input
           type="text"
           bind:value={form.customerPostalCode}
-          required={form.customerVatStatus !== "Other"}
+          required
           placeholder="1052"
           data-testid="customer-postal-input"
         />
@@ -1065,7 +1120,7 @@
         <input
           type="text"
           bind:value={form.customerCity}
-          required={form.customerVatStatus !== "Other"}
+          required
           placeholder="Budapest"
           data-testid="customer-city-input"
         />
@@ -1075,7 +1130,7 @@
         <input
           type="text"
           bind:value={form.customerStreet}
-          required={form.customerVatStatus !== "Other"}
+          required
           placeholder="Váci utca 19."
           data-testid="customer-street-input"
         />
@@ -1543,6 +1598,21 @@
             <span class="inline-error-en">{vatKindOpt.hintEn}</span>
           </p>
         {/if}
+        <!-- ADR-0102 — HÜLYE-BIZTOS cross-field guidance: warn BEFORE
+             submit when the selected VAT type needs a different buyer type
+             than the one currently chosen (EU-0 kinds need an Other buyer;
+             AAM / reverse-charge need a Domestic buyer). The backend
+             preflight is the hard gate; this is the inline heads-up. -->
+        {@const vatKindMismatch = vatKindBuyerMismatch(
+          line.vatRateKind,
+          form.customerVatStatus,
+        )}
+        {#if vatKindMismatch}
+          <p class="vat-kind-mismatch" data-testid={`line-${index}-vat-kind-mismatch`}>
+            <span class="inline-error-hu">⚠ {vatKindMismatch.hu}</span>
+            <span class="inline-error-en">{vatKindMismatch.en}</span>
+          </p>
+        {/if}
         <!-- PR-82 — per-line buyer note ("Megjegyzés"). Compact
              always-visible textarea below each line so the operator
              can annotate without an extra "+ note" click. Blank
@@ -1958,6 +2028,20 @@
     color: var(--color-text-muted);
   }
 
+  /* ADR-0102 — cross-field kind↔buyer warning. A caution (not yet a hard
+   * error — the operator may still change the buyer), so it uses the
+   * warning signal token rather than the negative one. */
+  .vat-kind-mismatch {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 2px 0 var(--space-2) 0;
+    font-size: var(--type-size-xs);
+  }
+  .vat-kind-mismatch .inline-error-hu {
+    color: var(--color-signal-warning, var(--color-signal-negative));
+  }
+
   /* PR-82 — per-line buyer note. Inline under the line row, sized
    * down so the line table stays readable when notes are absent. */
   .line-note {
@@ -2109,11 +2193,6 @@
     font-size: var(--type-size-sm);
     color: var(--color-text-strong);
     cursor: pointer;
-  }
-
-  .vat-radio--disabled {
-    color: var(--color-text-muted);
-    cursor: not-allowed;
   }
 
   .vat-radio__hint {

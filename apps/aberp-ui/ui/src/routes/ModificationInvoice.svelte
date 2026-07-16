@@ -135,7 +135,18 @@
     name: InvoicePreflightErrorItem | null;
     taxNumber: InvoicePreflightErrorItem | null;
     address: InvoicePreflightErrorItem | null;
-  } = $state({ name: null, taxNumber: null, address: null });
+    // ADR-0102 — EU community VAT + buyer-type control slots (the router
+    // can target these; modification of an EU-0 base is blocked upstream,
+    // but the shared router type requires the exhaustive shape).
+    communityVatNumber: InvoicePreflightErrorItem | null;
+    vatStatus: InvoicePreflightErrorItem | null;
+  } = $state({
+    name: null,
+    taxNumber: null,
+    address: null,
+    communityVatNumber: null,
+    vatStatus: null,
+  });
   let linesContainerError: InvoicePreflightErrorItem | null = $state(null);
   let lineErrors: Record<
     number,
@@ -276,7 +287,7 @@
   // `bankAccountId` targets fall through to the unrouted bucket
   // (the general error block surfaces them verbatim — fail loud).
   function routePreflightErrors(body: InvoicePreflightErrorBody) {
-    customerErrors = { name: null, taxNumber: null, address: null };
+    customerErrors = { name: null, taxNumber: null, address: null, communityVatNumber: null, vatStatus: null };
     linesContainerError = null;
     lineErrors = {};
     unroutedPreflightErrors = [];
@@ -311,7 +322,7 @@
 
   function clearPreflightErrors() {
     preflightErrors = null;
-    customerErrors = { name: null, taxNumber: null, address: null };
+    customerErrors = { name: null, taxNumber: null, address: null, communityVatNumber: null, vatStatus: null };
     linesContainerError = null;
     lineErrors = {};
     unroutedPreflightErrors = [];

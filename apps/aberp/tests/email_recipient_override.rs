@@ -113,6 +113,7 @@ fn fixture_supplier() -> SupplierJson {
 
 fn fixture_customer() -> CustomerJson {
     CustomerJson {
+        community_vat_number: None,
         vat_status: CustomerVatStatus::Domestic,
         partner_id: None,
         tax_number: "87654321-2-13".to_string(),

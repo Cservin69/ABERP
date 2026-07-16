@@ -249,6 +249,17 @@ pub struct InvoiceDraftCreatedPayload {
     /// audit-payloads header at lines 25-33).
     #[serde(default)]
     pub customer_vat_status: Option<String>,
+    /// ADR-0102 — the buyer's EU community VAT number at issuance time,
+    /// for an `Other` (foreign-EU) buyer. `Some(_)` ONLY when
+    /// `customer_vat_status == Some("Other")`; `None` for
+    /// Domestic/PrivatePerson and for every pre-ADR-0102 entry. Additive
+    /// `Option<String>` with `#[serde(default)]` — F12 four-edit ritual
+    /// does NOT fire (back-compat; the `InvoiceDraftCreated` kind keeps
+    /// its name). The tamper-evident snapshot half; the wire-body
+    /// `input.json` + on-disk NAV XML are the other two immutable copies
+    /// (a later `partners.eu_vat_number` edit rewrites none of them).
+    #[serde(default)]
+    pub customer_community_vat_number: Option<String>,
 }
 
 impl InvoiceDraftCreatedPayload {
@@ -287,6 +298,7 @@ impl InvoiceDraftCreatedPayload {
             // default to `None`; SPA-issue path stamps the operator's
             // radio choice via `with_customer_vat_status` below.
             customer_vat_status: None,
+            customer_community_vat_number: None,
         }
     }
 
@@ -338,6 +350,7 @@ impl InvoiceDraftCreatedPayload {
             // default to `None`; SPA-issue path stamps the operator's
             // radio choice via `with_customer_vat_status` below.
             customer_vat_status: None,
+            customer_community_vat_number: None,
         }
     }
 
@@ -392,6 +405,7 @@ impl InvoiceDraftCreatedPayload {
             // default to `None`; SPA-issue path stamps the operator's
             // radio choice via `with_customer_vat_status` below.
             customer_vat_status: None,
+            customer_community_vat_number: None,
         }
     }
 
@@ -427,6 +441,22 @@ impl InvoiceDraftCreatedPayload {
     /// + chainable from the `from_invoice_*` constructor.
     pub fn with_customer_vat_status(mut self, status: crate::nav_xml::CustomerVatStatus) -> Self {
         self.customer_vat_status = Some(status.as_db_str().to_string());
+        self
+    }
+
+    /// ADR-0102 — stamp the buyer's EU community VAT number onto the
+    /// tamper-evident payload (the audit-trail half of the per-invoice
+    /// snapshot; the wire-body `input.json` + on-disk NAV XML are the
+    /// other two immutable copies). `None` for Domestic/PrivatePerson
+    /// buyers (they carry no `communityVatNumber`) — the builder is a
+    /// no-op then so the field stays absent for the byte-identical
+    /// backward-compat path. Same idempotent/chainable posture as
+    /// [`Self::with_customer_vat_status`].
+    pub fn with_customer_community_vat_number(mut self, number: Option<&str>) -> Self {
+        self.customer_community_vat_number = number
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         self
     }
 

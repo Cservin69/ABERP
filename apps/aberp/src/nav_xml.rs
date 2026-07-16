@@ -75,11 +75,14 @@ pub enum CustomerVatStatus {
     /// ADR-0048 §3 open-question #5 lands on "name always, address
     /// optional" for v1).
     PrivatePerson,
-    /// Non-Hungarian buyer (EU community VAT or non-EU third-state
-    /// tax-id). v1 named-defers this branch per ADR-0048 §7; the
-    /// preflight emits [`CustomerVatStatusOtherNotSupportedV1`] BEFORE
-    /// the emitter can be reached, and the NAV emitter itself
-    /// loud-fails if it materialises this variant.
+    /// Non-Hungarian buyer. ADR-0102 wires the EU-community-VAT
+    /// sub-shape end-to-end: the NAV wire REQUIRES `<customerVatData>`
+    /// carrying `<communityVatNumber>` (flat text, data namespace) plus
+    /// `<customerName>` + `<customerAddress>` (the `CUSTOMER_DATA_EXPECTED`
+    /// predicate is `status != PRIVATE_PERSON`). The non-EU
+    /// `<thirdStateTaxId>` arm stays named-deferred (ADR-0102 §8.1). The
+    /// preflight cross-field matrix binds the intra-Community 0% VAT
+    /// kinds (KBAET/EUFAD37) to this status.
     Other,
 }
 
@@ -306,6 +309,71 @@ pub fn parse_hungarian_tax_number(input: &str) -> Result<HungarianTaxNumber, Sup
     })
 }
 
+/// ADR-0102 — the EU-VAT country prefixes accepted for a
+/// `<communityVatNumber>` (VIES structural shape). `EL` (Greece, not
+/// `GR`) and `XI` (Northern Ireland, post-Brexit) are the two
+/// non-obvious members; `HU` is included for structural completeness
+/// (a Hungarian community VAT id is well-formed even though an `Other`
+/// buyer with an HU prefix would normally be `Domestic`). Sorted for
+/// readability; membership — not order — is load-bearing.
+const EU_VAT_COUNTRY_PREFIXES: &[&str] = &[
+    "AT", "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "EL", "ES", "FI", "FR", "HR", "HU", "IE", "IT",
+    "LT", "LU", "LV", "MT", "NL", "PL", "PT", "RO", "SE", "SI", "SK", "XI",
+];
+
+/// ADR-0102 — STRUCTURAL (VIES-shape) validation of an EU community VAT
+/// number, shared by the partner-form gate and the invoice preflight.
+/// This is deliberately NOT a live VIES lookup (out of scope, ADR-0102
+/// §8.2) and NOT a per-country length/checksum table — it is the
+/// operator-friendly "did you type something shaped like an EU VAT id"
+/// gate, symmetric with [`parse_hungarian_tax_number`]'s role for the
+/// Hungarian ADÓSZÁM. NAV's submit layer is the authoritative validator.
+///
+/// Shape: `<2-letter EU country prefix><2..=12 alphanumerics>`, case-
+/// and space-insensitive (VIES numbers are printed with spaces; some
+/// member states use letters in the body, e.g. NL/IE). Returns a
+/// bilingual, operator-actionable message on rejection (CLAUDE.md
+/// rule 12 — fail loud, name the problem).
+pub fn validate_community_vat_number(input: &str) -> Result<(), String> {
+    let normalized: String = input
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_uppercase())
+        .collect();
+    if normalized.is_empty() {
+        return Err("EU adószám kötelező külföldi (OTHER) vevőnél / \
+                    EU VAT number is required for a foreign (OTHER) buyer"
+            .to_string());
+    }
+    if normalized.len() < 2 || !normalized.is_char_boundary(2) {
+        return Err(format!(
+            "EU adószám túl rövid: „{input}” / EU VAT number too short: \"{input}\""
+        ));
+    }
+    let (prefix, body) = normalized.split_at(2);
+    if !EU_VAT_COUNTRY_PREFIXES.contains(&prefix) {
+        return Err(format!(
+            "Ismeretlen EU országkód „{prefix}” az EU adószámban / \
+             unknown EU country prefix \"{prefix}\" in the EU VAT number"
+        ));
+    }
+    if !(2..=12).contains(&body.len()) {
+        return Err(format!(
+            "Az EU adószám törzse 2–12 karakter kell legyen (kapott: {}) / \
+             EU VAT number body must be 2–12 chars (got {})",
+            body.len(),
+            body.len()
+        ));
+    }
+    if !body.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "Az EU adószám törzse csak betű/szám lehet: „{input}” / \
+             EU VAT number body must be alphanumeric: \"{input}\""
+        ));
+    }
+    Ok(())
+}
+
 /// PR-50 / session-70 — supplier-info shape guard, called from
 /// `issue_from_parsed` BEFORE any DB write and from
 /// `serve::handle_issue_invoice` BEFORE dispatching to the issuance
@@ -338,6 +406,16 @@ pub struct CustomerInfo {
     /// `Some(_)`; a Domestic + `None` reaching the emitter is a
     /// programmer-error loud-fail.
     pub tax_number: Option<String>,
+    /// ADR-0102 — EU community VAT number for an `Other` (foreign-EU
+    /// business) buyer. Emitted as `<customerVatData><communityVatNumber>`.
+    /// `Some(_)` ONLY for `Other`; `None` for Domestic/PrivatePerson (they
+    /// carry no `communityVatNumber`). Snapshotted at issuance from the
+    /// picked partner's `eu_vat_number` (the wire body + on-disk NAV XML +
+    /// audit payload are the immutable record; a later partner edit does
+    /// not rewrite an issued invoice). An `Other` + `None` reaching the
+    /// emitter is a programmer-error loud-fail — preflight + partner-form
+    /// validation guarantee `Some(_)` upstream (ADR-0102 §4).
+    pub community_vat_number: Option<String>,
     pub name: String,
     /// PR-77 / session-101 — NAV v3.0 business-rule
     /// `CUSTOMER_DATA_EXPECTED` requires `<customerAddress>` whenever
@@ -1203,10 +1281,24 @@ fn write_customer(w: &mut Writer<&mut Vec<u8>>, c: &CustomerInfo) -> Result<()> 
             // and the validator's symmetric ForbiddenChildUnderStatus rule.
         }
         CustomerVatStatus::Other => {
-            return Err(anyhow!(
-                "ADR-0048 §7: Other-status customer emit is v1 named-deferred \
-                 (use Domestic or PrivatePerson; foreign-buyer support lands in v2)"
-            ));
+            // ADR-0102 — foreign-EU business buyer. NAV's
+            // `CustomerVatDataType` choice carries `<communityVatNumber>`
+            // (a flat text element in the OSA data namespace — NOT the
+            // `common:`-prefixed structured `customerTaxNumber` shape) for
+            // the EU arm. The non-EU `<thirdStateTaxId>` arm stays named-
+            // deferred (ADR-0102 §8.1). `None` here is a programmer-error
+            // loud-fail: preflight (`CommunityVatNumberMissing`) + the
+            // partner-form gate guarantee `Some(_)` upstream.
+            let community_vat_number = c.community_vat_number.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "Other (foreign-EU) buyer requires community_vat_number at NAV-XML \
+                     render time — preflight + partner-form validation should have caught \
+                     this upstream (ADR-0102 §4)"
+                )
+            })?;
+            w.write_event(Event::Start(BytesStart::new("customerVatData")))?;
+            text_element(w, "communityVatNumber", community_vat_number)?;
+            w.write_event(Event::End(BytesEnd::new("customerVatData")))?;
         }
     }
 
@@ -2660,6 +2752,7 @@ mod tests {
     #[test]
     fn write_customer_omits_customer_name_for_private_person() {
         let c = CustomerInfo {
+            community_vat_number: None,
             customer_vat_status: CustomerVatStatus::PrivatePerson,
             // PrivatePerson carries no ADÓSZÁM.
             tax_number: None,
@@ -2688,6 +2781,7 @@ mod tests {
     #[test]
     fn write_customer_omits_address_for_private_person_with_address() {
         let c = CustomerInfo {
+            community_vat_number: None,
             customer_vat_status: CustomerVatStatus::PrivatePerson,
             tax_number: None,
             name: "Teszt Magánszemély".to_string(),
@@ -2722,6 +2816,7 @@ mod tests {
     #[test]
     fn write_customer_emits_name_and_address_for_domestic() {
         let c = CustomerInfo {
+            community_vat_number: None,
             customer_vat_status: CustomerVatStatus::Domestic,
             tax_number: Some("24904362-2-41".to_string()),
             name: "Teszt Kft.".to_string(),
