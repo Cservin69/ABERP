@@ -65,6 +65,23 @@
 # the Handle. calibration_overview_request STAYS fresh (it reads quote_calibration,
 # a fresh-open residual-floor family — migrating its read alone would create a NEW
 # half-migration). Total 95→90 openers, files unchanged (23).
+# ── VAT stack (ADR-0101 + ADR-0102, 2026-07-16) — REVIEWED census GROWTH +1 ────
+# The vat-rate-kind feature (ADR-0101 s1/s2/modguard + ADR-0102 eupartner/eu0fixes)
+# adds exactly ONE new prod DB opener across apps/aberp/src+modules+crates:
+# serve.rs:read_base_line_vat_kinds (ADR-0101 S2 modification-guard — reads the
+# persisted invoice_line.vat_rate_kind so modification_invoice_request rejects an
+# in-app modification of a non-Percent base). It is a pattern-IDENTICAL twin of the
+# already-frozen billing reader read_invoice_total_gross_minor: same fresh
+# Connection::open + scoped conn.transaction()→commit() read-tx, same
+# billing::load_ready_invoice_by_id source of truth (rule 8), reads BILLING data
+# (invoice_line — its own DuckDbBillingStore family, NOT the shared audit Handle),
+# READ-ONLY (no INSERT/UPDATE → no audit-atomicity concern). A like-for-like add
+# to the census-approved fresh-open billing-reader residual family (read_base_currency
+# / read_invoice_currency / read_invoice_total_gross_minor), NOT a rogue fork: the
+# write-fork + read-fork ENFORCE gates stay green (0). The full VAT stack fingerprint
+# diff vs the frozen set is a SINGLE pure addition (no removals/swaps). Re-cut +1:
+# serve.rs 28→29; census 90→91 openers, files unchanged (23). The EU-partner base
+# read (ADR-0102) reuses existing openers/stores — it added no new opener.
 apps/aberp/src/audit_dap_boot.rs|run_heartbeat_supervised:let mut ledger = Ledger::open(&db, tn, binary_hash)
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
@@ -116,6 +133,7 @@ apps/aberp/src/serve.rs|handle_list_email_relay_queue:let conn = duckdb::Connect
 apps/aberp/src/serve.rs|handle_quote_pipeline_status:let conn = duckdb::Connection::open(&db_path).context("open DB for daemon-pa
 apps/aberp/src/serve.rs|handle_relay_send_email:let conn = duckdb::Connection::open(&db_path).with_context(|| {
 apps/aberp/src/serve.rs|read_base_currency:let mut conn = Connection::open(db_path)
+apps/aberp/src/serve.rs|read_base_line_vat_kinds:let mut conn = Connection::open(db_path).with_context(|| {
 apps/aberp/src/serve.rs|read_invoice_currency:let mut conn = Connection::open(db_path).with_context(|| {
 apps/aberp/src/serve.rs|read_invoice_total_gross_minor:let mut conn = Connection::open(db_path).with_context(|| {
 apps/aberp/src/serve.rs|record_upgrade_snapshot_mismatch_audit:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
