@@ -140,7 +140,29 @@ fn fail(msg: String) -> ValidationReport {
 /// `record.meta.valid` to decide whether to emit `SnapshotCreated` or
 /// `SnapshotValidationFailed`. A hard error (source missing, export failed,
 /// rename failed) is returned as `Err`.
+///
+/// ## ADR-0099 — `conn` is CALLER-SUPPLIED, never opened here
+///
+/// `conn` MUST be a connection to the shared `aberp_db::Handle` instance
+/// (`Handle::read()` — a `try_clone`, not a second OS open). This module
+/// used to `Connection::open(db_path)` here. Inside `aberp serve` that was a
+/// SECOND opener co-resident with the shared Handle, and it carried two
+/// defects that the 2026-07-19 boot-refusal incident exercised:
+///
+///   * the Handle runs `checkpoint_enabled:false` +
+///     `disable_checkpoint_on_shutdown`; a fresh open does NOT, so **closing
+///     it folded the Handle's WAL into the main file** while the audit
+///     mirror had already durably appended past that point — the mirror ran
+///     ahead of the DB (seq 8060 > 8058);
+///   * a fresh instance does not replay the live writer's WAL, so the export
+///     could miss WAL-resident committed rows — a silently *stale* snapshot,
+///     which is the worst possible defect in a backup.
+///
+/// Taking the connection from the caller fixes both: a `try_clone` of the
+/// shared instance sees the live WAL (coherent by construction, no fresh
+/// opener needed) and dropping it closes no instance, so nothing folds.
 pub fn take_snapshot(
+    conn: &Connection,
     db_path: &Path,
     store_dir: &Path,
     tenant: &str,
@@ -164,18 +186,14 @@ pub fn take_snapshot(
         std::fs::remove_dir_all(&partial_dir).map_err(|e| SnapshotError::io(&partial_dir, e))?;
     }
 
-    // EXPORT runs against the live DB. When `serve` is running this opens a
-    // second in-process connection (DuckDB shares one instance per process,
-    // so no cross-process lock conflict); from the stopped-server CLI it is
-    // the only opener. EXPORT is a logical table scan — it never touches
-    // the ART/checkpoint structure that corrupts.
-    {
-        let conn = Connection::open(db_path)?;
-        conn.execute_batch(&format!(
-            "EXPORT DATABASE {} (FORMAT PARQUET);",
-            sql_quote(&partial_dir)
-        ))?;
-    }
+    // EXPORT runs against the CALLER's connection to the shared instance (see
+    // the fn doc): never a fresh open, so it neither folds the Handle's WAL on
+    // close nor reads a stale pre-WAL view. EXPORT is a logical table scan —
+    // it never touches the ART/checkpoint structure that corrupts.
+    conn.execute_batch(&format!(
+        "EXPORT DATABASE {} (FORMAT PARQUET);",
+        sql_quote(&partial_dir)
+    ))?;
 
     let report = validate_export(&partial_dir, tenant);
     let byte_size = dir_size(&partial_dir)?;

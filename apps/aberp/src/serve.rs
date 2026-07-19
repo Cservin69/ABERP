@@ -2803,7 +2803,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     match crate::snapshot::resolve_store(recovery_state.tenant.as_str(), None) {
                         Ok(snap_store_dir) => {
                             let snap_deps = crate::snapshot::SnapshotDaemonDeps {
-                                db_path: (*recovery_state.db_path).clone(),
+                                db: recovery_state.db.clone(),
                                 tenant: recovery_state.tenant.clone(),
                                 binary_hash: snap_binary_hash,
                                 store_dir: snap_store_dir,
@@ -27658,7 +27658,7 @@ fn snapshot_now_request(state: &AppState) -> Result<SnapshotNowResponse> {
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login_for_audit(state));
     let policy = crate::snapshot::policy_from_env();
     let rec = crate::snapshot::run_cycle(
-        &state.db_path,
+        &state.db,
         &store_dir,
         &state.tenant,
         binary_hash,
@@ -27682,7 +27682,7 @@ fn snapshot_restore_request(
         .context("binary hash for restore")?;
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login_for_audit(state));
     let rec = crate::snapshot::restore_and_emit(
-        &state.db_path,
+        &state.db,
         &store_dir,
         &body.selector,
         &target,

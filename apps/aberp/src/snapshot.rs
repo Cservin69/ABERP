@@ -27,7 +27,8 @@ use anyhow::{Context, Result};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{append_in_tx, Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
+use aberp_db::{Handle, HandleArc};
 use aberp_snapshot::{
     default_store_dir, ensure_restore_allowed, find_snapshot, list_snapshots, plan_retention,
     prune, restore_into, take_snapshot, RetentionPolicy, SnapshotRecord,
@@ -101,10 +102,28 @@ pub fn interval_from_env() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Open a [`Ledger`] against the live DB to append a snapshot audit event.
-fn open_ledger(db_path: &Path, tenant: &TenantId, binary_hash: BinaryHash) -> Result<Ledger> {
-    Ledger::open(db_path, tenant.clone(), binary_hash)
-        .map_err(|e| anyhow::anyhow!("open audit ledger for snapshot event: {e}"))
+/// Append ONE snapshot audit event through the shared `aberp_db::Handle`
+/// (ADR-0099 H3), replacing the per-event `Ledger::open` write-fork.
+///
+/// The guard is acquired here and dropped here — it is NEVER held across the
+/// `EXPORT DATABASE` or the retention file I/O (see [`take_and_emit`]).
+fn append_audit(
+    db: &Handle,
+    tenant: &TenantId,
+    binary_hash: BinaryHash,
+    kind: EventKind,
+    bytes: Vec<u8>,
+    actor: Actor,
+) -> Result<()> {
+    let meta = LedgerMeta::new(tenant.clone(), binary_hash);
+    let mut guard = db
+        .write()
+        .context("acquire shared writer for snapshot audit")?;
+    let tx = guard.transaction().context("begin snapshot audit tx")?;
+    append_in_tx(&tx, &meta, kind, bytes, actor, None)
+        .map_err(|e| anyhow::anyhow!("append snapshot audit event: {e}"))?;
+    tx.commit().context("commit snapshot audit")?;
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -117,18 +136,32 @@ fn open_ledger(db_path: &Path, tenant: &TenantId, binary_hash: BinaryHash) -> Re
 /// the invalid snapshot is kept on disk and the last-good is preserved by
 /// retention). Returns the finalized record either way.
 pub fn take_and_emit(
-    db_path: &Path,
+    db: &Handle,
     store_dir: &Path,
     tenant: &TenantId,
     binary_hash: BinaryHash,
     actor: Actor,
 ) -> Result<SnapshotRecord> {
     let now = OffsetDateTime::now_utc();
-    let rec = take_snapshot(db_path, store_dir, tenant.as_str(), now)
-        .with_context(|| format!("take snapshot of {}", db_path.display()))?;
+    let db_path = db.db_path().to_path_buf();
 
+    // ── Phase 1: EXPORT on a READ clone, NO writer guard held ──────────────
+    // `Handle::read()` holds the writer mutex only for the `try_clone` and
+    // releases it, so the (long, blocking) EXPORT does not stall every other
+    // writer in the process — and, critically, we are NOT holding `write()`
+    // when we take it, so there is no self-deadlock (CLAUDE.md rule 13: never
+    // nest `write()` while holding a guard, and `read()` locks the same mutex).
+    // The clone is dropped before phase 2 acquires the writer.
+    let rec = {
+        let conn = db
+            .read()
+            .context("shared read connection for snapshot export")?;
+        take_snapshot(&conn, &db_path, store_dir, tenant.as_str(), now)
+            .with_context(|| format!("take snapshot of {}", db_path.display()))?
+    };
+
+    // ── Phase 2: audit append on the shared writer, short guard ────────────
     let created_at = rfc3339(rec.meta.created_at);
-    let mut ledger = open_ledger(db_path, tenant, binary_hash)?;
     if rec.meta.valid {
         let payload = SnapshotCreatedPayload {
             seq: rec.meta.seq,
@@ -140,9 +173,14 @@ pub fn take_and_emit(
             chain_len: rec.meta.chain_len,
             store_dir: store_dir.display().to_string(),
         };
-        ledger
-            .append(EventKind::SnapshotCreated, payload.to_bytes(), actor, None)
-            .map_err(|e| anyhow::anyhow!("append SnapshotCreated: {e}"))?;
+        append_audit(
+            db,
+            tenant,
+            binary_hash,
+            EventKind::SnapshotCreated,
+            payload.to_bytes(),
+            actor,
+        )?;
         tracing::info!(
             seq = rec.meta.seq,
             audit = rec.meta.audit_count,
@@ -159,14 +197,14 @@ pub fn take_and_emit(
                 .clone()
                 .unwrap_or_else(|| "unknown validation failure".to_string()),
         };
-        ledger
-            .append(
-                EventKind::SnapshotValidationFailed,
-                payload.to_bytes(),
-                actor,
-                None,
-            )
-            .map_err(|e| anyhow::anyhow!("append SnapshotValidationFailed: {e}"))?;
+        append_audit(
+            db,
+            tenant,
+            binary_hash,
+            EventKind::SnapshotValidationFailed,
+            payload.to_bytes(),
+            actor,
+        )?;
         tracing::error!(
             seq = rec.meta.seq,
             error = rec.meta.validation_error.as_deref().unwrap_or("?"),
@@ -179,7 +217,7 @@ pub fn take_and_emit(
 /// Apply retention to the store and emit `SnapshotPruned` if anything was
 /// removed. Returns the pruned seqs.
 pub fn retention_and_emit(
-    db_path: &Path,
+    db: &Handle,
     store_dir: &Path,
     tenant: &TenantId,
     binary_hash: BinaryHash,
@@ -198,10 +236,16 @@ pub fn retention_and_emit(
             retained_count: plan.keep.len(),
             ran_at: rfc3339(OffsetDateTime::now_utc()),
         };
-        let mut ledger = open_ledger(db_path, tenant, binary_hash)?;
-        ledger
-            .append(EventKind::SnapshotPruned, payload.to_bytes(), actor, None)
-            .map_err(|e| anyhow::anyhow!("append SnapshotPruned: {e}"))?;
+        // The `prune` file deletes above ran with NO guard held; the writer is
+        // taken only now, for the append itself.
+        append_audit(
+            db,
+            tenant,
+            binary_hash,
+            EventKind::SnapshotPruned,
+            payload.to_bytes(),
+            actor,
+        )?;
         tracing::info!(pruned = ?removed, retained = plan.keep.len(), "snapshot retention applied");
     }
     Ok(removed)
@@ -210,7 +254,7 @@ pub fn retention_and_emit(
 /// One full daemon cycle: take + validate + emit, then retention + emit.
 /// Retention failure does not discard the snapshot just taken.
 pub fn run_cycle(
-    db_path: &Path,
+    db: &Handle,
     store_dir: &Path,
     tenant: &TenantId,
     binary_hash: BinaryHash,
@@ -218,8 +262,8 @@ pub fn run_cycle(
     policy: &RetentionPolicy,
 ) -> Result<SnapshotRecord> {
     // `BinaryHash` is `Copy`; `Actor` is cloned for the second emit.
-    let rec = take_and_emit(db_path, store_dir, tenant, binary_hash, actor.clone())?;
-    if let Err(e) = retention_and_emit(db_path, store_dir, tenant, binary_hash, actor, policy) {
+    let rec = take_and_emit(db, store_dir, tenant, binary_hash, actor.clone())?;
+    if let Err(e) = retention_and_emit(db, store_dir, tenant, binary_hash, actor, policy) {
         // A retention hiccup must not fail the cycle — the fresh snapshot is
         // the valuable output; stale extras are harmless.
         tracing::warn!(error = %e, "snapshot retention failed this cycle (snapshot itself is fine)");
@@ -231,7 +275,7 @@ pub fn run_cycle(
 /// ([`ensure_restore_allowed`]) MUST already have passed — callers run it
 /// first so a refusal never even finds the snapshot.
 pub fn restore_and_emit(
-    db_path_for_audit: &Path,
+    db: &Handle,
     store_dir: &Path,
     selector: &str,
     target: &Path,
@@ -252,11 +296,16 @@ pub fn restore_and_emit(
     };
     // The audit row records the restore against the live DB's ledger (NOT
     // the freshly-restored side-DB), so the operator's main timeline shows
-    // that a restore happened.
-    let mut ledger = open_ledger(db_path_for_audit, tenant, binary_hash)?;
-    ledger
-        .append(EventKind::SnapshotRestored, payload.to_bytes(), actor, None)
-        .map_err(|e| anyhow::anyhow!("append SnapshotRestored: {e}"))?;
+    // that a restore happened. `restore_into` above wrote only to `target`,
+    // never to the live DB, so no guard was held across it.
+    append_audit(
+        db,
+        tenant,
+        binary_hash,
+        EventKind::SnapshotRestored,
+        payload.to_bytes(),
+        actor,
+    )?;
     tracing::info!(seq = rec.meta.seq, target = %target.display(), "snapshot restored");
     Ok(rec)
 }
@@ -274,7 +323,8 @@ pub fn run_now(args: &SnapshotNowArgs) -> Result<()> {
     let actor = cli_actor("system:snapshot-cli");
     let policy = policy_from_env();
 
-    let rec = run_cycle(&args.db, &store_dir, &tenant, binary_hash, actor, &policy)?;
+    let db = open_cli_handle(&args.db, &tenant)?;
+    let rec = run_cycle(&db, &store_dir, &tenant, binary_hash, actor, &policy)?;
     if rec.meta.valid {
         println!(
             "Snapshot #{} written and validated → {}\n  invoices={}  audit_rows={}  chain={}  size={}",
@@ -335,8 +385,9 @@ pub fn run_restore(args: &SnapshotRestoreArgs) -> Result<()> {
     let binary_hash = crate::binary_hash::compute().context("compute binary hash")?;
     let actor = cli_actor("system:snapshot-cli");
 
+    let db = open_cli_handle(&args.db, &tenant)?;
     let rec = restore_and_emit(
-        &args.db,
+        &db,
         &store_dir,
         &args.selector,
         &args.to,
@@ -365,7 +416,10 @@ pub fn run_restore(args: &SnapshotRestoreArgs) -> Result<()> {
 
 /// Everything the snapshot daemon needs, captured at boot.
 pub struct SnapshotDaemonDeps {
-    pub db_path: PathBuf,
+    /// The ONE shared `aberp_db::Handle` (ADR-0099 H3) — the daemon's sole DB
+    /// access, for both the EXPORT read and the audit append. Replaces the
+    /// `db_path: PathBuf` that used to feed a per-event `Ledger::open`.
+    pub db: HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub store_dir: PathBuf,
@@ -399,7 +453,7 @@ pub async fn run_supervised(deps: SnapshotDaemonDeps, cancel: CancellationToken)
         if cancel.is_cancelled() {
             return;
         }
-        let db = deps.db_path.clone();
+        let db = deps.db.clone();
         let store = deps.store_dir.clone();
         let tenant = deps.tenant.clone();
         let bh = deps.binary_hash; // BinaryHash is Copy
@@ -428,6 +482,18 @@ pub async fn run_supervised(deps: SnapshotDaemonDeps, cancel: CancellationToken)
 // ──────────────────────────────────────────────────────────────────────
 // Small helpers
 // ──────────────────────────────────────────────────────────────────────
+
+/// The `aberp snapshot {now,restore}` CLI one-shots run in a SEPARATE process
+/// from `aberp serve` (mutually excluded by the F-E whole-DB writer flock), so
+/// there is no in-process shared Handle to borrow — this constructs the one
+/// Handle for the life of the one-shot. `Handle::open*` is the sanctioned
+/// single-instance seam, not an independent opener: it applies the
+/// `disable_checkpoint_on_shutdown` pragma, so unlike the `Ledger::open` /
+/// `Connection::open` it replaces it cannot fold a WAL on close.
+fn open_cli_handle(db_path: &Path, tenant: &TenantId) -> Result<HandleArc> {
+    Handle::open_default(db_path, tenant.clone())
+        .map_err(|e| anyhow::anyhow!("open shared DB handle for snapshot CLI: {e}"))
+}
 
 fn tenant_id(tenant: &str) -> Result<TenantId> {
     TenantId::new(tenant.to_string()).with_context(|| format!("invalid tenant id {tenant:?}"))

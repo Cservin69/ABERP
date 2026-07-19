@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use aberp::snapshot::{restore_and_emit, retention_and_emit, take_and_emit};
 use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_db::{Handle, HandleArc};
 use aberp_snapshot::{list_snapshots, RetentionPolicy};
 use duckdb::Connection;
 
@@ -81,9 +82,24 @@ fn seed(db: &Path, n_invoice: usize, n_audit: usize) {
     }
 }
 
-/// All event kinds currently in the DB's ledger, in seq order.
-fn ledger_kinds(db: &Path) -> Vec<EventKind> {
-    let l = Ledger::open(db, tid(), bh()).unwrap();
+/// Open the ONE shared Handle over a seeded DB — the same primitive `serve`
+/// hands the snapshot daemon (ADR-0099 H3).
+fn handle(db: &Path) -> HandleArc {
+    Handle::open_default(db, tid()).expect("open shared handle")
+}
+
+/// All event kinds currently in the ledger, in seq order, read THROUGH the
+/// shared Handle.
+///
+/// Reading via a fresh `Ledger::open` here would be a live coherence bug in
+/// the test itself: the Handle runs `checkpoint_enabled:false`, so its commits
+/// are WAL-resident and a second instance opened alongside it does not replay
+/// that WAL — the assertions would silently read a stale chain. `Handle::read()`
+/// is a `try_clone` of the same instance, so it always sees the writes the
+/// snapshot audit path just made.
+fn ledger_kinds(db: &HandleArc) -> Vec<EventKind> {
+    let conn = db.read().expect("shared read connection");
+    let l = Ledger::from_connection(conn, tid(), bh());
     l.entries()
         .unwrap()
         .iter()
@@ -91,7 +107,7 @@ fn ledger_kinds(db: &Path) -> Vec<EventKind> {
         .collect()
 }
 
-fn count_kind(db: &Path, kind: EventKind) -> usize {
+fn count_kind(db: &HandleArc, kind: EventKind) -> usize {
     ledger_kinds(db).into_iter().filter(|k| *k == kind).count()
 }
 
@@ -102,21 +118,22 @@ fn create_list_restore_journey_emits_events() {
     let dir = ScopedTempDir::new("journey");
     let db = dir.path().join("aberp.duckdb");
     seed(&db, 4, 3);
+    let h = handle(&db);
     let store = dir.path().join("store");
 
     // CREATE — emits SnapshotCreated against the live ledger.
-    let before = ledger_kinds(&db).len();
-    let rec = take_and_emit(&db, &store, &tid(), bh(), actor()).expect("take");
+    let before = ledger_kinds(&h).len();
+    let rec = take_and_emit(&h, &store, &tid(), bh(), actor()).expect("take");
     assert!(rec.meta.valid, "fresh snapshot valid: {:?}", rec.meta);
     assert_eq!(rec.meta.audit_count, 3);
     assert_eq!(rec.meta.invoice_count, 4);
-    assert_eq!(count_kind(&db, EventKind::SnapshotCreated), 1);
+    assert_eq!(count_kind(&h, EventKind::SnapshotCreated), 1);
     assert_eq!(
-        ledger_kinds(&db).last().cloned(),
+        ledger_kinds(&h).last().cloned(),
         Some(EventKind::SnapshotCreated),
         "SnapshotCreated is the newest ledger entry"
     );
-    assert!(ledger_kinds(&db).len() > before);
+    assert!(ledger_kinds(&h).len() > before);
 
     // LIST — the snapshot is discoverable.
     let listed = list_snapshots(&store).unwrap();
@@ -127,9 +144,9 @@ fn create_list_restore_journey_emits_events() {
     // carries the same invoice rows (validate the round-trip end-to-end).
     let target = dir.path().join("recovery").join("aberp.duckdb");
     let selector = rec.meta.seq.to_string();
-    restore_and_emit(&db, &store, &selector, &target, &tid(), bh(), actor()).expect("restore");
+    restore_and_emit(&h, &store, &selector, &target, &tid(), bh(), actor()).expect("restore");
     assert!(target.exists());
-    assert_eq!(count_kind(&db, EventKind::SnapshotRestored), 1);
+    assert_eq!(count_kind(&h, EventKind::SnapshotRestored), 1);
 
     let conn = Connection::open(&target).unwrap();
     let n: i64 = conn
@@ -150,11 +167,12 @@ fn validation_failure_emits_validation_failed_event() {
             .unwrap();
     }
 
+    let h = handle(&db);
     let store = dir.path().join("store");
-    let rec = take_and_emit(&db, &store, &tid(), bh(), actor()).expect("take produces a record");
+    let rec = take_and_emit(&h, &store, &tid(), bh(), actor()).expect("take produces a record");
     assert!(!rec.meta.valid, "tampered chain must fail validation");
-    assert_eq!(count_kind(&db, EventKind::SnapshotValidationFailed), 1);
-    assert_eq!(count_kind(&db, EventKind::SnapshotCreated), 0);
+    assert_eq!(count_kind(&h, EventKind::SnapshotValidationFailed), 1);
+    assert_eq!(count_kind(&h, EventKind::SnapshotCreated), 0);
 }
 
 #[test]
@@ -162,11 +180,12 @@ fn retention_emits_pruned_event_and_removes_dirs() {
     let dir = ScopedTempDir::new("retain");
     let db = dir.path().join("aberp.duckdb");
     seed(&db, 1, 1);
+    let h = handle(&db);
     let store = dir.path().join("store");
 
     // Take three snapshots.
     for _ in 0..3 {
-        take_and_emit(&db, &store, &tid(), bh(), actor()).unwrap();
+        take_and_emit(&h, &store, &tid(), bh(), actor()).unwrap();
     }
     assert_eq!(list_snapshots(&store).unwrap().len(), 3);
 
@@ -176,8 +195,8 @@ fn retention_emits_pruned_event_and_removes_dirs() {
         daily_days: 0,
         weekly_weeks: 0,
     };
-    let removed = retention_and_emit(&db, &store, &tid(), bh(), actor(), &policy).unwrap();
+    let removed = retention_and_emit(&h, &store, &tid(), bh(), actor(), &policy).unwrap();
     assert_eq!(removed.len(), 2, "two older snapshots pruned");
     assert_eq!(list_snapshots(&store).unwrap().len(), 1);
-    assert_eq!(count_kind(&db, EventKind::SnapshotPruned), 1);
+    assert_eq!(count_kind(&h, EventKind::SnapshotPruned), 1);
 }

@@ -16,6 +16,14 @@ use duckdb::Connection;
 use time::macros::datetime;
 use time::OffsetDateTime;
 
+/// `take_snapshot` takes a CALLER-supplied connection (ADR-0099: in `serve` it
+/// is a `Handle::read()` try_clone, never a fresh open). This crate has no
+/// dependency on `aberp-db`, and these tests are single-process with no live
+/// writer, so a plain open is the right stand-in here.
+fn snap_conn(db: &Path) -> Connection {
+    Connection::open(db).expect("open test db for export")
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Test scaffolding (no tempfile dev-dep — mirrors the S393 pattern)
 // ──────────────────────────────────────────────────────────────────────
@@ -123,7 +131,7 @@ fn take_snapshot_validates_and_round_trips() {
 
     let store = dir.path().join("store");
     let now = datetime!(2026-06-15 14:30:00 UTC);
-    let rec = take_snapshot(&db, &store, "prod", now).expect("snapshot ok");
+    let rec = take_snapshot(&snap_conn(&db), &db, &store, "prod", now).expect("snapshot ok");
 
     assert!(
         rec.meta.valid,
@@ -152,8 +160,22 @@ fn second_snapshot_gets_next_seq() {
     seed_db(&db, "prod", 1, 1);
     let store = dir.path().join("store");
 
-    let r1 = take_snapshot(&db, &store, "prod", datetime!(2026-06-15 10:00:00 UTC)).unwrap();
-    let r2 = take_snapshot(&db, &store, "prod", datetime!(2026-06-15 14:00:00 UTC)).unwrap();
+    let r1 = take_snapshot(
+        &snap_conn(&db),
+        &db,
+        &store,
+        "prod",
+        datetime!(2026-06-15 10:00:00 UTC),
+    )
+    .unwrap();
+    let r2 = take_snapshot(
+        &snap_conn(&db),
+        &db,
+        &store,
+        "prod",
+        datetime!(2026-06-15 14:00:00 UTC),
+    )
+    .unwrap();
     assert_eq!(r1.meta.seq, 1);
     assert_eq!(r2.meta.seq, 2);
 
@@ -184,7 +206,8 @@ fn validation_fails_on_tampered_chain() {
 
     let store = dir.path().join("store");
     let now = datetime!(2026-06-15 14:30:00 UTC);
-    let rec = take_snapshot(&db, &store, "prod", now).expect("snapshot still produced");
+    let rec =
+        take_snapshot(&snap_conn(&db), &db, &store, "prod", now).expect("snapshot still produced");
 
     assert!(!rec.meta.valid, "tampered chain must fail validation");
     let err = rec.meta.validation_error.unwrap_or_default();
@@ -219,7 +242,14 @@ fn restore_refuses_from_invalid_snapshot() {
             .unwrap();
     }
     let store = dir.path().join("store");
-    let rec = take_snapshot(&db, &store, "prod", datetime!(2026-06-15 14:30:00 UTC)).unwrap();
+    let rec = take_snapshot(
+        &snap_conn(&db),
+        &db,
+        &store,
+        "prod",
+        datetime!(2026-06-15 14:30:00 UTC),
+    )
+    .unwrap();
     assert!(!rec.meta.valid);
 
     let target = dir.path().join("out").join("aberp.duckdb");
@@ -382,6 +412,7 @@ fn prune_removes_condemned_dirs_only() {
     let mut dirs = Vec::new();
     for h in 0..3 {
         let r = take_snapshot(
+            &snap_conn(&db),
             &db,
             &store,
             "prod",
