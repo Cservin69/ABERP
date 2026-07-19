@@ -144,23 +144,26 @@ fn fail(msg: String) -> ValidationReport {
 /// ## ADR-0099 — `conn` is CALLER-SUPPLIED, never opened here
 ///
 /// `conn` MUST be a connection to the shared `aberp_db::Handle` instance
-/// (`Handle::read()` — a `try_clone`, not a second OS open). This module
-/// used to `Connection::open(db_path)` here. Inside `aberp serve` that was a
-/// SECOND opener co-resident with the shared Handle, and it carried two
-/// defects that the 2026-07-19 boot-refusal incident exercised:
+/// (`Handle::read()` — a `try_clone`, not a second OS open). This module used
+/// to `Connection::open(db_path)` here. Inside `aberp serve` that was a SECOND
+/// opener co-resident with the shared Handle, and **closing it folded the
+/// Handle's WAL into the main file**: the Handle runs `checkpoint_enabled:false`
+/// + `PRAGMA disable_checkpoint_on_shutdown` (set in `aberp-db` and nowhere
+/// else) precisely so its commits stay WAL-resident, and the fresh open carried
+/// neither. The fold landed while `sync_mirror` had already durably appended
+/// those rows — putting the audit mirror ahead of the DB (seq 8060 > 8058) and
+/// refusing boot on 2026-07-19.
 ///
-///   * the Handle runs `checkpoint_enabled:false` +
-///     `disable_checkpoint_on_shutdown`; a fresh open does NOT, so **closing
-///     it folded the Handle's WAL into the main file** while the audit
-///     mirror had already durably appended past that point — the mirror ran
-///     ahead of the DB (seq 8060 > 8058);
-///   * a fresh instance does not replay the live writer's WAL, so the export
-///     could miss WAL-resident committed rows — a silently *stale* snapshot,
-///     which is the worst possible defect in a backup.
+/// Taking the connection from the caller removes the second open entirely, so
+/// there is no close and nothing folds. Pinned by
+/// `apps/aberp/tests/snapshot_e2e.rs::snapshot_does_not_fold_the_handles_wal`
+/// (mutation-verified: re-introducing the fresh open here drains the WAL
+/// 3156 → 0 bytes and fails that test).
 ///
-/// Taking the connection from the caller fixes both: a `try_clone` of the
-/// shared instance sees the live WAL (coherent by construction, no fresh
-/// opener needed) and dropping it closes no instance, so nothing folds.
+/// NOTE on coherence: within ONE process DuckDB shares a single instance per
+/// path, so the old fresh open did still *read* the live WAL — the export was
+/// not stale. Verified by mutation, and recorded here so nobody re-derives a
+/// staleness rationale that does not hold. The fold is the defect.
 pub fn take_snapshot(
     conn: &Connection,
     db_path: &Path,

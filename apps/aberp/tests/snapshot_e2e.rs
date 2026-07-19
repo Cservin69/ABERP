@@ -91,12 +91,12 @@ fn handle(db: &Path) -> HandleArc {
 /// All event kinds currently in the ledger, in seq order, read THROUGH the
 /// shared Handle.
 ///
-/// Reading via a fresh `Ledger::open` here would be a live coherence bug in
-/// the test itself: the Handle runs `checkpoint_enabled:false`, so its commits
-/// are WAL-resident and a second instance opened alongside it does not replay
-/// that WAL — the assertions would silently read a stale chain. `Handle::read()`
-/// is a `try_clone` of the same instance, so it always sees the writes the
-/// snapshot audit path just made.
+/// Deliberately NOT a fresh `Ledger::open`. A second opener alongside the live
+/// Handle folds the Handle's WAL when it closes (the incident mechanism — see
+/// `snapshot_does_not_fold_the_handles_wal`), so a test that read that way
+/// would be checkpointing the DB between its own assertions and could not
+/// observe the very property the WAL-fold test pins. `Handle::read()` is a
+/// `try_clone` of the one instance: no second open, nothing to fold.
 fn ledger_kinds(db: &HandleArc) -> Vec<EventKind> {
     let conn = db.read().expect("shared read connection");
     let l = Ledger::from_connection(conn, tid(), bh());
@@ -199,4 +199,143 @@ fn retention_emits_pruned_event_and_removes_dirs() {
     assert_eq!(removed.len(), 2, "two older snapshots pruned");
     assert_eq!(list_snapshots(&store).unwrap().len(), 1);
     assert_eq!(count_kind(&h, EventKind::SnapshotPruned), 1);
+}
+
+// ── ADR-0099 regression pins (2026-07-19 prod boot refusal) ────────────
+//
+// Incident: the snapshot daemon was the one audit writer never migrated to
+// the shared Handle. Audit mirror seq 8060 > DB seq 8058 with a hash fork at
+// the boundary; prod refused to boot. Two independent defects, one test each.
+
+/// Append `n` audit events the way every MIGRATED writer does — through the
+/// shared Handle. This is the "other writer" the snapshot daemon raced.
+fn handle_append(db: &HandleArc, n: usize) {
+    for i in 0..n {
+        let mut guard = db.write().expect("shared writer");
+        let tx = guard.transaction().expect("tx");
+        aberp_audit_ledger::append_in_tx(
+            &tx,
+            &aberp_audit_ledger::LedgerMeta::new(tid(), bh()),
+            EventKind::Test,
+            format!("{{\"concurrent\":{i}}}").into_bytes(),
+            actor(),
+            None,
+        )
+        .expect("append_in_tx");
+        tx.commit().expect("commit");
+    }
+}
+
+/// All seqs in the ledger, read through the shared Handle.
+fn ledger_seqs(db: &HandleArc) -> Vec<u64> {
+    let conn = db.read().expect("shared read connection");
+    let mut stmt = conn
+        .prepare("SELECT seq FROM audit_ledger ORDER BY seq")
+        .expect("prepare");
+    stmt.query_map([], |r| r.get::<_, i64>(0))
+        .expect("query")
+        .map(|r| r.unwrap() as u64)
+        .collect()
+}
+
+/// DEFECT 2 — the checkpoint tear: the snapshot must not FOLD the Handle's WAL.
+///
+/// The Handle deliberately runs `checkpoint_enabled:false` +
+/// `PRAGMA disable_checkpoint_on_shutdown` (crates/aberp-db/src/lib.rs), a
+/// pragma set there and NOWHERE else, so its commits stay WAL-resident. The
+/// daemon's own `Connection::open` did not carry those settings, so when it
+/// closed, DuckDB folded the WAL into the main file underneath the Handle —
+/// while `sync_mirror` had already durably appended those rows to the audit
+/// mirror. That is the mirror-ahead-of-DB half of the incident (seq 8060 > 8058).
+///
+/// The observable invariant is therefore the WAL itself: taking a snapshot
+/// must leave it intact. Asserting on exported row counts does NOT work as a
+/// pin — DuckDB shares one instance per path per process, so an in-process
+/// fresh `Connection::open` still reads the WAL and the counts come out
+/// identical either way (verified by mutation). The FOLD is what differs.
+#[test]
+fn snapshot_does_not_fold_the_handles_wal() {
+    let dir = ScopedTempDir::new("walfold");
+    let db = dir.path().join("aberp.duckdb");
+    let wal = {
+        let mut os = db.as_os_str().to_owned();
+        os.push(".wal");
+        PathBuf::from(os)
+    };
+    seed(&db, 1, 2);
+    let h = handle(&db);
+    let store = dir.path().join("store");
+
+    // Handle writes stay in the WAL (no checkpoint while the Handle is live).
+    handle_append(&h, 5);
+    let wal_before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        wal_before > 0,
+        "precondition: Handle commits must be WAL-resident (checkpoint_enabled:false)"
+    );
+
+    let rec = take_and_emit(&h, &store, &tid(), bh(), actor()).expect("take");
+    assert!(rec.meta.valid, "snapshot must validate: {:?}", rec.meta);
+
+    let wal_after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        wal_after >= wal_before,
+        "CHECKPOINT TEAR — taking a snapshot folded the Handle's WAL ({wal_before} -> {wal_after} \
+         bytes). A snapshot must never checkpoint the live DB underneath the shared Handle; \
+         that is what put the audit mirror ahead of the DB (seq 8060 > 8058)."
+    );
+}
+
+/// DEFECT 1 — the duplicate-seq half, the direct cause of the boot refusal.
+///
+/// `Ledger::append` serializes on AUDIT_APPEND_LOCK; Handle writers use
+/// `append_in_tx`, which does not take that lock. Two DISJOINT mutexes, and no
+/// `UNIQUE(seq)` since S341 (dropped for DuckDB ART corruption) — so a snapshot
+/// append and a concurrent Handle append could both read head N-1 and both
+/// write seq N. That is precisely what produced seq 8056 twice.
+///
+/// Now that the snapshot path also goes through `db.write()`, both writers
+/// contend for the SAME writer mutex and the seqs must come out unique and
+/// gapless. Nothing else in the schema enforces this, so this assertion is the
+/// only thing standing between a regression and another forked prod ledger.
+#[test]
+fn snapshot_audit_and_concurrent_handle_writer_cannot_share_a_seq() {
+    let dir = ScopedTempDir::new("seqrace");
+    let db = dir.path().join("aberp.duckdb");
+    seed(&db, 1, 1);
+    let h = handle(&db);
+    let store = dir.path().join("store");
+
+    let before = ledger_seqs(&h).len();
+
+    // Snapshot audit appends racing a steady stream of Handle appends.
+    let writer = {
+        let h2 = h.clone();
+        std::thread::spawn(move || handle_append(&h2, 12))
+    };
+    for _ in 0..3 {
+        take_and_emit(&h, &store, &tid(), bh(), actor()).expect("take");
+    }
+    writer.join().expect("concurrent writer thread");
+
+    let seqs = ledger_seqs(&h);
+    assert_eq!(
+        seqs.len(),
+        before + 12 + 3,
+        "every append must land exactly once (1 seeded + 12 Handle + 3 SnapshotCreated)"
+    );
+
+    let mut sorted = seqs.clone();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        seqs.len(),
+        "DUPLICATE SEQ — the snapshot audit path forked the ledger again (incident seq 8056): {seqs:?}"
+    );
+    let expected: Vec<u64> = (1..=seqs.len() as u64).collect();
+    assert_eq!(
+        seqs, expected,
+        "seqs must be unique and gapless under contention: {seqs:?}"
+    );
+    assert_eq!(count_kind(&h, EventKind::SnapshotCreated), 3);
 }
