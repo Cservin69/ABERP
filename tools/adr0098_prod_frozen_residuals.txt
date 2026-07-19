@@ -152,6 +152,26 @@
 # NOT a fork: write-fork & read-fork ENFORCE gates stay = 0. Re-cut +1: serve.rs 28→29;
 # census 90→91 openers, files unchanged (23). See the fingerprint-set header for the
 # per-opener rationale. (The ADR-0102 EU-partner base read reuses existing openers.)
+#
+# ── 2026-07-19 SNAPSHOT-DAEMON HANDLE MIGRATION — census RATCHETS DOWN 91→89 ──
+# Root-cause fix for the prod boot refusal (audit mirror seq 8060 > DB seq 8058,
+# hash fork; third occurrence in two weeks). The snapshot daemon was the last
+# in-serve audit writer off the shared Handle. TWO openers REMOVED, zero added:
+#   - apps/aberp/src/snapshot.rs|open_ledger:Ledger::open(...)        [1 → 0, file drops out]
+#     Per-event audit ledger open. Its `append` took AUDIT_APPEND_LOCK while
+#     Handle writers use append_in_tx (a DISJOINT mutex) and there is no
+#     UNIQUE(seq) since S341 — so both could read head 8055 and both write 8056.
+#     Now db.write() -> append_in_tx -> commit, on the one writer mutex.
+#   - crates/aberp-snapshot/src/take.rs|take_snapshot:Connection::open(db_path)  [2 → 1]
+#     The EXPORT DATABASE opener. It lacked the Handle`s checkpoint_enabled:false
+#     + disable_checkpoint_on_shutdown, so closing it FOLDED the Handle`s WAL
+#     after sync_mirror had durably appended — the mirror-ahead half of the
+#     incident. It also risked exporting a stale pre-WAL view. take_snapshot now
+#     takes a CALLER-supplied connection (Handle::read(), a try_clone of the one
+#     instance): coherent by construction, and closing it folds nothing.
+# Census 91→89 openers, files 23→22 (both snapshot.rs and one take.rs opener
+# gone). Ratchet DOWN only — no additions, no content swaps. write-fork &
+# read-fork ENFORCE gates stay = 0.
 1 apps/aberp/src/audit_dap_boot.rs
 3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
@@ -166,12 +186,11 @@
 4 apps/aberp/src/request_technical_annulment.rs
 8 apps/aberp/src/retry_submission.rs
 29 apps/aberp/src/serve.rs
-1 apps/aberp/src/snapshot.rs
 3 apps/aberp/src/submit_annulment.rs
 3 apps/aberp/src/tenant_registry.rs
 1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
 1 crates/aberp-mes/src/ledger_writer.rs
 2 crates/aberp-snapshot/src/crash_safe.rs
-2 crates/aberp-snapshot/src/take.rs
+1 crates/aberp-snapshot/src/take.rs
 3 crates/audit-ledger/src/storage/mod.rs
 1 modules/billing/src/adapters/duckdb_store.rs

@@ -21,6 +21,38 @@ crates/audit-ledger/src/storage/mod.rs:append_reopen
 apps/aberp/src/request_technical_annulment.rs:run
 apps/aberp/src/serve.rs:record_upgrade_snapshot_mismatch_audit
 
+# ── ADR-0099 Addendum 4 — the RETURNED-`Ledger` blind spot (2026-07-19) ───────
+# The prod boot refusal (audit mirror seq 8060 > DB seq 8058, hash fork at the
+# boundary; third occurrence in two weeks — 7562 Jun-28, 7994 Jul-08, 8056 now)
+# was the SNAPSHOT DAEMON: the one audit writer never migrated to the shared
+# Handle, running in-serve, doing a per-event `Ledger::open`. This gate reported
+# GREEN the whole time. The scanner followed an escaping `Connection`;
+# snapshot.rs escaped via a returned `Ledger` (`open_ledger` opened, returned,
+# and `take_and_emit` appended), so NO arm fired — a false negative on the very
+# fork the scanner's header names as its reason to exist.
+#
+# FIXED, not allow-listed: the daemon now routes both SnapshotCreated and
+# SnapshotPruned (and Restored / ValidationFailed) through db.write() ->
+# append_in_tx, and `Ledger::open` is gone from snapshot.rs. The scanner gained
+# the returned-Ledger rule; probe W10 in cut_gate_write_fork_probes.sh is the
+# regression pin (it is the daemon's exact pre-incident shape).
+#
+# SWEEP RESULT (whole repo, apps/ modules/ crates/, minus /tests/ + /aberp-db/):
+# exactly ONE fn had this escape shape — snapshot.rs:open_ledger, now gone. So
+# this addendum adds ZERO new allow-list entries. Eight OTHER runtime fns call
+# `Ledger::open`, but every one is READ-ONLY (entries / verify_chain /
+# walk_ledger / stuck_precondition / find_invoice_draft, never an append):
+#   print_invoice.rs:render_to_bytes            reports.rs:compute_financial_report
+#   export_invoice_bundle.rs:run                mark_abandoned.rs:resolve_stuck_or_loud_fail
+#   recover_from_nav.rs:resolve_recovery_precondition
+#   retry_submission.rs:resolve_stuck_or_loud_fail
+#   drain_pending_retries.rs:run                drain_submission_queue.rs:run
+# Those are read-side coherence concerns, already covered and GREEN under the
+# separate read-fork gate (tools/cut_gate_read_fork.sh +
+# adr0099_read_fork_allowlist.txt). They are deliberately NOT flagged here:
+# doing so would fill the write gate with false positives and duplicate that
+# gate. Probes W11/W11b/W11c pin that boundary.
+
 # ── ADR-0099 H3 — DÁP/QES: TRACKED RESIDUAL, secured-by-guard, NOT allow-listed ──
 # The DÁP audit-chain boot + heartbeat are latent audit-ledger write-forks:
 #   apps/aberp/src/serve.rs:spawn_dap_audit_chain        (fresh Ledger::open, boot)
@@ -36,6 +68,21 @@ apps/aberp/src/serve.rs:record_upgrade_snapshot_mismatch_audit
 # the fork is UNREACHABLE in prod and the fork-zero-ENFORCED state holds. This note
 # exists so the ENFORCE flip does not silently miss the scanner-blind residual.
 # NEXT: build the WriteGuard adapter, route DÁP onto the Handle, drop the prod guard.
+#
+# Addendum 4 re-check (2026-07-19): STILL BLIND, and the reason is now precise.
+# These two are a DIFFERENT escape shape from the snapshot one just fixed — not a
+# RETURNED Ledger but a BORROWED one: `Ledger::open` here, then `&mut ledger`
+# handed to an appending fn in ANOTHER FILE (serve.rs:spawn_dap_audit_chain ->
+# audit_dap_boot::open_service_session_and_recover -> session/mod.rs:append_signed;
+# audit_dap_boot.rs:run_heartbeat_supervised -> session::heartbeat -> append_signed).
+# The new returned-Ledger rule requires the Ledger to be handed BACK and appended
+# by a SAME-FILE caller, so it does not reach these; catching them needs a
+# cross-file call graph this per-file scanner does not have. A repo-wide sweep for
+# non-test `&mut ledger` argument passing found ONLY these two sites, so the
+# borrow-escape class is fully enumerated here and nothing else is hiding.
+# Unchanged: prod-UNREACHABLE (IS_PRODUCTION_BUILD refuses to start with
+# dap_enabled=true), so fork-zero-ENFORCED still holds. The WriteGuard adapter
+# remains the real fix.
 
 # ── ADR-0099 Addendum 3 — SPLIT-fork CLI one-shots (this session) ──────────────
 # The scanner now sees the store-shape / moved-Connection split fork (opener and

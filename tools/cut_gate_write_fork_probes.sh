@@ -134,6 +134,60 @@ expect_silent "W9 appender-helper ALONE (takes conn + appends, NO opener): the f
     aberp_audit_ledger::append_in_tx(c, m, k, v, a, None).unwrap();
 }'
 
+# ── Addendum 4 — the RETURNED-`Ledger` escape (the 2026-07-19 incident) ───────
+# W10 is THE regression probe: it is the snapshot daemon's exact pre-incident
+# shape. Before Addendum 4 the scanner was SILENT on this and the gate reported
+# GREEN while prod forked its ledger three times in two weeks. If W10 ever goes
+# silent again, the fix has been reverted and the blind spot is back.
+expect_emit "W10 RETURNED-Ledger fork: opener hands a Ledger back, caller appends (the snapshot-daemon shape — seq 8056)" \
+'fn open_ledger(p: &std::path::Path, t: &TenantId, b: BinaryHash) -> Result<Ledger> {
+    Ledger::open(p, t.clone(), b).map_err(|e| anyhow::anyhow!("{e}"))
+}
+fn take_and_emit(p: &std::path::Path, t: &TenantId, b: BinaryHash, a: Actor) -> Result<()> {
+    let mut ledger = open_ledger(p, t, b)?;
+    ledger.append(EventKind::SnapshotCreated, payload.to_bytes(), a, None)?;
+    Ok(())
+}'
+
+expect_emit "W10b RETURNED-Ledger, append reached via a same-file appender helper (transitive)" \
+'fn open_ledger(p: &std::path::Path) -> Result<Ledger> {
+    Ledger::open(p, t, b).map_err(|e| anyhow::anyhow!("{e}"))
+}
+fn emit(p: &std::path::Path) -> Result<()> {
+    let mut l = open_ledger(p)?;
+    push(&mut l);
+    Ok(())
+}
+fn push(l: &mut Ledger) {
+    l.append(EventKind::Test, v, a, None).unwrap();
+}'
+
+# The false-positive guards. `Ledger` is ALSO the ledger READ/walk API, and the
+# tree has eight runtime read-only `Ledger::open` sites (print_invoice,
+# reports, export_invoice_bundle, the resolve_*_precondition helpers, the drain
+# runs). Those belong to the READ-fork gate; if the write gate starts flagging
+# them it has become a false-positive machine and duplicates that gate.
+expect_silent "W11 read-only Ledger::open (entries/verify_chain), NO append, NOT returned — a read-fork-gate concern" \
+'fn resolve_precondition(p: &std::path::Path) -> Result<StuckPrecondition> {
+    let ledger = Ledger::open(p, t, b).context("open audit ledger")?;
+    let e = ledger.entries().context("read entries")?;
+    audit_query::stuck_precondition(&ledger, id)
+}'
+
+expect_silent "W11b Ledger opened and RETURNED, but no caller ever appends (a pure read-side handout)" \
+'fn open_ledger(p: &std::path::Path) -> Result<Ledger> {
+    Ledger::open(p, t, b).map_err(|e| anyhow::anyhow!("{e}"))
+}
+fn report(p: &std::path::Path) -> Result<Vec<Row>> {
+    let l = open_ledger(p)?;
+    walk_ledger(&l, window)
+}'
+
+expect_silent "W11c appending fn TAKES a &mut Ledger but opens nothing — the fork is the opener, not the helper" \
+'fn push(l: &mut Ledger) {
+    l.append(EventKind::Test, v, a, None).unwrap();
+}'
+
 # ── the BLIND-SPOT invariant: the OLD colocated-only model misses the split ──
 # A minimal reference implementation of the PRE-Addendum-3 semantics (emit only
 # when an opener AND an append sit in the SAME fn). If this ever EMITS on the
