@@ -110,8 +110,10 @@
 #       are cross-fn (open here, append in open_service_session_and_recover /
 #       heartbeat), so the per-fn write-fork scanner is BLIND to them. TRACKED
 #       RESIDUAL, SECURED: a PRODUCTION build refuses to start when dap_enabled=true
-#       (serve.rs DÁP boot arm, build_profile::IS_PRODUCTION_BUILD) → unreachable in
-#       prod. See tools/adr0099_write_fork_allowlist.txt residual note.
+#       (serve.rs DÁP boot arm, build_profile::IS_PRODUCTION_BUILD) → never ARMED
+#       in prod. Precisely: a runtime `if` on a const, not a `cfg`, so the branch is
+#       not-taken rather than the code unreachable. See
+#       tools/adr0099_write_fork_allowlist.txt residual note.
 #     • serve.rs:seed_demo_sample_data (+1) — S434 boot-time, best-effort seed of the
 #       SEPARATE bundled-demo DB (not the booted tenant's Handle, not in-serve). A
 #       legitimate boot opener, not a fork.

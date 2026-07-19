@@ -61,11 +61,22 @@ rolled-back DB instead of healing the DB forward — the rollback sticks.
 
 ### Sequencing (both cases)
 
-1. `aberp snapshot restore <selector> --to <side-path> --confirm --tenant prod`
+> **Precondition: `aberp serve` must be STOPPED before you run `snapshot
+> restore`.** This is not advisory — the restore appends `snapshot.restored` to
+> the LIVE tenant ledger, so it takes the ADR-0099 F-E whole-DB writer lock and
+> **refuses** while serve holds it (`… another ABERP writer is already running on
+> tenant 'prod' …`). There is no override flag, and none is needed: you have to
+> stop serve to swap the file anyway. The lock is an `fs2` flock released by the
+> kernel when the holding process's fd closes — including on a crash or SIGKILL —
+> so a dead or crash-looping serve never leaves a stale lock behind. If the
+> refusal persists, a serve process really is still alive; find and stop it.
+
+1. **Stop `aberp serve`** in the `run_prod.sh` terminal (Ctrl-C). Never swap a
+   live file under a running serve — and the restore in step 2 will refuse until
+   you have.
+2. `aberp snapshot restore <selector> --to <side-path> --confirm --tenant prod`
    (the guard refuses a `--to` under any live `~/.aberp/` home).
-2. Verify the restored side-path DB.
-3. **Stop `aberp serve`** in the `run_prod.sh` terminal (Ctrl-C). Never swap a
-   live file under a running serve.
+3. Verify the restored side-path DB.
 4. **Rollback only:** clear the mirror siblings (command above).
 5. Swap the restored DB into the tenant home.
 6. Start serve; confirm the boot log shows the reconcile action you expect

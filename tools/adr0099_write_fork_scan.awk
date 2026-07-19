@@ -72,8 +72,9 @@
 # ANOTHER FILE (serve.rs:spawn_dap_audit_chain, audit_dap_boot.rs:
 # run_heartbeat_supervised). Catching those needs a cross-file call graph this
 # per-file scanner does not have. They remain TRACKED as documented residuals in
-# tools/adr0099_write_fork_allowlist.txt and are prod-unreachable by the
-# IS_PRODUCTION_BUILD dap_enabled guard.
+# tools/adr0099_write_fork_allowlist.txt and are never ARMED in prod by the
+# IS_PRODUCTION_BUILD dap_enabled guard (a runtime `if` on a const, not a `cfg`:
+# the branch is not-taken, the code is not unreachable).
 #
 # An INDEPENDENT live-DB opener is one of
 #     Connection::open(_with_flags)? / Ledger::open / DuckDbBillingStore::open /

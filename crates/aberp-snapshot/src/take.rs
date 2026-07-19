@@ -144,26 +144,42 @@ fn fail(msg: String) -> ValidationReport {
 /// ## ADR-0099 — `conn` is CALLER-SUPPLIED, never opened here
 ///
 /// `conn` MUST be a connection to the shared `aberp_db::Handle` instance
-/// (`Handle::read()` — a `try_clone`, not a second OS open). This module used
-/// to `Connection::open(db_path)` here. Inside `aberp serve` that was a SECOND
-/// opener co-resident with the shared Handle, and **closing it folded the
-/// Handle's WAL into the main file**: the Handle runs `checkpoint_enabled:false`
-/// + `PRAGMA disable_checkpoint_on_shutdown` (set in `aberp-db` and nowhere
-/// else) precisely so its commits stay WAL-resident, and the fresh open carried
-/// neither. The fold landed while `sync_mirror` had already durably appended
-/// those rows — putting the audit mirror ahead of the DB (seq 8060 > 8058) and
-/// refusing boot on 2026-07-19.
+/// (`Handle::read()` — a `try_clone`, not a second `Connection::open`). This
+/// module used to `Connection::open(db_path)` here, and inside `aberp serve`
+/// **closing that connection folded the Handle's WAL into the main file**.
 ///
-/// Taking the connection from the caller removes the second open entirely, so
-/// there is no close and nothing folds. Pinned by
+/// The mechanism is SESSION scope, and it is worth stating precisely because the
+/// obvious reading is wrong. DuckDB shares ONE instance per path per process, so
+/// the fresh open did NOT get its own database — it got a second *session* on
+/// the same one. But `wal_autocheckpoint` and `disable_checkpoint_on_shutdown`
+/// are per-CONNECTION settings, not per-database ones: `aberp-db` applies them
+/// to every connection it hands out (`PRAGMA disable_checkpoint_on_shutdown` +
+/// `PRAGMA wal_autocheckpoint='1TB'`), and a connection opened outside that seam
+/// carries DuckDB's defaults instead. So the fresh session sat on the SHARED
+/// instance with checkpointing switched back on, and its close checkpointed the
+/// shared instance's WAL — the Handle's own settings could not prevent it.
+///
+/// Measured on the same file in the same process: a `Handle` clone reports
+/// `wal_autocheckpoint` = 931.3 GiB, a fresh `Connection::open` = 16.0 MiB.
+///
+/// The fold landed while `sync_mirror` had already durably appended those rows —
+/// putting the audit mirror ahead of the DB (seq 8060 > 8058) and refusing boot
+/// on 2026-07-19.
+///
+/// Taking the connection from the caller removes the foreign session entirely,
+/// so there is no default-pragma close and nothing folds. Pinned by
 /// `apps/aberp/tests/snapshot_e2e.rs::snapshot_does_not_fold_the_handles_wal`
 /// (mutation-verified: re-introducing the fresh open here drains the WAL
 /// 3156 → 0 bytes and fails that test).
 ///
-/// NOTE on coherence: within ONE process DuckDB shares a single instance per
-/// path, so the old fresh open did still *read* the live WAL — the export was
-/// not stale. Verified by mutation, and recorded here so nobody re-derives a
-/// staleness rationale that does not hold. The fold is the defect.
+/// NOTE on coherence: because the instance IS shared, the old fresh session did
+/// still *read* the live WAL — the export was not stale. Recorded here so nobody
+/// re-derives a staleness rationale that does not hold. The fold is the defect.
+///
+/// FLAG (not chased): `ABERP-Editions` `adr/0098-*.md:40` asserts the opposite
+/// (that these pragmas are database-scoped). That is inconsistent with the
+/// measurement above on this tree's duckdb 1.10503 and is most likely
+/// version-stale. Noted, deliberately not reconciled here — it is another repo.
 pub fn take_snapshot(
     conn: &Connection,
     db_path: &Path,

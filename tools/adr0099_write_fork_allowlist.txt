@@ -65,7 +65,12 @@ apps/aberp/src/serve.rs:record_upgrade_snapshot_mismatch_audit
 # the Ledger-over-WriteGuard adapter that does not yet exist.
 # SECURED, not blessed: a PRODUCTION build (build_profile::IS_PRODUCTION_BUILD)
 # REFUSES TO START when a tenant has dap_enabled=true (serve.rs DÁP boot arm), so
-# the fork is UNREACHABLE in prod and the fork-zero-ENFORCED state holds. This note
+# the fork is NEVER ARMED in prod and the fork-zero-ENFORCED state holds. Stated
+# precisely: that guard is a RUNTIME `if` on the IS_PRODUCTION_BUILD const, NOT a
+# `cfg` — the DÁP code is compiled into the prod binary and the branch is merely
+# NOT TAKEN. "Unreachable" would overclaim; the guard holds because it is the one
+# early-return on the only path that reaches DÁP, not because the code is absent.
+# This note
 # exists so the ENFORCE flip does not silently miss the scanner-blind residual.
 # NEXT: build the WriteGuard adapter, route DÁP onto the Handle, drop the prod guard.
 #
@@ -80,8 +85,9 @@ apps/aberp/src/serve.rs:record_upgrade_snapshot_mismatch_audit
 # cross-file call graph this per-file scanner does not have. A repo-wide sweep for
 # non-test `&mut ledger` argument passing found ONLY these two sites, so the
 # borrow-escape class is fully enumerated here and nothing else is hiding.
-# Unchanged: prod-UNREACHABLE (IS_PRODUCTION_BUILD refuses to start with
-# dap_enabled=true), so fork-zero-ENFORCED still holds. The WriteGuard adapter
+# Unchanged: NOT ARMED in prod (the runtime IS_PRODUCTION_BUILD `if` refuses to
+# start with dap_enabled=true - not-taken, not unreachable; see above), so
+# fork-zero-ENFORCED still holds. The WriteGuard adapter
 # remains the real fix.
 
 # ── ADR-0099 Addendum 3 — SPLIT-fork CLI one-shots (this session) ──────────────

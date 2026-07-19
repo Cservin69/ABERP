@@ -2852,9 +2852,13 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 // moment a tenant sets `dap_enabled`. Migrating them needs the
                 // Ledger-over-WriteGuard adapter that does not yet exist (Editions never
                 // built it). Until then, a PRODUCTION build REFUSES TO START rather than
-                // arm the latent fork (fail loud — CLAUDE.md rule 11); this makes the
-                // residual UNREACHABLE in prod, so the fork-zero-ENFORCED acceptance
-                // state holds without an allow-list blessing. NetlockTsa is itself
+                // arm the latent fork (fail loud — CLAUDE.md rule 11), so the
+                // fork-zero-ENFORCED acceptance state holds without an allow-list
+                // blessing. Note the precision: this is a RUNTIME `if` on the
+                // `IS_PRODUCTION_BUILD` const, not a `cfg` — the DÁP code is still
+                // compiled into the prod binary, the branch is merely NOT TAKEN. Do not
+                // read it as "unreachable"; the guard's strength is that it is the one
+                // early-return on the only path that reaches DÁP. NetlockTsa is itself
                 // `todo!()`, so a prod DÁP path could not function anyway. Non-production
                 // builds still exercise the DÁP structural floor (MockTsa) under test.
                 // Tracked in tools/adr0099_write_fork_allowlist.txt (residual note).

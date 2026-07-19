@@ -339,3 +339,106 @@ fn snapshot_audit_and_concurrent_handle_writer_cannot_share_a_seq() {
     );
     assert_eq!(count_kind(&h, EventKind::SnapshotCreated), 3);
 }
+
+// ── F-E whole-DB writer flock: the snapshot CLI one-shots are REAL writers ──
+
+/// ADR-0099 F-E coherence guarantee, pinned permanently — the mirror of
+/// `export_invoice_bundle_smoke.rs::run_refuses_while_the_whole_db_writer_lock_is_held`
+/// for `aberp snapshot now`.
+///
+/// `snapshot.rs::open_cli_handle` documents that the one-shots are "mutually
+/// excluded by the F-E whole-DB writer flock". That claim is only true because
+/// `run_now` ACQUIRES the flock; nothing else enforces it. While another writer
+/// (stand-in for a running `aberp serve`) holds the lock, `snapshot now` must
+/// REFUSE — otherwise it opens a second whole-DB writer on a live tenant DB and
+/// appends `SnapshotCreated` into a forked ledger.
+#[test]
+fn snapshot_now_refuses_while_the_whole_db_writer_lock_is_held() {
+    let dir = ScopedTempDir::new("now-flock");
+    let db = dir.path().join("aberp.duckdb");
+    seed(&db, 2, 1);
+    let store = dir.path().join("store");
+
+    // Stand-in for a running `serve`: hold the whole-DB writer lock for `db`.
+    let _held = aberp::db_writer_lock::try_acquire(&db, TENANT)
+        .expect("acquire ok")
+        .expect("stand-in serve must get the lock");
+
+    let args = aberp::cli::SnapshotNowArgs {
+        db: db.clone(),
+        tenant: TENANT.to_string(),
+        store: Some(store.clone()),
+    };
+    let err = aberp::snapshot::run_now(&args)
+        .expect_err("`snapshot now` MUST refuse while the whole-DB writer lock is held");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("single-writer") || msg.contains("already running"),
+        "refusal must cite the single-writer rule: {msg}"
+    );
+    assert!(
+        !store.exists(),
+        "no snapshot may be written when `snapshot now` refuses"
+    );
+}
+
+/// Same pin for `aberp snapshot restore` — the acute one: this is the
+/// documented prod-repair path, and it appends `SnapshotRestored` to the LIVE
+/// tenant ledger. A real, restorable snapshot is staged first, so without the
+/// flock this restore would SUCCEED — that is the mutation tooth.
+#[test]
+fn snapshot_restore_refuses_while_the_whole_db_writer_lock_is_held() {
+    let dir = ScopedTempDir::new("restore-flock");
+    let db = dir.path().join("aberp.duckdb");
+    seed(&db, 4, 2);
+    let store = dir.path().join("store");
+
+    // Stage a genuine snapshot so the ONLY thing that can stop the restore is
+    // the flock (selector resolves, store is valid, --to is legal).
+    let rec = {
+        let h = handle(&db);
+        take_and_emit(&h, &store, &tid(), bh(), actor()).expect("stage a snapshot")
+    };
+    assert!(
+        rec.meta.valid,
+        "staged snapshot must be valid: {:?}",
+        rec.meta
+    );
+
+    let target = dir.path().join("recovery").join("aberp.duckdb");
+
+    // Stand-in for a running (or crash-looping) `serve`.
+    let _held = aberp::db_writer_lock::try_acquire(&db, TENANT)
+        .expect("acquire ok")
+        .expect("stand-in serve must get the lock");
+
+    let args = aberp::cli::SnapshotRestoreArgs {
+        selector: rec.meta.seq.to_string(),
+        to: target.clone(),
+        confirm: true,
+        tenant: TENANT.to_string(),
+        db: db.clone(),
+        store: Some(store.clone()),
+    };
+    let err = aberp::snapshot::run_restore(&args)
+        .expect_err("`snapshot restore` MUST refuse while the whole-DB writer lock is held");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("single-writer") || msg.contains("already running"),
+        "refusal must cite the single-writer rule: {msg}"
+    );
+    assert!(
+        !target.exists(),
+        "no database may be written at --to when the restore refuses"
+    );
+
+    // And the refusal is the LOCK, not a broken fixture: once the stand-in
+    // writer releases, the very same restore succeeds. Without this the test
+    // could pass against an unrelated failure.
+    drop(_held);
+    aberp::snapshot::run_restore(&args).expect("restore succeeds once the lock is free");
+    assert!(
+        target.exists(),
+        "restore writes the target DB when unblocked"
+    );
+}

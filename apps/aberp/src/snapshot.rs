@@ -323,6 +323,16 @@ pub fn run_now(args: &SnapshotNowArgs) -> Result<()> {
     let actor = cli_actor("system:snapshot-cli");
     let policy = policy_from_env();
 
+    // ADR-0099 F-E — CROSS-PROCESS whole-DB single-writer lock, held for the
+    // rest of this fn. `aberp snapshot now` APPENDS to the live tenant ledger
+    // (`SnapshotCreated` / `SnapshotValidationFailed` / `SnapshotPruned`), so it
+    // is a DB-mutating one-shot like every other CLI subcommand: refused while
+    // `aberp serve` (or another one-shot) holds the lock, rather than opening a
+    // second writer. Acquired BEFORE `open_cli_handle` so a refusal never opens
+    // the DB at all.
+    let _db_writer_lock =
+        crate::db_writer_lock::acquire_or_refuse(&args.db, tenant.as_str(), "aberp snapshot now")?;
+
     let db = open_cli_handle(&args.db, &tenant)?;
     let rec = run_cycle(&db, &store_dir, &tenant, binary_hash, actor, &policy)?;
     if rec.meta.valid {
@@ -385,6 +395,20 @@ pub fn run_restore(args: &SnapshotRestoreArgs) -> Result<()> {
     let binary_hash = crate::binary_hash::compute().context("compute binary hash")?;
     let actor = cli_actor("system:snapshot-cli");
 
+    // ADR-0099 F-E — same whole-DB writer lock as `snapshot now`. `restore_into`
+    // writes only to `--to`, but this path ALSO appends `SnapshotRestored` to the
+    // LIVE tenant ledger, so it is a DB-mutating one-shot. Deliberately NOT
+    // bypassable: stopping `aberp serve` is a precondition of a restore anyway
+    // (you cannot swap a file under a live serve — see
+    // docs/runbooks/audit-mirror-restore-rollback-caveat.md), and `fs2`'s flock is
+    // released by the kernel when the holder's fd closes — including on SIGKILL —
+    // so a dead serve never leaves a stale lock to force past.
+    let _db_writer_lock = crate::db_writer_lock::acquire_or_refuse(
+        &args.db,
+        tenant.as_str(),
+        "aberp snapshot restore",
+    )?;
+
     let db = open_cli_handle(&args.db, &tenant)?;
     let rec = restore_and_emit(
         &db,
@@ -397,7 +421,8 @@ pub fn run_restore(args: &SnapshotRestoreArgs) -> Result<()> {
     )?;
     println!(
         "Restored snapshot #{} → {}\n\
-         (verify it, then stop `aberp serve` and swap it into place if this is a prod recovery)\n\
+         (verify it, then swap it into place if this is a prod recovery — `aberp serve`\n\
+         is already stopped, since the whole-DB writer lock required it to be)\n\
          NOTE: the audit-ledger mirror `<db>.audit.log` is NOT rebuilt by a restore.\n\
          For CORRUPTION RECOVERY this is correct — the next serve boot heals the DB\n\
          forward from the mirror. For a DELIBERATE ROLLBACK you intend to KEEP, first\n\
@@ -484,9 +509,15 @@ pub async fn run_supervised(deps: SnapshotDaemonDeps, cancel: CancellationToken)
 // ──────────────────────────────────────────────────────────────────────
 
 /// The `aberp snapshot {now,restore}` CLI one-shots run in a SEPARATE process
-/// from `aberp serve` (mutually excluded by the F-E whole-DB writer flock), so
-/// there is no in-process shared Handle to borrow — this constructs the one
-/// Handle for the life of the one-shot. `Handle::open*` is the sanctioned
+/// from `aberp serve`, so there is no in-process shared Handle to borrow — this
+/// constructs the one Handle for the life of the one-shot.
+///
+/// The mutual exclusion that makes that sound is NOT implicit: BOTH callers —
+/// [`run_now`] and [`run_restore`] — acquire the F-E whole-DB writer flock
+/// (`db_writer_lock::acquire_or_refuse`) BEFORE calling this, and hold it for
+/// the rest of their fn body. `run_list` does not, and does not need to: it
+/// touches no DB. Adding a third caller here without that flock re-opens the
+/// two-writer window. `Handle::open*` is the sanctioned
 /// single-instance seam, not an independent opener: it applies the
 /// `disable_checkpoint_on_shutdown` pragma, so unlike the `Ledger::open` /
 /// `Connection::open` it replaces it cannot fold a WAL on close.
