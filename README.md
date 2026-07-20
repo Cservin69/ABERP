@@ -27,14 +27,24 @@ hash-chained ledger you can inspect and verify.
 
 ## Two editions
 
+> **The Defense edition ships from a different repository.** This repo
+> (`Cservin69/ABERP`) carries **Portable** and the legacy unified
+> `PROD_v2.*` line. The live Defense line lives on
+> **[`Cservin69/ABERP-Editions`](https://github.com/Cservin69/ABERP-Editions)**
+> and is installed from there — its `PROD_Defense_v*` refs were pruned from
+> this repo on 2026-07-11 (see
+> [`docs/PRUNED_DEFENSE_REFS.md`](docs/PRUNED_DEFENSE_REFS.md)). Nothing in
+> this README installs Defense; follow the Editions repo instead.
+
 | | **Portable** | **Defense (HU production)** |
 |---|---|---|
-| Latest | `PROD_Portable_v0.1.2` (2026-06-16) | `PROD_Defense_v0.2.1` (2026-06-16) |
+| Repo | **this repo** — `Cservin69/ABERP` | `Cservin69/ABERP-Editions` |
+| Latest | `PROD_Portable_v0.1.2` (2026-06-16) | see the Editions repo |
 | For | Anyone, anywhere — evaluating, or running outside Hungary | Hungarian manufacturing shops with NAV obligations + defense / aerospace compliance needs |
 | Tax filing | **Off by default** — invoices stay local (LocalOnly) | Live NAV Online Számla 3.0 e-invoicing |
 | First boot | Demo company pre-seeded — data to explore immediately | Your own seller profile + real NAV credentials |
 | Build | Dev profile — structurally cannot reach the live NAV endpoint | `--features production` — the real-money build |
-| Install | `./run/upgrade_portable.sh` | `./run/upgrade_defense.sh` |
+| Install | `./run/upgrade_portable.sh` | per the Editions repo |
 
 **Portable** is the path most newcomers want. It is the same application —
 quoting, manufacturing, the audit ledger, all of it — with the Hungarian
@@ -52,10 +62,9 @@ run for real money.
 
 > **The legacy unified `PROD_v2.27.76` line is frozen.** Up to that tag,
 > Portable and Defense shipped as one build. New work now lands on the two
-> dedicated lines above — Portable for everyone, Defense for HU production
-> — so each edition gets a launcher and an upgrade path scoped to it.
-> Existing `PROD_v2.27.76` installs keep working; there is just no
-> `PROD_v2.27.77`.
+> dedicated lines above — Portable here, Defense on `ABERP-Editions` — so
+> each edition gets a launcher and an upgrade path scoped to it. Existing
+> `PROD_v2.27.76` installs keep working; there is just no `PROD_v2.27.77`.
 
 ---
 
@@ -110,28 +119,22 @@ your runtime data lives under `~/.aberp/<tenant>/`.
 
 ---
 
-## Quick start — Defense (HU production)
+## Defense (HU production) — installed from another repo
 
 **For Hungarian operators with real NAV credentials and live NAV
-submission obligations.** This builds with `--features production`, talks
-to the real NAV Online Számla endpoint, and files invoices for real. Don't
-run it unless that's what you want — Portable above is the safe sandbox.
+submission obligations.** The Defense edition builds with
+`--features production`, talks to the real NAV Online Számla endpoint, and
+files invoices for real.
 
-```bash
-git clone https://github.com/Cservin69/ABERP.git ABERP-Defense
-cd ABERP-Defense
-git fetch origin --tags
-./run/upgrade_defense.sh PROD_Defense_v0.2.1
-```
+**It is not installable from this repo.** The live Defense line and its
+`PROD_Defense_v*` releases are on
+**<https://github.com/Cservin69/ABERP-Editions>** — clone that repo and
+follow its README. This repo's `PROD_Defense_v0.1.x`–`v0.2.1` refs were
+abandoned and pruned on 2026-07-11
+([`docs/PRUNED_DEFENSE_REFS.md`](docs/PRUNED_DEFENSE_REFS.md)); do not
+install from them.
 
-`upgrade_defense.sh` mirrors the Portable upgrade — confirm the release,
-snapshot existing tenant data, reset cleanly, provision the CAD Python
-environment, build, launch — but it is the real-money path: it **requires**
-a tenant and seller profile, forces a mandatory snapshot (no skip), and
-launches into the production build with the **"DEFENSE MODE: AVL + heat/lot
-+ DÁP-ready"** banner. Set up your NAV + SMTP credentials first (see
-[recipe 7](#7-set-up-nav-creds--smtp-on-a-fresh-box-új-gépen-alapbeállítás)
-and the [runbook](docs/CUTOVER_RUNBOOK.md)).
+Portable, above, is the edition this repo installs.
 
 ---
 
@@ -235,10 +238,11 @@ A few things under the hood that engineers tend to enjoy:
 - **Current Portable stable: `PROD_Portable_v0.1.2`** (cut 2026-06-16) —
   the edition the Quick Start above installs. Dev-profile build, NAV off,
   demo tenant seeded. `./run/upgrade_portable.sh PROD_Portable_v0.1.2`.
-- **Current Defense stable: `PROD_Defense_v0.2.1`** (cut 2026-06-16) — the
-  HU-production build with live NAV plus the defense/aerospace compliance
-  stack (AVL, purchasing, heat/lot, part UID, NCR/CAPA, QC inspection).
-  `./run/upgrade_defense.sh PROD_Defense_v0.2.1`.
+- **Defense — not released from this repo.** The HU-production build with
+  live NAV plus the defense/aerospace compliance stack (AVL, purchasing,
+  heat/lot, part UID, NCR/CAPA, QC inspection) ships from
+  [`Cservin69/ABERP-Editions`](https://github.com/Cservin69/ABERP-Editions).
+  Its release refs and install procedure live there.
 - **Legacy unified `PROD_v2.27.76` — frozen.** The last release before the
   Portable / Defense split. Still installable via
   `./run/upgrade_prod.sh PROD_v2.27.76` for existing operators (see the
@@ -252,7 +256,7 @@ safe to hand to anyone.
 
 ---
 
-## Defense (HU production) install
+## HU production install
 
 The complete procedure — first-time prod branch, `seller.toml` template,
 NAV + SMTP credentials, smoke-invoice checklist, rollback, and the ongoing
@@ -260,21 +264,10 @@ update workflow — lives in:
 
 → **[`docs/CUTOVER_RUNBOOK.md`](docs/CUTOVER_RUNBOOK.md)**
 
-Short version, on the prod machine:
-
-```bash
-git clone --branch PROD_Defense_v0.2.1 https://github.com/Cservin69/ABERP.git ABERP-Defense
-cd ABERP-Defense
-./run/run_defense.sh   # builds with --features production, launches the shell
-```
-
-To upgrade an existing Defense install, snapshot first (DuckDB storage
-upgrades are one-way), then:
-
-```bash
-git fetch origin && git reset --hard origin/PROD_Defense_v0.2.1 && \
-  ./run/upgrade_defense.sh PROD_Defense_v0.2.1
-```
+That runbook covers the `PROD_v2.*` line shipped from this repo, driven by
+`./run/run_prod.sh` and `./run/upgrade_prod.sh`. **For the Defense edition,
+use the [`ABERP-Editions`](https://github.com/Cservin69/ABERP-Editions)
+repo and its own launchers** — there is no Defense install path here.
 
 The versioning rules (when to bump patch vs minor vs major) are pinned in
 [`adr/0056-versioning-policy.md`](adr/0056-versioning-policy.md).
@@ -343,8 +336,7 @@ ABERP/
     aberp/             ← the Rust backend (HTTPS+JSON localhost service)
     aberp-ui/          ← Tauri 2 shell + Svelte 5 SPA (ADR-0004)
   run/                 ← launcher scripts (run_portable / upgrade_portable /
-                         run_defense / upgrade_defense / run_prod /
-                         upgrade_prod / release)
+                         run_prod / upgrade_prod / release)
   tools/               ← operational scripts (snapshot, icons)
 ```
 
@@ -382,8 +374,10 @@ your edition:
 
 - **Portable** — `*_portable.sh` and a `PROD_Portable_v*` tag
   (`PROD_Portable_v0.1.2` is current).
-- **Defense** — `*_defense.sh` and a `PROD_Defense_v*` tag
-  (`PROD_Defense_v0.2.1` is current).
+- **Legacy unified line** — `*_prod.sh` and a `PROD_v2.*` tag.
+
+Defense operators: these recipes do not apply — use the
+[`ABERP-Editions`](https://github.com/Cservin69/ABERP-Editions) repo.
 
 ### 1. Upgrade to a new release (Frissítés új verzióra)
 
@@ -433,8 +427,8 @@ Sanity-check before any `git reset --hard origin/<VERSION>`.
 
 ```bash
 git ls-remote https://github.com/Cservin69/ABERP.git \
-  refs/heads/main refs/heads/PROD_Defense_v0.2.1 \
-  refs/tags/PROD_Defense_v0.2.1
+  refs/heads/main refs/heads/PROD_Portable_v0.1.2 \
+  refs/tags/PROD_Portable_v0.1.2
 ```
 
 ### 6. DuckDB snapshot / restore — the panic button (DuckDB pillanatkép)
@@ -464,7 +458,7 @@ working DB with a broken one.
 
 ### 7. Set up NAV creds + SMTP on a fresh box (Új gépen alapbeállítás)
 
-For the **Defense (HU production)** edition, after cloning and before the
+For any **NAV-on (HU production)** install, after cloning and before the
 first prod launch. (Portable needs none of this — NAV is off.)
 
 ```bash

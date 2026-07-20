@@ -52,7 +52,17 @@ Loopback is the OAuth-for-native-apps norm and is **per-login disposable**: a fr
 
 ### 3. Sandbox vs production swap
 
-A single env var **`DAP_ENV`** selects the endpoint set: `sandbox` | `production`. **Default is `production` on Defense builds** (the Defense launcher, `run/run_defense.sh`, sets it; a Portable/demo build never constructs `DapProvider` at all — it runs the mock or NAV-off path). An unrecognised `DAP_ENV` value is a **loud boot error**, never a silent fall-through to either environment (mirrors ADR-0070's `ABERP_DIGITAL_ID_PROVIDER` loud-fallback posture). The endpoint set behind each value is filled from the szeusz.gov.hu spec at RP-registration time.
+A single env var **`DAP_ENV`** selects the endpoint set: `sandbox` | `production`. **Default is `production` on Defense builds** (the Defense launcher sets it; a Portable/demo build never constructs `DapProvider` at all — it runs the mock or NAV-off path).
+
+> **Correction 2026-07-20 (repo-layout only; the decision above is unchanged).**
+> The original text named `run/run_defense.sh` in this repo as the launcher
+> that sets `DAP_ENV`. That script has been **deleted** — the live Defense
+> line moved to `Cservin69/ABERP-Editions` and its `PROD_Defense_v*` refs
+> were pruned from `Cservin69/ABERP` on 2026-07-11
+> (`docs/PRUNED_DEFENSE_REFS.md`). The Defense launcher that owns `DAP_ENV`
+> lives in the **ABERP-Editions** repo. The `DAP_ENV` contract itself —
+> `sandbox` | `production`, production-default on Defense builds,
+> loud-fail on an unrecognised value — is unaffected. An unrecognised `DAP_ENV` value is a **loud boot error**, never a silent fall-through to either environment (mirrors ADR-0070's `ABERP_DIGITAL_ID_PROVIDER` loud-fallback posture). The endpoint set behind each value is filled from the szeusz.gov.hu spec at RP-registration time.
 
 ### 4. Fallback when DÁP is down or the phone is unreachable
 
