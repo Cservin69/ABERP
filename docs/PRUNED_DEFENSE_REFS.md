@@ -60,13 +60,24 @@ recorded below for completeness, though the commit they point to is what matters
 ## NOT pruned (deliberately preserved)
 
 - **All prod refs**: `main`, and `PROD_v1.4.1` … `PROD_v2.28.0` branches + tags. Untouched.
-- **Portable line** (`PROD_Portable_v0.1.0/0.1.1/0.1.2`, branches + tags): **VERIFIED LIVE on
-  ABERP.git — NOT pruned, and must not be.** `~/ABERP-Portable`'s origin is ABERP.git (not
-  Editions), it is checked out at `PROD_Portable_v0.1.2` (`6a51d4f`), and ABERP-Editions.git
-  carries **no** Portable refs. So the Portable upgrade/relaunch path depends on these refs.
-  Unlike Defense (which moved to Editions), the Portable line still lives on ABERP.git — these
-  are permanent refs, not dead aliases. (Their commits are also ancestors of `main`, but the
-  live-dependency is the reason they stay.)
+- **Portable line** (`PROD_Portable_v0.1.0/0.1.1/0.1.2`, branches + tags): **still on origin,
+  NOT pruned — but the reason recorded here on 2026-07-11 no longer holds.**
+
+  > **SUPERSEDED 2026-07-21.** The original note read: "VERIFIED LIVE on ABERP.git — NOT
+  > pruned, and must not be", justified by `~/ABERP-Portable` having origin ABERP.git and
+  > being checked out at `PROD_Portable_v0.1.2` (`6a51d4f`). **That checkout no longer
+  > exists.** It was deleted on 2026-07-21: it was clean, had zero commits absent from
+  > origin, and its data root (`~/.aberp/demo`) held zero invoices and zero NAV submissions
+  > (archived to `_archive/aberp-portable-demo-tenant-root-20260721.tgz` first). The
+  > Portable **line** belongs to `ABERP-Editions.git`, and this repo's Portable launcher
+  > pair was deleted the same day. **Nothing live depends on these refs any more.**
+
+  They stay on origin regardless, for a different and simpler reason: their commits are
+  ancestors of `main`, so keeping them costs nothing, and they are the recovery source for
+  the deleted launchers (`git show PROD_Portable_v0.1.2:run/run_portable.sh`). Treat them
+  as history. **Do not treat their existence as evidence that a Portable install path lives
+  in this repo — it does not.** Editions has not cut a Portable release yet; the line is
+  deliberately parked.
 - **Local Defense tags**: the 5 `PROD_Defense_v0.1.0`–`v0.2.1` tags still exist in the local
   clone (scope was origin refs only). They can be dropped with
   `git tag -d PROD_Defense_v0.1.0 …` in a follow-up if desired.

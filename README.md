@@ -27,24 +27,27 @@ hash-chained ledger you can inspect and verify.
 
 ## Two editions
 
-> **The Defense edition ships from a different repository.** This repo
-> (`Cservin69/ABERP`) carries **Portable** and the legacy unified
-> `PROD_v2.*` line. The live Defense line lives on
+> **Both editions ship from a different repository.** This repo
+> (`Cservin69/ABERP`) carries the **PROD** (HU production) and **DEV**
+> launchers and the legacy unified `PROD_v2.*` line — nothing else. The
+> **Portable** and **Defense** lines both live on
 > **[`Cservin69/ABERP-Editions`](https://github.com/Cservin69/ABERP-Editions)**
-> and is installed from there — its `PROD_Defense_v*` refs were pruned from
-> this repo on 2026-07-11 (see
-> [`docs/PRUNED_DEFENSE_REFS.md`](docs/PRUNED_DEFENSE_REFS.md)). Nothing in
-> this README installs Defense; follow the Editions repo instead.
+> and are installed from there. Defense's `PROD_Defense_v*` refs were
+> pruned from this repo on 2026-07-11 (see
+> [`docs/PRUNED_DEFENSE_REFS.md`](docs/PRUNED_DEFENSE_REFS.md)); Portable's
+> launcher pair was deleted on 2026-07-21 for the same reason — a launcher
+> in the wrong repo is what misleads the next reader. **Nothing in this
+> README installs either edition; follow the Editions repo.**
 
 | | **Portable** | **Defense (HU production)** |
 |---|---|---|
-| Repo | **this repo** — `Cservin69/ABERP` | `Cservin69/ABERP-Editions` |
-| Latest | `PROD_Portable_v0.1.2` (2026-06-16) | see the Editions repo |
+| Repo | `Cservin69/ABERP-Editions` | `Cservin69/ABERP-Editions` |
+| Latest | **no release cut yet** — the line is parked | see the Editions repo |
 | For | Anyone, anywhere — evaluating, or running outside Hungary | Hungarian manufacturing shops with NAV obligations + defense / aerospace compliance needs |
 | Tax filing | **Off by default** — invoices stay local (LocalOnly) | Live NAV Online Számla 3.0 e-invoicing |
 | First boot | Demo company pre-seeded — data to explore immediately | Your own seller profile + real NAV credentials |
 | Build | Dev profile — structurally cannot reach the live NAV endpoint | `--features production` — the real-money build |
-| Install | `./run/upgrade_portable.sh` | per the Editions repo |
+| Install | per the Editions repo, once a release is cut | per the Editions repo |
 
 **Portable** is the path most newcomers want. It is the same application —
 quoting, manufacturing, the audit ledger, all of it — with the Hungarian
@@ -70,35 +73,24 @@ run for real money.
 
 ## Quick start — Portable
 
-On a Mac, from a terminal:
+**Portable is not installed from this repo.** It ships from
+**[`Cservin69/ABERP-Editions`](https://github.com/Cservin69/ABERP-Editions)**,
+alongside Defense. This repo's Portable launcher pair
+(`run/run_portable.sh`, `run/upgrade_portable.sh`) was deleted on
+2026-07-21: it pointed at a line this repo no longer owns, and a launcher
+that should not be run is exactly the artifact that misleads the next
+reader into treating a parked line as live.
 
-```bash
-git clone https://github.com/Cservin69/ABERP.git ABERP-Portable
-cd ABERP-Portable
-git fetch origin --tags
-./run/upgrade_portable.sh PROD_Portable_v0.1.2
-```
+**There is deliberately no Portable installer here right now.** The
+Editions repo has not cut a Portable release yet — the line is parked on
+purpose. Until it is cut, there is no install path; that gap is intended,
+not a regression. Watch the Editions repo.
 
-That last command does everything for you, in order:
-
-1. Confirms the `PROD_Portable_v0.1.2` release exists on GitHub.
-2. Snapshots any existing tenant data first (skipped on a fresh install —
-   nothing to roll back to yet).
-3. Resets your checkout cleanly to the release.
-4. Provisions a small Python environment for the CAD geometry pipeline
-   (so STL/STEP quoting works without you installing anything by hand).
-5. Builds and launches the desktop app straight into the **demo** tenant.
-
-The first window opens on a dashboard (not a setup wizard) with a sample
-company already populated — partners, products, and machines to click
-through. A friendly green **"PORTABLE BUILD — NO NAV — local-only"** banner
-in the launch terminal confirms no invoices will be filed anywhere.
-
-To run your own company instead of the demo, give the tenant a name:
-
-```bash
-ABERP_TENANT=acme ./run/run_portable.sh
-```
+The `PROD_Portable_v0.1.0`–`v0.1.2` refs remain on this repo's origin —
+they are ancestors of `main`, so nothing is unreachable and the old
+launchers are recoverable from any of them
+(`git show PROD_Portable_v0.1.2:run/run_portable.sh`). They are history,
+not an install path.
 
 > **macOS only, for now.** Shipped builds target macOS (the desktop shell
 > and keychain integration need per-OS work). Linux and Windows are
@@ -134,7 +126,10 @@ abandoned and pruned on 2026-07-11
 ([`docs/PRUNED_DEFENSE_REFS.md`](docs/PRUNED_DEFENSE_REFS.md)); do not
 install from them.
 
-Portable, above, is the edition this repo installs.
+Portable is **also** installed from that repo — see
+[Quick start — Portable](#quick-start--portable). This repo installs
+neither edition; it carries the PROD and DEV launchers and the legacy
+unified line only.
 
 ---
 
@@ -235,9 +230,11 @@ A few things under the hood that engineers tend to enjoy:
 
 ## Status
 
-- **Current Portable stable: `PROD_Portable_v0.1.2`** (cut 2026-06-16) —
-  the edition the Quick Start above installs. Dev-profile build, NAV off,
-  demo tenant seeded. `./run/upgrade_portable.sh PROD_Portable_v0.1.2`.
+- **Portable — not released from this repo, and parked.** The line moved
+  to [`Cservin69/ABERP-Editions`](https://github.com/Cservin69/ABERP-Editions),
+  which has not cut a Portable release yet. This repo's launcher pair was
+  deleted on 2026-07-21; `PROD_Portable_v0.1.2` (cut 2026-06-16) remains
+  on origin as history, not as an install path.
 - **Defense — not released from this repo.** The HU-production build with
   live NAV plus the defense/aerospace compliance stack (AVL, purchasing,
   heat/lot, part UID, NCR/CAPA, QC inspection) ships from
@@ -335,8 +332,8 @@ ABERP/
   apps/
     aberp/             ← the Rust backend (HTTPS+JSON localhost service)
     aberp-ui/          ← Tauri 2 shell + Svelte 5 SPA (ADR-0004)
-  run/                 ← launcher scripts (run_portable / upgrade_portable /
-                         run_prod / upgrade_prod / release)
+  run/                 ← launcher scripts (run_prod / upgrade_prod — PROD;
+                         run_desktop / dev-test — DEV; release)
   tools/               ← operational scripts (snapshot, icons)
 ```
 
@@ -372,11 +369,11 @@ Field-tested commands, written against the legacy `run_prod.sh` /
 `upgrade_prod.sh` launcher names with a `<VERSION>` placeholder. Swap for
 your edition:
 
-- **Portable** — `*_portable.sh` and a `PROD_Portable_v*` tag
-  (`PROD_Portable_v0.1.2` is current).
+- **PROD (HU production)** — `*_prod.sh` and a `PROD_v2.*` tag.
 - **Legacy unified line** — `*_prod.sh` and a `PROD_v2.*` tag.
 
-Defense operators: these recipes do not apply — use the
+Portable and Defense operators: these recipes do not apply — both editions
+use their own launchers in the
 [`ABERP-Editions`](https://github.com/Cservin69/ABERP-Editions) repo.
 
 ### 1. Upgrade to a new release (Frissítés új verzióra)
@@ -427,8 +424,8 @@ Sanity-check before any `git reset --hard origin/<VERSION>`.
 
 ```bash
 git ls-remote https://github.com/Cservin69/ABERP.git \
-  refs/heads/main refs/heads/PROD_Portable_v0.1.2 \
-  refs/tags/PROD_Portable_v0.1.2
+  refs/heads/main refs/heads/PROD_v2.32.1 \
+  refs/tags/PROD_v2.32.1
 ```
 
 ### 6. DuckDB snapshot / restore — the panic button (DuckDB pillanatkép)
