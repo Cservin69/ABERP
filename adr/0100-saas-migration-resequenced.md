@@ -172,7 +172,7 @@ Secondary forks (lower stakes, defaults from ADR-0059 stand): **dual-target vs f
 
 ## 5. First shippable increment — Phase 1 in executable detail
 
-**Goal:** land the three seams + the token fix as a normal desktop release (a PROD_Portable / PROD line cut), byte-behavior-identical on the desktop, so every later cloud phase has a seam to fill and the most urgent pre-exposure blocker is already closed.
+**Goal:** land the three seams + the token fix as a normal desktop release (a PROD_Portable / PROD line cut — in the event it shipped as `PROD_v2.31.0`; the `PROD_Portable` option no longer exists in this repo, that line having moved to `ABERP-Editions.git`), byte-behavior-identical on the desktop, so every later cloud phase has a seam to fill and the most urgent pre-exposure blocker is already closed.
 
 **Scope & exact surfaces:**
 
