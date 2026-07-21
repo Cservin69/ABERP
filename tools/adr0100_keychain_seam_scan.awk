@@ -26,6 +26,20 @@
 # setup_nav_credentials.rs, …) never trip the scan — only real code does.
 # #[cfg(test)] regions are skipped: inline test mocks are "designated test
 # mocks" and never run in production (the seam is a runtime concern).
+#
+# ⚠ KNOWN FAIL-OPEN — DEFERRED, NOT FIXED (found 2026-07-21) ⚠
+# This lexer has no char-literal rule, the exact defect just repaired in
+# tools/adr0098_opener_scan.awk. A char literal holding a quote — out.push('"')
+# — flips `instr` ON and strands the scanner mid-string until the next stray
+# quote. Measured on this tree: 488 stranded lines in tenant_registry.rs, 410 in
+# serve.rs, 49 in numbering.rs. A direct `keyring::Entry` in one of those windows
+# would be INVISIBLE to this gate. Verified with the fixed lexer grafted in:
+# hits go 0 → 0, so NOTHING is hiding behind it today — the exposure is future
+# code, not current code. Deliberately left for its own change rather than
+# widening a prod-gate repair; the fix is to port the char-literal / raw-string /
+# nested-comment lexer block out of adr0098_opener_scan.awk verbatim.
+# (tools/adr0099_{read,write}_fork_scan.awk DO have a char-literal rule and are
+# NOT blind to this; their rule mishandles '\\' and '\u{…}' but fails CLOSED.)
 BEGIN{ depth=0; tdepth=-1; pending=0; inblk=0; instr=0 }
 {
   line=$0
