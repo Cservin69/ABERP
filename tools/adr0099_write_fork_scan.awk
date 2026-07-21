@@ -99,7 +99,7 @@
 # tools/adr0099_write_fork_allowlist.txt. A fn on the allow-list is a SANCTIONED
 # opener (pre-serve boot create/recover, or a separate-process CLI one-shot fenced
 # by the F-E whole-DB writer flock) and is skipped.
-BEGIN{ depth=0; tdepth=-1; pending=0; inblk=0; instr=0; fn_depth=-1; fn_pending=0; insig=0; nfn=0; n_allow=split(allow,A,",") }
+BEGIN{ depth=0; tdepth=-1; pending=0; inblk=0; instr=0; inraw=0; rawh=0; fn_depth=-1; fn_pending=0; insig=0; nfn=0; n_allow=split(allow,A,",") }
 function is_allowed(name,   k){ for(k=1;k<=n_allow;k++) if(A[k]==name) return 1; return 0 }
 # Record the fn whose body we just closed into the per-file buffer (indexed by a
 # unique fid so same-named fns never collide). The END block resolves A* and emits.
@@ -133,19 +133,42 @@ function flush(   id){
   # `fn NAME(c: &Connection) {` the `{` flips insig→0 mid-line, so a post-loop
   # `insig` read would miss the param type. `was_insig` pins it for this line.
   was_insig=insig
-  # code-only view (strip strings / // and /* */ comments / char literals)
+  # code-only view (strip strings / // and /* */ comments / char literals).
+  # LEXER: the tools/adr0098_opener_scan.awk block, ported verbatim (2026-07-21).
+  # The previous hand-rolled char rule mishandled '\\' / '\u{…}' and — the live
+  # fail-open — had NO raw-string rule at all: `let s = r##"a "# b"##;` stranded
+  # this scanner mid-string and hid a real `Connection::open` + `.append()` fork
+  # on the following line. ONE lexer idiom across all four scanners.
   code=""; L=length(line)
   for(i=1;i<=L;i++){
     c=substr(line,i,1); d=substr(line,i,2)
-    if(inblk){ if(d=="*/"){inblk=0;i++} ; continue }
+    if(inraw){
+      if(c=="\""){
+        ok=1; for(kk=1;kk<=rawh;kk++) if(substr(line,i+kk,1)!="#"){ ok=0; break }
+        if(ok){ inraw=0; i+=rawh }
+      }
+      continue
+    }
+    if(inblk){ if(d=="*/"){inblk--;i++} else if(d=="/*"){inblk++;i++} ; continue }
     if(instr){ if(c=="\\"){i++;continue} ; if(c=="\""){instr=0} ; continue }
     if(d=="//"){ break }
-    if(d=="/*"){ inblk=1;i++;continue }
-    if(c=="\""){ instr=1; continue }
+    if(d=="/*"){ inblk++;i++;continue }
+    if(c=="\""){
+      h=0; j=i-1
+      while(j>=1 && substr(line,j,1)=="#"){ h++; j-- }
+      if(j>=1 && substr(line,j,1)=="r" \
+         && (j==1 || substr(line,j-1,1) !~ /[A-Za-z0-9_]/ \
+             || (substr(line,j-1,1)=="b" && (j-1==1 || substr(line,j-2,1) !~ /[A-Za-z0-9_]/)))) {
+        inraw=1; rawh=h; continue
+      }
+      instr=1; continue
+    }
     if(c=="'"){
-       if(substr(line,i,3) ~ /^'\\.'/){ i+=2 }
-       else if(substr(line,i+2,1)=="'"){ i+=2 }
-       continue
+      n1=substr(line,i+1,1); n2=substr(line,i+2,1)
+      if(n1=="\\"){ j=index(substr(line,i+3),"'"); if(j>0) i=i+2+j; continue }
+      if(n2=="'"){ i=i+2; continue }
+      if(n1 !~ /^[A-Za-z_]$/){ j=index(substr(line,i+2),"'"); if(j>0){ i=i+1+j; continue } }
+      continue                            # lifetime / loop label — consumes nothing
     }
     code=code c
     if(c=="{"){

@@ -42,14 +42,62 @@ cd "$ROOT"
 SCAN="tools/adr0099_write_fork_scan.awk"
 ALLOW="tools/adr0099_write_fork_allowlist.txt"
 OPENSCAN="tools/adr0098_opener_scan.awk"   # ALL runtime openers (cfg(test)-aware)
-for req in "$SCAN" "$ALLOW" "$OPENSCAN"; do
+BACKSTOP="tools/cut_gate_scanner_backstop.sh"
+for req in "$SCAN" "$ALLOW" "$OPENSCAN" "$BACKSTOP"; do
   [[ -f "$req" ]] || { echo "✗ FAIL: required gate asset missing: $req"; exit 1; }
 done
+# shellcheck source=tools/cut_gate_scanner_backstop.sh
+source "$BACKSTOP"; bs_init
 
 enforce="${ENFORCE_WRITE_FORK:-1}"
 echo "ADR-0099 H3 write-fork gate — root: $ROOT  (mode: $([[ "$enforce" == "1" ]] && echo ENFORCING || echo informational))"
 
-scope_files() { find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/|/aberp-db/' | sort; }
+# ── CHECK M0 — scanner liveness (ALWAYS ENFORCED, never informational) ──
+# This gate was "zero forks ⇒ green" with `2>/dev/null`: a crashed or silent
+# scanner reported ZERO and PASSED. BOTH scanners it depends on are probed —
+# CHECK M below reads $OPENSCAN, so a dead opener scanner would silently turn
+# the half-migration check into a no-op too. The raw-string control is not
+# hypothetical: this scanner WAS fail-open on it until 2026-07-21.
+echo "[CHECK M0] scanner liveness — both scanners see a planted fork, incl. behind lexer traps"
+bs_check "$SCAN" 1 "positive: colocated fork — Connection::open + .append()" <<'RS'
+fn control() {
+    let c = Connection::open(p).unwrap();
+    ledger.append(e);
+}
+RS
+bs_check "$SCAN" 1 "positive: fork shielded by a char literal" <<'RS'
+fn control() {
+    out.push('"');
+    let c = Connection::open(p).unwrap();
+    ledger.append(e);
+}
+RS
+bs_check "$SCAN" 1 "positive: fork shielded by a raw string" <<'RS'
+fn control() {
+    let s = r##"a "# b"##;
+    let c = Connection::open(p).unwrap();
+    ledger.append(e);
+}
+RS
+bs_check "$SCAN" 0 "negative: Handle-routed append, no opener (must NOT hit)" <<'RS'
+fn control(db: &Handle) {
+    let g = db.write();
+    audit_ledger::append_in_tx(&tx, e);
+}
+RS
+bs_check "$OPENSCAN" 1 "positive: opener scanner sees Connection::open" <<'RS'
+fn control() { let c = Connection::open(p).unwrap(); }
+RS
+bs_check "$OPENSCAN" 0 "negative: opener scanner ignores open_in_memory" <<'RS'
+fn control() { let c = Connection::open_in_memory().unwrap(); }
+RS
+bs_controls_ok || { echo; echo "WRITE-FORK GATE: ✗ FAILED (scanner liveness)"; exit 1; }
+echo
+
+# SCOPE FIX (finding F5, 2026-07-21) — was `apps/aberp/src …`, which excluded
+# apps/aberp-ui/src (a crate that resolves $ABERP_DB itself, lib.rs:762). See the
+# cut_gate_opener_census.sh header for the full finding.
+scope_files() { find apps/*/src modules crates -name '*.rs' | grep -vE '/tests/|/aberp-db/' | sort; }
 
 # ── CHECK M — no half-migrated subsystem (the all-or-nothing rule, ALWAYS ENFORCED) ──
 # With the runtime checkpoint DISABLED in H3, the shared Handle holds a persistent
@@ -67,12 +115,13 @@ mixed=0
 while IFS= read -r f; do
   [[ "$f" == "apps/aberp/src/serve.rs" ]] && continue
   grep -qE '\.db\.(write|read)[[:space:]]*\(' "$f" || continue   # routes through the Handle?
-  op="$(awk -f "$OPENSCAN" "$f" 2>/dev/null)"                    # residual runtime openers?
+  op="$(bs_scan "$OPENSCAN" "$f")"                               # residual runtime openers?
   [[ -z "$op" ]] && continue
   echo "  ✗ HALF-MIGRATED: $f uses the shared Handle AND retains a separate runtime opener —"
   echo "$op" | sed 's/^/        /'
   mixed=$((mixed+1))
 done < <(scope_files)
+bs_scan_ok || { echo; echo "WRITE-FORK GATE: ✗ FAILED (the opener scanner failed during CHECK M)"; exit 1; }
 if [[ "$mixed" -ne 0 ]]; then
   echo
   echo "WRITE-FORK GATE: ✗ FAILED — $mixed half-migrated subsystem(s). Route ALL of each"
@@ -97,8 +146,15 @@ while IFS= read -r f; do
     if is_allowed "$key"; then continue; fi
     printf '%s:%s\n' "$f" "$rec" >> "$worklist"
     remaining=$((remaining + 1))
-  done < <(awk -f "$SCAN" "$f" 2>/dev/null)
+  done < <(bs_scan "$SCAN" "$f")
 done < <(scope_files)
+
+if ! bs_scan_ok; then
+  rm -f "$worklist"
+  echo
+  echo "WRITE-FORK GATE: ✗ FAILED (the scanner failed mid-scan — a zero-fork verdict is not trustworthy)"
+  exit 1
+fi
 
 if [[ "$remaining" -eq 0 ]]; then
   echo "✓ ZERO non-allow-listed in-serve audit write-forks — every runtime audit writer is on the shared Handle."

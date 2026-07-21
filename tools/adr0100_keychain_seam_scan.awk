@@ -27,20 +27,24 @@
 # #[cfg(test)] regions are skipped: inline test mocks are "designated test
 # mocks" and never run in production (the seam is a runtime concern).
 #
-# ⚠ KNOWN FAIL-OPEN — DEFERRED, NOT FIXED (found 2026-07-21) ⚠
-# This lexer has no char-literal rule, the exact defect just repaired in
-# tools/adr0098_opener_scan.awk. A char literal holding a quote — out.push('"')
-# — flips `instr` ON and strands the scanner mid-string until the next stray
-# quote. Measured on this tree: 488 stranded lines in tenant_registry.rs, 410 in
-# serve.rs, 49 in numbering.rs. A direct `keyring::Entry` in one of those windows
-# would be INVISIBLE to this gate. Verified with the fixed lexer grafted in:
-# hits go 0 → 0, so NOTHING is hiding behind it today — the exposure is future
-# code, not current code. Deliberately left for its own change rather than
-# widening a prod-gate repair; the fix is to port the char-literal / raw-string /
-# nested-comment lexer block out of adr0098_opener_scan.awk verbatim.
-# (tools/adr0099_{read,write}_fork_scan.awk DO have a char-literal rule and are
-# NOT blind to this; their rule mishandles '\\' and '\u{…}' but fails CLOSED.)
-BEGIN{ depth=0; tdepth=-1; pending=0; inblk=0; instr=0 }
+# LEXER (fixed 2026-07-21 — this scanner was FAIL-OPEN before this, and the
+# bypass was proven to pass the real CI gate end-to-end):
+#   - CHAR LITERALS are lexed. Before this, a char literal holding a quote —
+#     tenant_registry.rs's out.push('"') — flipped `instr` ON and stranded the
+#     scanner mid-string until the next stray quote (488 stranded lines in
+#     tenant_registry.rs, 410 in serve.rs, 49 in numbering.rs). A planted
+#     `keyring::Entry::new` at tenant_registry.rs:5 failed the gate; the SAME
+#     bypass at :700 PASSED it. Lifetimes/labels (&'a str, 'static, 'outer:) are
+#     NOT char literals and must not be lexed as such.
+#   - RAW STRINGS r"..." / r#"..."# / br##"..."## are lexed with their hash count
+#     and across lines — a SECOND, independent blind vector: `r##"a "# b"##`
+#     shielded a real `keyring::Entry` from this scanner (and from
+#     tools/adr0099_{read,write}_fork_scan.awk, whose char-literal rule did NOT
+#     save them here) before this fix.
+#   - Block comments nest, as in rustc.
+# The block below is the lexer from tools/adr0098_opener_scan.awk, ported
+# verbatim — ONE idiom across all four scanners, not a second dialect.
+BEGIN{ depth=0; tdepth=-1; pending=0; inblk=0; instr=0; inraw=0; rawh=0 }
 {
   line=$0
   st=line; sub(/^[ \t]+/,"",st)
@@ -50,11 +54,40 @@ BEGIN{ depth=0; tdepth=-1; pending=0; inblk=0; instr=0 }
   code=""; L=length(line)
   for(i=1;i<=L;i++){
     c=substr(line,i,1); d=substr(line,i,2)
-    if(inblk){ if(d=="*/"){inblk=0;i++} ; continue }
+    if(inraw){
+      if(c=="\""){
+        ok=1; for(k=1;k<=rawh;k++) if(substr(line,i+k,1)!="#"){ ok=0; break }
+        if(ok){ inraw=0; i+=rawh }
+      }
+      continue
+    }
+    if(inblk){ if(d=="*/"){inblk--;i++} else if(d=="/*"){inblk++;i++} ; continue }
     if(instr){ if(c=="\\"){i++;continue} ; if(c=="\""){instr=0} ; continue }
     if(d=="//"){ break }
-    if(d=="/*"){ inblk=1;i++;continue }
-    if(c=="\""){ instr=1; continue }
+    if(d=="/*"){ inblk++;i++;continue }
+    if(c=="\""){
+      # raw-string opener?  <non-ident> [b] r #* "   — count the #s backwards.
+      h=0; j=i-1
+      while(j>=1 && substr(line,j,1)=="#"){ h++; j-- }
+      if(j>=1 && substr(line,j,1)=="r" \
+         && (j==1 || substr(line,j-1,1) !~ /[A-Za-z0-9_]/ \
+             || (substr(line,j-1,1)=="b" && (j-1==1 || substr(line,j-2,1) !~ /[A-Za-z0-9_]/)))) {
+        inraw=1; rawh=h; continue
+      }
+      instr=1; continue
+    }
+    if(c=="'"){
+      n1=substr(line,i+1,1); n2=substr(line,i+2,1)
+      if(n1=="\\"){                       # '\'' '\\' '\n' '\x41' '\u{1F600}'
+        j=index(substr(line,i+3),"'"); if(j>0) i=i+2+j
+        continue
+      }
+      if(n2=="'"){ i=i+2; continue }      # 'X'
+      if(n1 !~ /^[A-Za-z_]$/){            # not a lifetime start → multi-byte 'é'
+        j=index(substr(line,i+2),"'"); if(j>0){ i=i+1+j; continue }
+      }
+      continue                            # lifetime / loop label — consumes nothing
+    }
     code=code c
     if(c=="{"){ depth++; if(pending && tdepth<0){ tdepth=depth; pending=0 } }
     else if(c=="}"){ if(tdepth==depth) tdepth=-1; depth-- }

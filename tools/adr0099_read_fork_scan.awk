@@ -42,7 +42,7 @@
 #            name lives inside a SQL string literal `code` would erase.
 # Function records are flushed AFTER a line's detection runs (deferred), so an
 # opener sharing a line with the fn's closing `}` (a one-liner) is NOT missed.
-BEGIN{ depth=0; tdepth=-1; pending=0; inblk=0; instr=0; fn_depth=-1; fn_pending=0; n_allow=split(allow,A,",") }
+BEGIN{ depth=0; tdepth=-1; pending=0; inblk=0; instr=0; inraw=0; rawh=0; fn_depth=-1; fn_pending=0; n_allow=split(allow,A,",") }
 function is_allowed(name,   k){ for(k=1;k<=n_allow;k++) if(A[k]==name) return 1; return 0 }
 function flush(   is_read){
   is_read = (cur_ledopen && cur_read) || (cur_connopen && cur_auditsel)
@@ -63,10 +63,25 @@ function flush(   is_read){
   if (st ~ /^#\[cfg\(/ && st ~ /test/ && st !~ /not\(test\)/) pending=1
   was_in=(tdepth>=0)
   fnclose=0
+  # LEXER: the tools/adr0098_opener_scan.awk block, ported verbatim (2026-07-21),
+  # with the raw/normal string bodies still fed to `codenc` (this scanner's
+  # strings-KEPT view — a raw SQL string `r#"… FROM audit_ledger"#` must stay
+  # visible). The previous hand-rolled char rule mishandled '\\' / '\u{…}' and —
+  # the live fail-open — had NO raw-string rule: `let s = r##"a "# b"##;`
+  # stranded this scanner and hid a real `Ledger::open` + `.entries()` read-fork
+  # on the following line. ONE lexer idiom across all four scanners.
   code=""; codenc=""; L=length(line)
   for(i=1;i<=L;i++){
     c=substr(line,i,1); d=substr(line,i,2)
-    if(inblk){ if(d=="*/"){inblk=0;i++} ; continue }
+    if(inraw){                       # raw-string body: kept in codenc, dropped from code
+      codenc=codenc c
+      if(c=="\""){
+        ok=1; for(kk=1;kk<=rawh;kk++) if(substr(line,i+kk,1)!="#"){ ok=0; break }
+        if(ok){ inraw=0; codenc=codenc substr(line,i+1,rawh); i+=rawh }
+      }
+      continue
+    }
+    if(inblk){ if(d=="*/"){inblk--;i++} else if(d=="/*"){inblk++;i++} ; continue }
     if(instr){                       # inside a string: kept in codenc, dropped from code
       codenc=codenc c
       if(c=="\\"){ codenc=codenc substr(line,i+1,1); i++; continue }
@@ -74,12 +89,23 @@ function flush(   is_read){
       continue
     }
     if(d=="//"){ break }
-    if(d=="/*"){ inblk=1;i++;continue }
-    if(c=="\""){ instr=1; codenc=codenc c; continue }
+    if(d=="/*"){ inblk++;i++;continue }
+    if(c=="\""){
+      h=0; jj=i-1
+      while(jj>=1 && substr(line,jj,1)=="#"){ h++; jj-- }
+      if(jj>=1 && substr(line,jj,1)=="r" \
+         && (jj==1 || substr(line,jj-1,1) !~ /[A-Za-z0-9_]/ \
+             || (substr(line,jj-1,1)=="b" && (jj-1==1 || substr(line,jj-2,1) !~ /[A-Za-z0-9_]/)))) {
+        inraw=1; rawh=h; codenc=codenc c; continue
+      }
+      instr=1; codenc=codenc c; continue
+    }
     if(c=="'"){
-       if(substr(line,i,3) ~ /^'\\.'/){ i+=2 }
-       else if(substr(line,i+2,1)=="'"){ i+=2 }
-       continue
+      n1=substr(line,i+1,1); n2=substr(line,i+2,1)
+      if(n1=="\\"){ jj=index(substr(line,i+3),"'"); if(jj>0) i=i+2+jj; continue }
+      if(n2=="'"){ i=i+2; continue }
+      if(n1 !~ /^[A-Za-z_]$/){ jj=index(substr(line,i+2),"'"); if(jj>0){ i=i+1+jj; continue } }
+      continue                            # lifetime / loop label — consumes nothing
     }
     code=code c; codenc=codenc c
     if(c=="{"){

@@ -233,3 +233,45 @@ Beyond the §4 forks (each blocking its phase): (1) the deferred **backup-encryp
 - **No cloud infra exists to verify.** §4-A/B/D recommendations are design-level (there is no current cloud deployment to grep); confidence is high on the seams (code-verified) and medium on the external-service picks (conventional at 1 MAU, un-reviewed by an external party — same caveat as ADR-0059 §12).
 - **Phase 1 CSPRNG has no external token consumer.** Verified the token is opaque to the shell/SPA and not derived-from elsewhere. Additionally confirmed the shell's handshake parser validates the *cert fingerprint* (64-hex), NOT the session token, so the base64url token shape change cannot break the handshake; the constant-time bearer compare is length-agnostic. Existing hex tokens keep validating (opaque, re-read). No external tool reconstructs the token (none found); if one did, that assumption breaks.
 - **Status update.** This ADR is no longer design-only: **Phase 1 is implemented** on branch `saas-phase1` (off `saas-migration-design`) and lands with this finalized ADR — all gates green, desktop behaviour-identical. Phases 2–7 remain design. Nothing merged to `main` or pushed to origin; this is handed back for the standing adversarial review + cut.
+
+---
+
+## Addendum (2026-07-21) — the keychain-seam gate was FAIL-OPEN and provably bypassable
+
+The gate committed above (§194) had a blind lexer, and the bypass was proven end-to-end
+against the real CI gate, not just the scanner:
+
+| planted `keyring::Entry::new` | gate verdict | exit |
+|---|---|---|
+| `tenant_registry.rs:5`   | ✗ FAILED | 1 |
+| `tenant_registry.rs:700` | ✓ **PASSED** | 0 |
+
+`tools/adr0100_keychain_seam_scan.awk` had no char-literal rule, so `out.push('"')`
+(`tenant_registry.rs:615`) flipped the string state ON and stranded the scanner for
+hundreds of lines. A change reading NAV credentials straight from the keychain — the
+path to live invoice submission — passed CI **and** `cargo test` (`keychain_seam_gate.rs`
+shells out to the same gate). This was carried as a *documented deferral* in the
+scanner header after the sibling ADR-0098 defect was repaired at `d432939`; the
+deferral note's claim that the exposure was "future code, not current code" was
+correct in fact but the wrong risk call — the gate enforced nothing in that window.
+
+Fixed, and wider than the deferral note described:
+
+1. **Two blind vectors, not one.** Raw strings (`r##"a "# b"##`, multi-line `r#"…"#`)
+   are an independent shield the char-literal fix alone does not close. Both are fixed.
+   `adr0098_opener_scan.awk` was checked and already handles raw strings.
+2. **The 0099 scanners were NOT safe either.** The deferral note asserted
+   `adr0099_{read,write}_fork_scan.awk` "fail CLOSED" here. True for char literals,
+   **false for raw strings** — both were measured fail-open on `r##"a "# b"##`. Fixed.
+3. **One lexer idiom.** All four scanners now carry the `adr0098_opener_scan.awk`
+   lexer block (char literals incl. lifetimes/labels, hash-counted raw strings,
+   nested block comments) rather than three dialects.
+
+Output on the real tree is **byte-identical** before/after for all four scanners
+(0100: 9, read-fork: 11, write-fork: 14, opener: 86 records) — nothing was hiding
+behind a trap today; the exposure closed was future code.
+
+Teeth: `cut_gate_keychain_seam_probes.sh` had **zero** lexer-trap probes and exited 0
+throughout. It now plants each bypass 700 lines behind a char literal, a raw string,
+and a multi-line raw string, plus a false-positive guard proving lifetimes/labels
+(`&'a str`, `'outer:`, `'\''`, `'\u{1F600}'`) do not re-blind the lexer. 16/16 pass.

@@ -51,7 +51,15 @@ done
 # `Connection::open` every other site now routes through. Like the editions
 # gate, that seam is EXCLUDED from the census (its opener is the fix, not a
 # residual); every OTHER runtime opener remains a frozen residual to migrate.
-scope_files() { find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/|/aberp-db/' | sort; }
+# SCOPE FIX (finding F5, 2026-07-21): this was `apps/aberp/src modules crates`,
+# which silently EXCLUDED apps/aberp-ui/src — a crate that resolves the prod DB
+# path itself (apps/aberp-ui/src/lib.rs:762 reads $ABERP_DB), so it is squarely
+# in the blast radius. A planted `Connection::open($ABERP_DB)` + `DELETE FROM
+# invoices` there scored census 0 / read_fork 0 / write_fork 0: the scanner
+# detects it fine when run on the file directly, the GATE just never handed it
+# over. Now `apps/*/src`, so a future third app cannot re-open the same hole.
+# (The keychain-seam gate already covered aberp-ui; these three did not.)
+scope_files() { find apps/*/src modules crates -name '*.rs' | grep -vE '/tests/|/aberp-db/' | sort; }
 
 # ── CHECK P1 — frozen census: no file exceeds its count; no new unlisted file ──
 echo "[CHECK P1] frozen opener census — no file grows, no new unlisted opener-bearing file (ENFORCED)"
