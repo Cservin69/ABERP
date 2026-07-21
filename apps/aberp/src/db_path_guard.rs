@@ -32,10 +32,28 @@ use anyhow::{anyhow, Result};
 /// absolute against the CWD first, so `./aberp.duckdb` compares as the
 /// real path it names rather than as a bare filename.
 ///
-/// The residual: `..` inside a *missing* tail is not resolved (there is
-/// no filesystem to resolve it against). That can only ever make the
-/// comparison in [`ensure_db_path_isolated`] read a non-tenant segment,
-/// which refuses — fail-closed, never fail-open.
+/// **The tail is UNVERIFIED, and this function does not classify it.**
+/// Whatever could not be resolved is re-appended verbatim, so the result
+/// is only as trustworthy as the caller's own check of it. Two shapes are
+/// actively dangerous, and [`ensure_db_path_isolated_under`] refuses both
+/// before it compares anything:
+///
+///   * an unresolved `..`, and
+///   * a tail that begins at a *dangling symlink*.
+///
+/// An earlier version of this comment claimed the `..` case was
+/// "fail-closed, never fail-open". **That was false, and execution
+/// disproved it.** The walk below stops at the deepest ancestor that
+/// EXISTS, so for `<root>/<own tenant>/missing/../../prod/aberp.duckdb`
+/// the deepest existing ancestor is `<root>/<own tenant>` and the
+/// re-appended tail keeps the tenant's OWN segment first — it reads as
+/// this tenant's own and is allowed. It was reachable, not merely
+/// theoretical: `serve` runs `create_dir_all` on the parent AFTER the
+/// guard, which materialises the missing component and makes that exact
+/// string resolve into the foreign tenant's root. It was demonstrated
+/// opening a seeded foreign DB. Both refusals are pinned by
+/// `adversarial_*` tests below; do not relax them on the strength of a
+/// comment.
 fn canonicalize_deepest(path: &Path) -> PathBuf {
     let abs = if path.is_absolute() {
         path.to_path_buf()
@@ -96,9 +114,65 @@ pub fn ensure_db_path_isolated(path: &Path, tenant: &str) -> Result<()> {
 /// `serve::sanity_check_environment` pattern: the rule is unit-testable
 /// against a temp root, with no process-global `HOME` mutation and no
 /// risk of a test resolving the operator's real `~/.aberp/`.
+/// The shallowest ancestor of `path` that the filesystem could NOT
+/// resolve — exactly where a [`canonicalize_deepest`] result stops being
+/// verified and becomes re-appended text. `None` when the path fully
+/// exists.
+fn unresolved_boundary(path: &Path) -> Option<PathBuf> {
+    let mut acc = PathBuf::new();
+    for c in path.components() {
+        acc.push(c);
+        if acc.canonicalize().is_err() {
+            return Some(acc);
+        }
+    }
+    None
+}
+
 fn ensure_db_path_isolated_under(root: &Path, path: &Path, tenant: &str) -> Result<()> {
     let root = canonicalize_deepest(root);
     let db = canonicalize_deepest(path);
+
+    // An UNRESOLVED `..` survives only when some component of the path does
+    // not exist yet, so the filesystem could not resolve it. Such a path
+    // cannot be classified: the comparison below reads the segment as
+    // written, while `serve`'s writer-lock step then calls `create_dir_all`
+    // on the parent — which MATERIALISES the missing component and makes
+    // the very same string resolve somewhere else entirely. `<root>/<own
+    // tenant>/missing/../../prod/aberp.duckdb` reads as this tenant's own
+    // and lands in prod's. Unclassifiable means refused.
+    if db
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "tenant DB isolation: this build runs as tenant '{tenant}' and refuses path {} — it \
+             contains a `..` that the filesystem could not resolve (a component does not exist), \
+             so where it will finally point cannot be determined. Pass a path with no `..`.",
+            path.display(),
+        ));
+    }
+
+    // A DANGLING SYMLINK where the resolved prefix ends is unclassifiable
+    // for the same reason. The segment EXISTS as a link but has no target,
+    // so the comparison below reads the LINK's own name — `<root>/<own
+    // tenant>` reads as this tenant's — while the file the OS eventually
+    // opens is wherever the link points. Nothing in this guard sees the
+    // target. Today that is caught downstream only by ACCIDENT (`serve`'s
+    // `create_dir_all` gets EEXIST on a dangling link and errors out), and
+    // a safety guard must not rest on a downstream accident.
+    if let Some(boundary) = unresolved_boundary(&db) {
+        if std::fs::symlink_metadata(&boundary).is_ok() {
+            return Err(anyhow!(
+                "tenant DB isolation: this build runs as tenant '{tenant}' and refuses path {} — \
+                 the component {} is a symlink whose target does not exist, so the file that \
+                 would finally be opened cannot be determined. Create the target, or pass the \
+                 real path.",
+                path.display(),
+                boundary.display(),
+            ));
+        }
+    }
 
     // Outside the ABERP data root altogether — an ordinary dev/test path.
     let Ok(under_root) = db.strip_prefix(&root) else {
@@ -262,6 +336,102 @@ mod tests {
             ensure_db_path_isolated_under(&root, &sneaky, "test").is_err(),
             "`..` traversal into prod must be refused: {}",
             sneaky.display()
+        );
+    }
+
+    /// ADVERSARIAL: `..` behind a component that does not exist yet. The
+    /// module docs claim this is fail-closed ("can only ever read as a
+    /// non-tenant segment, which refuses"). It is not: the deepest existing
+    /// ancestor is `<root>/test`, so the re-appended tail keeps `test` as
+    /// the FIRST component and the guard reads it as this tenant's own.
+    #[test]
+    fn adversarial_dotdot_behind_a_missing_component() {
+        let root = test_dir().join(".aberp");
+        fs::create_dir_all(root.join("test")).expect("create test root");
+        fs::create_dir_all(root.join("prod")).expect("create prod root");
+        let sneaky = root
+            .join("test")
+            .join("does-not-exist")
+            .join("..")
+            .join("..")
+            .join("prod")
+            .join("aberp.duckdb");
+        assert!(
+            ensure_db_path_isolated_under(&root, &sneaky, "test").is_err(),
+            "`..` behind a missing component must be refused: {}",
+            sneaky.display()
+        );
+    }
+
+    /// ADVERSARIAL: and the refusal must hold end-to-end, because
+    /// `serve.rs`'s writer-lock step does `create_dir_all` on the parent —
+    /// which MATERIALISES the missing component and makes the path resolve
+    /// straight into the foreign tenant's root.
+    #[test]
+    fn adversarial_dotdot_path_really_reaches_the_foreign_root() {
+        let root = test_dir().join(".aberp");
+        fs::create_dir_all(root.join("test")).expect("create test root");
+        fs::create_dir_all(root.join("prod")).expect("create prod root");
+        let victim = root.join("prod").join("aberp.duckdb");
+        fs::write(&victim, b"FOREIGN TENANT DATA").expect("seed foreign db");
+
+        let sneaky = root
+            .join("test")
+            .join("does-not-exist")
+            .join("..")
+            .join("..")
+            .join("prod")
+            .join("aberp.duckdb");
+
+        // serve.rs:877, verbatim.
+        fs::create_dir_all(sneaky.parent().unwrap()).expect("serve's create_dir_all");
+        assert_eq!(
+            fs::read_to_string(&sneaky).expect("read through the sneaky path"),
+            "FOREIGN TENANT DATA",
+            "the path really does resolve into the foreign tenant's DB"
+        );
+        assert!(
+            ensure_db_path_isolated_under(&root, &sneaky, "test").is_err(),
+            "guard allowed a path that demonstrably opens the foreign tenant's DB"
+        );
+    }
+
+    /// ADVERSARIAL (latent, not a demonstrated breach). The tenant's OWN
+    /// segment is a DANGLING symlink. `canonicalize` cannot follow it, so
+    /// the guard used to read the LINK's name — this tenant's own — and
+    /// allow, while the file the OS would open is wherever the link
+    /// points. Downstream `create_dir_all` happens to fail EEXIST on a
+    /// dangling link, so nothing broke; the guard must refuse on its own
+    /// merits rather than inherit that accident.
+    #[cfg(unix)]
+    #[test]
+    fn adversarial_own_tenant_segment_is_a_dangling_symlink() {
+        let root = test_dir().join(".aberp");
+        fs::create_dir_all(&root).expect("create data root");
+        // `<root>/test` -> `<root>/prod`, which does NOT exist yet.
+        std::os::unix::fs::symlink(root.join("prod"), root.join("test")).expect("dangling link");
+        assert!(
+            root.join("test").symlink_metadata().is_ok() && !root.join("test").exists(),
+            "test is not exercising the case: the link must exist and be dangling"
+        );
+        assert!(
+            ensure_db_path_isolated_under(&root, &root.join("test").join("aberp.duckdb"), "test")
+                .is_err(),
+            "a dangling own-tenant symlink is unclassifiable and must be refused"
+        );
+    }
+
+    /// The dangling-symlink refusal must NOT swallow the ordinary
+    /// first-launch case it sits next to: a plainly MISSING component is
+    /// not a dangling link and stays allowed. Without this, the guard
+    /// above would be an outage on every fresh install.
+    #[test]
+    fn dangling_symlink_rule_leaves_plain_missing_paths_alone() {
+        let root = test_dir().join(".aberp");
+        assert!(
+            ensure_db_path_isolated_under(&root, &root.join("test").join("aberp.duckdb"), "test")
+                .is_ok(),
+            "a merely missing tail must remain allowed"
         );
     }
 
