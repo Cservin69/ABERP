@@ -116,3 +116,29 @@ jobs:
         # fail-closed (a de-gated scanner passes the real bypass). A negative
         # probe that cannot fail is decoration.
         run: bash tools/cut_gate_keychain_seam_probes.sh
+
+      - name: ADR-0093 product-line saw-off ratchet (ENFORCING)
+        # The saw-off deleted the Portable/Defense surface from ABERP.git as a
+        # ONE-TIME event with no ratchet behind it: re-adding run/run_portable.sh,
+        # SAW-OFF.md and a crates/aberp-portable/ crate to a tree copy left ALL
+        # EIGHT pre-existing gates green. This is that ratchet — launcher path,
+        # edition crate (directory OR Cargo package name), SAW-OFF.md, and
+        # PROD_(Portable|Defense)_v* refs local and on origin. It matches
+        # STRUCTURE ONLY, never file contents, so the prune records, ADR-0093 and
+        # upgrade_prod_version_re_test.sh may keep naming these strings. Flag
+        # explicit here as well as defaulted in the script so enforcement is
+        # visible at the CI surface and cannot be silently weakened by a one-line
+        # script edit.
+        env:
+          ENFORCE_EDITION_RATCHET: "1"
+        run: bash tools/cut_gate_edition_ratchet.sh
+
+      - name: Prove the saw-off ratchet has teeth (negative probes)
+        # Re-adds each artifact to a synthetic post-saw-off tree and asserts RED,
+        # removes it and asserts GREEN — every arm, both directions. Also pins the
+        # NON-triggers: the prune records, ADR-0093, the version-regex test, the
+        # deliberately kept portable_demo_boot_e2e.rs, the worktree-* branch and
+        # the archive/ ref namespace must all stay green. A gate that cries wolf
+        # gets disabled, so the false-positive sources are pinned as hard as the
+        # true positives.
+        run: bash tools/cut_gate_edition_ratchet_probes.sh
