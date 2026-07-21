@@ -100,6 +100,52 @@ c="$(fresh)"
 printf '#[cfg(test)]\nmod zz {\n    fn t(p: &std::path::Path) { let _ = duckdb::Connection::open(p); }\n}\n' > "$c/$SCRATCH"
 expect_pass "$c" "cfg(test): a #[cfg(test)] opener is correctly IGNORED (not a residual)"
 
+# ── lexer traps (2026-07-21) ─────────────────────────────────────────────────
+# The scanner was FAIL-OPEN for as long as this gate existed: a char literal
+# holding a quote — out.push('"') at tenant_registry.rs:615 — flipped the string
+# state ON and left the lexer stuck mid-string from line 623 to 1092. In that
+# 470-line window it swallowed EVERYTHING: `mod tests {` at 880 (so 3 test-only
+# openers were frozen into the census as runtime residuals) and, far worse, any
+# genuine runtime opener anyone might have added there. 17 in-scope files carry
+# quote char literals, serve.rs among them. These two probes pin BOTH halves —
+# the blindness and the over-count — so the class cannot regress silently.
+echo "[lexer traps] an opener AFTER char literals / lifetimes / raw strings → still RED"
+c="$(fresh)"
+cat > "$c/$SCRATCH" <<'PROBE'
+fn _q(out: &mut String) { out.push('"'); out.push('\''); out.push('\\'); out.push('{'); }
+fn _lt<'a>(s: &'a str) -> &'a str { 'outer: loop { break 'outer; } s }
+fn _raw() -> &'static str { r#"a "b" \ c"# }
+fn _probe_after_traps(p: &std::path::Path) { let _ = duckdb::Connection::open(p); }
+PROBE
+expect_fail "$c" "NEW unaccounted opener-bearing file" "lexer traps: a runtime opener downstream of a quote char literal is still SEEN (not swallowed)"
+
+echo "[lexer traps] the scanner itself classifies a trap file EXACTLY: 1 runtime, 0 test"
+# Asserted directly against the scanner, not through the gate: the gate is blind
+# to the over-count half (an unregistered file that scans to 0 openers is simply
+# skipped, so a swallowed file looks identical to a clean one). This is the probe
+# that fails in BOTH directions — pre-fix it emits 0 lines (blind), and a naive
+# `'`-to-next-`'` char rule mangles the lifetimes/labels below into a phantom hit.
+trapfile="$WORK/lexer_traps.rs"
+cat > "$trapfile" <<'PROBE'
+fn _q(out: &mut String) { out.push('"'); out.push('\''); out.push('\\'); out.push('{'); }
+fn _lt<'a>(s: &'a str) -> &'a str { 'outer: loop { break 'outer; } s }
+fn _raw() -> &'static str { r#"a "b" \ c"# }
+fn _after_traps(p: &std::path::Path) { duckdb::Connection::open(p); }
+#[cfg(test)]
+mod zz {
+    fn t(p: &std::path::Path) { let _ = duckdb::Connection::open(p); }
+}
+PROBE
+got="$(awk -f "$ROOT/$SCAN" "$trapfile" 2>/dev/null)"
+want="4:_after_traps:fn _after_traps(p: &std::path::Path) { duckdb::Connection::open(p); }"
+if [[ "$got" == "$want" ]]; then
+  printf '  ✓ lexer traps: exactly the runtime opener is seen; the #[cfg(test)] one is not counted, lifetimes/labels produce no phantom\n'
+  pass=$((pass+1))
+else
+  printf '  ✗ BROKEN: lexer traps: scanner output != expected\n      want: %s\n      got:  %s\n' "$want" "${got:-<nothing — the lexer is swallowing the file>}"
+  bad=$((bad+1))
+fi
+
 echo "[P2 swap] a registered opener whose binding is renamed (count-preserving) → RED"
 c="$(fresh)"
 printf 'fn _p(p: &std::path::Path) { let conn_probe = duckdb::Connection::open(p); let _ = conn_probe; }\n' > "$c/$SCRATCH"

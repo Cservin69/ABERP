@@ -117,11 +117,10 @@
 #     • serve.rs:seed_demo_sample_data (+1) — S434 boot-time, best-effort seed of the
 #       SEPARATE bundled-demo DB (not the booted tenant's Handle, not in-serve). A
 #       legitimate boot opener, not a fork.
-#     • tenant_registry.rs ×3 (+3) — openers inside `#[cfg(test)] mod tests`. The
-#       scanner over-counts them (its string tracker mishandles the raw-string
-#       literal r#"ACME "Special" Co \ Ltd"# in that test, losing the cfg(test)
-#       scope). Conservative (over-count never HIDES a fork) and test-only; frozen
-#       here for consistency with what the shared scanner emits on this tree.
+#     • tenant_registry.rs ×3 (+3) — WITHDRAWN 2026-07-21, see the lexer-fix note
+#       at the foot of this header. These were scanner false positives, and the
+#       attribution above them was itself wrong: the raw string at :922 is INSIDE
+#       the swallowed window, not its cause.
 # ── H4 backlog-2 (2026-07-14) — pricing-config family onto the shared Handle ───
 # margin_profiles / quoting_materials / quoting_tunables: the 22 CRUD+list serve
 # handlers (create/update/archive/list/get margin profiles; create/update/delete/
@@ -174,6 +173,31 @@
 # Census 91→89 openers, files 23→22 (both snapshot.rs and one take.rs opener
 # gone). Ratchet DOWN only — no additions, no content swaps. write-fork &
 # read-fork ENFORCE gates stay = 0.
+# ── LEXER FIX (2026-07-21) — the scanner was FAIL-OPEN; census 89→86 / 22→21 ──
+# tools/adr0098_opener_scan.awk had no char-literal rule. `out.push('"')` at
+# tenant_registry.rs:615/:623 flipped the string state ON, leaving the lexer
+# stuck mid-string from :623 to :1092 — a 470-line window in which it saw
+# NOTHING. That window contains `mod tests {` (:880), so the 3 test-only
+# Ledger::open calls at :1280/:1298/:1311 were frozen here as runtime residuals.
+# The dangerous half is the other one: a genuine runtime opener added anywhere
+# in that window would have been invisible to a gate whose whole job is to see
+# it. 17 in-scope files carry quote char literals, serve.rs among them.
+# Blast radius, measured old-vs-new over all 272 in-scope files: the ONLY delta
+# is tenant_registry.rs 3→0. Cross-checked independently of the lexer — all 155
+# raw opener-token occurrences in scope classify as 86 runtime (unchanged), 64
+# inside #[cfg(test)], 5 in doc/line comments. NO real opener was hiding.
+# Delta, line by line — three removals, zero additions:
+#   −3  apps/aberp/src/tenant_registry.rs (file drops off the census entirely)
+#       −1 …|tenant_created_lands_in_new_tenant_ledger_not_caller:Ledger::open(&db_caller, …).unwrap();
+#       −1 …|tenant_created_lands_in_new_tenant_ledger_not_caller:let new_kinds: Vec<EventKind> = Ledger::open(&db_new, …
+#       −1 …|tenant_created_lands_in_new_tenant_ledger_not_caller:Ledger::open(&db_caller, …)
+#       all three: FALSE POSITIVE REMOVED (test-only, never runtime).
+# The lexer now also handles raw strings (r#"…"# incl. multi-line + hash width),
+# nested block comments, and keeps char-literal bodies out of the brace counter
+# so '{' / '}' (numbering.rs:649/:653) cannot skew cfg(test) depth. Lifetimes and
+# loop labels (&'a str, 'static, 'outer:) are explicitly NOT char literals — the
+# classic way a naive fix breaks. Pinned by the two [lexer traps] negative probes
+# in tools/cut_gate_negative_probes.sh; reverting the awk fix turns them RED.
 1 apps/aberp/src/audit_dap_boot.rs
 3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
@@ -189,7 +213,6 @@
 8 apps/aberp/src/retry_submission.rs
 29 apps/aberp/src/serve.rs
 3 apps/aberp/src/submit_annulment.rs
-3 apps/aberp/src/tenant_registry.rs
 1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
 1 crates/aberp-mes/src/ledger_writer.rs
 2 crates/aberp-snapshot/src/crash_safe.rs

@@ -49,6 +49,12 @@
 # and 3 tenant_registry.rs `#[cfg(test)] mod tests` openers the scanner
 # over-counts (raw-string parsing limitation; test-only, conservative). See the
 # frozen-residuals header for the itemised per-file rationale.
+# ⚠ 2026-07-21 — those 3 tenant_registry.rs entries are GONE (89→86 fingerprints)
+# and the "raw-string parsing limitation" above is a MISDIAGNOSIS. The real cause
+# was a missing char-literal rule: `out.push('"')` at :615/:623 left the lexer
+# stuck mid-string :623→:1092, swallowing `mod tests {` at :880. That is
+# fail-OPEN, not "conservative" — a real runtime opener in that window would
+# have been invisible too. Verified: none was. See the frozen-residuals header.
 # ── H4 backlog-2 (2026-07-14) — pricing-config family onto the shared Handle ───
 # The margin_profiles / quoting_materials / quoting_tunables CRUD+list serve
 # handlers were the LAST half-migration of these families: audit already rode the
@@ -179,9 +185,6 @@ apps/aberp/src/serve.rs|spawn_dap_audit_chain:let mut ledger = aberp_audit_ledge
 apps/aberp/src/submit_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
 apps/aberp/src/submit_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
 apps/aberp/src/submit_annulment.rs|run:let mut conn = Connection::open(&args.db)
-apps/aberp/src/tenant_registry.rs|tenant_created_lands_in_new_tenant_ledger_not_caller:Ledger::open(&db_caller, TenantId::new("prod").unwrap(), bh)
-apps/aberp/src/tenant_registry.rs|tenant_created_lands_in_new_tenant_ledger_not_caller:Ledger::open(&db_caller, TenantId::new("prod").unwrap(), bh).unwrap();
-apps/aberp/src/tenant_registry.rs|tenant_created_lands_in_new_tenant_ledger_not_caller:let new_kinds: Vec<EventKind> = Ledger::open(&db_new, TenantId::new("acme").
 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs|run:let mut conn = Connection::open(&db_path)
 crates/aberp-mes/src/ledger_writer.rs|write_one:let mut conn = duckdb::Connection::open(&db_path)
 crates/aberp-snapshot/src/crash_safe.rs|checkpoint_file:let conn = Connection::open(db)?;
