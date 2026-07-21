@@ -152,6 +152,7 @@ record. Backfilled 2026-06-17. -->
 - [ADR-0090 — NCR / CAPA quality workflow](0090-ncr-capa-quality-workflow.md) — non-conformance + corrective-action state machines, open-NCR shipment gate, 24h Critical escalation (S439).
 - [ADR-0091 — Purchasing / purchase-order module](0091-purchasing-purchase-order-module.md) — AVL-gated POs (create + issue), receiving-failure → auto-NCR, heat-lot capture on defense lines; supersedes ADR-0068's deferred purchasing scope (S440).
 - [ADR-0092 — On-machine probe ingestion → QC](0092-on-machine-probe-ingestion-to-qc.md) — DMG MORI (MTConnect) / Renishaw probe → QC inspections → auto-NCR; manual entry ships, probe sources stubbed (S442 / S443).
+- [ADR-0093 — Product-line saw-off: Portable + Defense isolated from the frozen Prod tree](0093-product-line-sawoff-isolation.md) — **verbatim mirror** of the authoritative copy in `ABERP-Editions`. Portable and Defense do **not** live in this repository; this repo carries the HU production (`PROD_v*`) line and the DEV launcher only. Read its mirror notice first — §6's "prod is frozen" claim is corrected there. Mirrored 2026-07-21 so an `ABERP.git` session never again has to infer this decision from repository state.
 
 ### Deferred (not yet filed — tracked so they don't fall through)
 

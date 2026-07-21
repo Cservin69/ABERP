@@ -32,22 +32,26 @@ hash-chained ledger you can inspect and verify.
 > launchers and the legacy unified `PROD_v2.*` line — nothing else. The
 > **Portable** and **Defense** lines both live on
 > **[`Cservin69/ABERP-Editions`](https://github.com/Cservin69/ABERP-Editions)**
-> and are installed from there. Defense's `PROD_Defense_v*` refs were
+> and are installed from there. This is the decision of
+> [`ADR-0093`](adr/0093-product-line-sawoff-isolation.md), mirrored into this
+> repo's `adr/` so it can be read here. Defense's `PROD_Defense_v*` refs were
 > pruned from this repo on 2026-07-11 (see
 > [`docs/PRUNED_DEFENSE_REFS.md`](docs/PRUNED_DEFENSE_REFS.md)); Portable's
-> launcher pair was deleted on 2026-07-21 for the same reason — a launcher
-> in the wrong repo is what misleads the next reader. **Nothing in this
-> README installs either edition; follow the Editions repo.**
+> launcher pair was deleted on 2026-07-21 and its
+> `PROD_Portable_v0.1.x` refs pruned the same day (see
+> [`docs/PRUNED_PORTABLE_REFS.md`](docs/PRUNED_PORTABLE_REFS.md)) — an
+> artefact in the wrong repo is what misleads the next reader. **Nothing in
+> this README installs either edition; follow the Editions repo.**
 
 | | **Portable** | **Defense (HU production)** |
 |---|---|---|
 | Repo | `Cservin69/ABERP-Editions` | `Cservin69/ABERP-Editions` |
-| Latest | **no release cut yet** — the line is parked | see the Editions repo |
+| Latest | `PROD_Portable_v1.0.0` — see the Editions repo | see the Editions repo |
 | For | Anyone, anywhere — evaluating, or running outside Hungary | Hungarian manufacturing shops with NAV obligations + defense / aerospace compliance needs |
 | Tax filing | **Off by default** — invoices stay local (LocalOnly) | Live NAV Online Számla 3.0 e-invoicing |
 | First boot | Demo company pre-seeded — data to explore immediately | Your own seller profile + real NAV credentials |
 | Build | Dev profile — structurally cannot reach the live NAV endpoint | `--features production` — the real-money build |
-| Install | per the Editions repo, once a release is cut | per the Editions repo |
+| Install | per the Editions repo | per the Editions repo |
 
 **Portable** is the path most newcomers want. It is the same application —
 quoting, manufacturing, the audit ledger, all of it — with the Hungarian
@@ -63,11 +67,13 @@ inspection plans, and the production build that talks to the real NAV
 endpoint. It is what Hungarian shops with real NAV submission obligations
 run for real money.
 
-> **The legacy unified `PROD_v2.27.76` line is frozen.** Up to that tag,
-> Portable and Defense shipped as one build. New work now lands on the two
-> dedicated lines above — Portable here, Defense on `ABERP-Editions` — so
-> each edition gets a launcher and an upgrade path scoped to it. Existing
-> `PROD_v2.27.76` installs keep working; there is just no `PROD_v2.27.77`.
+> **The legacy unified `PROD_v2.27.76` build is where the three lines
+> parted.** Up to that tag, Portable and Defense shipped as one build with
+> HU production. New edition work now lands on the two dedicated lines
+> above — **both on `ABERP-Editions`** — so each edition gets a launcher and
+> an upgrade path scoped to it. Existing `PROD_v2.27.76` installs keep
+> working, and the HU production line continues to release from **this**
+> repo (`PROD_v2.28.0` … `PROD_v2.32.1`); there is just no `PROD_v2.27.77`.
 
 ---
 
@@ -79,18 +85,22 @@ alongside Defense. This repo's Portable launcher pair
 (`run/run_portable.sh`, `run/upgrade_portable.sh`) was deleted on
 2026-07-21: it pointed at a line this repo no longer owns, and a launcher
 that should not be run is exactly the artifact that misleads the next
-reader into treating a parked line as live.
+reader into treating this repo as the line's home.
 
-**There is deliberately no Portable installer here right now.** The
-Editions repo has not cut a Portable release yet — the line is parked on
-purpose. Until it is cut, there is no install path; that gap is intended,
-not a regression. Watch the Editions repo.
+**There is deliberately no Portable installer here, and there will not be
+one.** Portable's current release is `PROD_Portable_v1.0.0`, cut in the
+Editions repo on 2026-07-21; install it from there with that repo's
+`run/upgrade_portable.sh`. The absence of an installer in *this* repo is
+the intended end state, not a gap waiting to be filled.
 
-The `PROD_Portable_v0.1.0`–`v0.1.2` refs remain on this repo's origin —
-they are ancestors of `main`, so nothing is unreachable and the old
-launchers are recoverable from any of them
-(`git show PROD_Portable_v0.1.2:run/run_portable.sh`). They are history,
-not an install path.
+The `PROD_Portable_v0.1.0`–`v0.1.2` branches and tags were **pruned from
+this repo's origin on 2026-07-21** — see
+[`docs/PRUNED_PORTABLE_REFS.md`](docs/PRUNED_PORTABLE_REFS.md) for the
+SHAs, the archive location, and how to retrieve them. Their commits are
+ancestors of `main`, so nothing became unreachable and the old launchers
+are still readable by SHA
+(`git show 6a51d4ffafba03b123f7693f8b7fc27f8e9fce4a:run/run_portable.sh`).
+They are history, not an install path.
 
 > **macOS only, for now.** Shipped builds target macOS (the desktop shell
 > and keychain integration need per-OS work). Linux and Windows are
@@ -230,11 +240,12 @@ A few things under the hood that engineers tend to enjoy:
 
 ## Status
 
-- **Portable — not released from this repo, and parked.** The line moved
-  to [`Cservin69/ABERP-Editions`](https://github.com/Cservin69/ABERP-Editions),
-  which has not cut a Portable release yet. This repo's launcher pair was
-  deleted on 2026-07-21; `PROD_Portable_v0.1.2` (cut 2026-06-16) remains
-  on origin as history, not as an install path.
+- **Portable — not released from this repo.** The line moved to
+  [`Cservin69/ABERP-Editions`](https://github.com/Cservin69/ABERP-Editions)
+  per [ADR-0093](adr/0093-product-line-sawoff-isolation.md), and released
+  there as `PROD_Portable_v1.0.0` on 2026-07-21. This repo's launcher pair
+  was deleted the same day and the `PROD_Portable_v0.1.x` refs pruned from
+  origin ([`docs/PRUNED_PORTABLE_REFS.md`](docs/PRUNED_PORTABLE_REFS.md)).
 - **Defense — not released from this repo.** The HU-production build with
   live NAV plus the defense/aerospace compliance stack (AVL, purchasing,
   heat/lot, part UID, NCR/CAPA, QC inspection) ships from
