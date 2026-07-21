@@ -142,14 +142,31 @@ if [[ "$rc" -ne 0 ]] && grep -qF 'EXEMPTION PREMISE UNTESTED' "$c/.o8"; then
   printf '  ✓ coupling holds: removing the flock test voids the CLI exemption (exit=%s) — the exemption cannot outlive its premise.\n' "$rc"; pass=$((pass+1))
 else printf '  ✗ DECOUPLED: flock test removed but CHECK N still passed (exit=%s) — exemption can rot alone\n' "$rc"; sed 's/^/        /' "$c/.o8"; bad=$((bad+1)); fi
 
-echo "[META fail-closed] a de-gated scanner must let real read-forks through"
+# INVERTED 2026-07-21 (finding F4). This META probe used to sabotage the scanner
+# to `END{}` and assert the gate went GREEN — treating "a neutered scanner passes
+# everything" as the proof that the scanner is load-bearing. That IS the F4
+# vulnerability (an awk-version change on a CI runner silently greens the gate),
+# and CHECK N0 now closes it. The probe's INTENT is preserved and strengthened:
+# a neutered scanner must still be DETECTED, but now it is detected as BROKEN
+# rather than silently believed. Proving the scanner is load-bearing no longer
+# requires the gate to be exploitable.
+echo "[META] a neutered scanner must be CAUGHT, not silently believed"
 c="$(fresh)"
 printf 'END{}\n' > "$c/$SCAN"   # sabotage: scanner emits nothing for every file
-rc=0; ( cd "$c" && ENFORCE_READ_FORK=1 bash "$GATE" ) >/dev/null 2>&1 || rc=$?
-if [[ "$rc" -eq 0 ]]; then
-  printf '  ✓ fail-closed: a de-gated scanner (emits nothing) makes ENFORCE pass the 24 real read-forks (rc=0) — so the SCANNER is load-bearing; the detection probes above would flip to MISSED the moment anyone neuters it.\n'
+rc=0; ( cd "$c" && ENFORCE_READ_FORK=1 bash "$GATE" ) >"$c/.meta" 2>&1 || rc=$?
+if [[ "$rc" -ne 0 ]] && grep -qF "SCANNER BROKEN" "$c/.meta"; then
+  printf '  ✓ backstop holds: a neutered scanner (emits nothing) is caught by CHECK N0 and fails the gate (rc=%s) — a zero-fork verdict can no longer be produced by a dead tool.\n' "$rc"
   pass=$((pass+1))
-else printf '  ✗ META BROKEN: de-gated scanner still non-zero (rc=%s)\n' "$rc"; bad=$((bad+1)); fi
+else printf '  ✗ META BROKEN: neutered scanner was not caught (rc=%s; expected non-zero + "SCANNER BROKEN")\n' "$rc"; sed 's/^/        /' "$c/.meta"; bad=$((bad+1)); fi
+
+# …and the backstop is NOT a policy switch: it stays RED when de-gated.
+c="$(fresh)"
+printf 'END{}\n' > "$c/$SCAN"
+rc=0; ( cd "$c" && ENFORCE_READ_FORK=0 bash "$GATE" ) >"$c/.meta2" 2>&1 || rc=$?
+if [[ "$rc" -ne 0 ]] && grep -qF "SCANNER BROKEN" "$c/.meta2"; then
+  printf '  ✓ liveness is not bypassable: ENFORCE_READ_FORK=0 does not suppress CHECK N0 (rc=%s)\n' "$rc"
+  pass=$((pass+1))
+else printf '  ✗ META BROKEN: ENFORCE_READ_FORK=0 suppressed the liveness backstop (rc=%s)\n' "$rc"; bad=$((bad+1)); fi
 
 echo
 echo "probes passed: $pass   broken/escaped: $bad"

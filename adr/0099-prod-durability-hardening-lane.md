@@ -1289,3 +1289,74 @@ ensures its own schema (`issue_*`/`reports`/`print_invoice`). The one caveat, na
 not hand-waved: this is proven for the billing schema (the question asked); the
 AUDIT-ledger schema on the Handle read path is a SEPARATE guarantee owned by the
 read-fork (CHECK N) migration, not settled here.
+
+---
+
+## Addendum (2026-07-21) — two structural gate defects: silent-green scanners, and a scope hole
+
+### F4 — three gates passed green with a completely dead scanner
+
+`cut_gate_{keychain_seam,read_fork,write_fork}.sh` combined `awk … 2>/dev/null` with
+"zero hits ⇒ green" and had **no backstop**. Measured before the fix:
+
+| gate | scanner CRASHES | scanner SILENT |
+|---|---|---|
+| keychain_seam | exit=0 **PASSED** | exit=0 **PASSED** |
+| read_fork | exit=0 **PASSED** | exit=0 **PASSED** |
+| write_fork | exit=0 **PASSED** | exit=0 **PASSED** |
+
+An awk-version change on a CI runner, a bad merge, or a deleted rule silently
+disarms the gate. The census gate does not share this hole — its CHECK P2 diffs
+against a non-empty frozen fingerprint file, so a dead scanner goes RED there.
+
+Each of the three now gets a liveness backstop (`tools/cut_gate_scanner_backstop.sh`,
+sourced): **CHECK K0 / N0 / M0**. stderr is captured rather than swallowed, a
+non-zero awk exit is fatal, and the scanner must prove itself on synthetic controls
+in *both* directions — a known-positive must hit (a scanner that finds nothing when
+handed a planted bypass is broken, not clean) and a known-negative must not (or a
+scanner that hits everything would also pass). The positives include the lexer traps
+that were live fail-opens, so a lexer regression is caught even when no real code
+happens to sit behind a trap. `write_fork` probes **both** scanners it depends on —
+CHECK M reads the opener scanner, so a dead one silently turned it into a no-op.
+
+Liveness is **not** covered by the `ENFORCE_*` switches: a dead scanner is a broken
+tool, not a policy question. All six mutations (crash + silent × three gates, plus
+the opener scanner under CHECK M) now go RED, de-gated runs included.
+
+**Two pre-existing META probes had to be inverted.** `cut_gate_{read,write}_fork_probes.sh`
+sabotaged the scanner to `END{}` and asserted the gate went **GREEN**, treating "a
+neutered scanner passes everything" as proof that the scanner was load-bearing. That
+assertion *is* the F4 vulnerability. Their intent is preserved — a neutered scanner
+must still be detected — but it is now detected as `SCANNER BROKEN` instead of
+silently believed. Proving the scanner is load-bearing no longer requires the gate
+to be exploitable.
+
+### F5 — `apps/aberp-ui/src` was outside the ADR-0099 census/fork scope
+
+`scope_files()` in the census, read-fork and write-fork gates read
+`apps/aberp/src modules crates` — omitting `apps/aberp-ui/src`, a crate that resolves
+the prod DB path itself (`apps/aberp-ui/src/lib.rs:762` reads `$ABERP_DB`) and is
+therefore squarely in the blast radius. A planted
+`duckdb::Connection::open("~/.aberp/aberp.duckdb")` + `DELETE FROM invoices` there
+scored **census 0 · read_fork 0 · write_fork 0**. The scanners detect it fine when run
+on the file directly — the gates simply never handed the file over. (The keychain gate
+already covered it; ADR-0100 §194 even documents the scope as `apps/*/src`, so these
+three had drifted from the written contract.)
+
+All four now use `find apps/*/src …`, so a future third app cannot re-open the hole.
+
+**Census delta — every line accounted for:**
+
+| | before | after | delta |
+|---|---|---|---|
+| scope files | 272 | 278 | **+6, all newly in scope** |
+| runtime openers | 86 | 86 | **0** |
+| fingerprint set | 86 | 86 | **0 — identical** |
+
+The six newly-in-scope files (`apps/aberp-ui/src/{backend,commands,handshake,lib,main,pinned_client}.rs`)
+contribute **zero** openers, zero read-forks and zero write-forks. `tools/adr0098_prod_frozen_residuals.txt`
+and `tools/adr0098_prod_opener_fingerprints.txt` therefore need **no re-baselining**.
+**No genuine finding: no real runtime opener was hiding in `aberp-ui`.** The crate does
+not even depend on `duckdb` today — but that is one line away, and the gate must cover
+it regardless. Mutation-verified: the planted opener now turns the census and write-fork
+gates RED, and a planted `Ledger::open` + `.entries()` read-fork turns the read-fork gate RED.

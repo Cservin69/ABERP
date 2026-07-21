@@ -35,14 +35,62 @@ cd "$ROOT"
 
 SCAN="tools/adr0099_read_fork_scan.awk"
 ALLOW="tools/adr0099_read_fork_allowlist.txt"
-for req in "$SCAN" "$ALLOW"; do
+BACKSTOP="tools/cut_gate_scanner_backstop.sh"
+for req in "$SCAN" "$ALLOW" "$BACKSTOP"; do
   [[ -f "$req" ]] || { echo "✗ FAIL: required gate asset missing: $req"; exit 1; }
 done
+# shellcheck source=tools/cut_gate_scanner_backstop.sh
+source "$BACKSTOP"; bs_init
 
 enforce="${ENFORCE_READ_FORK:-1}"
 echo "ADR-0099 H3 read-fork gate (CHECK N) — root: $ROOT  (mode: $([[ "$enforce" == "1" ]] && echo ENFORCING || echo informational))"
 
-scope_files() { find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/|/aberp-db/' | sort; }
+# ── CHECK N0 — scanner liveness (ALWAYS ENFORCED, never informational) ──
+# This gate was "zero forks ⇒ green" with `2>/dev/null`: a crashed or silent
+# scanner reported ZERO and PASSED. The raw-string control is not hypothetical —
+# this scanner WAS fail-open on it until 2026-07-21 (its char-literal rule did
+# not cover raw strings), so a `Ledger::open` + `.entries()` read-fork sitting
+# after any `r##"… " …"##` in the file was invisible.
+echo "[CHECK N0] scanner liveness — the scanner sees a planted read-fork, incl. behind lexer traps"
+bs_check "$SCAN" 1 "positive: Ledger::open + .entries()" <<'RS'
+fn control() {
+    let l = Ledger::open(p).unwrap();
+    let _ = l.entries();
+}
+RS
+bs_check "$SCAN" 1 "positive: read-fork shielded by a char literal" <<'RS'
+fn control() {
+    out.push('"');
+    let l = Ledger::open(p).unwrap();
+    let _ = l.entries();
+}
+RS
+bs_check "$SCAN" 1 "positive: read-fork shielded by a raw string" <<'RS'
+fn control() {
+    let s = r##"a "# b"##;
+    let l = Ledger::open(p).unwrap();
+    let _ = l.entries();
+}
+RS
+bs_check "$SCAN" 1 "positive: raw SQL read — Connection::open + FROM audit_ledger" <<'RS'
+fn control() {
+    let c = Connection::open(p).unwrap();
+    let _ = c.query("SELECT seq FROM audit_ledger");
+}
+RS
+bs_check "$SCAN" 0 "negative: Handle-routed from_connection read (must NOT hit)" <<'RS'
+fn control(db: &Handle) {
+    let l = Ledger::from_connection(db.read().try_clone().unwrap());
+    let _ = l.entries();
+}
+RS
+bs_controls_ok || { echo; echo "READ-FORK GATE: ✗ FAILED (scanner liveness)"; exit 1; }
+echo
+
+# SCOPE FIX (finding F5, 2026-07-21) — was `apps/aberp/src …`, which excluded
+# apps/aberp-ui/src (a crate that resolves $ABERP_DB itself, lib.rs:762). See the
+# cut_gate_opener_census.sh header for the full finding.
+scope_files() { find apps/*/src modules crates -name '*.rs' | grep -vE '/tests/|/aberp-db/' | sort; }
 allow_set="$(grep -vE '^\s*#' "$ALLOW" | sed '/^\s*$/d' | sort -u)"
 is_allowed() { grep -qxF "$1" <<< "$allow_set"; }
 
@@ -99,8 +147,15 @@ while IFS= read -r f; do
     fi
     printf '%s:%s\n' "$f" "$rec" >> "$worklist"
     remaining=$((remaining + 1))
-  done < <(awk -f "$SCAN" "$f" 2>/dev/null)
+  done < <(bs_scan "$SCAN" "$f")
 done < <(scope_files)
+
+if ! bs_scan_ok; then
+  rm -f "$worklist" "$allowed_hits" "$unfenced"
+  echo
+  echo "READ-FORK GATE: ✗ FAILED (the scanner failed mid-scan — a zero-fork verdict is not trustworthy)"
+  exit 1
+fi
 
 if [[ -s "$unfenced" ]]; then
   echo "  ✗ ALLOW-LISTED BUT NOT FLOCK-FENCED (exemption VOID — these read audit fresh with NO"

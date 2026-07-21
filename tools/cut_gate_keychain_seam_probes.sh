@@ -86,6 +86,96 @@ d="$(fresh)"
 printf 'fn planted() {}\n#[cfg(test)]\nmod tests {\n    fn mk() { let _ = keyring::Entry::new(s, a); }\n}\n' > "$d/$SCRATCH"
 expect_pass "$d" "#[cfg(test)] inline mock is skipped"
 
+# ── LEXER TRAPS (finding F2, 2026-07-21) ────────────────────────────────────
+# This probe file had ZERO lexer-trap probes and exited 0 throughout while the
+# scanner was FAIL-OPEN: the same planted bypass FAILED the gate at
+# tenant_registry.rs:5 and PASSED it at :700, shielded by the `out.push('"')`
+# char literal at :615. Probes 9-11 plant the bypass at a HIGH line number
+# behind each trap, so the gate must go RED exactly as it does at line 1.
+#
+# plant_behind <dir> — reads the SHIELD source on stdin, writes the scratch file
+# as: shield fn, 700 filler lines, then the real bypass. The distance is the
+# whole point: the bypass must be caught at line ~705 exactly as at line 1.
+plant_behind() {
+  cat > "$1/$SCRATCH"
+  for i in $(seq 1 700); do printf '// filler %s\n' "$i"; done >> "$1/$SCRATCH"
+  cat >> "$1/$SCRATCH" <<'RS'
+fn planted() {
+    let _e = keyring::Entry::new(s, a).unwrap();
+}
+RS
+}
+
+# 9 — CHAR LITERAL holding a quote, bypass ~700 lines below it → RED.
+#     This is tenant_registry.rs:615's `out.push('"')` — the exact live exploit.
+d="$(fresh)"; plant_behind "$d" <<'RS'
+fn shield() {
+    out.push('"');
+}
+RS
+expect_fail "$d" "direct keychain access" "bypass 700 lines behind a char literal out.push('\"')"
+
+# 10 — RAW STRING holding a stray quote (a SECOND, independent blind vector the
+#      char-literal fix alone does NOT close) → RED.
+d="$(fresh)"; plant_behind "$d" <<'RS'
+fn shield() {
+    let s = r##"a "# b"##;
+}
+RS
+expect_fail "$d" "direct keychain access" 'bypass 700 lines behind a raw string r##"a "# b"##'
+
+# 11 — MULTI-LINE raw string carrying an unbalanced quote across lines → RED.
+d="$(fresh)"; plant_behind "$d" <<'RS'
+fn shield() {
+    let s = r#"open " quote
+       still raw "#;
+}
+RS
+expect_fail "$d" "direct keychain access" "bypass 700 lines behind a MULTI-LINE raw string"
+
+# 11b — FALSE-POSITIVE guard for the new char-literal rule: lifetimes and loop
+#       labels are NOT char literals. If the lexer ate `'a` as one it would
+#       strand itself and go blind again — the classic way this fix breaks.
+d="$(fresh)"
+cat > "$d/$SCRATCH" <<'RS'
+fn shield<'a>(s: &'a str) -> &'static str {
+    'outer: loop { break 'outer; }
+    let c = '\'';
+    let e = '\\';
+    let u = '\u{1F600}';
+    s
+}
+fn planted() {
+    let _e = keyring::Entry::new(s, a).unwrap();
+}
+RS
+expect_fail "$d" "direct keychain access" "lifetimes/labels/escapes do not blind the lexer"
+
+# ── SCANNER LIVENESS (finding F4, 2026-07-21) ───────────────────────────────
+# The gate was "zero hits ⇒ green" with `awk … 2>/dev/null`: a crashed or a
+# silent scanner reported ZERO and PASSED. CHECK K0 is the backstop; 12-13 are
+# its teeth. A clean tree must NOT be provable green by a dead tool.
+#
+# 12 — scanner CRASHES (invalid awk) → RED, on an OTHERWISE CLEAN tree.
+d="$(fresh)"; printf 'BEGIN{ not valid awk ((( }\n' > "$d/tools/adr0100_keychain_seam_scan.awk"
+expect_fail "$d" "SCANNER BROKEN" "crashed scanner cannot report a clean tree green"
+
+# 13 — scanner SILENT (empty program, exit 0, no output) → RED.
+d="$(fresh)"; : > "$d/tools/adr0100_keychain_seam_scan.awk"
+expect_fail "$d" "SCANNER BROKEN" "silent scanner cannot report a clean tree green"
+
+# 14 — the liveness backstop is NOT bypassable by the enforcement switch: a dead
+#      scanner stays RED even with ENFORCE_KEYCHAIN_SEAM=0 (a broken tool is not
+#      a policy question). Distinguishes CHECK K0 from CHECK K.
+d="$(fresh)"; : > "$d/tools/adr0100_keychain_seam_scan.awk"
+rc="$( ( cd "$d" && ENFORCE_KEYCHAIN_SEAM=0 bash "$GATE" ) >"$d/.out3" 2>&1; echo $? )"
+if [[ "$rc" != "0" ]] && grep -qF "SCANNER BROKEN" "$d/.out3"; then
+  printf '  ✓ caught: dead scanner stays RED even de-gated (exit=%s)\n' "$rc"; pass=$((pass+1))
+else
+  printf '  ✗ ESCAPED: ENFORCE_KEYCHAIN_SEAM=0 suppressed the liveness backstop (exit=%s)\n' "$rc"
+  sed 's/^/        /' "$d/.out3"; bad=$((bad+1))
+fi
+
 # 8 — META fail-closed: a de-gated scanner (ENFORCE_KEYCHAIN_SEAM=0) lets a real
 #     bypass through. If THIS didn't pass, a green gate would be luck, not teeth.
 d="$(fresh)"
