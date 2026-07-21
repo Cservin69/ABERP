@@ -1,8 +1,11 @@
 //! Portable-line end-to-end boot smoke (S435).
 //!
-//! The Portable launcher pair (`run/run_portable.sh` +
-//! `run/upgrade_portable.sh`) builds a DEV-profile binary and boots it as
-//! `tenant=demo`. The promise that pair makes — and that this file pins —
+//! The Portable launcher pair that motivated this smoke was deleted from
+//! this repo on 2026-07-21 — the Portable line ships from
+//! `ABERP-Editions.git`, and its launchers live there. The behaviour is
+//! still pinned HERE because it is behaviour of THIS crate: a DEV-profile
+//! binary booted as `tenant=demo`. The promise that posture makes — and
+//! that this file pins —
 //! is the [[customer-journey-e2e-gate]]: the NAV-off demo tenant boots
 //! straight to `Ready` (NOT the first-run `NeedsSetup` wizard), with no
 //! NAV credentials present, serves its routes, and the real partner-create

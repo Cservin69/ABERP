@@ -26,7 +26,7 @@ This stands up the **infrastructure prerequisite** for ADR-0100 **Phase 2** (ide
 
 - ❌ **It does not move ABERP to the cloud.** ABERP keeps running exactly as today (desktop Tauri + loopback). Relocating ABERP is ADR-0100 **Phases 4/6/7** — separate work, later.
 - ❌ **It does not write a single line of ABERP↔Keycloak code.** No OIDC relying-party code, no callback handler, no token validation. That is the **Phase-2 code session**, done after this infra exists. This walkthrough *ends* by handing that session the four values it needs (§11).
-- ❌ **It does not touch `main`, the desktop build, or the `run/` launch scripts.** Nothing here changes `run_prod.sh` / `run_portable.sh` / `upgrade_prod.sh`. The desktop binary stays the rollback target (ADR-0100 §6).
+- ❌ **It does not touch `main`, the desktop build, or the `run/` launch scripts.** Nothing here changes `run_prod.sh` / `upgrade_prod.sh`. The desktop binary stays the rollback target (ADR-0100 §6).
 
 If you only remember one thing: **this session's deliverable is a working Keycloak login page at `https://auth.example.com`.** Nothing about ABERP itself changes yet.
 

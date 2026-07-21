@@ -100,11 +100,16 @@ if ! bash -n "$0" 2>/dev/null; then
   exit 2
 fi
 
-# Accepts the classic line (PROD_vX.Y[.Z]) plus the S433+ product lines
-# PROD_Defense_vX.Y[.Z] / PROD_Portable_vX.Y[.Z] (the optional
-# `(Defense|Portable)_` infix). The old `^PROD_v...` regex rejected
-# `PROD_Portable_v0.1.0`, blocking the first Portable-line upgrade.
-readonly VERSION_RE='^PROD_(Defense_|Portable_)?v[0-9]+\.[0-9]+(\.[0-9]+)?$'
+# PROD line only: PROD_vX.Y[.Z].
+#
+# The `(Defense_|Portable_)?` infix was added in 7b849f7 so this upgrader
+# could drive the two edition lines too. Both have since left this repo —
+# Defense's refs were pruned on 2026-07-11, Portable's launchers deleted on
+# 2026-07-21 — so both arms are dead here, and accepting them is a footgun:
+# `upgrade_prod.sh PROD_Portable_v0.1.2` would hard-reset a PROD checkout
+# onto a dev-profile edition ref. Editions upgrades run from
+# ABERP-Editions.git's own launchers. Narrowed back on 2026-07-21.
+readonly VERSION_RE='^PROD_v[0-9]+\.[0-9]+(\.[0-9]+)?$'
 readonly DEV_SENTINEL_PATH_SUBSTR="/Documents/Claude/Projects/"
 
 # ---------- colour helpers (no-op when stdout is not a terminal) ------------
@@ -161,8 +166,12 @@ if [[ -z "$version" ]]; then
 fi
 
 if [[ ! "$version" =~ $VERSION_RE ]]; then
-  die "version '$version' does not match $VERSION_RE — expected e.g. PROD_v1.5, PROD_v1.5.1, or PROD_Portable_v0.1.0
-HU: A '$version' nem felel meg a $VERSION_RE mintának — pl. PROD_v1.5, PROD_v1.5.1 vagy PROD_Portable_v0.1.0"
+  die "version '$version' does not match $VERSION_RE — expected e.g. PROD_v1.5 or PROD_v1.5.1.
+   Portable/Defense versions are NOT upgraded from here — both editions ship
+   from ABERP-Editions.git and use that repo's launchers.
+HU: A '$version' nem felel meg a $VERSION_RE mintának — pl. PROD_v1.5 vagy PROD_v1.5.1.
+   A Portable/Defense verziók NEM innen frissülnek — mindkét kiadás az
+   ABERP-Editions.git repóból, annak saját indítóival megy."
 fi
 
 # Resolve script + repo paths.
