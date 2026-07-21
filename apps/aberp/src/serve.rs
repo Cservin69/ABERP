@@ -261,6 +261,30 @@ fn guard_tenant_matches_build(tenant: &str) {
     }
 }
 
+/// The tenant DB-binding guard. Refuses to boot `serve` against a database
+/// that resolves into a FOREIGN tenant's root under `~/.aberp/` — no matter
+/// how the path arrived (`--db`, `ABERP_DB`, a hand-edited launcher).
+///
+/// [`guard_tenant_matches_build`] inspects the tenant SLUG and has already
+/// established that a dev build is not running as `prod`; it never looks at
+/// the resolved DB PATH, so on its own it lets
+/// `ABERP_TENANT=test ABERP_DB=~/.aberp/prod/aberp.duckdb` boot a dev binary
+/// straight onto the production database. This is the path half of that
+/// pair. Fires loud + `exit(1)` like its sibling, before the port binds,
+/// before the keychain is touched, and before DuckDB opens the file — the
+/// ordering matters: the writer-lock step below creates directories and a
+/// lock file next to the DB, which must never happen inside prod's root.
+fn guard_db_matches_tenant(db: &std::path::Path, tenant: &str) {
+    if let Err(e) = crate::db_path_guard::ensure_db_path_isolated(db, tenant) {
+        eprintln!("❌ FATAL: {e}");
+        eprintln!(
+            "   Point --db / ABERP_DB at ~/.aberp/{tenant}/aberp.duckdb (or a path outside \
+             ~/.aberp/ for dev), or launch via run/run_prod.sh / run/run_desktop.sh."
+        );
+        std::process::exit(1);
+    }
+}
+
 /// S165 / deliverable #3 — one-shot boot banner. PRODUCTION builds get a
 /// loud red/yellow REAL-NAV warning; dev builds get a dim one-liner.
 /// Bilingual (HU + EN) per the closed-vocab banner constraint. ANSI
@@ -788,6 +812,13 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // The prod/test choice is COMPILE-TIME (`build_profile`), so a dev
     // binary physically cannot run as tenant=prod and vice versa.
     guard_tenant_matches_build(&args.tenant);
+
+    // The path half of the same pair: the guard above cleared the tenant
+    // NAME, this one clears the resolved DB PATH. Runs here — before the
+    // banner, the binary-hash thread, the writer-lock's `create_dir_all`,
+    // the keychain, and any DuckDB open — so a dev build handed prod's
+    // `ABERP_DB` dies without having touched a single prod byte.
+    guard_db_matches_tenant(&args.db, &args.tenant);
 
     // S165 / deliverable #3 — one-shot boot banner naming the NAV
     // environment this build talks to. Loud + colourised on a real
