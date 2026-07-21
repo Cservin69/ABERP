@@ -167,18 +167,98 @@ was therefore not treated as a veto, and no assertion bearing on the archive
 itself (A, B, C, D, F) failed. Re-baselining check E is Editions' work, not this
 repository's; it is flagged in the residuals below.
 
-## Residuals — Portable artefacts still in this repository
+> **Superseded as of 2026-07-21.** Check E has since been re-baselined in
+> `ABERP-Editions` and the script now passes in full. The paragraph above is
+> retained as the record of what the S3 run actually saw; it is no longer a
+> description of current state. See residual 2 below.
 
-Recorded so no future session has to infer them from state:
+## Residuals — both CLOSED 2026-07-21
 
-- **`apps/aberp/tests/portable_demo_boot_e2e.rs` is still tracked here.** It is
-  a Portable-only file (ABERP-Editions ADR-0100 §5, "delete") that stage S4a
-  missed — the two launchers were deleted on 2026-07-21, this test was not.
-  It should be deleted as S4a residue. Not done here: this stage is refs and
-  documentation only.
-- **`tools/verify_ref_mirror.sh` check E in `ABERP-Editions` is stale by
-  design** (see above) and needs re-baselining against the existence of
-  `PROD_Portable_v1.0.0`.
+Both residuals recorded at S3 have been closed. Neither is open work.
+
+### 1. `apps/aberp/tests/portable_demo_boot_e2e.rs` — **KEPT, reclassified**
+
+ADR-0100 §5 lists this file as **Portable-only → delete**, and S3 recorded it
+as S4a residue awaiting deletion. **It was examined and is not being deleted.**
+The §5 disposition is a classification by *provenance* — §5's table is the diff
+of `7b849f7^..6a51d4f`, the Portable line's own commits, so everything the
+Portable line introduced appears in it. Provenance is not substance, and §5
+itself already draws that distinction for `serve.rs` ("not Portable-specific …
+keep verbatim"). The same distinction applies here and was not drawn.
+
+What the file actually is, verified on `main` at `8283dd9`:
+
+- **It still compiles and all three pins pass** with both launchers gone
+  (`cargo test --test portable_demo_boot_e2e` → `3 passed; 0 failed`). It never
+  invoked `run_portable.sh` or `upgrade_portable.sh`; it constructs an
+  `AppState` and spawns this crate's own compiled binary.
+- **It is the only consumer of `serve::build_router` in this repository, and
+  the only test that round-trips real HTTP through the real route table.**
+  `serve_smoke.rs` disclaims exactly that coverage in its own header ("The full
+  axum HTTPS handshake is not exercised … would require spinning the listener
+  up and binding a real port"). Deleting this file deletes that pin outright.
+- **It is the only test of the `GET /health` route** — an unauthenticated live
+  prod route, and the SPA's boot probe. `handle_health` has no Portable, demo,
+  or NAV coupling whatsoever; it reads `binary_hash`, a build-profile const,
+  and `first_prod_launch_required`.
+- **The posture it pins is this repository's own feature, not Portable's.** The
+  NAV-off demo tenant is S434 `tenant_registry::tenant_nav_enabled` +
+  `DEMO_SLUG` + `TenantState::Demo`, all of which live and ship here.
+- **Deleting it would strand the `pub` that §5 deliberately kept.** §5 keeps
+  `pub fn build_router` on the grounds that narrowing it "would be an unrelated
+  API change to a live prod file". This test is its only caller in this repo.
+  Delete the test and the widened visibility has zero consumers — the deletion
+  would manufacture the very residue §5 refused to create.
+
+Honest counterweight, so this is not read as a stronger keep than it is: of the
+three pins, only pin 1 is load-bearing here. Pin 2
+(`demo_tenant_create_partner_via_real_route_succeeds`) is near-duplicate of
+`serve_partners_route.rs::partners_create_happy_path_returns_populated_partner`
+— `create_partner_request` never consults `state.nav_enabled`, so pin 2's only
+marginal coverage is the `PrivatePerson` VAT variant. Pin 3 is gated behind
+`ABERP_PORTABLE_E2E=1` and is a no-op in every gate run. The keep rests on
+pin 1.
+
+Coverage on the Portable side is **not** lost by keeping this copy here:
+`ABERP-Editions` already carries its own `apps/aberp/tests/portable_demo_boot_e2e.rs`,
+adapted with `#![cfg(not(feature = "production"))]` and the shared `Handle`
+(ADR-0100 §11.4). Portable's pin lives where Portable lives. This copy pins the
+same route table for the line that ships *here*.
+
+**The filename is now the only Portable thing about this file, and it is
+deliberately unchanged** — it matches its Editions sibling and the path
+references in ADR-0100 §5/§6/§11.4. If a future sweep flags it again, the
+answer is this section, not a re-deletion.
+
+### 2. `tools/verify_ref_mirror.sh` check E in `ABERP-Editions` — **FIXED**
+
+Re-baselined in `ABERP-Editions` PR #21 (`f40cde2`, merged to `main` at
+`d48e0a7`). Check E was rescoped from the blanket "no Portable release branch
+anywhere" to the property it actually means — *no branch from the **archived
+v0.1.x lineage** exists on origin* — and a new **check C2** was added asserting
+the positive: `PROD_Portable_v1.0.0` resolves as a real installable branch, and
+no archived name collides with it. Check C's probe list was corrected in the
+same change.
+
+Verified 2026-07-21 against the live Editions origin: the whole script now
+reports `RESULT: ALL ASSERTIONS PASS — S3 prune precondition SATISFIED`.
+
+Mutation-verified that the repair did not simply defang the check — the check-E
+predicate was extracted verbatim (`verify_ref_mirror.sh:109-110`) and run
+against three synthetic origins, alongside the pre-fix blanket form:
+
+| origin under test | repaired E | pre-fix E |
+| --- | --- | --- |
+| no Portable branches at all | GREEN | GREEN |
+| **archived `PROD_Portable_v0.1.1` reappears as a branch** | **RED** | RED |
+| post-S5 expected state: only `PROD_Portable_v1.0.0` | **GREEN** | RED |
+
+The repaired check still goes red for the thing it was written to catch, and no
+longer goes red for the state that means the migration succeeded.
+
+The Editions branch `s5/cut-portable-v1.0.0`, which carries the ADR-0100 §12.4
+install proof, was already merged to Editions `main` (PR #20, `df98e9d`); the
+merged branch ref still exists on that origin and is harmless.
 
 ## Not pruned
 
