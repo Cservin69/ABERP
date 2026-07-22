@@ -557,3 +557,118 @@ async fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
         "pre-issuance gate must fire before any DB write — no audit row must exist"
     );
 }
+
+/// B4 / ADR-0103 §3.3 (Invariant I) — T8. An `Other` (foreign-EU) buyer
+/// whose community VAT number is entered VIES-style (`"at u123 45678"`,
+/// spaces + lowercase) must reach NAV **normalised** (`ATU12345678`), and
+/// the tamper-evident audit payload must carry the SAME normalised bytes.
+/// Before B4 the gate normalised the value only for validation and then
+/// emitted `c.community_vat_number` RAW — what passed the gate was not what
+/// NAV received.
+///
+/// This is the full SPA door: `issue_invoice_request` runs preflight, the
+/// handler side-stores `input`, and `issue_from_parsed` normalises at ingest
+/// before the emit + audit snapshots. Asserting the two authoritative
+/// artifacts — the on-disk NAV XML (the wire) and the audit payload —
+/// proves the ingest normalisation reaches both, on the door that
+/// side-stores BEFORE the entry point runs.
+///
+/// MUTATION (must turn this red): revert `validate_community_vat_number` to
+/// discard the normalised value / drop the `normalize_customer_community_vat_number`
+/// call — the raw `at u123 45678` (or its spaceless-but-lowercase form)
+/// would then appear in the XML and the audit payload.
+#[tokio::test(flavor = "current_thread")]
+async fn issue_route_other_buyer_normalizes_community_vat_in_xml_and_audit() {
+    let dir = test_dir("other-community-vat");
+    std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+    let actor = Actor::from_local_cli("test-session".to_string(), "test-user");
+
+    // `Other` (foreign-EU business) buyer: no HU tax number, a valid
+    // ISO country code, and a VIES-style community VAT with spaces + a
+    // lowercase prefix — the exact operator input the gate reshapes.
+    let other_customer = CustomerJson {
+        community_vat_number: Some("at u123 45678".to_string()),
+        vat_status: CustomerVatStatus::Other,
+        partner_id: None,
+        tax_number: String::new(),
+        name: "Alpine GmbH".to_string(),
+        address: Some(AddressJson {
+            country_code: "AT".to_string(),
+            postal_code: "1010".to_string(),
+            city: "Wien".to_string(),
+            street: "Kärntner Straße 1.".to_string(),
+        }),
+    };
+    let request = IssueInvoiceRequest {
+        customer: other_customer,
+        lines: fixture_lines(),
+        currency: Currency::Huf,
+        series: None,
+        bank_account_id: None,
+        invoice_note: None,
+        payment_deadline: None,
+        delivery_date: None,
+        delivery_date_override: None,
+        email_buyer_on_issue: Some(false),
+        submit_to_nav_on_issue: Some(false),
+        payment_method: aberp_billing::PaymentMethod::default(),
+        email_recipient_override: None,
+    };
+
+    let summary = serve::issue_invoice_request(
+        &state,
+        request,
+        fixture_supplier(),
+        &UnreachableProvider,
+        actor,
+        None,
+    )
+    .await
+    .expect("Other-buyer issuance must succeed");
+
+    // (1) The wire — read the emitted XML from the returned path (robust to
+    //     the process-wide HOME redirect the sibling tests also use).
+    let xml = std::fs::read_to_string(&summary.nav_xml_path).expect("read emitted NAV XML");
+    assert!(
+        xml.contains("<communityVatNumber>ATU12345678</communityVatNumber>"),
+        "NAV XML must carry the NORMALISED community VAT number; body:\n{xml}"
+    );
+    // The raw operator input, in any un-normalised form, must NOT reach NAV.
+    for raw in [
+        "at u123 45678",
+        "atu12345678",
+        "ATU123 45678",
+        "at u12345678",
+    ] {
+        assert!(
+            !xml.contains(raw),
+            "NAV XML must not carry the un-normalised community VAT `{raw}`; body:\n{xml}"
+        );
+    }
+
+    // (2) The tamper-evident audit payload must carry the SAME bytes.
+    let ledger = Ledger::open(
+        dir.join("aberp.duckdb"),
+        TenantId::new(TEST_TENANT.to_string()).unwrap(),
+        BinaryHash::from_bytes([0u8; 32]),
+    )
+    .expect("open ledger");
+    let entries = ledger.entries().expect("read entries");
+    let draft = entries
+        .iter()
+        .find(|e| e.kind == EventKind::InvoiceDraftCreated)
+        .expect("InvoiceDraftCreated entry must exist");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&draft.payload).expect("decode draft payload");
+    assert_eq!(
+        payload
+            .get("customer_community_vat_number")
+            .and_then(|v| v.as_str()),
+        Some("ATU12345678"),
+        "audit payload must carry the NORMALISED community VAT number; payload:\n{payload:#}"
+    );
+
+    let _keep = &dir;
+}

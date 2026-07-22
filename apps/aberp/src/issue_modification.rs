@@ -206,7 +206,7 @@ pub struct ModificationIssuedSummary {
 /// `operator_login`).
 #[allow(clippy::too_many_arguments)]
 pub fn modification_from_inputs(
-    input: InvoiceInputJson,
+    mut input: InvoiceInputJson,
     // H3 (ADR-0099): the shared DuckDB `Handle` (serve: `&state.db`; CLI: a
     // process-local `Handle::open_default` under the F-E flock). Modification is
     // SYNCHRONOUS, so one write guard spans setup→tx→verify.
@@ -221,6 +221,11 @@ pub fn modification_from_inputs(
     if input.lines.is_empty() {
         return Err(anyhow!("input has no lines"));
     }
+
+    // B4 / ADR-0103 §3.3 (Invariant I) — normalise the buyer's community
+    // VAT number at ingest so the modification's emitted XML + audit payload
+    // carry the same normalised bytes.
+    crate::issue_invoice::normalize_customer_community_vat_number(&mut input);
 
     // Validate modification_date is canonical YYYY-MM-DD per ADR-0024
     // §1. No silent today-default. The parsed Date is discarded (the

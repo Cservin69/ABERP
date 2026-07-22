@@ -234,7 +234,7 @@ pub struct StornoIssuedSummary {
 /// call NAV). The CLI path stays compatible by passing the same
 /// `Actor::from_local_cli` it always built.
 pub fn storno_from_inputs(
-    input: InvoiceInputJson,
+    mut input: InvoiceInputJson,
     // H3 (ADR-0099): the shared DuckDB `Handle` (serve: `&state.db`; CLI: a
     // process-local `Handle::open_default` under the F-E flock). Storno is
     // SYNCHRONOUS (no NAV call), so a single write guard spans setup→tx→verify.
@@ -260,6 +260,11 @@ pub fn storno_from_inputs(
     if input.lines.is_empty() {
         return Err(anyhow!("input JSON has no lines"));
     }
+
+    // B4 / ADR-0103 §3.3 (Invariant I) — normalise the buyer's community
+    // VAT number at ingest so the storno's emitted XML + audit payload carry
+    // the same normalised bytes (the base's side-store may predate B4).
+    crate::issue_invoice::normalize_customer_community_vat_number(&mut input);
 
     // 2. Resolve tenant id + series code (loud-fail on invalid input).
     let tenant = TenantId::new(tenant_str.to_string())

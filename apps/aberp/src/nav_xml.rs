@@ -334,7 +334,17 @@ const EU_VAT_COUNTRY_PREFIXES: &[&str] = &[
 /// member states use letters in the body, e.g. NL/IE). Returns a
 /// bilingual, operator-actionable message on rejection (CLAUDE.md
 /// rule 12 — fail loud, name the problem).
-pub fn validate_community_vat_number(input: &str) -> Result<(), String> {
+///
+/// B4 / ADR-0103 §3.3 (Invariant I) — on success this **returns the
+/// normalised value** (whitespace-stripped, upper-cased) rather than
+/// discarding it. Ingest normalises `input.customer.community_vat_number`
+/// with this returned value so the bytes validated, audited, and written
+/// to the NAV XML are the SAME bytes (`validate_country_code` achieves
+/// the same identity by being verbatim-strict; VIES numbers are pasted
+/// with spaces, so this field normalises instead — different lenience,
+/// same invariant). Emitting a raw value the gate silently reshaped was
+/// the B4 defect: what passed the gate was not what NAV received.
+pub fn validate_community_vat_number(input: &str) -> Result<String, String> {
     let normalized: String = input
         .chars()
         .filter(|c| !c.is_whitespace())
@@ -371,7 +381,7 @@ pub fn validate_community_vat_number(input: &str) -> Result<(), String> {
              EU VAT number body must be alphanumeric: \"{input}\""
         ));
     }
-    Ok(())
+    Ok(normalized)
 }
 
 /// ADR-0102 (NAV-adversarial FIX #1) — STRUCTURAL ISO 3166-1 alpha-2
@@ -2931,6 +2941,19 @@ mod tests {
         // Space + lowercase tolerated (VIES prints spaces).
         assert!(validate_community_vat_number("at U1234 5678").is_ok());
         assert!(validate_community_vat_number("IE1234567FA").is_ok());
+        // B4 / ADR-0103 §3.3 — success RETURNS the normalised value
+        // (whitespace-stripped, upper-cased); ingest writes it back so the
+        // gate value == the emitted value. MUTATION: revert to `Ok(())`.
+        assert_eq!(
+            validate_community_vat_number("at U1234 5678").unwrap(),
+            "ATU12345678",
+            "validate must return the normalised value, not discard it"
+        );
+        assert_eq!(
+            validate_community_vat_number("ATU12345678").unwrap(),
+            "ATU12345678",
+            "an already-normalised value returns itself (bytes-neutral)"
+        );
         // Reject.
         assert!(validate_community_vat_number("").is_err(), "empty");
         assert!(
