@@ -128,6 +128,19 @@ Each fully-wired kind maps to **exactly one** `(element, case, reason)` triple. 
 
 `nav_xml.rs::write_vat_rate` (`:1546-1552`) and validator `walk_vat_rate` (`:957`) handle `summaryByVatRate/vatRate` — the **invoice-level** aggregate, same choice shape. NAV requires the summary's `vatRate` to **match** the lines' rate categories. So a non-Percent line must also produce the matching **`summaryByVatRate`** entry (e.g. an AAM line → a summary bucket keyed on `vatExemption/AAM`, not `vatPercentage 0.00`). **This is in-scope for the NAV-emit session** — emitting the line correctly but leaving the summary as `vatPercentage 0.00` would be a NAV cross-field mismatch rejection. Grep `write_summary`/`summaryByVatRate` in `nav_xml.rs` before that session; the round-trip test must assert line **and** summary agree.
 
+> **⚠ AMENDMENT (2026-07-22, ADR-0103) — §3.4 shipped only HALF.** The
+> *kind*-mirror (a non-`Percent` line's `summaryByVatRate` bucket keys on the
+> matching choice element) landed. The **rate**-mirror did not: `write_summary`
+> still emitted a **single** bucket keyed on `lines.first()` and summed every
+> line into it, and the "assert line **and** summary agree" round-trip test for
+> a **multi-rate** invoice was never written — so a 27% + 5% invoice sent NAV
+> one bucket of everything under 27% (silently wrong ÁFA). This was **not** a
+> new defect; it was §3.4 landing partially and being read as complete. The
+> per-`(kind, rate)` bucketing, the validator's `maxOccurs="unbounded"`
+> acceptance, and the multi-rate round-trip pins are completed in **ADR-0103
+> (Invariant S)**. Do not read §3.4 above as "shipped in 0101"; read it as
+> "specified in 0101, completed in 0103".
+
 ---
 
 ## 4. Preflight accept/reject matrix

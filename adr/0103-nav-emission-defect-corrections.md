@@ -1,11 +1,11 @@
 # ADR-0103 — Correcting five confirmed NAV-emission defects: summary bucketing, VAT derivation, preflight universality, and validate/emit identity
 
-- **Status:** **Proposed (design-only, 2026-07-20).** No application code written in this session. This ADR is the design a later implementation session executes against, in the sequence of §7.
+- **Status:** **Accepted, PARTIALLY IMPLEMENTED (2026-07-22).** Invariants **S** (B3/B3′), **V** (B2), and **I** (B4) are implemented and landed (see §11). Invariants **P** (B1 preflight universality) and **C** (chain congruence) are **NOT in this change** — they were out of the implementation session's scope and remain deferred (§11). Design authored design-only on 2026-07-20; §7's sequence was followed for the three landed invariants.
 - **Date:** 2026-07-20
 - **Deciders:** Ervin Áben (identified and confirmed all five defects; set the two-scope framing of §1). Design-pass by Dispatch.
 - **Base:** all five defects grep-confirmed present on `main` @ `76e9dad`. Every file:line in §2 was read in this session, not inferred.
 - **Related:** **ADR-0101** (per-line `vat_rate_kind` — §3.4 of which *specified* the summary mirror this ADR finds unbuilt; see §9), **ADR-0102** (EU-partner `Other` / `communityVatNumber` — B4 lives on the path it opened, and its §4 cross-field matrix is load-bearing for §3.1's guard decision), ADR-0049 (storno/modification replay the side-stored `input.json` — the shape B1 must not break), ADR-0048 (customer VAT status closed vocab), ADR-0042 (notes never on the NAV wire — a firewall none of these fixes may breach), ADR-0022 (`nav-xsd-validator`). NAV wire-shape gotchas: `reference-nav-gotchas` memory §1–§4.
-- **⛔ BLOCKED ON §9** — a parallel archaeology session must complete before implementation begins. See §9 for why this is a hard gate and not a nicety.
+- **§9 RESOLVED (2026-07-22)** — the root-cause doc question is answered (§9's resolution subsection). The load-bearing finding: a repo **walkthrough** taught the defect as correct, and the local **XSD validator** enforced the wrong shape. Both were corrected in lock-step with the S fix.
 
 ---
 
@@ -265,7 +265,24 @@ A parallel archaeology session is establishing two things this design session de
 - the list of documents (ADR / `docs/` / load-bearing code comment) that describe any defective behaviour as correct or acceptable;
 - for each such document, whether it is **superseded**, **amended**, or **deleted** — and by which step of §7.
 
-Until then this ADR stays **Proposed**. It does not advance to Accepted.
+### 9.RESOLUTION (2026-07-22 — implementation session)
+
+Scoped to the three invariants this session implemented (S/V/I). The two
+directly-relevant root-cause questions from §9(b) are **answered**, and both
+answers were load-bearing exactly as §9 warned.
+
+**Documents that describe the defective behaviour as correct/acceptable — and their disposition:**
+
+1. **`docs/walkthroughs/nav-test-hardening-and-vat-walkthrough.md:192`** — states *"NAV's `summaryByVatRate` is single-bucket, so mixed kinds must be split onto separate invoices."* This is the §9(b) root cause: a repo document teaching the defect as a NAV fact. **It is NOT on `main`** — it lives only on the unmerged `docs-nav-test-walkthrough` branch. Corrected **on that branch** (the single-bucket claim is false; the operator conclusion "mixed *non-`Percent`-kind* invoices must be split" stays true but for the re-founded reason). ⚠ Flagged: this is a cross-branch correction, not part of this PR's tree — if the walkthrough branch is superseded/rebased, re-verify the correction survived.
+2. **`crates/nav-xsd-validator/src/validate.rs` `walk_summary_normal`** — not a doc, but the enforcement twin of the teacher: it was built to the single-bucket shape and rejected a correct multi-bucket body with `ChildOrderViolation`. Corrected in the **same change** as the emitter (§11). This is the "validator was built to match the wrong shape" trap the brief named.
+3. **`nav_xml.rs::write_summary` in-file comment (`:1885-1889`)** and **`issue_preflight.rs` FLAG + guard comment** — described the single-bucket collapse / the mixed-`Percent`-RATE gap as a known-and-deferred posture. All rewritten in the same change (§11) so no comment asserts the closed defect is still open.
+4. **ADR-0101 §3.4** — specified the summary mirror but was only half-landed (kind-mirror shipped, rate-mirror did not). **Amended in this change** with a ⚠ note so it is read as "specified in 0101, completed in 0103", not "shipped in 0101".
+
+**Ground truth check (§10.1):** confirmed against the published NAV `nav-gov-hu/Online-Invoice` `invoiceData.xsd` that `SummaryNormalType/summaryByVatRate` is `maxOccurs="unbounded"` and `SummaryByVatRateType` orders `vatRate, vatRateNetData, (vatRateVatData?), (vatRateGrossData?)`. The local validator (deliberately loose, ADR-0022) was NOT taken as authority.
+
+**Regression-vs-defect (§9(a)):** not separately excavated for S/V/I. The evidence points to *never-fixed* (§3.4 half-landed), not *regressed*: no prior multi-bucket emitter or test existed to regress from. No pin was found that once caught this and was removed. Treated as an original defect; if a future archaeology pass finds a removed guard, that is a new finding.
+
+Until this resolution, the ADR stayed **Proposed**; it now advances to **Accepted, partially implemented** (§11).
 
 ---
 
@@ -278,3 +295,24 @@ Until then this ADR stays **Proposed**. It does not advance to Accepted.
 5. **Out of scope:** the invoice-level HUF rounding posture beyond ADR-0037 §1.c's per-bucket-then-sum rule. Invariant S must implement that rule; it does not revisit it.
 6. **Scope B (Defense) is a port, not an inheritance.** `ABERP-Editions.git` is a separate repository; the fixes do not arrive by rebuild. Each step of §7 needs an explicit Scope-B port and its own green run (§6). Portable, by contrast, genuinely inherits by compilation — the asymmetry is why one is gated and the other parked (§1).
 7. **No implementation code was written in this session.** Every file:line in §2 was read at `76e9dad`. Where this ADR asserts current behaviour, it was verified; where it asserts NAV behaviour, it is flagged ⚠ (item 1).
+
+---
+
+## 11. Implementation record (2026-07-22)
+
+Branch `nav-vat-emission-fix` off `main` @ `f8ff121` (the design branch's base `76e9dad` was 21 commits behind current `main`; none of those 21 touched the §2 files, so the line numbers held). Landed in §7 order, each step gate-green, every new test **mutation-verified** (revert → observed red).
+
+**Landed — Invariants S, V, I:**
+
+- **B4 / Invariant I** — `validate_community_vat_number` returns its normalised value; the three issuance entry points normalise `input.customer.community_vat_number` in place at ingest. Pin: `serve_issue_route::issue_route_other_buyer_normalizes_community_vat_in_xml_and_audit` asserts the normalised value in the emitted NAV XML **and** the audit payload.
+- **B2 / Invariant V** — `LineItem::vat_amount` returns `Huf::ZERO` for every non-`Percent` kind unconditionally. Pin: `aberp_billing … vat_amount_is_zero_for_non_percent_kinds_even_with_nonzero_rate`.
+- **B3/B3′ / Invariant S** — `write_summary` groups by `(kind, basis_points)`, one bucket per group, stable-sorted, per-bucket HUF summed for the invoice level; the `nav-xsd-validator` accepts a leading run of 1+ buckets and still rejects a bucket after an amount. Guard **re-founded, kept** (T13). Pins: `nav_xml_summary_multibucket` (T1–T5, T7), `validate::tests::validator_accepts_multiple_summary_by_vat_rate_buckets` + `…rejects_summary_by_vat_rate_after_invoice_amount`, `issue_preflight … mixed_kbaet_and_drc_still_rejected`.
+- **Teachers corrected in lock-step:** `write_summary` comment, `issue_preflight.rs` FLAG + guard + mixed-kinds test doc, ADR-0101 §3.4 amendment (all on `main`); the `docs-nav-test-walkthrough` walkthrough on its own branch (§9.RESOLUTION item 1).
+
+**NOT in this change — deferred (were out of the implementation session's scope):**
+
+- **Invariant P (B1 — preflight universality)**: re-targeting `validate_invoice_preflight` onto `InvoiceInputJson` and calling it from all three entry points (1-of-8 → 8-of-8 doors). Highest blast radius (§3.4 fallout); a separate change.
+- **Invariant C (B1b — chain congruence)**: `validate_against_base` for storno/modification. Depends on P's chokepoint.
+- **Scope B (Defense port)** and **the structural `vat_rate_basis_points` model** (§3.2 residual) remain as the ADR states.
+
+⚠ These deferrals are **flagged, not silently dropped**: the community-VAT normalisation (B4) reaches the wire+audit on all 8 doors because it sits on the shared entry points, but B1's gate-universality and chain-congruence guards are genuinely absent — a preflight-bypassing CLI door can still originate a body this change does not gate (it will, however, now emit a *correct summary* and *kind-consistent VAT* for whatever lines it carries).
