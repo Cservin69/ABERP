@@ -171,24 +171,26 @@ pub enum InvoicePreflightError {
         line_index: usize,
         kind: VatRateKind,
     },
-    /// ADR-0101 (Session-2 conservative guard — FLAGGED). The invoice mixes
-    /// a non-`Percent` `vat_rate_kind` with a DIFFERENT kind on another
-    /// line. The NAV emitter's `summaryByVatRate` is single-bucket, keyed
-    /// on the FIRST line's kind/rate (`nav_xml.rs::write_summary`), so a
-    /// mixed-kind invoice would emit a summary whose category does not
-    /// cover every line — a NAV cross-field rejection at best, a silently
-    /// mis-categorised filing at worst. Until the summary emitter groups by
-    /// (kind, rate) — a separate follow-up — an invoice that carries ANY
-    /// non-`Percent` line must have EVERY line on that same kind. All-
-    /// `Percent` invoices are unaffected (byte-identical backward-compat);
-    /// this guard fires only once a non-`Percent` kind is present. Carries
-    /// the two disagreeing kinds + the line that first differs.
+    /// The invoice mixes a non-`Percent` `vat_rate_kind` with a DIFFERENT
+    /// kind on another line.
     ///
-    /// FLAG (for the NAV-category adversarial review): this enforces the
-    /// invariant `write_summary` already assumes but never checked. The
-    /// pre-existing mixed-`Percent`-RATE single-bucket gap (e.g. a 27% line
-    /// + a 5% line) is untouched here — out of ADR-0101 scope — and remains
-    /// a NAV-reject-on-submit rather than a preflight catch.
+    /// ADR-0103 §3.1 RE-FOUNDING (T13): the emitter now groups by (kind, rate)
+    /// and emits one `summaryByVatRate` per group (Invariant S), so this guard
+    /// no longer exists to protect a single-bucket summary — and the
+    /// mixed-`Percent`-RATE case (27% + 5% on one invoice) is now emitted
+    /// correctly and is NOT gated. The guard survives on a different, stronger
+    /// invariant: each wired non-`Percent` kind carries an invoice-scoped
+    /// precondition (buyer VAT status, ADR-0102 §4(a); seller-side exemption
+    /// for AAM) that a second differing kind would contradict — a KBAET + DRC
+    /// invoice, for one, demands both `Other` and `Domestic` buyer status at
+    /// once, which the single invoice-level field cannot satisfy. So any
+    /// non-`Percent` line still forces every line onto that one kind. All-
+    /// `Percent` invoices are unaffected. Carries the two disagreeing kinds +
+    /// the line that first differs.
+    ///
+    /// Whether to relax this to admit legitimately-mixable kinds (a §142 DRC
+    /// line beside a normal 27% line) is a FEATURE decision, deferred to a
+    /// separate ADR (ADR-0103 §10.4).
     MixedVatRateKindsUnsupported {
         line_index: usize,
         first_kind: VatRateKind,
@@ -1007,15 +1009,37 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
             }
         }
 
-        // ADR-0101 conservative mixed-kind guard (FLAGGED). The NAV emitter's
-        // `summaryByVatRate` is single-bucket, keyed on the FIRST line's kind
-        // (`nav_xml.rs::write_summary`). Once ANY line carries a non-`Percent`
-        // kind, every line must share that exact kind or the emitted summary
-        // would not cover every line's category — a NAV cross-field mismatch.
-        // All-`Percent` invoices skip this guard entirely (the `any`
-        // short-circuits false), so backward-compat is byte-identical. The
-        // pre-existing mixed-`Percent`-RATE single-bucket gap is out of
-        // ADR-0101 scope and intentionally NOT gated here.
+        // ADR-0103 §3.1 — mixed non-`Percent`-KIND guard (RE-FOUNDED, T13).
+        //
+        // The old justification — "`write_summary` is single-bucket, keyed on
+        // the first line, so mixed kinds would emit a summary that doesn't
+        // cover every line" — is GONE: the emitter now groups by (kind, rate)
+        // and emits one `summaryByVatRate` per group (Invariant S). The
+        // pre-existing mixed-`Percent`-RATE case (e.g. a 27% line + a 5% line)
+        // is emitted correctly now and is deliberately NOT gated — that gap is
+        // CLOSED, not tolerated.
+        //
+        // A DIFFERENT, stronger reason keeps this guard standing: each wired
+        // non-`Percent` kind carries an INVOICE-scoped precondition that a
+        // second, differing kind on the same invoice would contradict. The
+        // buyer-status ↔ line-kind matrix below (ADR-0102 §4(a)) is the sharp
+        // case: `IntraCommunity*` requires customerVatStatus=Other and
+        // `DomesticReverseCharge` requires Domestic, so a KBAET + DRC invoice
+        // demands two customer statuses at once — unsatisfiable, because the
+        // status is a single invoice-level field. Post-grouping such a body
+        // would produce well-formed buckets and pass the local validator while
+        // being semantically impossible; this guard is the only thing that
+        // rejects it (pinned by `mixed_kbaet_and_drc_still_rejected`).
+        //
+        // It is conservatively over-broad: it also rejects mixes that could be
+        // legitimate (a §142 `DomesticReverseCharge` line beside a normal 27%
+        // line). RELAXING it to admit those is a FEATURE decision — does the
+        // SPA thread per-line kinds, and which mixes are lawful — deferred to a
+        // separate ADR (ADR-0103 §10.4), NOT a defect correction. Until then
+        // the safe posture is: any non-`Percent` line forces every line onto
+        // that one kind. All-`Percent` invoices skip the guard entirely (the
+        // `any` short-circuits false), so multi-rate `Percent` invoices — now
+        // first-class under Invariant S — are unaffected.
         let any_non_percent = request.lines.iter().any(|l| !l.vat_rate_kind.is_percent());
         if any_non_percent {
             let first_kind = request.lines[0].vat_rate_kind;
@@ -1262,10 +1286,12 @@ mod tests {
         }
     }
 
-    /// ADR-0101 conservative guard (FLAGGED) — an invoice mixing a
-    /// non-`Percent` kind with a DIFFERENT kind trips
-    /// `MixedVatRateKindsUnsupported` (the summary emitter is single-bucket).
-    /// A Percent line beside an AAM line is a mix; two AAM lines are not.
+    /// ADR-0103 §3.1 re-founded guard — an invoice mixing a non-`Percent`
+    /// kind with a DIFFERENT kind trips `MixedVatRateKindsUnsupported`. NOT
+    /// because the summary is single-bucket (it groups by (kind, rate) now),
+    /// but because each wired non-`Percent` kind carries an invoice-scoped
+    /// precondition a second differing kind would contradict. A Percent line
+    /// beside an AAM line is a mix; two AAM lines are not.
     #[test]
     fn mixed_kinds_rejected_but_uniform_non_percent_accepted() {
         use aberp_billing::VatRateKind::*;
@@ -1298,6 +1324,40 @@ mod tests {
         assert!(
             errs.is_empty(),
             "a uniform all-AAM invoice must be accepted; got {errs:?}"
+        );
+    }
+
+    /// ADR-0103 §3.1 (T13) — the re-founding is behaviourally verified, not
+    /// just re-commented: a KBAET (`IntraCommunityGoods`, requires buyer
+    /// status Other) line beside a `DomesticReverseCharge` (requires Domestic)
+    /// line demands two invoice-level customer statuses at once — unsatisfiable
+    /// — and must STILL be rejected as mixed kinds AFTER the summary emitter
+    /// learned to group by (kind, rate). This is the load-bearing reason the
+    /// guard was kept rather than deleted once Invariant S landed.
+    ///
+    /// MUTATION: delete the `MixedVatRateKindsUnsupported` push in
+    /// `validate_invoice_preflight` — this assertion goes red.
+    #[test]
+    fn mixed_kbaet_and_drc_still_rejected() {
+        use aberp_billing::VatRateKind::*;
+        let mut req = good_request();
+        req.lines = vec![good_line(), good_line()];
+        req.lines[0].vat_rate_kind = IntraCommunityGoods;
+        req.lines[0].vat_rate_percent = 0;
+        req.lines[1].vat_rate_kind = DomesticReverseCharge;
+        req.lines[1].vat_rate_percent = 0;
+        let errs = validate_invoice_preflight(&req);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                InvoicePreflightError::MixedVatRateKindsUnsupported {
+                    first_kind: IntraCommunityGoods,
+                    other_kind: DomesticReverseCharge,
+                    ..
+                }
+            )),
+            "KBAET + DRC on one invoice must still be rejected as mixed kinds \
+             after grouping landed; got {errs:?}"
         );
     }
 

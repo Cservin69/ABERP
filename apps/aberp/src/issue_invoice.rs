@@ -327,6 +327,37 @@ pub struct LineJson {
     pub unit: Option<ProductUnit>,
 }
 
+/// B4 / ADR-0103 §3.3 (Invariant I — one value) — normalise the buyer's
+/// community VAT number IN PLACE at the library ingest boundary, so the
+/// bytes validated, the bytes stamped on the audit payload, and the bytes
+/// written to the NAV XML are the SAME bytes. `validate_community_vat_number`
+/// already computed this normalised form (whitespace-stripped, upper-cased)
+/// but discarded it — emitting `c.community_vat_number` raw at `nav_xml.rs`
+/// meant what passed the gate was not what NAV received (the B4 defect).
+///
+/// Called as the first data step of every issuance entry point
+/// (`issue_from_parsed`, `storno_from_inputs`, `modification_from_inputs`),
+/// which covers all invoice-originating doors: the wire body and the
+/// tamper-evident audit payload both derive from `input` downstream of this
+/// call, and a storno/modification REPLAY re-enters through these same
+/// entry points, so no path can produce a non-normalised wire.
+///
+/// A `None`/empty value is left untouched (it collapses to `None` at the
+/// emit-body snapshot). A MALFORMED value is left exactly as the operator
+/// typed it — preflight surfaces it and the emit path fails loud as before;
+/// B4 is the validate-vs-emit divergence for a VALID value the gate silently
+/// reshaped, not a question of admitting malformed ones.
+pub(crate) fn normalize_customer_community_vat_number(input: &mut InvoiceInputJson) {
+    let normalized = input
+        .customer
+        .community_vat_number
+        .as_deref()
+        .and_then(|raw| crate::nav_xml::validate_community_vat_number(raw).ok());
+    if let Some(n) = normalized {
+        input.customer.community_vat_number = Some(n);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Entry point
 // ──────────────────────────────────────────────────────────────────────
@@ -530,7 +561,7 @@ pub async fn run_with_provider<P: MnbRatesProvider + ?Sized>(
 /// (see `serve::issued_xml_path`).
 #[allow(clippy::too_many_arguments)]
 pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
-    input: InvoiceInputJson,
+    mut input: InvoiceInputJson,
     // H3 (ADR-0099): the shared DuckDB `Handle` — the ONE runtime instance for
     // this tenant, in BOTH contexts. Serve handlers pass `&state.db`; the CLI
     // `run` opens a process-local `Handle::open_default` under the F-E writer
@@ -556,6 +587,11 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     if input.lines.is_empty() {
         return Err(anyhow!("input has no lines"));
     }
+
+    // B4 / ADR-0103 §3.3 (Invariant I) — normalise the buyer's community
+    // VAT number ONCE, here at ingest, before the side-store/emit/audit
+    // snapshots read it, so validated == audited == transmitted.
+    normalize_customer_community_vat_number(&mut input);
 
     // PR-50 / session-70 — pre-issuance supplier shape guard. Refuse
     // to burn a sequence slot when the supplier's tax number isn't

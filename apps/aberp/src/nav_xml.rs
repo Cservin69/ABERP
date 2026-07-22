@@ -334,7 +334,17 @@ const EU_VAT_COUNTRY_PREFIXES: &[&str] = &[
 /// member states use letters in the body, e.g. NL/IE). Returns a
 /// bilingual, operator-actionable message on rejection (CLAUDE.md
 /// rule 12 — fail loud, name the problem).
-pub fn validate_community_vat_number(input: &str) -> Result<(), String> {
+///
+/// B4 / ADR-0103 §3.3 (Invariant I) — on success this **returns the
+/// normalised value** (whitespace-stripped, upper-cased) rather than
+/// discarding it. Ingest normalises `input.customer.community_vat_number`
+/// with this returned value so the bytes validated, audited, and written
+/// to the NAV XML are the SAME bytes (`validate_country_code` achieves
+/// the same identity by being verbatim-strict; VIES numbers are pasted
+/// with spaces, so this field normalises instead — different lenience,
+/// same invariant). Emitting a raw value the gate silently reshaped was
+/// the B4 defect: what passed the gate was not what NAV received.
+pub fn validate_community_vat_number(input: &str) -> Result<String, String> {
     let normalized: String = input
         .chars()
         .filter(|c| !c.is_whitespace())
@@ -371,7 +381,7 @@ pub fn validate_community_vat_number(input: &str) -> Result<(), String> {
              EU VAT number body must be alphanumeric: \"{input}\""
         ));
     }
-    Ok(())
+    Ok(normalized)
 }
 
 /// ADR-0102 (NAV-adversarial FIX #1) — STRUCTURAL ISO 3166-1 alpha-2
@@ -1857,96 +1867,172 @@ fn write_line_gross(
     Ok(())
 }
 
+/// One `summaryByVatRate` bucket: a distinct `(vat_rate_kind,
+/// vat_rate_basis_points)` group and its accumulated native totals.
+struct VatRateBucket {
+    kind: VatRateKind,
+    basis_points: u16,
+    net: Huf,
+    vat: Huf,
+    gross: Huf,
+}
+
 fn write_summary(
     w: &mut Writer<&mut Vec<u8>>,
     lines: &[LineItem],
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
 ) -> Result<()> {
-    let mut net_total = Huf::ZERO;
-    let mut vat_total = Huf::ZERO;
-    let mut gross_total = Huf::ZERO;
+    // B3/B3′ / ADR-0103 §3.1 (Invariant S — summary coverage). Group lines
+    // by the composite key `(vat_rate_kind, vat_rate_basis_points)` and emit
+    // ONE `<summaryByVatRate>` per group, each carrying its OWN group's
+    // net/vat/gross sums; the invoice-level totals are the sum OVER buckets.
+    //
+    // Was (the B3′ defect): a single bucket keyed on `lines.first()` wrapped
+    // around every line's total — so a mixed-rate or mixed-kind invoice sent
+    // NAV one bucket carrying every line's money under the first line's rate,
+    // i.e. silently wrong ÁFA. The NAV OSA 3.0 `SummaryNormalType` defines
+    // `summaryByVatRate` as `maxOccurs="unbounded"` (verified against the
+    // published `invoiceData.xsd`), so multiple buckets are the correct wire
+    // shape; the local validator was corrected to accept them in lock-step.
+    //
+    // Determinism: buckets are emitted in a stable sort on (kind canonical
+    // name, basis points), NEVER `HashMap` iteration order, so a given
+    // invoice renders byte-identically on every render (T4) and the on-disk
+    // XML stays a stable canonical record of what NAV saw
+    // (`reference-nav-gotchas` §3).
+    //
+    // HUF conversion is PER BUCKET (ADR-0037 §1.c): each bucket converts its
+    // own native totals, and the invoice-level HUF figures are the SUM of the
+    // per-bucket HUF figures — NOT a fresh conversion of the native grand
+    // total, which would reintroduce a rounding discrepancy the moment there
+    // is more than one bucket.
+    //
+    // Back-compat (T5): for a single-rate, single-kind invoice — every
+    // invoice issued to date — the grouping yields exactly one bucket and the
+    // emitted bytes are IDENTICAL to the pre-0103 single-bucket output.
+    let mut buckets: Vec<VatRateBucket> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        net_total = net_total
+        let key = (line.vat_rate_kind, line.vat_rate_basis_points);
+        let idx = match buckets.iter().position(|b| (b.kind, b.basis_points) == key) {
+            Some(idx) => idx,
+            None => {
+                buckets.push(VatRateBucket {
+                    kind: line.vat_rate_kind,
+                    basis_points: line.vat_rate_basis_points,
+                    net: Huf::ZERO,
+                    vat: Huf::ZERO,
+                    gross: Huf::ZERO,
+                });
+                buckets.len() - 1
+            }
+        };
+        let b = &mut buckets[idx];
+        b.net = b
+            .net
             .checked_add(line.net_total().unwrap_or(Huf::ZERO))
             .with_context(|| format!("net overflow at line {i}"))?;
-        vat_total = vat_total
+        b.vat = b
+            .vat
             .checked_add(line.vat_amount().unwrap_or(Huf::ZERO))
             .with_context(|| format!("vat overflow at line {i}"))?;
-        gross_total = gross_total
+        b.gross = b
+            .gross
             .checked_add(line.gross_total().unwrap_or(Huf::ZERO))
             .with_context(|| format!("gross overflow at line {i}"))?;
     }
+    // Stable, deterministic bucket order (independent of line order).
+    buckets.sort_by(|a, b| {
+        a.kind
+            .as_str()
+            .cmp(b.kind.as_str())
+            .then(a.basis_points.cmp(&b.basis_points))
+    });
 
-    // PR-44δ — ADR-0037 §1.c invoice-level HUF totals are the sum of
-    // per-VAT-rate HUF amounts (NOT a fresh round_half_even on the
-    // EUR invoice total). PR-5's single-`summaryByVatRate` posture
-    // collapses everything into one VAT rate today; when a future PR
-    // extends to multi-rate invoices the per-rate HUF amounts here
-    // need to be summed before serializing the invoice-level *HUF.
-    let net_total_huf = huf_equivalent_for(net_total.as_i64(), currency, rate_metadata)?;
-    let vat_total_huf = huf_equivalent_for(vat_total.as_i64(), currency, rate_metadata)?;
-    let gross_total_huf = huf_equivalent_for(gross_total.as_i64(), currency, rate_metadata)?;
+    let mut inv_net = Huf::ZERO;
+    let mut inv_vat = Huf::ZERO;
+    let mut inv_gross = Huf::ZERO;
+    let mut inv_net_huf: i64 = 0;
+    let mut inv_vat_huf: i64 = 0;
+    let mut inv_gross_huf: i64 = 0;
 
     w.write_event(Event::Start(BytesStart::new("invoiceSummary")))?;
     w.write_event(Event::Start(BytesStart::new("summaryNormal")))?;
-    // summaryByVatRate (one entry, assuming all lines share a rate; PR-5
-    // does not yet group by rate — a follow-up extends this for
-    // multi-rate invoices).
-    if let Some(first) = lines.first() {
+    for b in &buckets {
+        let net_huf = huf_equivalent_for(b.net.as_i64(), currency, rate_metadata)?;
+        let vat_huf = huf_equivalent_for(b.vat.as_i64(), currency, rate_metadata)?;
+        let gross_huf = huf_equivalent_for(b.gross.as_i64(), currency, rate_metadata)?;
+
         w.write_event(Event::Start(BytesStart::new("summaryByVatRate")))?;
-        // ADR-0101 §3.4 — the summary mirror keys on the first line's KIND
-        // as well as its rate, so the `summaryByVatRate` bucket's choice
-        // element matches the lines' (today's single-bucket posture assumes
-        // all lines share a rate/kind). A line/summary category mismatch is
-        // a NAV cross-field rejection.
-        write_vat_rate(w, first.vat_rate_kind, first.vat_rate_basis_points)?;
+        // The bucket's `<vatRate>` choice element mirrors its lines' kind +
+        // rate — a line/summary category mismatch is a NAV cross-field
+        // rejection.
+        write_vat_rate(w, b.kind, b.basis_points)?;
         w.write_event(Event::Start(BytesStart::new("vatRateNetData")))?;
         text_element(
             w,
             "vatRateNetAmount",
-            &format_native_amount(net_total.as_i64(), currency),
+            &format_native_amount(b.net.as_i64(), currency),
         )?;
-        text_element(w, "vatRateNetAmountHUF", &net_total_huf.to_string())?;
+        text_element(w, "vatRateNetAmountHUF", &net_huf.to_string())?;
         w.write_event(Event::End(BytesEnd::new("vatRateNetData")))?;
         w.write_event(Event::Start(BytesStart::new("vatRateVatData")))?;
         text_element(
             w,
             "vatRateVatAmount",
-            &format_native_amount(vat_total.as_i64(), currency),
+            &format_native_amount(b.vat.as_i64(), currency),
         )?;
-        text_element(w, "vatRateVatAmountHUF", &vat_total_huf.to_string())?;
+        text_element(w, "vatRateVatAmountHUF", &vat_huf.to_string())?;
         w.write_event(Event::End(BytesEnd::new("vatRateVatData")))?;
         w.write_event(Event::Start(BytesStart::new("vatRateGrossData")))?;
         text_element(
             w,
             "vatRateGrossAmount",
-            &format_native_amount(gross_total.as_i64(), currency),
+            &format_native_amount(b.gross.as_i64(), currency),
         )?;
-        text_element(w, "vatRateGrossAmountHUF", &gross_total_huf.to_string())?;
+        text_element(w, "vatRateGrossAmountHUF", &gross_huf.to_string())?;
         w.write_event(Event::End(BytesEnd::new("vatRateGrossData")))?;
         w.write_event(Event::End(BytesEnd::new("summaryByVatRate")))?;
+
+        inv_net = inv_net
+            .checked_add(b.net)
+            .context("invoice-level net overflow summing buckets")?;
+        inv_vat = inv_vat
+            .checked_add(b.vat)
+            .context("invoice-level vat overflow summing buckets")?;
+        inv_gross = inv_gross
+            .checked_add(b.gross)
+            .context("invoice-level gross overflow summing buckets")?;
+        inv_net_huf = inv_net_huf
+            .checked_add(net_huf)
+            .context("invoice-level net HUF overflow summing buckets")?;
+        inv_vat_huf = inv_vat_huf
+            .checked_add(vat_huf)
+            .context("invoice-level vat HUF overflow summing buckets")?;
+        inv_gross_huf = inv_gross_huf
+            .checked_add(gross_huf)
+            .context("invoice-level gross HUF overflow summing buckets")?;
     }
     text_element(
         w,
         "invoiceNetAmount",
-        &format_native_amount(net_total.as_i64(), currency),
+        &format_native_amount(inv_net.as_i64(), currency),
     )?;
-    text_element(w, "invoiceNetAmountHUF", &net_total_huf.to_string())?;
+    text_element(w, "invoiceNetAmountHUF", &inv_net_huf.to_string())?;
     text_element(
         w,
         "invoiceVatAmount",
-        &format_native_amount(vat_total.as_i64(), currency),
+        &format_native_amount(inv_vat.as_i64(), currency),
     )?;
-    text_element(w, "invoiceVatAmountHUF", &vat_total_huf.to_string())?;
+    text_element(w, "invoiceVatAmountHUF", &inv_vat_huf.to_string())?;
     w.write_event(Event::End(BytesEnd::new("summaryNormal")))?;
     w.write_event(Event::Start(BytesStart::new("summaryGrossData")))?;
     text_element(
         w,
         "invoiceGrossAmount",
-        &format_native_amount(gross_total.as_i64(), currency),
+        &format_native_amount(inv_gross.as_i64(), currency),
     )?;
-    text_element(w, "invoiceGrossAmountHUF", &gross_total_huf.to_string())?;
+    text_element(w, "invoiceGrossAmountHUF", &inv_gross_huf.to_string())?;
     w.write_event(Event::End(BytesEnd::new("summaryGrossData")))?;
     w.write_event(Event::End(BytesEnd::new("invoiceSummary")))?;
     Ok(())
@@ -2931,6 +3017,19 @@ mod tests {
         // Space + lowercase tolerated (VIES prints spaces).
         assert!(validate_community_vat_number("at U1234 5678").is_ok());
         assert!(validate_community_vat_number("IE1234567FA").is_ok());
+        // B4 / ADR-0103 §3.3 — success RETURNS the normalised value
+        // (whitespace-stripped, upper-cased); ingest writes it back so the
+        // gate value == the emitted value. MUTATION: revert to `Ok(())`.
+        assert_eq!(
+            validate_community_vat_number("at U1234 5678").unwrap(),
+            "ATU12345678",
+            "validate must return the normalised value, not discard it"
+        );
+        assert_eq!(
+            validate_community_vat_number("ATU12345678").unwrap(),
+            "ATU12345678",
+            "an already-normalised value returns itself (bytes-neutral)"
+        );
         // Reject.
         assert!(validate_community_vat_number("").is_err(), "empty");
         assert!(
