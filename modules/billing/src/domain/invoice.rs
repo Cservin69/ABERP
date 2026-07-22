@@ -73,9 +73,26 @@ impl LineItem {
         self.unit_price.checked_mul_decimal(self.quantity)
     }
 
-    /// VAT amount for the line: `floor(net_total * rate / 10_000)`.
-    /// Returns `None` on overflow.
+    /// VAT amount for the line.
+    ///
+    /// B2 / ADR-0103 §3.2 (Invariant V — kind-consistent VAT). A line whose
+    /// [`Self::vat_rate_kind`] is not `Percent` (exempt / reverse-charge /
+    /// out-of-scope) has **zero** line VAT, unconditionally, for every value
+    /// of [`Self::vat_rate_basis_points`]. Only the `Percent` arm reaches the
+    /// `floor(net_total × rate / 10_000)` arithmetic; returns `None` there on
+    /// overflow.
+    ///
+    /// This moves the truth from the preflight *gate* (which 7 of 8 doors
+    /// bypass) to the *derivation* every emit path goes through, so there is
+    /// no way — present or future — to obtain a non-zero VAT for a
+    /// non-`Percent` line. A correctly-issued non-`Percent` line already
+    /// carries `basis_points == 0` (ADR-0101 §4), so this changes the emitted
+    /// bytes of ZERO correctly-issued invoices; it changes them only where a
+    /// gate-bypassing door admitted a non-zero rate on such a line.
     pub fn vat_amount(&self) -> Option<Huf> {
+        if !self.vat_rate_kind.is_percent() {
+            return Some(Huf::ZERO);
+        }
         let net = self.net_total()?.as_i64();
         let vat = net.checked_mul(self.vat_rate_basis_points as i64)?;
         Some(Huf(vat / 10_000))
@@ -478,6 +495,62 @@ mod tests {
         assert_eq!(f.sequence_number, seq);
         assert_eq!(f.fiscal_year, fy);
         assert_eq!(f.nav_transaction_id, txid);
+    }
+
+    /// B2 / ADR-0103 §3.2 (Invariant V) — T6. A non-`Percent` line with a
+    /// DELIBERATELY non-zero `vat_rate_basis_points` — precisely the state
+    /// preflight forbids but a gate-bypassing door admits — still derives
+    /// **zero** line VAT, and its gross equals its net. Asserted for every
+    /// fully-wired non-`Percent` kind. The `Percent` control proves the fix
+    /// does not flatten the ordinary rate path.
+    ///
+    /// MUTATION (must turn this red): revert `vat_amount` to the rate-only
+    /// form — the exempt/reverse-charge lines would then emit `net × 2700 /
+    /// 10_000` as a phantom VAT.
+    #[test]
+    fn vat_amount_is_zero_for_non_percent_kinds_even_with_nonzero_rate() {
+        use crate::VatRateKind;
+        let non_percent = [
+            VatRateKind::AamExempt,
+            VatRateKind::DomesticReverseCharge,
+            VatRateKind::IntraCommunityGoods,
+            VatRateKind::IntraCommunityServiceReverse,
+        ];
+        for kind in non_percent {
+            let line = LineItem {
+                description: format!("{kind:?} line with a stray rate"),
+                quantity: Decimal::from(2),
+                unit_price: Huf(10_000),
+                // The bypassed state: a non-zero rate on a non-`Percent` kind.
+                vat_rate_basis_points: 2700,
+                vat_rate_kind: kind,
+                note: None,
+                unit: None,
+            };
+            assert_eq!(
+                line.vat_amount(),
+                Some(Huf::ZERO),
+                "{kind:?}: non-`Percent` VAT must be 0 regardless of basis points"
+            );
+            assert_eq!(
+                line.gross_total(),
+                line.net_total(),
+                "{kind:?}: gross must equal net when VAT is 0"
+            );
+        }
+
+        // Control: the `Percent` path still computes VAT from the rate.
+        let percent = LineItem {
+            description: "27% line".to_string(),
+            quantity: Decimal::from(2),
+            unit_price: Huf(10_000),
+            vat_rate_basis_points: 2700,
+            vat_rate_kind: crate::VatRateKind::Percent,
+            note: None,
+            unit: None,
+        };
+        assert_eq!(percent.net_total(), Some(Huf(20_000)));
+        assert_eq!(percent.vat_amount(), Some(Huf(5_400)));
     }
 
     #[test]
