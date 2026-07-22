@@ -18,7 +18,9 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$ROOT/tools/cut_gate_edition_ratchet.sh"
-[[ -f "$GATE" ]] || { echo "✗ FAIL: gate under test missing: $GATE"; exit 1; }
+BACKSTOP="$ROOT/tools/cut_gate_edition_ratchet_backstop.sh"
+[[ -f "$GATE" ]]     || { echo "✗ FAIL: gate under test missing: $GATE"; exit 1; }
+[[ -f "$BACKSTOP" ]] || { echo "✗ FAIL: liveness backstop missing: $BACKSTOP"; exit 1; }
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/edition-ratchet-probes.XXXXXX")" || exit 1
 trap 'rm -rf "$TMP"' EXIT INT TERM
@@ -30,7 +32,7 @@ echo "ADR-0093 saw-off ratchet — negative probes"
 new_tree() {
   local t="$TMP/$1"; rm -rf "$t"
   mkdir -p "$t"/{run/tests,crates/aberp-db,apps/aberp/tests,docs,adr,tools}
-  cp "$GATE" "$t/tools/"
+  cp "$GATE" "$BACKSTOP" "$t/tools/"
   : > "$t/run/run_prod.sh"
   : > "$t/crates/aberp-db/Cargo.toml"
   # The four documented false-positive sources, verbatim in content.
@@ -108,6 +110,57 @@ if ( cd "$t" && ENFORCE_EDITION_RATCHET=0 EDITION_RATCHET_ROOT="$t" bash "$t/too
 else
   printf '  ✗ %-58s ENFORCE=0 should not fail\n' "de-gated escape hatch"; fail=1
 fi
+
+# --- scanner liveness (CHECK E0) — a blind scanner must FAIL, not pass green ---
+# The point of the whole backstop: red must mean red for the SCANNER too, not
+# only for a policy hit. So these assert not just RED but RED-for-SCANNER-BROKEN,
+# and mutation-verify both directions — break the find, expect broken; restore
+# it, expect green. A liveness check that cannot fail is the very hole it closes.
+
+# expect_broken <expect broken|clean> <cmd...> — run the gate <cmd>, require the
+# right exit AND, when broken, that it named SCANNER BROKEN (a plain policy RED
+# must not be mistaken for a liveness catch).
+run_out() { "$@" >"$TMP/out" 2>&1; }
+expect_broken() {
+  local want="$1" label="$2"; shift 2
+  if run_out "$@"; then got=green; else got=red; fi
+  if [[ "$want" == clean ]]; then
+    if [[ "$got" == green ]]; then printf '  ✓ %-58s green\n' "$label"
+    else printf '  ✗ %-58s expected green, got %s\n' "$label" "$got"; sed 's/^/      /' "$TMP/out"; fail=1; fi
+    return
+  fi
+  # want == broken
+  if [[ "$got" == red ]] && grep -q 'SCANNER BROKEN' "$TMP/out"; then
+    printf '  ✓ %-58s red (SCANNER BROKEN)\n' "$label"
+  elif [[ "$got" == red ]]; then
+    printf '  ✗ %-58s red but NOT flagged SCANNER BROKEN\n' "$label"; sed 's/^/      /' "$TMP/out"; fail=1
+  else
+    printf '  ✗ %-58s blind-green — a broken scanner PASSED\n' "$label"; sed 's/^/      /' "$TMP/out"; fail=1
+  fi
+}
+
+# 1) find binary itself erroring — shim a `find` that exits non-zero and writes
+#    stderr, ahead of the real one on PATH. Every arm's find now fails.
+t="$(new_tree brokenfind)"
+shim="$TMP/brokenbin"; mkdir -p "$shim"
+printf '#!/usr/bin/env bash\necho "find: simulated failure" >&2\nexit 1\n' > "$shim/find"; chmod +x "$shim/find"
+expect_broken broken "SABOTAGE: an erroring find is caught, not passed" \
+  env PATH="$shim:$PATH" EDITION_RATCHET_ROOT="$t" bash "$t/tools/cut_gate_edition_ratchet.sh"
+# A broken find must NOT be excusable via the policy escape hatch either.
+expect_broken broken "SABOTAGE: ENFORCE=0 does NOT excuse a blind scanner" \
+  env PATH="$shim:$PATH" ENFORCE_EDITION_RATCHET=0 EDITION_RATCHET_ROOT="$t" bash "$t/tools/cut_gate_edition_ratchet.sh"
+# RESTORE: the same tree with the real find on PATH is clean green.
+expect_broken clean "RESTORE: real find on the same tree is green" \
+  env EDITION_RATCHET_ROOT="$t" bash "$t/tools/cut_gate_edition_ratchet.sh"
+
+# 2) a live scan root that isn't there — find errors on the missing dir. This is
+#    the realistic failure (a moved/renamed run/), no PATH shim involved.
+t="$(new_tree norun)"; rm -rf "$t/run"
+expect_broken broken "SABOTAGE: missing run/ makes the E1 scan error out" \
+  env EDITION_RATCHET_ROOT="$t" bash "$t/tools/cut_gate_edition_ratchet.sh"
+mkdir -p "$t/run"; : > "$t/run/run_prod.sh"
+expect_broken clean "RESTORE: run/ back → green" \
+  env EDITION_RATCHET_ROOT="$t" bash "$t/tools/cut_gate_edition_ratchet.sh"
 
 echo
 if [[ "$fail" -ne 0 ]]; then echo "PROBES: ✗ FAILED"; exit 1; fi
