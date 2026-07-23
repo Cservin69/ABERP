@@ -836,6 +836,8 @@ impl PricingPipelineService {
             let mut conn = db.write().context("acquire shared writer for price")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
+            // ADR-0104 — the per-quote price-snapshot pin table.
+            crate::supplier_prices::ensure_schema(&conn).context("quote_price_snapshots schema")?;
             let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
             let graph_json = arts
                 .feature_graph_json
@@ -1042,6 +1044,24 @@ impl PricingPipelineService {
                         binary_hash,
                     );
                     let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+
+                    // ADR-0104 — pin the EXACT material-price set the engine
+                    // consumed (grade → cost_per_kg_eur, the pass-through of
+                    // `convert_materials`), content-addressed, in this same
+                    // priced-audit tx. Stamped on the priced payload so a later
+                    // re-quote resolves the pinned set and reproduces this
+                    // number even after a supplier ingest moves live prices.
+                    let price_map: std::collections::BTreeMap<String, f64> = materials
+                        .iter()
+                        .map(|m| (m.grade.clone(), m.cost_per_kg_eur))
+                        .collect();
+                    let price_snapshot_hash = crate::supplier_prices::record_price_set(
+                        &tx,
+                        &tenant_id_string,
+                        &price_map,
+                    )
+                    .context("record price snapshot pin")?;
+
                     let payload = QuotePricingPricedPayload {
                         quote_id: quote_id.clone(),
                         tenant_id: tenant_id_string.clone(),
@@ -1053,6 +1073,7 @@ impl PricingPipelineService {
                         setup_cost_eur: breakdown.setup_cost,
                         overhead_eur: breakdown.overhead,
                         margin_eur: breakdown.margin,
+                        price_snapshot_hash,
                         actor: "system".to_string(),
                         idempotency_key: format!("quote_pricing_priced:{quote_id}"),
                     };
@@ -2966,6 +2987,11 @@ struct QuotePricingPricedPayload {
     setup_cost_eur: f64,
     overhead_eur: f64,
     margin_eur: f64,
+    /// ADR-0104 — content hash (FNV-1a, same construction as the S429
+    /// calibration `set_hash`) of the exact `(grade → cost_per_kg_eur)`
+    /// set this quote priced against. Recorded in `quote_price_snapshots`;
+    /// a re-quote resolves it to reproduce this number after prices move.
+    price_snapshot_hash: String,
     actor: String,
     idempotency_key: String,
 }

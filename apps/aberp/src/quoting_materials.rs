@@ -800,6 +800,71 @@ pub fn delete_material(
     Ok(())
 }
 
+/// ADR-0104 — apply a supplier-ingested EUR/kg price to `grade` **in an
+/// existing transaction**, audited as a `MaterialCatalogueChanged` with
+/// `op="supplier_ingest"` and the caller's `provenance` object (source,
+/// native currency + amount, pinned FX rate/date, batch id). Returns the
+/// updated row, or `Ok(None)` if the grade does not exist for the tenant
+/// — the batch orchestrator ([`crate::supplier_prices::ingest_price_list`])
+/// pre-checks existence and rejects the whole batch, so `None` here is a
+/// belt-and-braces guard, never a silent skip.
+///
+/// This is the ONE writer of `cost_per_kg_eur` outside the operator CRUD;
+/// it lives here (not in `supplier_prices`) so every write of this table
+/// and its audit stay in the module that owns the table (CLAUDE.md rule
+/// 8/15). The business UPDATE and the audit `append_in_tx` share the
+/// caller's `tx`, so they commit or roll back together.
+pub fn set_cost_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    meta: &LedgerMeta,
+    actor_login: &str,
+    tenant: &str,
+    grade: &str,
+    new_cost_per_kg_eur: f64,
+    provenance: &serde_json::Value,
+) -> Result<Option<Material>> {
+    // Fail loud on garbage — a non-finite / negative EUR cost would silently
+    // mis-price every future quote off this grade (CLAUDE.md rule 11).
+    if !new_cost_per_kg_eur.is_finite() || new_cost_per_kg_eur < 0.0 {
+        anyhow::bail!(
+            "supplier-ingested cost_per_kg_eur for `{grade}` must be finite and >= 0 (got {new_cost_per_kg_eur})"
+        );
+    }
+    let now = now_rfc3339()?;
+    let changed = tx
+        .execute(
+            "UPDATE quoting_materials
+                SET cost_per_kg_eur = ?, updated_at = ?, updated_by_actor = ?
+              WHERE tenant_id = ? AND grade = ?;",
+            params![new_cost_per_kg_eur, &now, actor_login, tenant, grade],
+        )
+        .context("UPDATE quoting_materials cost_per_kg_eur (supplier ingest)")?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    let material = read_material_in_tx(tx, tenant, grade)?;
+    let payload = serde_json::json!({
+        "op": "supplier_ingest",
+        "grade": material.grade,
+        "row": material,
+        "supplier": provenance,
+        "idempotency_key": Ulid::new().to_string(),
+    });
+    let bytes = serde_json::to_vec(&payload)
+        .context("serialize supplier-ingest MaterialCatalogueChanged payload")?;
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), actor_login);
+    append_in_tx(
+        tx,
+        meta,
+        EventKind::MaterialCatalogueChanged,
+        bytes,
+        actor,
+        None,
+    )
+    .context("audit append supplier-ingest MaterialCatalogueChanged")?;
+    Ok(Some(material))
+}
+
 // ── Errors ──────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
