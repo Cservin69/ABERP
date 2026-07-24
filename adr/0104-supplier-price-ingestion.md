@@ -100,7 +100,9 @@ CREATE TABLE IF NOT EXISTS quote_price_snapshots (
 
 Content-addressed: the same price set written by two quotes collapses to one row-group; re-recording is idempotent (`ON CONFLICT DO NOTHING`).
 
-No new column on `quoting_materials`. The ingest **writes** the existing `cost_per_kg_eur`. The priced-quote pin rides `QuotePricingPricedPayload` (new additive `price_snapshot_hash` field) — no schema change to `quote_pricing_jobs`.
+No new column on `quoting_materials`. The ingest **writes** the existing `cost_per_kg_eur`. The priced-quote pin rides `QuotePricingPricedPayload` (new additive `price_snapshot_hash` field).
+
+**Amendment (2026-07-24, adversarial review).** The pin ALSO needs an additive nullable `price_snapshot_hash VARCHAR` on `quote_pricing_jobs`. As first shipped the hash existed only inside the priced audit-event payload, which no per-quote hot path can read — so the live re-price route (§4) could not consult it and silently re-priced at whatever the catalogue said at that moment. Pre-ADR-0104 rows read back NULL and keep the old live-price behaviour.
 
 ---
 
@@ -114,9 +116,13 @@ No new column on `quoting_materials`. The ingest **writes** the existing `cost_p
 
 **Pin** (in `advance_price`, inside the existing priced-audit tx):
 1. After loading `materials`, `record_price_set(&tx, tenant, &engine_materials)` → `price_snapshot_hash` (`INSERT ON CONFLICT DO NOTHING`).
-2. Stamp the hash into `QuotePricingPricedPayload`.
+2. Stamp the hash into `QuotePricingPricedPayload` **and onto the job row** (`jobs::set_price_snapshot_hash`, same tx — the pin and the rows it names commit together, so a row can never carry a hash that resolves to nothing).
 
-**Re-derive** (`resolve_price_set(conn, tenant, hash)` → `BTreeMap<grade, cost>`): overlay onto the catalogue, re-run the engine → identical figure. (A one-click operator "reprice" endpoint is deferred UI — §7.)
+**Re-derive** (`resolve_price_set(conn, tenant, hash)` → `BTreeMap<grade, cost>`): overlay onto the catalogue, re-run the engine → identical figure.
+
+**Re-price** (`reprice_quote`, the LIVE operator path behind the buyer-partner and margin-override routes) consumes the pin: when the job row carries a `price_snapshot_hash`, the pinned set is overlaid on the catalogue before the engine runs, so only the margin/buyer knobs that route exists to change can move the number. A supplier ingest landing between pricing and re-pricing cannot. A pin that resolves to no rows is a hard error, never a silent fall back to live prices (rule 11).
+
+*This wiring was missing in the first cut: `reprice_quote` read live prices and recorded no pin, so a routine buyer-partner change after an ingest silently re-priced a customer-facing quote and left the quote's only recorded pin misattributing the persisted number.*
 
 ---
 
@@ -141,4 +147,5 @@ No new column on `quoting_materials`. The ingest **writes** the existing `cost_p
 
 - **Operator UI** — the SPA upload screen and its HTTP route are **not** built this session. The library `ingest_price_list` is the seam a route/CLI calls; the live MNB-rate fetch for a HUF upload lands with that UI (the library already normalises HUF given the rate). *(If a CLI `supplier-prices ingest` subcommand ships alongside this ADR, it registers its one `Connection::open` in the census honestly — noted in the session report.)*
 - **Non-CSV formats** (XLSX/PDF) — operator exports to CSV first.
-- **One-click "reprice from pinned snapshot" endpoint** — `resolve_price_set` provides the mechanism; the operator-facing button is UI.
+- **One-click "reprice from pinned snapshot" endpoint** — the operator-facing *button* is UI. The pin is no longer optional plumbing behind it: the existing re-price routes honour it unconditionally (§4).
+- **Legacy un-pinned quotes** — rows priced before this ADR carry no pin and still re-price at live prices. They cannot be back-filled (the price set they used was never recorded). Nothing re-pins them either, so a re-price of a legacy quote persists a number with no snapshot behind it — accepted, since the population drains as quotes are re-priced or closed.

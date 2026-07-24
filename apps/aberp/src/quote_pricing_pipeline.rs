@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use aberp_db::{Handle, HandleArc};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -1061,6 +1061,18 @@ impl PricingPipelineService {
                         &price_map,
                     )
                     .context("record price snapshot pin")?;
+                    // …and stamp it on the job row, in this same tx, so the
+                    // operator re-price path can resolve THIS quote's pinned
+                    // set instead of re-reading whatever the catalogue says
+                    // later. Audit payload alone is not reachable per-quote.
+                    jobs::set_price_snapshot_hash(
+                        &tx,
+                        &quote_id,
+                        &tenant_id_string,
+                        &price_snapshot_hash,
+                        OffsetDateTime::now_utc(),
+                    )
+                    .context("stamp price snapshot pin on job row")?;
 
                     let payload = QuotePricingPricedPayload {
                         quote_id: quote_id.clone(),
@@ -2765,6 +2777,15 @@ pub struct RepriceOutcome {
 ///
 /// Re-prices at [`ToleranceRange::Standard`] — the same default the daemon
 /// config carries for first pricing; the tolerance is not stored per-job.
+///
+/// **ADR-0104 material prices are pinned, not live.** When the job row
+/// carries a `price_snapshot_hash`, the pinned `(grade → cost_per_kg_eur)`
+/// set is overlaid on the catalogue before the engine runs, so a supplier
+/// ingest between pricing and re-pricing cannot move the quote's material
+/// cost — only the margin/buyer knobs this function exists to change move
+/// the number. Rows with no pin (pre-ADR-0104) re-price at live prices as
+/// before. A pin that resolves to nothing is a hard error, never a silent
+/// fall back to live prices.
 pub fn reprice_quote(
     conn: &duckdb::Connection,
     tenant: &str,
@@ -2782,7 +2803,32 @@ pub fn reprice_quote(
         serde_json::from_str(&graph_json).context("decode FeatureGraph for reprice")?;
     let qty = detail.row.quantity.max(1);
 
-    let materials = crate::quoting_materials::list_materials(conn, tenant)?;
+    let mut materials = crate::quoting_materials::list_materials(conn, tenant)?;
+    // ADR-0104 — a quote that pinned a material-price set must re-price
+    // against THAT set. This function exists to move the margin/buyer knobs;
+    // a supplier ingest landing between pricing and re-pricing must NOT
+    // silently move a number the customer has already been shown. Only
+    // grades present in the pin are overlaid — a grade added to the
+    // catalogue after the pin keeps its live cost (it cannot have fed the
+    // pinned quote). Pre-ADR-0104 rows carry no pin and are untouched.
+    if let Some(hash) = detail.price_snapshot_hash.as_deref() {
+        let pinned = crate::supplier_prices::resolve_price_set(conn, tenant, hash)?;
+        if pinned.is_empty() {
+            // The pin and its rows commit in one tx, so an unresolvable hash
+            // means the snapshot table was truncated or the row was hand-
+            // edited. Falling back to live prices here would silently
+            // reintroduce the drift this guard exists to stop (rule 11).
+            bail!(
+                "quote {quote_id} pins price snapshot `{hash}` but it resolves to no rows — \
+                 refusing to re-price at live material prices"
+            );
+        }
+        for m in &mut materials {
+            if let Some(cost) = pinned.get(&m.grade) {
+                m.cost_per_kg_eur = *cost;
+            }
+        }
+    }
     let complexity = crate::quoting_tunables::list_complexity_rules(conn, tenant)?;
     let tolerance = crate::quoting_tunables::list_tolerance_multipliers(conn, tenant)?;
     let stock_adjustments = crate::quoting_tunables::list_stock_adjustments(conn, tenant)?;
@@ -5573,6 +5619,261 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── ADR-0104 — the re-price path must honour the quote's price pin ──
+    //
+    // The feature records a content-addressed material-price snapshot at
+    // price time. These tests pin the part that makes it worth anything:
+    // that the LIVE operator re-price route consumes it. `advance_price`
+    // is driven for real, so removing the pipeline's `record_price_set` /
+    // `set_price_snapshot_hash` wiring reds them.
+
+    fn adr0104_db(prefix: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("{prefix}-{}.duckdb", Ulid::new()));
+        p
+    }
+
+    fn adr0104_graph() -> String {
+        serde_json::to_string(&FeatureGraph {
+            schema_version: FeatureGraph::SCHEMA_VERSION,
+            bounding_box_mm: [50.0, 40.0, 30.0],
+            volume_mm3: 40_000.0,
+            surface_area_mm2: 9_400.0,
+            material_grade: "6061-T6".to_string(),
+            features: vec![],
+            requires_5_axis: false,
+            thin_wall_present: false,
+        })
+        .expect("encode graph")
+    }
+
+    fn adr0104_service(db_path: &std::path::Path) -> PricingPipelineService {
+        PricingPipelineService {
+            config: PricingPipelineConfig {
+                base_url: "http://127.0.0.1:1".to_string(),
+                bearer_token: Zeroizing::new("t0k3n".to_string()),
+                poll_interval: Duration::from_secs(60),
+                artifact_dir: std::env::temp_dir(),
+                python_bin: PathBuf::from("/usr/bin/python3"),
+                default_tolerance: ToleranceRange::Standard,
+            },
+            deps: PricingPipelineDeps {
+                db: test_handle(db_path),
+                tenant: TenantId::new("T").expect("tid"),
+                binary_hash: BinaryHash::from_bytes([0u8; 32]),
+                operator_login: "ervin".to_string(),
+            },
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(200))
+                .build()
+                .expect("client"),
+            cad_blob: CadBlobCtx::with_test_key(),
+        }
+    }
+
+    /// Seed every schema `advance_price` touches, plus one job sitting at
+    /// `Pricing` with a feature graph, and return the service.
+    async fn adr0104_priced_service(
+        db_path: &std::path::Path,
+        qid: &str,
+    ) -> PricingPipelineService {
+        let svc = adr0104_service(db_path);
+        {
+            let mut conn = svc.deps.db.write().expect("writer");
+            audit_ensure_schema(&conn).expect("audit schema");
+            jobs::ensure_schema(&conn).expect("jobs schema");
+            crate::supplier_prices::ensure_schema(&conn).expect("snapshot schema");
+            crate::quoting_machines::ensure_schema(&conn).expect("machines schema");
+            crate::quote_calibration::ensure_schema(&conn).expect("calibration schema");
+            crate::margin_profiles::ensure_schema(&conn).expect("profiles schema");
+            crate::partners::ensure_schema(&conn).expect("partners schema");
+            crate::quoting_materials::seed_if_empty(&mut conn, "T").expect("materials seed");
+            crate::quoting_tunables::ensure_schema(&mut conn, "T").expect("tunables schema");
+
+            let now = OffsetDateTime::now_utc();
+            jobs::insert_fetched_job(
+                &conn,
+                qid,
+                "T",
+                "buyer@example.com",
+                "Buyer",
+                "ACME",
+                "6061-T6",
+                10,
+                "part.step",
+                "/tmp/part.step",
+                now,
+            )
+            .expect("insert job");
+            jobs::set_extracted(&mut conn, qid, "T", "graphhash", &adr0104_graph(), now)
+                .expect("set extracted");
+        }
+        // Guard dropped — `advance_price` acquires the writer itself.
+        let row = {
+            let conn = svc.deps.db.read().expect("reader");
+            jobs::get_job_detail(&conn, qid, "T")
+                .expect("detail")
+                .expect("row")
+                .row
+        };
+        svc.advance_price(row).await.expect("advance_price");
+        svc
+    }
+
+    /// The live catalogue cost of `6061-T6` right now.
+    fn adr0104_live_cost(db: &HandleArc) -> f64 {
+        let conn = db.read().expect("reader");
+        crate::quoting_materials::list_materials(&conn, "T")
+            .expect("materials")
+            .into_iter()
+            .find(|m| m.grade == "6061-T6")
+            .expect("6061-T6 seeded")
+            .cost_per_kg_eur
+    }
+
+    /// Apply a supplier price list that doubles `6061-T6`.
+    fn adr0104_double_the_price(db: &HandleArc) {
+        let old = adr0104_live_cost(db);
+        let rows = crate::supplier_prices::parse_price_list(
+            &format!("grade,cost_per_kg\n6061-T6,{}\n", old * 2.0),
+            aberp_billing::Currency::Eur,
+        )
+        .expect("parse price list");
+        let mut conn = db.write().expect("writer");
+        let meta = LedgerMeta::new(
+            TenantId::new("T").expect("tid"),
+            BinaryHash::from_bytes([0u8; 32]),
+        );
+        crate::supplier_prices::ingest_price_list(
+            &mut conn,
+            &meta,
+            "ervin",
+            "T",
+            "AdversarialCo",
+            "2026-07-24T00:00:00Z",
+            &rows,
+            None,
+        )
+        .expect("ingest");
+    }
+
+    #[tokio::test]
+    async fn adr0104_a_pinned_quote_reprices_to_the_same_number_after_a_supplier_ingest() {
+        let db = adr0104_db("adr0104-pinned");
+        let qid = "q-adr0104-pinned";
+        let svc = adr0104_priced_service(&db, qid).await;
+
+        // 1) Pricing stamped a resolvable pin on the job ROW (not just the
+        //    audit payload) — this is what the re-price path reads.
+        let hash = {
+            let conn = svc.deps.db.read().expect("reader");
+            let detail = jobs::get_job_detail(&conn, qid, "T")
+                .expect("detail")
+                .expect("row");
+            let hash = detail
+                .price_snapshot_hash
+                .expect("a priced quote must carry its ADR-0104 price pin");
+            assert!(!hash.is_empty(), "the pin must not be an empty hash");
+            let pinned = crate::supplier_prices::resolve_price_set(&conn, "T", &hash)
+                .expect("resolve pinned set");
+            assert_eq!(
+                pinned.get("6061-T6").copied(),
+                Some(adr0104_live_cost(&svc.deps.db)),
+                "the pin must resolve to the prices pricing actually used"
+            );
+            hash
+        };
+
+        let total_before = {
+            let conn = svc.deps.db.write().expect("writer");
+            reprice_quote(&conn, "T", qid, None)
+                .expect("reprice")
+                .expect("outcome")
+                .total_price
+        };
+
+        // 2) A supplier ingest doubles the material price under the quote.
+        adr0104_double_the_price(&svc.deps.db);
+        assert_ne!(
+            adr0104_live_cost(&svc.deps.db),
+            crate::supplier_prices::resolve_price_set(
+                &svc.deps.db.read().expect("reader"),
+                "T",
+                &hash,
+            )
+            .expect("resolve")["6061-T6"],
+            "the ingest must actually have moved the live price"
+        );
+
+        // 3) The pinned quote must NOT move.
+        let total_after = {
+            let conn = svc.deps.db.write().expect("writer");
+            reprice_quote(&conn, "T", qid, None)
+                .expect("reprice")
+                .expect("outcome")
+                .total_price
+        };
+        assert_eq!(
+            total_before, total_after,
+            "a re-price of a pinned quote must not pick up a later supplier ingest"
+        );
+
+        // 4) …and the guard is the PIN, not an accident of the fixture:
+        //    clear the pin and the very same re-price moves.
+        {
+            let conn = svc.deps.db.write().expect("writer");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET price_snapshot_hash = NULL \
+                 WHERE quote_id = ? AND tenant_id = ?",
+                duckdb::params![qid, "T"],
+            )
+            .expect("clear pin");
+        }
+        let total_unpinned = {
+            let conn = svc.deps.db.write().expect("writer");
+            reprice_quote(&conn, "T", qid, None)
+                .expect("reprice")
+                .expect("outcome")
+                .total_price
+        };
+        assert!(
+            (total_unpinned - total_before).abs() > 1e-9,
+            "without a pin the re-price tracks live prices (else this test proves nothing)"
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn adr0104_a_pin_that_resolves_to_nothing_refuses_instead_of_pricing_live() {
+        let db = adr0104_db("adr0104-badpin");
+        let qid = "q-adr0104-badpin";
+        let svc = adr0104_priced_service(&db, qid).await;
+
+        // A hash with no snapshot rows behind it can only mean the snapshot
+        // table was lost or the row was hand-edited. Silently falling back to
+        // live prices is exactly the drift the pin exists to stop.
+        {
+            let conn = svc.deps.db.write().expect("writer");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET price_snapshot_hash = ? \
+                 WHERE quote_id = ? AND tenant_id = ?",
+                duckdb::params!["deadbeefdeadbeef", qid, "T"],
+            )
+            .expect("set bogus pin");
+        }
+        let conn = svc.deps.db.write().expect("writer");
+        let err = reprice_quote(&conn, "T", qid, None).expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deadbeefdeadbeef") && msg.contains("refusing"),
+            "the refusal must name the unresolvable pin, got: {msg}"
+        );
+
+        drop(conn);
         let _ = std::fs::remove_file(&db);
     }
 }
