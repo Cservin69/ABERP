@@ -313,6 +313,12 @@ ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS buyer_partner_id VARCHAR
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS margin_override_pct DOUBLE;
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS margin_below_floor BOOLEAN;
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS margin_floor_pct DOUBLE;
+-- ADR-0104 — the quote's material-price pin: the content hash of the exact
+-- (grade -> cost_per_kg_eur) set this quote priced against, resolvable via
+-- `supplier_prices::resolve_price_set`. Nullable, no DEFAULT per
+-- [[no-sql-specific]]; pre-ADR-0104 rows read back NULL and re-price at live
+-- prices exactly as they did before (`reprice_quote`).
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS price_snapshot_hash VARCHAR;
 ";
 
 /// Idempotent — call at every writer entry.
@@ -1244,6 +1250,11 @@ pub struct JobDetail {
     /// S428 — the effective floor the quote was measured against (for the
     /// operator banner), NULL pre-pricing / on the global path.
     pub margin_floor_pct: Option<f64>,
+    /// ADR-0104 — the material-price set this quote priced against, as the
+    /// content hash `supplier_prices::resolve_price_set` resolves. NULL on
+    /// pre-ADR-0104 rows and before pricing; [`crate::quote_pricing_pipeline::reprice_quote`]
+    /// re-prices against the pinned set when it is present.
+    pub price_snapshot_hash: Option<String>,
 }
 
 /// S349 / PR-40 (U1) — read one job row + its artifacts for the detail
@@ -1266,7 +1277,8 @@ pub fn get_job_detail(
                     cad_filename, feature_graph_json, breakdown_json, pdf_path,
                     valid_until_iso, customer_company,
                     lead_time_days, lead_time_override_days,
-                    buyer_partner_id, margin_override_pct, margin_below_floor, margin_floor_pct
+                    buyer_partner_id, margin_override_pct, margin_below_floor, margin_floor_pct,
+                    price_snapshot_hash
                 FROM quote_pricing_jobs
                 WHERE quote_id = ? AND tenant_id = ?",
         )
@@ -1324,7 +1336,39 @@ pub fn get_job_detail(
         margin_override_pct: r.get::<_, Option<f64>>(24).ok().flatten(),
         margin_below_floor: r.get::<_, Option<bool>>(25).ok().flatten().unwrap_or(false),
         margin_floor_pct: r.get::<_, Option<f64>>(26).ok().flatten(),
+        price_snapshot_hash: r.get::<_, Option<String>>(27).ok().flatten(),
     }))
+}
+
+/// ADR-0104 — stamp the quote's material-price pin (the content hash of the
+/// exact `(grade → cost_per_kg_eur)` set the engine consumed) onto the job
+/// row. Called by `advance_price` on the SAME transaction as the
+/// `quote_price_snapshots` rows and the `QuotePricingPriced` audit event, so
+/// the pin and the set it names commit together (CLAUDE.md rule 15) — a row
+/// can never carry a hash that resolves to nothing.
+///
+/// The hash also lives in the priced audit payload; the column exists because
+/// [`crate::quote_pricing_pipeline::reprice_quote`] must resolve it per-quote
+/// on the hot path, which an audit-ledger scan cannot serve.
+pub fn set_price_snapshot_hash(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    price_snapshot_hash: &str,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    ensure_schema(conn)?;
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format price_snapshot_hash updated_at")?;
+    let changed = conn
+        .execute(
+            "UPDATE quote_pricing_jobs SET price_snapshot_hash = ?, updated_at = ? \
+             WHERE quote_id = ? AND tenant_id = ?",
+            params![price_snapshot_hash, ts, quote_id, tenant_id],
+        )
+        .context("set_price_snapshot_hash UPDATE")?;
+    Ok(changed > 0)
 }
 
 /// S427 — the effective lead-time for a job: the operator override if
