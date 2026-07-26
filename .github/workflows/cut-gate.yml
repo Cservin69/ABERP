@@ -29,7 +29,14 @@ jobs:
   opener-census:
     name: ADR-0099 opener-census cut-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Was 15, set when this job ran five gates. It now runs SIX, and the probe
+    # suites — which each copy the tree and re-run their gate per planted defect
+    # — are the expensive part: the ADR-0106 suite alone is ~9 minutes here
+    # versus ~50s locally, because a 2-core runner is far slower at process
+    # spawning. The first ADR-0106 push was CANCELLED at 15 minutes, and a
+    # cancelled gate proves nothing at all, so the budget gets real headroom
+    # rather than being left one added probe away from the cliff.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
 
@@ -142,3 +149,34 @@ jobs:
         # gets disabled, so the false-positive sources are pinned as hard as the
         # true positives.
         run: bash tools/cut_gate_edition_ratchet_probes.sh
+
+      - name: ADR-0106 NAV-emission door gate (ENFORCING)
+        # THE tenth gate. Today's recurring defect is one shape, not three bugs:
+        # a path reaches NAV filing while bypassing the single validation choke
+        # point validate_invoice_preflight (F1, the Editions modification route
+        # in Editions PR #28, and the deferred Invariants P and C). This gate
+        # closes the CLASS by making the set of paths that can reach a NAV wire
+        # body a closed, written-down, machine-diffed set: N1 freezes the record
+        # set, N2 forces every NAV-reaching caller to be either a censused
+        # waypoint or a DOOR with a written preflight disposition, and N3
+        # machine-checks that the one door claiming to preflight actually does.
+        # Flags explicit here as well as defaulted in the script so enforcement
+        # is visible at the CI surface and cannot be silently weakened by a
+        # one-line script edit.
+        env:
+          ENFORCE_NAV_DOOR_RECORDS: "1"
+          ENFORCE_NAV_DOOR_CLOSURE: "1"
+          ENFORCE_NAV_DOOR_PREFLIGHT: "1"
+        run: bash tools/cut_gate_nav_emit_door.sh
+
+      - name: Prove the NAV-emission door gate has teeth (negative probes)
+        # Plants one synthetic instance of each historical form of the defect
+        # into a throwaway tree copy and asserts RED on the named arm: a route
+        # that emits a body with no preflight, a handler that reaches NAV
+        # through an existing helper without constructing a body (the Editions
+        # PR #28 shape), the preflight call deleted from the issue route (F1),
+        # an eighth nav_xml emitter, an aliased emitter call, and a broken or
+        # rule-less scanner (F4 silent-green). P0 and P7 pin the other
+        # direction: an unmutated tree and an unrelated non-NAV route must both
+        # stay green, because a gate that cries wolf gets switched off.
+        run: bash tools/cut_gate_nav_emit_door_probes.sh

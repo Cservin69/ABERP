@@ -42,11 +42,35 @@ bs_init() {
   trap "rm -rf '$_bs_dir'" EXIT
 }
 
-# bs_scan <scanner> <file> — emit the scanner's records; NEVER swallow a failure.
+# bs_scan <scanner> <file> [awk args…] — emit the scanner's records; NEVER
+# swallow a failure. Trailing args are passed to awk ahead of the program, for
+# scanners that take -v settings (ADR-0106's takes -v syms=…). Callers that
+# pass none behave exactly as before.
 bs_scan() {
   local out rc
-  out="$(awk -f "$1" "$2" 2>>"$_bs_errs")"; rc=$?
-  [[ "$rc" -ne 0 ]] && printf 'scanner %s exited %s on %s\n' "$1" "$rc" "$2" >> "$_bs_errs"
+  local scan="$1" file="$2"; shift 2
+  out="$(awk "$@" -f "$scan" "$file" 2>>"$_bs_errs")"; rc=$?
+  [[ "$rc" -ne 0 ]] && printf 'scanner %s exited %s on %s\n' "$scan" "$rc" "$file" >> "$_bs_errs"
+  [[ -n "$out" ]] && printf '%s\n' "$out"
+  return 0
+}
+
+# bs_scan_all <scanner> [awk args…] -- <file…> — one awk invocation over MANY
+# files, for scanners that carry FILENAME in their records and reset lexer state
+# at FNR==1 (ADR-0106's does). Same never-swallow-a-failure contract as bs_scan.
+#
+# WHY: the per-file bs_scan spawns one awk per source file. A gate that its own
+# probe suite runs nine times then costs ~10k process spawns, which CANCELLED
+# the ADR-0106 probes at the 15-minute CI job timeout — and a cancelled gate
+# proves nothing at all. Scanners that can batch should.
+bs_scan_all() {
+  local scan="$1"; shift
+  local -a pre=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do pre+=("$1"); shift; done
+  [[ "${1:-}" == "--" ]] && shift
+  local out rc
+  out="$(awk "${pre[@]}" -f "$scan" "$@" 2>>"$_bs_errs")"; rc=$?
+  [[ "$rc" -ne 0 ]] && printf 'scanner %s exited %s (multi-file scan of %s files)\n' "$scan" "$rc" "$#" >> "$_bs_errs"
   [[ -n "$out" ]] && printf '%s\n' "$out"
   return 0
 }
@@ -60,11 +84,13 @@ bs_scan_ok() {
   return 1
 }
 
-# bs_check <scanner> <expected-hits> <label>  — control source on stdin.
+# bs_check <scanner> <expected-hits> <label> [awk args…] — control source on
+# stdin. Trailing args are passed to awk ahead of the program (see bs_scan).
 bs_check() {
   local scan="$1" want="$2" label="$3" f rc got
+  shift 3
   f="$_bs_dir/control.rs"; cat > "$f"
-  awk -f "$scan" "$f" > "$_bs_dir/ctl.out" 2> "$_bs_dir/ctl.err"; rc=$?
+  awk "$@" -f "$scan" "$f" > "$_bs_dir/ctl.out" 2> "$_bs_dir/ctl.err"; rc=$?
   got="$(wc -l < "$_bs_dir/ctl.out" | tr -d ' ')"
   if [[ "$rc" -eq 0 && ! -s "$_bs_dir/ctl.err" && "$got" -eq "$want" ]]; then
     printf '  ✓ %s (%s hit(s), as expected)\n' "$label" "$got"; return 0

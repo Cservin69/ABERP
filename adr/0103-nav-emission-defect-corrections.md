@@ -316,3 +316,20 @@ Branch `nav-vat-emission-fix` off `main` @ `f8ff121` (the design branch's base `
 - **Scope B (Defense port)** and **the structural `vat_rate_basis_points` model** (§3.2 residual) remain as the ADR states.
 
 ⚠ These deferrals are **flagged, not silently dropped**: the community-VAT normalisation (B4) reaches the wire+audit on all 8 doors because it sits on the shared entry points, but B1's gate-universality and chain-congruence guards are genuinely absent — a preflight-bypassing CLI door can still originate a body this change does not gate (it will, however, now emit a *correct summary* and *kind-consistent VAT* for whatever lines it carries).
+
+**Update 2026-07-26 — the surface of Invariant P is now censused (ADR-0106).** The
+NAV-emission door gate does not close P; it makes P's remaining surface a frozen, written
+inventory: every entrypoint that can reach a NAV wire body is registered with a preflight
+disposition, and a new one cannot land without a red gate. Today that inventory reads
+**1 `direct`** (`serve.rs::handle_issue_invoice`), **2 `derived`** (the storno and
+modification routes, replaying a preflighted side-store — the modification route also
+carrying operator-edited fields that were never preflighted), and **1 `none`**
+(`main.rs::main`, covering four CLI verbs). ADR-0106 §5 sets out why the type-level witness
+must come *after* P rather than instead of it.
+
+⚠ **Count discrepancy, recorded rather than reconciled.** The "1-of-8 → 8-of-8 doors" above
+is not sourced to a scan. ADR-0106's scanner measures **7** NAV-reaching entry paths — 3
+HTTP routes plus 4 CLI verbs (`issue-invoice`, `issue-storno`, `issue-modification`,
+`request-technical-annulment`) — against 3 library entry points. Whichever number is right,
+the two should not disagree; resolving it belongs to the session that implements P, which
+has to enumerate the doors anyway.

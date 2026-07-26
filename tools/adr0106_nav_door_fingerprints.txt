@@ -1,0 +1,48 @@
+# ADR-0106 — FROZEN NAV-emission door record set.
+#
+# One line per RUNTIME record produced by tools/adr0106_nav_door_scan.awk over
+# the reaching set in tools/adr0106_nav_reach_symbols.txt:
+#
+#     <file>|<enclosing_fn>:<symbol>
+#
+# Line numbers are deliberately NOT part of the fingerprint (same convention as
+# the ADR-0098 opener fingerprints) so unrelated edits that shift lines in
+# serve.rs do not red the gate. What IS pinned is WHO calls WHAT — the only
+# thing that matters for "can this path reach NAV filing".
+#
+# `#emitter-def` records pin the set of NAV wire-body emitters in nav_xml.rs
+# (seven today). An eighth cannot land without this file changing.
+#
+# To change this file legitimately you must ALSO update
+# adr0106_nav_door_registry.txt (if a new door appeared) or
+# adr0106_nav_reach_symbols.txt (if a new waypoint appeared). A diff here with
+# neither of those touched is the review signal.
+apps/aberp/src/issue_invoice.rs|issue_from_parsed:render_invoice_data_with_number
+apps/aberp/src/issue_invoice.rs|run:run_with_provider
+apps/aberp/src/issue_invoice.rs|run_with_provider:issue_from_parsed
+apps/aberp/src/issue_modification.rs|modification_from_inputs:render_modification_data_with_number
+apps/aberp/src/issue_modification.rs|run:modification_from_inputs
+apps/aberp/src/issue_storno.rs|run:storno_from_inputs
+apps/aberp/src/issue_storno.rs|storno_from_inputs:render_storno_data_with_number
+apps/aberp/src/main.rs|main:issue_invoice::run
+apps/aberp/src/main.rs|main:issue_modification::run
+apps/aberp/src/main.rs|main:issue_storno::run
+apps/aberp/src/main.rs|main:request_technical_annulment::run
+apps/aberp/src/nav_xml.rs|render_annulment_data:#emitter-def
+apps/aberp/src/nav_xml.rs|render_invoice_data:#emitter-def
+apps/aberp/src/nav_xml.rs|render_invoice_data:render_invoice_data_with_number
+apps/aberp/src/nav_xml.rs|render_invoice_data_with_number:#emitter-def
+apps/aberp/src/nav_xml.rs|render_modification_data:#emitter-def
+apps/aberp/src/nav_xml.rs|render_modification_data:render_modification_data_with_number
+apps/aberp/src/nav_xml.rs|render_modification_data_with_number:#emitter-def
+apps/aberp/src/nav_xml.rs|render_storno_data:#emitter-def
+apps/aberp/src/nav_xml.rs|render_storno_data:render_storno_data_with_number
+apps/aberp/src/nav_xml.rs|render_storno_data_with_number:#emitter-def
+apps/aberp/src/request_technical_annulment.rs|run:render_annulment_data
+apps/aberp/src/serve.rs|handle_issue_invoice:issue_invoice_request
+apps/aberp/src/serve.rs|handle_issue_invoice:validate_invoice_preflight
+apps/aberp/src/serve.rs|handle_modification_invoice:modification_invoice_request
+apps/aberp/src/serve.rs|handle_storno_invoice:storno_invoice_request
+apps/aberp/src/serve.rs|issue_invoice_request:issue_from_parsed
+apps/aberp/src/serve.rs|modification_invoice_request:modification_from_inputs
+apps/aberp/src/serve.rs|storno_invoice_request:storno_from_inputs
