@@ -16,6 +16,7 @@
 #   P4  an EIGHTH nav_xml emitter appears                      (emitter growth)
 #   P5  the emitter is reached through a `use … as` alias      (alias evasion)
 #   P6  the scanner itself is broken                           (F4 silent-green)
+#   P8  empty scope + empty baseline is refused, not vacuously green
 #   P7  an unrelated non-NAV route is added                    (no false alarm)
 #
 # Exit 0 = every probe behaved.
@@ -152,6 +153,20 @@ expect_red "P6 a broken scanner fails the gate instead of silently passing it" "
 d="$(fresh)"
 printf 'BEGIN{exit 0}\n' > "$d/tools/adr0106_nav_door_scan.awk"
 expect_red "P6b a silent (rule-less) scanner fails the gate" "$d" "CUT-GATE: ✗ FAILED"
+
+# ── P8 — a vacuously-green gate (empty scope + empty baseline) ──────────────
+# The real bug this pins: the first multi-file version used `mapfile`, which
+# does not exist on macOS's bash 3.2, so the file array was silently empty. CI
+# (bash 5) would have been green while every local run scanned NOTHING. N1
+# catches an empty scope only while the frozen baseline is non-empty — so if
+# anyone ever re-freezes the baseline while the scope is broken, all four checks
+# pass on zero evidence. The scope floor is the backstop for that, and this
+# probe is the only thing that proves the floor works.
+d="$(fresh)"
+rm -rf "$d/crates" "$d/modules" "$d/apps"
+grep -E '^[[:space:]]*#' "$d/tools/adr0106_nav_door_fingerprints.txt" > "$d/fp.tmp"
+mv "$d/fp.tmp" "$d/tools/adr0106_nav_door_fingerprints.txt"
+expect_red "P8 empty scope + empty baseline is REFUSED, not vacuously green" "$d" "implausibly small"
 
 # ── P7 — no false alarm on an unrelated route ───────────────────────────────
 # A gate that reds on every new route gets switched off. This pins that the

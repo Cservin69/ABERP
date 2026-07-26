@@ -55,6 +55,26 @@ bs_scan() {
   return 0
 }
 
+# bs_scan_all <scanner> [awk args…] -- <file…> — one awk invocation over MANY
+# files, for scanners that carry FILENAME in their records and reset lexer state
+# at FNR==1 (ADR-0106's does). Same never-swallow-a-failure contract as bs_scan.
+#
+# WHY: the per-file bs_scan spawns one awk per source file. A gate that its own
+# probe suite runs nine times then costs ~10k process spawns, which CANCELLED
+# the ADR-0106 probes at the 15-minute CI job timeout — and a cancelled gate
+# proves nothing at all. Scanners that can batch should.
+bs_scan_all() {
+  local scan="$1"; shift
+  local -a pre=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do pre+=("$1"); shift; done
+  [[ "${1:-}" == "--" ]] && shift
+  local out rc
+  out="$(awk "${pre[@]}" -f "$scan" "$@" 2>>"$_bs_errs")"; rc=$?
+  [[ "$rc" -ne 0 ]] && printf 'scanner %s exited %s (multi-file scan of %s files)\n' "$scan" "$rc" "$#" >> "$_bs_errs"
+  [[ -n "$out" ]] && printf '%s\n' "$out"
+  return 0
+}
+
 # bs_scan_ok — call AFTER the per-file loop. Non-zero if any scan crashed or
 # wrote to stderr. A "clean" verdict built on a broken scanner is worthless.
 bs_scan_ok() {

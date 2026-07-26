@@ -142,14 +142,27 @@ CTL
 bs_controls_ok || fail=1
 
 # ── the scan ─────────────────────────────────────────────────────────────────
+# ONE awk invocation over the whole scope. The scanner carries FILENAME in each
+# record and resets its lexer at FNR==1; see bs_scan_all's header for why the
+# per-file form had to go (it cancelled this gate's own probes at the CI timeout).
 cur="$(mktemp)"; froz="$(mktemp)"; obs="$(mktemp)"
-while IFS= read -r f; do
-  recs="$(bs_scan "$SCAN" "$f" -v syms="$symlist")"
-  [[ -z "$recs" ]] && continue
-  while IFS= read -r r; do
-    printf '%s\n' "$f|${r#*:}"          # <file>|<fn>:<symbol>   (line-number free)
-  done <<< "$recs"
-done < <(scope_files) | sort -u > "$cur"
+# NOT `mapfile` — macOS ships bash 3.2, where it does not exist and the array
+# silently stays empty. CI (bash 5) would have passed while every local run
+# scanned nothing: a gate that is green because it looked at zero files. The
+# floor below is the backstop for exactly that.
+scoped=()
+while IFS= read -r f; do scoped+=("$f"); done < <(scope_files)
+if [[ "${#scoped[@]}" -lt 100 ]]; then
+  note "✗ FAIL: scan scope is ${#scoped[@]} file(s) — implausibly small for this tree."
+  note "  A zero-or-tiny scope makes every check below vacuously green. Fix the scope, do not lower this floor."
+  echo; echo "CUT-GATE: ✗ FAILED"; exit 1
+fi
+# Record: <file>|<fn>:<symbol> — the scanner's <file>:<line>:<fn>:<symbol> with
+# the LINE dropped, so unrelated edits that shift lines in serve.rs do not red
+# the gate. What is pinned is who calls what.
+bs_scan_all "$SCAN" -v syms="$symlist" -- "${scoped[@]}" \
+  | awk 'match($0,/^[^:]+:[0-9]+:/){ f=substr($0,1,index($0,":")-1); rest=substr($0,RLENGTH+1); printf "%s|%s\n", f, rest }' \
+  | sort -u > "$cur"
 bs_scan_ok || fail=1
 
 # ── CHECK N1 — frozen record set ─────────────────────────────────────────────

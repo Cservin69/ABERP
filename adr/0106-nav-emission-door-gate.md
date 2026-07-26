@@ -98,12 +98,35 @@ A gate never observed catching its own target is decoration. `tools/cut_gate_nav
 ✓ reds: P5 emitter reached through a `use … as` alias
 ✓ reds: P6 a broken scanner fails the gate instead of silently passing it
 ✓ reds: P6b a silent (rule-less) scanner fails the gate
+✓ reds: P8 empty scope + empty baseline is REFUSED, not vacuously green
 ✓ green: P7 an unrelated non-NAV route does not red the gate
 
-probes: 11 passed, 0 failed
+probes: 12 passed, 0 failed
 ```
 
 P0 and P7 are load-bearing in the other direction. Without P0, every "reds" line could just mean "the gate is always red". P7 pins the blast radius: a gate that reds on every new route gets switched off.
+
+### 4.1 The gate's own first CI run failed, and P8 is why
+
+The first push scanned one file per awk process. The gate is run **nine times by its own
+probe suite**, so that was ~10k process spawns, and the probes step was **CANCELLED at the
+15-minute job timeout**. A cancelled gate proves nothing — it is indistinguishable from a
+gate that was never run.
+
+The fix was to make the scanner multi-file (`FILENAME` in each record, lexer reset at
+`FNR==1`), one awk invocation per gate run: 13s → 5s for the gate, 90s → 49s for the whole
+suite, and ~3 orders of magnitude fewer spawns.
+
+The first attempt at that fix used `mapfile`, **which does not exist on macOS's bash 3.2**.
+The array stayed silently empty, so the gate scanned *zero files*. It happened to red on N1
+(the frozen baseline was non-empty) — but that is luck, not design: had anyone re-frozen the
+baseline while the scope was broken, all four checks would have passed on zero evidence, and
+CI (bash 5) would have been green throughout.
+
+Hence the **scope floor**: fewer than 100 files in scope is a hard refusal, not a scan. P8
+is the only thing that proves the floor works, and it plants exactly that state — empty
+scope *and* empty baseline. This is the gate's own instance of the failure mode it was
+built to prevent, and it is recorded rather than quietly patched.
 
 ---
 

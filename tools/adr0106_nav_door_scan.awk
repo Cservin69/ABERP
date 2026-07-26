@@ -5,7 +5,7 @@
 # `validate_invoice_preflight`, plus every definition of a NAV body emitter.
 # Prints one record per hit:
 #
-#     <LINE>:<enclosing_fn>:<symbol>
+#     <FILE>:<LINE>:<enclosing_fn>:<symbol>
 #
 # The reaching set is passed in with -v syms="a,b,c" (see
 # tools/adr0106_nav_door_registry.txt — the gate builds the list from the
@@ -41,11 +41,29 @@
 # symbol inside a doc comment, a string, or a test module never trips the
 # scan — and a stray quote inside a char literal or raw string cannot wedge
 # the scanner mid-string and blind it for the rest of the file.
+#
+# MULTI-FILE. Records are prefixed with FILENAME and the lexer state is reset
+# at FNR==1, so the whole scope can be handed over in ONE awk invocation:
+#
+#     awk -v syms=… -f this.awk $(find …)     →  <FILE>:<LINE>:<fn>:<symbol>
+#
+# This is not a micro-optimisation. The first version scanned one file per awk
+# process; the gate is itself run nine times by its own probe suite, which made
+# ~10k process spawns and blew the 15-minute CI job timeout on a 2-core runner
+# (the probes step was CANCELLED, not failed — a cancelled gate proves nothing).
+# One invocation per gate run is ~3 orders of magnitude fewer spawns.
 BEGIN{
   depth=0; tdepth=-1; pending=0; inblk=0; instr=0; inraw=0; rawh=0
   n_syms=split(syms,S,",")
   for(k=1;k<=n_syms;k++){ if(S[k]!="") WATCH[S[k]]=1 }
   WATCH["validate_invoice_preflight"]=1
+}
+FNR==1{
+  # Per-file reset. Without this, an unterminated block comment or a #[cfg(test)]
+  # region at the end of one file would leak into the next and blind the scan
+  # there — the same fail-open shape the ADR-0098 lexer fix closed within a file.
+  depth=0; tdepth=-1; pending=0; inblk=0; instr=0; inraw=0; rawh=0
+  fname=""; delete ALIAS
 }
 {
   line=$0
@@ -116,19 +134,19 @@ BEGIN{
   # END-of-name: nav-transport's `render_query_invoice_data_request` is a SOAP
   # *request* builder, not an invoice body, and must not be censused as one.
   if (isdef && code ~ /(^|[^A-Za-z0-9_])fn[ \t]+render_[A-Za-z0-9_]*_data(_with_number)?[ \t]*\(/) {
-    printf "%d:%s:#emitter-def\n", NR, fname
+    printf "%s:%d:%s:#emitter-def\n", FILENAME, FNR, fname
   }
   for (s in WATCH) {
     if (s ~ /::/) {
-      if (code ~ ("(^|[^A-Za-z0-9_:])" s "[ \t]*\\(")) printf "%d:%s:%s\n", NR, fname, s
+      if (code ~ ("(^|[^A-Za-z0-9_:])" s "[ \t]*\\(")) printf "%s:%d:%s:%s\n", FILENAME, FNR, fname, s
       continue
     }
     # A watched symbol's own `fn` definition line is a definition, not a call.
     if (isdef && fname == s) continue
-    if (code ~ ("(^|[^A-Za-z0-9_])" s "[ \t]*\\(")) printf "%d:%s:%s\n", NR, fname, s
+    if (code ~ ("(^|[^A-Za-z0-9_])" s "[ \t]*\\(")) printf "%s:%d:%s:%s\n", FILENAME, FNR, fname, s
   }
   for (a in ALIAS) {
     if (isdef && fname == a) continue
-    if (code ~ ("(^|[^A-Za-z0-9_])" a "[ \t]*\\(")) printf "%d:%s:%s (alias of %s)\n", NR, fname, a, ALIAS[a]
+    if (code ~ ("(^|[^A-Za-z0-9_])" a "[ \t]*\\(")) printf "%s:%d:%s:%s (alias of %s)\n", FILENAME, FNR, fname, a, ALIAS[a]
   }
 }
