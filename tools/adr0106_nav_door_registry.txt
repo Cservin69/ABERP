@@ -1,0 +1,43 @@
+# ADR-0106 — the NAV-emission DOOR REGISTRY.
+#
+# A DOOR is a terminal entrypoint that can reach NAV filing: an HTTP route
+# handler, a CLI dispatch, a daemon body. Every function observed calling a
+# symbol in adr0106_nav_reach_symbols.txt must be either in that set (it is a
+# waypoint, and its own callers get censused one hop further out) or listed
+# HERE with a preflight disposition. There is no third option that keeps the
+# cut-gate green — see CHECK N2 in tools/cut_gate_nav_emit_door.sh.
+#
+# FORMAT (whitespace-separated, `#` comment to end of line):
+#
+#     <file>::<fn>    <disposition>    <justification …>
+#
+# DISPOSITIONS
+#
+#   direct   The door itself calls `validate_invoice_preflight`. This is
+#            MACHINE-CHECKED: CHECK N3 requires the scanner to have observed a
+#            `validate_invoice_preflight` record inside this exact function.
+#            Deleting the preflight call from a `direct` door reds the gate on
+#            two independent arms (N1's fingerprint set loses a record; N3
+#            loses its witness). That pairing is the F1 defect shape.
+#
+#   derived  The door does not preflight, because it does not accept a NAV body
+#            from the caller — it replays one that was preflighted earlier and
+#            side-stored. NOT machine-checked; the justification must name the
+#            side-store and what happens when it is absent.
+#
+#   none     No preflight anywhere on this path. Permitted only with a named
+#            residual. Every `none` here is Invariant P (preflight universality,
+#            ADR-0103 deferred) still being open — the gate's job is to keep the
+#            count of them visible and frozen, not to pretend it is zero.
+#
+# ── HTTP routes (apps/aberp/src/serve.rs) ───────────────────────────────────
+
+serve.rs::handle_issue_invoice          direct   POST /invoices/issue. Runs validate_invoice_preflight FIRST (serve.rs, before the legacy shape gate, the seller.toml read and the issuance pipeline); nothing downstream runs if it rejects. This is the choke point every other row is measured against.
+
+serve.rs::handle_storno_invoice         derived  POST /api/invoices/:id/storno. Constructs no body from the request: it resolves the BASE invoice's `<ULID>.input.json` side-store (written by issue_invoice_request at issuance, i.e. AFTER that body passed preflight) and negates it. Absent side-store is a LOUD 500 steering the operator to `aberp issue-storno`, not a silent unvalidated path. Request body carries only the email/submit tail flags. RESIDUAL: the derivation is an argument, not a check — nothing asserts at storno time that the replayed input.json still passes preflight. Closed by Invariant P.
+
+serve.rs::handle_modification_invoice   derived  POST /api/invoices/:id/modification. Same side-store replay as storno. RESIDUAL, AND STRICTLY WORSE THAN STORNO'S: the modification form DOES surface operator-editable fields (invoice note, dates, line edits) that land in the emitted body without ever passing preflight, so the "derives from a preflighted base" argument covers only the inherited fields. This is the same shape as the Editions-side modification-route finding (Editions PR #28) and is the strongest single motivation for Invariant P. Closed by Invariant P.
+
+# ── CLI dispatch (apps/aberp/src/main.rs) ───────────────────────────────────
+
+main.rs::main                           none     The CLI verb dispatch. Four verbs reach a NAV emitter — `issue-invoice`, `issue-storno`, `issue-modification`, `request-technical-annulment` — and NONE of them calls validate_invoice_preflight; the CLI has always been the operator-trusted lane. The frozen record set in adr0106_nav_door_fingerprints.txt pins exactly which four, so a FIFTH NAV-reaching verb cannot be added without this file changing. RESIDUAL: Invariant P.

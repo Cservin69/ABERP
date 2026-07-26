@@ -1,0 +1,51 @@
+# ADR-0106 — the NAV-emission REACHING SET.
+#
+# A symbol is in this set when calling it can lead to a NAV wire body being
+# constructed. The set is CLOSED UNDER CALLS: every function that calls a
+# symbol in this set is itself either (a) listed here — extending the census
+# one hop — or (b) declared a terminal DOOR in adr0106_nav_door_registry.txt
+# with a written preflight disposition. The cut-gate's CHECK N2 enforces
+# exactly that dichotomy, which is what makes "a new route reached NAV filing
+# without going through the choke point" impossible to land silently: any such
+# route must call something in this set, and the moment it does, it is an
+# unregistered caller and the gate goes red.
+#
+# Bare names match a call in any path position (`foo(`, `x::foo(`).
+# `::`-qualified names match literally — used where the bare name is too
+# generic to census on its own (`run` is every CLI verb's entry function).
+#
+# Aliases (`use ...::render_invoice_data as emit;`) are learned by the scanner
+# per file and matched too — see the ALIAS EVASION note in
+# adr0106_nav_door_scan.awk.
+#
+# ── the NAV wire-body emitters themselves (apps/aberp/src/nav_xml.rs) ────────
+# Adding an EIGHTH emitter here is not required to be caught: the scanner
+# reports every `pub fn render_<what>_data[_with_number](` definition as the
+# pseudo-symbol `#emitter-def`, so a new emitter changes the frozen record set
+# on its own. (That arm is not decoration — it is how `render_annulment_data`
+# was found during this gate's own construction: it was missing from the
+# hand-written seed set, and it has a live prod caller.)
+render_invoice_data
+render_invoice_data_with_number
+render_storno_data
+render_storno_data_with_number
+render_modification_data
+render_modification_data_with_number
+render_annulment_data
+#
+# ── the library helpers that own an emit call site ──────────────────────────
+issue_from_parsed
+storno_from_inputs
+modification_from_inputs
+#
+# ── the wrappers between a door and those helpers ───────────────────────────
+run_with_provider
+issue_invoice_request
+storno_invoice_request
+modification_invoice_request
+#
+# ── CLI verb entry functions (qualified: bare `run` is far too generic) ─────
+issue_invoice::run
+issue_storno::run
+issue_modification::run
+request_technical_annulment::run
