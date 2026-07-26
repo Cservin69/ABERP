@@ -1194,7 +1194,12 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::QcInspectionFailed
         | EventKind::QcAutoNcrCreated
         | EventKind::QcProbeCalibrationStaleWarning
-        | EventKind::QcProbeIngestionFailed => (None, ""),
+        | EventKind::QcProbeIngestionFailed
+        // ADR-0105 — `mes.bom_revision_created` carries an app-layer JSON
+        // BOM snapshot (component ids + quantities + author + reason),
+        // never NAV XML bytes. Manufacturing traceability data, not the
+        // §169 invoice path. Exhaustiveness arm only.
+        | EventKind::BomRevisionCreated => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -1216,7 +1221,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 187,
+        EventKind::ALL_KINDS_COUNT == 188,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

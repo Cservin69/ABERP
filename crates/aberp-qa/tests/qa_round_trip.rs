@@ -150,12 +150,13 @@ fn create_and_release_wo_with_2_ops(
     let tx = conn.transaction().unwrap();
     replace_bom_for_product(
         &tx,
-        TEST_TENANT,
+        &wo_ctx_for(meta, "bom-author"),
         "prd_widget",
         &[BomLineInput {
             component_id: "prd_bar".to_string(),
             qty_per_unit: Decimal::from_str("1").unwrap(),
         }],
+        None,
     )
     .unwrap();
     tx.commit().unwrap();

@@ -401,6 +401,10 @@ pub fn run() {
             commands::transition_work_order,
             commands::get_product_bom,
             commands::put_product_bom,
+            // ADR-0105 — BOM revision history reads.
+            commands::list_bom_revisions,
+            commands::get_bom_revision,
+            commands::diff_bom_revisions,
             // S233 / PR-229 Part A — per-routing-op Complete cascade.
             commands::transition_routing_op,
             // S233 / PR-229 / ADR-0063 — Stage 3 Phase γ QA queue v1.

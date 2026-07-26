@@ -208,12 +208,13 @@ fn create_completed_wo(conn: &mut Connection, meta: &LedgerMeta, wo_number: &str
         let tx = conn.transaction().unwrap();
         replace_bom_for_product(
             &tx,
-            TEST_TENANT,
+            &wo_ctx_for(meta, "bom-author"),
             "prd_widget",
             &[BomLineInput {
                 component_id: "prd_bar".to_string(),
                 qty_per_unit: Decimal::from_str("1").unwrap(),
             }],
+            None,
         )
         .unwrap();
         tx.commit().unwrap();
@@ -447,12 +448,13 @@ fn create_dispatch_refuses_ineligible_wo() {
     let tx = conn.transaction().unwrap();
     replace_bom_for_product(
         &tx,
-        TEST_TENANT,
+        &wo_ctx_for(&meta, "bom-author"),
         "prd_widget",
         &[BomLineInput {
             component_id: "prd_bar".to_string(),
             qty_per_unit: Decimal::from_str("1").unwrap(),
         }],
+        None,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -1175,12 +1177,13 @@ fn wo_in_active_state_is_not_eligible() {
     let tx = conn.transaction().unwrap();
     replace_bom_for_product(
         &tx,
-        TEST_TENANT,
+        &wo_ctx_for(&meta, "bom-author"),
         "prd_widget",
         &[BomLineInput {
             component_id: "prd_bar".to_string(),
             qty_per_unit: Decimal::from_str("1").unwrap(),
         }],
+        None,
     )
     .unwrap();
     tx.commit().unwrap();

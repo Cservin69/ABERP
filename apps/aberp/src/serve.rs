@@ -4112,6 +4112,22 @@ pub fn build_router(state: AppState) -> Router {
             "/api/products/:id/bom",
             get(handle_get_product_bom).post(handle_put_product_bom),
         )
+        // ADR-0105 — BOM revision history. All three are reads; the
+        // revisions are authored by the POST above.
+        .route(
+            "/api/products/:id/bom/revisions",
+            get(handle_list_bom_revisions),
+        )
+        .route(
+            "/api/products/:id/bom/revisions/:rev_id",
+            get(handle_get_bom_revision),
+        )
+        // Path params rather than a `?from=&to=` query so the shape
+        // matches every other route here and needs no query parsing.
+        .route(
+            "/api/products/:id/bom/diff/:from_rev/:to_rev",
+            get(handle_diff_bom_revisions),
+        )
         // S233 / PR-229 / ADR-0063 — Stage 3 Phase γ QA queue v1.
         // GET lists tenant QA inspections (optional `?state=` filter +
         // pagination — defaults to all states); detail GET; decisions
@@ -15846,6 +15862,11 @@ pub fn get_product_bom_request(
 #[derive(Debug, Deserialize)]
 pub struct PutProductBomBody {
     pub lines: Vec<PutProductBomLine>,
+    /// ADR-0105 — operator's "why did this change" note, stored on the
+    /// minted revision and carried into the audit payload. Optional;
+    /// blank/whitespace is normalised to `None`.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -15860,16 +15881,21 @@ async fn handle_put_product_bom(
     AxumPath(id): AxumPath<String>,
     Json(body): Json<PutProductBomBody>,
 ) -> Response {
-    if let Err(resp) = require_ready(&state) {
-        return resp;
-    }
+    // ADR-0105 — a revision must be ATTRIBUTABLE, so this route now
+    // uses `require_ready`'s operator login (v1 BOM writes discarded it:
+    // they were unaudited reference-data edits). Same source the WO
+    // create/transition routes attribute from.
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
     let state_for_task = state.clone();
     let id_for_task = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        put_product_bom_request(&state_for_task, &id_for_task, body)
+        put_product_bom_request(&state_for_task, &operator_login, &id_for_task, body)
     })
     .await;
     let outcome = match result {
@@ -15889,9 +15915,10 @@ async fn handle_put_product_bom(
 
 pub fn put_product_bom_request(
     state: &AppState,
+    operator_login: &str,
     product_id: &str,
     body: PutProductBomBody,
-) -> std::result::Result<Vec<aberp_work_orders::BomLine>, WorkOrderRouteError> {
+) -> std::result::Result<aberp_work_orders::BomRevisionOutcome, WorkOrderRouteError> {
     use std::str::FromStr;
 
     let lines: Vec<aberp_work_orders::BomLineInput> = body
@@ -15911,20 +15938,185 @@ pub fn put_product_bom_request(
         })
         .collect::<std::result::Result<_, _>>()?;
 
+    // An all-whitespace reason is no reason — normalise to None so the
+    // stored attribution never carries a blank string.
+    let reason = body
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+
     // ADR-0099 H3 STEP 4c — the product BOM lives in the work_orders Handle
     // family; the soft-retire + replace ride ONE tx on the shared Handle writer.
+    // ADR-0105 — the bom_revisions header INSERT and the BomRevisionCreated
+    // audit append ride that SAME tx (CLAUDE.md rule 15).
     let mut guard = state
         .db
         .write()
         .map_err(|e| WorkOrderRouteError::Other(anyhow!("shared writer for replace_bom: {e}")))?;
+
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+
     let tx = guard
         .transaction()
         .context("begin BOM replace transaction")?;
-    let out =
-        aberp_work_orders::replace_bom_for_product(&tx, state.tenant.as_str(), product_id, &lines)
-            .map_err(map_wo_err)?;
+    let ctx = aberp_work_orders::WoWriteContext {
+        tenant: state.tenant.as_str(),
+        actor: aberp_inventory::ActorKind::SpaOperator {
+            operator_login: operator_login.to_string(),
+        },
+        ledger_meta: &ledger_meta,
+        ledger_actor,
+    };
+    let out = aberp_work_orders::replace_bom_for_product(&tx, &ctx, product_id, &lines, reason)
+        .map_err(map_wo_err)?;
     tx.commit().context("commit BOM replace transaction")?;
+    // ADR-0099 H3 — guard drop lockstep-syncs the audit mirror.
+    drop(guard);
     Ok(out)
+}
+
+// ── ADR-0105 — BOM revision history reads ──────────────────────────────
+
+/// GET /api/products/:id/bom/revisions — the revision headers for a
+/// product, newest first.
+async fn handle_list_bom_revisions(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || list_bom_revisions_request(&state_for_task, &id)).await;
+    match result {
+        Ok(Ok(items)) => Json(items).into_response(),
+        Ok(Err(e)) => internal_error("list_bom_revisions_request", e),
+        Err(join_err) => internal_error(
+            "list_bom_revisions_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn list_bom_revisions_request(
+    state: &AppState,
+    product_id: &str,
+) -> anyhow::Result<Vec<aberp_work_orders::BomRevision>> {
+    // ADR-0099 H3 STEP 4c — work_orders Handle family; shared reader.
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for list_bom_revisions")?;
+    aberp_work_orders::list_bom_revisions(&conn, state.tenant.as_str(), product_id)
+}
+
+/// One revision plus the lines it consisted of — the "show me what the
+/// BOM looked like at revision N" response.
+#[derive(Debug, Serialize)]
+pub struct BomRevisionDetail {
+    pub revision: aberp_work_orders::BomRevision,
+    pub lines: Vec<aberp_work_orders::BomLine>,
+}
+
+/// GET /api/products/:id/bom/revisions/:rev_id — one revision's lines.
+async fn handle_get_bom_revision(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath((id, rev_id)): AxumPath<(String, String)>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        get_bom_revision_request(&state_for_task, &id, &rev_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(detail)) => Json(detail).into_response(),
+        Ok(Err(e)) => wo_route_error_response(e),
+        Err(join_err) => internal_error(
+            "get_bom_revision_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn get_bom_revision_request(
+    state: &AppState,
+    product_id: &str,
+    bom_rev_id: &str,
+) -> std::result::Result<BomRevisionDetail, WorkOrderRouteError> {
+    let conn = state
+        .db
+        .read()
+        .context("shared reader for get_bom_revision")?;
+    let revision = aberp_work_orders::read_bom_revision(&conn, state.tenant.as_str(), bom_rev_id)?
+        .ok_or(WorkOrderRouteError::NotFound)?;
+    // Refuse a revision belonging to a DIFFERENT product than the path
+    // names — the URL would otherwise assert a false parentage, and the
+    // diff route below leans on this to keep a diff within one product.
+    if revision.product_id != product_id {
+        return Err(WorkOrderRouteError::NotFound);
+    }
+    let lines =
+        aberp_work_orders::list_bom_lines_for_revision(&conn, state.tenant.as_str(), bom_rev_id)?;
+    Ok(BomRevisionDetail { revision, lines })
+}
+
+/// GET /api/products/:id/bom/diff/:from_rev/:to_rev — what changed
+/// between two revisions of the same product's BOM.
+async fn handle_diff_bom_revisions(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath((id, from_rev, to_rev)): AxumPath<(String, String, String)>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        diff_bom_revisions_request(&state_for_task, &id, &from_rev, &to_rev)
+    })
+    .await;
+    match result {
+        Ok(Ok(diff)) => Json(diff).into_response(),
+        Ok(Err(e)) => wo_route_error_response(e),
+        Err(join_err) => internal_error(
+            "diff_bom_revisions_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn diff_bom_revisions_request(
+    state: &AppState,
+    product_id: &str,
+    from_rev: &str,
+    to_rev: &str,
+) -> std::result::Result<aberp_work_orders::BomDiff, WorkOrderRouteError> {
+    // Both sides go through the same product-parentage gate as the
+    // single-revision read, so a diff can never straddle two products.
+    let from = get_bom_revision_request(state, product_id, from_rev)?;
+    let to = get_bom_revision_request(state, product_id, to_rev)?;
+    aberp_work_orders::diff_bom_revisions(&from.lines, &to.lines).map_err(map_wo_err)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -32047,6 +32239,7 @@ mod tests {
             notes: None,
             source_quote_id: None,
             actual_machining_minutes: None,
+            bom_rev_id: None,
         };
 
         // 1. Only created_at set — that's the floor.
