@@ -16,12 +16,16 @@
 
   import {
     createStockMovement,
+    diffBomRevisions,
     getProduct,
     getProductBom,
+    listBomRevisions,
     listProducts,
     listStockMovements,
     putProductBom,
+    type BomDiff,
     type BomLine,
+    type BomRevision,
     type Product,
     type StockMovement,
   } from "../lib/api";
@@ -80,6 +84,23 @@
   let bomLoadError: string | null = $state(null);
   let bomSaveState: "idle" | "saving" | "error" = $state("idle");
   let bomSaveError: string | null = $state(null);
+
+  // ADR-0105 — BOM revision history.
+  // - `bomReason` is the operator's "why did this change" note,
+  //   recorded on the revision the next Save mints. Cleared after a
+  //   successful save so the next edit needs its own justification.
+  // - `bomRevisions` is the retained history, newest first.
+  // - `diffFrom` / `diffTo` are the two `bom_rev_id`s the operator
+  //   picked to compare; `bomDiff` holds the backend's answer. The
+  //   diff is computed server-side so the SPA never has to re-derive
+  //   what "changed" means.
+  let bomReason: string = $state("");
+  let bomRevisions: BomRevision[] = $state([]);
+  let diffFrom: string = $state("");
+  let diffTo: string = $state("");
+  let bomDiff: BomDiff | null = $state(null);
+  let diffState: "idle" | "loading" | "error" = $state("idle");
+  let diffError: string | null = $state(null);
 
   // Manual adjustment form state. `reason` defaults to Adjustment —
   // the only reason that accepts any sign per ADR-0061 §5, so the
@@ -141,18 +162,52 @@
     bomLoadState = "loading";
     bomLoadError = null;
     try {
-      const [lines, catalog] = await Promise.all([
+      const [lines, catalog, revisions] = await Promise.all([
         getProductBom(id),
         listProducts(),
+        // ADR-0105 — the retained revision history rides the same
+        // fetch; the history panel is always in sync with the recipe
+        // shown above it.
+        listBomRevisions(id),
       ]);
       bomLines = lines;
       bomForm = formFromBomLines(lines);
       componentCatalog = catalog;
+      bomRevisions = revisions;
+      // Default the comparison to "previous → current", the question
+      // an operator asks first. Left blank when there is no prior.
+      diffTo = revisions[0]?.bom_rev_id ?? "";
+      diffFrom = revisions[1]?.bom_rev_id ?? "";
+      bomDiff = null;
+      diffState = "idle";
+      diffError = null;
       bomLoadState = "loaded";
     } catch (err: unknown) {
       bomLoadState = "error";
       bomLoadError = err instanceof Error ? err.message : String(err);
     }
+  }
+
+  // ADR-0105 — compare two retained revisions. The backend owns the
+  // diff so the SPA cannot drift from what the traceability record
+  // says changed.
+  async function compareRevisions() {
+    if (productId === null || diffFrom === "" || diffTo === "") return;
+    diffState = "loading";
+    diffError = null;
+    try {
+      bomDiff = await diffBomRevisions(productId, diffFrom, diffTo);
+      diffState = "idle";
+    } catch (err: unknown) {
+      bomDiff = null;
+      diffState = "error";
+      diffError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  function revisionLabel(rev: BomRevision): string {
+    const when = rev.created_at.slice(0, 10);
+    return `r${rev.rev_number} — ${when} — ${rev.author}`;
   }
 
   // S232 — POST the operator-edited BOM. Backend semantics are full-
@@ -165,9 +220,21 @@
     bomSaveState = "saving";
     bomSaveError = null;
     try {
-      const result = await putProductBom(productId, composeBomBody(bomForm));
-      bomLines = result;
-      bomForm = formFromBomLines(result);
+      // ADR-0105 — the save mints a revision; the response carries it
+      // alongside the new active lines.
+      const result = await putProductBom(productId, {
+        ...composeBomBody(bomForm),
+        reason: bomReason.trim().length > 0 ? bomReason.trim() : null,
+      });
+      bomLines = result.lines;
+      bomForm = formFromBomLines(result.lines);
+      // Each edit needs its OWN justification — carrying the previous
+      // reason forward would silently mis-attribute the next revision.
+      bomReason = "";
+      bomRevisions = await listBomRevisions(productId);
+      diffTo = bomRevisions[0]?.bom_rev_id ?? "";
+      diffFrom = bomRevisions[1]?.bom_rev_id ?? "";
+      bomDiff = null;
       bomSaveState = "idle";
     } catch (err: unknown) {
       bomSaveState = "error";
@@ -486,6 +553,19 @@
               </div>
             {/each}
 
+            <!-- ADR-0105 — the change note recorded on the revision
+                 this Save mints. Optional, but it is the only place a
+                 later auditor learns WHY the recipe moved. -->
+            <label class="bom-form__field bom-form__field--grow">
+              <span>Indoklás / Change reason (optional)</span>
+              <input
+                type="text"
+                bind:value={bomReason}
+                maxlength="200"
+                placeholder="e.g. ECO-14 — thicker bar stock"
+              />
+            </label>
+
             <div class="bom-form__actions">
               <button
                 type="button"
@@ -509,6 +589,124 @@
               <p class="product-detail__error" role="alert">{bomSaveError}</p>
             {/if}
           </form>
+
+          <!-- ADR-0105 — retained revision history. Superseded
+               revisions are never overwritten; a work order released
+               against one records its id, so this list is what a
+               later traceability question is answered from. -->
+          <section class="bom-history" aria-labelledby="pd-bom-history-title">
+            <h4 id="pd-bom-history-title" class="bom-form__title">
+              Verziótörténet / Revision history
+            </h4>
+
+            {#if bomRevisions.length === 0}
+              <p class="product-detail__muted">
+                Még nincs verzió — mentsd el a receptúrát a
+                verziókövetés indításához. / No revisions yet — save
+                the recipe to start its history.
+              </p>
+            {:else}
+              <table class="ledger-table" aria-label="BOM revisions">
+                <thead>
+                  <tr>
+                    <th scope="col">Verzió / Rev</th>
+                    <th scope="col">Mikor / When</th>
+                    <th scope="col">Ki / Author</th>
+                    <th scope="col">Indoklás / Reason</th>
+                    <th scope="col" class="num">Sorok / Lines</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each bomRevisions as rev (rev.bom_rev_id)}
+                    <tr>
+                      <td class="mono">r{rev.rev_number}</td>
+                      <td class="mono">{rev.created_at.slice(0, 19)}</td>
+                      <td>{rev.author}</td>
+                      <td>
+                        {#if rev.reason === null}
+                          <span class="product-detail__muted">—</span>
+                        {:else}
+                          {rev.reason}
+                        {/if}
+                      </td>
+                      <td class="num mono">{rev.line_count}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+
+              {#if bomRevisions.length >= 2}
+                <div class="bom-history__compare">
+                  <label class="bom-form__field">
+                    <span>Ettől / From</span>
+                    <select bind:value={diffFrom}>
+                      {#each bomRevisions as rev (rev.bom_rev_id)}
+                        <option value={rev.bom_rev_id}
+                          >{revisionLabel(rev)}</option
+                        >
+                      {/each}
+                    </select>
+                  </label>
+                  <label class="bom-form__field">
+                    <span>Eddig / To</span>
+                    <select bind:value={diffTo}>
+                      {#each bomRevisions as rev (rev.bom_rev_id)}
+                        <option value={rev.bom_rev_id}
+                          >{revisionLabel(rev)}</option
+                        >
+                      {/each}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    class="quiet-button"
+                    onclick={() => void compareRevisions()}
+                    disabled={diffState === "loading" ||
+                      diffFrom === "" ||
+                      diffTo === ""}
+                  >
+                    {diffState === "loading"
+                      ? "Összehasonlítás… / Comparing…"
+                      : "Összehasonlítás / Compare"}
+                  </button>
+                </div>
+
+                {#if diffError !== null}
+                  <p class="product-detail__error" role="alert">{diffError}</p>
+                {:else if bomDiff !== null}
+                  {#if bomDiff.added.length === 0 && bomDiff.removed.length === 0 && bomDiff.changed.length === 0}
+                    <p class="product-detail__muted">
+                      Nincs eltérés a két verzió között. / The two
+                      revisions are materially identical.
+                    </p>
+                  {:else}
+                    <ul class="bom-diff">
+                      {#each bomDiff.added as d (d.component_id)}
+                        <li class="bom-diff__added">
+                          + {componentName(d.component_id, componentCatalog)}
+                          <span class="mono">{formatQty(d.qty_per_unit)}</span>
+                        </li>
+                      {/each}
+                      {#each bomDiff.removed as d (d.component_id)}
+                        <li class="bom-diff__removed">
+                          − {componentName(d.component_id, componentCatalog)}
+                          <span class="mono">{formatQty(d.qty_per_unit)}</span>
+                        </li>
+                      {/each}
+                      {#each bomDiff.changed as d (d.component_id)}
+                        <li class="bom-diff__changed">
+                          ~ {componentName(d.component_id, componentCatalog)}
+                          <span class="mono"
+                            >{formatQty(d.qty_from)} → {formatQty(d.qty_to)}</span
+                          >
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
+                {/if}
+              {/if}
+            {/if}
+          </section>
         {/if}
       </section>
     {/if}
@@ -724,6 +922,43 @@
     margin: 0 0 var(--space-2) 0;
     font-size: 0.95rem;
     font-weight: 600;
+  }
+
+  /* ADR-0105 — revision history + diff. Signal colours only where
+     they carry meaning (added / removed / re-quantified), per the
+     ADR-0017 "colour means something" posture; everything else rides
+     the neutral surface tokens so light and dark both hold. */
+  .bom-history {
+    margin-top: var(--space-4);
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--color-surface-divider);
+  }
+  .bom-history__compare {
+    display: flex;
+    gap: var(--space-2);
+    align-items: flex-end;
+    flex-wrap: wrap;
+    margin-top: var(--space-3);
+  }
+  .bom-diff {
+    list-style: none;
+    margin: var(--space-3) 0 0 0;
+    padding: 0;
+    font-size: var(--type-size-sm, 0.9rem);
+  }
+  .bom-diff li {
+    display: flex;
+    gap: var(--space-2);
+    padding: 2px 0;
+  }
+  .bom-diff__added {
+    color: var(--color-signal-positive);
+  }
+  .bom-diff__removed {
+    color: var(--color-signal-negative);
+  }
+  .bom-diff__changed {
+    color: var(--color-signal-warning);
   }
   .bom-form__row {
     display: flex;

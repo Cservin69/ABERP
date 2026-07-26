@@ -177,12 +177,13 @@ fn seed_one_op_wo_with_pending_qa(db_path: &PathBuf) -> (String, String) {
     let tx = conn.transaction().unwrap();
     replace_bom_for_product(
         &tx,
-        TEST_TENANT,
+        &wo_ctx(&m, "bom-author"),
         "prd_widget",
         &[BomLineInput {
             component_id: "prd_bar".to_string(),
             qty_per_unit: Decimal::from_str("1").unwrap(),
         }],
+        None,
     )
     .unwrap();
     tx.commit().unwrap();

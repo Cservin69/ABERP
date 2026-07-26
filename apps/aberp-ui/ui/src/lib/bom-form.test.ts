@@ -68,6 +68,9 @@ function makeBomBackend(initial: BomLine[] = []): BomBackend {
         qty_per_unit: l.qty_per_unit,
         created_at: "2026-06-03T00:00:00Z",
         retired_at: null,
+        // ADR-0105 — every line authored through the real path carries
+        // its revision; the fake mirrors that.
+        bom_rev_id: "bmr_test",
       }));
       return [...active];
     },
@@ -179,6 +182,9 @@ describe("bom-form — pin #3: soft-retire of prior is reflected in the next GET
         qty_per_unit: "4",
         created_at: "2026-05-01T00:00:00Z",
         retired_at: null,
+        // ADR-0105 — every line authored through the real path carries
+        // its revision; the fake mirrors that.
+        bom_rev_id: "bmr_test",
       },
       {
         bom_line_id: "bom_old_b",
@@ -187,6 +193,9 @@ describe("bom-form — pin #3: soft-retire of prior is reflected in the next GET
         qty_per_unit: "2",
         created_at: "2026-05-01T00:00:00Z",
         retired_at: null,
+        // ADR-0105 — every line authored through the real path carries
+        // its revision; the fake mirrors that.
+        bom_rev_id: "bmr_test",
       },
     ];
     const backend = makeBomBackend(initial);
@@ -231,6 +240,9 @@ describe("bom-form — pin #3: soft-retire of prior is reflected in the next GET
         qty_per_unit: "4",
         created_at: "2026-05-01T00:00:00Z",
         retired_at: null,
+        // ADR-0105 — every line authored through the real path carries
+        // its revision; the fake mirrors that.
+        bom_rev_id: "bmr_test",
       },
     ]);
 

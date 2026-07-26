@@ -31,7 +31,8 @@ use ulid::Ulid;
 use aberp_audit_ledger::{append_in_tx, Actor, EventKind, LedgerMeta};
 
 use crate::audit::{
-    RoutingOpStateChangedPayload, WorkOrderCreatedPayload, WorkOrderStateChangedPayload,
+    BomRevisionCreatedPayload, BomRevisionLine, RoutingOpStateChangedPayload,
+    WorkOrderCreatedPayload, WorkOrderStateChangedPayload,
 };
 use crate::error::WorkOrderError;
 use crate::state::{next_routing_op_state, next_state};
@@ -48,7 +49,10 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
         .context("ensure work-orders schema")?;
     // S429 — additive calibration-link columns on work_orders.
     conn.execute_batch(include_str!("../migrations/V002__calibration_link.sql"))
-        .context("ensure work-orders calibration-link schema")
+        .context("ensure work-orders calibration-link schema")?;
+    // ADR-0105 — bom_revisions table + the two bom_rev_id link columns.
+    conn.execute_batch(include_str!("../migrations/V003__bom_revisions.sql"))
+        .context("ensure BOM-revision schema")
 }
 
 // ── BOM (ADR-0062 §1, §6) ───────────────────────────────────────────
@@ -68,6 +72,10 @@ pub struct BomLine {
     pub created_at: String,
     /// `Some(_)` once retired per ADR-0062 §6; otherwise `None`.
     pub retired_at: Option<String>,
+    /// ADR-0105 — the revision this line belongs to (`bmr_<ULID>`).
+    /// `None` ONLY for pre-ADR-0105 legacy rows written before the
+    /// revision store existed; every line authored since carries one.
+    pub bom_rev_id: Option<String>,
 }
 
 /// Operator-supplied BOM line at author time (no id; the repository
@@ -91,32 +99,59 @@ pub fn list_active_bom_for_product(
     tenant: &str,
     product_id: &str,
 ) -> anyhow::Result<Vec<BomLine>> {
-    let mut stmt = conn.prepare(
+    query_bom_lines(
+        conn,
+        "WHERE tenant_id = ? AND product_id = ? AND retired_at IS NULL",
+        params![tenant, product_id],
+    )
+}
+
+/// ADR-0105 — the lines that made up ONE revision, retired or not.
+/// This is the "what did the BOM look like at revision N" read: it
+/// filters on `bom_rev_id`, NOT on `retired_at`, so a superseded
+/// revision reads back exactly as authored.
+pub fn list_bom_lines_for_revision(
+    conn: &Connection,
+    tenant: &str,
+    bom_rev_id: &str,
+) -> anyhow::Result<Vec<BomLine>> {
+    query_bom_lines(
+        conn,
+        "WHERE tenant_id = ? AND bom_rev_id = ?",
+        params![tenant, bom_rev_id],
+    )
+}
+
+/// Shared `boms` row-mapper for the two readers above. Stable order
+/// (`created_at`, then `bom_line_id`) so the SPA and the diff both see
+/// a deterministic sequence.
+fn query_bom_lines(
+    conn: &Connection,
+    where_clause: &str,
+    args: &[&dyn duckdb::ToSql],
+) -> anyhow::Result<Vec<BomLine>> {
+    let sql = format!(
         "SELECT bom_line_id, product_id, component_id,
-                CAST(qty_per_unit AS VARCHAR), created_at, retired_at
-         FROM boms
-         WHERE tenant_id = ? AND product_id = ? AND retired_at IS NULL
-         ORDER BY created_at ASC, bom_line_id ASC;",
-    )?;
-    let rows = stmt.query_map(params![tenant, product_id], |row| {
-        let bom_line_id: String = row.get(0)?;
-        let product_id: String = row.get(1)?;
-        let component_id: String = row.get(2)?;
-        let qty_str: String = row.get(3)?;
-        let created_at: String = row.get(4)?;
-        let retired_at: Option<String> = row.get(5)?;
+                CAST(qty_per_unit AS VARCHAR), created_at, retired_at, bom_rev_id
+         FROM boms {where_clause}
+         ORDER BY created_at ASC, bom_line_id ASC;"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(args, |row| {
         Ok((
-            bom_line_id,
-            product_id,
-            component_id,
-            qty_str,
-            created_at,
-            retired_at,
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
         ))
     })?;
     let mut out = Vec::new();
     for r in rows {
-        let (bom_line_id, product_id, component_id, qty_str, created_at, retired_at) = r?;
+        let (bom_line_id, product_id, component_id, qty_str, created_at, retired_at, bom_rev_id) =
+            r?;
         out.push(BomLine {
             bom_line_id,
             product_id,
@@ -125,23 +160,66 @@ pub fn list_active_bom_for_product(
                 .with_context(|| format!("parse qty_per_unit {qty_str:?}"))?,
             created_at,
             retired_at,
+            bom_rev_id,
         });
     }
     Ok(out)
 }
 
-/// Author a new BOM for a product. Soft-retires any prior active rows
-/// (sets their `retired_at` to now) and inserts the new lines per
-/// ADR-0062 §6 — the table is append-only by application discipline.
+/// ADR-0105 — one row from `bom_revisions`: the identity of an
+/// authored BOM revision. `rev_number` is 1-based and monotonic per
+/// (tenant, product).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BomRevision {
+    /// `bmr_<ULID>`.
+    pub bom_rev_id: String,
+    pub product_id: String,
+    /// 1-based, monotonic per (tenant, product).
+    pub rev_number: i64,
+    pub created_at: String,
+    /// Operator attribution string — same
+    /// `ActorKind::as_operator_string()` form every other WO audit
+    /// payload carries.
+    pub author: String,
+    /// Free-form operator note ("why did this change"). `None` when
+    /// the author supplied none.
+    pub reason: Option<String>,
+    pub line_count: i64,
+    /// FNV-1a over the canonical sorted `component_id=qty;` set.
+    pub content_hash: String,
+}
+
+/// What [`replace_bom_for_product`] returns: the minted revision plus
+/// the lines it now consists of.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BomRevisionOutcome {
+    pub revision: BomRevision,
+    pub lines: Vec<BomLine>,
+}
+
+/// Author a new BOM revision for a product. Soft-retires the prior
+/// active rows (sets their `retired_at`) and inserts the new lines per
+/// ADR-0062 §6 — the table is append-only by application discipline —
+/// then mints the ADR-0105 `bom_revisions` header that gives the
+/// retained prior set an identity, and appends ONE
+/// `mes.bom_revision_created` audit entry carrying the full line
+/// snapshot.
 ///
-/// Per ADR-0062: no audit kind for BOM mutations in v1 (it's reference
-/// data, not regulated state).
+/// The business INSERTs and the audit append ride the SAME transaction
+/// (CLAUDE.md rule 15) — a BOM revision is never written unaudited.
+///
+/// This supersedes ADR-0062's "BOM is reference data, no audit kind"
+/// call: once a work order pins the revision it was released against
+/// (§2.5), the BOM is part of the traceability record, not reference
+/// data. ADR-0105 §2.3 states the reversal.
 pub fn replace_bom_for_product(
     tx: &Transaction<'_>,
-    tenant: &str,
+    ctx: &WoWriteContext<'_>,
     product_id: &str,
     lines: &[BomLineInput],
-) -> Result<Vec<BomLine>, WorkOrderError> {
+    reason: Option<&str>,
+) -> Result<BomRevisionOutcome, WorkOrderError> {
+    let tenant = ctx.tenant;
     if lines.len() > MAX_BOM_LINES_PER_REQUEST {
         return Err(WorkOrderError::Validation(format!(
             "BOM has {} lines; max is {MAX_BOM_LINES_PER_REQUEST}",
@@ -160,6 +238,23 @@ pub fn replace_bom_for_product(
         if line.component_id.trim().is_empty() {
             return Err(WorkOrderError::Validation(format!(
                 "line {i}: component_id is empty"
+            )));
+        }
+    }
+    // ADR-0105 §2.6 — a component may appear at most ONCE per BOM.
+    // Without this, a revision-to-revision diff keyed on component_id
+    // is ill-defined (which of the two `STL-BAR` lines changed?). Two
+    // lines for the same component are one line with the summed qty;
+    // refusing is loud, collapsing them silently would not be.
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(j) = lines[..i]
+            .iter()
+            .position(|prior| prior.component_id == line.component_id)
+        {
+            return Err(WorkOrderError::Validation(format!(
+                "component {} appears on both line {j} and line {i}; \
+                 a component may appear at most once per BOM",
+                line.component_id
             )));
         }
     }
@@ -183,6 +278,29 @@ pub fn replace_bom_for_product(
 
     let now = now_rfc3339()?;
 
+    // Allocate the revision number inside the tx — same allocator
+    // posture as `wo_number` (V001): the in-tx MAX+1 probe is the
+    // authoritative gate, not a DB constraint.
+    let prior: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT rev_number, bom_rev_id FROM bom_revisions
+             WHERE tenant_id = ? AND product_id = ?
+             ORDER BY rev_number DESC LIMIT 1;",
+            params![tenant, product_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            duckdb::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(WorkOrderError::Storage(anyhow!(
+                "probe prior BOM revision: {other}"
+            ))),
+        })?;
+    let rev_number = prior.as_ref().map(|(n, _)| n + 1).unwrap_or(1);
+    let prior_rev_id = prior.map(|(_, id)| id);
+    let bom_rev_id = format!("bmr_{}", Ulid::new());
+    let content_hash = bom_content_hash(lines);
+
     // Retire any prior active rows.
     tx.execute(
         "UPDATE boms SET retired_at = ?
@@ -191,15 +309,37 @@ pub fn replace_bom_for_product(
     )
     .map_err(|e| WorkOrderError::Storage(anyhow!("retire prior BOM rows: {e}")))?;
 
-    // Insert the new lines.
+    // Mint the revision header BEFORE the lines so a line can never
+    // reference a header that does not exist.
+    let line_count = i64::try_from(lines.len()).unwrap_or(i64::MAX);
+    tx.execute(
+        "INSERT INTO bom_revisions (
+            bom_rev_id, tenant_id, product_id, rev_number,
+            created_at, author, reason, line_count, content_hash
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);",
+        params![
+            &bom_rev_id,
+            tenant,
+            product_id,
+            rev_number,
+            &now,
+            ctx.actor.as_operator_string(),
+            reason,
+            line_count,
+            &content_hash,
+        ],
+    )
+    .map_err(|e| WorkOrderError::Storage(anyhow!("INSERT bom_revisions: {e}")))?;
+
+    // Insert the new lines, each stamped with the revision.
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
         let bom_line_id = format!("bml_{}", Ulid::new());
         tx.execute(
             "INSERT INTO boms (
                 bom_line_id, tenant_id, product_id, component_id,
-                qty_per_unit, created_at, retired_at
-             ) VALUES (?, ?, ?, ?, ?, ?, NULL);",
+                qty_per_unit, created_at, retired_at, bom_rev_id
+             ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?);",
             params![
                 &bom_line_id,
                 tenant,
@@ -207,6 +347,7 @@ pub fn replace_bom_for_product(
                 &line.component_id,
                 line.qty_per_unit.to_string(),
                 &now,
+                &bom_rev_id,
             ],
         )
         .map_err(|e| WorkOrderError::Storage(anyhow!("INSERT BOM line: {e}")))?;
@@ -217,9 +358,230 @@ pub fn replace_bom_for_product(
             qty_per_unit: line.qty_per_unit,
             created_at: now.clone(),
             retired_at: None,
+            bom_rev_id: Some(bom_rev_id.clone()),
         });
     }
+
+    let revision = BomRevision {
+        bom_rev_id: bom_rev_id.clone(),
+        product_id: product_id.to_string(),
+        rev_number,
+        created_at: now,
+        author: ctx.actor.as_operator_string(),
+        reason: reason.map(str::to_string),
+        line_count,
+        content_hash: content_hash.clone(),
+    };
+
+    // Audit entry — full line snapshot so the hash-chained ledger is
+    // an independently sufficient record of the revision, not a
+    // pointer into a table an attacker with DB access could rewrite.
+    let payload = BomRevisionCreatedPayload {
+        bom_rev_id,
+        product_id: product_id.to_string(),
+        rev_number,
+        prior_rev_id,
+        line_count,
+        content_hash,
+        lines: out
+            .iter()
+            .map(|l| BomRevisionLine {
+                component_id: l.component_id.clone(),
+                qty_per_unit: l.qty_per_unit,
+            })
+            .collect(),
+        reason: reason.map(str::to_string),
+        actor: ctx.actor.as_operator_string(),
+    };
+    append_in_tx(
+        tx,
+        ctx.ledger_meta,
+        EventKind::BomRevisionCreated,
+        payload.to_bytes(),
+        ctx.ledger_actor.clone(),
+        Some(format!("bom_revision:{product_id}:{rev_number}")),
+    )
+    .map_err(|e| WorkOrderError::Storage(anyhow!("audit append BomRevisionCreated: {e}")))?;
+
+    Ok(BomRevisionOutcome {
+        revision,
+        lines: out,
+    })
+}
+
+/// FNV-1a over the canonical `component_id=qty;` set, sorted by
+/// component id so line ORDER never changes the hash — identical
+/// construction to `aberp_quote_engine::CalibrationTable::set_hash`
+/// (S429) and the ADR-0104 price-set pin. Two revisions with the same
+/// hash have the same material content.
+fn bom_content_hash(lines: &[BomLineInput]) -> String {
+    let mut canonical: Vec<String> = lines
+        .iter()
+        .map(|l| format!("{}={};", l.component_id, l.qty_per_unit.normalize()))
+        .collect();
+    canonical.sort();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in canonical.concat().bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// ADR-0105 — the revision headers for a product, NEWEST FIRST (the
+/// order the SPA history panel renders).
+pub fn list_bom_revisions(
+    conn: &Connection,
+    tenant: &str,
+    product_id: &str,
+) -> anyhow::Result<Vec<BomRevision>> {
+    let mut stmt = conn.prepare(
+        "SELECT bom_rev_id, product_id, rev_number, created_at,
+                author, reason, line_count, content_hash
+         FROM bom_revisions
+         WHERE tenant_id = ? AND product_id = ?
+         ORDER BY rev_number DESC;",
+    )?;
+    let rows = stmt.query_map(params![tenant, product_id], |row| {
+        Ok(BomRevision {
+            bom_rev_id: row.get(0)?,
+            product_id: row.get(1)?,
+            rev_number: row.get(2)?,
+            created_at: row.get(3)?,
+            author: row.get(4)?,
+            reason: row.get(5)?,
+            line_count: row.get(6)?,
+            content_hash: row.get(7)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
     Ok(out)
+}
+
+/// Read ONE revision header by id, tenant-scoped. `None` for unknown.
+pub fn read_bom_revision(
+    conn: &Connection,
+    tenant: &str,
+    bom_rev_id: &str,
+) -> anyhow::Result<Option<BomRevision>> {
+    conn.query_row(
+        "SELECT bom_rev_id, product_id, rev_number, created_at,
+                author, reason, line_count, content_hash
+         FROM bom_revisions
+         WHERE tenant_id = ? AND bom_rev_id = ? LIMIT 1;",
+        params![tenant, bom_rev_id],
+        |row| {
+            Ok(BomRevision {
+                bom_rev_id: row.get(0)?,
+                product_id: row.get(1)?,
+                rev_number: row.get(2)?,
+                created_at: row.get(3)?,
+                author: row.get(4)?,
+                reason: row.get(5)?,
+                line_count: row.get(6)?,
+                content_hash: row.get(7)?,
+            })
+        },
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        duckdb::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(anyhow!("SELECT bom_revisions: {other}")),
+    })
+}
+
+// ── BOM diff (ADR-0105 §2.6) ────────────────────────────────────────
+
+/// One side of an add/remove in a [`BomDiff`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BomDiffLine {
+    pub component_id: String,
+    pub qty_per_unit: Decimal,
+}
+
+/// A component present in both revisions with a different quantity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BomDiffChange {
+    pub component_id: String,
+    pub qty_from: Decimal,
+    pub qty_to: Decimal,
+}
+
+/// What changed between two BOM revisions. Every vector is sorted by
+/// `component_id` so the rendering (and any test) is deterministic.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BomDiff {
+    pub added: Vec<BomDiffLine>,
+    pub removed: Vec<BomDiffLine>,
+    pub changed: Vec<BomDiffChange>,
+}
+
+impl BomDiff {
+    /// True when the two revisions are materially identical.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+/// Diff two revisions' line sets, keyed on `component_id`.
+///
+/// Pure — takes the already-read line sets so it is testable without a
+/// DB and so the caller decides which revisions to compare.
+///
+/// Refuses LOUD on a duplicate `component_id` within either side: the
+/// author-time gate in [`replace_bom_for_product`] prevents new ones,
+/// but a pre-ADR-0105 legacy revision could contain a duplicate, and
+/// silently keeping the last-seen line would under-report the change.
+pub fn diff_bom_revisions(from: &[BomLine], to: &[BomLine]) -> Result<BomDiff, WorkOrderError> {
+    use std::collections::BTreeMap;
+
+    fn index(side: &str, lines: &[BomLine]) -> Result<BTreeMap<String, Decimal>, WorkOrderError> {
+        let mut map = BTreeMap::new();
+        for line in lines {
+            if map
+                .insert(line.component_id.clone(), line.qty_per_unit)
+                .is_some()
+            {
+                return Err(WorkOrderError::Validation(format!(
+                    "{side} revision has duplicate component {}; cannot diff",
+                    line.component_id
+                )));
+            }
+        }
+        Ok(map)
+    }
+
+    let from_map = index("from", from)?;
+    let to_map = index("to", to)?;
+
+    let mut diff = BomDiff::default();
+    for (component_id, qty_to) in &to_map {
+        match from_map.get(component_id) {
+            None => diff.added.push(BomDiffLine {
+                component_id: component_id.clone(),
+                qty_per_unit: *qty_to,
+            }),
+            Some(qty_from) if qty_from != qty_to => diff.changed.push(BomDiffChange {
+                component_id: component_id.clone(),
+                qty_from: *qty_from,
+                qty_to: *qty_to,
+            }),
+            Some(_) => {}
+        }
+    }
+    for (component_id, qty_from) in &from_map {
+        if !to_map.contains_key(component_id) {
+            diff.removed.push(BomDiffLine {
+                component_id: component_id.clone(),
+                qty_per_unit: *qty_from,
+            });
+        }
+    }
+    // BTreeMap iteration is already component_id-ordered.
+    Ok(diff)
 }
 
 // ── Work order (ADR-0062 §1, §3, §5) ────────────────────────────────
@@ -250,6 +612,16 @@ pub struct WorkOrder {
     /// S429 — MES/operator-recorded actual machining minutes (total over the
     /// batch), set at Complete. `None` = no time tracking → calibration skip.
     pub actual_machining_minutes: Option<f64>,
+    /// ADR-0105 §2.5 — **the traceability pin**: which BOM revision
+    /// this WO was RELEASED against. Stamped once, at Release, from the
+    /// revision the consumed lines belonged to; never re-stamped by a
+    /// later transition, so a subsequent BOM edit cannot retro-change
+    /// what this batch was built to.
+    ///
+    /// `None` means either "not released yet" (`released_at IS NULL`)
+    /// or "released against a legacy pre-ADR-0105 unrevisioned BOM" —
+    /// the latter also raised a transition warning at the time.
+    pub bom_rev_id: Option<String>,
 }
 
 /// One row from `routings`.
@@ -490,6 +862,8 @@ pub fn create_work_order(
         notes: inputs.notes,
         source_quote_id: inputs.source_quote_id,
         actual_machining_minutes: None,
+        // ADR-0105 §2.5 — stamped at Release, not at create.
+        bom_rev_id: None,
     };
     Ok((wo, routing_ops_out))
 }
@@ -598,6 +972,10 @@ pub fn transition_work_order(
     }
 
     let mut warnings: Vec<String> = Vec::new();
+    // ADR-0105 §2.5 — the BOM revision this Release consumed. Stays
+    // `None` for every non-Release action, and the UPDATE below
+    // COALESCEs, so a later transition can never re-stamp the pin.
+    let mut pinned_bom_rev_id: Option<String> = None;
 
     // ── Action-specific side effects ────────────────────────────
     let now = now_rfc3339()?;
@@ -609,6 +987,34 @@ pub fn transition_work_order(
                 .map_err(|e| WorkOrderError::Storage(anyhow!("read BOM for release: {e}")))?;
             if bom.is_empty() {
                 return Err(WorkOrderError::NoActiveBomForProduct(product_id.clone()));
+            }
+            // ADR-0105 §2.5 — pin WHICH revision this batch was built
+            // to. The active set is written by one `replace_bom_for_product`
+            // call, so every line shares one revision id.
+            let distinct_revs: std::collections::BTreeSet<Option<&str>> =
+                bom.iter().map(|l| l.bom_rev_id.as_deref()).collect();
+            match distinct_revs.len() {
+                // Uniform. Either all-Some (pin it) or all-None (legacy).
+                1 => match bom[0].bom_rev_id.as_deref() {
+                    Some(rev) => pinned_bom_rev_id = Some(rev.to_string()),
+                    None => warnings.push(format!(
+                        "product {product_id} has a pre-ADR-0105 unrevisioned BOM; \
+                         released WITHOUT a BOM-revision pin — re-save the BOM to \
+                         start its revision history"
+                    )),
+                },
+                // Mixed revisions in one active set means a torn write:
+                // two `replace_bom_for_product` calls' lines are both
+                // live. Refuse rather than pin an arbitrary one — a
+                // wrong pin is worse than no pin (CLAUDE.md rule 11).
+                _ => {
+                    return Err(WorkOrderError::Storage(anyhow!(
+                        "active BOM for product {product_id} spans {} distinct revisions \
+                         ({:?}); refusing to pin — the active set is torn",
+                        distinct_revs.len(),
+                        distinct_revs
+                    )));
+                }
             }
             for line in &bom {
                 let qty_delta = -(line.qty_per_unit * qty_target);
@@ -756,7 +1162,10 @@ pub fn transition_work_order(
             cancelled_at  = COALESCE(cancelled_at, ?),
             hold_reason   = CASE WHEN ? THEN NULL
                                  ELSE COALESCE(?, hold_reason) END,
-            actual_machining_minutes = COALESCE(?, actual_machining_minutes)
+            actual_machining_minutes = COALESCE(?, actual_machining_minutes),
+            -- ADR-0105 §2.5: COALESCE, so the pin is stamped ONCE (at
+            -- Release) and no later transition can overwrite it.
+            bom_rev_id    = COALESCE(bom_rev_id, ?)
          WHERE tenant_id = ? AND wo_id = ?;",
         params![
             new_state.as_str(),
@@ -774,6 +1183,7 @@ pub fn transition_work_order(
             clear_hold_reason,
             hold_reason.as_deref(),
             actual_machining_minutes_set,
+            pinned_bom_rev_id.as_deref(),
             ctx.tenant,
             wo_id,
         ],
@@ -864,6 +1274,7 @@ fn read_wo_inner(
             Option<String>,
             Option<String>,
             Option<f64>,
+            Option<String>,
         )>,
     >,
     tenant: &str,
@@ -873,7 +1284,7 @@ fn read_wo_inner(
         "SELECT wo_id, wo_number, product_id, CAST(qty_target AS VARCHAR),
                 state, created_at, released_at, started_at,
                 completed_at, cancelled_at, hold_reason, notes,
-                source_quote_id, actual_machining_minutes
+                source_quote_id, actual_machining_minutes, bom_rev_id
          FROM work_orders WHERE tenant_id = ? AND wo_id = ? LIMIT 1;",
         &[&tenant, &wo_id],
     )
@@ -895,6 +1306,7 @@ fn read_wo_inner(
             notes,
             source_quote_id,
             actual_machining_minutes,
+            bom_rev_id,
         )) => Ok(Some(WorkOrder {
             wo_id,
             wo_number,
@@ -912,6 +1324,7 @@ fn read_wo_inner(
             notes,
             source_quote_id,
             actual_machining_minutes,
+            bom_rev_id,
         })),
     }
 }
@@ -936,6 +1349,7 @@ impl WorkOrderReader for Connection {
                         row.get(11)?,
                         row.get(12)?,
                         row.get(13)?,
+                        row.get(14)?,
                     ))
                 })
                 .map(Some)
@@ -970,6 +1384,7 @@ impl WorkOrderReader for Transaction<'_> {
                         row.get(11)?,
                         row.get(12)?,
                         row.get(13)?,
+                        row.get(14)?,
                     ))
                 })
                 .map(Some)
@@ -997,7 +1412,7 @@ pub fn list_work_orders(
         "SELECT wo_id, wo_number, product_id, CAST(qty_target AS VARCHAR),
                 state, created_at, released_at, started_at,
                 completed_at, cancelled_at, hold_reason, notes,
-                source_quote_id, actual_machining_minutes
+                source_quote_id, actual_machining_minutes, bom_rev_id
          FROM work_orders WHERE tenant_id = ?",
     );
     if state_filter.is_some() {
@@ -1092,6 +1507,7 @@ fn row_to_wo(row: &duckdb::Row<'_>) -> duckdb::Result<anyhow::Result<WorkOrder>>
     let notes: Option<String> = row.get(11)?;
     let source_quote_id: Option<String> = row.get(12)?;
     let actual_machining_minutes: Option<f64> = row.get(13)?;
+    let bom_rev_id: Option<String> = row.get(14)?;
 
     let parse = || -> anyhow::Result<WorkOrder> {
         Ok(WorkOrder {
@@ -1111,6 +1527,7 @@ fn row_to_wo(row: &duckdb::Row<'_>) -> duckdb::Result<anyhow::Result<WorkOrder>>
             notes,
             source_quote_id,
             actual_machining_minutes,
+            bom_rev_id,
         })
     };
     Ok(parse())

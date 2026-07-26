@@ -1594,7 +1594,9 @@ pub async fn get_product_bom(
 
 /// S232 — `POST /api/products/:id/bom`. Replace the active BOM lines
 /// (soft-retires the prior set per ADR-0062 §6). Body shape:
-/// `{ lines: [{ component_id, qty_per_unit }, ...] }`.
+/// `{ lines: [{ component_id, qty_per_unit }, ...], reason? }`.
+/// ADR-0105 — the response is now `{ revision, lines }`: authoring a
+/// BOM mints a revision.
 #[tauri::command]
 pub async fn put_product_bom(
     state: State<'_, AppState>,
@@ -1604,6 +1606,49 @@ pub async fn put_product_bom(
     validate_product_id(&product_id).map_err(|e| format!("{e:#}"))?;
     let path = format!("/api/products/{product_id}/bom");
     forward_post(&state, &path, body).await
+}
+
+/// ADR-0105 — `GET /api/products/:id/bom/revisions`. Revision headers
+/// for a product, newest first. The Product detail page's BOM history
+/// panel reads here.
+#[tauri::command]
+pub async fn list_bom_revisions(
+    state: State<'_, AppState>,
+    product_id: String,
+) -> Result<Value, String> {
+    validate_product_id(&product_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/products/{product_id}/bom/revisions");
+    forward_get(&state, &path, true).await
+}
+
+/// ADR-0105 — `GET /api/products/:id/bom/revisions/:rev_id`. One
+/// revision header + the lines it consisted of.
+#[tauri::command]
+pub async fn get_bom_revision(
+    state: State<'_, AppState>,
+    product_id: String,
+    rev_id: String,
+) -> Result<Value, String> {
+    validate_product_id(&product_id).map_err(|e| format!("{e:#}"))?;
+    validate_qa_or_routing_op_id(&rev_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/products/{product_id}/bom/revisions/{rev_id}");
+    forward_get(&state, &path, true).await
+}
+
+/// ADR-0105 — `GET /api/products/:id/bom/diff/:from_rev/:to_rev`.
+/// What changed between two revisions of the same product's BOM.
+#[tauri::command]
+pub async fn diff_bom_revisions(
+    state: State<'_, AppState>,
+    product_id: String,
+    from_rev: String,
+    to_rev: String,
+) -> Result<Value, String> {
+    validate_product_id(&product_id).map_err(|e| format!("{e:#}"))?;
+    validate_qa_or_routing_op_id(&from_rev).map_err(|e| format!("{e:#}"))?;
+    validate_qa_or_routing_op_id(&to_rev).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/products/{product_id}/bom/diff/{from_rev}/{to_rev}");
+    forward_get(&state, &path, true).await
 }
 
 // ── S233 / PR-229 — Per-routing-op Complete cascade + QA queue ──────
@@ -2855,9 +2900,12 @@ fn validate_wo_id(s: &str) -> anyhow::Result<()> {
 }
 
 /// S233 / PR-229 — defence-in-depth validator for `qa_<ULID>` and
-/// `rop_<ULID>` ids on the QA / routing-op routes. Same ASCII-safe
-/// charset as `validate_wo_id`; both id shapes ride a single
-/// validator since the constraints are identical.
+/// `rop_<ULID>` ids on the QA / routing-op routes, and (ADR-0105) for
+/// `bmr_<ULID>` BOM-revision ids. Same ASCII-safe charset as
+/// `validate_wo_id`; the id shapes ride a single validator since the
+/// constraints are identical — a fourth copy would be pure duplication.
+/// The name is narrower than the use; kept as-is to avoid a rename
+/// across unrelated call sites.
 fn validate_qa_or_routing_op_id(s: &str) -> anyhow::Result<()> {
     if s.is_empty() {
         anyhow::bail!("id is empty");

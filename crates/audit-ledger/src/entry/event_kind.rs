@@ -954,6 +954,24 @@ pub enum EventKind {
     /// F12 four-edit ritual fires once.
     RoutingOpStateChanged,
 
+    /// ADR-0105 — a new BOM revision was authored for a product. ONE
+    /// entry per `replace_bom_for_product` call, written in the SAME
+    /// transaction as the `bom_revisions` header + `boms` line INSERTs
+    /// (CLAUDE.md rule 15).
+    ///
+    /// Carries the **full component line snapshot**, not a pointer:
+    /// once a work order pins the revision it was released against, the
+    /// BOM is part of the traceability record, and the hash-chained
+    /// ledger must be able to attest what the BOM WAS independently of
+    /// the mutable tables. This deliberately reverses ADR-0062 §6's
+    /// "BOM is reference data, no audit kind" call — ADR-0105 §2.3
+    /// states why.
+    ///
+    /// `mes.` prefix — same Stage 3 family as the WO kinds above.
+    ///
+    /// F12 four-edit ritual fires once.
+    BomRevisionCreated,
+
     /// S233 / PR-229 / ADR-0063 — one Pending `qa_inspections` row was
     /// auto-created when a routing-op transitioned to `Completed`. ONE
     /// entry per inspection at create time; carries `qa_id`, `wo_id`,
@@ -3164,6 +3182,7 @@ impl EventKind {
             EventKind::WorkOrderCreated => "mes.work_order_created",
             EventKind::WorkOrderStateChanged => "mes.work_order_state_changed",
             EventKind::RoutingOpStateChanged => "mes.routing_op_state_changed",
+            EventKind::BomRevisionCreated => "mes.bom_revision_created",
             EventKind::QaInspectionCreated => "mes.qa_inspection_created",
             EventKind::QaInspectionDecided => "mes.qa_inspection_decided",
             EventKind::DispatchCreated => "mes.dispatch_created",
@@ -3383,6 +3402,7 @@ impl EventKind {
             "mes.work_order_created" => Ok(EventKind::WorkOrderCreated),
             "mes.work_order_state_changed" => Ok(EventKind::WorkOrderStateChanged),
             "mes.routing_op_state_changed" => Ok(EventKind::RoutingOpStateChanged),
+            "mes.bom_revision_created" => Ok(EventKind::BomRevisionCreated),
             "mes.qa_inspection_created" => Ok(EventKind::QaInspectionCreated),
             "mes.qa_inspection_decided" => Ok(EventKind::QaInspectionDecided),
             "mes.dispatch_created" => Ok(EventKind::DispatchCreated),
@@ -3591,6 +3611,7 @@ impl EventKind {
         EventKind::WorkOrderCreated,
         EventKind::WorkOrderStateChanged,
         EventKind::RoutingOpStateChanged,
+        EventKind::BomRevisionCreated,
         EventKind::QaInspectionCreated,
         EventKind::QaInspectionDecided,
         EventKind::DispatchCreated,
@@ -3805,6 +3826,7 @@ mod tests {
             EventKind::WorkOrderCreated,
             EventKind::WorkOrderStateChanged,
             EventKind::RoutingOpStateChanged,
+            EventKind::BomRevisionCreated,
             EventKind::QaInspectionCreated,
             EventKind::QaInspectionDecided,
             EventKind::DispatchCreated,
@@ -3991,7 +4013,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            187,
+            188,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
@@ -4863,6 +4885,8 @@ mod tests {
             EventKind::WorkOrderCreated,
             EventKind::WorkOrderStateChanged,
             EventKind::RoutingOpStateChanged,
+            // ADR-0105 — BOM revisions join the same Stage 3 family.
+            EventKind::BomRevisionCreated,
         ] {
             let s = k.as_str();
             assert!(s.starts_with("mes."), "{s} must start with mes.");

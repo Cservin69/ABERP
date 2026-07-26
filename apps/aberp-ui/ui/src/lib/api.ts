@@ -2966,6 +2966,10 @@ export interface WorkOrder {
   cancelled_at: string | null;
   hold_reason: string | null;
   notes: string | null;
+  /** ADR-0105 §2.5 — the BOM revision this WO was RELEASED against.
+   * `null` when not yet released, or when released against a legacy
+   * pre-ADR-0105 unrevisioned BOM. */
+  bom_rev_id: string | null;
 }
 
 /** S232 — one routing operation. */
@@ -2989,6 +2993,55 @@ export interface BomLine {
   qty_per_unit: string;
   created_at: string;
   retired_at: string | null;
+  /** ADR-0105 — which revision this line belongs to. `null` only on
+   * pre-ADR-0105 legacy rows. */
+  bom_rev_id: string | null;
+}
+
+/** ADR-0105 — one BOM revision header. */
+export interface BomRevision {
+  bom_rev_id: string;
+  product_id: string;
+  /** 1-based, monotonic per product. */
+  rev_number: number;
+  created_at: string;
+  author: string;
+  reason: string | null;
+  line_count: number;
+  /** FNV-1a over the canonical component set — equal hashes mean
+   * materially identical revisions. */
+  content_hash: string;
+}
+
+/** ADR-0105 — `POST /api/products/:id/bom` response: the minted
+ * revision + the lines it now consists of. */
+export interface BomRevisionOutcome {
+  revision: BomRevision;
+  lines: BomLine[];
+}
+
+/** ADR-0105 — one revision + the lines it consisted of. */
+export interface BomRevisionDetail {
+  revision: BomRevision;
+  lines: BomLine[];
+}
+
+/** ADR-0105 — what changed between two revisions. */
+export interface BomDiff {
+  added: BomDiffLine[];
+  removed: BomDiffLine[];
+  changed: BomDiffChange[];
+}
+
+export interface BomDiffLine {
+  component_id: string;
+  qty_per_unit: string;
+}
+
+export interface BomDiffChange {
+  component_id: string;
+  qty_from: string;
+  qty_to: string;
 }
 
 /** S232 — POST /api/work-orders body. */
@@ -3058,6 +3111,9 @@ export interface TransitionWorkOrderResponse {
 /** S232 — PUT BOM body: full-replace the active BOM rows. */
 export interface PutProductBomBody {
   lines: PutProductBomLine[];
+  /** ADR-0105 — operator's "why did this change" note, recorded on the
+   * minted revision. Optional. */
+  reason?: string | null;
 }
 
 export interface PutProductBomLine {
@@ -3108,12 +3164,37 @@ export async function getProductBom(productId: string): Promise<BomLine[]> {
   return invoke<BomLine[]>("get_product_bom", { productId });
 }
 
-/** S232 — `POST /api/products/:id/bom`. Replace active BOM lines. */
+/** S232 — `POST /api/products/:id/bom`. Replace active BOM lines.
+ * ADR-0105 — this mints a revision; the response carries it. */
 export async function putProductBom(
   productId: string,
   body: PutProductBomBody,
-): Promise<BomLine[]> {
-  return invoke<BomLine[]>("put_product_bom", { productId, body });
+): Promise<BomRevisionOutcome> {
+  return invoke<BomRevisionOutcome>("put_product_bom", { productId, body });
+}
+
+/** ADR-0105 — `GET /api/products/:id/bom/revisions`. Newest first. */
+export async function listBomRevisions(
+  productId: string,
+): Promise<BomRevision[]> {
+  return invoke<BomRevision[]>("list_bom_revisions", { productId });
+}
+
+/** ADR-0105 — `GET /api/products/:id/bom/revisions/:rev_id`. */
+export async function getBomRevision(
+  productId: string,
+  revId: string,
+): Promise<BomRevisionDetail> {
+  return invoke<BomRevisionDetail>("get_bom_revision", { productId, revId });
+}
+
+/** ADR-0105 — `GET /api/products/:id/bom/diff/:from_rev/:to_rev`. */
+export async function diffBomRevisions(
+  productId: string,
+  fromRev: string,
+  toRev: string,
+): Promise<BomDiff> {
+  return invoke<BomDiff>("diff_bom_revisions", { productId, fromRev, toRev });
 }
 
 // ── S233 / PR-229 / ADR-0063 — Stage 3 Phase γ QA queue v1 ──────────

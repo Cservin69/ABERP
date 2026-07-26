@@ -102,6 +102,51 @@ impl RoutingOpStateChangedPayload {
     }
 }
 
+/// One component line inside a [`BomRevisionCreatedPayload`] snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BomRevisionLine {
+    pub component_id: String,
+    pub qty_per_unit: Decimal,
+}
+
+/// ADR-0105 `mes.bom_revision_created` payload. ONE entry per authored
+/// BOM revision.
+///
+/// Carries the **full line snapshot**, not a pointer: the hash-chained
+/// ledger is then an independently sufficient record of what the BOM
+/// was at that revision, so a later tamper of the `boms` /
+/// `bom_revisions` tables is detectable against it. Bounded by
+/// `MAX_BOM_LINES_PER_REQUEST` (200). Same carry-the-snapshot posture
+/// as [`WorkOrderCreatedPayload`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BomRevisionCreatedPayload {
+    /// `bmr_<ULID>`.
+    pub bom_rev_id: String,
+    pub product_id: String,
+    /// 1-based, monotonic per (tenant, product).
+    pub rev_number: i64,
+    /// The revision this one supersedes; `None` for revision 1 (or for
+    /// the first revision authored on a product that carried legacy
+    /// pre-ADR-0105 rows).
+    pub prior_rev_id: Option<String>,
+    pub line_count: i64,
+    /// FNV-1a over the canonical sorted `component_id=qty;` set.
+    pub content_hash: String,
+    pub lines: Vec<BomRevisionLine>,
+    /// Operator-supplied "why did this change" note; `None` when the
+    /// author supplied none.
+    pub reason: Option<String>,
+    /// Human-readable operator attribution string.
+    pub actor: String,
+}
+
+impl BomRevisionCreatedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self)
+            .expect("JSON serialization of BomRevisionCreatedPayload cannot fail")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +232,65 @@ mod tests {
         op.to_state = RoutingOpState::Completed;
         let v: serde_json::Value = serde_json::from_slice(&op.to_bytes()).unwrap();
         assert_eq!(v["to_state"].as_str(), Some("completed"));
+    }
+
+    fn sample_bom_revision() -> BomRevisionCreatedPayload {
+        BomRevisionCreatedPayload {
+            bom_rev_id: "bmr_01H8REV1234567890ABCDEFG".to_string(),
+            product_id: "prd_01H8PROD234567890ABCDEFGH".to_string(),
+            rev_number: 2,
+            prior_rev_id: Some("bmr_01H8REV0000000000ABCDEFG".to_string()),
+            line_count: 2,
+            content_hash: "0123456789abcdef".to_string(),
+            lines: vec![
+                BomRevisionLine {
+                    component_id: "prd_bar".to_string(),
+                    qty_per_unit: Decimal::from_str("2").unwrap(),
+                },
+                BomRevisionLine {
+                    component_id: "prd_bolt".to_string(),
+                    qty_per_unit: Decimal::from_str("4.5").unwrap(),
+                },
+            ],
+            reason: Some("supplier changed bar stock".to_string()),
+            actor: "ervin".to_string(),
+        }
+    }
+
+    #[test]
+    fn bom_revision_payload_round_trips() {
+        let p = sample_bom_revision();
+        let back: BomRevisionCreatedPayload = serde_json::from_slice(&p.to_bytes()).unwrap();
+        assert_eq!(back, p);
+    }
+
+    /// ADR-0105 §2.3 — the ledger entry MUST carry the full line set,
+    /// not a pointer into `boms`. A payload that serialized only the
+    /// revision id would make the chain unable to attest what the BOM
+    /// actually was.
+    #[test]
+    fn bom_revision_payload_carries_the_full_line_snapshot() {
+        let p = sample_bom_revision();
+        let v: serde_json::Value = serde_json::from_slice(&p.to_bytes()).unwrap();
+        let lines = v["lines"].as_array().expect("lines array present");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["component_id"].as_str(), Some("prd_bar"));
+        assert_eq!(lines[1]["component_id"].as_str(), Some("prd_bolt"));
+        // Quantities survive as exact decimals, not floats.
+        assert_eq!(lines[1]["qty_per_unit"].as_str(), Some("4.5"));
+    }
+
+    /// `reason: None` must serialize as a literal null, not be omitted
+    /// — same reason `source_event_id` does below: a consumer must be
+    /// able to tell "no reason given" from "writer forgot the field".
+    #[test]
+    fn bom_revision_reason_none_serializes_as_null_not_omitted() {
+        let mut p = sample_bom_revision();
+        p.reason = None;
+        p.prior_rev_id = None;
+        let v: serde_json::Value = serde_json::from_slice(&p.to_bytes()).unwrap();
+        assert!(v["reason"].is_null());
+        assert!(v["prior_rev_id"].is_null());
     }
 
     /// `source_event_id: None` MUST serialize as a literal JSON null,

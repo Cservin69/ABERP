@@ -2,12 +2,16 @@
 //!
 //! ## What this crate does
 //!
-//! Three tables on the per-tenant DuckDB:
+//! Four tables on the per-tenant DuckDB:
 //!
 //! - `work_orders` — the regulated entity (Created → Released →
 //!   InProgress → Completed | Cancelled | OnHold).
 //! - `boms` — 1-level bill of materials per finished good
 //!   (soft-retired, never DELETEd per ADR-0062 §6).
+//! - `bom_revisions` — ADR-0105 revision IDENTITY for the above: one
+//!   header per authored revision (rev number, author, reason, content
+//!   hash). Each `boms` line carries its `bom_rev_id`, and a released
+//!   `work_orders` row pins the revision it was built to.
 //! - `routings` — linear per-WO operation sequence.
 //!
 //! One write surface per concern:
@@ -17,10 +21,13 @@
 //! - [`transition_work_order`] — state transition + side effects
 //!   (BOM consumption on Release, finished-good production on
 //!   Complete) + audit entry. SAME function called by SPA buttons
-//!   AND future adapter events per ADR-0062 §3.
-//! - [`replace_bom_for_product`] — soft-retire prior active BOM
-//!   rows + insert new lines (no audit kind in v1; BOM is reference
-//!   data per ADR-0062 §6).
+//!   AND future adapter events per ADR-0062 §3. On Release it also
+//!   stamps the ADR-0105 `bom_rev_id` pin.
+//! - [`replace_bom_for_product`] — mint a `bom_revisions` header,
+//!   soft-retire the prior active BOM rows, insert the new lines
+//!   stamped with the revision, and append ONE `BomRevisionCreated`
+//!   audit entry — all in the caller's transaction (ADR-0105 §2.3;
+//!   supersedes ADR-0062 §6's "no audit kind for BOM" call).
 //!
 //! ## What this crate does NOT do
 //!
@@ -46,14 +53,17 @@ mod state;
 mod types;
 
 pub use audit::{
-    RoutingOpStateChangedPayload, WorkOrderCreatedPayload, WorkOrderStateChangedPayload,
+    BomRevisionCreatedPayload, BomRevisionLine, RoutingOpStateChangedPayload,
+    WorkOrderCreatedPayload, WorkOrderStateChangedPayload,
 };
 pub use error::WorkOrderError;
 pub use repository::{
-    count_work_orders_by_state, create_work_order, ensure_schema, list_active_bom_for_product,
-    list_routing_ops_for_wo, list_work_orders, read_routing_op, read_work_order,
+    count_work_orders_by_state, create_work_order, diff_bom_revisions, ensure_schema,
+    list_active_bom_for_product, list_bom_lines_for_revision, list_bom_revisions,
+    list_routing_ops_for_wo, list_work_orders, read_bom_revision, read_routing_op, read_work_order,
     replace_bom_for_product, transition_routing_op, transition_work_order, try_auto_complete_wo,
-    AutoCompleteOutcome, BomLine, BomLineInput, CreateWorkOrderInputs, RoutingOp, RoutingOpInput,
+    AutoCompleteOutcome, BomDiff, BomDiffChange, BomDiffLine, BomLine, BomLineInput, BomRevision,
+    BomRevisionOutcome, CreateWorkOrderInputs, RoutingOp, RoutingOpInput,
     RoutingOpTransitionInputs, RoutingOpTransitionOutcome, TransitionInputs, WoWriteContext,
     WorkOrder, WorkOrderStateCounts, WorkOrderTransitionOutcome, MAX_BOM_LINES_PER_REQUEST,
     MAX_ROUTING_OPS_PER_WO,

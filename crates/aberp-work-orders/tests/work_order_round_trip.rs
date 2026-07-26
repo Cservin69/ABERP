@@ -134,12 +134,13 @@ fn happy_path_create_release_start_complete_writes_all_expected_movements_and_au
         let tx = conn.transaction().unwrap();
         replace_bom_for_product(
             &tx,
-            TEST_TENANT,
+            &ctx_for(&meta, "bom-author"),
             "prd_widget",
             &[BomLineInput {
                 component_id: "prd_bar".to_string(),
                 qty_per_unit: Decimal::from_str("2").unwrap(),
             }],
+            None,
         )
         .unwrap();
         tx.commit().unwrap();
@@ -351,12 +352,13 @@ fn cancel_from_released_does_not_auto_reverse_inventory() {
     let tx = conn.transaction().unwrap();
     replace_bom_for_product(
         &tx,
-        TEST_TENANT,
+        &ctx_for(&meta, "bom-author"),
         "prd_widget",
         &[BomLineInput {
             component_id: "prd_bar".to_string(),
             qty_per_unit: Decimal::from_str("2").unwrap(),
         }],
+        None,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -444,12 +446,13 @@ fn cancel_from_created_emits_no_stock_movements() {
     let tx = conn.transaction().unwrap();
     replace_bom_for_product(
         &tx,
-        TEST_TENANT,
+        &ctx_for(&meta, "bom-author"),
         "prd_widget",
         &[BomLineInput {
             component_id: "prd_bar".to_string(),
             qty_per_unit: Decimal::from_str("2").unwrap(),
         }],
+        None,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -576,12 +579,13 @@ fn release_with_insufficient_stock_succeeds_with_warning() {
     let tx = conn.transaction().unwrap();
     replace_bom_for_product(
         &tx,
-        TEST_TENANT,
+        &ctx_for(&meta, "bom-author"),
         "prd_widget",
         &[BomLineInput {
             component_id: "prd_bar".to_string(),
             qty_per_unit: Decimal::from_str("2").unwrap(),
         }],
+        None,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -655,12 +659,13 @@ fn adapter_driven_transition_preserves_source_event_id_on_audit_entry() {
     let tx = conn.transaction().unwrap();
     replace_bom_for_product(
         &tx,
-        TEST_TENANT,
+        &ctx_for(&meta, "bom-author"),
         "prd_widget",
         &[BomLineInput {
             component_id: "prd_bar".to_string(),
             qty_per_unit: Decimal::from_str("1").unwrap(),
         }],
+        None,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -805,16 +810,18 @@ fn replace_bom_soft_retires_prior_rows() {
     insert_product(&conn, "prd_widget", "Widget");
     insert_product(&conn, "prd_bar_v1", "Bar v1");
     insert_product(&conn, "prd_bar_v2", "Bar v2");
+    let meta = meta();
 
     let tx = conn.transaction().unwrap();
     replace_bom_for_product(
         &tx,
-        TEST_TENANT,
+        &ctx_for(&meta, "bom-author"),
         "prd_widget",
         &[BomLineInput {
             component_id: "prd_bar_v1".to_string(),
             qty_per_unit: Decimal::from_str("2").unwrap(),
         }],
+        None,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -822,12 +829,13 @@ fn replace_bom_soft_retires_prior_rows() {
     let tx = conn.transaction().unwrap();
     replace_bom_for_product(
         &tx,
-        TEST_TENANT,
+        &ctx_for(&meta, "bom-author"),
         "prd_widget",
         &[BomLineInput {
             component_id: "prd_bar_v2".to_string(),
             qty_per_unit: Decimal::from_str("3").unwrap(),
         }],
+        None,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -929,12 +937,13 @@ fn count_work_orders_by_state_groups_correctly() {
         let tx = conn.transaction().unwrap();
         replace_bom_for_product(
             &tx,
-            TEST_TENANT,
+            &ctx_for(&meta, "bom-author"),
             "prd_widget",
             &[BomLineInput {
                 component_id: "prd_bar".to_string(),
                 qty_per_unit: Decimal::from_str("1").unwrap(),
             }],
+            None,
         )
         .unwrap();
         tx.commit().unwrap();
@@ -1084,12 +1093,13 @@ fn count_work_orders_by_state_is_tenant_scoped() {
         let tx = conn.transaction().unwrap();
         replace_bom_for_product(
             &tx,
-            TEST_TENANT,
+            &ctx_for(&meta, "bom-author"),
             "prd_widget",
             &[BomLineInput {
                 component_id: "prd_bar".to_string(),
                 qty_per_unit: Decimal::from_str("1").unwrap(),
             }],
+            None,
         )
         .unwrap();
         tx.commit().unwrap();
