@@ -29,7 +29,14 @@ jobs:
   opener-census:
     name: ADR-0099 opener-census cut-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Was 15, set when this job ran five gates. It now runs SIX, and the probe
+    # suites — which each copy the tree and re-run their gate per planted defect
+    # — are the expensive part: the ADR-0106 suite alone is ~9 minutes here
+    # versus ~50s locally, because a 2-core runner is far slower at process
+    # spawning. The first ADR-0106 push was CANCELLED at 15 minutes, and a
+    # cancelled gate proves nothing at all, so the budget gets real headroom
+    # rather than being left one added probe away from the cliff.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
 

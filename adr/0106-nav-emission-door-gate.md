@@ -89,11 +89,9 @@ A gate never observed catching its own target is decoration. `tools/cut_gate_nav
 
 ```
 ✓ green: P0 control — unmutated tree
-✓ reds: P1 synthetic route emits a NAV body with no preflight (via CHECK N1)
-✓ reds: P1 (same mutation, closure arm) unregistered NAV door
+✓ reds: P1 synthetic route emits a NAV body with no preflight (arms: CHECK N1, UNREGISTERED NAV door)
 ✓ reds: P2 new handler reaches NAV via an existing helper (no body of its own)
-✓ reds: P3 preflight call deleted from the issue route (record set)
-✓ reds: P3 preflight call deleted from the issue route (declared-direct arm)
+✓ reds: P3 preflight call deleted from the issue route (arms: CHECK N1, declared 'direct')
 ✓ reds: P4 an eighth nav_xml wire-body emitter is added
 ✓ reds: P5 emitter reached through a `use … as` alias
 ✓ reds: P6 a broken scanner fails the gate instead of silently passing it
@@ -101,8 +99,13 @@ A gate never observed catching its own target is decoration. `tools/cut_gate_nav
 ✓ reds: P8 empty scope + empty baseline is REFUSED, not vacuously green
 ✓ green: P7 an unrelated non-NAV route does not red the gate
 
-probes: 12 passed, 0 failed
+probes: 10 passed, 0 failed
 ```
+
+Ten probes asserting **twelve** arms: P1 and P3 each plant one mutation that must fire two
+independent checks, and each runs the gate once and greps both rather than re-running it
+(see §4.1 — a gate run costs ~50s on the CI runner, so the duplicates were minutes of
+waste in a job that had already been cancelled once for running long).
 
 P0 and P7 are load-bearing in the other direction. Without P0, every "reds" line could just mean "the gate is always red". P7 pins the blast radius: a gate that reds on every new route gets switched off.
 
@@ -114,8 +117,12 @@ probe suite**, so that was ~10k process spawns, and the probes step was **CANCEL
 gate that was never run.
 
 The fix was to make the scanner multi-file (`FILENAME` in each record, lexer reset at
-`FNR==1`), one awk invocation per gate run: 13s → 5s for the gate, 90s → 49s for the whole
-suite, and ~3 orders of magnitude fewer spawns.
+`FNR==1`), one awk invocation per gate run: 13s → 5s for the gate, 90s → 39s for the whole
+suite, and ~3 orders of magnitude fewer spawns. The suite also stopped re-running the gate
+once per *arm* (P1 and P3 each assert two arms off a single run), and the job's
+`timeout-minutes` went 15 → 25 — it runs six gates now, not the five it was budgeted for.
+The re-run passed at 12m17s **before** those last two changes; leaving under three minutes
+of headroom on a reliability gate is not shipping it, it is deferring the next cancellation.
 
 The first attempt at that fix used `mapfile`, **which does not exist on macOS's bash 3.2**.
 The array stayed silently empty, so the gate scanned *zero files*. It happened to red on N1

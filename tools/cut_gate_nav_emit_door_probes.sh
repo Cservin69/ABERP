@@ -49,6 +49,26 @@ expect_red() {
   fi
   printf '  ✓ reds: %s%s\n' "$label" "${want:+ (via $want)}"; pass=$((pass+1))
 }
+# expect_red_arms <label> <dir> <pattern…> — one mutation that must fire SEVERAL
+# arms. Runs the gate ONCE and greps each pattern, instead of re-running it per
+# arm: on a 2-core CI runner a single gate run costs ~50s, so the duplicates
+# were minutes of pure waste in a job that had already been cancelled once for
+# running long.
+expect_red_arms() {
+  local label="$1" dir="$2"; shift 2
+  local rc missing=""
+  rc="$(run_gate "$dir")"
+  if [[ "$rc" == "0" ]]; then
+    printf '  ✗ BLIND: %s — gate PASSED on a planted defect\n' "$label"; bad=$((bad+1)); return
+  fi
+  local p
+  for p in "$@"; do grep -q "$p" "$dir/gate.out" || missing="$missing [$p]"; done
+  if [[ -n "$missing" ]]; then
+    printf '  ✗ WRONG ARM: %s — gate failed, but these did not fire:%s\n' "$label" "$missing"
+    sed 's/^/      /' "$dir/gate.out"; bad=$((bad+1)); return
+  fi
+  printf '  ✓ reds: %s (arms: %s)\n' "$label" "$*"; pass=$((pass+1))
+}
 expect_green() {
   local label="$1" dir="$2" rc
   rc="$(run_gate "$dir")"
@@ -85,8 +105,8 @@ pub async fn handle_backdoor_issue(request: IssueInvoiceRequest) -> Response {
     submit(xml).await
 }
 RS
-expect_red "P1 synthetic route emits a NAV body with no preflight" "$d" "CHECK N1"
-expect_red "P1 (same mutation, closure arm) unregistered NAV door" "$d" "UNREGISTERED NAV door"
+expect_red_arms "P1 synthetic route emits a NAV body with no preflight" "$d" \
+  "CHECK N1" "UNREGISTERED NAV door"
 
 # ── P2 — the Editions PR #28 shape ──────────────────────────────────────────
 # The realistic version: the new door does NOT construct a body itself, it
@@ -113,8 +133,9 @@ perl -0pi -e 's/^(\s*)let preflight = validate_invoice_preflight\(&request\);/$1
   "$d/apps/aberp/src/serve.rs"
 grep -q 'let preflight = validate_invoice_preflight' "$d/apps/aberp/src/serve.rs" \
   && { echo "  ✗ PROBE SETUP FAILED: P3 did not remove the preflight call"; bad=$((bad+1)); }
-expect_red "P3 preflight call deleted from the issue route (record set)" "$d" "CHECK N1"
-expect_red "P3 preflight call deleted from the issue route (declared-direct arm)" "$d" "declared 'direct'"
+# N1 and N3 must BOTH fire — two independent arms on the F1 shape.
+expect_red_arms "P3 preflight call deleted from the issue route" "$d" \
+  "CHECK N1" "declared 'direct'"
 
 # ── P4 — an EIGHTH NAV body emitter appears in nav_xml.rs ───────────────────
 d="$(fresh)"

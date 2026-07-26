@@ -19,11 +19,13 @@ each suite actually printed.
 | 3 | ADR-0099 write-fork | `adr0099_write_fork_scan.awk` | `cut_gate_write_fork_probes.sh` | 23 ‡ | `cut_gate_scanner_backstop.sh` | ✓ |
 | 4 | ADR-0100 keychain seam | `adr0100_keychain_seam_scan.awk` | `cut_gate_keychain_seam_probes.sh` | 17 ‡ | `cut_gate_scanner_backstop.sh` | ✓ |
 | 5 | ADR-0093 product-line saw-off ratchet | structural (no awk) | `cut_gate_edition_ratchet_probes.sh` | 23 ‡ | `cut_gate_edition_ratchet_backstop.sh` | ✓ |
-| 6 | **ADR-0106 NAV-emission door** *(added this session)* | `adr0106_nav_door_scan.awk` | `cut_gate_nav_emit_door_probes.sh` | 12 † | `cut_gate_scanner_backstop.sh` (CHECK N0) + scope floor | ✓ |
+| 6 | **ADR-0106 NAV-emission door** *(added this session)* | `adr0106_nav_door_scan.awk` | `cut_gate_nav_emit_door_probes.sh` | 10 probes / 12 arms † | `cut_gate_scanner_backstop.sh` (CHECK N0) + scope floor | ✓ |
 
 All six gates green; all six probe suites exit 0.
 
-† the suite's own reported probe count (`probes passed: 13`, `probes: 12 passed`).
+† the suite's own reported probe count (`probes passed: 13`, `probes: 10 passed`). The
+ADR-0106 suite's 10 probes assert 12 arms: P1 and P3 each plant one mutation that must fire
+two independent checks, verified from a single gate run.
 ‡ these suites report a verdict line rather than a count, so the figure is the number of
 `✓` assertions they printed. The two conventions are not directly comparable and no total
 is given, because adding them would imply a precision the measurement does not have.
@@ -100,13 +102,16 @@ scanner ran one awk process per source file, and the gate is executed nine times
 probe suite. A cancelled gate is indistinguishable from one that never ran.
 
 Fixed by making the scanner multi-file (one awk invocation per gate run): gate 13s → 5s,
-suite 90s → 49s. The fix's *own* first attempt used `mapfile`, absent on macOS bash 3.2,
+suite 90s → 39s, plus dropping the per-arm gate re-runs and raising the job budget 15 → 25
+minutes (it runs six gates now, not the five it was budgeted for). The fix's *own* first attempt used `mapfile`, absent on macOS bash 3.2,
 which silently scanned zero files — so the gate also gained a **scope floor** (fewer than
 100 files in scope is a hard refusal) and probe P8 to prove the floor works.
 
-Generalisable lesson for the other five suites: they each copy the tree per probe and are
-the slowest steps in the cut-gate job. None is near the timeout today, but the budget is
-shared and the job has no per-step headroom left to spare.
+Generalisable lesson for the other five suites: they each copy the tree per probe and
+re-run their gate per planted defect, and together they are the slowest thing in CI. None
+is near the budget individually, but it is a **shared job budget** — the re-run passed at
+12m17s against the old 15-minute limit, which is not headroom, it is the next cancellation
+waiting for someone to add a probe.
 
 ### R4 — MEDIUM — ADR-0106 is textual, not semantic
 
