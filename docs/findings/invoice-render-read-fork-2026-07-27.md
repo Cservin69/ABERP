@@ -119,3 +119,121 @@ issue→render journey with a registered Handle.
 | D2 | `serve::read_base_currency` (`serve.rs:9622`) and `read_base_line_vat_kinds` do `Connection::open(&state.db_path)` in-serve on the modification route. They read **business** tables, so CHECK N (audit-only) is blind and CHECK M exempts `serve.rs`. Same stale-read hazard for a just-issued base invoice. | a business-table read-fork sweep of `serve.rs` |
 | D3 | `serve::record_upgrade_snapshot_mismatch_audit` (`serve.rs:6149`) appends via a fresh `Ledger::open` at boot. Believed safe (runs before the Handle exists, process exits after) but unguarded. | the H3 boot-path sweep |
 | D4 | Arm `ABERP_SERVE_HANDLE_TRIPWIRE` in prod boot — "arm at zero" is now closer, but D2's openers are still outstanding. | after D2 |
+
+---
+
+# Follow-ups for the PROD_v2.33.1 pre-cut adversarial
+
+Two items are handed to the 2.33.1 pre-cut adversarial for a final call. Neither
+is fixed in this session. The assessments below are mine; the adversarial
+decides.
+
+## D2 — in-serve `Connection::open` on the modification route
+
+`serve::modification_invoice_request` reaches two fresh openers on
+`state.db_path` while the shared Handle is live. Same WAL-coherence read-fork
+class as the defect this document fixes, and gate-blind for two independent
+reasons: they read **business** tables, so CHECK N (audit-ledger-only) cannot
+see them, and CHECK M exempts `serve.rs` as "the serve.rs router".
+
+The two are NOT equally severe.
+
+### D2a — `read_base_line_vat_kinds` (`serve.rs:9665`) — **I consider this independently ship-blocking**
+
+```rust
+Ok(pair.map(|(inv, _)| inv.lines.iter().map(|l| l.vat_rate_kind).collect())
+       .unwrap_or_default())          // <-- missing base row => empty Vec
+```
+
+A stale read that cannot see the base invoice's `invoice_line` rows returns an
+**empty vector**, not an error. The ADR-0101 S2 guard immediately downstream is
+
+```rust
+if let Some(kind) = base_vat_kinds.iter().copied().find(|k| !k.is_percent()) { ... reject ... }
+```
+
+which over an empty vector **vacuously passes**. The guard's own comment states
+what it is holding back:
+
+> modifying it here would silently re-file the invoice to NAV as plain 0% VAT
+> and drop the exemption / self-assessment.
+
+So the failure mode is: an exempt / reverse-charge / intra-Community base
+invoice slips the in-app modification form and is re-filed to NAV as plain 0%
+VAT — **silently**, on the regulated ÁFA path. That is CLAUDE.md rule 11's
+worst class, and it is the same `.unwrap_or_default()`-over-a-forked-read shape
+that just cost a live invoice its email.
+
+Worse, the two reads on this route disagree about which instance they trust:
+the derived-state precondition (`derived_state_for_invoice`, `serve.rs:21283`)
+IS Handle-routed and will correctly find the base, so the route proceeds — and
+then the VAT-kind guard, on the forked instance, silently no-ops. The coherent
+read opens the door and the forked read fails to close it. **The adversarial
+should verify the exact ordering of those two reads before accepting this
+reasoning.**
+
+Exposure window: under H3 `checkpoint_enabled` is `false` for the whole serve
+process, so "invisible to a fresh open" means *any invoice issued since serve
+booted* — not a narrow race. As on DEV, whether a given fresh open folds the
+WAL is nondeterministic, so this is a *can*-happen, not a *will*-happen.
+
+Why I still call it ship-blocking rather than deferring: the payload is a
+wrong-VAT NAV filing with no operator-visible signal, the trigger is an ordinary
+same-session modification, and the fix is the same three-line
+`state.db.read()` + `&Connection` change already proven in this PR. The cost of
+fixing is far below the cost of one mis-filed exempt invoice.
+
+### D2b — `read_base_currency` (`serve.rs:9622`) — **safe to defer**
+
+Same fresh open, but `load_invoice_currency_metadata_in_tx` uses `query_row`,
+which **errors** on a missing row. A stale read therefore produces a loud 500
+and blocks the modification. Annoying, not dangerous: no wrong wire is emitted,
+nothing is silently dropped. It should ride the same sweep as D2a for coherence
+(rule 14 — migrate the family together), but on its own it does not justify
+holding a cut.
+
+## I1 — `finalize_rate`'s direct conversion (ADR-0037 §1.c)
+
+Verified in code this session. `issue_invoice::finalize_rate`
+(`issue_invoice.rs:1560`) sums the **whole invoice** gross into
+`gross_total_minor_units` and applies ONE conversion:
+
+```rust
+huf_equivalent_round_half_even(gross_total_minor_units, &rate_decimal)
+```
+
+Post-B3 the NAV wire sums **per (kind, rate) bucket**, converting each bucket
+and then summing. The two disagree by rounding on multi-rate EUR invoices —
+the observed case was PDF 7169 vs NAV 7170. The per-bucket wire is the correct
+side; ADR-0037 §1.c forbids the direct conversion, so the **books/PDF are the
+wrong side**, not the wire.
+
+Blast radius: non-HUF invoices with **more than one VAT bucket**. A
+single-bucket EUR invoice converts identically either way, and HUF invoices
+never reach this path. The divergent value lands on the `InvoiceDraftCreated`
+audit payload, the `invoice.huf_equivalent_total` column, the SPA list/detail
+row, and the printed PDF's rate-metadata block.
+
+**My assessment: not independently ship-blocking for 2.33.1 — but fix it in
+2.33.1 if the window allows.** Reasoning:
+
+* The legally-operative figure — what was actually filed to NAV — is already
+  correct. The defect is in the local record and the buyer-facing PDF, not the
+  filing.
+* It is pre-existing and has shipped in every prior cut. 2.33.1 does not
+  regress it; B3 merely made the wire correct and thereby exposed the books
+  side. Holding 2.33.1 for it would be holding a cut for a defect the previous
+  cut also carried.
+* Magnitude is a rounding unit (≤ a few Ft), and the trigger requires a
+  multi-rate EUR invoice.
+
+What would flip my assessment to blocking: **if any multi-rate EUR invoice has
+actually been issued on the live prod line.** Then the books-vs-filing gap is a
+concrete reconciliation defect on issued documents rather than a latent one,
+and the printed HUF VAT figure a buyer holds would not match what NAV has. The
+adversarial should run that query against prod before accepting "defer" — I did
+not, because this session must not touch `~/.aberp/prod/**`.
+
+Note the asymmetry with D2a and why I score them differently: I1 produces a
+correct NAV filing with a slightly wrong local copy; D2a produces a **wrong NAV
+filing** with no local signal at all.
