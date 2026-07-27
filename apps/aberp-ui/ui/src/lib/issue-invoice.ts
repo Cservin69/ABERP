@@ -734,8 +734,11 @@ export type InvoicePreflightErrorKind =
   // to `lines[N].vatRateKind` (the selector). `NonZeroPercentForExemptKind`
   // fires only for a non-UI caller (the selector locks the rate);
   // `VatRateKindNotSupportedYet` rejects a named-deferred kind;
-  // `MixedVatRateKindsUnsupported` rejects an invoice mixing kinds (the NAV
-  // summary is single-bucket). New variant → extend this union AND add a
+  // `MixedVatRateKindsUnsupported` rejects an invoice mixing kinds — each
+  // non-Percent kind constrains the invoice-level customer VAT status and
+  // there is only one of those (ADR-0103 §3.1 re-founding). It is NOT about
+  // the NAV summary, which has been multi-bucket since B3′.
+  // New variant → extend this union AND add a
   // vitest case, same closed-vocab discipline as the rest.
   | "NonZeroPercentForExemptKind"
   | "VatRateKindNotSupportedYet"

@@ -495,7 +495,7 @@ impl InvoicePreflightError {
                 other_kind,
             } => {
                 format!(
-                    "A(z) {}. tételsor ÁFA-típusa ({}) eltér a számla első tételsorának típusától ({}). Egy adómentes / fordított adózású számlán minden tételsornak azonos ÁFA-típusúnak kell lennie (a NAV összesítő egyetlen kategóriát tartalmaz). Bontsa külön számlára a különböző ÁFA-típusú tételeket.",
+                    "A(z) {}. tételsor ÁFA-típusa ({}) eltér a számla első tételsorának típusától ({}). Egy adómentes / fordított adózású számlán minden tételsornak azonos ÁFA-típusúnak kell lennie: minden ilyen típus a számla EGÉSZÉRE vonatkozó feltételt támaszt (pl. a Közösségen belüli értékesítés külföldi EU-s vevőt, a belföldi fordított adózás belföldit követel meg), és egy számlán csak egy vevői ÁFA-státusz szerepelhet. Bontsa külön számlára a különböző ÁFA-típusú tételeket.",
                     line_index + 1,
                     other_kind.as_str(),
                     first_kind.as_str()
@@ -646,7 +646,7 @@ impl InvoicePreflightError {
                 other_kind,
             } => {
                 format!(
-                    "Line {} VAT kind ({}) differs from the invoice's first line kind ({}). An invoice carrying any exempt / reverse-charge line must have EVERY line on the same VAT kind — NAV's summaryByVatRate is single-bucket, so a mixed-kind invoice mis-categorises the summary. Split differing VAT kinds onto separate invoices.",
+                    "Line {} VAT kind ({}) differs from the invoice's first line kind ({}). An invoice carrying any exempt / reverse-charge line must have EVERY line on the same VAT kind — each such kind imposes a condition on the WHOLE invoice (intra-Community supply requires a foreign-EU buyer, domestic reverse-charge requires a domestic one), and an invoice carries only one customer VAT status. Split differing VAT kinds onto separate invoices.",
                     line_index + 1,
                     other_kind.as_str(),
                     first_kind.as_str()
