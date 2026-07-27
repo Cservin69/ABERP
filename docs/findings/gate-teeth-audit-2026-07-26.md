@@ -116,9 +116,88 @@ waiting for someone to add a probe.
 ### R4 — MEDIUM — ADR-0106 is textual, not semantic
 
 A NAV path constructed through a function pointer, a trait object, or a macro-generated
-body is not seen by the scanner. The reaching set's closure property means such a path must
-still *name* a censused symbol somewhere to exist, but a sufficiently indirect construction
-could evade it. Same limit ADR-0098's opener census carries; recorded, not fixed.
+body is not seen by the scanner. Same limit ADR-0098's opener census carries; recorded, not
+fixed. ~~The reaching set's closure property means such a path must still *name* a censused
+symbol somewhere to exist~~ — **retracted 2026-07-27**, see R7: a bypass need not name a
+censused symbol at all.
+
+---
+
+## 2b. Added by the adversarial review of 2026-07-27
+
+### R7 — HIGH — the ADR-0106 census stops at the body emitter, not at NAV
+
+**A NAV-mis-filing door can still land green today.** The reaching set is anchored on
+`nav_xml::render_*_data*`, but filing only requires reaching
+`manage_invoice::build_request` / `send_built_request` (or `manage_annulment::call`), which
+are **not in the set**. Three bypasses were written and run against the live gate; all
+three passed it green:
+
+| # | Bypass | Result |
+|---|---|---|
+| 1 | Route assembles the `InvoiceData` XML by hand and calls the transport directly | gate **green** |
+| 2 | Route writes a hand-built body into the submission queue; `drain_submission_queue` files it | gate **green** |
+| 3 | New off-convention body builder in `nav_xml.rs` (not named `render_<what>_data`) + a route calling it | gate **green** |
+
+None emits a single record, so N1/N2/N3 are vacuously satisfied. This is the one finding on
+this page under which a NAV mis-filing could reach NAV unnoticed, and it is why ADR-0106 §5's
+claim has been corrected from "no NAV door" to "no NAV door *that goes through an emitter*".
+
+**This is not hypothetical — an independent re-enumeration of the call graph found real
+production doors the registry never knew about.** The registry lists four doors. Measured:
+
+| Door the registry omits | Reaches NAV via | Preflight |
+|---|---|---|
+| `serve.rs::handle_submit_invoice` — **live route `POST /invoices/:id/submit`** | `submit_invoice_request` → `submit_invoice::submit_from_inputs` → `send_built_request` | **none** |
+| CLI `submit-invoice` | `submit_invoice::run` → same | none |
+| CLI `submit-annulment` | `submit_annulment::call_nav` → `manage_annulment::call` | none |
+| CLI `retry-submission` | `retry_submission::run` → `send_built_request` | none |
+| CLI `drain-submission-queue` | `drive_one_invoice` → `send_built_request` | none |
+| CLI `drain-pending-retries` | `drive_one_retry` → `send_built_request` | none |
+
+`POST /invoices/:id/submit` is the route that actually *files* an invoice to NAV, and it is
+absent from `adr0106_nav_door_registry.txt` entirely. So the door count is **not 4** — it is
+4 emitting doors plus at least 6 filing doors. The registry's `main.rs::main` justification
+("Four verbs reach a NAV emitter… a FIFTH NAV-reaching verb cannot be added without this
+file changing") is **true of emitters and false of NAV**: five further CLI verbs reach NAV
+filing today, and a sixth could be added without moving one record. That line has been
+corrected in the registry rather than left to read as a guarantee.
+
+**Cost of closing it, measured not estimated:** adding the four transport symbols to the
+reaching set yields ~15 new call records across `submit_invoice.rs`,
+`drain_submission_queue.rs`, `drain_pending_retries.rs`, `retry_submission.rs`,
+`submit_annulment.rs` and `nav_number_probe.rs`. Each caller then needs a written
+disposition. **Not done here on purpose:** authoring dispositions for the submission
+subsystem is real judgement about what each daemon replays, and a wrong justification
+written into the registry is worse than a known gap. Sequenced like Invariant P — its own
+session. **Owner decision needed.**
+
+### R8 — HIGH (FIXED here) — every scanner treated prod-compilable cfgs as test-only
+
+All **five** awk scanners (`adr0098_opener`, `adr0099_read_fork`, `adr0099_write_fork`,
+`adr0100_keychain_seam`, `adr0106_nav_door`) shared one predicate:
+
+```awk
+if (st ~ /^#\[cfg\(/ && st ~ /test/ && st !~ /not\(test\)/) pending=1
+```
+
+That skips any cfg line whose text merely *contains* `test`. But
+`#[cfg(any(test, feature = "test-support"))]` and `#[cfg(feature = "test-support")]`
+**compile into non-test builds**, and this tree already uses the first idiom in
+`crates/audit-ledger/src/entry/actor.rs` and `crates/nav-transport/src/credentials/mod.rs`
+— i.e. on the NAV credentials path. A door, opener or keychain seam behind either was
+invisible to its gate while shipping in any build with the feature on. This is the
+"`#[cfg(test)]` door that drifts to prod" shape, and it was live in all six gates.
+
+Fixed by skipping only cfgs that *require* `test` (bare `#[cfg(test)]`, or `all(...)` with
+`test` as a bare conjunct); everything else is scanned, which is the fail-closed direction.
+**Behaviour-neutral on today's tree** — all five scanners produce byte-identical output and
+no frozen baseline moved. Pinned by a new always-enforced N0 control and probe **P9**, both
+mutation-verified: with the old predicate restored, the control reports `expected 2, got 0`
+and P9 fails on its named arm.
+
+*Residual:* the teeth for this arm exist only in ADR-0106's suite. Gates 1–5 got the
+predicate fix but no probe of their own for it. Same shape as R1 — recorded, not chased.
 
 ### R5 — MEDIUM — the Editions mirror does not exist
 

@@ -71,7 +71,15 @@ FNR==1{
     fn=substr(line,RSTART,RLENGTH); sub(/.*fn[ \t]+/,"",fn); fname=fn; isdef=1
   } else isdef=0
   st=line; sub(/^[ \t]+/,"",st)
-  if (st ~ /^#\[cfg\(/ && st ~ /test/ && st !~ /not\(test\)/) pending=1
+  # TEST-ONLY, not "mentions test". `#[cfg(any(test, feature = "test-support"))]`
+  # and `#[cfg(feature = "test-support")]` COMPILE INTO NON-TEST BUILDS, and the
+  # old `st ~ /test/` predicate skipped both — a door behind either was invisible
+  # to every scanner in this tree. Only a cfg that REQUIRES `test` is a test
+  # region: bare `#[cfg(test)]`, or `all(...)` with `test` as a bare conjunct.
+  # Anything else is scanned (fail-CLOSED: an extra record must be censused,
+  # which is the safe direction).
+  if (st ~ /^#\[cfg\(test\)\]/ \
+      || (st ~ /^#\[cfg\(all\(/ && st ~ /(\(|,)[ \t]*test[ \t]*(,|\))/ && st !~ /not\(test\)/)) pending=1
   was_in=(tdepth>=0)
   # Build a "code-only" version of the line (strip comments/strings) for matching.
   code=""; L=length(line)

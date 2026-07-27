@@ -139,6 +139,30 @@ pub fn render_settlement_data(x: &X) -> Result<Vec<u8>> { todo!() }
 pub fn render_query_invoice_data_request(x: &X) -> Result<Vec<u8>> { todo!() }
 CTL
 
+# A cfg region is skipped only when it REQUIRES `test`. `any(test, feature=…)`
+# and `feature = "test-support"` both COMPILE INTO NON-TEST BUILDS — this tree
+# already uses the `any(test, feature = "test-support")` idiom, including on the
+# NAV credentials path — so a door behind either must be SEEN. Before this
+# control the scanner skipped them on a bare `/test/` substring match, which
+# made a feature-gated NAV door invisible.
+bs_check "$SCAN" 2 "feature-gated (prod-compilable) doors are seen; a genuinely test-only one is not" \
+  -v syms="$ctl_syms" <<'CTL'
+#[cfg(any(test, feature = "test-support"))]
+fn support_build_door() {
+    let _ = issue_from_parsed(&input);
+}
+#[cfg(feature = "test-support")]
+fn feature_gated_door() {
+    let _ = render_invoice_data(&invoice);
+}
+#[cfg(all(test, feature = "test-support"))]
+mod genuinely_test_only {
+    fn t() {
+        let _ = render_invoice_data(&invoice);
+    }
+}
+CTL
+
 bs_controls_ok || fail=1
 
 # ── the scan ─────────────────────────────────────────────────────────────────
