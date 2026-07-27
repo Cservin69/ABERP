@@ -153,6 +153,10 @@
 # NOT a fork: write-fork & read-fork ENFORCE gates stay = 0. Re-cut +1: serve.rs 28→29;
 # census 90→91 openers, files unchanged (23). See the fingerprint-set header for the
 # per-opener rationale. (The ADR-0102 EU-partner base read reuses existing openers.)
+# ⚠ RETRACTED 2026-07-27 — see the D2 re-cut at the foot of this header. "NOT a fork,
+# read-fork gate stays = 0" was TRUE only because CHECK N is audit-ledger-shaped and
+# structurally could not see a BUSINESS-table opener. This opener WAS a fork, and its
+# stale read silently re-filed exempt bases to NAV at 0%.
 #
 # ── 2026-07-19 SNAPSHOT-DAEMON HANDLE MIGRATION — census RATCHETS DOWN 91→89 ──
 # Root-cause fix for the prod boot refusal (audit mirror seq 8060 > DB seq 8058,
@@ -198,6 +202,23 @@
 # loop labels (&'a str, 'static, 'outer:) are explicitly NOT char literals — the
 # classic way a naive fix breaks. Pinned by the two [lexer traps] negative probes
 # in tools/cut_gate_negative_probes.sh; reverting the awk fix turns them RED.
+# ── 2026-07-27 D2 MODIFICATION-ROUTE BASE READS — census RATCHETS DOWN 83→81 ──
+# Both openers on the modification route migrated onto the shared Handle. Delta,
+# line by line — two removals, zero additions (comm-verified):
+#   −2  apps/aberp/src/serve.rs 29→27, file stays on the census (27 remain)
+#       −1 …|read_base_currency:let mut conn = Connection::open(db_path)
+#       −1 …|read_base_line_vat_kinds:let mut conn = Connection::open(db_path).with_context(|| {
+# Both now take the caller's `state.db.read()` connection. The 2026-07-16 note
+# above admitted read_base_line_vat_kinds as a "like-for-like billing-reader
+# residual, NOT a fork" on the evidence that the read-fork gate stayed at 0 — but
+# that gate is audit-ledger-shaped and structurally could not see a business-table
+# opener at all. It WAS a fork: its stale read returned an empty Vec, the ADR-0101
+# S2 guard passed vacuously over it, and an exempt / reverse-charge base was
+# re-filed to NAV as plain 0% VAT. Both names are now PINNED in
+# adr0099_read_fork_scan.awk, so re-introducing either opener reds CHECK N as well
+# as this census. Their named twins on the mark-paid route (read_invoice_currency,
+# read_invoice_total_gross_minor) are NOT migrated here and stay on the census —
+# recorded as D2c in docs/findings/modification-base-read-fork-2026-07-27.md.
 1 apps/aberp/src/audit_dap_boot.rs
 3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
@@ -210,7 +231,7 @@
 4 apps/aberp/src/reports.rs
 4 apps/aberp/src/request_technical_annulment.rs
 8 apps/aberp/src/retry_submission.rs
-29 apps/aberp/src/serve.rs
+27 apps/aberp/src/serve.rs
 3 apps/aberp/src/submit_annulment.rs
 1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
 1 crates/aberp-mes/src/ledger_writer.rs

@@ -9482,8 +9482,24 @@ pub fn modification_invoice_request(
     // kind blocker regardless of currency; all-`Percent` bases fall straight
     // through — byte-identical behaviour, the guard fires ONLY on a
     // non-`Percent` base line.
-    let base_vat_kinds = read_base_line_vat_kinds(&state.db_path, invoice_id)
+    //
+    // H3 (ADR-0099) / CHECK N — D2, 2026-07-27. BOTH base reads below ride the
+    // shared Handle (`state.db.read()` = a `try_clone` of the ONE instance).
+    // They used to `Connection::open(&state.db_path)` a SECOND DuckDB instance
+    // each; with runtime checkpointing disabled the base invoice's `invoice` /
+    // `invoice_line` rows stay WAL-resident for the life of the serve process,
+    // so a second instance reads the last-checkpointed SUBSET. Step 1's
+    // `derive_state_for` is already Handle-routed, so it finds the base and
+    // opens the door — and the forked read below then failed to shut the gate
+    // (see `read_base_line_vat_kinds` for the vacuous-pass mechanics).
+    // Dropped before step 6 dispatches into the write path.
+    let base_conn = state
+        .db
+        .read()
+        .context("acquire shared reader for the modification route's base-invoice reads")
         .map_err(ModificationRouteError::Other)?;
+    let base_vat_kinds =
+        read_base_line_vat_kinds(&base_conn, invoice_id).map_err(ModificationRouteError::Other)?;
     if let Some(kind) = base_vat_kinds.iter().copied().find(|k| !k.is_percent()) {
         return Err(ModificationRouteError::BadRequest(format!(
             "modification of invoice {invoice_id} is not supported in the app: a base line \
@@ -9507,7 +9523,8 @@ pub fn modification_invoice_request(
     //    surfacing the mismatch loud here keeps the wire shape honest
     //    per CLAUDE.md rule 12.
     let base_currency =
-        read_base_currency(&state.db_path, invoice_id).map_err(ModificationRouteError::Other)?;
+        read_base_currency(&base_conn, invoice_id).map_err(ModificationRouteError::Other)?;
+    drop(base_conn);
     if base_currency != request.currency {
         return Err(ModificationRouteError::BadRequest(format!(
             "modification body currency {} differs from base invoice {} \
@@ -9619,9 +9636,20 @@ pub fn modification_invoice_request(
 /// [`InvoiceCurrencyMetadata`] bundle) — the route only needs the
 /// currency for the equality check; reading the rate columns here would
 /// be speculative work the core re-reads anyway inside its own write tx.
-fn read_base_currency(db_path: &Path, invoice_id: &str) -> Result<Currency> {
-    let mut conn = Connection::open(db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+///
+/// H3 (ADR-0099) / CHECK N — D2b, 2026-07-27. Takes the CALLER's shared-Handle
+/// connection. It used to `Connection::open(&state.db_path)` a second DuckDB
+/// instance, which does not replay the live writer's WAL. Unlike its
+/// `read_base_line_vat_kinds` sibling this one already failed LOUDLY on a
+/// stale read (`load_invoice_currency_metadata_in_tx` uses `query_row`, so a
+/// missing base row is an `Err`, never a silent default) — it is migrated here
+/// for rule-14 coherence, not because it could mis-file.
+fn read_base_currency(conn: &Connection, invoice_id: &str) -> Result<Currency> {
+    // `transaction()` needs `&mut`; a `try_clone` is the SAME instance (not a
+    // second OS open), so this stays coherent with the writer's WAL.
+    let mut conn = conn
+        .try_clone()
+        .context("try_clone the shared connection for the base-currency read")?;
     let tx = conn
         .transaction()
         .context("begin read transaction for base-currency lookup (modification route)")?;
@@ -9657,21 +9685,45 @@ fn read_base_currency(db_path: &Path, invoice_id: &str) -> Result<Currency> {
 /// SPA and CLI issue paths run the billing allocator that writes
 /// `invoice_line` rows) and is keyed by `invoice_id`, so it has no gap.
 ///
-/// Returns an empty Vec when the id has no allocated billing row (a
-/// draft); the caller treats that as all-`Percent` (nothing to reject),
-/// which is safe because the route's `Finalized`/`Amended` precondition
-/// has already established the base is an allocated, issued invoice — and
-/// a non-`Percent` invoice is necessarily allocated (it was issued).
+/// # NEVER returns an empty Vec — absent is an ERROR, not "all-`Percent`"
+///
+/// H3 (ADR-0099) / CHECK N — D2a, 2026-07-27. Two things were wrong here and
+/// they compounded into a silent NAV mis-filing.
+///
+/// 1. The read forked the DB: `Connection::open(&state.db_path)` opened a
+///    SECOND DuckDB instance while serve held the shared `Handle`. With
+///    runtime checkpointing disabled under H3 the base invoice's
+///    `invoice_line` rows are WAL-resident for the life of the serve process,
+///    so the fresh instance saw the last-checkpointed SUBSET — for a base
+///    issued since serve boot, nothing. It now takes the caller's
+///    shared-Handle connection.
+/// 2. The absent case returned `Ok(vec![])` (`.unwrap_or_default()`), and the
+///    caller's ADR-0101 S2 guard is `.find(|k| !k.is_percent())` — which over
+///    an EMPTY vector passes VACUOUSLY. `derive_state_for` (step 1) is
+///    Handle-routed, so it found the base and let the route through; this
+///    read then failed to shut the gate. Net effect: modifying an AAM /
+///    reverse-charge / intra-Community base re-filed it to NAV as plain 0%
+///    VAT, dropping the exemption / self-assessment on real ÁFA.
+///
+/// So the empty result is now a hard error. The pre-fix doc-comment argued
+/// that empty is SAFE because the route's `Finalized`/`Amended` precondition
+/// has already established the base is an allocated, issued invoice. That
+/// premise is right; the conclusion drawn from it was backwards. An allocated,
+/// issued invoice ALWAYS has at least one `invoice_line` row, so an empty or
+/// absent result does not mean "no non-`Percent` kinds" — it means the read
+/// could not see the base, and the guard has no basis to pass. Routing through
+/// the Handle removes today's cause; erroring on empty removes the CLASS
+/// (CLAUDE.md rule 11 — the guard must be safe even if a future read returns
+/// empty for a reason nobody has thought of yet).
 fn read_base_line_vat_kinds(
-    db_path: &Path,
+    conn: &Connection,
     invoice_id: &str,
 ) -> Result<Vec<aberp_billing::VatRateKind>> {
-    let mut conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for base vat_rate_kind lookup",
-            db_path.display()
-        )
-    })?;
+    // `transaction()` needs `&mut`; a `try_clone` is the SAME instance (not a
+    // second OS open), so this stays coherent with the writer's WAL.
+    let mut conn = conn
+        .try_clone()
+        .context("try_clone the shared connection for the base vat_rate_kind read")?;
     let tx = conn
         .transaction()
         .context("begin read transaction for base vat_rate_kind lookup (modification route)")?;
@@ -9680,9 +9732,26 @@ fn read_base_line_vat_kinds(
     })?;
     tx.commit()
         .context("commit read transaction for base vat_rate_kind lookup")?;
-    Ok(pair
-        .map(|(inv, _)| inv.lines.iter().map(|l| l.vat_rate_kind).collect())
-        .unwrap_or_default())
+    let kinds: Vec<aberp_billing::VatRateKind> = match pair {
+        Some((invoice, _)) => invoice.lines.iter().map(|l| l.vat_rate_kind).collect(),
+        None => Vec::new(),
+    };
+    if kinds.is_empty() {
+        return Err(anyhow!(
+            "cannot establish the VAT rate-kinds of base invoice {invoice_id}: the billing store \
+             returned no `invoice_line` rows for it. The route's Finalized/Amended precondition \
+             (read through the shared Handle) already established that this base is an allocated, \
+             issued invoice, so it MUST have at least one line — an empty result means the read \
+             did not see the base, not that the base is plain-percentage VAT. Refusing to proceed: \
+             treating this as all-`Percent` would let an exempt / reverse-charge / \
+             intra-Community base be re-filed to NAV as plain 0% VAT, silently dropping the \
+             exemption / self-assessment (ADR-0101 S2). Re-try the modification; if it persists, \
+             this is DB corruption or schema drift — use \
+             `aberp issue-modification --references {invoice_id} --in <PATH>` on the CLI, which \
+             replays the base issuance JSON verbatim."
+        ));
+    }
+    Ok(kinds)
 }
 
 // ── PR-47β / session-65 — GET /api/invoices/:id/issuance-input ───────

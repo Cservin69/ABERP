@@ -88,6 +88,14 @@
 # diff vs the frozen set is a SINGLE pure addition (no removals/swaps). Re-cut +1:
 # serve.rs 28→29; census 90→91 openers, files unchanged (23). The EU-partner base
 # read (ADR-0102) reuses existing openers/stores — it added no new opener.
+# ⚠ RETRACTED 2026-07-27 (D2). "NOT a rogue fork: the read-fork ENFORCE gate
+# stays green (0)" was true only because CHECK N is audit-ledger-shaped and could
+# not see a BUSINESS-table opener at all — absence of a gate hit was mistaken for
+# absence of a fork. read_base_line_vat_kinds WAS a fork; its stale read returned
+# an empty Vec, the ADR-0101 S2 guard passed vacuously over it, and an exempt /
+# reverse-charge base was re-filed to NAV at plain 0% VAT. Removed below together
+# with its read_base_currency twin; both names are now PINNED in
+# adr0099_read_fork_scan.awk so neither can come back unseen.
 #
 # ── 2026-07-19 SNAPSHOT-DAEMON HANDLE MIGRATION — census RATCHETS DOWN 91→89 ──
 # Root-cause fix for the prod boot refusal (audit mirror seq 8060 > DB seq 8058,
@@ -155,8 +163,6 @@ apps/aberp/src/serve.rs|handle_get_email_relay_row:let conn = duckdb::Connection
 apps/aberp/src/serve.rs|handle_list_email_relay_queue:let conn = duckdb::Connection::open(&db_path).with_context(|| {
 apps/aberp/src/serve.rs|handle_quote_pipeline_status:let conn = duckdb::Connection::open(&db_path).context("open DB for daemon-pa
 apps/aberp/src/serve.rs|handle_relay_send_email:let conn = duckdb::Connection::open(&db_path).with_context(|| {
-apps/aberp/src/serve.rs|read_base_currency:let mut conn = Connection::open(db_path)
-apps/aberp/src/serve.rs|read_base_line_vat_kinds:let mut conn = Connection::open(db_path).with_context(|| {
 apps/aberp/src/serve.rs|read_invoice_currency:let mut conn = Connection::open(db_path).with_context(|| {
 apps/aberp/src/serve.rs|read_invoice_total_gross_minor:let mut conn = Connection::open(db_path).with_context(|| {
 apps/aberp/src/serve.rs|record_upgrade_snapshot_mismatch_audit:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
