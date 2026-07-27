@@ -189,6 +189,27 @@ grep -E '^[[:space:]]*#' "$d/tools/adr0106_nav_door_fingerprints.txt" > "$d/fp.t
 mv "$d/fp.tmp" "$d/tools/adr0106_nav_door_fingerprints.txt"
 expect_red "P8 empty scope + empty baseline is REFUSED, not vacuously green" "$d" "implausibly small"
 
+# ── P9 — a NAV door behind a prod-compilable `test`-flavoured cfg ───────────
+# The lexer skipped ANY `#[cfg(...)]` line whose text contained the substring
+# `test`. But `any(test, feature = "test-support")` and `feature = "test-support"`
+# both COMPILE INTO NON-TEST BUILDS — and this tree already uses the first idiom
+# in crates/audit-ledger and crates/nav-transport (on the NAV credentials path).
+# So a door behind either was invisible to the gate while shipping in any build
+# with the feature on. That is the "#[cfg(test)] door that drifts to prod" shape.
+d="$(fresh)"
+cat > "$d/apps/aberp/src/zz_navdoor_scratch.rs" <<'RS'
+//! Synthetic probe route — NOT part of the product.
+
+/// Ships in any build with `--features test-support`. No preflight.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn handle_support_reissue(request: IssueInvoiceRequest) -> Response {
+    let parsed = parse(request);
+    issue_from_parsed(&parsed).await
+}
+RS
+expect_red_arms "P9 NAV door behind #[cfg(any(test, feature))] is NOT treated as test-only" "$d" \
+  "CHECK N1" "UNREGISTERED NAV door"
+
 # ── P7 — no false alarm on an unrelated route ───────────────────────────────
 # A gate that reds on every new route gets switched off. This pins that the
 # blast radius is NAV-reaching code only.

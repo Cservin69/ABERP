@@ -127,7 +127,15 @@ function flush(   id){
     }
   }
   st=line; sub(/^[ \t]+/,"",st)
-  if (st ~ /^#\[cfg\(/ && st ~ /test/ && st !~ /not\(test\)/) pending=1
+  # TEST-ONLY, not "mentions test". `#[cfg(any(test, feature = "test-support"))]`
+  # and `#[cfg(feature = "test-support")]` COMPILE INTO NON-TEST BUILDS, and the
+  # old `st ~ /test/` predicate skipped both — a door behind either was invisible
+  # to every scanner in this tree. Only a cfg that REQUIRES `test` is a test
+  # region: bare `#[cfg(test)]`, or `all(...)` with `test` as a bare conjunct.
+  # Anything else is scanned (fail-CLOSED: an extra record must be censused,
+  # which is the safe direction).
+  if (st ~ /^#\[cfg\(test\)\]/ \
+      || (st ~ /^#\[cfg\(all\(/ && st ~ /(\(|,)[ \t]*test[ \t]*(,|\))/ && st !~ /not\(test\)/)) pending=1
   was_in=(tdepth>=0)
   # Capture the signature-region flag BEFORE the tokenizer runs: on a single-line
   # `fn NAME(c: &Connection) {` the `{` flips insig→0 mid-line, so a post-loop

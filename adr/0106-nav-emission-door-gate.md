@@ -153,7 +153,9 @@ It is **not achievable today**, for a specific reason: *the invariant it would e
 2. **Invariant P** (follow-up) — make preflight universal: run it on the replayed `input.json` at storno/modification time and on the CLI input shapes. This is a behaviour change on NAV filing and wants its own session with its own adversarial pass. The modification route's operator-editable fields are the strongest single motivation, and the Editions-side finding is the same hole in the same place.
 3. **The witness type** (after P) — once every door genuinely preflights, the witness has no escape hatch to carve out, and the compile-time guarantee becomes real rather than decorative.
 
-Until step 2 lands, this gate's honest claim is: **no NAV door can be added, moved or silently de-preflighted without a red gate and a registry diff.** It does not claim every door preflights, and the registry says so in plain text for each one.
+Until step 2 lands, this gate's honest claim is: **no NAV door that goes through a `nav_xml` wire-body emitter can be added, moved or silently de-preflighted without a red gate and a registry diff.** It does not claim every door preflights, and the registry says so in plain text for each one.
+
+> **Scope correction (adversarial review, 2026-07-27).** The qualifier above is not decoration — the original sentence said "no NAV door" without it, and that was **false**. A door that reaches `manage_invoice::build_request` with a hand-assembled body, or that enqueues one for the drain daemon, never touches an emitter and runs this gate green. See §6, second bullet, for the three verified bypasses and the measured cost of closing them. Anyone reading this ADR to decide how much to trust the gate should read that bullet first.
 
 ---
 
@@ -165,6 +167,15 @@ Until step 2 lands, this gate's honest claim is: **no NAV door can be added, mov
 
 **Known limits, stated rather than papered over.**
 
-- **Textual, not semantic.** A call through a function pointer, a trait object, or a macro-generated body is not seen. The reaching set's closure property means such a path still has to *name* a censused symbol somewhere to exist at all, but a sufficiently indirect construction could evade it. This is the same limit ADR-0098's opener census carries.
+- **Textual, not semantic.** A call through a function pointer, a trait object, or a macro-generated body is not seen. This is the same limit ADR-0098's opener census carries. ~~The reaching set's closure property means such a path still has to *name* a censused symbol somewhere to exist at all~~ — **that consolation was wrong and is retracted** (adversarial review 2026-07-27): a path that never names a censused symbol at all is exactly the gap in the next bullet.
+
+- **The census stops at the BODY EMITTER, not at NAV.** *(adversarial review 2026-07-27 — the largest known hole, and it falsifies §5's claim as originally written.)* The reaching set is anchored on `nav_xml::render_*_data*`. But a NAV wire body only has to reach `manage_invoice::build_request` / `send_built_request` (or `manage_annulment::call`) to be **filed**, and those are not in the set. Three verified bypasses run green against this gate today:
+  - a route that assembles the `InvoiceData` XML by hand (`format!`/a writer) and calls the transport directly;
+  - a route that writes a hand-built body into the submission queue and lets the existing `drain_submission_queue` daemon file it;
+  - a new body builder in `nav_xml.rs` named off-convention (anything not matching `render_<what>_data[_with_number]`), plus a route calling it.
+
+  None produces a single record, so N1/N2/N3 are all vacuously satisfied. **Closing this means extending the reaching set to the transport symbols and censusing the submission subsystem** — measured blast radius: ~15 new call records across `submit_invoice.rs`, `drain_submission_queue.rs`, `drain_pending_retries.rs`, `retry_submission.rs`, `submit_annulment.rs`, `nav_number_probe.rs`, each needing a written disposition. That is a second subsystem census with real judgement in it, sequenced like Invariant P rather than bolted on here.
+
+- **`test`-flavoured cfg regions were skipped (FIXED 2026-07-27).** All five awk scanners in this tree treated *any* `#[cfg(...)]` line containing the substring `test` as a test region. `#[cfg(any(test, feature = "test-support"))]` and `#[cfg(feature = "test-support")]` **compile into non-test builds**, and this tree already uses the first idiom in `crates/audit-ledger` and `crates/nav-transport` (on the NAV credentials path) — so a door behind either was invisible while shipping. The predicate now skips only cfgs that *require* `test`. Behaviour-neutral on today's tree (no baseline moved, all five scanners byte-identical output); pinned by a new always-enforced N0 control and probe **P9**.
 - **`derived` is not machine-checked.** N3 verifies only `direct`. A door declared `derived` is trusted on its written justification. Invariant P is what turns those into `direct`.
 - **Editions is not covered.** `ABERP-Editions.git` carries the same emitters and the modification route whose bypass started this. Mirroring this gate there is a named follow-up.
