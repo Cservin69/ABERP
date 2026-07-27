@@ -205,7 +205,6 @@
 4 apps/aberp/src/mark_abandoned.rs
 4 apps/aberp/src/observe_receiver_confirmation.rs
 3 apps/aberp/src/poll_annulment_ack.rs
-3 apps/aberp/src/print_invoice.rs
 1 apps/aberp/src/quote_pdf_rerender_daemon.rs
 3 apps/aberp/src/recover_from_nav.rs
 4 apps/aberp/src/reports.rs
