@@ -75,6 +75,8 @@ The exact emit for the EU sub-shape (this session wires **only** the `communityV
 
 No schema change. `partners.eu_vat_number: Option<String>` **is** the community VAT number. It becomes **required + structurally-validated** at the partner-form gate **only** when `customer_vat_status == Other` (Domestic/PrivatePerson keep it optional free-text — existing rows unaffected).
 
+> **AMENDED 2026-07-27 — the partner-form half of the sentence above is RETRACTED.** `eu_vat_number` is **optional and NOT shape-gated** at partner save; it is required + `validate_community_vat_number`-gated at **invoice preflight only**. Reason: `Other` means "non-Hungarian partner", which spans an EU business, a third-state business holding a non-EU tax id (§8.1's deferred arm), a foreign entity with no tax id we hold, and a foreign `PartnerKind::Supplier` we never invoice. Making the EU arm mandatory at CRUD turned §8.1's *emitter* deferral into a *save-blocker*: an operator on DEV could not create a Swiss / US / tax-id-less foreign partner at all. A partner row is not an invoice. The NAV constraint is unweakened — `issue_preflight.rs`'s `Other` arm still requires a non-empty `community_vat_number`, runs the same shape gate, and requires an `[A-Z]{2}` country code, all before a sequence number is burnt. The **HU-ADÓSZÁM-forbidden** rule (§9.4 below) is retained at partner save: it is about the field's meaning, not the wire. Consequence: for `Other` the reused column is **polymorphic** (EU community VAT number *or* third-state tax id); only a value that reaches the emitter is EU-shaped, enforced there. Pinned by `partners::tests::validate_partner_inputs_other_saves_without_eu_vat` + `serve_partners_route.rs` Pin #7 (both mutation-verified).
+
 ### 3.2 Per-invoice snapshot (the "survives a later partner edit" invariant)
 
 The community VAT number is snapshotted onto the issued invoice exactly like the buyer's name/address/tax_number already are — it rides the **immutable** triple:
@@ -86,7 +88,7 @@ The SPA populates the wire field from the picked partner's `eu_vat_number` at *i
 
 ### 3.3 EU VAT number structural validator (VIES shape)
 
-`validate_community_vat_number(&str) -> Result<(), String>`, applied at both the partner-form gate and invoice preflight:
+`validate_community_vat_number(&str) -> Result<String, String>` (returns the normalised value since B4 / ADR-0103 §3.3), applied at **invoice preflight** — and, until the 2026-07-27 amendment in §3.1, also at the partner-form gate; it is no longer applied there:
 - normalise: uppercase, strip spaces;
 - 2-letter prefix ∈ the EU-VAT country set (incl. `EL` for Greece, `XI` for Northern Ireland; `HU` included for structural completeness);
 - remainder: 2–12 alphanumeric chars (`[0-9A-Z]`);
@@ -133,7 +135,7 @@ The two combine so the dangerous state — *EU-0 line assembled against a domest
 | SPA issue-invoice.ts | form field `customerCommunityVatNumber`; composer emits it for Other; `vatKindBuyerMismatch` helper | `issue-invoice.ts` |
 | SPA partners.ts | `buyerFieldsFromPartner` pulls `eu_vat_number` + passes through non-HU country for Other | `partners.ts:227` |
 | SPA IssueInvoice.svelte | enable `Other` radio; community-VAT input (shown+required for Other); fix address-required for Other; inline cross-field guidance | `IssueInvoice.svelte` |
-| SPA PartnerForm.svelte | enable `Other` radio; make `euVatNumber` required+validated for Other | `PartnerForm.svelte` |
+| SPA PartnerForm.svelte | enable `Other` radio; ~~make `euVatNumber` required+validated for Other~~ — **retracted 2026-07-27 (§3.1 amendment)**: the input is optional for `Other` | `PartnerForm.svelte` |
 
 ---
 

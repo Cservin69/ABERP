@@ -61,7 +61,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use crate::nav_xml::{validate_community_vat_number, CustomerVatStatus};
+use crate::nav_xml::CustomerVatStatus;
 
 // ──────────────────────────────────────────────────────────────────────
 // PartnerId — prefixed-ULID newtype.
@@ -474,9 +474,10 @@ pub fn join_emails_canonical(addresses: &[String]) -> String {
 /// PR-97 / ADR-0048 — `customer_vat_status` discriminator drives the
 /// tax-number invariant: `Domestic` requires a well-formed
 /// `xxxxxxxx-y-zz` Hungarian ADÓSZÁM; `PrivatePerson` requires the
-/// field to be absent (`None` or empty-after-trim); `Other` is v1
-/// named-deferred and surfaces a typed validation error pointing the
-/// operator at the radio.
+/// field to be absent (`None` or empty-after-trim); `Other`
+/// (non-Hungarian) forbids a Hungarian ADÓSZÁM and leaves
+/// `eu_vat_number` free — see the `Other` arm for why the EU-VAT
+/// requirement does NOT live at this gate.
 pub fn validate_partner_inputs(inputs: &PartnerInputs) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     if inputs.display_name.trim().is_empty() {
@@ -550,33 +551,34 @@ pub fn validate_partner_inputs(inputs: &PartnerInputs) -> Result<(), Vec<Validat
             }
         }
         CustomerVatStatus::Other => {
-            // ADR-0102 — foreign-EU business buyer. The EU community VAT
-            // number lives on the reused `eu_vat_number` column (NOT a new
-            // column — ADR-0102 §1/§3.1); it becomes REQUIRED + structurally
-            // (VIES-shape) validated for `Other`. A Hungarian ADÓSZÁM is
-            // forbidden (an EU buyer carries an EU VAT number, not a HU one)
-            // — symmetric with the PrivatePerson tax-number rule above.
-            match inputs
-                .eu_vat_number
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                None => errors.push(ValidationError {
-                    field: "eu_vat_number",
-                    message: "Külföldi (OTHER) vevőhöz kötelező az EU adószám. \
-                              / EU VAT number is required for a foreign (OTHER) buyer."
-                        .to_string(),
-                }),
-                Some(raw) => {
-                    if let Err(msg) = validate_community_vat_number(raw) {
-                        errors.push(ValidationError {
-                            field: "eu_vat_number",
-                            message: msg,
-                        });
-                    }
-                }
-            }
+            // `Other` is "non-Hungarian partner" — which spans an EU
+            // business (EU community VAT number), a third-state business
+            // (a non-EU tax id: Swiss CHE-…, a US EIN, …), and a foreign
+            // entity with no tax identifier we hold at all. It also spans
+            // `PartnerKind::Supplier`, which we never invoice.
+            //
+            // ADR-0102 made `eu_vat_number` REQUIRED + EU-shape validated
+            // for the whole status at this gate. That was an INVOICE-
+            // EMISSION constraint applied at the CRM boundary: NAV's
+            // `<customerVatData>` needs a `<communityVatNumber>` for an
+            // OTHER buyer, so ADR-0102 §8.1 deferred the non-EU
+            // `<thirdStateTaxId>` arm — but the deferral landed here as a
+            // hard save-blocker, so a legitimate Swiss/US/VAT-less foreign
+            // partner could not be created at all (operator-reported on
+            // DEV, 2026-07-27). A partner row is not an invoice.
+            //
+            // The NAV constraint is unweakened and stays where it costs
+            // something: `issue_preflight.rs`'s `Other` arm independently
+            // requires a non-empty `community_vat_number`, runs the same
+            // `validate_community_vat_number` shape gate on it, and
+            // requires an `[A-Z]{2}` country code — all BEFORE a sequence
+            // number is burnt. This gate keeps only the invariant that is
+            // about the FIELD'S MEANING rather than the wire: a
+            // non-Hungarian partner does not carry a Hungarian ADÓSZÁM
+            // (symmetric with the PrivatePerson rule above). No shape gate
+            // on `eu_vat_number` here — the reused column is polymorphic
+            // for `Other` (EU VAT *or* third-state tax id), so an EU-only
+            // shape check on it is simply wrong.
             if inputs
                 .tax_number
                 .as_deref()
@@ -1586,39 +1588,16 @@ mod tests {
         );
     }
 
-    /// ADR-0102 — an `Other` (foreign-EU) partner REQUIRES a
-    /// structurally-valid EU VAT number (the reused `eu_vat_number`
-    /// column) and MUST NOT carry a Hungarian ADÓSZÁM.
+    /// An `Other` (non-Hungarian) partner MUST NOT carry a Hungarian
+    /// ADÓSZÁM. `eu_vat_number` is NOT required and NOT shape-gated
+    /// here — a foreign partner may hold an EU community VAT number, a
+    /// third-state (non-EU) tax id, or nothing. See the `Other` arm of
+    /// `validate_partner_inputs`: the NAV `<communityVatNumber>`
+    /// requirement is enforced at invoice preflight, not at partner
+    /// save. Pinned by
+    /// `validate_partner_inputs_other_saves_without_eu_vat` below.
     #[test]
     fn validate_partner_inputs_other_requires_eu_vat_and_no_hu_tax() {
-        // Missing EU VAT number → flag eu_vat_number.
-        let missing = PartnerInputs {
-            customer_vat_status: CustomerVatStatus::Other,
-            tax_number: None,
-            eu_vat_number: None,
-            ..minimal_valid_inputs()
-        };
-        let errors =
-            validate_partner_inputs(&missing).expect_err("Other without EU VAT must reject");
-        assert!(
-            errors.iter().any(|e| e.field == "eu_vat_number"),
-            "must flag eu_vat_number; got {errors:?}"
-        );
-
-        // Malformed EU VAT number → flag eu_vat_number.
-        let malformed = PartnerInputs {
-            customer_vat_status: CustomerVatStatus::Other,
-            tax_number: None,
-            eu_vat_number: Some("ZZ9".to_string()),
-            ..minimal_valid_inputs()
-        };
-        let errors = validate_partner_inputs(&malformed)
-            .expect_err("Other with malformed EU VAT must reject");
-        assert!(
-            errors.iter().any(|e| e.field == "eu_vat_number"),
-            "must flag eu_vat_number for malformed value; got {errors:?}"
-        );
-
         // Valid EU VAT + a stray HU tax number → flag tax_number.
         let with_hu_tax = PartnerInputs {
             customer_vat_status: CustomerVatStatus::Other,
@@ -1643,6 +1622,90 @@ mod tests {
         assert!(
             validate_partner_inputs(&ok).is_ok(),
             "well-formed Other partner must validate"
+        );
+    }
+
+    /// REGRESSION (operator-reported on DEV, 2026-07-27) — a foreign
+    /// partner was unsavable unless it carried an EU-shaped community
+    /// VAT number. `Other` spans more than the EU-business arm; each
+    /// shape below is a legitimate partner record and MUST save.
+    ///
+    /// Reverting the `Other` arm of `validate_partner_inputs` to the
+    /// required-and-EU-shape-gated form turns every case here red
+    /// (mutation-verified).
+    #[test]
+    fn validate_partner_inputs_other_saves_without_eu_vat() {
+        // (a) Foreign partner with NO tax identifier at all.
+        let no_vat = PartnerInputs {
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            eu_vat_number: None,
+            ..minimal_valid_inputs()
+        };
+        assert!(
+            validate_partner_inputs(&no_vat).is_ok(),
+            "a foreign partner with no tax id must save; got {:?}",
+            validate_partner_inputs(&no_vat)
+        );
+
+        // (b) Foreign partner with an empty-after-trim EU VAT field —
+        //     the SPA's `emptyToNull` should send null, but a `""` on
+        //     the wire must not resurrect the block either.
+        let blank_vat = PartnerInputs {
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            eu_vat_number: Some("   ".to_string()),
+            ..minimal_valid_inputs()
+        };
+        assert!(
+            validate_partner_inputs(&blank_vat).is_ok(),
+            "a blank EU VAT field must not block a foreign partner; got {:?}",
+            validate_partner_inputs(&blank_vat)
+        );
+
+        // (c) Third-state (non-EU) partner carrying a NON-EU tax id.
+        //     `CHE-…` / a US EIN have no EU country prefix and are not
+        //     VIES-shaped; the reused column is polymorphic for `Other`.
+        for third_state in ["CHE-123.456.789", "12-3456789", "NO123456789MVA"] {
+            let inputs = PartnerInputs {
+                customer_vat_status: CustomerVatStatus::Other,
+                tax_number: None,
+                eu_vat_number: Some(third_state.to_string()),
+                ..minimal_valid_inputs()
+            };
+            assert!(
+                validate_partner_inputs(&inputs).is_ok(),
+                "third-state tax id `{third_state}` must save; got {:?}",
+                validate_partner_inputs(&inputs)
+            );
+        }
+
+        // (d) The EU-business arm still saves — unchanged.
+        let eu = PartnerInputs {
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            eu_vat_number: Some("DE123456789".to_string()),
+            ..minimal_valid_inputs()
+        };
+        assert!(
+            validate_partner_inputs(&eu).is_ok(),
+            "an EU partner with an EU VAT number must save; got {:?}",
+            validate_partner_inputs(&eu)
+        );
+
+        // (e) The relaxation is BOUNDED: the HU-ADÓSZÁM-forbidden
+        //     invariant is the one rule that survives on this arm.
+        let with_hu_tax = PartnerInputs {
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: Some("24904362-2-41".to_string()),
+            eu_vat_number: None,
+            ..minimal_valid_inputs()
+        };
+        let errors = validate_partner_inputs(&with_hu_tax)
+            .expect_err("a foreign partner with a HU ADÓSZÁM must still reject");
+        assert!(
+            errors.iter().any(|e| e.field == "tax_number"),
+            "must flag tax_number; got {errors:?}"
         );
     }
 

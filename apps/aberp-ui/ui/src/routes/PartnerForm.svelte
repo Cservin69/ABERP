@@ -195,7 +195,7 @@
               />
               <span>
                 Külföldi / Foreign
-                <span class="field__hint">EU-s vevő EU adószámmal / EU business (EU VAT)</span>
+                <span class="field__hint">Nem magyar partner (EU vagy EU-n kívüli) / non-Hungarian partner (EU or not)</span>
               </span>
             </label>
             {#if fieldErrors.customer_vat_status !== undefined}
@@ -217,7 +217,7 @@
                 {:else if form.customerVatStatus === "PrivatePerson"}
                   Magánszemély vevő esetén nem kell adószám / no tax number for natural persons
                 {:else}
-                  Külföldi vevőnél EU adószámot adjon meg (lent) / EU buyers: use the EU VAT number (below)
+                  Külföldi partnernél a magyar adószám nem érvényes; használja az alábbi mezőt / not valid for a foreign partner; use the field below
                 {/if}
               </span>
             </span>
@@ -264,20 +264,26 @@
             </select>
           </label>
 
-          <!-- ADR-0102 — EU community VAT number. REQUIRED + structurally
-               validated (backend `validate_community_vat_number`, VIES
-               shape) for an Other (foreign-EU) buyer; optional free-text
-               metadata for Domestic/PrivatePerson. This column is the
-               community-VAT source snapshotted onto issued invoices. -->
+          <!-- ADR-0102 — foreign tax identifier, on the reused
+               `eu_vat_number` column. OPTIONAL at partner save: a foreign
+               partner may hold an EU community VAT number, a third-state
+               (non-EU) tax id, or none, and a foreign SUPPLIER is never
+               invoiced at all. Requiring it here blocked legitimate
+               foreign partners (operator-reported on DEV, 2026-07-27).
+               NAV's `<communityVatNumber>` requirement + its VIES-shape
+               gate live at invoice preflight (`issue_preflight.rs`), which
+               is where a bad value would actually cost a NAV sequence.
+               This column is the community-VAT source snapshotted onto
+               issued invoices. -->
           <label class="field">
             <span class="field__label">
               EU VAT number
-              {#if form.customerVatStatus === "Other"}
-                *
-              {/if}
               <span class="field__hint">
                 {#if form.customerVatStatus === "Other"}
-                  kötelező — pl. ATU12345678 / required — e.g. ATU12345678
+                  EU vevőnél pl. ATU12345678; EU-n kívül a helyi adószám,
+                  vagy hagyja üresen / EU buyer e.g. ATU12345678; outside
+                  the EU the local tax id, or leave empty. Számlázáshoz EU
+                  adószám kell / an EU VAT number is required to invoice.
                 {:else}
                   optional
                 {/if}
@@ -288,7 +294,6 @@
               bind:value={form.euVatNumber}
               autocomplete="off"
               spellcheck="false"
-              required={form.customerVatStatus === "Other"}
               placeholder="ATU12345678"
               aria-invalid={fieldErrors.eu_vat_number !== undefined}
             />

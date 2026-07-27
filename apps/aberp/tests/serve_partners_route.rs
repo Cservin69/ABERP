@@ -346,3 +346,93 @@ fn partners_soft_delete_makes_partner_invisible_to_api() {
 
     let _keep = &dir;
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Pin #7 — foreign-partner save regression (operator-reported, DEV,
+// 2026-07-27). Route-level twin of
+// `partners::tests::validate_partner_inputs_other_saves_without_eu_vat`:
+// the unit pin covers the gate, this one covers the surface the operator
+// actually hits (`POST /api/partners` → `create_partner_request`) and
+// asserts the row is READABLE BACK, not merely accepted.
+// ──────────────────────────────────────────────────────────────────────
+
+fn foreign_inputs(display: &str, foreign_tax_id: Option<&str>, country: &str) -> PartnerInputs {
+    PartnerInputs {
+        display_name: display.to_string(),
+        legal_name: format!("{display} GmbH"),
+        kind: PartnerKind::Customer,
+        customer_vat_status: CustomerVatStatus::Other,
+        customer_type: CustomerType::Unset,
+        // A foreign partner never carries a Hungarian ADÓSZÁM.
+        tax_number: None,
+        eu_vat_number: foreign_tax_id.map(str::to_string),
+        address_street: Some("Hauptstr. 1".to_string()),
+        address_postal_code: Some("10115".to_string()),
+        address_city: Some("Berlin".to_string()),
+        address_country: Some(country.to_string()),
+        bank_account: None,
+        contact_email: Some("ops@example.de".to_string()),
+        contact_phone: None,
+    }
+}
+
+/// Pin #7 — every legitimate foreign-partner shape saves through the
+/// route helper and round-trips on read. Was: an `Other` partner
+/// without an EU-shaped community VAT number was rejected 400
+/// `validation_failed` at partner save, so a Swiss / US / tax-id-less
+/// foreign partner (including a foreign SUPPLIER we never invoice)
+/// could not be created at all.
+///
+/// Restoring the required-and-EU-shape-gated `Other` arm in
+/// `validate_partner_inputs` turns cases (a) and (c) red
+/// (mutation-verified).
+#[test]
+fn partners_create_accepts_foreign_partner_without_eu_vat_number() {
+    let dir = test_dir("create-foreign");
+    let state = build_state(dir.join("aberp.duckdb"));
+
+    // (a) Foreign partner with NO tax identifier at all.
+    let no_id = serve::create_partner_request(&state, &foreign_inputs("Kein Ust", None, "DE"))
+        .expect("a foreign partner with no tax id must save");
+    assert!(no_id.eu_vat_number.is_none());
+
+    // (b) EU business with an EU community VAT number — unchanged arm.
+    let eu =
+        serve::create_partner_request(&state, &foreign_inputs("Muster", Some("DE123456789"), "DE"))
+            .expect("an EU partner with an EU VAT number must save");
+    assert_eq!(eu.eu_vat_number.as_deref(), Some("DE123456789"));
+
+    // (c) Third-state (non-EU) partner carrying a non-EU tax id. `CHE-…`
+    //     has no EU country prefix and is not VIES-shaped — the reused
+    //     column is polymorphic for `Other`.
+    let ch = serve::create_partner_request(
+        &state,
+        &foreign_inputs("Helvetia", Some("CHE-123.456.789"), "CH"),
+    )
+    .expect("a third-state partner with a non-EU tax id must save");
+    assert_eq!(ch.eu_vat_number.as_deref(), Some("CHE-123.456.789"));
+
+    // All three are readable back — the save persisted, it did not just
+    // return a populated struct (CLAUDE.md rule 11: no silent no-op).
+    for created in [&no_id, &eu, &ch] {
+        let fetched = serve::get_partner_request(&state, &created.id).expect("re-read");
+        assert_eq!(&fetched, created, "partner must round-trip on read");
+        assert_eq!(fetched.customer_vat_status, CustomerVatStatus::Other);
+    }
+
+    // The relaxation is BOUNDED — a foreign partner carrying a Hungarian
+    // ADÓSZÁM is still a 400 at this surface.
+    let mut hu_tax = foreign_inputs("Falsch", Some("DE123456789"), "DE");
+    hu_tax.tax_number = Some("24904362-2-41".to_string());
+    match serve::create_partner_request(&state, &hu_tax) {
+        Err(PartnerRouteError::Validation(errors)) => assert!(
+            errors.iter().any(|e| e.field == "tax_number"),
+            "must flag tax_number; got {errors:?}"
+        ),
+        other => {
+            panic!("expected Validation on a foreign partner with a HU ADÓSZÁM, got {other:?}")
+        }
+    }
+
+    let _keep = &dir;
+}
