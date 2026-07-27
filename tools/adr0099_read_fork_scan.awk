@@ -50,6 +50,25 @@
 # `from_connection` / `open_in_memory` are the sanctioned shared-instance seams (a
 # from_connection reader rides the Handle — coherent) and never trip it.
 #
+# ── D2 (2026-07-27): the BUSINESS-TABLE blind spot, and the name PIN ──
+# Everything above is AUDIT-LEDGER-shaped: the typed-read tokens and the raw
+# `FROM audit_ledger` SELECT both key off the audit ledger. A fresh opener that
+# reads a BUSINESS table is invisible to all of it — and `serve::
+# read_base_line_vat_kinds` was exactly that: `Connection::open(&state.db_path)`
+# + `billing::load_ready_invoice_by_id`, on the live modification route. Its
+# stale read returned an EMPTY Vec, the ADR-0101 S2 guard below it passed
+# VACUOUSLY over that empty vector, and an exempt / reverse-charge base was
+# re-filed to NAV as plain 0% VAT.
+#
+# The general fix is structural (flag ANY fn holding a fresh opener whose reads
+# leave the fn — the D1 rewrite). Until that lands, `PINNED` is a name RATCHET:
+# a listed fn may hold NO fresh opener at all, whatever it reads, and no
+# allow-list entry can exempt it. It is honest about what it is — teeth on the
+# names we have actually audited and migrated, not a claim of coverage. ADD a
+# name here ONLY together with its migration to the shared Handle; a pinned
+# name that still forks makes this gate RED, which is the point.
+BEGIN{ n_pin=split("read_base_line_vat_kinds,read_base_currency",P,",") }
+#
 # TWO parsing views are built per line so both shapes above are visible:
 #   code   — strings AND comments stripped: for openers / typed reads / appends
 #            (a `Connection::open` inside a string or comment must not count).
@@ -59,9 +78,14 @@
 # opener sharing a line with the fn's closing `}` (a one-liner) is NOT missed.
 BEGIN{ depth=0; tdepth=-1; pending=0; inblk=0; instr=0; inraw=0; rawh=0; fn_depth=-1; fn_pending=0; n_allow=split(allow,A,",") }
 function is_allowed(name,   k){ for(k=1;k<=n_allow;k++) if(A[k]==name) return 1; return 0 }
-function flush(   is_read){
+function is_pinned(name,   k){ for(k=1;k<=n_pin;k++) if(P[k]==name) return 1; return 0 }
+function flush(   is_read, pinned_fork){
   is_read = (cur_ledopen && cur_read) || (cur_connopen && cur_auditsel)
-  if (cur_fn!="" && is_read && !cur_app && !is_allowed(cur_fn)) {
+  # A PINNED name forks on the OPENER ALONE — no typed-read token required (its
+  # reads are business-table, which this scanner cannot recognise) and no
+  # allow-list exemption honoured.
+  pinned_fork = (cur_ledopen || cur_connopen) && is_pinned(cur_fn)
+  if (cur_fn!="" && !cur_app && (pinned_fork || (is_read && !is_allowed(cur_fn)))) {
     printf "%d:%s:readfork@L%d\n", cur_open_ln, cur_fn, cur_open_ln
   }
   cur_ledopen=0; cur_connopen=0; cur_read=0; cur_auditsel=0; cur_app=0; cur_open_ln=0

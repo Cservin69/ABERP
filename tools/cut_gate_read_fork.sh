@@ -84,6 +84,35 @@ fn control(db: &Handle) {
     let _ = l.entries();
 }
 RS
+# D2 (2026-07-27) — the PINNED-name ratchet. A pinned fn forks on the OPENER
+# ALONE, with no audit-ledger token anywhere: that is the whole point (its reads
+# are BUSINESS-table, which this scanner is structurally blind to). These three
+# controls pin all three halves of the rule — it fires on a pinned name, it does
+# NOT fire on the same body under an unpinned name (so the teeth stay honest
+# about their reach), and it still does NOT fire once the fn rides the Handle.
+bs_check "$SCAN" 1 "positive: PINNED name + fresh Connection::open, business read only" <<'RS'
+fn read_base_line_vat_kinds(db_path: &Path, invoice_id: &str) -> Result<Vec<VatRateKind>> {
+    let mut conn = Connection::open(db_path)?;
+    let tx = conn.transaction()?;
+    let pair = billing::load_ready_invoice_by_id(&tx, invoice_id)?;
+    Ok(pair.map(|(i, _)| i.lines).unwrap_or_default())
+}
+RS
+bs_check "$SCAN" 0 "negative: SAME body under an UNPINNED name (the D1 blind spot, still open)" <<'RS'
+fn read_some_other_business_thing(db_path: &Path, invoice_id: &str) -> Result<Vec<VatRateKind>> {
+    let mut conn = Connection::open(db_path)?;
+    let tx = conn.transaction()?;
+    let pair = billing::load_ready_invoice_by_id(&tx, invoice_id)?;
+    Ok(pair.map(|(i, _)| i.lines).unwrap_or_default())
+}
+RS
+bs_check "$SCAN" 0 "negative: PINNED name reading through the shared Handle (must NOT hit)" <<'RS'
+fn read_base_currency(conn: &Connection, invoice_id: &str) -> Result<Currency> {
+    let mut conn = conn.try_clone()?;
+    let tx = conn.transaction()?;
+    Ok(load_invoice_currency_metadata_in_tx(&tx, invoice_id)?.currency)
+}
+RS
 bs_controls_ok || { echo; echo "READ-FORK GATE: ✗ FAILED (scanner liveness)"; exit 1; }
 echo
 
