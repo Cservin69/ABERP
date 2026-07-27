@@ -6865,9 +6865,20 @@ pub fn get_invoice_pdf(
     invoice_id: &str,
     seller_toml_override: Option<&Path>,
 ) -> Result<Option<print_invoice::RenderedInvoice>> {
-    match print_invoice::render_to_bytes(
+    // H3 (ADR-0099) — render off the shared Handle, never a fresh open of
+    // `state.db_path`. The issuing writer's `InvoiceDraftCreated` (and the
+    // invoice row the notes/bank-snapshot reads target) are WAL-resident
+    // with checkpointing disabled, so a second DuckDB instance sees only the
+    // last-checkpointed subset — the 2026-07-27 DEV failure where a
+    // finalized, NAV-acked invoice reported "no InvoiceDraftCreated audit
+    // entry found" to email compose, resend and the PDF route.
+    let conn = state
+        .db
+        .read()
+        .context("acquire shared reader for printed-invoice render")?;
+    match print_invoice::render_to_bytes_on_conn(
         invoice_id,
-        &state.db_path,
+        &conn,
         state.tenant.as_str(),
         seller_toml_override,
     ) {

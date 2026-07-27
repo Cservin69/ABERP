@@ -16,7 +16,7 @@
 # here to avoid double-counting). A read-fork is a fn with NO append AND either:
 #   * a fresh `Ledger::open(` AND a typed ledger READ
 #       (.entries( / .verify_chain( / .sync_mirror( / list_notes_history( /
-#        pending_from_ledger( ), OR
+#        pending_from_ledger( / find_invoice_draft( ), OR
 #   * a fresh `Connection::open(` AND a raw `... FROM audit_ledger` SELECT.
 #
 # ── ADR-0099 Addendum 3 (this session): the read-VIA-HELPER blind spot ──
@@ -31,6 +31,21 @@
 # gates missed it (it is not a write, and its read hid behind the helper). Adding
 # `pending_from_ledger(` to the typed-read set closes it, the same way
 # `list_notes_history(` (also a read-helper name, not a `.method`) already is.
+#
+# ── 2026-07-27 (DEV invoice #62): the SAME blind spot, still open ──
+# `print_invoice::render_to_bytes` opens a fresh `Ledger` and reads it through
+# `find_invoice_draft(&ledger, id)` — one indirection away, exactly the shape
+# above. It is reached IN-SERVE from `serve::get_invoice_pdf` (the PDF route AND
+# the `POST /api/invoices/:id/email` compose path), so a normally-issued invoice
+# whose `InvoiceDraftCreated` was still WAL-resident on the shared Handle read
+# back as "no InvoiceDraftCreated audit entry found" — email/resend/PDF 404 on a
+# finalized, NAV-acked invoice. The gate reported ZERO in-serve read-forks
+# throughout. `find_invoice_draft(` joins the typed-read set.
+#
+# STRUCTURAL RESIDUAL (deferred, ADR-0099 §CHECK N): name-listing read helpers
+# one at a time is whack-a-mole. The general shape — "a fn with a fresh opener
+# that hands the opened `Ledger`/`Connection` to ANOTHER fn" — is what should be
+# flagged; the three names below are the third patch to the same hole.
 #
 # `from_connection` / `open_in_memory` are the sanctioned shared-instance seams (a
 # from_connection reader rides the Handle — coherent) and never trip it.
@@ -137,7 +152,8 @@ function flush(   is_read){
       cur_connopen=1
     }
     if (code ~ /\.entries[ \t]*\(/ || code ~ /\.verify_chain[ \t]*\(/ || code ~ /\.sync_mirror[ \t]*\(/ \
-        || code ~ /list_notes_history[ \t]*\(/ || code ~ /pending_from_ledger[ \t]*\(/) { cur_read=1 }
+        || code ~ /list_notes_history[ \t]*\(/ || code ~ /pending_from_ledger[ \t]*\(/ \
+        || code ~ /find_invoice_draft[ \t]*\(/) { cur_read=1 }
     if (codenc ~ /[Ff][Rr][Oo][Mm][ \t]+audit_ledger/) { cur_auditsel=1 }
     if (code ~ /\.append(_signed)?[ \t]*\(/ || code ~ /append_in_tx(_signed)?[ \t]*\(/ \
         || code ~ /append_reopen[ \t]*\(/ || codenc ~ /[Ii][Nn][Tt][Oo][ \t]+audit_ledger/) { cur_app=1 }

@@ -145,9 +145,53 @@ pub fn run(args: &PrintInvoiceArgs) -> Result<()> {
 /// `seller_toml`: `Some(path)` for an explicit override (CLI's
 /// `--seller-toml` or the test fixture); `None` to fall back to
 /// `~/.aberp/<tenant>/seller.toml` per `resolve_seller_toml_path`.
+///
+/// PATH-TAKING = CLI ONE-SHOT ONLY (ADR-0099 H3). Opens a PROCESS-LOCAL
+/// shared `Handle` (checkpoint disabled, no daemon threads) and reads
+/// through it — the same idiom `issue_invoice::run` uses for the CLI
+/// issuance one-shot, and the reason this file keeps NO separate runtime
+/// opener (CHECK M: half-migrated is worse than unmigrated). Anything
+/// running INSIDE serve must call [`render_to_bytes_on_conn`] with a
+/// `state.db.read()` clone of the ALREADY-OPEN Handle instead — a second
+/// instance does not replay the live writer's WAL, so a just-issued
+/// invoice's `InvoiceDraftCreated` is invisible to it.
 pub fn render_to_bytes(
     invoice_id: &str,
     db: &Path,
+    tenant: &str,
+    seller_toml: Option<&Path>,
+) -> Result<RenderedInvoice> {
+    let tenant_id = TenantId::new(tenant.to_string())
+        .ok_or_else(|| anyhow!("--tenant value '{}' is empty or has a null byte", tenant))?;
+    let handle = aberp_db::Handle::open_default(db, tenant_id).with_context(|| {
+        format!(
+            "open shared DuckDB handle for print-invoice at {}",
+            db.display()
+        )
+    })?;
+    let conn = handle
+        .read()
+        .context("acquire process-local reader for printed-invoice render")?;
+    render_to_bytes_on_conn(invoice_id, &conn, tenant, seller_toml)
+}
+
+/// Handle-routed twin of [`render_to_bytes`] — renders off an ALREADY-OPEN
+/// connection to the tenant DB instead of opening the file itself.
+///
+/// ADR-0099 H3 / CHECK N — 2026-07-27 (DEV invoice #62). Every read this
+/// function makes (audit ledger, `invoice.invoice_note` + `invoice_line.note`,
+/// the PR-73 bank snapshot) targets rows the issuing writer commits through
+/// the shared `aberp_db::Handle`. With `checkpoint_enabled == false` under H3
+/// those rows stay WAL-resident for the life of the serve process, so the
+/// pre-fix `Ledger::open(db)` here read the last-checkpointed SUBSET of the
+/// file and reported `no InvoiceDraftCreated audit entry found` for an
+/// invoice that had just finalized and been NAV-acked — breaking email
+/// compose, resend, the PDF route and the storno-side re-render. Serve passes
+/// `state.db.read()` (a `try_clone` of the ONE instance, coherent with the
+/// writer's WAL); the CLI arm above passes its own process-local connection.
+pub fn render_to_bytes_on_conn(
+    invoice_id: &str,
+    conn: &Connection,
     tenant: &str,
     seller_toml: Option<&Path>,
 ) -> Result<RenderedInvoice> {
@@ -159,8 +203,12 @@ pub fn render_to_bytes(
     //    LedgerMeta surface; the print-invoice path does NOT write to
     //    the ledger so the hash is not load-bearing here.
     let binary_hash_bytes: BinaryHash = binary_hash::compute().context("compute binary hash")?;
-    let ledger = Ledger::open(db, tenant_id, binary_hash_bytes)
-        .with_context(|| format!("open audit ledger at {}", db.display()))?;
+    let ledger = Ledger::from_connection(
+        conn.try_clone()
+            .context("try_clone the shared connection for the audit-ledger read")?,
+        tenant_id,
+        binary_hash_bytes,
+    );
     let draft = find_invoice_draft(&ledger, invoice_id)?;
 
     // 2. Read the verbatim NAV body bytes off disk.
@@ -225,7 +273,7 @@ pub fn render_to_bytes(
     // invoices return an empty snapshot; the renderer falls back to
     // the legacy flat-root fields read from `seller.toml` for those
     // rows so historical re-renders stay byte-stable.
-    let bank_snapshot = load_invoice_bank_snapshot(db, invoice_id)
+    let bank_snapshot = load_invoice_bank_snapshot(conn, invoice_id)
         .with_context(|| format!("load bank snapshot for invoice {invoice_id} (PR-86)"))?;
 
     // 6. Build the renderer model. The supplier's bank block prefers
@@ -271,7 +319,7 @@ pub fn render_to_bytes(
     // the audit-ledger read above. Operator-twin record stays in the
     // audit-ledger payload too; the DuckDB read is the operational
     // index for fast lookup.
-    let invoice_notes = load_invoice_notes(db, invoice_id)
+    let invoice_notes = load_invoice_notes(conn, invoice_id)
         .with_context(|| format!("load buyer-facing notes for invoice {invoice_id} (PR-82)"))?;
 
     let lines: Vec<PdfLine> = parsed
@@ -844,10 +892,12 @@ pub struct InvoiceNotes {
 /// invoice-level note and walks `invoice_line.note` in ordinal order
 /// for the per-line vector.
 ///
-/// Caller already holds the invoice id from the audit-ledger walk; we
-/// open a fresh read tx here rather than thread the existing
-/// `Ledger`-side connection through (the ledger crate manages its own
-/// connection internally and exposes no tx handle).
+/// ADR-0099 H3 / CHECK N (2026-07-27) — takes the CALLER's connection.
+/// It used to `Connection::open(db)` a fresh instance, which does not
+/// replay the shared `Handle`'s WAL: the note columns of an invoice
+/// issued earlier in the same serve process read back empty (or the
+/// row read back missing entirely). `try_clone` here is the same
+/// instance, so it sees the writer's uncheckpointed rows.
 ///
 /// Returns `InvoiceNotes::default()` (empty) if the billing tables do
 /// not exist in this DB. That class of failure happens in two
@@ -859,9 +909,12 @@ pub struct InvoiceNotes {
 /// Real DB corruption (column missing but table present) still
 /// surfaces as an error because `load_invoice_note_in_tx`'s SELECT
 /// errors on that specific shape.
-pub fn load_invoice_notes(db: &Path, invoice_id: &str) -> Result<InvoiceNotes> {
-    let mut conn = Connection::open(db)
-        .with_context(|| format!("open tenant DuckDB for notes read at {}", db.display()))?;
+pub fn load_invoice_notes(conn: &Connection, invoice_id: &str) -> Result<InvoiceNotes> {
+    // `transaction()` needs `&mut`; a `try_clone` is the SAME instance (not a
+    // second OS open), so this stays coherent with the writer's WAL.
+    let mut conn = conn
+        .try_clone()
+        .context("try_clone the shared connection for the buyer-notes read")?;
     let tx = conn
         .transaction()
         .context("begin read transaction for buyer-notes lookup")?;
@@ -918,11 +971,13 @@ pub fn load_invoice_notes(db: &Path, invoice_id: &str) -> Result<InvoiceNotes> {
 /// returns `Ok(None)` so test harnesses constructing such DBs don't
 /// have to scaffold a phantom snapshot.
 pub fn load_invoice_bank_snapshot(
-    db: &Path,
+    conn: &Connection,
     invoice_id: &str,
 ) -> Result<Option<BankAccountSnapshot>> {
-    let mut conn = Connection::open(db)
-        .with_context(|| format!("open tenant DuckDB for bank snapshot at {}", db.display()))?;
+    // Same `try_clone`-for-`&mut` seam as `load_invoice_notes` (ADR-0099 H3).
+    let mut conn = conn
+        .try_clone()
+        .context("try_clone the shared connection for the bank-snapshot read")?;
     let tx = conn
         .transaction()
         .context("begin read transaction for bank snapshot lookup")?;
