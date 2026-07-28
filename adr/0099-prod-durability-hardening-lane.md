@@ -1360,3 +1360,53 @@ and `tools/adr0098_prod_opener_fingerprints.txt` therefore need **no re-baselini
 not even depend on `duckdb` today — but that is one line away, and the gate must cover
 it regardless. Mutation-verified: the planted opener now turns the census and write-fork
 gates RED, and a planted `Ledger::open` + `.entries()` read-fork turns the read-fork gate RED.
+
+---
+
+## Addendum 5 (2026-07-28) — CHECK N goes STRUCTURAL; CHECK N1 ratchet
+
+Supersedes the "STRUCTURAL RESIDUAL (deferred)" note in `adr0099_read_fork_scan.awk`
+and narrows §"CHECK N residual STATIC LIMITATION" above. Findings:
+`docs/findings/read-fork-structural-detector-2026-07-28.md`.
+
+**Why.** Four instances of one class shipped (#40, #41, #42, E1) because CHECK N was
+a NAME allowlist — a list of read-helper names plus a `PINNED` list of enclosing-fn
+names. The identical shape under an unlisted name was invisible. The claim above
+that "no silent Ledger/raw-SQL reader shape is known to escape" was true as written
+and beside the point: every escape was a **business-table** read, or a read one
+indirection behind an unlisted helper.
+
+**CHECK N is now shape-based.** A fresh live-DB opener bound to a local, whose handle
+or any derivative is read through — a non-propagating method call, or the value
+passed to another fn — in a non-appending runtime fn, under ANY name. The opener set
+is by TYPE and now includes `Handle::open{,_default}`.
+
+**`Handle::open` was the specific escape hatch.** It is absent from the ADR-0098
+opener census (which treats the shared Handle as *the* sanctioned seam — sound only
+while there is exactly one) and was unhooked by `SERVE_HANDLE_LIVE` until PR#42
+`4acd42b`. PR#40 moved a still-forking reader from `Ledger::open` (censused AND
+hooked) onto `Handle::open_default` (neither) and every detector went quiet.
+`serve_handle_tripwire.rs` now pins the hook (it was previously untested: deleting it
+left all 8 tripwire tests green). **The census remains blind to `Handle::open` — open
+residual, deliberately not re-baselined here.**
+
+**CHECK N1 — structural ratchet.** Turning the shape rule on surfaced **28
+pre-existing forks, 12 live in-serve** on the serve-held DB, never before visible to
+any gate. Migrating them is product work with its own review, so
+`tools/adr0099_read_fork_structural_baseline.txt` freezes them as an EXACT set:
+additions RED, stale entries RED (the ADR-0098 CHECK P2 posture). `CHECK N1 ✓ 0 new`
+means **no fork was ADDED** — it is a debt register with teeth, NOT a coherence
+claim, and the gate prints that caveat on every run. The CHECK N verdict for the
+audit-ledger/PINNED scope is unchanged.
+
+**Residual 1 — the factory carve-out.** A fn that opens and RETURNS the handle
+(`serve::open_tenant_handle`) is not a read-fork, so a fork SPLIT across a factory
+and its caller has no opener textually in the reading fn. Closing that needs the call
+graph; the runtime tripwire is call-graph-complete and now covers `Handle::open`. The
+static and runtime halves are complements — neither alone catches all four historical
+instances.
+
+**Residual 2 — CHECK 10M has the identical weakness.** Its append-token set is also a
+name list: `aberp-mes::ledger_writer::write_one` opens a fresh connection in-serve and
+appends through `write_mes_adapter_event`, and the write-fork gate reports ZERO. The
+D1 treatment applied to CHECK N has NOT been applied to CHECK 10M.

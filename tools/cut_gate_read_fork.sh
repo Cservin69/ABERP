@@ -98,19 +98,63 @@ fn read_base_line_vat_kinds(db_path: &Path, invoice_id: &str) -> Result<Vec<VatR
     Ok(pair.map(|(i, _)| i.lines).unwrap_or_default())
 }
 RS
-bs_check "$SCAN" 0 "negative: SAME body under an UNPINNED name (the D1 blind spot, still open)" <<'RS'
-fn read_some_other_business_thing(db_path: &Path, invoice_id: &str) -> Result<Vec<VatRateKind>> {
+bs_check "$SCAN" 0 "negative: PINNED name reading through the shared Handle (must NOT hit)" <<'RS'
+fn read_base_currency(conn: &Connection, invoice_id: &str) -> Result<Currency> {
+    let mut conn = conn.try_clone()?;
+    let tx = conn.transaction()?;
+    Ok(load_invoice_currency_metadata_in_tx(&tx, invoice_id)?.currency)
+}
+RS
+
+# ── D1 (2026-07-28) — the STRUCTURAL controls. THE TEETH TEST. ──
+# Until today the control directly below was a NEGATIVE, asserting the blind spot:
+# the D2a body under an UNPINNED name did not hit. That is the hole four shipped
+# defects went through (#40 render, #41 modification base, #42 auto-email, E1), and
+# flipping it to a POSITIVE is the point of this change — a scanner that only reds
+# on names it was told about cannot protect against the class. The controls come in
+# RED/GREEN pairs so "it hits everything" cannot pass either.
+bs_check "$SCAN" 1 "STRUCTURAL positive: D2a body under a BRAND-NEW never-listed name" <<'RS'
+fn a_name_this_gate_has_never_heard_of(db_path: &Path, invoice_id: &str) -> Result<Vec<VatRateKind>> {
     let mut conn = Connection::open(db_path)?;
     let tx = conn.transaction()?;
     let pair = billing::load_ready_invoice_by_id(&tx, invoice_id)?;
     Ok(pair.map(|(i, _)| i.lines).unwrap_or_default())
 }
 RS
-bs_check "$SCAN" 0 "negative: PINNED name reading through the shared Handle (must NOT hit)" <<'RS'
-fn read_base_currency(conn: &Connection, invoice_id: &str) -> Result<Currency> {
+bs_check "$SCAN" 0 "STRUCTURAL negative: the SAME unlisted fn once Handle-routed (must NOT hit)" <<'RS'
+fn a_name_this_gate_has_never_heard_of(conn: &Connection, invoice_id: &str) -> Result<Vec<VatRateKind>> {
     let mut conn = conn.try_clone()?;
     let tx = conn.transaction()?;
-    Ok(load_invoice_currency_metadata_in_tx(&tx, invoice_id)?.currency)
+    let pair = billing::load_ready_invoice_by_id(&tx, invoice_id)?;
+    Ok(pair.map(|(i, _)| i.lines).unwrap_or_default())
+}
+RS
+# E1's ACTUAL body, verbatim from `baf5095` (post-#40, pre-#42). `Handle::open` is
+# in neither the ADR-0098 opener census nor — until 2026-07-28 — the
+# SERVE_HANDLE_LIVE tripwire, so when #40 moved this fn off `Ledger::open` onto its
+# own Handle EVERY detector went quiet on a path that still forked. This control is
+# the regression pin for that specific escape.
+bs_check "$SCAN" 1 "STRUCTURAL positive: E1's real body — a second Handle::open, read through" <<'RS'
+pub fn render_to_bytes(invoice_id: &str, db: &Path, tenant: &str) -> Result<RenderedInvoice> {
+    let handle = aberp_db::Handle::open_default(db, tenant_id).with_context(|| {
+        format!("open shared DuckDB handle at {}", db.display())
+    })?;
+    let conn = handle
+        .read()
+        .context("acquire process-local reader")?;
+    render_to_bytes_on_conn(invoice_id, &conn, tenant, seller_toml)
+}
+RS
+# The FACTORY carve-out, both directions. `serve::open_tenant_handle` opens and
+# RETURNS — the sanctioned boot opener, and it must stay green or the rule is
+# unusable. The cost is stated in the scanner header: a fork SPLIT across a factory
+# and its caller has no opener in the reading fn and is invisible here. That gap is
+# the runtime tripwire's (it fires on the OPEN itself, whoever did it, and now hooks
+# `Handle::open`) — the two halves are complements, not duplicates.
+bs_check "$SCAN" 0 "STRUCTURAL negative: factory that opens and RETURNS the handle" <<'RS'
+fn open_tenant_handle(db_path: &Path, tenant: TenantId) -> Result<Arc<Handle>> {
+    let h = aberp_db::Handle::open_default(db_path, tenant)?;
+    Ok(h)
 }
 RS
 bs_controls_ok || { echo; echo "READ-FORK GATE: ✗ FAILED (scanner liveness)"; exit 1; }
@@ -158,12 +202,21 @@ fi
 is_flock_fenced() { grep -qE 'acquire_or_refuse|try_acquire' "$1"; }
 
 remaining=0
-worklist="$(mktemp)"; allowed_hits="$(mktemp)"; unfenced="$(mktemp)"
+worklist="$(mktemp)"; allowed_hits="$(mktemp)"; unfenced="$(mktemp)"; structhits="$(mktemp)"
 while IFS= read -r f; do
   while IFS= read -r rec; do
     [[ -z "$rec" ]] && continue
     fname="$(cut -d: -f2 <<< "$rec")"
     key="$f:$fname"
+    # D1 structural hits are ratcheted (CHECK N1 below), not enforced at zero —
+    # turning the shape rule on surfaced 28 PRE-EXISTING forks. Allow-listed +
+    # flock-fenced CLI one-shots fall through to the same exemption as before.
+    if [[ "$rec" == *:structfork@* ]]; then
+      if is_allowed "$key" && is_flock_fenced "$f"; then
+        printf '%s:%s\n' "$f" "$rec" >> "$allowed_hits"; continue
+      fi
+      printf '%s|%s\n' "$f" "$fname" >> "$structhits"; continue
+    fi
     if is_allowed "$key"; then
       if is_flock_fenced "$f"; then
         printf '%s:%s\n' "$f" "$rec" >> "$allowed_hits"; continue
@@ -196,6 +249,56 @@ rm -f "$unfenced"
 
 na="$(wc -l < "$allowed_hits" | tr -d ' ')"
 echo "  ($na CLI one-shot read(s) allow-listed as coherent — separate process, flock-fenced.)"
+
+# ── CHECK N1 — the D1 STRUCTURAL RATCHET (ALWAYS ENFORCED) ──
+# The shape rule (fresh opener → handle read through, under ANY fn name) is what
+# four shipped defects needed and none of them had. Switching it on found 28
+# pre-existing forks — NINE of them live in-serve on `state.db_path`. Migrating
+# those is product work with its own review; this gate does NOT pretend they are
+# fixed. It freezes them and refuses ANY ADDITION, so a FIFTH instance of the class
+# cannot ship the way the first four did.
+#
+# The baseline is an exact set, both directions — an added entry is a new fork, and
+# a STALE entry (a fork that was fixed, or renamed) must be removed in the SAME
+# change, so the file can never drift into a list of names that no longer mean
+# anything. This is the ADR-0098 CHECK P2 frozen-fingerprint posture.
+#
+# NOT a coherence claim. `✓ 0 new` means "no fork was ADDED", never "the tree has no
+# forks" — read the baseline for what is still open.
+echo
+echo "[CHECK N1] D1 structural read-fork ratchet — frozen baseline, additions REFUSED"
+STRUCT_BASE="tools/adr0099_read_fork_structural_baseline.txt"
+[[ -f "$STRUCT_BASE" ]] || { echo "  ✗ FAIL: baseline missing: $STRUCT_BASE"; rm -f "$worklist" "$allowed_hits" "$structhits"; exit 1; }
+base_set="$(grep -vE '^\s*#' "$STRUCT_BASE" | sed '/^\s*$/d' | sort -u)"
+now_set="$(sort -u "$structhits" 2>/dev/null)"
+added="$(comm -13 <(printf '%s\n' "$base_set") <(printf '%s\n' "$now_set"))"
+stale="$(comm -23 <(printf '%s\n' "$base_set") <(printf '%s\n' "$now_set"))"
+rm -f "$structhits"
+struct_bad=0
+if [[ -n "$added" ]]; then
+  echo "  ✗ NEW structural read-fork(s) — a fresh DB opener whose handle is read through,"
+  echo "    in a function the baseline does not list. This is the shape that shipped four"
+  echo "    times (#40/#41/#42/E1). Route the read through the shared Handle"
+  echo "    (state.db.read()/.write() → try_clone), do NOT add it to the baseline:"
+  sed 's/^/      + /' <<< "$added"
+  struct_bad=1
+fi
+if [[ -n "$stale" ]]; then
+  echo "  ✗ STALE baseline entr(ies) — listed but no longer detected (fixed? renamed?)."
+  echo "    Remove them from $STRUCT_BASE in the same change, or the ratchet decays:"
+  sed 's/^/      - /' <<< "$stale"
+  struct_bad=1
+fi
+if [[ "$struct_bad" -ne 0 ]]; then
+  rm -f "$worklist" "$allowed_hits"
+  echo
+  echo "READ-FORK GATE: ✗ FAILED (CHECK N1 — structural ratchet)"
+  exit 1
+fi
+nb="$(grep -c . <<< "$base_set")"
+echo "  ✓ 0 new — $nb known structural fork(s) held at the frozen baseline."
+echo "    (NOT a coherence claim: $nb forks are still OPEN. See $STRUCT_BASE.)"
+echo
 
 if [[ "$remaining" -eq 0 ]]; then
   echo "✓ ZERO non-allow-listed in-serve audit read-forks — every in-serve audit reader is on the shared Handle."

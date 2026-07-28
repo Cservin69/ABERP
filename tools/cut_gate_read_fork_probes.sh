@@ -101,9 +101,21 @@ mod z {
     }
 }'
 
-expect_silent "P5 business read (no audit): Connection::open reading a business table" \
+# P5 — INVERTED 2026-07-28 (D1). This probe used to be an `expect_silent`, i.e. it
+# ASSERTED the business-table blind spot: a fresh opener reading a non-audit table
+# was invisible, so the whole gate only ever protected the audit ledger. That hole
+# is what `read_base_line_vat_kinds` fell through (#41 — a stale empty Vec let the
+# ADR-0101 S2 guard pass vacuously and re-file an exempt base to NAV at 0% ÁFA), and
+# the name PIN added then covered exactly one function. The structural rule covers
+# the shape, so this is now a POSITIVE.
+expect_emit "P5 business read (no audit): Connection::open reading a business table" \
 'fn _p(p: &std::path::Path) {
     let c = duckdb::Connection::open(p).unwrap();
+    let _ = c.prepare("SELECT id FROM vendors");
+}'
+expect_silent "P5b the SAME business read, Handle-routed (the fix must go quiet)" \
+'fn _p(db: &aberp_db::Handle) {
+    let c = db.read().unwrap();
     let _ = c.prepare("SELECT id FROM vendors");
 }'
 

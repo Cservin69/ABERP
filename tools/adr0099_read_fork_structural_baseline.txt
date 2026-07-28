@@ -1,0 +1,95 @@
+# ADR-0099 CHECK N1 — FROZEN baseline of D1 STRUCTURAL read-forks.
+# Format: <path>|<fn>.  Enforced by tools/cut_gate_read_fork.sh as an EXACT SET:
+# an ADDED entry is a new fork and goes RED; a STALE entry (fixed or renamed) also
+# goes RED, so the file cannot decay into names that no longer mean anything.
+#
+# ── WHAT THIS FILE IS, AND WHAT IT IS NOT ──
+# The read-fork scanner keyed off NAMES until 2026-07-28: a list of read-helper
+# names and a list of enclosing-fn names. FOUR instances of one bug class shipped
+# through that hole (#40 render, #41 modification base, #42 auto-email, E1) because
+# the same defective SHAPE under an UNLISTED name was invisible. The scanner now
+# detects the shape itself — a fresh live-DB opener bound to a local whose handle
+# (or a derivative) is read through, under ANY fn name.
+#
+# Switching that on found 28 PRE-EXISTING forks. TWELVE are live in-serve on the
+# serve-held tenant DB — the exact defect class, never before visible to any gate.
+# Migrating them is product work (each is a read-path change on live routes, several
+# on the invoice/NAV path) with its own review; it is deliberately NOT done in the
+# detector-hardening change that found them. So this file FREEZES them.
+#
+# `CHECK N1 ✓ 0 new` therefore means "no fork was ADDED". It does NOT mean the tree
+# is fork-free. The 28 below are OPEN. Nothing here is an exemption, an allow-list,
+# or a claim of coherence — it is a debt register with teeth on additions.
+#
+# NEVER add a line here to make the gate pass. A new hit means a NEW fork: route the
+# read through the shared Handle (`state.db.read()`/`.write()` → `try_clone`).
+# Lines are removed only when the fork is actually migrated, in that same change.
+#
+# Verdicts below are from the 2026-07-28 triage (call sites checked, not inferred).
+
+# ── GROUP A — LIVE IN-SERVE on the serve-held DB. GENUINE, OPEN, HIGHEST PRIORITY.
+# A second DuckDB instance co-resident with serve's Handle. Under H3 checkpointing
+# is disabled, so anything the Handle has written is WAL-resident and these read the
+# last-checkpointed SUBSET — the identical primitive behind #40/#41/#42/E1.
+#
+# `read_invoice_currency` is the twin of `read_base_currency`, which is PINNED and
+# already Handle-routed; `read_invoice_total_gross_minor` is the D2a shape verbatim
+# (fresh Connection::open + billing::load_ready_invoice_by_id). Both are called with
+# `&state.db_path` from serve.rs:10493 / 10512. Whatever argument migrated their
+# pinned siblings applies here unchanged; they were simply never named.
+apps/aberp/src/serve.rs|read_invoice_currency
+apps/aberp/src/serve.rs|read_invoice_total_gross_minor
+apps/aberp/src/serve.rs|resolve_recipient_email
+apps/aberp/src/serve.rs|calibration_overview_request
+apps/aberp/src/serve.rs|handle_quote_pipeline_status
+apps/aberp/src/serve.rs|handle_list_email_relay_queue
+apps/aberp/src/serve.rs|handle_get_email_relay_row
+apps/aberp/src/serve.rs|spawn_dap_audit_chain
+apps/aberp/src/reports.rs|compute_financial_report
+apps/aberp/src/quote_pdf_rerender_daemon.rs|prepare_rerender
+apps/aberp/src/audit_dap_boot.rs|run_heartbeat_supervised
+# `write_one` also APPENDS (write_mes_adapter_event) through its fresh connection,
+# so it is a WRITE-fork too — yet CHECK 10M reports ZERO, because its append-token
+# set does not know that helper name either. Same name-list failure, other gate.
+crates/aberp-mes/src/ledger_writer.rs|write_one
+
+# ── GROUP B — SEPARATE-PROCESS CLI one-shots. Coherent, but NOT allow-listed.
+# The parent `run` of most of these IS already on the read-fork allow-list; these
+# are helpers it calls in the same flock-fenced process, and the old scanner never
+# saw them (business-table reads, or reads one indirection away). They belong in
+# tools/adr0099_read_fork_allowlist.txt once each is re-verified against the
+# EXEMPTION↔PREMISE coupling above — moving them is a deliberate follow-up, not
+# something to do silently inside a detector change.
+apps/aberp/src/drain_pending_retries.rs|run
+apps/aberp/src/drain_pending_retries.rs|drive_one_retry
+apps/aberp/src/mark_abandoned.rs|resolve_stuck_or_loud_fail
+apps/aberp/src/recover_from_nav.rs|resolve_recovery_precondition
+apps/aberp/src/request_technical_annulment.rs|load_base_invoice_issue_year
+apps/aberp/src/observe_receiver_confirmation.rs|load_base_nav_invoice_number
+# ⚠ These two hold NO flock (`acquire_or_refuse` / `try_acquire` absent from both
+# files), so the premise that makes a CLI one-shot's fresh read coherent — mutual
+# exclusion against serve — is NOT established for them. They must NOT be moved to
+# the allow-list as-is; either fence them or migrate them.
+apps/aberp/src/print_invoice.rs|render_to_bytes
+crates/aberp-inventory/src/bin/rebuild_stock_cache.rs|run
+
+# ── GROUP C — NOT the serve-held live path. No fork; the shape rule cannot tell.
+# A static shape scanner sees `Connection::open(x)`; it cannot see WHICH file `x` is
+# or whether serve's Handle exists yet. These are the cases where that matters. The
+# discriminator they all have is runtime, not textual — which is exactly what the
+# SERVE_HANDLE_LIVE tripwire provides, and it stays silent on every one of them.
+# serve.rs|run — `provision_atomic`, at boot, BEFORE the shared Handle is opened.
+apps/aberp/src/serve.rs|run
+# These three open a DIFFERENT tenant's DB file (the demo / newly-created tenant),
+# not `args.db`, so they are not co-resident with the serve Handle at all.
+apps/aberp/src/serve.rs|bootstrap_demo_tenant
+apps/aberp/src/serve.rs|seed_demo_sample_data
+apps/aberp/src/serve.rs|create_tenant_request
+# Snapshot machinery on TEMP/STAGING files, plus the ADR-0099 H2 pre-boot probe
+# (`probe_open` is by definition the open that happens before any other).
+crates/aberp-snapshot/src/crash_safe.rs|checkpoint_file
+crates/aberp-snapshot/src/crash_safe.rs|probe_open
+crates/aberp-snapshot/src/take.rs|restore_into
+# `Ledger::open` ITSELF — the opener implementation, which hands its new connection
+# to `Self::initialise`. It is the seam the tripwire hooks, not a caller of one.
+crates/audit-ledger/src/storage/mod.rs|open
