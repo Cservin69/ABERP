@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use aberp_billing::{Currency, RateMetadata};
-use aberp_invoice_pdf::{render_invoice, InvoiceModel, LineItem, PartyInfo};
+use aberp_invoice_pdf::{render_invoice, InvoiceModel, LineItem, PartyInfo, TenantLogo};
 use rust_decimal::Decimal;
 use time::macros::date;
 
@@ -166,9 +166,75 @@ fn sample_eur_long() -> InvoiceModel {
     }
 }
 
+/// PR-279 — reproduces the exact shape of the invoice Ervin flagged
+/// (TEST-ABERPNEW2026/0063): a single line at 16 × 130 000 Ft net, 27%
+/// ÁFA, 2 641 600 Ft gross. On the pre-PR-279 geometry the `27%` and
+/// `2 641 600 Ft` values printed on top of each other.
+///
+/// The second line pushes past the reported defect to a 9-digit gross —
+/// the worst case the column band is now derived against — so the
+/// eyeball check covers headroom, not just the reported value.
+///
+/// Renders with the tenant logo when `ABERP_SAMPLE_LOGO_PNG` points at
+/// a PNG, so the sample can show the approved brand mark in the header
+/// without the example reaching into `~/.aberp`.
+fn sample_column_overlap_repro() -> InvoiceModel {
+    let tenant_logo = std::env::var("ABERP_SAMPLE_LOGO_PNG").ok().map(|p| {
+        let bytes = fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+        TenantLogo::from_png_bytes(&bytes).expect("decode sample logo PNG")
+    });
+    InvoiceModel {
+        invoice_number: "TEST-ABERPNEW2026/0063".to_string(),
+        issue_date: date!(2026 - 07 - 28),
+        fulfillment_date: date!(2026 - 07 - 28),
+        payment_due_date: date!(2026 - 08 - 05),
+        payment_method: "Átutalás".to_string(),
+        currency: Currency::Huf,
+        rate_metadata: None,
+        supplier: supplier(),
+        customer: customer_huf(),
+        lines: vec![
+            LineItem {
+                description: "Erste BA".to_string(),
+                quantity: Decimal::from(16),
+                unit: "nap".to_string(),
+                unit_price_minor: 130_000,
+                net_minor: 2_080_000,
+                vat_rate_percent: 27,
+                vat_minor: 561_600,
+                gross_minor: 2_641_600,
+                performance_period: None,
+                note: None,
+            },
+            LineItem {
+                description: "Szerszámacél megmunkálás és hőkezelés — \
+                              teljes sorozat, NAV-megfelelőségi \
+                              dokumentációval"
+                    .to_string(),
+                quantity: Decimal::from(742),
+                unit: "db".to_string(),
+                unit_price_minor: 131_200,
+                net_minor: 97_350_400,
+                vat_rate_percent: 27,
+                vat_minor: 26_284_608,
+                gross_minor: 123_635_008,
+                performance_period: None,
+                note: None,
+            },
+        ],
+        note: None,
+        tenant_logo,
+        brand_primary_color: None,
+    }
+}
+
 fn main() {
     write_sample("sample-huf-short", &sample_huf_short());
     write_sample("sample-eur-long", &sample_eur_long());
+    write_sample(
+        "sample-column-overlap-repro",
+        &sample_column_overlap_repro(),
+    );
     println!("\nsamples in: {}", out_dir().display());
     println!("\nrasterize with ghostscript (page 1 → PNG):");
     println!(

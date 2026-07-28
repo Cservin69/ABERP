@@ -512,7 +512,7 @@ fn write_party(
 
 /// PR-85 — line-item column geometry. Pulled into a named struct so
 /// the column positions are tunable in one place (and so the test
-/// for description-wrap can use the same `DESC_WRAP_CHARS` value the
+/// for description-wrap can use the same `DESC_WIDTH` value the
 /// renderer uses).
 ///
 /// Pre-PR-85 the table sat hard against the right margin and the
@@ -520,6 +520,23 @@ fn write_party(
 /// `NETTÓ EGYSÉGÁR` / `BRUTTÓ ÁR` headers visually kissed each other.
 /// This pass shifts every column slightly left off the right margin
 /// AND widens the gutters between right-edges of adjacent columns.
+///
+/// PR-279 — PR-85's nudge-the-constants pass did not hold: the ÁFA and
+/// BRUTTÓ ÁR values still collided on a live invoice (`27%2 641 600 Ft`).
+/// The right-edges below are no longer hand-tuned. They are DERIVED,
+/// right-to-left from `GROSS_RIGHT`, as
+///
+///   `edge(n) = edge(n+1) − width(n+1) − MIN_GUTTER`
+///
+/// where `width(n)` is the real Helvetica advance ([`text::text_width_points`])
+/// of the WIDEST content that column can carry — its bold size-8 header
+/// or its worst-case size-9 value, whichever is wider. Worst-case value
+/// is a 9-digit NEGATIVE (storno) amount: `-123 641 600 Ft` at 63pt,
+/// which is also the widest EUR shape (`-€ 1 234 567,89`, 63pt).
+///
+/// `layout_gutters_clear_worst_case_row` pins the invariant, so a future
+/// tweak to any edge that closes a gutter fails the suite rather than
+/// reaching a customer's PDF.
 struct TableLayout;
 
 impl TableLayout {
@@ -527,15 +544,16 @@ impl TableLayout {
     const NUM_X: i64 = MARGIN_LEFT;
     /// Description column anchor (left-aligned).
     const DESC_X: i64 = MARGIN_LEFT + 18;
-    /// Description column maximum width in characters before wrap.
-    /// At size 9 with the 0.55-of-size proxy ≈ 4.95 pts/char, 40
-    /// chars ≈ 198 pts of horizontal real estate — comfortably inside
-    /// the description-to-quantity gutter. Deliberately set BELOW the
-    /// existing print_invoice_render fixture description's 42 chars so
-    /// that the wrap behaviour is exercised by the workspace test suite
-    /// (a regression that loses the wrap fires as a layout drift in
-    /// the next sample render, not silently).
-    const DESC_WRAP_CHARS: usize = 40;
+    /// Description column maximum width in POINTS before wrap.
+    ///
+    /// PR-279 — was `DESC_WRAP_CHARS: usize = 40`, a char count. Same
+    /// root cause as the numeric-column overlap: a char count is blind
+    /// to glyph width, so a 40-char all-caps description (caps average
+    /// ≈ 0.7 em, not the assumed 0.55) ran ~70pt past where the count
+    /// implied and into the MENNYISÉG column. Now measured in points
+    /// against the real metric via [`wrap_to_width`], sized to land one
+    /// `MIN_GUTTER` clear of `QTY_RIGHT`'s worst-case left extent.
+    const DESC_WIDTH: i64 = Self::QTY_RIGHT - Self::QTY_W - Self::MIN_GUTTER - (MARGIN_LEFT + 18);
     /// Per-extra-wrapped-description-line vertical advance (points).
     const DESC_WRAP_LINE_HEIGHT: i64 = 11;
 
@@ -543,27 +561,38 @@ impl TableLayout {
     /// so the right edge is the anchor; the leftmost glyph of the data
     /// floats left based on its width.
     ///
-    /// PR-85 — column positions tuned for breathing room. The pre-PR-85
-    /// layout had the VAT column hard up against the BRUTTÓ ÁR column
-    /// (visible overlap on the live render Ervin flagged: "27%₣905,00"
-    /// where 27% and €1 905,00 collided). Root cause: the 0.55-of-size
-    /// per-char proxy in `text_right` underestimates the width of `%`
-    /// (real ≈ 0.93×size) and uppercase header glyphs (real ≈ 0.7×size),
-    /// so right-aligned content was extending past its stated right-
-    /// edge by 5-10pt and into the next column.
+    /// PR-85 tried to fix the ÁFA/BRUTTÓ ÁR collision by nudging these
+    /// constants while leaving the flawed width proxy in place. It did
+    /// not hold — PR-279 fixes the proxy ([`text_right_in`]) and derives
+    /// the edges below from real content widths instead.
     ///
-    /// The fix here is structural rather than touching the shared
-    /// proxy: pull `VAT_RIGHT` far enough left that even with the
-    /// proxy's underestimate, neither the `27%` data nor the `ÁFA`
-    /// header crosses into the gross column. Other right-edges shift
-    /// outward slightly to widen the gutters Ervin asked for, and
-    /// `GROSS_RIGHT` pulls 6pt off `MARGIN_RIGHT` so the rightmost
-    /// column no longer hugs the page edge.
-    const QTY_RIGHT: i64 = MARGIN_LEFT + 270; // unchanged
-    const UNIT_PRICE_RIGHT: i64 = MARGIN_LEFT + 345; // was + 340 — +5 for wider gutter
-    const NET_RIGHT: i64 = MARGIN_LEFT + 410; // was + 400 — +10 for wider gutter
-    const VAT_RIGHT: i64 = MARGIN_LEFT + 435; // was + 432, BUT GROSS shifted left so net
-    const GROSS_RIGHT: i64 = MARGIN_RIGHT - 6; // was MARGIN_RIGHT exactly — pulled off edge
+    /// Minimum clear space between one column's worst-case left extent
+    /// and the previous column's right edge. 10pt ≈ 1.1 em at size 9 —
+    /// a visually unambiguous gutter at print size.
+    const MIN_GUTTER: i64 = 10;
+
+    // Worst-case content width per column, in points, at the real
+    // Helvetica advances — the wider of the bold size-8 header and the
+    // worst-case size-9 value. `column_widths_match_measured_content`
+    // pins each of these against `text::text_width_points`, so a stale
+    // number here fails the suite instead of silently shrinking a
+    // gutter.
+    const QTY_W: i64 = 52; // header `MENNYISÉG`
+    const UNIT_PRICE_W: i64 = 74; // header `NETTÓ EGYSÉGÁR` (widest header)
+    const NET_W: i64 = 63; // value `-123 641 600 Ft`
+    const VAT_W: i64 = 18; // value `27%`
+    const GROSS_W: i64 = 63; // value `-123 641 600 Ft`
+
+    // Right edges, DERIVED right-to-left from `GROSS_RIGHT`. Writing the
+    // subtraction out (rather than baking the results) is the point:
+    // PR-85 hand-tuned these five numbers and the gutters silently went
+    // negative. Here a column cannot encroach on its neighbour without
+    // someone deleting a `MIN_GUTTER` term in plain sight.
+    const GROSS_RIGHT: i64 = MARGIN_RIGHT - 6; // 6pt off the page edge
+    const VAT_RIGHT: i64 = Self::GROSS_RIGHT - Self::GROSS_W - Self::MIN_GUTTER;
+    const NET_RIGHT: i64 = Self::VAT_RIGHT - Self::VAT_W - Self::MIN_GUTTER;
+    const UNIT_PRICE_RIGHT: i64 = Self::NET_RIGHT - Self::NET_W - Self::MIN_GUTTER;
+    const QTY_RIGHT: i64 = Self::UNIT_PRICE_RIGHT - Self::UNIT_PRICE_W - Self::MIN_GUTTER;
 }
 
 /// Render the line-items table. Returns the y-coordinate of the
@@ -629,7 +658,7 @@ fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i6
         // to anchor at `y` (top of the row) — accountants read the
         // numbers off the row's top edge regardless of how tall the
         // description column grows.
-        let desc_lines = wrap_to_chars(&line.description, TableLayout::DESC_WRAP_CHARS);
+        let desc_lines = wrap_to_width(&line.description, TableLayout::DESC_WIDTH, 9, false);
         for (i_line, dline) in desc_lines.iter().enumerate() {
             text(
                 ops,
@@ -1009,13 +1038,29 @@ fn text_in(
 }
 
 /// Emit a right-anchored text run whose right edge sits at `x_right`,
-/// in `INK` colour. Width estimated from a Helvetica per-char proxy of
-/// `0.55 * size` (Helvetica is variable-width; the proxy is a coarse
-/// upper bound that keeps right-alignment visually correct without a
-/// full font-metrics lookup). Per CLAUDE.md rule 13: a metrics table
-/// would be ~200 LoC of glyph-width data for a layout that doesn't
-/// need that precision — the printed totals block visually right-
-/// aligns within 3-4 points of perfect.
+/// in `INK` colour. Width comes from the real Helvetica glyph advances
+/// ([`text::text_width_points`]).
+///
+/// PR-279 — this used to estimate width as a flat `0.55 * size` per
+/// char. That proxy is blind to glyph width in BOTH directions and the
+/// two errors compound on a right-aligned row:
+///   - it UNDER-estimates `%` (real 0.889 em), so `27%` right-aligned
+///     at `VAT_RIGHT` actually painted 4pt PAST its stated right edge;
+///   - it OVER-estimates the thousands-separator spaces in a money
+///     string (real 0.278 em), so `2 641 600 Ft` started 9pt further
+///     LEFT than it needed to.
+///
+/// Net: a 5pt overlap that printed as `27%2 641 600 Ft` on a live
+/// invoice. The defect scaled with the magnitude of the amount (more
+/// digits + more separators = bigger over-estimate), which is why only
+/// large gross values collided.
+///
+/// The old doc-comment justified the proxy as "a metrics table would be
+/// ~200 LoC we don't need". That table has existed since PR-249
+/// (`text::HELVETICA_W`, added for the header wrap) — this crate was
+/// carrying two width models and right-alignment was using the wrong
+/// one. Per CLAUDE.md rule 7 (surface conflicts, don't average them)
+/// there is now ONE width model for all measurement.
 fn text_right(
     ops: &mut Vec<Operation>,
     font: &str,
@@ -1038,8 +1083,8 @@ fn text_right_in(
     content: &str,
     color: Color,
 ) {
-    let est_width = (content.chars().count() as i64) * size * 55 / 100;
-    let x_left = x_right - est_width;
+    let width = crate::text::text_width_points(content, size, font == "FB");
+    let x_left = x_right - width;
     text_in(ops, font, size, x_left, y, content, color);
 }
 
@@ -1305,6 +1350,166 @@ mod tests {
         );
     }
 
+    /// PR-279 — THE pin for the defect Ervin flagged as unacceptable:
+    /// the ÁFA value printing on top of the BRUTTÓ ÁR value
+    /// (`27%2 641 600 Ft` on TEST-ABERPNEW2026/0063).
+    ///
+    /// Walks the line-item table's numeric band left-to-right and
+    /// asserts that every adjacent column pair keeps at least
+    /// `MIN_GUTTER` points of clear space between the left column's
+    /// right edge and the right column's worst-case LEFT extent —
+    /// measured with the same real-glyph metric the renderer aligns
+    /// with, so the assertion is over what actually gets painted.
+    ///
+    /// This fails on the pre-PR-279 geometry (gap was −5pt for the
+    /// 7-digit gross in the screenshot, −2pt for a 9-digit one), and it
+    /// fails again if anyone re-tunes a right-edge constant by hand.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn layout_gutters_clear_worst_case_row() {
+        // Widest content each column can carry: the bold size-8 header
+        // or the worst-case size-9 value. `-123 641 600 Ft` is a 9-digit
+        // storno amount — the widest money string the formatter emits
+        // (ties with EUR's `-€ 1 234 567,89`).
+        const WORST_MONEY: &str = "-123 641 600 Ft";
+        let cols: [(&str, i64, &str, &str); 5] = [
+            (
+                "MENNYISÉG",
+                TableLayout::QTY_RIGHT,
+                "MENNYISÉG",
+                "1 000 000 db",
+            ),
+            (
+                "NETTÓ EGYSÉGÁR",
+                TableLayout::UNIT_PRICE_RIGHT,
+                "NETTÓ EGYSÉGÁR",
+                WORST_MONEY,
+            ),
+            ("NETTÓ ÁR", TableLayout::NET_RIGHT, "NETTÓ ÁR", WORST_MONEY),
+            ("ÁFA", TableLayout::VAT_RIGHT, "ÁFA", "27%"),
+            (
+                "BRUTTÓ ÁR",
+                TableLayout::GROSS_RIGHT,
+                "BRUTTÓ ÁR",
+                WORST_MONEY,
+            ),
+        ];
+
+        // Left extent = right edge − max(header width @ FB/8, value width @ F1/9).
+        let left_extent = |right: i64, header: &str, value: &str| {
+            let w = crate::text::text_width_points(header, 8, true)
+                .max(crate::text::text_width_points(value, 9, false));
+            right - w
+        };
+
+        // The description column opens the band.
+        let mut prev_name = "MEGNEVEZÉS";
+        let mut prev_right = TableLayout::DESC_X + TableLayout::DESC_WIDTH;
+
+        for (name, right, header, value) in cols {
+            let left = left_extent(right, header, value);
+            let gutter = left - prev_right;
+            assert!(
+                gutter >= TableLayout::MIN_GUTTER,
+                "column `{prev_name}` (right edge {prev_right}) and `{name}` \
+                 (worst-case left extent {left}) leave only {gutter}pt — \
+                 below the {}pt minimum. Negative means they OVERLAP, which \
+                 is the `27%2 641 600 Ft` defect returning.",
+                TableLayout::MIN_GUTTER
+            );
+            prev_name = name;
+            prev_right = right;
+        }
+
+        // The band must also stay inside the printable area.
+        assert!(
+            TableLayout::GROSS_RIGHT <= MARGIN_RIGHT,
+            "gross column must not cross the right margin"
+        );
+        assert!(
+            TableLayout::DESC_X + TableLayout::DESC_WIDTH < TableLayout::QTY_RIGHT,
+            "description column must end before the quantity column"
+        );
+    }
+
+    /// PR-279 — the `*_W` constants that `TableLayout`'s right-edges are
+    /// derived FROM must equal the real measured width of the widest
+    /// thing each column carries. Without this the derivation is just
+    /// hand-tuned numbers wearing a subtraction: someone could widen a
+    /// column's content and the arithmetic would keep reporting healthy
+    /// gutters over a layout that overlaps.
+    #[test]
+    fn column_widths_match_measured_content() {
+        const WORST_MONEY: &str = "-123 641 600 Ft";
+        let hdr = |s: &str| crate::text::text_width_points(s, 8, true);
+        let val = |s: &str| crate::text::text_width_points(s, 9, false);
+
+        for (name, declared, measured) in [
+            (
+                "QTY_W",
+                TableLayout::QTY_W,
+                hdr("MENNYISÉG").max(val("1 000 000 db")),
+            ),
+            (
+                "UNIT_PRICE_W",
+                TableLayout::UNIT_PRICE_W,
+                hdr("NETTÓ EGYSÉGÁR").max(val(WORST_MONEY)),
+            ),
+            (
+                "NET_W",
+                TableLayout::NET_W,
+                hdr("NETTÓ ÁR").max(val(WORST_MONEY)),
+            ),
+            ("VAT_W", TableLayout::VAT_W, hdr("ÁFA").max(val("27%"))),
+            (
+                "GROSS_W",
+                TableLayout::GROSS_W,
+                hdr("BRUTTÓ ÁR").max(val(WORST_MONEY)),
+            ),
+        ] {
+            assert_eq!(
+                declared, measured,
+                "TableLayout::{name} is {declared}pt but its widest content \
+                 measures {measured}pt — the derived right-edges are stale"
+            );
+        }
+
+        // EUR is the other currency the formatter emits; its worst shape
+        // must not exceed the HUF one the widths were derived from.
+        assert!(
+            val("-\u{20AC}\u{00A0}1 234 567,89") <= TableLayout::GROSS_W,
+            "worst-case EUR amount is wider than the derived money column"
+        );
+    }
+
+    /// PR-279 — pin the width model itself. Right-alignment must use
+    /// real glyph advances, not a per-char proxy. `27%` is the canonical
+    /// witness: three chars, but `%` alone is 0.889 em, so the flat
+    /// `0.55 * size` proxy called it 14pt when it actually paints 18pt —
+    /// the 4pt that ran into the gross column.
+    #[test]
+    fn right_alignment_measures_real_glyph_advances() {
+        let real = crate::text::text_width_points("27%", 9, false);
+        let old_proxy = 3 * 9 * 55 / 100;
+        assert_eq!(real, 18, "Helvetica `27%` at size 9 is 18pt");
+        assert!(
+            real > old_proxy,
+            "the retired proxy ({old_proxy}pt) under-measured `27%` ({real}pt) — \
+             if this stops holding the regression witness is gone"
+        );
+
+        // And the opposite error, which compounded with it: a money
+        // string's thousands separators are 0.278 em, far NARROWER than
+        // the proxy's flat guess, so the proxy pushed it too far left.
+        let money = "2 641 600 Ft";
+        let money_real = crate::text::text_width_points(money, 9, false);
+        let money_proxy = (money.chars().count() as i64) * 9 * 55 / 100;
+        assert!(
+            money_real < money_proxy,
+            "proxy {money_proxy}pt should have OVER-measured `{money}` ({money_real}pt)"
+        );
+    }
+
     /// PR-85 — pin the description-wrap behaviour. A short description
     /// fits on one line; a long one wraps; and no mid-word break
     /// occurs (a long URL or product code prints on its own line as
@@ -1313,20 +1518,20 @@ mod tests {
     fn description_wraps_when_long() {
         // A clearly-short description stays on one line.
         let short = "Tanácsadói díj";
-        assert!(short.chars().count() <= TableLayout::DESC_WRAP_CHARS);
-        let wrapped_short = wrap_to_chars(short, TableLayout::DESC_WRAP_CHARS);
+        assert!(crate::text::text_width_points(short, 9, false) <= TableLayout::DESC_WIDTH);
+        let wrapped_short = wrap_to_width(short, TableLayout::DESC_WIDTH, 9, false);
         assert_eq!(wrapped_short.len(), 1);
 
-        // A long description wraps to multiple lines (≥ 2). Note the
-        // existing `print_invoice_render` integration fixture's 42-char
-        // description sits ABOVE the 40-char wrap width — its wrap-to-
-        // two-lines behaviour is exercised by that suite, which keeps
-        // the wrap path live in CI.
+        // A long description wraps to multiple lines (≥ 2). The
+        // existing `print_invoice_render` integration fixture's
+        // description sits ABOVE the wrap width — its wrap-to-two-lines
+        // behaviour is exercised by that suite, which keeps the wrap
+        // path live in CI.
         let long = "Tanácsadói szolgáltatás Áben Consulting KFT részére \
                     2026 második negyedévében az ERP-rendszer bevezetésére \
                     vonatkozóan, NAV-megfelelőség és könyvviteli integráció \
                     kiegészítéssel";
-        let wrapped_long = wrap_to_chars(long, TableLayout::DESC_WRAP_CHARS);
+        let wrapped_long = wrap_to_width(long, TableLayout::DESC_WIDTH, 9, false);
         assert!(
             wrapped_long.len() >= 2,
             "long description must wrap to ≥ 2 lines; got {} lines",
@@ -1339,6 +1544,22 @@ mod tests {
             for word in line.split_whitespace() {
                 assert!(!word.is_empty(), "no empty fragments in a wrapped line");
             }
+        }
+
+        // PR-279 — the reason the wrap moved off a char count: an
+        // ALL-CAPS description of the same char length is far wider in
+        // real glyphs. Under `DESC_WRAP_CHARS = 40` this fit on one
+        // line by the count while painting ~70pt into the MENNYISÉG
+        // column. Every emitted line must now measure inside the column.
+        let caps = "SZERSZÁMACÉL MEGMUNKÁLÁS ÉS HŐKEZELÉS KOMPLETT";
+        for line in &wrap_to_width(caps, TableLayout::DESC_WIDTH, 9, false) {
+            assert!(
+                crate::text::text_width_points(line, 9, false) <= TableLayout::DESC_WIDTH,
+                "wrapped line {line:?} measures \
+                 {}pt — past the {}pt description column",
+                crate::text::text_width_points(line, 9, false),
+                TableLayout::DESC_WIDTH
+            );
         }
     }
 
