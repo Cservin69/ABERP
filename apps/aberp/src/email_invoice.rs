@@ -12,9 +12,11 @@
 //!      is the to-address. If the partner has no email, the send is
 //!      refused with `MissingRecipient` — wrong-recipient guard
 //!      (ADR-0047 §3 — never silently send to a fallback).
-//!   2. Renders the printed PDF via the existing
-//!      [`crate::print_invoice::render_to_bytes`] path. Same byte
-//!      shape the operator would download.
+//!   2. Attaches the printed PDF the CALLER rendered. Same byte shape
+//!      the operator would download — the caller obtains it from
+//!      `serve::get_invoice_pdf`, which renders off the shared
+//!      `aberp_db::Handle`. This module holds NO DB path and opens NO
+//!      connection: see [`SendInvoiceEmailInput::pdf_bytes`].
 //!   3. Optionally attaches the on-disk NAV InvoiceData XML (the
 //!      verbatim wire body) when `attach_xml = true` in the config.
 //!   4. Composes a bilingual (HU + EN) email subject + body
@@ -77,7 +79,6 @@ use zeroize::Zeroizing;
 
 use crate::audit_payloads::InvoiceEmailedSentPayload;
 use crate::binary_hash;
-use crate::print_invoice;
 use crate::smtp_config::{self, SmtpConfig, SmtpSecurity};
 
 /// Typed outcome of a send attempt. Maps onto the
@@ -232,8 +233,27 @@ impl SendTrigger {
 pub struct SendInvoiceEmailInput<'a> {
     pub invoice_id: &'a str,
     pub tenant: &'a str,
-    pub db_path: &'a Path,
-    pub seller_toml_path: &'a Path,
+    /// The rendered invoice PDF, supplied by the CALLER.
+    ///
+    /// ADR-0099 H3 / CHECK N — 2026-07-28. This used to be a `db_path` +
+    /// `seller_toml_path` pair that this module handed to the PATH-TAKING
+    /// `print_invoice::render_to_bytes`, which opens its OWN
+    /// `aberp_db::Handle` on the tenant DB. In-serve
+    /// (`serve::send_invoice_email_route`, reached by BOTH auto-send-on-issue
+    /// and the manual `POST /api/invoices/:id/email` resend) that is a SECOND
+    /// DuckDB instance co-resident with serve's shared Handle: with runtime
+    /// checkpointing disabled under H3 it does not replay the live writer's
+    /// WAL, so an invoice issued in THIS serve process rendered back as
+    /// `no InvoiceDraftCreated audit entry found` — the 2026-07-27 DEV
+    /// `auto-email on issue` compose failure. PR #40 moved
+    /// `serve::get_invoice_pdf` onto the Handle but left this path, which
+    /// reaches the renderer directly and not through `get_invoice_pdf`.
+    ///
+    /// Taking BYTES rather than a path removes the capability rather than
+    /// re-routing it (CLAUDE.md rule 12): this module can no longer open the
+    /// DB at all, so the fork cannot come back here. The caller renders via
+    /// `serve::get_invoice_pdf` (shared-Handle) and passes the result.
+    pub pdf_bytes: &'a [u8],
     /// PR-98 — partner `contact_email` may carry MULTIPLE addresses,
     /// canonical-form `"a@x.com, b@y.com"` (the storage normaliser
     /// emits `", "` separators). The send path parses the string via
@@ -315,17 +335,10 @@ pub async fn send_invoice_email(
         validate_no_crlf("from_display_name", name)?;
     }
 
-    // Render the PDF via the existing path. The renderer is the
-    // single source of byte truth — no separate "email PDF" shape.
-    let rendered = print_invoice::render_to_bytes(
-        input.invoice_id,
-        input.db_path,
-        input.tenant,
-        Some(input.seller_toml_path),
-    )
-    .map_err(|e| {
-        EmailSendError::Compose(e.context("render printed PDF for SMTP email attachment"))
-    })?;
+    // The PDF is rendered by the caller off the shared Handle and handed in
+    // as bytes (see `SendInvoiceEmailInput::pdf_bytes`). The renderer is
+    // still the single source of byte truth — there is no separate "email
+    // PDF" shape — but this module no longer reaches the DB to get it.
 
     // Optional XML attachment.
     let xml_bytes = if let Some(path) = input.xml_path_if_attached {
@@ -372,7 +385,7 @@ pub async fn send_invoice_email(
     );
 
     let pdf_part = Attachment::new(pdf_filename).body(
-        rendered.pdf_bytes.clone(),
+        input.pdf_bytes.to_vec(),
         ContentType::parse("application/pdf").map_err(|e| {
             EmailSendError::Compose(anyhow!("content-type parse application/pdf: {e}"))
         })?,

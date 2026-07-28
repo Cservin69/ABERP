@@ -20860,11 +20860,58 @@ pub async fn send_invoice_email_route(
     } else {
         None
     };
+    // H3 (ADR-0099) / CHECK N — 2026-07-28. Render the attachment HERE, off
+    // the shared Handle, and hand `email_invoice` the bytes.
+    //
+    // `email_invoice::send_invoice_email` used to render it itself from a
+    // `db_path`, through the PATH-TAKING `print_invoice::render_to_bytes`,
+    // which opens its OWN `aberp_db::Handle` — a second DuckDB instance
+    // co-resident with serve's. With checkpointing disabled under H3 it does
+    // not replay the live writer's WAL, so an invoice issued in THIS serve
+    // process rendered back as "no InvoiceDraftCreated audit entry found":
+    // the 2026-07-27 DEV `auto-email on issue` compose failure. PR #40 fixed
+    // `get_invoice_pdf` (the PDF route and the resend handler's number
+    // lookup) but NOT this path — it does not funnel through `get_invoice_pdf`
+    // and reaches the renderer directly.
+    //
+    // `get_invoice_pdf` is the same renderer on the shared Handle, so the
+    // attachment stays byte-identical to the operator's own download.
+    let rendered = match get_invoice_pdf(state, invoice_id, Some(&seller_toml_path)) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return finalize_email_audit(
+                state,
+                invoice_id,
+                operator_login,
+                trigger,
+                Err(EmailSendError::Compose(anyhow!(
+                    "render printed PDF for SMTP email attachment: invoice {invoice_id} \
+                     not found in the audit ledger"
+                ))),
+                recipient_email,
+                String::new(),
+                false,
+            );
+        }
+        Err(e) => {
+            return finalize_email_audit(
+                state,
+                invoice_id,
+                operator_login,
+                trigger,
+                Err(EmailSendError::Compose(
+                    e.context("render printed PDF for SMTP email attachment"),
+                )),
+                recipient_email,
+                String::new(),
+                false,
+            );
+        }
+    };
     let input = SendInvoiceEmailInput {
         invoice_id,
         tenant: state.tenant.as_str(),
-        db_path: state.db_path.as_path(),
-        seller_toml_path: &seller_toml_path,
+        pdf_bytes: &rendered.pdf_bytes,
         recipient_email: &recipient_email,
         recipient_display_name: recipient_display_name.as_deref(),
         invoice_number,

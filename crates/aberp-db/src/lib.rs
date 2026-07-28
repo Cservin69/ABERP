@@ -238,6 +238,20 @@ impl Handle {
         // `LedgerMeta` with the real `binary_hash` they `wait()` for; they never
         // use this meta for `append_in_tx`.
         let meta = LedgerMeta::new(tenant.clone(), BinaryHash::from_bytes([0u8; 32]));
+        // SERVE_HANDLE_LIVE (ADR-0099 H3 Addendum 3) — 2026-07-28. The tripwire
+        // hooked `Ledger::open` and `DuckDbBillingStore::open` but NOT the Handle
+        // constructor itself, so a SECOND Handle opened in-serve on the same file
+        // was invisible to it. That gap is not theoretical: PR #40 moved
+        // `print_invoice::render_to_bytes` from a bare `Ledger::open` (hooked) to
+        // its own `Handle::open_default` (unhooked) while
+        // `email_invoice::send_invoice_email` still reached it in-serve — the
+        // detector went quiet on a path that still forked. `open_runtime_connection`
+        // below is a real second OS open; the `disable_checkpoint_on_shutdown`
+        // pragma stops it TEARING the live WAL, but it still does not REPLAY it, so
+        // it reads the last-checkpointed subset exactly like the openers it
+        // replaced. Registration happens AFTER this call in `serve::run`, so serve's
+        // own boot open cannot trip on itself. Debug/test only, like every other arm.
+        aberp_audit_ledger::serve_tripwire::assert_no_serve_handle(db_path, "Handle::open");
         let conn = open_runtime_connection(db_path, &config)?;
         // Capture the coalescing window before `config` moves into the struct.
         let min_interval = config.min_checkpoint_interval;
