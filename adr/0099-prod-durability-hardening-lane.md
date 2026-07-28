@@ -1404,7 +1404,24 @@ audit-ledger/PINNED scope is unchanged.
 and its caller has no opener textually in the reading fn. Closing that needs the call
 graph; the runtime tripwire is call-graph-complete and now covers `Handle::open`. The
 static and runtime halves are complements — neither alone catches all four historical
-instances.
+instances. **Size that complement honestly** (2026-07-28, pre-cut v2.33.2 review):
+`assert_no_serve_handle` is `#[cfg(debug_assertions)]` and an explicit no-op in
+release, so in a PROD build the runtime half is INERT and the static scanner stands
+alone. This residual has no production backstop — it is covered in dev/test runs and
+nowhere else.
+
+**Addendum 5a (2026-07-28) — the shape rule was defeated by `rustfmt`.** The D1 rule
+was recognised only in line-local forms, so a read call WRAPPED across lines read as
+clean — meaning its reach depended on the character length of the callee's path.
+`rustfmt` emits that wrapping automatically past 100 columns, so adding one argument
+to a caught fork silently un-caught it. Two sibling gaps: only the FIRST link of a
+method chain was inspected (`h.read()?.query_row(…)` clean), and a read chained onto
+the opener itself was never tainted (`Connection::open(p)?.query_row(…)` clean).
+Fixing all three surfaced **five more pre-existing forks (28 → 33, 12 → 13 live
+in-serve)**, incl. `serve::handle_relay_send_email` — a live route whose fresh
+`Connection::open` writes the relay queue while the shared Handle is live, and whose
+sibling READERS of that table were already baselined. Frozen, not silenced. Full
+triage: `docs/findings/precut-integration-v2_33_2-2026-07-28.md`.
 
 **Residual 2 — CHECK 10M has the identical weakness.** Its append-token set is also a
 name list: `aberp-mes::ledger_writer::write_one` opens a fresh connection in-serve and
