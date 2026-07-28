@@ -51,6 +51,84 @@ fn billing_store_open_trips_while_serve_handle_registered() {
     let _ = DuckDbBillingStore::open(&db);
 }
 
+// ── `Handle::open` — the opener the tripwire did NOT hook until 2026-07-28 ──
+//
+// `Ledger::open` and `DuckDbBillingStore::open` have had teeth tests above since
+// the tripwire was built. `Handle::open` had none, and was not hooked: a forked
+// reader could MOVE from a hooked opener to an unhooked one and go invisible. That
+// is not hypothetical — it is how E1 hid. PR#40 migrated
+// `print_invoice::render_to_bytes` off a bare `Ledger::open` onto its own
+// `Handle::open_default` while `email_invoice::send_invoice_email` still reached it
+// in-serve, and the detector went quiet on a path that STILL forked. #42 hooked the
+// Handle constructor; these two tests are the teeth for that hook.
+//
+// A second `Handle` is a second DuckDB instance. The H3
+// `disable_checkpoint_on_shutdown` pragma stops it TEARING the live WAL on close,
+// but it never REPLAYS it — so it reads the last-checkpointed subset exactly like
+// the openers it replaced. Being "the sanctioned type" does not make a second one
+// coherent; being the ONE instance does.
+
+/// A request-path business-table read in its two forms. `_forked` is the shape that
+/// shipped four times: a helper handed the DB PATH, which opens its own instance.
+/// `_handle_routed` is the fix — the caller's already-open shared Handle.
+fn read_widget_count_forked(db_path: &std::path::Path) -> i64 {
+    let h = aberp_db::Handle::open_default(db_path, tid()).expect("second Handle::open");
+    let conn = h.read().expect("read off the second Handle");
+    conn.query_row("SELECT count(*) FROM widget", [], |r| r.get(0))
+        .expect("count widgets")
+}
+
+fn read_widget_count_handle_routed(db: &aberp_db::Handle) -> i64 {
+    let conn = db.read().expect("read off the shared Handle");
+    conn.query_row("SELECT count(*) FROM widget", [], |r| r.get(0))
+        .expect("count widgets")
+}
+
+/// Boot the ONE Handle in serve's order (open, THEN register — serve.rs does the
+/// same, so the boot Handle can never trip on itself), seed a business table
+/// through it, and return both. Reaching the end at all proves the `Handle::open`
+/// hook does not false-fire on the legitimate boot open.
+fn boot_serve_handle(
+    tag: &str,
+) -> (
+    PathBuf,
+    std::sync::Arc<aberp_db::Handle>,
+    aberp_audit_ledger::serve_tripwire::ServeHandleGuard,
+) {
+    let db = fresh_db(tag);
+    let handle = aberp_db::Handle::open_default(&db, tid()).expect("boot handle");
+    {
+        let w = handle.write().expect("boot write");
+        w.execute_batch("CREATE TABLE widget(id INTEGER); INSERT INTO widget VALUES (1), (2);")
+            .expect("seed business table");
+    }
+    let guard = register_serve_handle(&db);
+    assert!(is_serve_handle_live(&db));
+    // The boot Handle keeps working AFTER registration — the tripwire must fire on a
+    // SECOND, in-request open, never on the one instance serve legitimately holds.
+    assert_eq!(read_widget_count_handle_routed(&handle), 2);
+    (db, handle, guard)
+}
+
+#[test]
+#[should_panic(expected = "SERVE_HANDLE_LIVE tripwire")]
+fn a_request_path_business_reader_that_opens_its_own_handle_trips() {
+    let (db, _handle, _guard) = boot_serve_handle("handle-trip");
+    // In-request, on the live path serve holds: the fresh `Handle::open` must trip
+    // BEFORE the stale read can happen. `boot_serve_handle` has already asserted the
+    // boot Handle reads clean, so this panic can only come from the second open.
+    let _ = read_widget_count_forked(&db);
+}
+
+#[test]
+fn the_same_request_path_reader_is_clean_once_handle_routed() {
+    // Same fn, same live path, same registered tripwire — the ONLY difference is
+    // that it reads through the Handle serve already holds instead of opening its
+    // own. No trip, and the count is the WAL-resident truth (2), not a stale subset.
+    let (_db, handle, _guard) = boot_serve_handle("handle-routed");
+    assert_eq!(read_widget_count_handle_routed(&handle), 2);
+}
+
 #[test]
 fn ledger_open_does_not_trip_when_unregistered() {
     let db = fresh_db("ledger-clean");

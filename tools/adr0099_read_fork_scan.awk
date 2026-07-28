@@ -60,14 +60,54 @@
 # VACUOUSLY over that empty vector, and an exempt / reverse-charge base was
 # re-filed to NAV as plain 0% VAT.
 #
-# The general fix is structural (flag ANY fn holding a fresh opener whose reads
-# leave the fn — the D1 rewrite). Until that lands, `PINNED` is a name RATCHET:
-# a listed fn may hold NO fresh opener at all, whatever it reads, and no
-# allow-list entry can exempt it. It is honest about what it is — teeth on the
-# names we have actually audited and migrated, not a claim of coverage. ADD a
-# name here ONLY together with its migration to the shared Handle; a pinned
-# name that still forks makes this gate RED, which is the point.
+# ── D1 (2026-07-28): the STRUCTURAL rule — the name allow-list is CLOSED ──
+# Everything above keys off a NAME: the typed-read token set (`find_invoice_draft`,
+# `pending_from_ledger`, `list_notes_history`, …) is a list of helper names, and
+# `PINNED` is a list of enclosing-fn names. FOUR instances of one bug class shipped
+# through that (#40 render, #41 modification base, #42 auto-email, E1) because the
+# same defective SHAPE under an UNLISTED name is invisible. A scanner that only
+# catches names it was told about does not protect against the class.
+#
+# The shape, stated without reference to any name:
+#
+#     a FRESH live-DB opener bound to a local, whose handle (or anything derived
+#     from it) is then READ THROUGH — a non-propagating method call, or the value
+#     handed to ANOTHER function — inside a runtime fn that does not itself append.
+#
+# `Handle::open` / `Handle::open_default` JOIN the opener set here. They are absent
+# from the ADR-0098 opener census (which by design treats the shared Handle as THE
+# sanctioned seam — sound only while there is exactly ONE) and, until 2026-07-28,
+# from the SERVE_HANDLE_LIVE tripwire. That is precisely how E1 hid: PR#40 moved
+# `print_invoice::render_to_bytes` off a bare `Ledger::open` (censused AND hooked)
+# onto its own `Handle::open_default` (neither), and every detector went quiet on a
+# path that still forked. A second Handle is a second DuckDB instance; it does not
+# replay the live WAL, so it reads the last-checkpointed subset exactly like the
+# opener it replaced.
+#
+# PROPAGATE vs READ. `.transaction()` / `.read()` / `.write()` / `.try_clone()` and
+# the unwrap family yield a DERIVATIVE of the forked handle, not a read — they
+# extend the taint (`let tx = conn.transaction()?` taints `tx`) so the read is
+# caught wherever it actually happens, one or more indirections later. Any other
+# method call on a tainted value, or a tainted value passed as an argument, IS the
+# read. Appends still belong to CHECK 10M (`cur_app` suppresses, as before).
+#
+# FACTORY CARVE-OUT and its residual. A fn that opens and RETURNS the handle
+# (`Ok(handle)`, `Ok(Arc::new(h))`, a bare tail `h`) is not itself a read-fork —
+# `serve::open_tenant_handle` is the sanctioned boot opener and must stay green.
+# The cost is honest and bounded: a fork SPLIT across two fns (a factory here, the
+# read in its caller) has no opener textually in the reading fn and this scanner
+# cannot see it. Closing that needs the call graph. The SERVE_HANDLE_LIVE runtime
+# tripwire IS call-graph-complete — it fires on the OPEN itself, whoever did it —
+# and as of 2026-07-28 it hooks `Handle::open` too. The two halves are complements,
+# not duplicates: neither alone would have caught all four instances.
+#
+# `PINNED` stays as a BACKSTOP under the structural rule (it fires on the opener
+# alone, with no read required and no allow-list exemption). It is now a ratchet on
+# names already migrated rather than the primary signal.
 BEGIN{ n_pin=split("read_base_line_vat_kinds,read_base_currency",P,",") }
+# Method calls that yield a DERIVATIVE of the forked handle rather than reading
+# through it — they extend the taint instead of tripping the rule.
+BEGIN{ split("transaction try_clone read write clone as_ref as_mut borrow borrow_mut lock unwrap expect ok context with_context",PR_," "); for(i_ in PR_) PROP[PR_[i_]]=1 }
 #
 # TWO parsing views are built per line so both shapes above are visible:
 #   code   — strings AND comments stripped: for openers / typed reads / appends
@@ -79,16 +119,63 @@ BEGIN{ n_pin=split("read_base_line_vat_kinds,read_base_currency",P,",") }
 BEGIN{ depth=0; tdepth=-1; pending=0; inblk=0; instr=0; inraw=0; rawh=0; fn_depth=-1; fn_pending=0; n_allow=split(allow,A,",") }
 function is_allowed(name,   k){ for(k=1;k<=n_allow;k++) if(A[k]==name) return 1; return 0 }
 function is_pinned(name,   k){ for(k=1;k<=n_pin;k++) if(P[k]==name) return 1; return 0 }
-function flush(   is_read, pinned_fork){
+# The single simple `let` binding a line introduces, or "" — `let x =`, `let mut x:
+# T =`. Destructuring (`let Some(x) = …`, `let (a, b) = …`) yields "" on purpose:
+# the taint is only followed through bindings this scanner can name exactly.
+function let_bind(c,   b){
+  if (!match(c, /(^|[^A-Za-z0-9_])let[ \t]+(mut[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*[:=]/)) return ""
+  b = substr(c, RSTART, RLENGTH)
+  sub(/.*[^A-Za-z0-9_]let[ \t]+/, "", b); sub(/^let[ \t]+/, "", b)
+  sub(/^mut[ \t]+/, "", b); sub(/[ \t]*[:=]$/, "", b)
+  return b
+}
+function has_word(c, w){ return match(c, "(^|[^A-Za-z0-9_])" w "($|[^A-Za-z0-9_])") }
+# Is this line NOTHING BUT a return/wrap of `w`? Then the fn is a FACTORY for the
+# opened handle, not a reader of it (see the factory carve-out in the header).
+function is_factory_line(c, w,   s){
+  s = c; gsub(/[ \t]/, "", s)
+  return s ~ ("^(return)?(Ok\\(|Some\\(|Arc::new\\(|Rc::new\\(|Box::new\\()*&?(mut)?" w "[?]?\\)*[;,]?$")
+}
+# Does this line READ THROUGH tainted value `w`? Either a non-propagating method
+# call on it, or `w` handed to another fn as an argument (the read-via-helper shape
+# that four shipped defects all had).
+function reads_through(c, w,   m, meth){
+  if (match(c, "(^|[^A-Za-z0-9_])" w "[ \t]*\\.[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*\\(")) {
+    meth = substr(c, RSTART, RLENGTH)
+    sub(/^.*[ \t]*\.[ \t]*/, "", meth); sub(/[ \t]*\($/, "", meth)
+    if (!(meth in PROP)) return 1
+  }
+  if (is_factory_line(c, w)) return 0
+  # `w` sitting in an argument list: preceded by `(` or `,` (only `&`/`mut` between)
+  # and closed by `,` or `)`. A struct-literal field (`db: h,`) has `:` before the
+  # value and so does NOT match — those store the handle, they do not read it.
+  if (match(c, "(\\(|,)[ \t]*&?[ \t]*(mut[ \t]+)?" w "[ \t]*[?]?[ \t]*(,|\\))") \
+      && c ~ /[A-Za-z_][A-Za-z0-9_:]*[ \t]*\(/) return 1
+  return 0
+}
+function flush(   is_read, pinned_fork, struct_fork){
   is_read = (cur_ledopen && cur_read) || (cur_connopen && cur_auditsel)
   # A PINNED name forks on the OPENER ALONE — no typed-read token required (its
   # reads are business-table, which this scanner cannot recognise) and no
   # allow-list exemption honoured.
   pinned_fork = (cur_ledopen || cur_connopen) && is_pinned(cur_fn)
-  if (cur_fn!="" && !cur_app && (pinned_fork || (is_read && !is_allowed(cur_fn)))) {
-    printf "%d:%s:readfork@L%d\n", cur_open_ln, cur_fn, cur_open_ln
+  # D1 — the STRUCTURAL signal: a fresh opener whose handle is read through, under
+  # ANY fn name. Honours the allow-list (flock-fenced CLI one-shots are coherent).
+  struct_fork = cur_freshopen && cur_structread && !is_allowed(cur_fn)
+  # TAGS route the two verdicts the gate keeps SEPARATE, and must stay distinct:
+  #   readfork@   — the audit-ledger / PINNED rules. ENFORCED AT ZERO (unchanged).
+  #   structfork@ — the D1 shape rule. Ratcheted against a frozen baseline, because
+  #                 turning it on surfaced 28 pre-existing forks (see the baseline
+  #                 file). A hit that is BOTH reports as `readfork` — one record per
+  #                 fn, and the stricter verdict owns it.
+  if (cur_fn!="" && !cur_app) {
+    if (pinned_fork || (is_read && !is_allowed(cur_fn)))
+      printf "%d:%s:readfork@L%d\n", cur_open_ln, cur_fn, cur_open_ln
+    else if (struct_fork)
+      printf "%d:%s:structfork@L%d\n", cur_open_ln, cur_fn, cur_open_ln
   }
   cur_ledopen=0; cur_connopen=0; cur_read=0; cur_auditsel=0; cur_app=0; cur_open_ln=0
+  cur_freshopen=0; cur_structread=0; split("", T)
 }
 {
   line=$0
@@ -181,6 +268,26 @@ function flush(   is_read, pinned_fork){
     if (codenc ~ /[Ff][Rr][Oo][Mm][ \t]+audit_ledger/) { cur_auditsel=1 }
     if (code ~ /\.append(_signed)?[ \t]*\(/ || code ~ /append_in_tx(_signed)?[ \t]*\(/ \
         || code ~ /append_reopen[ \t]*\(/ || codenc ~ /[Ii][Nn][Tt][Oo][ \t]+audit_ledger/) { cur_app=1 }
+
+    # ── D1 STRUCTURAL RULE (2026-07-28) ──
+    # Order matters within the line: a READ through an already-tainted value is
+    # checked BEFORE this line's own binding is taint-tracked, so `let n =
+    # tx.query_row(…)` counts as a read (and also propagates), while the opener
+    # line's own `let h = Handle::open(…)` does not read itself.
+    bind = let_bind(code)
+    for (t_ in T) if (reads_through(code, t_)) { cur_structread=1; break }
+    # Fresh live-DB opener — by OPENER TYPE, never by enclosing-fn name. Handle::open
+    # is in the set (see the header: its absence is how E1 hid). The two sanctioned
+    # shared-instance seams are excluded exactly as above.
+    if (code ~ /(^|[^A-Za-z0-9_])(Ledger|Connection|Handle|DuckDbBillingStore|Database)::open(_default|_with_flags)?[ \t]*\(/ \
+        && code !~ /from_connection/ && code !~ /open_in_memory/) {
+      if (bind != "") { T[bind]=1; cur_freshopen=1; if(!cur_open_ln) cur_open_ln=NR }
+    } else if (bind != "") {
+      # Taint PROPAGATION: a binding whose initialiser mentions a tainted value is
+      # itself tainted (`let conn = handle.read()?` / `let tx = conn.transaction()?`),
+      # so a read an indirection or two downstream is still attributed to the fork.
+      for (t_ in T) if (t_ != bind && has_word(code, t_)) { T[bind]=1; break }
+    }
   }
   if (fnclose) { flush(); cur_fn=""; fn_depth=-1 }
 }
