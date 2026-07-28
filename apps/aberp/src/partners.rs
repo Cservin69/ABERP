@@ -143,7 +143,20 @@ impl PartnerKind {
 /// quote for an `Unset` buyer uses the global default margin. The db-strings
 /// MUST match `margin_profiles.customer_type` so the engine resolution can
 /// join the two — invariant in code, not a SQL FK ([[no-sql-specific]]).
+///
+/// Serde emits the SAME snake_case strings as [`Self::as_db_str`]
+/// (`"industrial"`, `"prototype_shop"`, `"unset"`) — one string per
+/// value across the wire, the DB column, and the `margin_profiles`
+/// wire contract (which carries this vocab as a `String` validated by
+/// [`Self::from_db_str`]). NOT the [`PartnerKind`] / `CustomerVatStatus`
+/// PascalCase shape: those two have PascalCase *db-strings*, so their
+/// derive-default serde happens to agree with their SPA mirror. This
+/// enum's db-strings are snake_case, so the derive default silently
+/// forked the wire from the column and every SPA partner save 422'd
+/// (operator-reported on DEV, 2026-07-28). Pinned by
+/// `serve_partners_route.rs`'s Pin #8 against the literal SPA body.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum CustomerType {
     Industrial,
     Defense,

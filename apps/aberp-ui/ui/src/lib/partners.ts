@@ -143,12 +143,20 @@ export function composePartnerInputs(
     kind: form.kind,
     customer_vat_status: form.customerVatStatus,
     customer_type: form.customerType,
-    // PR-97 / ADR-0048 — nullable. PrivatePerson rows store NULL; the
-    // form's disabled input renders "" which collapses to null here so
-    // the backend column sees the absence verbatim. Domestic rows
-    // require a non-empty value; the backend's `validate_partner_inputs`
-    // surfaces the typed error inline.
-    tax_number: emptyToNull(form.taxNumber),
+    // PR-97 / ADR-0048 — nullable. Only a Domestic partner carries a
+    // Hungarian ADÓSZÁM; the validator REJECTS one on PrivatePerson and
+    // on Other (foreign).
+    //
+    // 2026-07-28 — this line used to send `form.taxNumber` verbatim on
+    // the claim that "the form's disabled input renders ''". It does
+    // not: PartnerForm only sets `disabled`, and `bind:value` keeps
+    // whatever was typed under the previous status. An operator who
+    // filled the ADÓSZÁM while Domestic and then switched to Other got a
+    // 400 naming `tax_number` — on an input they could no longer edit to
+    // clear. A disabled field contributes no value, so gate it on the
+    // status the form gates the input on.
+    tax_number:
+      form.customerVatStatus === "Domestic" ? emptyToNull(form.taxNumber) : null,
     eu_vat_number: emptyToNull(form.euVatNumber),
     address_street: emptyToNull(form.addressStreet),
     address_postal_code: emptyToNull(form.addressPostalCode),
