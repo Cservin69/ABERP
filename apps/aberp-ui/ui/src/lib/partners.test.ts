@@ -10,8 +10,9 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { Partner } from "./api";
+import type { CustomerType, Partner } from "./api";
 import {
+  CUSTOMER_TYPE_OPTIONS,
   EMPTY_PARTNER_FILTER,
   buyerFieldsFromPartner,
   comparePartners,
@@ -579,5 +580,90 @@ describe("filterPartnersWith / isPartnerFilterEmpty", () => {
 
   it("isPartnerFilterEmpty is false when the kind facet is engaged", () => {
     expect(isPartnerFilterEmpty({ needle: "", kind: "Customer" })).toBe(false);
+  });
+});
+
+// S428 / 2026-07-28 — the SPA half of the `customer_type` wire contract.
+// The option VALUES were previously unpinned on this side, so only the
+// Rust enum's shape was guarded and the two could (and did) drift: the
+// backend derived serde with no `rename_all` and wanted PascalCase while
+// these literals are snake_case, 422-ing every partner save. The Rust
+// twin is `spa_customer_type_options_cover_the_closed_vocab` in
+// `apps/aberp/tests/serve_partners_route.rs`, which asserts the SAME
+// eight literals deserialize into `CustomerType` and equal its
+// db-strings. Renaming an option value here without renaming it there
+// turns that test red.
+describe("customer type wire contract", () => {
+  const WIRE_VALUES = [
+    "industrial",
+    "defense",
+    "aerospace",
+    "research",
+    "prototype_shop",
+    "oem",
+    "consumer",
+    "unset",
+  ];
+
+  it("the dropdown emits exactly the eight backend db-strings", () => {
+    expect(CUSTOMER_TYPE_OPTIONS.map((o) => o.value)).toEqual(WIRE_VALUES);
+  });
+
+  it("the fresh-form default is one of them, so an untouched form saves", () => {
+    expect(WIRE_VALUES).toContain(emptyPartnerForm().customerType);
+  });
+
+  it("the composer puts the selected option on the wire verbatim", () => {
+    for (const value of WIRE_VALUES) {
+      const form = { ...emptyPartnerForm(), customerType: value as CustomerType };
+      expect(composePartnerInputs(form).customer_type).toBe(value);
+    }
+  });
+
+  it("a backend response value round-trips back into the dropdown", () => {
+    // `formFromPartner` seeds the <select>; a value with no matching
+    // option leaves the control blank and the operator stuck.
+    for (const value of WIRE_VALUES) {
+      const seeded = formFromPartner({
+        ...SAMPLE_PARTNER,
+        customer_type: value as CustomerType,
+      }).customerType;
+      expect(CUSTOMER_TYPE_OPTIONS.map((o) => o.value)).toContain(seeded);
+    }
+  });
+});
+
+// 2026-07-28 — the SECOND blocker on the foreign-partner journey, found
+// while confirming "no unrecoverable form state". PartnerForm disables
+// the ADÓSZÁM input for non-Domestic statuses but `bind:value` keeps the
+// typed value, so an operator who filled it while Domestic and then
+// switched to Other shipped a Hungarian tax number on a foreign partner
+// — a 400 naming an input they could no longer edit to clear.
+describe("tax number follows the status the form gates the input on", () => {
+  const withTaxNumber = { ...emptyPartnerForm(), taxNumber: "12345678-1-42" };
+
+  it("sends the ADÓSZÁM for a Domestic partner (the enabled-input case)", () => {
+    const body = composePartnerInputs({
+      ...withTaxNumber,
+      customerVatStatus: "Domestic",
+    });
+    expect(body.tax_number).toBe("12345678-1-42");
+  });
+
+  it("drops a stale ADÓSZÁM when the operator switches to Other", () => {
+    const body = composePartnerInputs({
+      ...withTaxNumber,
+      customerVatStatus: "Other",
+      euVatNumber: "SK123456789",
+    });
+    expect(body.tax_number).toBeNull();
+  });
+
+  it("drops a stale ADÓSZÁM when the operator switches to PrivatePerson", () => {
+    const body = composePartnerInputs({
+      ...withTaxNumber,
+      customerVatStatus: "PrivatePerson",
+    });
+    expect(body.tax_number).toBeNull();
   });
 });

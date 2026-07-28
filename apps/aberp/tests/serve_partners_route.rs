@@ -436,3 +436,218 @@ fn partners_create_accepts_foreign_partner_without_eu_vat_number() {
 
     let _keep = &dir;
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Pin #8 — SPA→`/api/partners` WIRE contract (operator-reported, DEV,
+// 2026-07-28).
+//
+// Why a JSON-body pin rather than another `PartnerInputs` struct
+// literal: pins #1–#7 all construct `PartnerInputs` in Rust, so they
+// exercise the business path while BYPASSING serde entirely. That is
+// precisely how the `customer_type` casing fork reached DEV — the enum
+// derived serde with no `rename_all`, so the wire wanted `"Industrial"`
+// while every other representation of the same value (`as_db_str`, the
+// `margin_profiles` wire contract, the SPA's `CustomerType` union) is
+// snake_case. EVERY SPA partner save 422'd before the body ever reached
+// a validator, and 438 lines of green route tests could not see it.
+//
+// These pins deserialize the EXACT bytes `composePartnerInputs`
+// (`apps/aberp-ui/ui/src/lib/partners.ts`) emits, for all eight
+// customer types × domestic/foreign, and assert the SERIALIZED response
+// carries the same literal back (the edit-mode `<select>` matches on
+// it — a PascalCase response leaves the control with no selected option
+// and the operator with no recoverable state).
+// ──────────────────────────────────────────────────────────────────────
+
+/// The `value` column of `CUSTOMER_TYPE_OPTIONS` — the literals the
+/// PartnerForm `<select>` actually puts on the wire — paired with the
+/// variant each MUST deserialize to. Mirrored by
+/// `customer_type_options_are_the_wire_contract` on the vitest side.
+const SPA_CUSTOMER_TYPE_OPTIONS: [(&str, CustomerType); 8] = [
+    ("industrial", CustomerType::Industrial),
+    ("defense", CustomerType::Defense),
+    ("aerospace", CustomerType::Aerospace),
+    ("research", CustomerType::Research),
+    ("prototype_shop", CustomerType::PrototypeShop),
+    ("oem", CustomerType::Oem),
+    ("consumer", CustomerType::Consumer),
+    ("unset", CustomerType::Unset),
+];
+
+/// Compile-time exhaustiveness guard: a ninth `CustomerType` variant
+/// breaks this match, which forces its SPA option into the table above
+/// rather than letting a new segment ship unreachable from the form.
+fn customer_type_index(ct: CustomerType) -> usize {
+    match ct {
+        CustomerType::Industrial => 0,
+        CustomerType::Defense => 1,
+        CustomerType::Aerospace => 2,
+        CustomerType::Research => 3,
+        CustomerType::PrototypeShop => 4,
+        CustomerType::Oem => 5,
+        CustomerType::Consumer => 6,
+        CustomerType::Unset => 7,
+    }
+}
+
+/// The exact JSON body `composePartnerInputs` emits: all fourteen keys
+/// in composer order, empty optionals collapsed to `null` (not omitted).
+/// `foreign` switches to the operator's reported Slovak shape — `Other`
+/// vat status, no Hungarian ADÓSZÁM, an EU community VAT number.
+fn spa_partner_body(display: &str, customer_type: &str, foreign: bool) -> String {
+    let (vat_status, tax_number, eu_vat, street, postal, city, country) = if foreign {
+        (
+            "Other",
+            "null",
+            "\"SK123456789\"",
+            "Dunaj",
+            "82109",
+            "Bratislava",
+            "Slovakia",
+        )
+    } else {
+        (
+            "Domestic",
+            "\"12345678-1-42\"",
+            "null",
+            "Fő utca 1.",
+            "1011",
+            "Budapest",
+            "Magyarország",
+        )
+    };
+    format!(
+        r#"{{"display_name":"{display}","legal_name":"{display} Kft.","kind":"Customer","customer_vat_status":"{vat_status}","customer_type":"{customer_type}","tax_number":{tax_number},"eu_vat_number":{eu_vat},"address_street":"{street}","address_postal_code":"{postal}","address_city":"{city}","address_country":"{country}","bank_account":null,"contact_email":"ops@example.com","contact_phone":null}}"#
+    )
+}
+
+/// The `customer_type` string on a serialized `Partner` — i.e. what the
+/// SPA's `formFromPartner` reads back into the `<select>`.
+fn wire_customer_type(partner: &aberp::partners::Partner) -> String {
+    serde_json::to_value(partner).expect("Partner serializes")["customer_type"]
+        .as_str()
+        .expect("customer_type is a JSON string")
+        .to_string()
+}
+
+/// Pin #8a — the option table covers the closed vocab exactly once, and
+/// each literal is the variant's db-string. Keeps the wire, the DB
+/// column, and `margin_profiles.customer_type` a single string per
+/// value; a `rename_all` drift on the enum turns this red.
+#[test]
+fn spa_customer_type_options_cover_the_closed_vocab() {
+    let mut seen = [false; 8];
+    for (literal, variant) in SPA_CUSTOMER_TYPE_OPTIONS {
+        let idx = customer_type_index(variant);
+        assert!(!seen[idx], "variant listed twice at literal `{literal}`");
+        seen[idx] = true;
+        assert_eq!(
+            variant.as_db_str(),
+            literal,
+            "SPA literal must equal the db-string so wire == column == margin_profiles"
+        );
+    }
+    assert!(
+        seen.iter().all(|s| *s),
+        "a CustomerType variant has no SPA option: {seen:?}"
+    );
+}
+
+/// Pin #8b — all eight customer types save for a DOMESTIC (HU) partner
+/// through the real serialized request body, and the response hands the
+/// same literal back.
+#[test]
+fn spa_body_saves_every_customer_type_domestic() {
+    let dir = test_dir("spa-wire-domestic");
+    let state = build_state(dir.join("aberp.duckdb"));
+
+    for (literal, variant) in SPA_CUSTOMER_TYPE_OPTIONS {
+        let body = spa_partner_body(&format!("HU {literal}"), literal, false);
+        let inputs: PartnerInputs = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("SPA body for `{literal}` must deserialize: {e}"));
+        assert_eq!(inputs.customer_type, variant);
+
+        let created = serve::create_partner_request(&state, &inputs)
+            .unwrap_or_else(|e| panic!("domestic `{literal}` must save: {e:?}"));
+        assert_eq!(created.customer_type, variant);
+        assert_eq!(
+            wire_customer_type(&created),
+            literal,
+            "response literal must match the `<select>` option value"
+        );
+
+        // Persisted, not merely returned (CLAUDE.md rule 11).
+        let fetched = serve::get_partner_request(&state, &created.id).expect("re-read");
+        assert_eq!(fetched.customer_type, variant);
+    }
+
+    let _keep = &dir;
+}
+
+/// Pin #8c — the same eight, for the FOREIGN (EU / Slovak) partner the
+/// operator was actually creating. `Other` vat status is a different
+/// validator arm than Domestic, so the matrix is 8 × 2, not 8.
+#[test]
+fn spa_body_saves_every_customer_type_foreign_eu() {
+    let dir = test_dir("spa-wire-foreign");
+    let state = build_state(dir.join("aberp.duckdb"));
+
+    for (literal, variant) in SPA_CUSTOMER_TYPE_OPTIONS {
+        let body = spa_partner_body(&format!("SK {literal}"), literal, true);
+        let inputs: PartnerInputs = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("SPA body for `{literal}` must deserialize: {e}"));
+
+        let created = serve::create_partner_request(&state, &inputs)
+            .unwrap_or_else(|e| panic!("foreign `{literal}` must save: {e:?}"));
+        assert_eq!(created.customer_type, variant);
+        assert_eq!(created.customer_vat_status, CustomerVatStatus::Other);
+        assert_eq!(created.eu_vat_number.as_deref(), Some("SK123456789"));
+        assert_eq!(wire_customer_type(&created), literal);
+    }
+
+    let _keep = &dir;
+}
+
+/// Pin #8d — no unrecoverable form state. The operator's sequence was:
+/// open the form (default `unset`) → save → error → change the type →
+/// save again. Both the default AND the post-change value must go
+/// through, and the value the response feeds back into `formFromPartner`
+/// must itself be re-submittable (a PascalCase response would leave the
+/// `<select>` with no matching option and every retry stuck).
+#[test]
+fn spa_default_unset_saves_and_a_changed_type_re_saves() {
+    let dir = test_dir("spa-wire-recovery");
+    let state = build_state(dir.join("aberp.duckdb"));
+
+    // 1. Fresh form, untouched dropdown: `unset` is the SPA default.
+    let created: PartnerInputs =
+        serde_json::from_str(&spa_partner_body("Recovery", "unset", true)).expect("default body");
+    let partner = serve::create_partner_request(&state, &created)
+        .expect("the form's DEFAULT customer_type must be saveable");
+    assert_eq!(partner.customer_type, CustomerType::Unset);
+
+    // 2. Re-open for edit: `formFromPartner` seeds the `<select>` from
+    //    the response literal, so it must be one the form knows.
+    let seeded = wire_customer_type(&partner);
+    assert!(
+        SPA_CUSTOMER_TYPE_OPTIONS.iter().any(|(v, _)| *v == seeded),
+        "response `{seeded}` has no matching <select> option — the edit form would open blank"
+    );
+
+    // 3. Operator changes the type and re-submits.
+    let edited: PartnerInputs =
+        serde_json::from_str(&spa_partner_body("Recovery", "industrial", true))
+            .expect("edited body");
+    let updated = serve::update_partner_request(
+        &state,
+        &partner.id,
+        &edited,
+        "test-operator",
+        BinaryHash::from_bytes([0u8; 32]),
+    )
+    .expect("a changed customer_type must re-save");
+    assert_eq!(updated.customer_type, CustomerType::Industrial);
+    assert_eq!(wire_customer_type(&updated), "industrial");
+
+    let _keep = &dir;
+}
