@@ -157,6 +157,56 @@ fn open_tenant_handle(db_path: &Path, tenant: TenantId) -> Result<Arc<Handle>> {
     Ok(h)
 }
 RS
+# ── D1a (2026-07-28) — the RUSTFMT controls. ──
+# D1's shape rule was recognised only in line-local forms. The first control below
+# is the one that matters: `rustfmt` EMITS this wrapping automatically for any
+# read-through call past 100 columns, so before D1a the rule's reach depended on how
+# long the callee's path happened to be — adding one argument to a caught fork
+# silently un-caught it. Turning these on surfaced FIVE more pre-existing forks,
+# including the live in-serve `serve::handle_relay_send_email`.
+bs_check "$SCAN" 1 "STRUCTURAL positive: read call WRAPPED across lines by rustfmt" <<'RS'
+fn a_wrapped_reader(db_path: &Path, invoice_id: &str) -> Result<Vec<VatRateKind>> {
+    let mut conn = Connection::open(db_path)?;
+    let tx = conn.transaction()?;
+    let pair = billing::load_ready_invoice_by_id_with_currency_metadata(
+        &tx,
+        invoice_id,
+    )?;
+    Ok(pair.map(|(i, _)| i.lines).unwrap_or_default())
+}
+RS
+bs_check "$SCAN" 1 "STRUCTURAL positive: propagate-then-read on ONE line" <<'RS'
+fn a_chained_reader(db: &Path, tenant: TenantId) -> Result<i64> {
+    let h = aberp_db::Handle::open_default(db, tenant)?;
+    let n = h.read()?.query_row("SELECT count(*) FROM invoices", [], |r| r.get(0))?;
+    Ok(n)
+}
+RS
+bs_check "$SCAN" 1 "STRUCTURAL positive: read chained straight onto the opener" <<'RS'
+fn an_inline_reader(db_path: &Path) -> Result<i64> {
+    let n = Connection::open(db_path)?.query_row("SELECT count(*) FROM invoices", [], |r| r.get(0))?;
+    Ok(n)
+}
+RS
+bs_check "$SCAN" 1 "STRUCTURAL positive: opener stashed in a struct, read via the field" <<'RS'
+fn a_struct_stashing_reader(db_path: &Path) -> Result<i64> {
+    let raw = Connection::open(db_path)?;
+    let ctx = ReadCtx { conn: raw, tenant: 1 };
+    ctx.conn.query_row("SELECT count(*) FROM invoices", [], |r| r.get(0))
+}
+RS
+# The GREEN half of the rustfmt pair — the same wrapped call, Handle-routed. Without
+# this, "wrap anything and it reds" would pass the control above.
+bs_check "$SCAN" 0 "STRUCTURAL negative: the SAME wrapped call, Handle-routed (must NOT hit)" <<'RS'
+fn a_wrapped_reader(db: &Handle, invoice_id: &str) -> Result<Vec<VatRateKind>> {
+    let conn = db.read()?;
+    let pair = billing::load_ready_invoice_by_id_with_currency_metadata(
+        &conn,
+        invoice_id,
+    )?;
+    Ok(pair.map(|(i, _)| i.lines).unwrap_or_default())
+}
+RS
 bs_controls_ok || { echo; echo "READ-FORK GATE: ✗ FAILED (scanner liveness)"; exit 1; }
 echo
 

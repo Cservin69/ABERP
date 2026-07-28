@@ -13,6 +13,12 @@
 #
 # Switching that on found 28 PRE-EXISTING forks. TWELVE are live in-serve on the
 # serve-held tenant DB — the exact defect class, never before visible to any gate.
+#
+# 2026-07-28 (D1a, pre-cut v2.33.2 adversarial): 33, of which THIRTEEN are live
+# in-serve. The D1 shape rule was recognised only in line-local forms, so a call
+# rustfmt had WRAPPED across lines read as clean — meaning the rule's reach depended
+# on the character length of the callee's path. Five more pre-existing forks were
+# hiding behind that, one of them live in-serve. See the scanner header (D1a).
 # Migrating them is product work (each is a read-path change on live routes, several
 # on the invoice/NAV path) with its own review; it is deliberately NOT done in the
 # detector-hardening change that found them. So this file FREEZES them.
@@ -45,6 +51,18 @@ apps/aberp/src/serve.rs|handle_quote_pipeline_status
 apps/aberp/src/serve.rs|handle_list_email_relay_queue
 apps/aberp/src/serve.rs|handle_get_email_relay_row
 apps/aberp/src/serve.rs|spawn_dap_audit_chain
+# ── D1a (2026-07-28, pre-cut v2.33.2 adversarial) ──
+# `handle_relay_send_email` is `POST /api/internal/send-email` — a LIVE in-serve
+# route (deprecated, but it warns and serves rather than 410-ing). Inside its
+# `spawn_blocking` it does `duckdb::Connection::open(&state.db_path)` and hands the
+# connection to `email_relay_queue::insert_queued(…)`, a call rustfmt wraps across
+# lines — which is exactly why D1 could not see it. It is co-resident with the shared
+# Handle (the very next block uses `state.db.clone()`), and it WRITES, so it is a
+# write-fork too. Its sibling READERS of the same table — `handle_list_email_relay_
+# queue` and `handle_get_email_relay_row`, both in GROUP A above — were already
+# frozen: a fused family (CLAUDE.md rule 14) split in half by a formatting accident.
+# Migrating it is product work on a live route; frozen here, not silenced.
+apps/aberp/src/serve.rs|handle_relay_send_email
 apps/aberp/src/reports.rs|compute_financial_report
 apps/aberp/src/quote_pdf_rerender_daemon.rs|prepare_rerender
 apps/aberp/src/audit_dap_boot.rs|run_heartbeat_supervised
@@ -72,6 +90,24 @@ apps/aberp/src/observe_receiver_confirmation.rs|load_base_nav_invoice_number
 # the allow-list as-is; either fence them or migrate them.
 apps/aberp/src/print_invoice.rs|render_to_bytes
 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs|run
+# ── D1a (2026-07-28) — the four DUAL-CONTEXT fns, finally visible ──
+# The read-fork ALLOW-LIST header has named these four for months as the fns that are
+# deliberately NOT exempted ("they DO run in-serve, so the CLI context does not exempt
+# them; the in-serve path must read via the Handle") — but they were in NO list. The
+# audit rule cannot see them (they open `Handle::open_default`, which is not in its
+# `Ledger::open`/`Connection::open` token set), and D1 could not see them either
+# (their reads are rustfmt-wrapped). So the gate's own documentation described a
+# worklist that was, in fact, empty of them.
+#
+# Re-verified 2026-07-28: all four hold the F-E flock, and every non-comment call site
+# is `main.rs` (CLI). `poll_ack`'s in-serve entry point is `run_nav_poll_daemon`, a
+# DIFFERENT fn. So they are coherent TODAY — GROUP B, not GROUP A — but they stay out
+# of the allow-list because the dual-context claim above must be re-checked whenever
+# serve grows a call site, and the frozen baseline is where that stays visible.
+apps/aberp/src/issue_invoice.rs|run_with_provider
+apps/aberp/src/issue_modification.rs|run
+apps/aberp/src/issue_storno.rs|run
+apps/aberp/src/poll_ack.rs|run
 
 # ── GROUP C — NOT the serve-held live path. No fork; the shape rule cannot tell.
 # A static shape scanner sees `Connection::open(x)`; it cannot see WHICH file `x` is

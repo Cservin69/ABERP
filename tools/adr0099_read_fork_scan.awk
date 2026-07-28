@@ -101,9 +101,43 @@
 # and as of 2026-07-28 it hooks `Handle::open` too. The two halves are complements,
 # not duplicates: neither alone would have caught all four instances.
 #
+# BUT SIZE THAT COMPLEMENT HONESTLY (2026-07-28, pre-cut v2.33.2 adversarial):
+# `assert_no_serve_handle` is `#[cfg(debug_assertions)]` and an explicit no-op in
+# release. In a PROD build the runtime half is INERT and this scanner is the only
+# detector standing, so the factory-split residual above has NO production backstop —
+# it is covered in dev/test runs and nowhere else. "Complements" describes the test
+# suite, not the shipped binary.
+#
 # `PINNED` stays as a BACKSTOP under the structural rule (it fires on the opener
 # alone, with no read required and no allow-list exemption). It is now a ratchet on
 # names already migrated rather than the primary signal.
+#
+# ── D1a (2026-07-28, pre-cut v2.33.2 adversarial): the RUSTFMT blind spot ──
+# D1 replaced a NAME list with a SHAPE rule, but the shape was recognised only in
+# the LINE-LOCAL forms the author happened to write. Three variants of the same
+# shape came back clean:
+#
+#   1. the read call WRAPPED across lines — `load(\n  &tx,\n  id,\n)?` — because the
+#      argument-list rule needs the `(`/`,` and the callee `ident(` on ONE line;
+#   2. propagate-then-read on a single line — `h.read()?.query_row(…)` — because only
+#      the FIRST link of the method chain was inspected, and it is a propagator;
+#   3. the read chained directly onto the opener — `Connection::open(p)?.query_row(…)`
+#      — because the `let` binds the RESULT of the read, so nothing is ever tainted.
+#
+# (1) is the serious one: it is not an evasion anyone has to contrive. `rustfmt`
+# EMITS it, automatically, for any read-through call that crosses 100 columns. So the
+# rule's reach depended on the character length of the callee's path — add one
+# argument to a caught fork and it silently un-catches. Switching these three on
+# surfaced FIVE more pre-existing forks the D1 census could not see, including
+# `serve::handle_relay_send_email` — a live in-serve route whose fresh
+# `Connection::open` writes the relay queue while the shared Handle is live, and
+# whose sibling READERS of that same table (`handle_list_email_relay_queue`,
+# `handle_get_email_relay_row`) were already in the baseline. A fused family split
+# in half by a formatting accident (CLAUDE.md rule 14).
+#
+# KNOWN RESIDUAL, fail-CLOSED: a tuple-returning factory (`Ok((h, meta))`) is read as
+# an argument-list read and reports. That over-reports rather than under-reports, so
+# it costs a baseline triage, never a missed fork. Left as-is deliberately.
 BEGIN{ n_pin=split("read_base_line_vat_kinds,read_base_currency",P,",") }
 # Method calls that yield a DERIVATIVE of the forked handle rather than reading
 # through it — they extend the taint instead of tripping the rule.
@@ -139,12 +173,35 @@ function is_factory_line(c, w,   s){
 # Does this line READ THROUGH tainted value `w`? Either a non-propagating method
 # call on it, or `w` handed to another fn as an argument (the read-via-helper shape
 # that four shipped defects all had).
-function reads_through(c, w,   m, meth){
-  if (match(c, "(^|[^A-Za-z0-9_])" w "[ \t]*\\.[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*\\(")) {
-    meth = substr(c, RSTART, RLENGTH)
-    sub(/^.*[ \t]*\.[ \t]*/, "", meth); sub(/[ \t]*\($/, "", meth)
-    if (!(meth in PROP)) return 1
+# D1a (2026-07-28) — a rustfmt CONTINUATION-ARGUMENT line: the tainted value alone
+# on its own line inside a WRAPPED call (`    &conn,`). The argument-list rule below
+# needs the opening `(` or a `,` AND the callee's `ident(` on the SAME line, so it
+# stops seeing the read the moment rustfmt breaks the call across lines — which it
+# does automatically at 100 columns. Requiring the line to contain NO parenthesis is
+# what separates this from a tuple/struct return (`Ok((h, meta))`) — a factory.
+function is_cont_arg_line(c, w,   s){
+  s = c; gsub(/[ \t]/, "", s)
+  if (s ~ /[()]/) return 0
+  return s ~ ("^&?(mut)?" w "[?]?,$")
+}
+function reads_through(c, w,   m, meth, rest){
+  # D1a — walk the WHOLE method chain to the right of `w`, not just the first link.
+  # The old rule read only the first `.method(` and gave up if it was a propagator,
+  # so `h.read()?.query_row(…)` (propagate-then-read on one line) and `ctx.conn.
+  # query_row(…)` (read through a struct field) both came back clean.
+  if (match(c, "(^|[^A-Za-z0-9_])" w "($|[^A-Za-z0-9_])")) {
+    rest = substr(c, RSTART + RLENGTH - 1)
+    while (match(rest, /\.[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*\(/)) {
+      meth = substr(rest, RSTART, RLENGTH)
+      sub(/^\.[ \t]*/, "", meth); sub(/[ \t]*\($/, "", meth)
+      if (!(meth in PROP)) return 1
+      rest = substr(rest, RSTART + RLENGTH)
+    }
   }
+  # ORDER: the continuation-arg test MUST precede the factory test. `&tx,` alone on a
+  # line satisfies both patterns, and the factory reading is the wrong one — a
+  # returned handle is never followed by a comma at the end of its own line.
+  if (is_cont_arg_line(c, w)) return 1
   if (is_factory_line(c, w)) return 0
   # `w` sitting in an argument list: preceded by `(` or `,` (only `&`/`mut` between)
   # and closed by `,` or `)`. A struct-literal field (`db: h,`) has `:` before the
@@ -282,6 +339,17 @@ function flush(   is_read, pinned_fork, struct_fork){
     if (code ~ /(^|[^A-Za-z0-9_])(Ledger|Connection|Handle|DuckDbBillingStore|Database)::open(_default|_with_flags)?[ \t]*\(/ \
         && code !~ /from_connection/ && code !~ /open_in_memory/) {
       if (bind != "") { T[bind]=1; cur_freshopen=1; if(!cur_open_ln) cur_open_ln=NR }
+      # D1a — the opener's OWN line can already read through it when the call is
+      # CHAINED (`Connection::open(p)?.query_row(…)`): the `let` binds the RESULT of
+      # the read, so nothing is ever tainted and the taint loop has nothing to check.
+      # Walk the chain to the right of the opener for the first non-propagating call.
+      opr = code; sub(/.*::open(_default|_with_flags)?[ \t]*\(/, "", opr)
+      while (match(opr, /\.[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*\(/)) {
+        omt = substr(opr, RSTART, RLENGTH)
+        sub(/^\.[ \t]*/, "", omt); sub(/[ \t]*\($/, "", omt)
+        if (!(omt in PROP)) { cur_structread=1; cur_freshopen=1; if(!cur_open_ln) cur_open_ln=NR; break }
+        opr = substr(opr, RSTART + RLENGTH)
+      }
     } else if (bind != "") {
       # Taint PROPAGATION: a binding whose initialiser mentions a tainted value is
       # itself tainted (`let conn = handle.read()?` / `let tx = conn.transaction()?`),
