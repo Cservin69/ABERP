@@ -13,8 +13,21 @@
 //!   equivalents, the rate-source MEGJEGYZÉS, all three dates (PR-84),
 //!   a buyer-facing invoice-level note (PR-82), and a per-line
 //!   "Megjegyzés" sub-line.
+//! - `sample-paginated-NN-items.pdf` (PR-296) — the pagination eyeball
+//!   set at 6 / 7 / 18 / 25 / 42 line items. For THIS fixture's row
+//!   shape (full seller bank block, one description in five wrapping to
+//!   three lines, notes and performance periods sprinkled in) 6 items is
+//!   the last count that fits on one page and 7 the first that breaks,
+//!   so the pair brackets the boundary. 18 is the count at which the
+//!   pre-PR-296 renderer began painting at NEGATIVE y — off the sheet.
+//!   25 and 42 give clean three- and four-page documents.
+//!
+//!   The break point is a function of content, not a fixed row count:
+//!   a leaner invoice (no bank block, short descriptions) fits ~11 rows
+//!   on page 1 and ~22 on each continuation page.
 //!
 //! Run with: `cargo run --example render_samples -p aberp-invoice-pdf`
+//! (set `ABERP_SAMPLE_LOGO_PNG` to render with a brand mark).
 
 use std::fs;
 use std::path::PathBuf;
@@ -228,6 +241,77 @@ fn sample_column_overlap_repro() -> InvoiceModel {
     }
 }
 
+/// PR-296 — pagination samples.
+///
+/// A realistic multi-item HUF invoice with `n` line items: mixed VAT
+/// rates (so the totals block carries several ÁFA rows), a long
+/// description that wraps, a per-line Megjegyzés and a performance
+/// period on a couple of rows, and an invoice-level note. Everything
+/// that makes a row taller than its 28pt base is represented, because
+/// those are exactly the rows the page break has to measure correctly.
+fn sample_paginated(n: usize) -> InvoiceModel {
+    let descriptions = [
+        "Marógép-alkatrész, sorozatgyártás",
+        "Szerszámacél megmunkálás és hőkezelés — teljes sorozat, \
+         NAV-megfelelőségi dokumentációval és mérési jegyzőkönyvvel",
+        "CNC esztergálás",
+        "Felületkezelés (eloxálás)",
+        "Minőségellenőrzés, végátvétel",
+    ];
+    let rates: [u16; 3] = [27, 27, 5];
+    let lines = (0..n)
+        .map(|i| {
+            let vat = rates[i % rates.len()];
+            let unit_price = 12_500 + (i as i64) * 1_450;
+            let qty = 1 + (i as i64 % 4);
+            let net = unit_price * qty;
+            let vat_minor = net * (vat as i64) / 100;
+            LineItem {
+                description: format!("{}. {}", i + 1, descriptions[i % descriptions.len()]),
+                quantity: Decimal::from(qty),
+                unit: "db".to_string(),
+                unit_price_minor: unit_price,
+                net_minor: net,
+                vat_rate_percent: vat,
+                vat_minor,
+                gross_minor: net + vat_minor,
+                performance_period: if i % 7 == 3 {
+                    Some((date!(2026 - 04 - 01), date!(2026 - 06 - 30)))
+                } else {
+                    None
+                },
+                note: if i % 5 == 2 {
+                    Some(format!("PO-ref: 2026/Q2-{:03}", i + 1))
+                } else {
+                    None
+                },
+            }
+        })
+        .collect();
+    InvoiceModel {
+        invoice_number: format!("TEST-ABERPNEW2026/0{:03}", 100 + n),
+        issue_date: date!(2026 - 07 - 28),
+        fulfillment_date: date!(2026 - 07 - 28),
+        payment_due_date: date!(2026 - 08 - 05),
+        payment_method: "Átutalás".to_string(),
+        currency: Currency::Huf,
+        rate_metadata: None,
+        supplier: supplier(),
+        customer: customer_huf(),
+        lines,
+        note: Some(
+            "Köszönjük a megrendelést. Kérjük az utalásnál tüntessék fel \
+             a számla sorszámát a közlemény mezőben."
+                .to_string(),
+        ),
+        tenant_logo: std::env::var("ABERP_SAMPLE_LOGO_PNG").ok().map(|p| {
+            let bytes = fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+            TenantLogo::from_png_bytes(&bytes).expect("decode sample logo PNG")
+        }),
+        brand_primary_color: None,
+    }
+}
+
 fn main() {
     write_sample("sample-huf-short", &sample_huf_short());
     write_sample("sample-eur-long", &sample_eur_long());
@@ -235,6 +319,16 @@ fn main() {
         "sample-column-overlap-repro",
         &sample_column_overlap_repro(),
     );
+    // PR-296 — pagination eyeball set. For this fixture's row shape 6
+    // is the last count that fits on one page and 7 the first that
+    // breaks; 18 is the line count at which the pre-PR-296 renderer
+    // started painting at negative y.
+    for n in [6usize, 7, 18, 25, 42] {
+        write_sample(
+            &format!("sample-paginated-{n:02}-items"),
+            &sample_paginated(n),
+        );
+    }
     println!("\nsamples in: {}", out_dir().display());
     println!("\nrasterize with ghostscript (page 1 → PNG):");
     println!(

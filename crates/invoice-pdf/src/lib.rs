@@ -3,7 +3,9 @@
 //!
 //! # Posture
 //!
-//! Single-page A4 PDF. Built-in `Helvetica` + `Helvetica-Bold` fonts
+//! A4 PDF, paginated (PR-296 — see [`layout_pages`]; before that the
+//! renderer emitted exactly one page and painted anything past it off
+//! the sheet). Built-in `Helvetica` + `Helvetica-Bold` fonts
 //! with WinAnsi encoding. Layout matches the reference template
 //! (`reference_aberp_invoice_template.md`) re-branded from Billingo to
 //! ABERP — same field set, same top-to-bottom order, same
@@ -51,7 +53,7 @@ pub mod model;
 pub mod text;
 
 use lopdf::content::{Content, Operation};
-use lopdf::{dictionary, Document, Object, ObjectId, Stream, StringFormat};
+use lopdf::{dictionary, Document, Object, Stream, StringFormat};
 use thiserror::Error;
 
 use aberp_billing::Currency;
@@ -70,6 +72,37 @@ const MARGIN_RIGHT: i64 = PAGE_WIDTH - 48;
 /// Top margin (y-coord of the top of the printable area; PDF y grows
 /// upward).
 const MARGIN_TOP: i64 = PAGE_HEIGHT - 56;
+
+// ─── PR-296 — pagination geometry ─────────────────────────────────────
+//
+// The footer band is fixed at the bottom of every page: the `i/N Oldal`
+// counter at `FOOTER_Y_TOP`, the attestation sentence 14pt below it.
+// `CONTENT_FLOOR` is the y below which no flowed content (line-item
+// rows, totals, MEGJEGYZÉS) may paint — it sits a row's breathing room
+// above the counter so a row's sub-lines never collide with the footer.
+
+/// Baseline of the `i/N Oldal` page counter in the footer band.
+const FOOTER_Y_TOP: i64 = 64;
+/// Lowest y that flowed content may paint at. A row is placed only when
+/// its WHOLE slot clears this line; otherwise the flow breaks to the
+/// next page.
+const CONTENT_FLOOR: i64 = FOOTER_Y_TOP + 28;
+/// Continuation-page title baseline ("Számla" + invoice number).
+const CONT_TITLE_Y: i64 = MARGIN_TOP - 14;
+/// Continuation-page header under-rule.
+const CONT_RULE_Y: i64 = MARGIN_TOP - 26;
+/// Continuation-page column-header band baseline. Pages 2..N skip the
+/// party / date / banner block entirely, so the table starts high.
+const CONT_TABLE_TOP: i64 = MARGIN_TOP - 48;
+/// Widow control — how many trailing line-item rows are kept together
+/// with the closing block when deciding where to break.
+///
+/// The closing block is ~150pt tall, so reserving it under the LAST row
+/// alone routinely pushed exactly one row plus the totals onto a nearly
+/// empty final page. Rows this close to the end instead reserve the
+/// whole tail, so the break lands before them and the final page reads
+/// as a deliberate closing page rather than an orphan.
+const TAIL_ROWS_KEPT_WITH_TOTALS: usize = 3;
 
 // ─── PR-85 — silver / gold palette ────────────────────────────────────
 //
@@ -253,23 +286,30 @@ pub fn render_invoice(model: &InvoiceModel) -> Result<Vec<u8>, RenderError> {
         })
     };
 
-    let mut ops: Vec<Operation> = Vec::new();
-    layout(&mut ops, model, logo_xobject_name);
-    let content = Content { operations: ops };
-    let content_bytes = content
-        .encode()
-        .map_err(|e| RenderError::ContentEncode(e.to_string()))?;
-    let content_id = doc.add_object(Stream::new(dictionary! {}, content_bytes));
+    // PR-296 — one content stream + one Page object per laid-out page.
+    // `Resources` and `MediaBox` stay on the Pages node so every page
+    // inherits them (the fonts and the logo XObject are shared).
+    let page_ops = layout_pages(model, logo_xobject_name);
+    let page_count = page_ops.len() as i64;
+    let mut kids: Vec<Object> = Vec::with_capacity(page_ops.len());
+    for ops in page_ops {
+        let content = Content { operations: ops };
+        let content_bytes = content
+            .encode()
+            .map_err(|e| RenderError::ContentEncode(e.to_string()))?;
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content_bytes));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
 
-    let page_id = doc.add_object(dictionary! {
-        "Type" => "Page",
-        "Parent" => pages_id,
-        "Contents" => content_id,
-    });
     let pages = dictionary! {
         "Type" => "Pages",
-        "Kids" => vec![Object::Reference(page_id)],
-        "Count" => 1,
+        "Kids" => kids,
+        "Count" => page_count,
         "Resources" => resources_id,
         "MediaBox" => vec![0.into(), 0.into(), PAGE_WIDTH.into(), PAGE_HEIGHT.into()],
     };
@@ -284,13 +324,107 @@ pub fn render_invoice(model: &InvoiceModel) -> Result<Vec<u8>, RenderError> {
     let mut buf: Vec<u8> = Vec::new();
     doc.save_to(&mut buf)
         .map_err(|e| RenderError::Save(e.to_string()))?;
-    let _ = page_id;
-    let _: ObjectId = catalog_id;
     Ok(buf)
 }
 
-/// Append the full top-to-bottom layout operations onto `ops`.
-fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel, logo_xobject_name: Option<&str>) {
+/// Lay the invoice out across as many A4 pages as its line items need.
+/// Returns one content-stream operation list per page, in page order —
+/// always at least one (`render_invoice` rejects a line-less invoice
+/// before reaching here).
+///
+/// # PR-296 — why this function exists
+///
+/// The renderer used to emit a single page unconditionally
+/// (`"Count" => 1`) with no line-count guard anywhere. Rows just kept
+/// advancing downward: at 16 line items the lowest baseline was y=28,
+/// at 17 it was y=0, and from 18 on it went NEGATIVE — painted off the
+/// physical sheet, taking the totals block and the ÁFA summary with it
+/// on longer invoices, while `render_invoice` still returned
+/// `Ok(bytes)`. On a legally-required Hungarian document that is
+/// CLAUDE.md rule 11 in its worst form.
+///
+/// The flow rules, in the order they matter:
+///
+/// 1. A line-item row is placed only when its WHOLE slot
+///    ([`row_height`]) clears [`CONTENT_FLOOR`]; otherwise the flow
+///    breaks and the row starts the next page.
+/// 2. Every continuation page repeats the column-header band
+///    ([`write_table_header`]) under a compact identifying header
+///    ([`write_continuation_header`]) — invoice number at the top, page
+///    counter in the footer.
+/// 3. The closing block (table footer rule + NETTÓ ÖSSZEG / per-rate
+///    ÁFA / FIZETENDŐ BRUTTÓ VÉGÖSSZEG + MEGJEGYZÉS) is never split.
+///    The LAST row's fit check reserves [`closing_block_depth`] under
+///    it, so the block always sits directly below the final row on the
+///    final page — which also means a trailing page can never carry a
+///    lone totals block.
+/// 4. Footers are appended last, once the page count is known, so
+///    `i/N Oldal` is correct on every page.
+fn layout_pages(m: &InvoiceModel, logo_xobject_name: Option<&str>) -> Vec<Vec<Operation>> {
+    let mut pages: Vec<Vec<Operation>> = vec![Vec::new()];
+
+    let table_top = write_page_one_header(&mut pages[0], m, logo_xobject_name);
+    let mut y = write_table_header(&mut pages[0], m, table_top);
+    let mut rows_on_page = 0usize;
+
+    let closing_depth = closing_block_depth(m);
+    for (i, line) in m.lines.iter().enumerate() {
+        // A row far from the end only has to fit itself. Each of the
+        // last `TAIL_ROWS_KEPT_WITH_TOTALS` rows instead reserves the
+        // whole remaining tail PLUS the closing block, so the break
+        // lands before the tail and the closing page carries it whole.
+        // Reserving under the last row ALONE was not enough: the
+        // closing block is ~150pt, so it routinely stranded exactly one
+        // row above the totals on a nearly empty final page.
+        let remaining = m.lines.len() - i;
+        let needed = if remaining <= TAIL_ROWS_KEPT_WITH_TOTALS {
+            m.lines[i..].iter().map(row_height).sum::<i64>() + closing_depth
+        } else {
+            row_height(line)
+        };
+        // `rows_on_page > 0` keeps a row that cannot fit even on an
+        // empty page from bouncing onto a blank one — it prints where
+        // it is instead. Reachable only for a description wrapping past
+        // a full page (~50 lines), which no NAV line description does.
+        if y - needed < CONTENT_FLOOR && rows_on_page > 0 {
+            pages.push(Vec::new());
+            let page = pages.last_mut().expect("just pushed");
+            write_continuation_header(page, m);
+            y = write_table_header(page, m, CONT_TABLE_TOP);
+            rows_on_page = 0;
+        }
+        let page = pages.last_mut().expect("at least one page");
+        draw_line_row(page, m, line, i, y);
+        y -= row_height(line);
+        rows_on_page += 1;
+    }
+
+    // Closing block — on the last page, directly under the final row.
+    let page = pages.last_mut().expect("at least one page");
+    let footer_rule_y = y + 8;
+    silver_rule(page, MARGIN_LEFT, MARGIN_RIGHT, footer_rule_y);
+    let invoice_gross_minor: i64 = m.lines.iter().map(|l| l.gross_minor).sum();
+    let totals_bottom = write_totals(page, m, footer_rule_y - 24, invoice_gross_minor);
+    write_note(page, m, totals_bottom - 24);
+
+    // Footer band on every page — page counter + attestation. Appended
+    // after the flow so the denominator is the real page count.
+    let total_pages = pages.len();
+    for (i, page) in pages.iter_mut().enumerate() {
+        write_page_footer(page, i + 1, total_pages);
+    }
+
+    pages
+}
+
+/// Draw the page-1 header — logo, title, invoice number, party block,
+/// date block, and the FIZETENDŐ BRUTTÓ VÉGÖSSZEG banner. Returns the
+/// y-coordinate the line-item column-header band should sit at.
+fn write_page_one_header(
+    ops: &mut Vec<Operation>,
+    m: &InvoiceModel,
+    logo_xobject_name: Option<&str>,
+) -> i64 {
     // PR-176 — optional tenant logo top-left of the header. When
     // present, the title cluster shifts right by the logo box width
     // plus a small gap so logo + title sit side-by-side without
@@ -416,27 +550,56 @@ fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel, logo_xobject_name: Option<
     );
     text_right(ops, "FB", 20, MARGIN_RIGHT, banner_y, &banner_amount);
 
-    // Line items table.
-    let table_top = banner_y - 28;
-    let table_bottom = write_lines_table(ops, m, table_top);
+    // Line-item column-header band sits below the banner.
+    banner_y - 28
+}
 
-    // Totals block (right-aligned).
-    let totals_top = table_bottom - 24;
-    let totals_bottom = write_totals(ops, m, totals_top, invoice_gross_minor);
+/// PR-296 — compact identifying header for pages 2..N. The full
+/// seller / buyer / date / banner block belongs to page 1 only; a
+/// continuation page needs the reader to be able to tell WHICH invoice
+/// the rows in front of them belong to, which is the invoice number
+/// here plus the `i/N Oldal` counter in the footer.
+fn write_continuation_header(ops: &mut Vec<Operation>, m: &InvoiceModel) {
+    text(ops, "FB", 14, MARGIN_LEFT, CONT_TITLE_Y, "Számla");
+    let title_width = crate::text::text_width_points("Számla", 14, true);
+    text_in(
+        ops,
+        "FI",
+        9,
+        MARGIN_LEFT + title_width + 8,
+        CONT_TITLE_Y,
+        "(folytatás)",
+        MUTED,
+    );
+    text_right(ops, "F1", 11, MARGIN_RIGHT, CONT_TITLE_Y, &m.invoice_number);
+    structural_rule(
+        ops,
+        MARGIN_LEFT,
+        MARGIN_RIGHT,
+        CONT_RULE_Y,
+        m.brand_primary_color,
+    );
+}
 
-    // MEGJEGYZÉS (note) block.
-    let note_top = totals_bottom - 24;
-    write_note(ops, m, note_top);
-
-    // Footer: page number + attestation.
-    let footer_y_top = 64;
-    text_in(ops, "FB", 8, MARGIN_LEFT, footer_y_top, "1/1 Oldal", MUTED);
+/// PR-296 — footer band, drawn on every page once the total page count
+/// is known. Pre-PR-296 this printed the literal `1/1 Oldal` on the one
+/// page the renderer emitted.
+fn write_page_footer(ops: &mut Vec<Operation>, page_number: usize, total_pages: usize) {
+    text_in(
+        ops,
+        "FB",
+        8,
+        MARGIN_LEFT,
+        FOOTER_Y_TOP,
+        &format!("{page_number}/{total_pages} Oldal"),
+        MUTED,
+    );
     text_in(
         ops,
         "FI",
         8,
         MARGIN_LEFT,
-        footer_y_top - 14,
+        FOOTER_Y_TOP - 14,
         "A számla tartalma mindenben megfelel a hatályos törvényekben foglaltaknak",
         MUTED,
     );
@@ -595,14 +758,13 @@ impl TableLayout {
     const QTY_RIGHT: i64 = Self::UNIT_PRICE_RIGHT - Self::UNIT_PRICE_W - Self::MIN_GUTTER;
 }
 
-/// Render the line-items table. Returns the y-coordinate of the
-/// horizontal rule that closes the table — the caller uses this to
-/// anchor the totals block. Per PR-82 the row height grows from the
-/// base 28pt when a line carries either a `performance_period`
-/// sub-line OR a `note` sub-line; both can coexist (note prints
-/// below the performance period). Per PR-85 the row height ALSO grows
-/// when the description wraps to multiple lines.
-fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i64 {
+/// Draw the line-item column-header band at `top` and return the
+/// baseline of the FIRST body row beneath it.
+///
+/// PR-296 — split out of the old `write_lines_table` so a continuation
+/// page can repeat the band. An invoice whose rows run onto page 2 must
+/// still tell the reader which column is ÁFA and which is BRUTTÓ ÁR.
+fn write_table_header(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i64 {
     // Header row — column labels in MUTED at size 8 bold.
     text_in(ops, "FB", 8, TableLayout::NUM_X, top, "#", MUTED);
     text_in(ops, "FB", 8, TableLayout::DESC_X, top, "MEGNEVEZÉS", MUTED);
@@ -646,103 +808,118 @@ fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i6
         m.brand_primary_color,
     );
 
-    // Body rows.
-    let mut y = top - 22;
-    for (i, line) in m.lines.iter().enumerate() {
-        let row_num = format!("{}", i + 1);
-        text(ops, "F1", 9, TableLayout::NUM_X, y, &row_num);
+    top - 22
+}
 
-        // PR-85 — description wraps to multiple lines when long. The
-        // first line sits at `y`; subsequent lines stack downward at
-        // `DESC_WRAP_LINE_HEIGHT` apart. The numeric columns continue
-        // to anchor at `y` (top of the row) — accountants read the
-        // numbers off the row's top edge regardless of how tall the
-        // description column grows.
-        let desc_lines = wrap_to_width(&line.description, TableLayout::DESC_WIDTH, 9, false);
-        for (i_line, dline) in desc_lines.iter().enumerate() {
-            text(
-                ops,
-                "F1",
-                9,
-                TableLayout::DESC_X,
-                y - (i_line as i64) * TableLayout::DESC_WRAP_LINE_HEIGHT,
-                dline,
-            );
-        }
-        let desc_extra =
-            (desc_lines.len().saturating_sub(1) as i64) * TableLayout::DESC_WRAP_LINE_HEIGHT;
+/// Vertical slot (in points) one line item consumes.
+///
+/// Per PR-82 the row height grows from the base 28pt when a line
+/// carries a `note` sub-line; per PR-85 it ALSO grows when the
+/// description wraps to multiple lines. A `performance_period`
+/// sub-line stays inside the 28pt slot (pre-PR-82 legacy posture).
+///
+/// PR-296 — [`layout_pages`] and [`draw_line_row`] BOTH call this. If
+/// they ever disagreed the pagination would drift out of step with what
+/// is actually painted, so the arithmetic lives in exactly one place.
+fn row_height(line: &LineItem) -> i64 {
+    let desc_lines = wrap_to_width(&line.description, TableLayout::DESC_WIDTH, 9, false).len();
+    let desc_extra = (desc_lines.saturating_sub(1) as i64) * TableLayout::DESC_WRAP_LINE_HEIGHT;
+    let note_extra = match line.note.as_ref() {
+        Some(n) if !n.trim().is_empty() => 12,
+        _ => 0,
+    };
+    28 + desc_extra + note_extra
+}
 
-        let qty_str = format!("{} {}", format::quantity(line.quantity), line.unit);
-        text_right(ops, "F1", 9, TableLayout::QTY_RIGHT, y, &qty_str);
-        text_right(
-            ops,
-            "F1",
-            9,
-            TableLayout::UNIT_PRICE_RIGHT,
-            y,
-            &format::money(m.currency, line.unit_price_minor),
-        );
-        text_right(
-            ops,
-            "F1",
-            9,
-            TableLayout::NET_RIGHT,
-            y,
-            &format::money(m.currency, line.net_minor),
-        );
-        text_right(
-            ops,
-            "F1",
-            9,
-            TableLayout::VAT_RIGHT,
-            y,
-            &format!("{}%", line.vat_rate_percent),
-        );
-        text_right(
-            ops,
-            "F1",
-            9,
-            TableLayout::GROSS_RIGHT,
-            y,
-            &format::money(m.currency, line.gross_minor),
-        );
+/// Draw one line-item row with its top baseline at `y`. `index` is the
+/// zero-based position in `m.lines` (printed as the 1-based `#`).
+fn draw_line_row(
+    ops: &mut Vec<Operation>,
+    m: &InvoiceModel,
+    line: &LineItem,
+    index: usize,
+    y: i64,
+) {
+    let row_num = format!("{}", index + 1);
+    text(ops, "F1", 9, TableLayout::NUM_X, y, &row_num);
 
-        // Sub-line baseline — sits below the wrapped description so
-        // performance-period + buyer-note sub-lines don't overlap
-        // long descriptions.
-        let mut sub_y = y - desc_extra - 12;
-        if let Some((start, end)) = line.performance_period {
-            let perf = format!(
-                "Teljesítési időszak: {} – {}",
-                format::iso_dotted_date(start),
-                format::iso_dotted_date(end),
-            );
-            text_in(ops, "FI", 8, TableLayout::DESC_X, sub_y, &perf, MUTED);
-            sub_y -= 11;
-        }
-        // PR-82 — per-line buyer note ("Megjegyzés"). Italic sub-line
-        // labelled in Hungarian ("Megjegyzés:") so the buyer reads it
-        // in context. Only renders when present; absent notes leave
-        // the row at its base height so unannotated invoices look
-        // identical to pre-PR-82 output.
-        let mut extra_subline = 0;
-        if let Some(note) = line.note.as_ref().filter(|s| !s.trim().is_empty()) {
-            let label = format!("Megjegyzés: {}", note);
-            text_in(ops, "FI", 8, TableLayout::DESC_X, sub_y, &label, MUTED);
-            extra_subline += 12;
-        }
-        let base_advance = 28;
-        // Per PR-82 + PR-85 row-height composition:
-        //   base 28pt
-        // + (desc_lines - 1) × 11pt for each wrapped description line
-        // + 12pt iff a buyer note prints
-        // Performance-period stays inside the 28pt slot (pre-PR-82
-        // legacy posture — overlays into the row).
-        y -= base_advance + desc_extra + extra_subline;
+    // PR-85 — description wraps to multiple lines when long. The
+    // first line sits at `y`; subsequent lines stack downward at
+    // `DESC_WRAP_LINE_HEIGHT` apart. The numeric columns continue
+    // to anchor at `y` (top of the row) — accountants read the
+    // numbers off the row's top edge regardless of how tall the
+    // description column grows.
+    let desc_lines = wrap_to_width(&line.description, TableLayout::DESC_WIDTH, 9, false);
+    for (i_line, dline) in desc_lines.iter().enumerate() {
+        text(
+            ops,
+            "F1",
+            9,
+            TableLayout::DESC_X,
+            y - (i_line as i64) * TableLayout::DESC_WRAP_LINE_HEIGHT,
+            dline,
+        );
     }
-    let footer_rule_y = y + 8;
-    silver_rule(ops, MARGIN_LEFT, MARGIN_RIGHT, footer_rule_y);
-    footer_rule_y
+    let desc_extra =
+        (desc_lines.len().saturating_sub(1) as i64) * TableLayout::DESC_WRAP_LINE_HEIGHT;
+
+    let qty_str = format!("{} {}", format::quantity(line.quantity), line.unit);
+    text_right(ops, "F1", 9, TableLayout::QTY_RIGHT, y, &qty_str);
+    text_right(
+        ops,
+        "F1",
+        9,
+        TableLayout::UNIT_PRICE_RIGHT,
+        y,
+        &format::money(m.currency, line.unit_price_minor),
+    );
+    text_right(
+        ops,
+        "F1",
+        9,
+        TableLayout::NET_RIGHT,
+        y,
+        &format::money(m.currency, line.net_minor),
+    );
+    text_right(
+        ops,
+        "F1",
+        9,
+        TableLayout::VAT_RIGHT,
+        y,
+        &format!("{}%", line.vat_rate_percent),
+    );
+    text_right(
+        ops,
+        "F1",
+        9,
+        TableLayout::GROSS_RIGHT,
+        y,
+        &format::money(m.currency, line.gross_minor),
+    );
+
+    // Sub-line baseline — sits below the wrapped description so
+    // performance-period + buyer-note sub-lines don't overlap
+    // long descriptions.
+    let mut sub_y = y - desc_extra - 12;
+    if let Some((start, end)) = line.performance_period {
+        let perf = format!(
+            "Teljesítési időszak: {} – {}",
+            format::iso_dotted_date(start),
+            format::iso_dotted_date(end),
+        );
+        text_in(ops, "FI", 8, TableLayout::DESC_X, sub_y, &perf, MUTED);
+        sub_y -= 11;
+    }
+    // PR-82 — per-line buyer note ("Megjegyzés"). Italic sub-line
+    // labelled in Hungarian ("Megjegyzés:") so the buyer reads it
+    // in context. Only renders when present; absent notes leave
+    // the row at its base height so unannotated invoices look
+    // identical to pre-PR-82 output.
+    if let Some(note) = line.note.as_ref().filter(|s| !s.trim().is_empty()) {
+        let label = format!("Megjegyzés: {}", note);
+        text_in(ops, "FI", 8, TableLayout::DESC_X, sub_y, &label, MUTED);
+    }
 }
 
 fn write_totals(
@@ -900,6 +1077,82 @@ fn write_note(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) {
             text(ops, "F1", 9, MARGIN_LEFT, y, &wrapped_line);
             y -= 12;
         }
+    }
+}
+
+// ─── PR-296 — closing-block measurement ───────────────────────────────
+//
+// The three functions below predict, without drawing anything, how far
+// down the page the closing block (table footer rule → totals →
+// MEGJEGYZÉS) will reach. `layout_pages` reserves exactly that much
+// under the LAST line-item row, which is what keeps the totals whole,
+// on the last page, and above the footer band.
+//
+// They mirror `write_totals` / `write_note` step for step. The
+// `closing_block_depth_matches_painted_extent` test renders across
+// currencies, rate counts and note lengths and compares this prediction
+// against the lowest baseline actually emitted, so a future edit to
+// either writer that forgets its counterpart here fails the suite
+// instead of pushing the totals off the sheet again.
+
+/// Number of 14pt rows [`write_totals`] emits for `m`.
+fn totals_row_count(m: &InvoiceModel) -> i64 {
+    let rates = m
+        .lines
+        .iter()
+        .map(|l| l.vat_rate_percent)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as i64;
+    // The HUF-equivalent sub-row per rate, and the trailing Árfolyam +
+    // Bruttó összeg pair, print only for a non-HUF invoice carrying a
+    // rate stamp — the same condition `write_totals` branches on.
+    let huf_equivalents = !matches!(m.currency, Currency::Huf) && m.rate_metadata.is_some();
+    // NETTÓ ÖSSZEG + per-rate ÁFA + FIZETENDŐ BRUTTÓ VÉGÖSSZEG.
+    let mut rows = 1 + rates * if huf_equivalents { 2 } else { 1 } + 1;
+    if huf_equivalents {
+        rows += 2;
+    }
+    rows
+}
+
+/// Number of text lines [`write_note`] emits below its MEGJEGYZÉS
+/// header. Zero means the section is skipped entirely.
+fn note_line_count(m: &InvoiceModel) -> i64 {
+    let mut lines = 0;
+    if !matches!(m.currency, Currency::Huf) && m.rate_metadata.is_some() {
+        lines += 1;
+    }
+    if let Some(note) = m.note.as_ref().filter(|s| !s.trim().is_empty()) {
+        lines += wrap_to_chars(note, NOTE_WRAP_WIDTH_CHARS).len() as i64;
+    }
+    lines
+}
+
+/// Points from the cursor left below the last line-item row down to the
+/// LOWEST baseline the closing block paints. Walks the same offsets
+/// [`layout_pages`] then uses to draw:
+///
+/// ```text
+///   cursor + 8              table footer silver rule
+///   cursor - 16             totals top            (rule - 24)
+///   … - (rows-1) × 14       LAST totals baseline
+///   … - 14                  totals bottom cursor  (write_totals' return)
+///   … - 24                  MEGJEGYZÉS header
+///   … - 14 - (n-1) × 12     LAST note baseline
+/// ```
+///
+/// Note the `rows-1`: `write_totals` advances 14pt PAST its final row,
+/// so the last thing it paints sits one advance above the cursor it
+/// returns. Without a note that trailing advance is empty space and
+/// must not be reserved; with one it is the gap the MEGJEGYZÉS block
+/// hangs off.
+fn closing_block_depth(m: &InvoiceModel) -> i64 {
+    let rows = totals_row_count(m);
+    let note_lines = note_line_count(m);
+    if note_lines == 0 {
+        16 + (rows - 1) * 14
+    } else {
+        16 + rows * 14 + 24 + 14 + (note_lines - 1) * 12
     }
 }
 
@@ -1772,6 +2025,24 @@ mod tests {
     /// Minimal `InvoiceModel` for rule-color pins below — one HUF line,
     /// no logo, no notes. Lets the per-test `brand_primary_color` setter
     /// stay as the only varying input across the pin pair.
+    /// PR-296 — the pins below were written when the renderer had a
+    /// single `layout()` that appended one page's worth of ops. They
+    /// still describe page-1 geometry, so this flattens a single-page
+    /// render back to one op stream for them. The length assertion is
+    /// the point: a pin can never silently degrade into "reads page 1
+    /// of a multi-page document and ignores the rest".
+    fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel, logo_xobject_name: Option<&str>) {
+        let pages = layout_pages(m, logo_xobject_name);
+        assert_eq!(
+            pages.len(),
+            1,
+            "this pin describes a single-page layout but the model rendered \
+             {} pages — re-target it at the page it means",
+            pages.len()
+        );
+        ops.extend(pages.into_iter().next().expect("one page"));
+    }
+
     fn pin_model_with_brand(brand: Option<(f32, f32, f32)>) -> InvoiceModel {
         use rust_decimal::Decimal;
         use time::macros::date;
@@ -2125,5 +2396,336 @@ mod tests {
             !has_pair(&huf_ops),
             "HUF layout must not emit a € + NBSP pair (HUF is postfix `Ft`)"
         );
+    }
+
+    // ─── PR-296 — pagination ──────────────────────────────────────────
+    //
+    // The defect these pin: the renderer emitted `"Count" => 1` with no
+    // line-count guard, so rows just kept advancing downward. Measured
+    // on the pre-PR-296 build — 16 line items put the lowest baseline at
+    // y=28, 17 at y=0, and from 18 on it went NEGATIVE: painted off the
+    // physical sheet, taking the totals block and the ÁFA summary with
+    // it, while `render_invoice` still returned `Ok(bytes)`.
+
+    /// `n`-line variant of [`pin_model_with_brand`] — same parties,
+    /// same money, one row per index so a row can be identified by its
+    /// printed `#`.
+    fn pin_model_with_lines(n: usize) -> InvoiceModel {
+        let mut m = pin_model_with_brand(None);
+        let base = m.lines[0].clone();
+        m.lines = (0..n)
+            .map(|i| LineItem {
+                description: format!("Tétel {}", i + 1),
+                ..base.clone()
+            })
+            .collect();
+        m
+    }
+
+    /// Lowest y any operator paints at on this page — text baselines
+    /// (`Td`) and rule endpoints (`m` / `l`). This is the number that
+    /// went negative pre-PR-296.
+    fn lowest_painted_y(ops: &[Operation]) -> i64 {
+        let mut lowest = i64::MAX;
+        for op in ops {
+            if matches!(op.operator.as_str(), "Td" | "m" | "l") {
+                if let Some(Object::Integer(y)) = op.operands.get(1) {
+                    lowest = lowest.min(*y);
+                }
+            }
+        }
+        lowest
+    }
+
+    /// Every `Tj` string on the page, as the WinAnsi bytes actually
+    /// emitted.
+    fn page_texts(ops: &[Operation]) -> Vec<Vec<u8>> {
+        ops.iter()
+            .filter(|op| op.operator == "Tj")
+            .filter_map(|op| match op.operands.first() {
+                Some(Object::String(bytes, _)) => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn page_has_text(ops: &[Operation], needle: &str) -> bool {
+        let want = text::winansi_bytes(needle);
+        page_texts(ops).contains(&want)
+    }
+
+    /// THE pin for the reported defect: at no line count does any page
+    /// paint below the footer band. Fails on the pre-PR-296 renderer
+    /// from 17 line items up (y=0, then negative).
+    #[test]
+    fn no_line_count_paints_content_off_the_page() {
+        // The attestation sentence is the lowest thing on a healthy
+        // page; nothing may sit below it.
+        let floor = FOOTER_Y_TOP - 14;
+        for n in 1..=60 {
+            let m = pin_model_with_lines(n);
+            let pages = layout_pages(&m, None);
+            for (i, page) in pages.iter().enumerate() {
+                let lowest = lowest_painted_y(page);
+                assert!(
+                    lowest >= floor,
+                    "{n} line items: page {} paints at y={lowest}, below the \
+                     footer band at y={floor}. Negative means off the sheet — \
+                     the pre-PR-296 defect.",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    /// No row may be dropped or duplicated by the page break. Each row
+    /// prints its 1-based index in the `#` column; all `n` of them must
+    /// appear exactly once across the document, in order. CLAUDE.md
+    /// rule 11 — a paginator that silently loses row 12 is worse than
+    /// one that refuses.
+    #[test]
+    fn every_line_item_is_painted_exactly_once_across_pages() {
+        for n in [1usize, 11, 12, 18, 25, 40, 60] {
+            let m = pin_model_with_lines(n);
+            let pages = layout_pages(&m, None);
+            let printed: Vec<String> = pages
+                .iter()
+                .flat_map(|p| page_texts(p))
+                .filter_map(|t| String::from_utf8(t).ok())
+                .filter(|s| s.parse::<usize>().is_ok())
+                .collect();
+            let expected: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
+            assert_eq!(
+                printed, expected,
+                "{n} line items: the `#` column must read 1..{n} exactly once, \
+                 in order, across all pages"
+            );
+        }
+    }
+
+    /// An invoice that spills carries its column headers onto every
+    /// continuation page (a reader on page 2 must still know which
+    /// column is ÁFA and which is BRUTTÓ ÁR) and identifies itself with
+    /// the invoice number.
+    #[test]
+    fn continuation_pages_repeat_headers_and_identify_the_invoice() {
+        let m = pin_model_with_lines(25);
+        let pages = layout_pages(&m, None);
+        assert!(pages.len() >= 2, "25 line items must spill past page 1");
+        for (i, page) in pages.iter().enumerate() {
+            for header in ["#", "MEGNEVEZÉS", "MENNYISÉG", "ÁFA", "BRUTTÓ ÁR"] {
+                assert!(
+                    page_has_text(page, header),
+                    "page {} is missing the `{header}` column header",
+                    i + 1
+                );
+            }
+            assert!(
+                page_has_text(page, &m.invoice_number),
+                "page {} does not carry the invoice number",
+                i + 1
+            );
+        }
+    }
+
+    /// The footer counter must count the real pages. Pre-PR-296 it was
+    /// the hardcoded literal `1/1 Oldal`.
+    #[test]
+    fn page_counter_reads_i_of_n_on_every_page() {
+        for n in [1usize, 25, 60] {
+            let pages = layout_pages(&pin_model_with_lines(n), None);
+            let total = pages.len();
+            for (i, page) in pages.iter().enumerate() {
+                let want = format!("{}/{} Oldal", i + 1, total);
+                assert!(
+                    page_has_text(page, &want),
+                    "{n} line items: page {} must print `{want}`",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    /// The totals block is never split and always lands on the LAST
+    /// page — with at least one line-item row above it, so a trailing
+    /// page can never be a lone totals block.
+    #[test]
+    fn totals_block_lands_whole_on_the_last_page() {
+        for n in [1usize, 11, 12, 18, 25, 40, 60] {
+            let pages = layout_pages(&pin_model_with_lines(n), None);
+            let last = pages.len() - 1;
+            for label in ["NETTÓ ÖSSZEG:", "27% ÁFA:", "FIZETENDŐ BRUTTÓ VÉGÖSSZEG:"] {
+                let carrying: Vec<usize> = pages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| page_has_text(p, label))
+                    .map(|(i, _)| i)
+                    .collect();
+                // The banner at the top of page 1 carries the same
+                // FIZETENDŐ label, so page 0 is a legitimate second
+                // home for that one string; the totals-block copy must
+                // still be on the last page.
+                assert!(
+                    carrying.contains(&last),
+                    "{n} line items: `{label}` must appear on the last page \
+                     (page {}), found on pages {carrying:?}",
+                    last + 1
+                );
+            }
+            assert!(
+                page_has_text(&pages[last], "1") || n > 0,
+                "sanity: the last page carries content"
+            );
+            // Widow rule — the last page always has a line-item row
+            // above the totals.
+            let row_on_last = page_texts(&pages[last])
+                .iter()
+                .filter_map(|t| String::from_utf8(t.clone()).ok())
+                .any(|s| s.parse::<usize>().is_ok());
+            assert!(
+                row_on_last,
+                "{n} line items: the last page must carry at least one line-item \
+                 row — a page holding only the totals block is the orphan case \
+                 the last-row reservation exists to prevent"
+            );
+        }
+    }
+
+    /// [`closing_block_depth`] is a PREDICTION of what `write_totals` +
+    /// `write_note` will paint; the page break is sized by it. If the
+    /// two ever drift the totals go off the sheet again — silently,
+    /// because the prediction would still report a comfortable fit.
+    /// Compare prediction against the real painted extent across the
+    /// shapes that change the block's height: HUF vs EUR (HUF-equivalent
+    /// sub-rows + Árfolyam pair), one VAT rate vs three, no note vs a
+    /// wrapping one.
+    #[test]
+    fn closing_block_depth_matches_painted_extent() {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+        use time::macros::date;
+
+        let long_note = "Köszönjük a megrendelést. Kérjük az utalásnál tüntessék fel a \
+                         számla sorszámát a közlemény mezőben, valamint a teljesítés \
+                         igazolásának másolatát is csatolják a bizonylathoz."
+            .to_string();
+        let rate = aberp_billing::RateMetadata {
+            rate: Decimal::from_str("405.23").unwrap(),
+            source: "MNB".to_string(),
+            date: date!(2026 - 05 - 26),
+            huf_equivalent_total: 810_460,
+        };
+
+        for (label, m) in [
+            ("HUF, one rate, no note", pin_model_with_lines(3)),
+            ("HUF, one rate, long note", {
+                let mut m = pin_model_with_lines(3);
+                m.note = Some(long_note.clone());
+                m
+            }),
+            ("HUF, three rates", {
+                let mut m = pin_model_with_lines(3);
+                for (i, pct) in [5u16, 18, 27].into_iter().enumerate() {
+                    m.lines[i].vat_rate_percent = pct;
+                }
+                m
+            }),
+            ("EUR, rate stamp, long note", {
+                let mut m = pin_model_with_lines(3);
+                m.currency = Currency::Eur;
+                m.rate_metadata = Some(rate.clone());
+                m.note = Some(long_note.clone());
+                m
+            }),
+        ] {
+            // Draw the closing block alone from a known cursor and read
+            // back how far down it actually reached.
+            let cursor = 500;
+            let mut ops: Vec<Operation> = Vec::new();
+            let gross: i64 = m.lines.iter().map(|l| l.gross_minor).sum();
+            silver_rule(&mut ops, MARGIN_LEFT, MARGIN_RIGHT, cursor + 8);
+            let totals_bottom = write_totals(&mut ops, &m, cursor + 8 - 24, gross);
+            write_note(&mut ops, &m, totals_bottom - 24);
+
+            let painted = cursor - lowest_painted_y(&ops);
+            assert_eq!(
+                closing_block_depth(&m),
+                painted,
+                "{label}: closing_block_depth predicts {}pt but the block paints \
+                 {painted}pt below the cursor — the page break is sized off the \
+                 prediction, so a mismatch puts the totals off the sheet",
+                closing_block_depth(&m)
+            );
+        }
+    }
+
+    /// The concrete threshold from the field report: an 18-line invoice
+    /// was the first one to paint at negative y. It must now be a clean
+    /// two-page document.
+    #[test]
+    fn eighteen_line_invoice_is_two_clean_pages() {
+        let pages = layout_pages(&pin_model_with_lines(18), None);
+        assert_eq!(
+            pages.len(),
+            2,
+            "18 line items — the measured pre-PR-296 off-page threshold — must \
+             render as two pages"
+        );
+        assert!(page_has_text(&pages[0], "1/2 Oldal"));
+        assert!(page_has_text(&pages[1], "2/2 Oldal"));
+        assert!(page_has_text(&pages[1], "FIZETENDŐ BRUTTÓ VÉGÖSSZEG:"));
+        // The banner is a page-1 element and does NOT repeat.
+        assert!(page_has_text(&pages[0], "ELADÓ"));
+        assert!(
+            !page_has_text(&pages[1], "ELADÓ"),
+            "the seller/buyer block belongs to page 1 only"
+        );
+    }
+
+    /// Widow control — a paginated invoice must not strand a lone row
+    /// above the totals on an otherwise empty final page. With uniform
+    /// rows the tail reservation can always be satisfied, so the last
+    /// page carries at least `TAIL_ROWS_KEPT_WITH_TOTALS` rows — more
+    /// when the break lands earlier for its own reasons.
+    #[test]
+    fn the_last_page_is_not_a_single_orphan_row_under_the_totals() {
+        for n in 12..=60 {
+            let pages = layout_pages(&pin_model_with_lines(n), None);
+            if pages.len() < 2 {
+                continue;
+            }
+            let rows_on_last = page_texts(pages.last().expect("pages"))
+                .iter()
+                .filter_map(|t| String::from_utf8(t.clone()).ok())
+                .filter(|s| s.parse::<usize>().is_ok())
+                .count();
+            assert!(
+                rows_on_last >= TAIL_ROWS_KEPT_WITH_TOTALS,
+                "{n} line items over {} pages: the closing page carries only \
+                 {rows_on_last} row(s), below the {TAIL_ROWS_KEPT_WITH_TOTALS} \
+                 the tail reservation keeps with the totals. One row marooned \
+                 above the totals on an otherwise empty page is the widow this \
+                 exists to prevent.",
+                pages.len()
+            );
+        }
+    }
+
+    /// Page count never decreases as line items are added — a break
+    /// rule that oscillates would be a layout bug even when every
+    /// individual page happens to fit.
+    #[test]
+    fn page_count_is_monotonic_in_line_count() {
+        let mut previous = 0usize;
+        for n in 1..=60 {
+            let pages = layout_pages(&pin_model_with_lines(n), None).len();
+            assert!(
+                pages >= previous,
+                "{n} line items render on {pages} pages but {} lines needed \
+                 {previous}",
+                n - 1
+            );
+            previous = pages;
+        }
     }
 }

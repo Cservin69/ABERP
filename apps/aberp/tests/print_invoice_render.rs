@@ -131,6 +131,21 @@ fn fixture_ready_invoice(
     }
 }
 
+/// PR-296 — `n`-line variant of [`fixture_ready_invoice`]. Each line
+/// carries a distinct description so the pagination pin can assert that
+/// every row survived the page break by name.
+fn fixture_ready_invoice_with_lines(n: usize) -> ReadyInvoice {
+    let mut invoice = fixture_ready_invoice(1000, rust_decimal::Decimal::from(1), 2700);
+    let base = invoice.lines[0].clone();
+    invoice.lines = (1..=n)
+        .map(|i| LineItem {
+            description: format!("Tetelsor {i} megnevezes"),
+            ..base.clone()
+        })
+        .collect();
+    invoice
+}
+
 /// Wire the audit ledger + on-disk XML for one invoice id under a
 /// fresh tenant DB. Returns the InvoiceId prefixed string the
 /// orchestrator looks up plus the temp-dir holder.
@@ -406,10 +421,8 @@ fn eur_invoice_uses_round_half_even_for_per_rate_huf() {
     );
 }
 
-/// Single-page assertion — the printed invoice fits on one A4 page per
-/// the renderer's deliberate posture (`Pages.Count = 1` in
-/// `crates/invoice-pdf/src/lib.rs::render_invoice`). A regression that
-/// adds an overflow second page would surface here.
+/// A SHORT invoice still renders as exactly one A4 page — PR-296's
+/// pagination must not split a document that fits.
 #[test]
 fn printed_invoice_pdf_is_single_page() {
     let invoice = fixture_ready_invoice(1000, rust_decimal::Decimal::from(1), 2700);
@@ -425,7 +438,67 @@ fn printed_invoice_pdf_is_single_page() {
     );
     let pdf = run_print_invoice(&wired);
     let count = pdf_page_count(&pdf);
-    assert_eq!(count, 1, "printed invoice must be exactly one A4 page");
+    assert_eq!(count, 1, "a one-line invoice must be exactly one A4 page");
+}
+
+/// PR-296 — end-to-end pin for the pagination defect, through the real
+/// orchestration (NAV XML → audit ledger → `print_invoice::run`) rather
+/// than the renderer's unit surface.
+///
+/// Pre-PR-296 the renderer hardcoded `Pages.Count = 1` with no
+/// line-count guard: a 25-line invoice painted its later rows, the
+/// totals block and the ÁFA summary at negative y — off the physical
+/// sheet, invisible, and `Ok(bytes)` returned regardless. This asserts
+/// the document now flows onto a second page, that EVERY line item's
+/// description survives into the extracted text, and that the totals
+/// labels are present.
+#[test]
+fn long_invoice_paginates_and_keeps_every_line_and_the_totals() {
+    let invoice = fixture_ready_invoice_with_lines(25);
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = fixture_parties();
+    let wired = wire_invoice(
+        "paginated",
+        &invoice,
+        &series,
+        &parties,
+        Currency::Huf,
+        None,
+    );
+    let pdf = run_print_invoice(&wired);
+
+    assert!(
+        pdf_page_count(&pdf) >= 2,
+        "a 25-line invoice must not be squeezed onto one A4 page — that is \
+         the defect: the overflow was painted off the sheet"
+    );
+
+    let text = read_pdf_text(&pdf);
+    for i in 1..=25 {
+        let needle = format!("Tetelsor {i} megnevezes");
+        assert!(
+            text.contains(&needle),
+            "line item {i} ({needle:?}) is missing from the printed PDF — \
+             rows must survive the page break, not fall off it:\n{text}"
+        );
+    }
+    for label in ["NETTÓ ÖSSZEG:", "FIZETENDŐ BRUTTÓ VÉGÖSSZEG:"] {
+        // The renderer substitutes the double-acute `Ő` to `Ö` at the
+        // WinAnsi boundary (see `crates/invoice-pdf/src/text.rs`), so
+        // match what actually reaches the page.
+        let printed = label.replace('Ő', "Ö").replace('Ű', "Ü");
+        assert!(
+            text.contains(&printed),
+            "totals label {printed:?} must reach the printed PDF — the totals \
+             block belongs on the LAST page, not off the sheet:\n{text}"
+        );
+    }
+    // The page counter must count the pages it actually produced.
+    assert!(
+        text.contains("1/2 Oldal") && text.contains("2/2 Oldal"),
+        "page counter must read `i/N Oldal` across the document, not the \
+         pre-PR-296 hardcoded `1/1 Oldal`:\n{text}"
+    );
 }
 
 // ── PR-176 — tenant logo convention ───────────────────────────────────
