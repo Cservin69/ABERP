@@ -477,6 +477,23 @@ fn resolve_bucket(
     Ok((series.id.to_prefixed_string(), fiscal_year))
 }
 
+/// S444 — the `fiscal_year` half of the allocator bucket
+/// [`allocate_in_tx`] will key `invoice_sequence_state` on for an invoice
+/// issued in `issue_year` (`0` for a [`ResetPolicy::Never`] series, the
+/// year itself for `AnnualOnFiscalYear`).
+///
+/// Exposed so the binary can scope its durable high-water read
+/// ([`AllocateArgs::durable_high_water`]) to the SAME bucket the allocator
+/// is about to advance, without duplicating the reset-policy rule. Reads
+/// only `invoice_series`; safe to call on the allocation transaction.
+pub fn resolve_bucket_fiscal_year(
+    conn: &Connection,
+    series_id: SeriesId,
+    issue_year: i32,
+) -> Result<i32, BillingError> {
+    resolve_bucket(conn, series_id, issue_year).map(|(_, fiscal_year)| fiscal_year)
+}
+
 /// S392 — read the next sequence number [`allocate_in_tx`] would assign
 /// for the `(series, issue_year)` bucket WITHOUT advancing it. Returns
 /// `max(stored_next_number, start_value)`, or `start_value.max(1)` when
@@ -643,9 +660,47 @@ pub fn allocate_in_tx(
     // skip) burns the skipped range as deliberate gaps — those numbers
     // were either issued upstream or intentionally vacated by the
     // operator, so the gap-free invariant is knowingly relaxed here.
+    //   * S444 — the DURABLE floor: one past the highest number a
+    //     crash-durable source can prove was already reserved in this
+    //     bucket. `next_number` alone cannot carry this invariant because
+    //     it lives in these same business tables, and a foreign
+    //     `Connection::open` folding the shared instance's WAL can rewind
+    //     them (measured on DEV 2026-07-30: numbers 62/63/64 each handed
+    //     out more than once, every repeat rejected by NAV as
+    //     `INVOICE_NUMBER_NOT_UNIQUE`). The caller supplies the witness —
+    //     the mirror-backed audit ledger, read in THIS transaction — so a
+    //     torn business tail cannot rewind the sequence. `None` (fresh
+    //     bucket, or an in-process caller with no ledger) contributes 0 and
+    //     leaves the pre-S444 arithmetic byte-identical.
+    let durable_floor: u64 = args
+        .durable_high_water
+        .map(|hw| hw.saturating_add(1))
+        .unwrap_or(0);
     let allocated: u64 = next_number
         .max(args.start_value)
-        .max(args.sequence_floor.unwrap_or(0));
+        .max(args.sequence_floor.unwrap_or(0))
+        .max(durable_floor);
+
+    // Fail loud when the durable witness had to correct the counter: the
+    // stored `next_number` was at or below a number the ledger proves was
+    // already burned, which means this DB's business tail was torn. The
+    // allocation is SAFE (we jumped clear), but the tear itself is a real
+    // defect the operator must know about — silence here is how three DEV
+    // sessions each re-filed a number NAV had already accepted.
+    if durable_floor > next_number.max(args.start_value) {
+        tracing::error!(
+            series_id = %series_id_str,
+            fiscal_year,
+            stored_next_number = next_number,
+            durable_high_water = args.durable_high_water.unwrap_or(0),
+            allocated,
+            "S444: invoice_sequence_state.next_number was BEHIND the audit ledger's \
+             proven high-water mark — this tenant DB lost committed business rows (torn \
+             tail / folded WAL). The sequence was floored forward to stay monotonic, so \
+             no number is re-issued, but invoice + reservation rows below the allocated \
+             number are MISSING and should be reconciled against the audit ledger."
+        );
+    }
 
     // Advance the stored counter to `allocated + 1`. Equivalent to the
     // pre-S392 `next_number + 1` when no floor jump occurred; when the

@@ -121,6 +121,32 @@ pub struct AllocateArgs {
     /// Set only on dev/test builds; the binary passes `None` in
     /// production, where numbers are strictly monotonic.
     pub sequence_floor: Option<u64>,
+    /// S444 — the highest sequence number a DURABLE source can prove was
+    /// already reserved in this bucket. The allocator reserves strictly
+    /// ABOVE it: `allocated > durable_high_water`.
+    ///
+    /// This exists because `next_number` is **not** durable on its own.
+    /// It lives in the business tables, and a foreign `Connection::open`
+    /// on the shared DuckDB instance folds the `aberp_db::Handle`'s WAL on
+    /// close (those pragmas are per-connection), which can rewind the
+    /// counter to a value already handed out — and already filed with NAV.
+    /// Observed on DEV 2026-07-30: numbers 62, 63 and 64 were each issued
+    /// more than once and NAV rejected the repeats as
+    /// `INVOICE_NUMBER_NOT_UNIQUE`.
+    ///
+    /// `sequence_floor` (S392) does not cover this: it is dev-only, it is
+    /// derived from NAV rather than from local durable state, and it is
+    /// `None` in production — exactly where the consequence is a real ÁFA
+    /// filing. Kept as a separate field rather than folded into
+    /// `sequence_floor` so the two provenances stay distinguishable in
+    /// logs and tests (CLAUDE.md rule 7).
+    ///
+    /// The binary passes
+    /// `apps/aberp::issue_invoice::durable_sequence_high_water`, read from
+    /// the mirror-backed audit ledger inside the SAME transaction. `None`
+    /// means "no durable witness" (fresh tenant / fresh annual bucket) and
+    /// leaves the pre-S444 arithmetic byte-identical.
+    pub durable_high_water: Option<u64>,
 }
 
 /// Outcome of an `allocate_and_insert` call. The fresh and replay
