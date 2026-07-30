@@ -3,6 +3,11 @@
 - **Status:** Proposed — **plan only**. This document authorises no engine code,
   no schema change, and no data migration. It is the artefact a later execution
   session works from, one gated step at a time.
+  **Adversarially reviewed 2026-07-30 → verdict NO-GO pending §13's must-fix list.**
+  §13 is the authoritative ruling on §10's Q1–Q11 and supersedes the "my call"
+  column there where the two disagree. Four blockers (B1–B4) and seven must-fixes
+  (F1–F7) were measured against the tree; the corrections are folded into §1–§8
+  in place and flagged **[ADV]**.
 - **Date:** 2026-07-30
 - **Deciders:** Ervin
 - **Depends on:** ADR-0107 / PR #47 (engine evaluation — recommends Option B),
@@ -82,11 +87,12 @@ baseline table.**
 | ADR-0098 frozen openers | 81 across 20 files | `adr0098_prod_opener_fingerprints.txt` |
 | ADR-0099 frozen read-forks | 33 | `adr0099_read_fork_structural_baseline.txt` |
 | `state.db.write()` / `.read()` call sites | 84 | the Handle seam's blast radius |
-| `ON CONFLICT` | 21 | needs an explicit conflict target on SQLite |
+| `ON CONFLICT` — ~~21~~ **5 executable** | **5** | **[ADV / F3]** the raw grep returns 21; **16 are doc comments and 1 is a test assertion string**. This is `ALTER COLUMN`'s exact error (G-1), reproduced. The 5 real sites are `material_inventory.rs:555`, `supplier_prices.rs:470`, `quote_pricing_jobs.rs:415`+`:476`, `restore_from_nav_outgoing.rs:326`. See §4.3. |
 | `IS NOT DISTINCT FROM` | 8 | needs SQLite ≥ 3.39 |
 | `LIKE` | 2 | unescaped metacharacters (M11) |
 | `ATTACH` / `load_extension` / `CREATE TRIGGER` / `CREATE VIEW` / `WITH RECURSIVE` / `OVER (` | **0** | PR #49 confirmed |
-| **SQL-side arithmetic on a money/quantity column** | **6** | §3.4 — the item neither doc names |
+| **SQL-side arithmetic on a money/quantity column** | ~~6~~ **7** | §3.4 — the item neither doc names. **[ADV / F1]** the 7th is `aberp-inventory/src/repository.rs:549`, a `-` (subtraction), which the §8 T-8 grep pattern cannot see. |
+| **SQL-side `<` comparison on an R2 (TEXT-decimal) column** | **1** | **[ADV / F1]** `repository.rs:549`'s `WHERE` — the only Q2 lexicographic-ordering break in the tree, and it is a live correctness bug. §3.4. |
 | `duckdb::Error::DuckDBFailure` | 3 | the only `duckdb::` path with **no** same-named rusqlite twin |
 | DEV DB / mirror on disk | 20.4 MB / 1.3 MB, mode **0644** | confirms PR #49 F-5a |
 
@@ -204,7 +210,13 @@ identical — rule 12's "should this exist at all" says no.
 ```
 apps/aberp-ui/
   aberp.duckdb                    ← source of truth. NEVER opened by a sqlite-engine build.
+  aberp.duckdb.wal                ← [ADV / B3] DuckDB's OWN write-ahead log. Present whenever
+                                     the DB was not cleanly closed. Absent from the original
+                                     map; `.gitignore` proves it is a real sidecar class.
   aberp.duckdb.audit.log          ← the mirror. READ by the migrator; never written by it.
+  aberp.duckdb.audit.log.*.bak    ← [ADV / B3] the ADR-0030 preservation files (`.ahead-*`,
+                                     `.healed-*`, `.devstale-*`). 10 present on the DEV
+                                     tenant today. The manifest must enumerate them.
   aberp.sqlite                    ← created by the migrator. Deleted by rollback.
   aberp.sqlite-wal  / -shm        ← WAL siblings. Deleted by rollback.
   aberp.sqlite.audit.log          ← the SQLite build's own mirror (mirror_path_for appends
@@ -212,6 +224,24 @@ apps/aberp-ui/
   .aberp-db-writer.test.lock      ← shared by BOTH builds (dir+tenant keyed) → mutual exclusion.
   .aberp-premigration-<ts>/       ← the Step-2 snapshot + manifest. Rollback's restore source.
 ```
+
+> **[ADV / B3] The `.wal` sidecar is the one artefact in this plan that can make
+> DEV unrestorable, and §6.2 step 4 as originally written would have caused it.**
+> "Restore `aberp.duckdb` from the snapshot dir" pairs a restored main file with
+> whatever `aberp.duckdb.wal` happens to be on disk — a WAL from a *different*
+> generation of the same file. DuckDB replays it on the next open. That is not a
+> failed rollback, it is a corrupted one, and there is no second snapshot to go
+> back to. **The snapshot must capture `aberp.duckdb` and `aberp.duckdb.wal` as an
+> atomic pair, and the restore must write both or neither** — never the main file
+> alone, and never the main file with the WAL merely deleted (a WAL holding
+> committed-but-unfolded transactions *is* part of the DB's content).
+>
+> **[ADV / B3, second arm] `.gitignore` covers `*.duckdb*` and nothing for
+> `*.sqlite*`.** Every artefact §7 produces — `aberp.sqlite`, `-wal`, `-shm`,
+> `aberp.sqlite.audit.log`, `.aberp-premigration-<ts>/`, `.aberp-rolledback-<ts>/`
+> — is untracked-**and-unignored** in a repository the topology record lists as
+> **public**, holding partner bank accounts, tax numbers and every invoice. One
+> `.gitignore` line, **Step 1, before the migrator exists**.
 
 **The engine is chosen at build time; the file is chosen by `ABERP_DB`; the two are
 cross-checked at boot.** Step 1 lands a boot refusal: a `sqlite-engine` binary
@@ -280,8 +310,16 @@ converts data. **Sources: `.rs` DDL and the 7 `.sql` migration files (§1.1 G-2)
 | `products.unit_price_minor` | `BIGINT` | `i64` | `INTEGER NOT NULL` | no |
 | `ap_invoice.total_net_minor` / `total_vat_minor` / `total_gross_minor` | `BIGINT` | `i64` | `INTEGER NOT NULL` | no |
 | `restored_invoice.total_net_minor` / `total_vat_minor` / `total_gross_minor` | `BIGINT` | `i64` | `INTEGER NOT NULL` | no |
-| `purchase_order_line.unit_price_minor` / `line_total_minor` | `BIGINT` | `i64` | `INTEGER NOT NULL` | no |
-| `purchase_order.subtotal_minor` / `vat_minor` / `total_minor` | `BIGINT` | `i64` | `INTEGER NOT NULL` | no |
+| `purchase_order_lines.unit_price_minor` / `line_total_minor` | `BIGINT` | `i64` | `INTEGER NOT NULL` | no |
+| `purchase_orders.subtotal_minor` / `vat_minor` / `total_minor` | `BIGINT` | `i64` | `INTEGER NOT NULL` | no |
+
+> **[ADV / F4] Table names in this census were wrong in three places and are
+> corrected above and below.** An execution session greps §3.2 for a table name;
+> a name that does not exist returns zero hits and reads as "already done".
+> Measured against the tree: `purchase_order_lines` / `purchase_orders` (both
+> plural, not singular); `po_number_state` (§3.2 F, **not** `purchase_order_sequence`);
+> `quote_price_snapshots` (§3.2 D, **not** `supplier_prices` — no table of that
+> name exists; the column lives at `apps/aberp/src/supplier_prices.rs:428`).
 
 #### B — money declared `DECIMAL` but already `i64` in Rust: **converts to `INTEGER`**
 
@@ -305,6 +343,7 @@ converts data. **Sources: `.rs` DDL and the 7 `.sql` migration files (§1.1 G-2)
 |---|---|---|---|---|
 | `invoice.exchange_rate` | `DECIMAL(18,6)` | `RateMetadata.rate: Decimal` | `TEXT` | representation-compatible; the migrator carries the canonical string verbatim |
 | `invoice_line.quantity` | `DECIMAL(18,6)` | `LineItem.quantity: Decimal` | `TEXT NOT NULL` | ditto |
+| `invoice_line.quantity_dec` | `DECIMAL(18,6)` | — (transient) | **must not exist post-migration** | **[ADV / F4]** missing from this census. It is the S157 widen ladder's scratch column (`duckdb_store.rs:355–358`: add `quantity_dec` → copy → `DROP COLUMN IF EXISTS quantity` → `RENAME quantity_dec TO quantity`). Step 4 creates the invoice schema fresh with `quantity TEXT`, so the ladder must be **proved unreachable on SQLite**, not merely ported: SQLite refuses `DROP COLUMN` on an indexed/PK/UNIQUE column, so a ladder that *does* fire is a hard boot abort. See §4.3's `information_schema` row — the S157 guard's fail-open is what decides whether it fires. |
 | `work_orders.qty_target` | `DECIMAL(18,6)` | `Decimal` | `TEXT NOT NULL` | ditto |
 | `boms.qty_per_unit` | `DECIMAL(18,6)` | `Decimal` | `TEXT NOT NULL` | ditto |
 | `stock_movements.qty_delta` | `DECIMAL(18,6)` | `Decimal` | `TEXT NOT NULL` | ditto |
@@ -329,7 +368,7 @@ migration faithfully preserves a float-money bug and M1 signs it off.
 |---|---|---|---|
 | `quote_pricing_jobs.total_price_eur` | `DOUBLE` | `Option<f64>` / `f64` | **`TEXT` (R2), Rust type → `Decimal`** |
 | `quote_intake_log.total_price_eur` | `DOUBLE` | `f64` | **`TEXT` (R2), Rust type → `Decimal`** |
-| `supplier_prices.cost_per_kg_eur` | `DOUBLE` | `f64` | **`TEXT` (R2)** |
+| `quote_price_snapshots.cost_per_kg_eur` (**[ADV / F4]** — not `supplier_prices`; `supplier_prices.rs:428`) | `DOUBLE` | `f64` | **`TEXT` (R2)** |
 | `quoting_materials.cost_per_kg_eur` | `DOUBLE` | `f64` | **`TEXT` (R2)** |
 | `quoting_parameters.cad_cam_rate_eur_per_hour`, `machining_rate_eur_per_minute` | `DOUBLE` | `f64` | **`TEXT` (R2)** |
 
@@ -373,17 +412,40 @@ and it is written here so a later session cannot quietly take the easy branch.
 #### F — integers and identity: `BIGINT`/`INTEGER` → `INTEGER`, unchanged
 
 `invoice.sequence_number`, `invoice_sequence_state.next_number`,
-`invoice_sequence_reservation.number`, `purchase_order_sequence.next_number`,
+`invoice_sequence_reservation.number`, `po_number_state.next_number` (**[ADV / F4]**
+— not `purchase_order_sequence`),
 `invoice_line.vat_rate_basis_points`, `invoice.fiscal_year`,
 `partners.issued_invoice_count`, `email_relay_queue.byte_size`,
 `audit_ledger.seq`, `audit_ledger.time_mono`, `bom_revisions.rev_number`,
 `bom_revisions.line_count`, `routings.sequence`, `routings.est_time_min`.
 
-**`vat_rate_basis_points INTEGER` is why VAT never touches a float** — 27% is
-`2700`, not `0.27`. That property is preserved verbatim and is worth naming: the
-ÁFA percentage on the NAV wire is rendered from an integer basis-point count, so
-F-6a's float-coercion class cannot reach the VAT rate itself. It reaches
+**`vat_rate_basis_points INTEGER` is why VAT never touches a float *in storage*** —
+27% is `2700`, not `0.27`. The **storage** property is preserved verbatim, and
+F-6a's storage-side float-coercion class cannot reach the VAT rate. F-6a reaches
 `exchange_rate` and `huf_equivalent_total`, which is what §3.2 B and C close.
+
+> ⚠ **[ADV / B2] The stronger claim this paragraph originally made is false, and
+> §3.3's was too.** `apps/aberp/src/nav_xml.rs:1788` renders the value actually
+> written to the NAV wire as
+> `format!("{:.2}", vat_rate_basis_points as f64 / 10000.0)`. **There is an `f64`
+> on the NAV emission path today, in the exact place this plan asserted none
+> exists.** Three consequences the execution session inherits:
+> 1. For the finite set of legal Hungarian ÁFA rates (0 / 5 / 18 / 27) the
+>    `bp as f64 / 10000.0` → `{:.2}` round is exact, so this is **not** a live
+>    filing defect. It is a false invariant, which is worse in a plan than in code:
+>    §3.3's trace table row for "VAT rate" says *integer arithmetic*, and it is not.
+> 2. It is a **rule-7 fork**: the write path is `f64`, while the inverse read path
+>    `parse_vat_percentage_to_basis_points` (`nav_xml.rs:2658`) is exact
+>    `Decimal::from_str_exact` × 10000. Two representations of one value, one hop
+>    apart, in the same file.
+> 3. **T-5(d) as specified is unimplementable.** A grep/clippy gate asserting "no
+>    code path between column and emitted byte constructs an `f64`" over
+>    billing + `nav_xml` + `invoice-pdf` goes **red on day one** against this line.
+>    The execution session must pick, in the PR body, one of: (a) convert
+>    `write_vat_rate_choice` to `Decimal` (≈3 lines, makes the claim true and the
+>    gate implementable — **recommended**), or (b) scope T-5(d) to an explicit
+>    allowlist naming this site. It must not silently weaken the gate, which is
+>    the fail-open branch.
 
 #### G — hash chain and payloads: `BLOB` → `BLOB` (R3)
 
@@ -410,18 +472,29 @@ The trace, per value, from column to emitted byte:
 |---|---|---|---|---|
 | line net / gross | `invoice_line.unit_price` INTEGER | `i64` | `Money::Huf/Eur` | `nav_xml`: integer→string; `invoice-pdf`: `format.rs` integer formatter |
 | quantity | `invoice_line.quantity` TEXT | `String` | `Decimal::from_str` | `nav_xml`: `.normalize().to_string()`; PDF: same |
-| VAT rate | `vat_rate_basis_points` INTEGER | `i64` | basis points | `nav_xml`: `bp/100` as decimal string, integer arithmetic |
+| VAT rate | `vat_rate_basis_points` INTEGER | `i64` | basis points | `nav_xml:1788`: **`bp as f64 / 10000.0`, formatted `{:.2}` — an `f64`, [ADV / B2]**. Exact for 0/5/18/27; fix to `Decimal` in Step 5 or allowlist it in T-5(d). |
 | exchange rate | `invoice.exchange_rate` TEXT | `String` | `Decimal::from_str` | printed invoice only (ADR-0037 §1.a) |
 | HUF equivalent | `invoice.huf_equivalent_total` **INTEGER** | **`i64`** | `RateMetadata.huf_equivalent_total` | NAV wire + PDF |
 | ledger hashes | `*_hash` BLOB | `Vec<u8>` | `EntryHash` | `verify_chain` |
 
-**There is no point in this trace where an `f64` exists.** The round-half-even HUF
+**[ADV / B2] — corrected.** The original text here read *"There is no point in this
+trace where an `f64` exists."* That is false: the VAT-rate row above is an `f64`
+today. The claim that survives measurement, and the one the execution session
+should hold itself to, is narrower and still worth having:
+
+> **No monetary *amount* — no net, gross, VAT amount, or HUF equivalent — passes
+> through an `f64` between column and emitted byte.** The one `f64` in the trace
+> is the VAT *rate*, a `{:.2}` rendering of an integer basis-point count over the
+> four legal Hungarian rates, and it is exact for all four. It is a false-invariant
+> defect, not a filing defect, and Step 5 closes it.
+
+The round-half-even HUF
 conversion (`huf_equivalent_round_half_even`, ADR-0037 §1.c / C11) already runs on
 `rust_decimal::Decimal` and lands on `i64`; §3.2 B removes the last string↔decimal
 round-trip that stood between that `i64` and the column. The property test T-5
 (§8) is what makes this claim falsifiable rather than asserted.
 
-### 3.4 The six SQL-side arithmetic sites that must move to Rust
+### 3.4 The ~~six~~ **seven** SQL-side arithmetic sites that must move to Rust — and the one comparison
 
 | Site | Statement | Why it breaks | Fix |
 |---|---|---|---|
@@ -430,12 +503,34 @@ round-trip that stood between that `i64` and the column. The property test T-5
 | `aberp-inventory/src/repository.rs:222` | `CAST(COALESCE(SUM(qty_delta),0) AS VARCHAR)` (cache rebuild, in-tx) | `qty_delta` becomes `TEXT` → `SUM` coerces to `REAL`. **This is the stock-cache invariant** `stock_qty = SUM(qty_delta)`. | Select the column, fold `Decimal` in Rust. |
 | `aberp-inventory/src/repository.rs:629` | same, batch rebuild | same | same |
 | `aberp-inventory/src/bin/rebuild_stock_cache.rs:29` | same, CLI one-shot | same | same |
+| **`aberp-inventory/src/repository.rs:549`** (`low_stock_products`) — **[ADV / F1], site 7, and this plan's only Q2 break** | `WHERE COALESCE(stock_qty,0) < COALESCE(min_stock,0)`<br>`ORDER BY (COALESCE(stock_qty,0) - COALESCE(min_stock,0)) ASC, name ASC` | **Two distinct breaks in one statement.** (a) *The comparison.* Both columns are R2/`TEXT` after migration, so `COALESCE(col, 0)` yields `TEXT` when the column is present and `INTEGER 0` when it is `NULL`. `TEXT < TEXT` is **lexicographic**: stock `'9'` vs min `'10'` compares `'9' > '1…'` → **FALSE → the low-stock product is silently not flagged.** And where one side is `NULL`→`INTEGER 0`, SQLite's storage-class ordering places INTEGER before TEXT *unconditionally*, so `0 < '<any text>'` is always TRUE. (b) *The ordering.* `TEXT - TEXT` forces REAL coercion → **float arithmetic on a quantity**, exactly R1/R2's target class. | Select `stock_qty`, `min_stock` as `TEXT`; do **both** the `<` filter and the deficit ordering in Rust over `Decimal` — the crate already parses both columns into `Decimal` at `:449` and `:502`, so the fold has no new dependency. Lands with inventory in **Step 7**. |
 | `reports.rs` `MAX(...)` / `COUNT(*)` sites | — | unaffected (no money arithmetic) | none |
 
 **This work is not optional and not deferrable to a cleanup phase.** Three of the
-five sites are the inventory cache-rebuild path, which is a *write* — a float
-there writes a wrong `stock_qty` back into the products cache. They land in the
-same step as their family (Steps 5 and 7).
+sites are the inventory cache-rebuild path, which is a *write* — a float there
+writes a wrong `stock_qty` back into the products cache. They land in the same
+step as their family (Steps 5 and 7).
+
+> **[ADV / F5] The fold move must also kill the fail-open beside it.**
+> `reports.rs:871` reads the aggregate back through
+> `decimal_str_to_i64(&s).unwrap_or(0)`. If a `REAL`-rendered `SUM` produces a
+> string that does not parse, the ÁFA report silently prints **0 HUF**. That is
+> rule 11 in the plan's own worst class, and it is *load-bearing during the
+> migration*: it is the mechanism by which a missed §3.4 fold reads as a working
+> report. **The `unwrap_or(0)` dies in the same commit as the fold** — the Rust
+> fold returns `Result` and the caller propagates.
+
+> **[ADV / F1] This closes Q2.** A per-column sweep of every `ORDER BY`,
+> `MIN`/`MAX`, `<`/`>`, and `BETWEEN` over all ten R2 (TEXT-decimal) columns —
+> `exchange_rate`, `quantity`, `qty_target`, `qty_per_unit`, `qty_delta`,
+> `stock_qty`, `min_stock`, `est_cost_huf`, `total_price_eur`, `cost_per_kg_eur` —
+> returns **exactly one hit in the whole tree: `repository.rs:549`.** Every other
+> comparison on these values (`repository.rs:449`, `:502`;
+> `work-orders/repository.rs:232`, `:699`) is already in Rust over `Decimal`.
+> Q2's mitigation is therefore **done here, in the plan**, not deferred to
+> "check every `ORDER BY` before Step 5" — and note the original mitigation
+> wording said *`ORDER BY`* only and would have missed the `WHERE`, which is the
+> half that actually returns wrong rows.
 
 ---
 
@@ -519,7 +614,7 @@ time — is a parser we would own forever (rule 12). Flagged for the adversarial
 | `information_schema.tables` → `sqlite_master` | `print_invoice.rs:926,986` | `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='invoice'` |
 | `DROP COLUMN IF EXISTS` | `duckdb_store.rs:357`, `quoting_materials.rs:132` | Guard on `pragma_table_info` then bare `DROP COLUMN` |
 | `RENAME COLUMN` | `duckdb_store.rs:358` | Supported ≥3.25. No change. |
-| `ON CONFLICT` | 21 | **Each needs a real `UNIQUE` index.** ADR-0019's "no DB-level UNIQUE" posture means several may not have one — SQLite's upsert requires an explicit conflict target that resolves to a unique index. **This is a genuine tension with `[[no-sql-specific]]` and §2.1's "no invariant moves into the DDL"**: a `UNIQUE` index added *only* to satisfy `ON CONFLICT` is a constraint in the schema. Conservative resolution: audit all 21 in Step 3; where a unique index already exists, use it; where none does, **rewrite the upsert as an explicit in-transaction `SELECT`-then-`INSERT`/`UPDATE` under `BEGIN IMMEDIATE`** rather than adding a constraint. Flagged — this is the item most likely to grow. |
+| `ON CONFLICT` — **5**, not 21 | **5** | **[ADV / F3] — the audit is done, and it is empty work.** The 21 was a raw grep over comments (G-1's error, reproduced). All 5 executable sites are the same shape — `INSERT INTO t (…) VALUES (…) ON CONFLICT (<cols>) DO NOTHING` — and in **every one** `<cols>` is *exactly* the table's already-declared `PRIMARY KEY`: `inventory_balances (tenant_id, material_grade)` (`material_inventory.rs:236`), `quote_price_snapshots (tenant_id, price_set_hash, grade)` (`supplier_prices.rs:429`), `quote_pricing_jobs (quote_id)` (`:248`, ×2 call sites), `restore_lock (tenant_id)` (`restore_from_nav_outgoing.rs:270`). SQLite resolves an upsert conflict target against a `PRIMARY KEY`'s implicit unique index exactly as DuckDB does. **Zero `UNIQUE` indexes to add. Zero rewrites. No `SELECT`-then-write. No new constraint, so no `[[no-sql-specific]]` / §2.1 tension exists.** Two of the five (`restore_from_nav_outgoing.rs:334`, `quote_pricing_jobs.rs:415`/`:476`) branch on the affected-row count as an idempotency signal; SQLite's `changes()` returns 0 for a skipped upsert row, same as DuckDB — pin it, don't re-derive it. Step 3's obligation shrinks to **one confirmation test per site**. |
 | `IS NOT DISTINCT FROM` | 8 | Supported ≥3.39; M12 pins the floor at 3.51.3 anyway. No rewrite. |
 | `CREATE INDEX IF NOT EXISTS` | many | Supported. No change. |
 | `PRIMARY KEY` on `STRICT` tables | many | Supported; note `INTEGER PRIMARY KEY` aliases rowid — none of ABERP's PKs are integer (all ULID `TEXT`), so no behaviour change. |
@@ -601,8 +696,14 @@ run/rollback_to_duckdb.sh [--from <snapshot-dir>]
    `.aberp-rolledback-<ts>/` (**move, never delete** — rule 11; a deleted artefact
    cannot be post-mortemed).
 4. If `--from` is given, or if `aberp.duckdb`'s digest does not match the
-   pre-migration manifest, restore `aberp.duckdb` + `aberp.duckdb.audit.log` from
-   the snapshot dir.
+   pre-migration manifest, restore from the snapshot dir — **[ADV / B3] as an
+   atomic set: `aberp.duckdb` **and** `aberp.duckdb.wal` **and**
+   `aberp.duckdb.audit.log` **and** every `aberp.duckdb.audit.log.*.bak`
+   preservation file, all or none.** Restoring the main file alone pairs it with a
+   foreign WAL and corrupts on next open; that is the one failure in this plan
+   with no second snapshot behind it. If the snapshot recorded no `.wal` (clean
+   close) and one is present now, it is **moved aside into
+   `.aberp-rolledback-<ts>/`, never deleted** — same rule-11 reasoning as step 3.
 5. `cargo build` **without** `--features sqlite-engine` (the default).
 6. **Verify, and this is the part that makes it "verified rollback":**
    - `aberp verify-chain` genesis→head on the restored DuckDB DB — must be `OK`;
@@ -627,7 +728,38 @@ transformation rather than a cast.
 
 | Family | Method | Why |
 |---|---|---|
-| **`audit_ledger`** | **Replay from the fsync'd mirror** (`aberp.duckdb.audit.log`, 1.3 MB), not from the DuckDB table. | The mirror is ADR-0030's primary evidence and is the *more* durable of the two — the 2026-07-19 incident had five entries in the mirror and gone from the DB. Replaying the mirror and then running `verify_chain` genesis→head on the SQLite side is a **stronger** exit criterion than copying the table. Any DB-vs-mirror divergence surfaces here as a hard stop, which is exactly what we want to know before Step 5 completes. |
+| **`audit_ledger`** | ~~Replay from the fsync'd mirror~~ → **[ADV / B1] INVERTED. Row-by-row carry from the DuckDB table; the mirror is the *cross-check*, never the source.** | **Mirror replay is lossy and the plan's own gate cannot see the loss.** Measured: `MirrorEntry` (`crates/audit-ledger/src/mirror.rs:111`) has **no `session_id`, no `session_pubkey`, no `event_sig` field**, and `MirrorEntry::to_entry()` (`:206–215`) sets all three to `None` — the code says so in its own comment: *"the ADR-0030 mirror is a hash-chain DIVERGENCE detector and does not carry the session-signing columns."* Replaying the mirror therefore **strips the S441 / ADR-0087 per-entry signature layer from the entire migrated history**. And it is invisible to every check in this plan: `compute_entry_hash` deliberately excludes the session fields, so `verify_chain` passes, all three head-`entry_hash` equalities pass, `PRAGMA integrity_check` passes, and the `typeof()` sweep passes — **green gate, gutted tamper-evidence.** That is D2a's fail-open shape sitting inside the step this plan exists to protect. |
+| **`audit_ledger_anchors`** | **[ADV / B1] Row-by-row carry. Newly added — it appeared in no carry table.** | The S441 / ADR-0087 qualified-timestamp anchors (`crates/audit-ledger/src/session/anchors.rs:32`). Not in the mirror, and not named anywhere in the original §6.3 or §3.2. Carried unnamed = dropped silently; `verify_chain_signed` then returns *chain intact, not anchored* while `verify_chain` says OK. Its `entry_hash`-class columns follow **R3 (`BLOB`)**. |
+
+> **[ADV / B1] What replaces the rejected argument.** The original reasoning for
+> mirror replay was sound about *durability* — the mirror survived 2026-07-19
+> when the DB table did not — and wrong about *completeness*. Both properties are
+> obtainable without choosing between them:
+>
+> 1. **Carry the `audit_ledger` table row-by-row**, including `session_id`,
+>    `session_pubkey`, `event_sig`, bound per R3 as `BLOB` where the column is a
+>    hash and `TEXT` where the column is a hex/base64 string — the `typeof()`
+>    sweep (T-2) must cover all three session columns explicitly, since they are
+>    the ones with no hash-chain check behind them.
+> 2. **Replay the mirror into a scratch in-memory ledger and diff it against the
+>    carried table**, at the `entry_hash` level, which ADR-0030 §4 already names as
+>    the canonical agreement key. This keeps the mirror's evidentiary value as a
+>    *check* — the thing it is built to be — without making it the source.
+> 3. **Classify the divergence rather than failing flat**, because the original
+>    gate ("SQLite head == DuckDB head == mirror tail") would **hard-stop on
+>    exactly the 2026-07-19 scenario the plan cites as the justification for
+>    mirror replay**: mirror ahead of the DB. Three arms:
+>    - *mirror == table* → proceed.
+>    - *mirror **ahead** of table* (the 2026-07-19 shape) → **stop and route to the
+>      existing boot-heal path**, do not migrate, do not force-fix. The migration
+>      is not the place to heal a torn tail.
+>    - *table **ahead** of mirror* → **hard stop, no heal.** This is the direction
+>      that means the fsync'd mirror missed a committed append, and it must not be
+>      papered over by a migration.
+> 4. **The reconciliation gate gains `verify_chain_signed`**, an anchor-count
+>    equality, and a **signature-coverage equality** — "count of entries with
+>    `event_sig IS NOT NULL` is identical on both sides". That last one is the
+>    single check that would have caught B1, and it is one line of SQL per side.
 | **invoice / invoice_line / sequence tables** | **Row-by-row carry** through `duckdb_store`'s own read path → the new SQLite writer. | These are the legally-binding records (ADR-0009, 8-year). They must cross with byte-identical NAV/PDF output (T-4). Rebuilding them from the ledger is possible but would re-derive a regulatory record from a derived source — wrong direction. |
 | **partners / products / purchasing** | Row-by-row carry. | Operator-entered master data; cheap; needed for the customer-journey e2e. |
 | **inventory (`stock_movements`, cache cols)** | Carry `stock_movements` (append-only ledger); **rebuild** the `products.stock_qty` cache from `SUM(qty_delta)` **in Rust** via the existing `rebuild-stock-cache` path. | The cache is derived by definition, and rebuilding it exercises §3.4's Rust-side fold on real data. |
@@ -642,13 +774,44 @@ transformation rather than a cast.
 - per-money-column **exact sum** SQLite == DuckDB, computed **in Rust on both
   sides** (never with SQL `SUM` — §3.4);
 - `Ledger::verify_chain` genesis→head **OK on the SQLite side**;
-- SQLite head `entry_hash` == DuckDB head `entry_hash` == mirror tail `entry_hash`;
+- **[ADV / B1] `verify_chain_signed` OK on the SQLite side**; `audit_ledger_anchors`
+  row count SQLite == DuckDB; **count of entries with a non-NULL `event_sig`
+  SQLite == DuckDB** (the check that catches a silently-unsigned carry);
+- SQLite head `entry_hash` == DuckDB head `entry_hash` == mirror tail `entry_hash`,
+  **with the three-arm divergence classification above — not a flat equality**;
 - `PRAGMA integrity_check` == `ok`;
 - **`SELECT typeof(col)` over every row of every column in §3.2 A–G matches the
   declared class** — the M1 pin, applied to migrated data and not only to fresh
   writes.
 
 Any mismatch → the step fails, `rollback_to_duckdb.sh` runs, nothing is force-fixed.
+
+> **[ADV / B4] The gate is circular unless the DuckDB side is re-read
+> independently, and the migrator must hold the writer lock.** Two coupled holes:
+>
+> 1. **Rule 13 applies to the migrator.** Step 4 opens the DuckDB file in "a
+>    separate one-shot process" — that is, as a *fresh opener*, which is precisely
+>    the shape CLAUDE.md rule 13 says reads **stale** against Handle-WAL-resident
+>    data. §6.2 gives the rollback script a `db_writer_lock` check; **Step 4's
+>    migrator was given none.** If a DEV `serve` is live, the migrator silently
+>    migrates a stale, short snapshot. → **The migrator must acquire
+>    `db_writer_lock` for the tenant (dir+tenant keyed, §1.1 G-7) and refuse — not
+>    wait, not force — if it is held.** It must additionally refuse if
+>    `aberp.duckdb.wal` is non-empty (B3): a read-only DuckDB open cannot replay a
+>    WAL, so an unfolded WAL is data the migrator cannot see and will not miss
+>    loudly.
+> 2. **The verification must not reuse the extraction.** "Row count SQLite ==
+>    DuckDB" is worthless if the DuckDB figure is the migrator's own in-memory
+>    extraction count: it then compares the migrator against itself and passes
+>    vacuously on any read-side loss. **The gate re-opens DuckDB and re-queries,
+>    after the migrator process has exited**, through the ordinary read path.
+> 3. **No read-only open exists in the tree today.** A sweep for
+>    `access_mode` / `read_only` / `READ_ONLY` across `apps/`, `crates/`,
+>    `modules/` returns **zero** non-test hits. Step 4's "opens DuckDB read-only"
+>    is a capability to be *built* (`duckdb::Config::access_mode`), not one to be
+>    used — and it is the single mechanism behind C-I's "the DuckDB file is
+>    byte-unmodified". It gets its own pin: open read-only, attempt a write, assert
+>    the error.
 
 ---
 
@@ -676,6 +839,20 @@ that is ADR-0107's own "stop here having spent little" exit.
   `db_writer_lock` is **not** retired (PR #49 F-7b).
 - *Verified by:* T-13 (refusal mutation-verified); the rollback script run against
   a DuckDB-only tree and asserted PASS; snapshot round-trip on a copy.
+- **[ADV / B3] Also lands here:** the `*.sqlite*` / `.aberp-premigration-*` /
+  `.aberp-rolledback-*` `.gitignore` entries, and the manifest's `.wal` +
+  `.audit.log.*.bak` enumeration. Both are prerequisites for Step 4 producing
+  anything on disk, so they cannot wait.
+- **[ADV / F6] T-13 cannot be mutation-verified in this step as written.** The
+  refusal is "inert while no `sqlite-engine` feature exists", and the arm that
+  carries C-I — *a `sqlite-engine` binary refuses a non-`.sqlite` path* — is
+  unbuildable until Step 3. So the property the whole reversibility argument rests
+  on would be **unpinned across Steps 1 and 2, including the step that links
+  `rusqlite`.** Fix: implement the decision as a **pure function**
+  (`engine_path_agrees(engine: Engine, path: &Path) -> Result<()>`) that takes the
+  engine as an *argument*, not from `cfg!`. Both arms are then unit-testable and
+  mutation-verifiable in Step 1 with no feature at all; Step 3 adds only the
+  three-line `cfg!`-driven caller and re-runs T-13 end-to-end.
 - *Rollback:* `git revert`. Nothing on disk changed.
 
 **Step 2 — `rusqlite` dependency + the open-time posture. Nothing uses it yet.**
@@ -692,15 +869,46 @@ that is ADR-0107's own "stop here having spent little" exit.
 - *Changes:* `aberp_db::engine` type aliases behind the `sqlite-engine` feature
   (§2.3), incl. the 3 `DuckDBFailure` wrappers; `ensure_columns` with the
   fail-loud post-condition (§4.1, **M8**); `BEGIN IMMEDIATE` as the `Handle`'s
-  transaction default (**M5**); the `ON CONFLICT` audit of all 21 sites (**M12**,
-  §4.3) with each site's resolution recorded.
-- *Verified by:* T-9 (M8 fail-loud, both arms), T-6 (M5 interleave), the 21-site
-  audit table in the PR body.
+  transaction default (**M5**); **[ADV / F3]** a confirmation test per **5**
+  `ON CONFLICT` site (**M12**, §4.3 — the audit itself is now done; no rewrites,
+  no new `UNIQUE` index); **[ADV / Q10]** the **exhaustive** `read()` audit.
+- *Verified by:* T-9 (M8 fail-loud, both arms), T-6 (M5 interleave), the 5-site
+  `ON CONFLICT` confirmation table and the `read()` audit table in the PR body.
 - *Rollback:* revert. Default build unaffected (feature off).
 
+> **[ADV / Q10 + Q11 — one question, not two, and no longer deferrable.]**
+> `read()` becoming a real second connection is safe only under a claim §2.4
+> asserts and never pins: that WAL gives a reader a fresh snapshot per statement.
+> That holds **in autocommit** and is **false inside an explicit transaction**,
+> where the reader freezes its snapshot at `BEGIN`. And a `read()` taken *while a
+> `write()` guard is live* now contends for a real file lock instead of sharing
+> one in-process instance — M7's finite `busy_timeout` (Q11) converts DuckDB's
+> immediate mutex self-deadlock into a **timed hang, then `SQLITE_BUSY`**: rule
+> 13's known failure mode with its loudness removed. That is why Q11's "needs a
+> number, measured, in Step 2" is not a separable nit — the number *is* the
+> observability of Q10's worst case.
+>
+> The Step-3 audit classifies all 84 sites on **two** axes: *(a)* does it read
+> inside an open transaction; *(b)* is it reached while a `write()` guard is live.
+> Any site that is both is a defect `try_clone` was masking. Two pins, both
+> mutation-verified: commit on connection A → read on a pre-existing connection B
+> in autocommit → assert B sees it (the snapshot claim); and a nested
+> `read()`-inside-`write()` **aborts loudly** rather than waiting out
+> `busy_timeout`. **This audit gates Step 5. It does not run alongside it.**
+
 **Step 4 — The migrator + the reconciliation gate. Read-only against DuckDB.**
+- **[ADV / B4] Preconditions the migrator enforces before it opens anything**, all
+  refusals, none of them waits: it holds `db_writer_lock` for the tenant;
+  `aberp.duckdb.wal` is absent or empty; `ABERP_DB` resolves inside
+  `apps/aberp-ui/` and nowhere under `~/.aberp/`; the pre-migration snapshot
+  (incl. the `.wal` pair, B3) exists and verifies. The read-only open itself is
+  **new capability** — a sweep for `access_mode`/`read_only` over `apps/`,
+  `crates/`, `modules/` returns zero non-test hits — so it gets its own pin: open
+  read-only, attempt a write, assert the error.
 - *Changes:* `aberp migrate-to-sqlite` one-shot: opens DuckDB **read-only**, opens
-  a fresh `aberp.sqlite`, replays the ledger from the mirror, carries the families
+  a fresh `aberp.sqlite`, **[ADV / B1] carries `audit_ledger` + `audit_ledger_anchors`
+  from the DuckDB tables and uses the mirror as a three-arm cross-check (§6.3) —
+  it does *not* replay the mirror as the source**, carries the families
   per §6.3, applies §3's representation rules, runs the reconciliation gate (§6.3),
   and **refuses on any mismatch**; the `information_schema` → `pragma_table_info` /
   `sqlite_master` rewrites (§4.3 G-3) and the `DROP COLUMN IF EXISTS` guards (G-4).
@@ -771,7 +979,7 @@ a pin (ADR-0107 §4.1, extended to security by PR #49).
 | **T-5** | **Money property tests**: (a) `Decimal` round-trips through `TEXT` for 10⁵ generated values at scale 0–6 incl. trailing-zero forms; (b) `huf_equivalent_round_half_even` on `Decimal` → `i64` matches DuckDB's result for the whole DEV rate set; (c) `unit_price × quantity` folded in Rust equals the pre-migration DuckDB `DECIMAL(38,6)` aggregate for every invoice; (d) **no code path between column and emitted byte constructs an `f64`** — enforced as a `clippy`/grep gate over the billing + nav_xml + invoice-pdf crates | §3.1, §3.3, §3.4 |
 | **T-6** | Two connections interleave read-head → append; must **not** produce two links off one `prev_hash`. Run with and without `BEGIN IMMEDIATE` | M5 / F-7a |
 | **T-7** | `db_writer_lock_e2e` re-pointed at SQLite; **plus** a cross-engine test: a DuckDB `serve` holding the lock refuses a SQLite `serve` on the same tenant+dir | M6 / F-7b / §1.1 G-7 |
-| **T-8** | Cut-gate grep: no `SUM(`/`*`/`+`/`AVG(` over any §3.2 A–D column name in any SQL string | §3.4 |
+| **T-8** | Cut-gate grep over any §3.2 A–D column name in any SQL string: no `SUM(`/`*`/`+`/`AVG(` — **[ADV / F2] and no `-`, no `/`, and no bare `<` / `>` / `<=` / `>=` / `BETWEEN` either.** The original pattern omitted subtraction and division and had no comparison arm at all, so it was structurally incapable of seeing `repository.rs:549` — the one site §3.4 and Q2 both turn on. A gate that cannot red on the plan's own worst example is PR #43's name-vs-shape lesson, unlearned. Mutation-verify it **against `repository.rs:549` specifically**: restore the original query, watch T-8 go red. | §3.4, Q2 |
 | **T-9** | `ensure_columns`: seeds a pre-migration schema and asserts every expected column exists after `ensure_schema`; **and** asserts `Err` when a column cannot be added, and `Err` when the table is absent | M8 / F-1c / D2a's shape |
 | **T-10** | mode of `aberp.sqlite`, `-wal`, `-shm` == `0600`; tenant dir `0700` | M9 / F-5a |
 | **T-11** | `sqlite3_libversion_number() >= 3051003` | M10 / M12 |
@@ -812,6 +1020,10 @@ it or an explicit "out of scope".
 
 Where a choice was open I took the conservative branch and recorded it. These are
 the ones most worth attacking.
+
+> **[ADV] Ruled 2026-07-30. §13 carries the verdict on each and supersedes the
+> "My call" column below wherever the two disagree — Q2, Q5, Q7 and Q10 all
+> changed.**
 
 | # | Question | My call | Why it might be wrong |
 |---|---|---|---|
@@ -882,3 +1094,88 @@ stored on the paths that reach the Hungarian tax authority. Every mechanism in �
 and §8 exists to make that change reversible and observable, but reversible is not
 the same as harmless, and the DEV-only scope (C-II) is what keeps the blast radius
 at a disposable database.
+
+---
+
+## 13. Adversarial review — 2026-07-30
+
+> ## VERDICT: **NO-GO to begin execution**, pending B1–B4 and F1–F7.
+>
+> The plan's **structure** is sound and its **direction** survives attack: the
+> step ordering is right, Step 4 genuinely is a cheap abort point, the
+> compile-time selector is the correct engineering call, keeping the frozen gates
+> is correct, and the `db_writer_lock` mutual-exclusion property (G-7) verifies
+> exactly as claimed — `lock_path_for` (`db_writer_lock.rs:73`) keys on
+> `<parent-dir>/.aberp-db-writer.<tenant>.lock`, and `mirror_path_for`
+> (`mirror.rs:94`) appends its suffix to the db path, so the two engines' mirrors
+> cannot collide either. Both load-bearing claims measured true.
+>
+> It is NO-GO on two of the three grounds Ervin named as disqualifying.
+>
+> **The money model has a hole (B2):** §3.3's "there is no point in this trace
+> where an `f64` exists" and §3.2 F's "VAT never touches a float" are both false —
+> `nav_xml.rs:1788` renders the `<vatPercentage>` written to NAV via
+> `vat_rate_basis_points as f64 / 10000.0`. Benign in value for all four legal
+> Hungarian rates; **not** benign as a plan invariant, because T-5(d) is specified
+> as a gate enforcing precisely the claim that is false, so it goes red on day one
+> and the execution session's cheapest path is to weaken it.
+>
+> **The reversibility guarantee has a hole (B3):** §2.5's file map and §6.2 step 4
+> never name `aberp.duckdb.wal`. Restoring the main file from the snapshot while a
+> foreign-generation WAL sits beside it does not fail the rollback — it corrupts
+> it, with no second snapshot behind it. This is the one step in the plan where a
+> failure leaves DEV unrestorable, and it is a two-line fix.
+>
+> **And the crown-jewel family loses its tamper-evidence silently (B1),** which is
+> not one of Ervin's three grounds but is worse than any of them: mirror replay
+> strips `session_id` / `session_pubkey` / `event_sig` from every migrated entry
+> **by design** (`mirror.rs:206–215`, in the code's own comment), drops
+> `audit_ledger_anchors` entirely, and **every check in §6.3 passes green anyway**
+> because `compute_entry_hash` excludes those fields. Fail-open at the exact
+> point the plan was written to defend.
+>
+> Every one of the four is closable in the plan text, and three of them already
+> are, above. **None of them reopens the engine decision.** Fix them and this is a
+> GO — the plan is closer to ready than the verdict word suggests.
+
+### 13.1 Must-fix before execution begins
+
+| # | Must-fix | Lands |
+|---|---|---|
+| **B1** | Invert §6.3's ledger carry: **table row-by-row is the source, the mirror is a three-arm cross-check**. Add `audit_ledger_anchors` to the carry set. Add `verify_chain_signed`, anchor-count equality, and **non-NULL `event_sig` count equality** to the reconciliation gate. Extend T-2's `typeof()` sweep over the three session columns — they are the only hash-adjacent columns with no chain check behind them. | §6.3, Step 4, T-2 |
+| **B2** | Resolve the `nav_xml.rs:1788` `f64`: convert `write_vat_rate_choice` to `Decimal` (≈3 lines, **recommended** — it also closes the rule-7 fork against the exact `Decimal` parse at `:2658`), **or** scope T-5(d) to an explicit allowlist naming the site. Stated in the Step-5 PR body either way. Silently weakening T-5(d) is the forbidden branch. | §3.2 F, §3.3, Step 5, T-5(d) |
+| **B3** | Snapshot and restore `aberp.duckdb` + `aberp.duckdb.wal` + the mirror + every `.audit.log.*.bak` **as an atomic set, all or none**. Add `*.sqlite*`, `.aberp-premigration-*`, `.aberp-rolledback-*` to `.gitignore` **in Step 1** — the repo is public and the artefacts hold partner bank details. | §2.5, §6.2, Step 1 |
+| **B4** | The migrator acquires `db_writer_lock` and **refuses** if held (rule 13: a fresh opener reads a Handle-WAL-resident DB stale); refuses on a non-empty `aberp.duckdb.wal`; and the reconciliation gate **re-reads DuckDB independently after the migrator exits** rather than comparing against the migrator's own extraction counts. Build + pin the read-only open (zero such opens exist in the tree today). | §6.3, Step 4 |
+| **F1** | `aberp-inventory/src/repository.rs:549` — fold **both** the `<` comparison and the deficit `ORDER BY` into Rust. It is §3.4's 7th arithmetic site and the tree's **only** Q2 lexicographic break. | §3.4, Step 7 |
+| **F2** | T-8's grep gains `-`, `/`, and the comparison operators; mutation-verify it against `repository.rs:549` specifically. | T-8 |
+| **F3** | Correct the `ON CONFLICT` census 21 → **5**; record that all 5 targets are already the declared `PRIMARY KEY`, so Step 3's obligation is 5 confirmation tests, **not** an audit-and-rewrite. | §1.2, §4.3, Step 3 |
+| **F4** | Fix the three non-existent table names in §3.2 and add `invoice_line.quantity_dec`. | §3.2 |
+| **F5** | `reports.rs:871`'s `decimal_str_to_i64(...).unwrap_or(0)` dies in the same commit as the fold it hides. | §3.4, Step 5 |
+| **F6** | Make the engine↔path refusal a **pure function taking the engine as an argument**, so T-13 is mutation-verifiable in Step 1 instead of unpinned until Step 3. | Step 1, T-13 |
+| **F7** | Q10's `read()` audit is **exhaustive and gates Step 5**, classified on two axes (in-transaction reads; reads reached under a live `write()` guard), with the WAL snapshot claim pinned rather than asserted. Q11's `busy_timeout` number is chosen in the same breath — it is the observability of Q10's worst case, not a separate nit. | Step 3 |
+
+### 13.2 Ruling on Q1–Q11
+
+| # | Ruling | Reasoning |
+|---|---|---|
+| **Q1** | **Resolved-in-plan.** | Compile-time is right, and §2.2's rejection of the runtime selector is the strongest passage in the document. The reversibility genuinely comes from two files, not from the selector — which the B3 fix makes *more* true, not less. If Ervin meant a runtime toggle, that is his call to reopen; the engineering case is made honestly and not averaged. |
+| **Q2** | **Must-fix (F1, F2) — and then closed, here, not deferred.** | The plan deferred this to "check every `ORDER BY` before Step 5" and the sweep is cheap enough to have done: across all ten R2 columns the tree yields **exactly one** hit. But the deferred wording would have missed it anyway — it says `ORDER BY`, and the half that returns wrong rows is the `WHERE`. `'9' < '10'` is FALSE lexicographically; a `NULL`→`INTEGER 0` on either side compares against TEXT by storage class unconditionally. |
+| **Q3** | **Acceptable-open.** | `routings.est_cost_huf` → R2 is defensible and correctly flagged as the one R1 exception: `Option<Decimal>` in Rust, never on the NAV wire, PDF, or ledger totals, and R1 would force a "what is HUF's minor unit for an estimate" product decision to serve consistency alone. The plan's own discomfort with a rule that has an exception is the right instinct and the wrong trade here. |
+| **Q4** | **Acceptable-open — and the strictness is correct.** | Converting the five quoting `f64` money columns rather than carrying them as `REAL` is right, and §3.2 D's pre-commitment ("if Step 8 overruns, *stop* — do not migrate as `REAL`") is exactly the rule-11 guard that stops a later session taking the easy branch. Do not soften it. One naming fix only (F4): the table is `quote_price_snapshots`. |
+| **Q5** | **Resolved — the concern dissolves entirely.** | Not "audit 21 and expect it to grow": there are **5**, and all 5 conflict targets are already the declared `PRIMARY KEY` (`inventory_balances`, `quote_price_snapshots`, `quote_pricing_jobs` ×2, `restore_lock`). SQLite resolves against a PK's implicit unique index exactly as DuckDB does. Zero indexes added, zero rewrites, and the `[[no-sql-specific]]` tension the plan invented does not exist. Notably this was G-1's error — comment lines counted as executable — reproduced two rows below the correction. |
+| **Q6** | **Acceptable-open.** | Splitting 8 `ALTER` lines out of the `.sql` files beats owning a load-time rewriter forever (rule 12). "A family's schema now lives in two places" is real but small, and the `CREATE`-stays-SQL / `ALTER`-moves-to-Rust split is a legible line. |
+| **Q7** | **NO-GO as written (B1). The plan asked the adversarial to check the comparison for circularity; the circularity is not there — the *lossiness* is.** | The three-way head-hash comparison is **not** circular: `verify_chain` recomputes `compute_entry_hash` (`chain/verify.rs:50`), so a BLOB/TEXT class error would surface. The defect is elsewhere and larger. `MirrorEntry` carries no signing columns and `to_entry()` nulls all three; mirror-as-source therefore strips S441/ADR-0087 from the whole migrated ledger, drops `audit_ledger_anchors`, and passes every gate — because `compute_entry_hash` deliberately excludes those fields. Separately, the flat head-equality would **hard-stop on mirror-ahead-of-DB**, i.e. on the 2026-07-19 scenario cited as the *justification* for mirror replay. Both fixed above. |
+| **Q8** | **Acceptable-open.** | Dropping quoting job history is correct for a disposable DEV DB, and §11.1 already carries the "wrong for prod" flag forward explicitly. |
+| **Q9** | **Resolved-in-plan — and the divergence from ADR-0107 §4.1 is the better call.** | A gate deleted is a gate that cannot protect the state you roll back to. Under a rollback-only constraint that is not a preference, it is a requirement. Rule 12's objection to dead machinery does not apply to machinery guarding a live rollback target. |
+| **Q10** | **Must-fix (F7).** | The plan's "assumed safe — it strictly sees *more*" is the one place a load-bearing engine-semantics claim is asserted rather than pinned, over 84 sites, in the class that caused five of July's incidents, deferred to a step that runs beside the family it guards. It is also **coupled to Q11** in a way the plan does not notice: a finite `busy_timeout` is what converts a nested `read()`-inside-`write()` from an immediate self-deadlock into a silent hang. |
+| **Q11** | **Acceptable-open, folded into F7.** | Leaving the number to a Step-2 measurement is fine. Choosing it *without* Q10's nesting audit in hand is not — the audit tells you whether a timeout is a backpressure knob or a hang. Decide them together. |
+
+### 13.3 Deferral ledger additions
+
+| Item | Disposition |
+|---|---|
+| `nav_xml.rs:1788` write path is `f64` while `:2658` read path is exact `Decimal` — **rule-7 fork on the NAV VAT rate**, pre-existing, engine-independent | Closed by B2 option (a). If option (b) is chosen instead, this stays open and gets its own PR. |
+| `reports.rs:871` `unwrap_or(0)` fail-open on the ÁFA report — **pre-existing today, on DuckDB** | Closed by F5 in Step 5. Worth noting it is a live rule-11 defect right now, independent of any engine. |
+| `MirrorEntry` cannot round-trip a signed entry — the mirror is a divergence detector, not a backup, and ADR-0030's own comment says so | **Out of scope**, recorded because B1 is the first time that design limit has had a consumer that assumed otherwise. If the mirror is ever to be a recovery source, that is its own ADR. |
+| `information_schema` executable-site count = **4** (`print_invoice.rs:926`, `:986`, `duckdb_store.rs:427`, `quoting_materials.rs:1376`) | Verified — §1.1 G-3 is correct as written. `duckdb_store.rs:427`'s `.ok()` → `false` fail-open is real and correctly routed to Step 4. |
+| DDL census: 105 `.rs` + 8 `.sql` executable + 1 dynamic = **114** | Verified exactly. §1.2 and §4.2 are correct. |
