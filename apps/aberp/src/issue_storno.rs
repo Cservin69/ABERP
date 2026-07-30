@@ -480,6 +480,7 @@ pub fn storno_from_inputs(
         // path only; storno chains are out of scope here, so no floor is
         // forced (numbers advance from the stored counter).
         sequence_floor: None,
+        durable_high_water: None,
     };
 
     // S375 — read the BASE invoice's NAV-side identity from its on-disk
@@ -1099,6 +1100,10 @@ where
     // (c) Standard allocator path: burn the storno's own sequence
     //     number + write its reservation + invoice rows.
     let now = OffsetDateTime::now_utc();
+    // S444 — a storno burns a number from the same bucket, so it takes the
+    // same durable floor (read on THIS tx). Without it a torn tail could
+    // hand the storno a number NAV already holds.
+    let allocate_args = crate::issue_invoice::with_durable_high_water(&tx, allocate_args)?;
     let outcome = billing::allocate_in_tx(&tx, allocate_args, now)
         .context("billing::allocate_in_tx (storno)")?;
 

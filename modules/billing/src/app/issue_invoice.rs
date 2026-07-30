@@ -263,6 +263,7 @@ where
             // `[seller.numbering].start_value` and thread it explicitly.
             start_value: 1,
             sequence_floor: None,
+            durable_high_water: None,
         },
         issue_date,
     )?;

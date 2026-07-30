@@ -96,6 +96,7 @@ fn build_allocate_args(series_id: SeriesId, idem: IdempotencyKey) -> AllocateArg
         email_recipient_override: None,
         start_value: 1,
         sequence_floor: None,
+        durable_high_water: None,
     }
 }
 

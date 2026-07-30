@@ -49,12 +49,47 @@ use serde::{Deserialize, Serialize};
 /// the allocator outcome — i.e. exactly when a sequence number was
 /// burned. On replay, this event is **not** re-written; the prior
 /// issuance's entry remains the canonical record.
+///
+/// # `series_id` + `fiscal_year` (S444 — the durable allocator floor)
+///
+/// Additive per this module's header contract (same posture as PR-18's
+/// `nav_xml_path` and PR-44γ's currency quintet): pre-S444 entries
+/// deserialise with both as `None`, the `EventKind` is unchanged, and
+/// the F12 four-edit ritual does not fire.
+///
+/// These two fields make this entry a **self-contained, bucket-scoped
+/// record that a number was burned**. That matters because the audit
+/// ledger is the only durable witness to an allocation:
+/// `invoice_sequence_state.next_number` lives in the business tables,
+/// which a WAL fold by a foreign DuckDB session can rewind (the
+/// 2026-07-30 DEV tear re-handed numbers 62, 63 and 64 — 62 three
+/// times — because the counter rewound while the mirror-backed ledger
+/// kept every reservation). The mirror is fsync-appended per write and
+/// the boot reconciler replays its tail back into `audit_ledger`, so
+/// this entry survives exactly the failure that loses the counter.
+/// [`crate::issue_invoice::durable_sequence_high_water`] reads it back
+/// as the allocator's durable floor.
+///
+/// A legacy entry (`series_id: None`) is treated as belonging to EVERY
+/// bucket by that reader — conservative on purpose: over-flooring a
+/// second series leaves a gap, under-flooring re-files a number NAV
+/// already accepted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InvoiceSequenceReservedPayload {
     pub invoice_id: String,
     pub seq: u64,
     pub reservation_id: String,
     pub idempotency_key: String,
+    /// S444 — prefixed `srs_<ULID>` form of the series this number was
+    /// burned in. `None` for pre-S444 entries.
+    #[serde(default)]
+    pub series_id: Option<String>,
+    /// S444 — the allocator bucket's fiscal year (`0` for a
+    /// `ResetPolicy::Never` series, matching
+    /// `invoice_sequence_state.fiscal_year`). `None` for pre-S444
+    /// entries.
+    #[serde(default)]
+    pub fiscal_year: Option<i32>,
 }
 
 impl InvoiceSequenceReservedPayload {
@@ -68,6 +103,14 @@ impl InvoiceSequenceReservedPayload {
             seq: invoice.sequence_number,
             reservation_id: reservation.id.to_prefixed_string(),
             idempotency_key: idempotency_key.to_canonical_string(),
+            // S444 — stamp the allocator bucket. Both come from the
+            // reservation the allocator just wrote, so they are the same
+            // `(series_id, fiscal_year)` pair keying
+            // `invoice_sequence_state` (NOT `invoice.fiscal_year`, which
+            // is the same value but reached via the invoice row that the
+            // tear can destroy).
+            series_id: Some(reservation.series_id.to_prefixed_string()),
+            fiscal_year: Some(reservation.fiscal_year),
         }
     }
 

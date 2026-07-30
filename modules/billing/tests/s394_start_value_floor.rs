@@ -74,6 +74,7 @@ fn args(series_id: SeriesId, start_value: u64, sequence_floor: Option<u64>) -> A
         email_recipient_override: None,
         start_value,
         sequence_floor,
+        durable_high_water: None,
     }
 }
 

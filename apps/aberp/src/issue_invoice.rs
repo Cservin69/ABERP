@@ -71,6 +71,144 @@ use ulid::Ulid;
 use crate::audit_payloads;
 use crate::binary_hash;
 use crate::cli::IssueInvoiceArgs;
+
+/// S444 — the highest invoice sequence number the **audit ledger** can
+/// prove was ever reserved in the `(series_id, fiscal_year)` bucket.
+///
+/// # Why the ledger and not `invoice_sequence_state`
+///
+/// `invoice_sequence_state.next_number` is the allocator's counter, and it
+/// is the ONLY floor the allocator used before S444. It lives in the
+/// business tables, and those are not durable across a session boundary:
+/// `disable_checkpoint_on_shutdown` / `wal_autocheckpoint` are
+/// **per-connection** DuckDB settings, so any foreign `Connection::open`
+/// on the shared instance carries engine defaults and its close folds the
+/// `aberp_db::Handle`'s WAL (see `aberp_snapshot::take_snapshot`'s doc for
+/// the measured mechanism). The observed result is a rewound counter.
+///
+/// Measured on Ervin's DEV tenant, 2026-07-30 — the audit mirror proves
+/// numbers were handed out **more than once**, each collision rejected by
+/// NAV as `INVOICE_NUMBER_NOT_UNIQUE`:
+///
+/// | when | invoice | seq | NAV ack |
+/// |---|---|---|---|
+/// | 07-27 17:49 | `inv_01KYJB52…` | 62 | SAVED |
+/// | 07-28 08:25 | `inv_01KYKX7X…` | **62 again** | ABORTED |
+/// | 07-28 08:27 | `inv_01KYKXC5…` | 63 | SAVED |
+/// | 07-29 18:28 | `inv_01KYQJ5M…` | **62 again** | ABORTED |
+/// | 07-29 18:29 | `inv_01KYQJ6V…` | **63 again** | ABORTED |
+/// | 07-29 18:32 | `inv_01KYQJC3…` | 64 | SAVED |
+/// | 07-30 06:09 | `inv_01KYRT9K…` | **63 again** | ABORTED |
+/// | 07-30 06:10 | `inv_01KYRTAZ…` | **64 again** | ABORTED |
+/// | 07-30 06:11 | `inv_01KYRTCY…` | 65 | SAVED |
+///
+/// The ledger, by contrast, IS durable across exactly that failure: every
+/// append fsyncs a line into the `<db>.audit.log` mirror, and the boot
+/// reconciler (`aberp_audit_ledger::ensure_consistent_with_db`) replays a
+/// mirror tail the DB lost back into `audit_ledger` — the
+/// `db.auto_recovered` entry at the head of every one of those sessions.
+/// That heal repairs the ledger and **only** the ledger; nothing rebuilds
+/// `invoice_sequence_state`. Flooring the allocator by this value closes
+/// the asymmetry.
+///
+/// # Bucket scoping, and what a legacy entry means
+///
+/// Post-S444 entries stamp `series_id` + `fiscal_year`, so they match
+/// their bucket exactly. Pre-S444 entries carry neither. For those:
+///
+///   * `fiscal_year == 0` is the continuous (`ResetPolicy::Never`) bucket —
+///     every legacy entry belongs to it.
+///   * otherwise the bucket year is taken from the entry's own
+///     `time_wall.year()`. The allocator keys on the invoice's issue-date
+///     year and the issue date is server-stamped `now_utc` at issuance, so
+///     the append's wall year IS the bucket year. (Same reconstruction
+///     `request_technical_annulment::base_issue_year` already relies on.)
+///     Without this, an `AnnualOnFiscalYear` series would never reset —
+///     January's floor would still be December's high number.
+///   * `series_id` is unrecoverable, so a legacy entry counts toward
+///     **every** series. On a multi-series tenant that over-floors the
+///     other series into a gap. Deliberate: a gap is a bookkeeping
+///     annoyance, re-filing a number NAV already accepted is a compliance
+///     breach. Both live tenants (prod `INV-default`, dev `ABERPNEW2026`)
+///     are single-series, so today this is exact.
+///
+/// Returns `None` when the ledger holds no reservation for the bucket
+/// (fresh tenant, or a fresh annual bucket) — the caller then has no
+/// durable floor to apply and the stored counter stands.
+///
+/// Runs on the CALLER's transaction so the read is inside the same
+/// single-writer tx that writes the reservation: no TOCTOU window between
+/// learning the floor and burning the number.
+/// S444 — stamp [`AllocateArgs::durable_high_water`] from the audit ledger,
+/// scoped to the bucket the allocator is about to advance.
+///
+/// Shared by all three number-burning paths (issue, storno, modification):
+/// they build their own `AllocateArgs` but every one of them reaches
+/// `allocate_in_tx` on a transaction, and the read MUST happen on that
+/// transaction (same-tx = no TOCTOU between reading the floor and burning
+/// the number).
+pub fn with_durable_high_water(
+    tx: &duckdb::Transaction<'_>,
+    mut args: AllocateArgs,
+) -> Result<AllocateArgs> {
+    let issue_year = args.draft.issue_date.year();
+    let fiscal_year = billing::resolve_bucket_fiscal_year(tx, args.series_id, issue_year)
+        .context("resolve allocator bucket fiscal_year for the durable floor (S444)")?;
+    args.durable_high_water = durable_sequence_high_water(tx, args.series_id, fiscal_year)?;
+    Ok(args)
+}
+
+pub fn durable_sequence_high_water(
+    conn: &Connection,
+    series_id: SeriesId,
+    fiscal_year: i32,
+) -> Result<Option<u64>> {
+    let series_id_str = series_id.to_prefixed_string();
+    let mut stmt = conn
+        .prepare("SELECT payload, time_wall FROM audit_ledger WHERE kind = ?;")
+        .context("prepare durable sequence high-water scan (S444)")?;
+    let rows = stmt
+        .query_map([EventKind::InvoiceSequenceReserved.as_str()], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
+        })
+        .context("query durable sequence high-water scan (S444)")?;
+
+    let mut high_water: Option<u64> = None;
+    for row in rows {
+        let (payload_bytes, time_wall) =
+            row.context("decode audit_ledger row for durable sequence high-water (S444)")?;
+        // A payload that will not decode means the ledger is tampered or
+        // schema-drifted. Loud-fail (CLAUDE.md rule 11) rather than skip:
+        // skipping is precisely how a burned number goes unseen.
+        let payload: audit_payloads::InvoiceSequenceReservedPayload =
+            serde_json::from_slice(&payload_bytes).map_err(|e| {
+                anyhow!(
+                    "InvoiceSequenceReserved audit payload failed typed decode: {e} \
+                     — audit ledger appears tampered or schema-drifted; refusing to \
+                     allocate an invoice number against an unreadable ledger (S444)"
+                )
+            })?;
+
+        let in_bucket = match (&payload.series_id, payload.fiscal_year) {
+            // Post-S444: exact bucket match.
+            (Some(sid), Some(fy)) => sid == &series_id_str && fy == fiscal_year,
+            // Pre-S444: no scope stamped — see the fn doc.
+            _ => {
+                fiscal_year == 0
+                    || OffsetDateTime::parse(
+                        &time_wall,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .map(|t| t.year() == fiscal_year)
+                    .unwrap_or(true)
+            }
+        };
+        if in_bucket {
+            high_water = Some(high_water.map_or(payload.seq, |h: u64| h.max(payload.seq)));
+        }
+    }
+    Ok(high_water)
+}
 use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
 use crate::nav_xml::{
     self, CustomerAddress, CustomerInfo, NavParties, SupplierConfigError, SupplierInfo,
@@ -837,6 +975,11 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         // number) computed above; `None` when probing is disabled or no
         // number was skipped, preserving the pre-S392 allocator path.
         sequence_floor,
+        // S444 — stamped inside the allocator tx by `with_durable_high_water`
+        // (see `run_single_tx`), NOT here: the read must sit in the same
+        // transaction that burns the number, and this struct is built before
+        // the tx opens.
+        durable_high_water: None,
     };
 
     // S375 — build the NAV-XML render+validate+write step as a closure
@@ -1239,6 +1382,11 @@ where
         .context("begin DuckDB transaction (billing + audit-ledger)")?;
 
     let now = OffsetDateTime::now_utc();
+    // S444 — read the durable high-water mark from the mirror-backed audit
+    // ledger INSIDE this transaction, so the number the allocator burns is
+    // strictly above every number this tenant can prove it already
+    // reserved even if the business tail was torn. Same-tx = no TOCTOU.
+    let allocate_args = with_durable_high_water(&tx, allocate_args)?;
     let outcome =
         billing::allocate_in_tx(&tx, allocate_args, now).context("billing::allocate_in_tx")?;
 

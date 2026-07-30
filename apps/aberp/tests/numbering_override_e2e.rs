@@ -98,6 +98,7 @@ fn args(series_id: SeriesId, start_value: u64) -> AllocateArgs {
         // Production-shaped: no NAV pre-flight floor (the seam this test
         // exercises is the operator override, not the S392 NAV skip).
         sequence_floor: None,
+        durable_high_water: None,
     }
 }
 
