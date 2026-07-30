@@ -38,6 +38,7 @@ A pid is reaped only if **every** clause holds. Clause numbers match the
 | 2 | **also** has the EXACT absolute db file open | the same identification the manual `lsof <abs-path>` used; lsof matches by inode, so a same-named db in another checkout can never match |
 | 3 | argv is an `aberp serve` (argv[0] basename exactly `aberp`) | keeps `aberp-ui` and friends out |
 | 3b | argv carries `--tenant <this tenant>` | authoritative tenant attribution, straight from the process |
+| 3c | argv carries `--port 0` | `aberp-ui`'s spawn hardcodes it and is the shell's only serve-spawn path, so this says "started by a Tauri shell like ours". Without it, a `serve` an operator ran by hand on a real port and then `nohup`'d/`disown`ed — live, reachable, and at PPID 1 — would qualify |
 | 4 | **PPID is 1** — a true orphan | a live parent means a legitimately-running writer. Never ours to kill |
 | 5 | PGID differs from this launcher run's | can never target a sibling of the run doing the checking |
 
@@ -52,17 +53,24 @@ kernel to release the flock on exit, then `SIGKILL` and up to
 `STALE_WRITER_KILL_WAIT_SECS` (3s) more. The verdict is re-derived from the
 predicate afterwards, never assumed.
 
-`lsof`/`ps` and `kill` are not atomic, so argv and PPID are re-checked one more
-time immediately before each signal — a pid that exited in between could have
-been recycled onto an unrelated process. Any pid that no longer matches is
-skipped and reported.
+`lsof`/`ps` and `kill` are not atomic, so clauses 3/3b/3c/4 — everything that
+identifies *this pid* rather than the set — are re-derived from `ps` immediately
+before **each** signal, by the one `still_stale_orphan()` the attribution pass
+itself uses. That includes the `SIGKILL` escalation: `kill -0` proves only that
+*some* process owns the pid, and the pid we `SIGTERM`'d may have exited and been
+recycled onto an unrelated one during the wait. `SIGKILL` is the one signal a
+process cannot decline, so it gets the same check the survivable one does. Any
+pid that no longer matches is skipped and reported, and the reap then falls
+through to today's refusal rather than claiming success.
 
 ### On "not reachable via the normal handshake"
 
-Clause 4 settles this without a fake probe. The handshake is a line on `serve`'s
-**stdout pipe**, whose read end died with the parent, and the listener port is
-ephemeral (`--port 0`) and recorded nowhere the launcher reads. An orphan is
-therefore provably unreachable from here.
+Clauses 3c and 4 together settle this without a fake probe. The handshake is a
+line on `serve`'s **stdout pipe**, whose read end died with the parent (4), and
+the listener port is ephemeral (3c: `--port 0`) and recorded nowhere the
+launcher reads. Such an orphan is provably unreachable from here. Clause 4 alone
+would not be enough — PPID 1 means "the parent is gone", not "nobody is using
+it", and a hand-started `serve` on a real port is both orphaned and live.
 
 A process that has genuinely **exited** holds nothing: `flock` is released by
 the kernel on close, so a leftover lock *file* on its own is inert and needs no

@@ -97,6 +97,13 @@ cat >"$SRC" <<'MOCK_C'
  *                       which is the one thing clause (5) exists to reject.
  *   --mock-no-db        hold the lock file but NOT the db file
  *   --mock-ignore-term  SIG_IGN on SIGTERM, forcing the SIGKILL escalation
+ *   --mock-morph-on-term  on SIGTERM, exec /bin/sleep — SAME pid, different
+ *                       argv, fds (and therefore the flock) still held. A
+ *                       deterministic stand-in for "this pid is no longer the
+ *                       process we attributed", which is what a pid RECYCLED
+ *                       during the SIGTERM wait looks like to the launcher.
+ *                       Real pid recycling cannot be provoked on demand; this
+ *                       reproduces the only thing the guard can actually see.
  */
 #include <fcntl.h>
 #include <signal.h>
@@ -105,9 +112,15 @@ cat >"$SRC" <<'MOCK_C'
 #include <sys/file.h>
 #include <unistd.h>
 
+static void morph_on_term(int sig) {
+  (void)sig;                      /* execve is async-signal-safe */
+  execl("/bin/sleep", "sleep", "300", (char *)0);
+  _exit(7);
+}
+
 int main(int argc, char **argv) {
   const char *db = NULL, *lock = NULL, *pidfile = NULL;
-  int orphan = 0, detach = 0, no_db = 0, ignore_term = 0, i, fd;
+  int orphan = 0, detach = 0, no_db = 0, ignore_term = 0, morph = 0, i, fd;
   for (i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--db") && i + 1 < argc) db = argv[++i];
     else if (!strcmp(argv[i], "--mock-lock") && i + 1 < argc) lock = argv[++i];
@@ -116,6 +129,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--mock-detach")) detach = 1;
     else if (!strcmp(argv[i], "--mock-no-db")) no_db = 1;
     else if (!strcmp(argv[i], "--mock-ignore-term")) ignore_term = 1;
+    else if (!strcmp(argv[i], "--mock-morph-on-term")) morph = 1;
   }
   if (orphan) {
     pid_t p = fork();
@@ -124,6 +138,7 @@ int main(int argc, char **argv) {
   }
   if (detach && setsid() < 0) return 6;
   if (ignore_term) signal(SIGTERM, SIG_IGN);
+  if (morph) signal(SIGTERM, morph_on_term);
   if (lock) {                                  /* fds held open on purpose */
     fd = open(lock, O_RDWR | O_CREAT, 0644);
     if (fd < 0) return 2;
@@ -161,6 +176,11 @@ scenario_dir() {
   printf '%s' "$d"
 }
 
+# The `--port` the mocks advertise. aberp-ui's spawn hardcodes `--port 0`
+# (apps/aberp-ui/src/backend.rs), which is what clause (3c) keys on; a scenario
+# overrides this to model a serve an operator started by hand on a real port.
+MOCK_PORT=0
+
 # spawn_mock <bin> <tenant> <dir> [extra mock flags...] -> prints holder pid
 # Blocks until the holder has BOTH fds open (pidfile is written last), so no
 # scenario can race the predicate.
@@ -174,7 +194,7 @@ spawn_mock() {
   shift 3
   local pf="${dir}/pidfile.$$.${RANDOM}"
   : >"$pf"
-  "$bin" serve --tenant "$tenant" --db "${dir}/aberp.duckdb" --port 0 \
+  "$bin" serve --tenant "$tenant" --db "${dir}/aberp.duckdb" --port "$MOCK_PORT" \
     --mock-lock "${dir}/.aberp-db-writer.test.lock" --mock-pidfile "$pf" "$@" \
     </dev/null >/dev/null 2>&1 &
   local pid="" i=0
@@ -205,7 +225,7 @@ spawn_mock_parented() {
   shift 3
   local pf="${dir}/pidfile.parented.$$"
   : >"$pf"
-  "$bin" serve --tenant "$tenant" --db "${dir}/aberp.duckdb" --port 0 \
+  "$bin" serve --tenant "$tenant" --db "${dir}/aberp.duckdb" --port "$MOCK_PORT" \
     --mock-lock "${dir}/.aberp-db-writer.test.lock" --mock-pidfile "$pf" "$@" \
     </dev/null >/dev/null 2>&1 &
   PARENTED_PID=""
@@ -429,16 +449,32 @@ else
   fail "gate B: pid ${outside} was killed for a db outside the checkout"
 fi
 
+kill -KILL "$outside" 2>/dev/null
+
 # ============================================================================
-# 9. HARD gate A — tenant=prod refuses outright, even with the same orphan.
+# 9. HARD gate A — tenant=prod refuses outright.
+#
+#    The orphan's OWN argv must say `--tenant prod`, or clause (3b) rejects it
+#    on the tenant mismatch and the scenario passes without gate A existing.
+#    (It did: deleting gate A left the whole suite green until this scenario
+#    was given a prod-argv holder.) Gate B is satisfied deliberately — repo_root
+#    is $TMP and the db is under it — so gate A is the ONLY thing left to stop
+#    the kill.
 # ============================================================================
+d="$(scenario_dir s9)"
+prodish="$(spawn_mock "${BIN_DIR}/aberp" prod "$d" --mock-orphan --mock-detach)"
+if [[ "$(predicate_rc "${d}/aberp.duckdb" prod)" == "0" ]]; then
+  pass "gate A setup: the holder WOULD otherwise qualify on tenant=prod (rc 0)"
+else
+  fail "gate A setup: holder does not qualify — scenario cannot prove the gate"
+fi
 reap_quiet "$TMP" "${d}/aberp.duckdb" prod
-if alive "$outside"; then
+if alive "$prodish"; then
   pass "gate A: tenant=prod — reap refuses to run at all"
 else
-  fail "gate A: pid ${outside} was killed on tenant=prod"
+  fail "gate A: pid ${prodish} was killed on tenant=prod"
 fi
-kill -KILL "$outside" 2>/dev/null
+kill -KILL "$prodish" 2>/dev/null
 
 # ============================================================================
 # 10. SIGTERM is preferred; SIGKILL escalates only on a bounded timeout
@@ -487,6 +523,78 @@ else
   fail "own-process-group holder pid ${sibling} WAS KILLED — clause (5) has no teeth"
 fi
 kill -KILL "$sibling" 2>/dev/null
+
+# ============================================================================
+# 12. clause (3c) — an orphan on a REAL port is never killed.
+#     PPID 1 alone does NOT mean "dead session". A serve an operator started by
+#     hand (docs/walkthroughs/dr-playbook.md §3 tells them to) and then nohup'd,
+#     `disown`ed, or whose `cargo run` parent was killed is reparented to 1
+#     while still LIVE and still reachable on its port. aberp-ui's spawn always
+#     passes `--port 0`, so requiring it is what separates "our crashed shell's
+#     child" from "a writer a human is actively using".
+# ============================================================================
+d="$(scenario_dir s12)"
+MOCK_PORT=8899
+handrun="$(spawn_mock "${BIN_DIR}/aberp" test "$d" --mock-orphan --mock-detach)"
+MOCK_PORT=0
+if [[ "$(ps -o ppid= -p "$handrun" | tr -d ' ')" == "1" ]]; then
+  pass "hand-started setup: holder is at ppid 1 and differs ONLY in its port"
+else
+  fail "hand-started setup: holder ppid is not 1 — scenario invalid"
+fi
+if [[ "$(predicate_rc "${d}/aberp.duckdb" test)" == "2" ]]; then
+  pass "orphan on a real port: predicate reports AMBIGUOUS (rc 2)"
+else
+  fail "orphan on a real port: expected rc 2, got $(predicate_rc "${d}/aberp.duckdb" test)"
+fi
+reap_quiet "$TMP" "${d}/aberp.duckdb" test
+if alive "$handrun"; then
+  pass "orphan on a real port: NOT killed"
+else
+  fail "orphan on a real port pid ${handrun} WAS KILLED — a live writer died"
+fi
+kill -KILL "$handrun" 2>/dev/null
+
+# ============================================================================
+# 13. SIGKILL is re-attributed, not fired on a bare `kill -0`.
+#     `kill -0` proves only that SOME process owns the pid. If the pid we
+#     SIGTERM'd exits during the wait and the kernel recycles it, the escalation
+#     would SIGKILL whatever inherited it — the one operation here that cannot
+#     be undone. Real recycling cannot be provoked on demand, so the mock execs
+#     /bin/sleep on SIGTERM: same pid, still holding the flock, no longer the
+#     process we attributed. That is precisely what the guard can see, and the
+#     escalation must refuse it.
+# ============================================================================
+d="$(scenario_dir s13)"
+morph="$(spawn_mock "${BIN_DIR}/aberp" test "$d" --mock-orphan --mock-detach --mock-morph-on-term)"
+if [[ "$(predicate_rc "${d}/aberp.duckdb" test)" == "0" ]]; then
+  pass "recycle setup: holder qualifies before the signal (rc 0)"
+else
+  fail "recycle setup: holder does not qualify — scenario cannot prove the guard"
+fi
+out="$(reap_stale_orphan_writer "$TMP" "${d}/aberp.duckdb" test 2>&1)"
+if [[ "$(ps -ww -o args= -p "$morph" 2>/dev/null)" == *sleep* ]]; then
+  pass "recycle setup: pid ${morph} changed identity during the SIGTERM wait"
+else
+  fail "recycle setup: pid ${morph} did not morph — scenario invalid (argv: $(ps -ww -o args= -p "$morph" 2>/dev/null))"
+fi
+if alive "$morph"; then
+  pass "recycled pid: NOT SIGKILLed — escalation re-attributed first"
+else
+  fail "recycled pid ${morph} WAS SIGKILLed — the escalation trusts a stale attribution"
+fi
+if echo "$out" | grep -q "no longer the stale orphan — NOT escalating"; then
+  pass "recycled pid: the refusal is announced, not silent"
+else
+  fail "recycled pid: no escalation-refusal line — output: ${out}"
+fi
+# ...and the reap still reports the honest verdict rather than claiming success.
+if echo "$out" | grep -q "STILL held after the reap attempt"; then
+  pass "recycled pid: reap reports the lock as STILL held (boot falls through)"
+else
+  fail "recycled pid: reap did not report the still-held lock — output: ${out}"
+fi
+kill -KILL "$morph" 2>/dev/null
 
 # ---------- result ----------------------------------------------------------
 echo

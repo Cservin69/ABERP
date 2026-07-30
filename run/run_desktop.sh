@@ -187,22 +187,50 @@ set -uo pipefail   # NOTE: no -e — we want to handle child exit code, not abor
 #       subcommand `serve` — so `aberp-ui` and friends never match) carrying
 #       `--tenant <tenant>`. aberp-ui always passes it explicitly, see
 #       apps/aberp-ui/src/backend.rs::spawn.
+#   (3c) P's argv carries `--port 0`. aberp-ui's spawn (backend.rs, the ONLY
+#       serve-spawn path in the shell) hardcodes it, so this clause says "P was
+#       started by a Tauri shell like ours" — and, crucially, it is what makes
+#       the unreachability argument in (4) a CHECK rather than an assumption. A
+#       serve an operator started by hand on a real `--port 8899` (dr-playbook
+#       §3 tells them to do exactly that) IS reachable and may well be live even
+#       at PPID 1 — nohup'd, `disown`ed, or its `cargo run` parent killed. It
+#       must never be reaped, and without this clause it would have been.
 #   (4) PPID(P) == 1 — a TRUE orphan. The Tauri shell (or a previous
 #       run_desktop.sh) that spawned it is gone, so macOS reparented it to
 #       launchd. A live parent means a legitimately-running writer: not ours to
-#       kill, ever. This clause also settles "unreachable via the normal
+#       kill, ever. Together with (3c) this settles "unreachable via the normal
 #       handshake" without a fake probe: the handshake is a line on serve's
 #       stdout PIPE, whose read end died with the parent, and the listener port
 #       is ephemeral (`--port 0`) and never recorded anywhere this launcher
-#       reads — so an orphan is provably unreachable from here. (A process that
-#       has genuinely EXITED holds nothing: flock is released by the kernel on
-#       close, so a leftover lock FILE alone is inert and needs no reaping.)
+#       reads — so such an orphan is provably unreachable from here. (A process
+#       that has genuinely EXITED holds nothing: flock is released by the kernel
+#       on close, so a leftover lock FILE alone is inert and needs no reaping.)
 #   (5) PGID(P) != our PGID — belt-and-suspenders so this can never target a
 #       process from this very launcher run.
+
+# Clauses (3)/(3b)/(3c)/(4) for ONE pid, read fresh off `ps` at call time.
+#
+# Factored out because it is needed in three places — attribution, and again
+# immediately before EACH of the two signals — and the two signal sites must
+# not be able to drift apart from the attribution one. Everything it checks is
+# per-pid identity, i.e. exactly what a pid that exited and was RECYCLED onto an
+# unrelated process would no longer satisfy. (Clauses (1)/(2)/(5) are set- or
+# run-scoped and stay in the caller.)
+still_stale_orphan() {
+  local pid="$1" tenant="$2" argv ppid
+  argv="$(ps -ww -o args= -p "$pid" 2>/dev/null)"
+  ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [[ "$argv" =~ (^|/)aberp[[:space:]]serve([[:space:]]|$) ]]                || return 1  # (3)
+  [[ "$argv" =~ [[:space:]]--tenant[[:space:]]+"$tenant"([[:space:]]|$) ]]  || return 1  # (3b)
+  [[ "$argv" =~ [[:space:]]--port[[:space:]]+0([[:space:]]|$) ]]            || return 1  # (3c)
+  [[ "$ppid" == "1" ]]                                                     || return 1  # (4)
+  return 0
+}
+
 stale_orphan_writer_pids() {
   local db_abs="$1" tenant="$2"
   local db_dir lock_holders db_holders our_pgid
-  local lf pid argv ppid pgid qualified=""
+  local lf pid pgid qualified=""
 
   command -v lsof >/dev/null 2>&1 || return 2   # fail closed: cannot attribute
   [[ -e "$db_abs" ]] || return 1
@@ -223,14 +251,10 @@ stale_orphan_writer_pids() {
   [[ -n "$our_pgid" ]] || return 2               # fail closed
 
   for pid in $lock_holders; do
-    argv="$(ps -ww -o args= -p "$pid" 2>/dev/null)"
-    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
     pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
 
     [[ "$db_holders" == *" ${pid} "* ]]                                || return 2  # (2)
-    [[ "$argv" =~ (^|/)aberp[[:space:]]serve([[:space:]]|$) ]]         || return 2  # (3)
-    [[ "$argv" =~ [[:space:]]--tenant[[:space:]]+"$tenant"([[:space:]]|$) ]] || return 2  # (3b)
-    [[ "$ppid" == "1" ]]                                              || return 2  # (4)
+    still_stale_orphan "$pid" "$tenant"                                || return 2  # (3)(3b)(3c)(4)
     [[ "$pgid" != "$our_pgid" ]]                                      || return 2  # (5)
 
     qualified+="${pid}"$'\n'
@@ -248,7 +272,7 @@ stale_orphan_writer_pids() {
 reap_stale_orphan_writer() {
   local repo_root="$1" db_abs="$2" tenant="$3"
   local pids rc pid alive waited=0
-  local argv_now ppid_now to_kill=""
+  local kill_now to_kill=""
 
   # HARD gate A: never the prod tenant. (Redundant with the tenant=prod refusal
   # further down, kept local so the predicate is safe wherever it is called.)
@@ -285,10 +309,7 @@ reap_stale_orphan_writer() {
     # below are not atomic: a pid that exited in between could have been
     # recycled onto an unrelated process, and this is the one operation in this
     # file that cannot be undone. Cheap insurance.
-    argv_now="$(ps -ww -o args= -p "$pid" 2>/dev/null)"
-    ppid_now="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
-    if [[ ! "$argv_now" =~ (^|/)aberp[[:space:]]serve([[:space:]]|$) ]] \
-      || [[ "$ppid_now" != "1" ]]; then
+    if ! still_stale_orphan "$pid" "$tenant"; then
       echo "[writer-lock] pid ${pid} no longer looks like the stale orphan — skipping it"
       continue
     fi
@@ -312,9 +333,24 @@ reap_stale_orphan_writer() {
     [[ -z "$alive" ]] && break
     [[ $waited -ge $deadline ]] && break
     if [[ $escalated -eq 0 && $waited -ge $STALE_WRITER_TERM_WAIT_SECS ]]; then
-      echo "[writer-lock] pid(s) ${alive}still alive after ${STALE_WRITER_TERM_WAIT_SECS}s — escalating to SIGKILL"
-      # shellcheck disable=SC2086
-      kill -KILL $alive 2>/dev/null || true
+      # Re-attribute before SIGKILL, exactly as before SIGTERM. `kill -0` proves
+      # only that SOME process owns this pid — and the pid we SIGTERM'd may have
+      # exited and been recycled onto an unrelated one during the wait above.
+      # SIGKILL is the one signal a process cannot decline, so it gets the same
+      # identity check the survivable signal already had.
+      kill_now=""
+      for pid in $alive; do
+        if still_stale_orphan "$pid" "$tenant"; then
+          kill_now+="${pid} "
+        else
+          echo "[writer-lock] pid ${pid} is no longer the stale orphan — NOT escalating to SIGKILL on it"
+        fi
+      done
+      if [[ -n "$kill_now" ]]; then
+        echo "[writer-lock] pid(s) ${kill_now}still alive after ${STALE_WRITER_TERM_WAIT_SECS}s — escalating to SIGKILL"
+        # shellcheck disable=SC2086
+        kill -KILL $kill_now 2>/dev/null || true
+      fi
       escalated=1
     fi
     sleep 1
