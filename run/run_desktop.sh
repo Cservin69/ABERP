@@ -68,7 +68,11 @@
 #      and the linker-signed ad-hoc CDHash stays stable across runs.
 #   4. (No explicit codesign — see PR-52 note above. --no-codesign is
 #      retained as an inert no-op for backward compat.)
-#   5. Frees TCP port 5173 if a prior run left Vite stranded there.
+#   5. Frees TCP port 5173 if a prior run left Vite stranded there, and reaps a
+#      stale ORPHANED `aberp serve` still holding this DEV tenant DB's
+#      cross-process writer flock (the `kill -9`-during-crash-testing residue
+#      that used to require a manual lsof/kill hunt). DEV-only, tightly
+#      predicated, kills nothing it cannot attribute — see the S445 block below.
 #   6. cd's into `apps/aberp-ui/` and runs `./ui/node_modules/.bin/tauri dev`.
 #      tauri-CLI then:
 #        - executes `beforeDevCommand` from tauri.conf.json (which is
@@ -131,6 +135,210 @@
 #
 
 set -uo pipefail   # NOTE: no -e — we want to handle child exit code, not abort on it
+
+# ============================================================================
+# DEV-ONLY stale-orphan writer reap (S445)
+# ============================================================================
+# The symptom (three times in one evening of crash-testing): `kill -9` on the
+# Tauri shell leaves its `aberp serve` child ALIVE. SIGKILL runs no drop
+# handlers, so aberp-ui's `kill_on_drop` never fires and the F-E cross-process
+# whole-DB writer flock (apps/aberp/src/db_writer_lock.rs) is still held by a
+# process macOS has reparented to launchd. The next launch then dies at
+#   refusing to boot: another writer holds the tenant DB
+# and the only way forward was a manual `lsof <db>` / `kill <pid>` hunt.
+#
+# THIS IS A DEV-LAUNCHER CONVENIENCE ONLY. `aberp serve`'s refuse-to-boot
+# behaviour is deliberately UNCHANGED — prod must keep refusing rather than
+# auto-killing a writer ([[trust-code-not-operator]]): serve.rs and
+# db_writer_lock.rs are not touched, and run_prod.sh does not source this file.
+#
+# The predicate below is deliberately narrow. Every clause has to hold, and a
+# holder it cannot fully attribute makes it kill NOTHING and fall through to
+# today's refusal. False-negative (didn't reap, operator does it by hand) is a
+# minor annoyance; false-positive (killed a live writer) is data loss.
+: "${STALE_WRITER_TERM_WAIT_SECS:=5}"   # overridable by run/tests/*
+: "${STALE_WRITER_KILL_WAIT_SECS:=3}"
+
+# Which pids hold the DEV tenant DB's writer flock AND are attributable as a
+# stale ORPHANED `aberp serve`?
+#
+# Prints one qualifying pid per line. The exit status carries the verdict,
+# because "nobody is holding it" and "somebody we must NOT touch is holding it"
+# need different handling by the caller:
+#   0 — every holder qualifies as a stale orphan; the printed pids are reapable
+#   1 — no process holds the writer lock (nothing to do; the normal path)
+#   2 — AMBIGUOUS. At least one holder is not attributable as a stale orphan
+#       (a live-PARENTED writer, a sibling of this launcher run, a process that
+#       is not `aberp serve`, another tenant, or one that does not have THIS
+#       exact db file open). Prints nothing; the caller must kill nothing.
+#
+# Clause by clause, for pid P:
+#   (1) P holds a `.aberp-db-writer.*.lock` flock file sitting next to this db.
+#       That file — not the db — is what blocks boot. It is opened by Rust's
+#       `OpenOptions` (O_CLOEXEC), so an inherited fd in a child of serve can
+#       never masquerade as a holder. Globbing the tenant segment instead of
+#       re-deriving db_writer_lock.rs's sanitiser keeps this from silently
+#       drifting out of step with the Rust side; the tenant is then pinned
+#       authoritatively by clause (3) from P's own argv.
+#   (2) P also has the EXACT absolute db file open — the same identification
+#       the manual `lsof <abs-path>` hunt used. lsof resolves the path to an
+#       inode, so a same-NAMED db in another checkout can never match.
+#   (3) P's argv is an `aberp serve` (argv[0] basename exactly `aberp`, first
+#       subcommand `serve` — so `aberp-ui` and friends never match) carrying
+#       `--tenant <tenant>`. aberp-ui always passes it explicitly, see
+#       apps/aberp-ui/src/backend.rs::spawn.
+#   (4) PPID(P) == 1 — a TRUE orphan. The Tauri shell (or a previous
+#       run_desktop.sh) that spawned it is gone, so macOS reparented it to
+#       launchd. A live parent means a legitimately-running writer: not ours to
+#       kill, ever. This clause also settles "unreachable via the normal
+#       handshake" without a fake probe: the handshake is a line on serve's
+#       stdout PIPE, whose read end died with the parent, and the listener port
+#       is ephemeral (`--port 0`) and never recorded anywhere this launcher
+#       reads — so an orphan is provably unreachable from here. (A process that
+#       has genuinely EXITED holds nothing: flock is released by the kernel on
+#       close, so a leftover lock FILE alone is inert and needs no reaping.)
+#   (5) PGID(P) != our PGID — belt-and-suspenders so this can never target a
+#       process from this very launcher run.
+stale_orphan_writer_pids() {
+  local db_abs="$1" tenant="$2"
+  local db_dir lock_holders db_holders our_pgid
+  local lf pid argv ppid pgid qualified=""
+
+  command -v lsof >/dev/null 2>&1 || return 2   # fail closed: cannot attribute
+  [[ -e "$db_abs" ]] || return 1
+  db_dir="$(dirname "$db_abs")"
+
+  # (1) holders of any whole-DB writer flock file next to this db
+  lock_holders=""
+  for lf in "${db_dir}"/.aberp-db-writer.*.lock; do
+    [[ -e "$lf" ]] || continue
+    lock_holders+=" $(lsof -t -- "$lf" 2>/dev/null | tr '\n' ' ')"
+  done
+  [[ -n "${lock_holders// /}" ]] || return 1
+
+  # (2) holders of the exact absolute db file, for cross-checking below
+  db_holders=" $(lsof -t -- "$db_abs" 2>/dev/null | tr '\n' ' ') "
+
+  our_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')"
+  [[ -n "$our_pgid" ]] || return 2               # fail closed
+
+  for pid in $lock_holders; do
+    argv="$(ps -ww -o args= -p "$pid" 2>/dev/null)"
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+
+    [[ "$db_holders" == *" ${pid} "* ]]                                || return 2  # (2)
+    [[ "$argv" =~ (^|/)aberp[[:space:]]serve([[:space:]]|$) ]]         || return 2  # (3)
+    [[ "$argv" =~ [[:space:]]--tenant[[:space:]]+"$tenant"([[:space:]]|$) ]] || return 2  # (3b)
+    [[ "$ppid" == "1" ]]                                              || return 2  # (4)
+    [[ "$pgid" != "$our_pgid" ]]                                      || return 2  # (5)
+
+    qualified+="${pid}"$'\n'
+  done
+
+  printf '%s' "$qualified"
+  return 0
+}
+
+# Reap a stale-orphan same-tenant DEV writer so a crash-restart is one step.
+# Loud at every branch, bounded in time, and refuses to act on anything it
+# cannot attribute. Return 0 = the writer lock looks clear to take, 1 = leave
+# it to `aberp serve`'s own refusal to speak. The caller ignores the status:
+# the point is that boot proceeds either way and serve stays the authority.
+reap_stale_orphan_writer() {
+  local repo_root="$1" db_abs="$2" tenant="$3"
+  local pids rc pid alive waited=0
+  local argv_now ppid_now to_kill=""
+
+  # HARD gate A: never the prod tenant. (Redundant with the tenant=prod refusal
+  # further down, kept local so the predicate is safe wherever it is called.)
+  if [[ "$tenant" == "prod" ]]; then
+    echo "[writer-lock] tenant=prod — the stale-orphan reap is DEV-only and does not run" >&2
+    return 1
+  fi
+  # HARD gate B: only for a db INSIDE this checkout. The operator/prod DBs live
+  # under ~/.aberp/serve/<tenant>/ — outside the repo — so even a spoofed
+  # tenant name cannot get this code near real operator data.
+  if [[ "$db_abs" != "${repo_root}/"* ]]; then
+    echo "[writer-lock] db ${db_abs} is outside ${repo_root} — not a DEV db; stale-orphan reap skipped"
+    return 1
+  fi
+
+  pids="$(stale_orphan_writer_pids "$db_abs" "$tenant")"
+  rc=$?
+  if [[ $rc -eq 1 ]]; then
+    return 0            # nothing holds the DEV writer lock — the normal path
+  fi
+  if [[ $rc -eq 2 ]]; then
+    echo "[writer-lock] the DEV writer lock next to ${db_abs} is held by a process this"
+    echo "[writer-lock] launcher will NOT touch — a live-parented writer, a sibling of this"
+    echo "[writer-lock] run, or a holder it cannot attribute. Current holders:"
+    lsof -- "${db_abs}" "$(dirname "$db_abs")"/.aberp-db-writer.*.lock 2>/dev/null \
+      | sed 's/^/[writer-lock]   /'
+    echo "[writer-lock] Leaving them alone. If ABERP is already running, quit that window;"
+    echo "[writer-lock] otherwise boot will refuse with the single-writer message."
+    return 1
+  fi
+
+  for pid in $pids; do
+    # Re-verify immediately before signalling. The lsof/ps above and the kill
+    # below are not atomic: a pid that exited in between could have been
+    # recycled onto an unrelated process, and this is the one operation in this
+    # file that cannot be undone. Cheap insurance.
+    argv_now="$(ps -ww -o args= -p "$pid" 2>/dev/null)"
+    ppid_now="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    if [[ ! "$argv_now" =~ (^|/)aberp[[:space:]]serve([[:space:]]|$) ]] \
+      || [[ "$ppid_now" != "1" ]]; then
+      echo "[writer-lock] pid ${pid} no longer looks like the stale orphan — skipping it"
+      continue
+    fi
+    echo "[writer-lock] stale orphan \`aberp serve --tenant ${tenant}\` pid ${pid} (ppid 1)"
+    echo "[writer-lock] holds ${db_abs} and its writer flock — sending SIGTERM"
+    kill -TERM "$pid" 2>/dev/null || true
+    to_kill+="${pid} "
+  done
+
+  # The kernel releases a flock when the holding process exits, so "pid gone"
+  # IS "lock released" — no need to poll the lock file itself. SIGTERM first
+  # (serve's shutdown path closes the DB cleanly); SIGKILL only if it will not
+  # release within the short bound above.
+  local deadline=$((STALE_WRITER_TERM_WAIT_SECS + STALE_WRITER_KILL_WAIT_SECS))
+  local escalated=0
+  while :; do
+    alive=""
+    for pid in $to_kill; do
+      kill -0 "$pid" 2>/dev/null && alive+="${pid} "
+    done
+    [[ -z "$alive" ]] && break
+    [[ $waited -ge $deadline ]] && break
+    if [[ $escalated -eq 0 && $waited -ge $STALE_WRITER_TERM_WAIT_SECS ]]; then
+      echo "[writer-lock] pid(s) ${alive}still alive after ${STALE_WRITER_TERM_WAIT_SECS}s — escalating to SIGKILL"
+      # shellcheck disable=SC2086
+      kill -KILL $alive 2>/dev/null || true
+      escalated=1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  # Honest verdict — re-run the predicate rather than assuming the kill worked.
+  stale_orphan_writer_pids "$db_abs" "$tenant" >/dev/null 2>&1
+  if [[ $? -eq 1 ]]; then
+    echo "[writer-lock] reaped — the DEV writer lock is free; continuing to boot."
+    return 0
+  fi
+  echo "[writer-lock] WARNING: ${db_abs} is STILL held after the reap attempt." >&2
+  echo "[writer-lock] Not escalating further; boot will refuse and name the writer." >&2
+  return 1
+}
+
+# Test seam: sourcing with ABERP_RUN_DESKTOP_LIB_ONLY=1 loads the pure helpers
+# above without building or launching anything. Used by
+# run/tests/run_desktop_stale_writer_reap_test.sh. (Same shape as
+# ABERP_UPGRADE_PROD_LIB_ONLY in run/upgrade_prod.sh.)
+if [[ "${ABERP_RUN_DESKTOP_LIB_ONLY:-0}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 # ---------- self-syntax-check (PR-55) ---------------------------------------
 # Catch a parse-error regression at startup so a typo doesn't manifest as a
@@ -318,6 +526,25 @@ if command -v lsof >/dev/null 2>&1; then
     unset held_by
   fi
 fi
+
+# ---------- DEV: reap a stale-orphan same-tenant writer (S445) ---------------
+# Sibling of the :5173 sweep above — same job (clear a prior run's straggler),
+# different resource (the whole-DB writer flock instead of a TCP port). See the
+# long note at the top of this file for the predicate and why it is DEV-only.
+#
+# Resolve the db path exactly the way the Tauri shell will: aberp-ui reads
+# ABERP_DB verbatim and hands it to `aberp serve --db` (apps/aberp-ui/src/lib.rs
+# ::boot_backend), and tauri-CLI runs the shell with cwd = DESKTOP_DIR — so the
+# relative `./aberp.duckdb` default lands in apps/aberp-ui/, NOT in the repo
+# root and NOT in whatever directory the operator invoked this script from.
+# `pwd -P` canonicalises symlinks and `..` so gate B below compares real paths.
+dev_db_abs="$db_path"
+if [[ "$dev_db_abs" != /* ]]; then
+  dev_db_abs="${DESKTOP_DIR}/${dev_db_abs#./}"
+fi
+dev_db_abs="$(cd "$(dirname "$dev_db_abs")" 2>/dev/null && pwd -P)/$(basename "$dev_db_abs")"
+repo_root_real="$(cd "$REPO_ROOT" && pwd -P)"
+reap_stale_orphan_writer "$repo_root_real" "$dev_db_abs" "$tenant" || true
 
 # ---------- cleanup hook (group SIGTERM + port-5173 belt-and-suspenders) ----
 # Whatever path we exit through (graceful, signal, error), kill the whole
