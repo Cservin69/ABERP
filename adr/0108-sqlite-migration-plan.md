@@ -354,6 +354,29 @@ scaled integers introduce their own SQLite hazard: **`a*b` on INTEGERs that
 overflows i64 silently converts to REAL** — the exact failure class we are
 migrating to eliminate. Rejected on rules 2 and 12.
 
+> ⚠ **CORRECTED 2026-07-31 by Step 5's measurement (S450). `STRICT` does NOT
+> protect an R2 column, and the sentence below that implies it does is
+> narrowed here.** `STRICT` applies the ordinary affinity conversion and
+> refuses only what cannot convert **losslessly**. REAL → TEXT always
+> converts, so a float written into `quantity` or `exchange_rate` is
+> **accepted and stringified** — and `typeof()` still reads `'text'`, so the
+> T-2 sweep is blind to it as well.
+>
+> | declared | given a REAL | result |
+> |---|---|---|
+> | `INTEGER` (R1, money) | `1234.56` | `SQLITE_CONSTRAINT_DATATYPE` |
+> | `INTEGER` (R1, money) | `1234.0` | accepted, converted to `1234` |
+> | `TEXT` (R2) | `0.1 + 0.2` | **accepted, stored as `'0.30000000000000004'`** |
+> | `BLOB` (R3) | `'abc'` | `SQLITE_CONSTRAINT_DATATYPE` |
+>
+> So R1 and R3 *are* enforced by the declared type; **R2 is not enforced by
+> anything in the engine.** Its guards are exactly two, and they are now known
+> to be the only two: the Rust-side bind (a `Decimal`, never an `f64`) and
+> **T-8's cut-gate keeping arithmetic out of SQL** — which is what makes T-8 a
+> load-bearing mitigation rather than a tidiness rule. Pinned by
+> `strict_does_not_protect_an_r2_text_column_from_a_float`
+> (`crates/aberp-db/tests/adr0108_money_representation.rs`).
+
 **R3 — Hashes and canonical payloads are `BLOB`, bound as `&[u8]`/`Vec<u8>`,
 never as `&str`.** Declared type `BLOB` in a `STRICT` table. In SQLite, `BLOB` and
 `TEXT` are distinct storage classes that **never compare equal**; a single `&str`
@@ -1332,6 +1355,45 @@ invoice-sequence allocation.** *(the whole point of the exercise)*
 - *Rollback:* `rollback_to_duckdb.sh`. **This is the step where the rollback drill
   is not a formality — run it, boot DuckDB green, re-apply, and say so in the PR.**
 
+> **What Step 5 ACTUALLY landed, 2026-07-31 (S450) — read this before Step 7.**
+>
+> The bullet above is the full Step 5. What landed is its **migrator half**,
+> and the split is deliberate: Ervin's constraint for this session was
+> *"DuckDB remains the source of truth for this family until an explicit,
+> gated cutover; SQLite is populated behind the compile-time selector."*
+>
+> **Landed.** The family's `STRICT` DDL built the way the DuckDB schema is
+> built (base `CREATE` + six `ensure_columns` ladders, 16 columns, M8's
+> post-condition exercised on the real family rather than on an
+> already-complete table); the typed row-by-row carry applying §3.2 B's
+> `huf_equivalent_total` `DECIMAL→INTEGER` and §3.2 C's `exchange_rate` /
+> `quantity` `DECIMAL→TEXT`; the reconciliation gate's arm for the family
+> (presence symmetry, row counts, **per-row** money equality keyed by PK,
+> per-money-column exact sums folded in Rust, a 12-column `typeof()` sweep,
+> bucket-by-bucket sequence agreement); T-1, T-5(a), R1/R3 round-trips, and
+> T-14 on SQLite. S444's durable floor is carried unchanged and now pinned on
+> the new engine.
+>
+> **NOT landed, and each one needs the Rust-side seam crossing that is the
+> cutover:** the 25 + 4 + 2 + 1 `ensure_columns` *call-site* rewrites inside
+> `duckdb_store.rs` / `restore_from_nav_outgoing.rs` / `invoice_draft.rs` /
+> `serve.rs`; `write_vat_rate_choice`'s `f64 → Decimal` (B2) and therefore
+> T-5(d)/(e); `reports.rs:800,861`'s folds **and the three `unwrap_or(0)`
+> fail-opens at `:827`, `:872`, `:1279`**; T-4's NAV/PDF byte-identity, which
+> is only meaningful once something reads the SQLite side. Per §9's own escape
+> clause, **the `reports.rs` fail-opens revert to owing their own PR and do not
+> lapse** — they are a live production defect on the ÁFA report, independent
+> of this migration.
+>
+> **The rollback drill was run** against a byte-identical copy of the DEV
+> tenant DB (20 MB, 240 ledger entries, 16 invoices) rather than in place —
+> the conservative call, and it cost nothing, because the copy carries the real
+> data. It surfaced **S-1** and **S-2** in §9, which are why the ADR's stated
+> Step-5 exit criterion ("the real DEV tenant DB migrates and the gate passes
+> green") is **not reachable today for two pre-existing reasons**, both caught
+> loudly by gates that were built for exactly that. That is the single most
+> important input to Step 6.
+
 **Step 6 — Adversarial checkpoint.** Not a code step. Rule 4 reserves full
 adversarial review for the invoice→NAV/ÁFA path; Step 5 *is* that path. No further
 family crosses until this closes.
@@ -1413,6 +1475,8 @@ it or an explicit "out of scope".
 
 | Item | Closed by |
 |---|---|
+| **S-1 — THE DEV TENANT HAS NO TAMPER-EVIDENCE COVERAGE AT ALL, so Step 5's stated exit criterion cannot be met and neither can §6.2's rollback verification.** Measured 2026-07-31 against a byte-identical copy of `apps/aberp-ui/aberp.duckdb` (240 `audit_ledger` rows): **`signed_entry_count = 0`, `anchor_count = 0`.** The S441 / ADR-0087 per-entry signature layer and the qualified-timestamp anchors are simply not populated on this tenant. B1's non-zero precondition therefore hard-stops the migrator *and* `rollback_to_duckdb.sh`, both correctly — an equality between two zeros is not a check. But the consequence is sharper than "the gate is strict": **§6.2 step 7's verification can never report PASS against the actual DEV database**, and §6.2's own argument is that "a rollback path exercised once at the end is a rollback path that has never been exercised". Every other check in the drill passed (all 40-odd per-table row counts, the WAL check, the artefact digests); only these two fail. | **Step 6's adversarial, as an input rather than a finding to fix in flight.** Two candidate dispositions and they are genuinely different: (a) the DEV ledger's signature/anchor layer is *supposed* to be populated and is not — a live defect in S441/ADR-0087's wiring, which would make this the most valuable thing Step 5 found; or (b) it is expected to be empty on a DEV tenant that has never opened a signed session, in which case B1's non-zero precondition needs a stated, testable exemption rather than an unreachable PASS. **Do not soften the precondition to make the drill green** — that is the exact fail-open B1 exists to stop. |
+| **S-2 — THE DEV TENANT'S AUDIT MIRROR IS AHEAD OF THE DB TABLE BY 5 ENTRIES, TODAY.** Measured in the same snapshot: `head_seq = 240`, `mirror_tail_seq = 245`. This is the **2026-07-19 shape** (`docs/runbooks/audit-mirror-defork-20260719.md`), recurring — five committed audit appends that the fsync'd mirror kept and the DB table lost. It is what R-5 looks like from the outside. `classify_mirror` classifies it correctly and routes to `heal_from_mirror_ahead` with "STOP: a migration is not a repair tool", so the migrator would refuse here too even with S-1 resolved. | **The existing heal path, run by the operator, before any real-DEV migration** — not by this migration and not by a session doing something else. Recorded here because it is a *second*, independent reason the Step-5 exit criterion is unreachable today, and because a session that fixed only S-1 would then hit this and might read it as a Step-5 regression. |
 | **R-5 — A FOREIGN CONNECTION'S `close` SILENTLY DESTROYS EVERY SUBSEQUENT COMMIT'S DURABILITY. Live in production today, on DuckDB, on 13 in-serve routes. Measured, deterministic (3/3), with a no-fork control and a mutation.** The `Handle` sets `disable_checkpoint_on_shutdown` + `wal_autocheckpoint='1TB'` (`lib.rs:648`) so its commits stay WAL-resident *by design*. A co-resident `Connection::open` carries neither pragma, so **its close checkpoints**: the WAL is folded into the main file and truncated to zero. From that moment the writer's WAL is gone and does not come back — 10 further commits returned `Ok` and were written **nowhere**; on process exit they are gone. **The read-fork class is not a stale read.** The forked read itself is coherent (DuckDB replays the WAL on open); the stale read is a *symptom of a prior fork's close*. **Consequences for this plan's framing:** (i) read/write is the wrong axis — the injury is the `close`, so the census that matters is the **ADR-0098 opener census (81)**, not the read-fork subset (33); (ii) the 13 GROUP-A in-serve entries are not stale-read nuisances — the **first** hit of any one of them ends that `serve` process's write durability for invoices, audit rows and the invoice-number floor; (iii) it settles ADR-0107 §1.3 F1. | **ITS OWN PR, BEFORE ANYTHING ELSE — explicitly NOT folded into this migration** (CLAUDE.md rule 3). This plan is DEV-only (§11 authorises no cutover), so **prod stays on DuckDB and this stays live for as long as it does; the migration is not its fix.** Two shapes, in preference order: **(1) containment — make every opener carry the two pragmas** at every `Connection::open` on a live tenant DB (measured to reduce the loss to zero; hours of work; the forks remain, so it is containment, not a fix); **(2) migrate the 13 GROUP-A routes to the `Handle`**, which is what the frozen baseline says should happen — larger, and it is product work on live invoice/NAV routes. The containment should land first regardless, because it stops the bleeding on a defect that is live today. Evidence: `docs/findings/read-fork-audit-sqlite-20260731.md` §3, `duckdb_a_foreign_close_silently_destroys_every_later_commit`. |
 | The frozen baseline's GROUP-A rationale states the mechanism as a stale read of "the last-checkpointed **SUBSET**" (`tools/adr0099_read_fork_structural_baseline.txt`). **Measured false** — see R-5. | Same PR as R-5: the baseline's header text is where the next reader learns the mechanism, so leaving it wrong there is worse than leaving it unfixed. |
 | The read-fork gate and the write-fork gate partition on read/write, but the hazard is the **close** and does not respect that partition. | Recorded here; a gate change belongs with R-5, **not** with this migration. |
