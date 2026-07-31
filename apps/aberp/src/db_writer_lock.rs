@@ -19,6 +19,32 @@
 //! instead of stalling. Loud-fail on a genuine fs error (never silently skip the
 //! lock — a skipped whole-DB lock silently re-opens the two-writer corruption
 //! window).
+//!
+//! # ADR-0108 (M6) — re-scoped from "corruption guard" to **app-invariant guard**,
+//! # and NOT retirable
+//!
+//! ADR-0107 §2 lists this lock in its retirement table, on the reading that
+//! SQLite's own locking makes a cross-process advisory lock redundant. It is
+//! **not retired**, and PR #49 F-7b says so for a reason worth stating here
+//! rather than in a document nobody greps: SQLite permits a second writer.
+//! What this lock stops is not *file corruption* — it is two ABERP processes
+//! each believing it owns the tenant's invariants: the audit chain head, the
+//! invoice-number allocator, the stock cache. Those are **application**
+//! invariants; no storage engine enforces them.
+//!
+//! It also turns out to be a free safety property for the SQLite migration's
+//! reversible window, and ADR-0108 §1.1 G-7 measured it: [`lock_path_for`]
+//! keys the lock on `<parent-dir>/.aberp-db-writer.<tenant>.lock` — the
+//! **directory + tenant**, *not* the DB filename. So a DuckDB `serve` and a
+//! SQLite `serve` on tenant `test` in the same directory **already mutually
+//! exclude**, with no change at all. The two engines cannot both be live.
+//!
+//! Its third consumer is the migration tooling: `aberp premigration-snapshot`
+//! and `aberp verify-against-manifest` acquire it for their whole run
+//! (CLAUDE.md rule 13 — a fresh opener reads Handle-WAL-resident data STALE,
+//! so a snapshot taken while `serve` is live is a *short* snapshot), and
+//! ADR-0108 §7 Step 4 requires the migrator to do the same. They **refuse**;
+//! they never wait and never force.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};

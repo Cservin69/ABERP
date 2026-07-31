@@ -17,7 +17,7 @@ use clap::Parser;
 use aberp::{
     cli, drain_pending_retries, drain_submission_queue, export_invoice_bundle, issue_invoice,
     issue_modification, issue_storno, mark_abandoned, observe_receiver_confirmation, poll_ack,
-    poll_annulment_ack, print_invoice, recover_from_nav, request_technical_annulment,
+    poll_annulment_ack, premigration, print_invoice, recover_from_nav, request_technical_annulment,
     retry_submission, serve, setup_nav_credentials, snapshot, submit_annulment, submit_invoice,
 };
 
@@ -49,6 +49,10 @@ fn main() -> Result<()> {
             cli::SnapshotCommand::List(a) => snapshot::run_list(&a),
             cli::SnapshotCommand::Restore(a) => snapshot::run_restore(&a),
         },
+        cli::Command::PremigrationSnapshot(a) => premigration::run(&a),
+        cli::Command::VerifyAgainstManifest(a) => premigration::run_verify_cmd(&a),
+        cli::Command::RollbackRestore(a) => premigration::run_rollback_restore(&a),
+        cli::Command::DbMatchesManifest(a) => premigration::run_db_matches_manifest(&a),
     }
 }
 

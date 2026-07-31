@@ -71,6 +71,12 @@
 //!      snapshot primitive), so [`run_durable_checkpoint_locked`] is a stub.
 
 pub mod debounce;
+// ADR-0108 Step 1 — the SQLite-migration reversibility scaffolding. Neither
+// module is reachable from `Handle`; both are pure/one-shot capability the
+// migration tooling consumes. See their own module docs for why they live in
+// this crate (it is the sanctioned seam, excluded from the opener census).
+pub mod engine_path;
+pub mod readonly;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};

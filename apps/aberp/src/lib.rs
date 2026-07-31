@@ -99,6 +99,9 @@ pub mod observe_receiver_confirmation;
 pub mod partners;
 pub mod poll_ack;
 pub mod poll_annulment_ack;
+/// ADR-0108 Step 1 — the pre-migration snapshot + manifest, and the verifier
+/// `run/rollback_to_duckdb.sh` calls to make the rollback *verified* (C-IV).
+pub mod premigration;
 pub mod print_invoice;
 pub mod products;
 pub mod purchasing;
