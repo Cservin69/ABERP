@@ -77,6 +77,10 @@ pub mod debounce;
 // this crate (it is the sanctioned seam, excluded from the opener census).
 pub mod engine_path;
 pub mod readonly;
+// ADR-0108 Step 2 — the SQLite open path + its security posture. Behind the
+// default-OFF `sqlite-engine` feature; nothing consumes it yet.
+#[cfg(feature = "sqlite-engine")]
+pub mod sqlite;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -112,6 +116,19 @@ pub enum DbError {
     /// Underlying DuckDB error (open / try_clone / runtime pragma).
     #[error("duckdb: {0}")]
     Duck(#[from] duckdb::Error),
+
+    /// ADR-0108 Step 2 — underlying SQLite error (open / pragma / limit).
+    #[cfg(feature = "sqlite-engine")]
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+
+    /// ADR-0108 Step 2 — a §5 mitigation could not be established at open
+    /// (version floor, file mode). Distinct from [`DbError::Sqlite`] because
+    /// this is *our* refusal, not the engine's: a database whose security
+    /// posture cannot be applied is not served (CLAUDE.md rule 11).
+    #[cfg(feature = "sqlite-engine")]
+    #[error("sqlite security posture: {0}")]
+    SqlitePosture(String),
 }
 
 /// Tunables for a [`Handle`]. [`HandleConfig::default`] is the ADR-0099 H3
