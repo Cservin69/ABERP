@@ -1402,9 +1402,14 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     }
 
     // S177 / PR-177 — pin the ap_invoice (incoming AP-side mirror)
-    // schema at boot, same posture as products + partners. The route
-    // layer also calls `ensure_schema` defensively so a fresh DB +
-    // first route hit does not 500.
+    // schema at boot, same posture as products + partners.
+    //
+    // R-1 (read-fork audit 2026-07-31): this boot ensure is now the SOLE
+    // pre-write establishment of the ap_invoice schema. The three read paths
+    // (`list_incoming` / `get_incoming` / `get_nav_xml_path`) used to repeat
+    // it defensively on a `Handle::read()` connection — DDL on a reader, which
+    // becomes a second writer outside the writer mutex under ADR-0108's
+    // `sqlite-engine` arm. Those calls are gone; do not put them back.
     {
         let _s = tracing::info_span!("serve.ensure_ap_invoice_schema").entered();
         let conn = Connection::open(&args.db).with_context(|| {
