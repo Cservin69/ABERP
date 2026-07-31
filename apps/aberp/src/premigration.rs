@@ -132,7 +132,7 @@ pub struct PremigrationManifest {
 /// only to a `sqlite-engine` build (a DuckDB build under `~/.aberp/` is
 /// ordinary production operation; this *tool* has no business there either
 /// way).
-fn ensure_dev_only(db: &Path) -> Result<()> {
+pub(crate) fn ensure_dev_only(db: &Path) -> Result<()> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         // No HOME to compare against. Refuse rather than wave through: a tool
         // that touches the audit ledger does not get to fail open (rule 11).
@@ -660,8 +660,28 @@ pub struct VerifyReport {
     pub mismatches: Vec<String>,
 }
 
-/// The library face of [`run_verify_cmd`].
+/// The library face of [`run_verify_cmd`]. Acquires the tenant's whole-DB
+/// writer lock for the run.
 pub fn run_verify(db: &Path, tenant: &str, manifest_path: &Path) -> Result<VerifyReport> {
+    let _writer_lock =
+        crate::db_writer_lock::acquire_or_refuse(db, tenant, "aberp verify-against-manifest")?;
+    verify_against_manifest_locked(db, tenant, manifest_path)
+}
+
+/// [`run_verify`] for a caller that **already holds** the tenant's writer lock.
+///
+/// ADR-0108 Step 4's migrator holds it for its whole run and still needs to
+/// verify the pre-migration snapshot (precondition 4). Calling [`run_verify`]
+/// there would try to acquire a lock the same process already owns — an
+/// `flock` on a second file handle, which on macOS is granted and on Linux is
+/// not, i.e. a portability bug that would look like a hang on one platform and
+/// pass on the other. Splitting the acquisition out makes "who owns the lock"
+/// explicit at both call sites rather than accidental.
+pub(crate) fn verify_against_manifest_locked(
+    db: &Path,
+    tenant: &str,
+    manifest_path: &Path,
+) -> Result<VerifyReport> {
     ensure_dev_only(db)?;
     let raw = std::fs::read(manifest_path)
         .with_context(|| format!("read manifest {}", manifest_path.display()))?;
@@ -681,8 +701,6 @@ pub fn run_verify(db: &Path, tenant: &str, manifest_path: &Path) -> Result<Verif
         );
     }
 
-    let _writer_lock =
-        crate::db_writer_lock::acquire_or_refuse(db, tenant, "aberp verify-against-manifest")?;
     if let Some(len) = aberp_db::readonly::unfolded_wal_len(db)? {
         bail!(
             "refusing to verify: {} holds an unfolded WAL of {len} bytes, so a read-only open \

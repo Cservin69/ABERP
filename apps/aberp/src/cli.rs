@@ -667,6 +667,66 @@ pub enum Command {
     /// the digest the manifest recorded? Exit 0 = matches (C-I held, nothing to
     /// restore); exit 2 = differs.
     DbMatchesManifest(DbMatchesManifestArgs),
+
+    /// ADR-0108 Step 4 — carry `audit_ledger` + `audit_ledger_anchors` from a
+    /// **read-only** DuckDB into a fresh `aberp.sqlite`. The cheap abort point.
+    ///
+    /// Four preconditions, all refusals and none of which waits: the tenant's
+    /// whole-DB writer lock (rule 13 — a fresh opener reads Handle-WAL-resident
+    /// DuckDB stale), no unfolded `.wal` (a read-only open cannot replay one),
+    /// DEV-only paths (C-II), and a pre-migration snapshot that verifies.
+    ///
+    /// The `audit_ledger` TABLE is the source; the mirror is a cross-check arm
+    /// only (B1/Q7 — replaying the mirror strips every per-entry signature and
+    /// drops the anchors while leaving all four hash checks green).
+    #[cfg(feature = "sqlite-engine")]
+    MigrateToSqlite(MigrateToSqliteArgs),
+
+    /// ADR-0108 Step 4 — the reconciliation gate, as a **separate invocation**
+    /// run after the migrator has exited and released the lock (B4). It
+    /// re-opens both databases and re-queries through the ordinary read path:
+    /// **no number it compares was produced by the migrator.**
+    #[cfg(feature = "sqlite-engine")]
+    MigrateReconcile(MigrateReconcileArgs),
+}
+
+/// `aberp migrate-to-sqlite` (ADR-0108 Step 4).
+#[cfg(feature = "sqlite-engine")]
+#[derive(Debug, Parser)]
+pub struct MigrateToSqliteArgs {
+    /// The DEV DuckDB source. Opened READ-ONLY and byte-unmodified (C-I).
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// The SQLite target. Must not already exist.
+    #[arg(long, default_value = "./aberp.sqlite")]
+    pub to: PathBuf,
+
+    /// Tenant identifier — selects the whole-DB writer lock held for the run.
+    #[arg(long, default_value = "test")]
+    pub tenant: String,
+
+    /// The `.aberp-premigration-<ts>/` directory. Must verify before anything
+    /// is carried: there is no rollback target without it.
+    #[arg(long)]
+    pub from_snapshot: PathBuf,
+}
+
+/// `aberp migrate-reconcile` (ADR-0108 Step 4, §6.3).
+#[cfg(feature = "sqlite-engine")]
+#[derive(Debug, Parser)]
+pub struct MigrateReconcileArgs {
+    /// The DuckDB side, re-opened read-only and re-queried.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// The SQLite side the migrator produced.
+    #[arg(long, default_value = "./aberp.sqlite")]
+    pub sqlite: PathBuf,
+
+    /// Tenant identifier.
+    #[arg(long, default_value = "test")]
+    pub tenant: String,
 }
 
 /// `aberp rollback-restore` (ADR-0108 §6.2 steps 4–5).

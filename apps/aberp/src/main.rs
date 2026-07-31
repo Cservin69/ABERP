@@ -53,6 +53,10 @@ fn main() -> Result<()> {
         cli::Command::VerifyAgainstManifest(a) => premigration::run_verify_cmd(&a),
         cli::Command::RollbackRestore(a) => premigration::run_rollback_restore(&a),
         cli::Command::DbMatchesManifest(a) => premigration::run_db_matches_manifest(&a),
+        #[cfg(feature = "sqlite-engine")]
+        cli::Command::MigrateToSqlite(a) => aberp::migrate_to_sqlite::run(&a),
+        #[cfg(feature = "sqlite-engine")]
+        cli::Command::MigrateReconcile(a) => aberp::migrate_to_sqlite::run_reconcile(&a),
     }
 }
 
