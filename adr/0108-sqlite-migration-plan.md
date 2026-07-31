@@ -1152,8 +1152,29 @@ that is ADR-0107's own "stop here having spent little" exit.
 > `read()` becoming a real second connection is safe only under a claim §2.4
 > asserts and never pins: that WAL gives a reader a fresh snapshot per statement.
 > That holds **in autocommit** and is **false inside an explicit transaction**,
-> where the reader freezes its snapshot at `BEGIN` and will not see a commit that
-> lands after it. And a `read()` taken *while a `write()` guard is live* now
+> where the reader freezes its snapshot and will not see a commit that lands
+> after it.
+>
+> > **CORRECTED 2026-07-31 by finding R-4 (read-fork audit): the snapshot is
+> > NOT taken at `BEGIN`.** This paragraph originally said "freezes its snapshot
+> > at `BEGIN`". Measured, that is false. `BEGIN` is `BEGIN DEFERRED`: it
+> > acquires nothing and starts no read transaction. **The snapshot is taken at
+> > the first read statement.**
+> >
+> > | Sequence | Result |
+> > |---|---|
+> > | `BEGIN` → writer commits → `SELECT` | **sees** the commit |
+> > | `BEGIN` → `SELECT` → writer commits → `SELECT` | does **not** see it |
+> > | … → `COMMIT` → `SELECT` | re-syncs |
+> >
+> > The exposure therefore begins at a transaction's **first `SELECT`**, not at
+> > its `BEGIN`. Since axis (a) found **zero** `read()` sites that open a
+> > transaction at all, the class is empty either way — but a T-20 written to the
+> > original wording would have been written, failed, and then "fixed" into
+> > whichever assertion happened to go green. That is how a false semantics claim
+> > gets pinned. The corrected pin is `t20b_the_snapshot_is_taken_at_the_first_read_not_at_begin`.
+>
+> And a `read()` taken *while a `write()` guard is live* now
 > contends for a real file lock instead of sharing one in-process instance, so
 > M7's finite `busy_timeout` converts DuckDB's immediate mutex self-deadlock into
 > a **timed hang, then `SQLITE_BUSY`** — rule 13's known failure mode with its
@@ -1210,9 +1231,14 @@ that is ADR-0107's own "stop here having spent little" exit.
 > **Three pins, all mutation-verified:**
 > - **T-20** — commit on connection A → read on a **pre-existing** connection B in
 >   autocommit → assert B sees it. This is §2.4's snapshot claim, pinned instead
->   of asserted. Its in-transaction twin asserts the *opposite*: B inside `BEGIN`
->   must **not** see the commit — so the test encodes the real semantics, not the
->   convenient half.
+>   of asserted. Its in-transaction twin asserts the *opposite* — **and per R-4
+>   the twin's trigger is B's FIRST READ STATEMENT, not its `BEGIN`** (`BEGIN` is
+>   `BEGIN DEFERRED` and acquires nothing): B inside a transaction that has
+>   **already issued a read** must **not** see the commit, while B that has only
+>   issued `BEGIN` **does** see it — so the test encodes the real semantics, not
+>   the convenient half. **LANDED** as `t20a` + `t20b` in the audit's harness
+>   (`crates/aberp-db/tests/adr0108_read_fork.rs`, PR #52); `t20b` is one of only
+>   two arms of six that actually discriminate WAL.
 > - **T-21** *(rewritten 2026-07-31, R-3 — the original wording was unwritable;
 >   see the correction above)* — a nested `read()`-inside-`write()` **never
 >   reaches the storage engine**: it resolves against the Rust writer `Mutex`,
@@ -1368,7 +1394,7 @@ a pin (ADR-0107 §4.1, extended to security by PR #49).
 | **T-17** | **`.gitignore` coverage, asserted not assumed** (B3). `git check-ignore` returns 0 for each of: `aberp.sqlite`, `aberp.sqlite-wal`, `aberp.sqlite-shm`, `aberp.sqlite.audit.log`, `.aberp-premigration-<ts>/x`, `.aberp-rolledback-<ts>/x`, `aberp.duckdb`, `aberp.duckdb.wal`, `aberp.duckdb.audit.log`, `aberp.duckdb.audit.log.healed-1.bak`. A shell test in `run/tests/`, wired into CI — the repo is public and every one of these holds partner bank details. Mutation-verify by deleting the `*.sqlite*` line. | B3, Step 1 |
 | **T-18** | **The tamper-evidence gate catches its own blocker** (B1). Run the migrator in the **rejected** mirror-as-source mode against a copy of the DEV DB; assert the reconciliation gate goes **red** on the non-NULL `event_sig` count and on the `audit_ledger_anchors` count. Also assert that `verify_chain`, `verify_chain_signed`, `PRAGMA integrity_check` and the head-hash equality all still pass on that same gutted output — **the point of the test is that four green checks and one red one is the true picture**, and that removing the two count checks makes the whole gate green on a signature-stripped ledger. | B1, §6.3 |
 | **T-19** | **The read-only DuckDB open** (B4, new capability — zero such opens exist today). Open `aberp.duckdb` read-only, attempt a write, assert the error; and assert the file's SHA-256 is byte-unchanged across a full migrator run against a copy. This is the single mechanism behind C-I. | B4, C-I, Step 4 |
-| **T-20** | **The WAL snapshot claim, pinned in both directions** (F7/Q10). Commit on connection A → read on a **pre-existing** connection B **in autocommit** → B sees it. Twin: B inside an explicit `BEGIN` → B does **not** see it. §2.4 asserted the first and never mentioned the second. | F7, Q10, §2.4 |
+| **T-20** | **The WAL snapshot claim, pinned in both directions** (F7/Q10). Commit on connection A → read on a **pre-existing** connection B **in autocommit** → B sees it. Twin: B inside a transaction that has **already issued a read** → B does **not** see it. §2.4 asserted the first and never mentioned the second. *(**CORRECTED 2026-07-31, R-4:** this row said "B inside an explicit `BEGIN`". Measured false — `BEGIN` is `BEGIN DEFERRED`, acquires nothing, and starts no read transaction; the snapshot is taken at the **first read statement**. A T-20 written to the old wording would have failed and then been "fixed" into whichever assertion went green, pinning a false claim. The corrected pin is `t20b_the_snapshot_is_taken_at_the_first_read_not_at_begin`.)* | F7, Q10, §2.4, R-4 |
 | **T-21** | **Nested `read()`-inside-`write()` NEVER REACHES THE ENGINE** (F7/Q11). *Rewritten 2026-07-31 by finding R-3 — the original "aborts loudly rather than waiting out `busy_timeout`" described a race that cannot occur, and was unwritable until the SQLite arm's mutex choice was made.* Per R-3 the SQLite arm **keeps `lock_recovering()`**, so the nested case resolves against the Rust `Mutex`: tripwire panic in debug, mutex deadlock in release, `busy_timeout` never involved. Two arms — behavioural (`#[should_panic]`, `debug_assertions`-gated) **and structural** (`Handle::read()` still calls `lock_recovering()`, with no engine-gated arm returning before it), because the tripwire panics *before* the lock and would mask the decision being reversed. **LANDED** — `crates/aberp-db/tests/adr0108_t21_nested_read_in_write.rs`. | F7, Q11, rule 13, R-3 |
 
 **On the existing gates.** ADR-0107 §4.1 Phase 2 says census entries and fork-gate
