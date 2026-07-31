@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aberp::migrate_to_sqlite::{migrate_ledger, reconcile, LedgerSource};
+use aberp::migrate_to_sqlite::{migrate_families, reconcile, LedgerSource};
 use aberp::premigration::run_snapshot;
 use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
 
@@ -118,7 +118,7 @@ fn the_ledger_crosses_and_the_reconciliation_gate_passes() {
     let snap = run_snapshot(&db, TENANT, None).unwrap();
     let lite = dir.join("aberp.sqlite");
 
-    let out = migrate_ledger(&db, &lite, TENANT, &snap, LedgerSource::Table).expect("migrate");
+    let out = migrate_families(&db, &lite, TENANT, &snap, LedgerSource::Table).expect("migrate");
     assert_eq!(out.entries_carried, 6);
     assert_eq!(out.anchors_carried, 2);
 
@@ -175,7 +175,7 @@ fn t18_the_gate_hard_stops_on_a_signature_stripped_carry() {
     let snap = run_snapshot(&db, TENANT, None).unwrap();
     let lite = dir.join("aberp.sqlite");
 
-    let out = migrate_ledger(
+    let out = migrate_families(
         &db,
         &lite,
         TENANT,
@@ -261,7 +261,7 @@ fn the_gate_hard_stops_when_the_duckdb_side_has_no_tamper_evidence_at_all() {
     let snap_dir = dir.join("snap");
     run_snapshot(&db, TENANT, Some(&snap_dir)).expect("snapshot of a healthy ledger");
     let lite = dir.join("aberp.sqlite");
-    migrate_ledger(&db, &lite, TENANT, &snap_dir, LedgerSource::Table)
+    migrate_families(&db, &lite, TENANT, &snap_dir, LedgerSource::Table)
         .expect("the healthy carry must succeed — otherwise there is nothing to gate");
 
     // Now gut BOTH sides equally. This is the "green zero" shape: the counts
@@ -313,7 +313,7 @@ fn the_gate_hard_stops_when_the_duckdb_side_has_no_tamper_evidence_at_all() {
 
 /// **S449 (B4) — the gate must not compare against a STALE DuckDB extraction.**
 ///
-/// `run_snapshot`, `verify_against_manifest_locked` and `migrate_ledger` all
+/// `run_snapshot`, `verify_against_manifest_locked` and `migrate_families` all
 /// refuse on a non-empty `aberp.duckdb.wal`. `reconcile` did not, and it is the
 /// one that matters most: the writer lock stops a CONCURRENT writer, never a
 /// previously CRASHED one, so a DuckDB build that wrote rows and died between
@@ -331,7 +331,7 @@ fn s449_the_gate_refuses_when_an_unfolded_duckdb_wal_is_present() {
     let snap_dir = dir.join("snap");
     run_snapshot(&db, TENANT, Some(&snap_dir)).unwrap();
     let lite = dir.join("aberp.sqlite");
-    migrate_ledger(&db, &lite, TENANT, &snap_dir, LedgerSource::Table).unwrap();
+    migrate_families(&db, &lite, TENANT, &snap_dir, LedgerSource::Table).unwrap();
 
     // The gate is green on the clean state — otherwise the refusal below could
     // be coming from anywhere.
@@ -364,7 +364,7 @@ fn s449_the_gate_refuses_when_an_unfolded_duckdb_wal_is_present() {
 /// `reconcile` checked `ensure_dev_only` on the DuckDB path only, and
 /// `open_hardened` CREATES the file it is given — so a typo'd `--sqlite` under
 /// `~/.aberp/` wrote a fresh database into the production root before the first
-/// query failed. `migrate_ledger` guards both paths; the gate is the command an
+/// query failed. `migrate_families` guards both paths; the gate is the command an
 /// operator runs by hand, so it needed the same.
 #[test]
 fn s449_the_gate_refuses_a_sqlite_target_under_the_production_root() {
@@ -411,7 +411,7 @@ fn s449_the_gate_hard_stops_when_only_the_session_pubkey_is_stripped() {
     let snap_dir = dir.join("snap");
     run_snapshot(&db, TENANT, Some(&snap_dir)).unwrap();
     let lite = dir.join("aberp.sqlite");
-    migrate_ledger(&db, &lite, TENANT, &snap_dir, LedgerSource::Table).unwrap();
+    migrate_families(&db, &lite, TENANT, &snap_dir, LedgerSource::Table).unwrap();
 
     // The strip: SQLite side only, one column, signatures left intact.
     {
@@ -472,7 +472,7 @@ fn t19_the_duckdb_file_is_byte_unchanged_across_a_full_migrator_run() {
     let before_mtime = std::fs::metadata(&db).unwrap().modified().unwrap();
 
     let lite = dir.join("aberp.sqlite");
-    let out = migrate_ledger(&db, &lite, TENANT, &snap, LedgerSource::Table).unwrap();
+    let out = migrate_families(&db, &lite, TENANT, &snap, LedgerSource::Table).unwrap();
     reconcile(&db, &lite, TENANT).unwrap();
 
     assert_eq!(
@@ -505,7 +505,7 @@ fn the_migrator_refuses_while_another_writer_holds_the_tenant_lock() {
     let lite = dir.join("aberp.sqlite");
 
     let held = aberp::db_writer_lock::acquire_or_refuse(&db, TENANT, "test serve").unwrap();
-    let err = migrate_ledger(&db, &lite, TENANT, &snap, LedgerSource::Table)
+    let err = migrate_families(&db, &lite, TENANT, &snap, LedgerSource::Table)
         .expect_err("a held writer lock must refuse the migrator");
     assert!(err.to_string().contains("single-writer"), "{err}");
     assert!(!lite.exists(), "nothing may be produced on a refusal");
@@ -524,7 +524,7 @@ fn the_migrator_refuses_on_an_unfolded_wal() {
     std::fs::write(aberp_db::readonly::wal_path_for(&db), b"unfolded").unwrap();
 
     let lite = dir.join("aberp.sqlite");
-    let err = migrate_ledger(&db, &lite, TENANT, &snap, LedgerSource::Table)
+    let err = migrate_families(&db, &lite, TENANT, &snap, LedgerSource::Table)
         .expect_err("an unfolded WAL must refuse");
     assert!(err.to_string().contains("unfolded WAL"), "{err}");
     assert!(!lite.exists());
@@ -540,7 +540,7 @@ fn the_migrator_refuses_without_a_snapshot_and_when_the_snapshot_no_longer_verif
     let lite = dir.join("aberp.sqlite");
 
     // (a) no snapshot at all
-    let err = migrate_ledger(&db, &lite, TENANT, &dir.join("nope"), LedgerSource::Table)
+    let err = migrate_families(&db, &lite, TENANT, &dir.join("nope"), LedgerSource::Table)
         .expect_err("no manifest must refuse");
     assert!(
         err.to_string().contains("no pre-migration manifest"),
@@ -555,7 +555,7 @@ fn the_migrator_refuses_without_a_snapshot_and_when_the_snapshot_no_longer_verif
             .unwrap();
         conn.close().unwrap();
     }
-    let err = migrate_ledger(&db, &lite, TENANT, &snap, LedgerSource::Table)
+    let err = migrate_families(&db, &lite, TENANT, &snap, LedgerSource::Table)
         .expect_err("a snapshot that no longer verifies must refuse");
     assert!(err.to_string().contains("does NOT verify"), "{err}");
     assert!(!lite.exists());
@@ -570,12 +570,12 @@ fn the_migrator_refuses_a_production_path_and_a_mismatched_extension() {
 
     let home = std::env::var("HOME").unwrap();
     let prod = PathBuf::from(&home).join(".aberp/prod/aberp.sqlite");
-    let err = migrate_ledger(&db, &prod, TENANT, &snap, LedgerSource::Table)
+    let err = migrate_families(&db, &prod, TENANT, &snap, LedgerSource::Table)
         .expect_err("a target under ~/.aberp must be refused");
     assert!(err.to_string().contains("DEV-only violation"), "{err}");
 
     // The target must be a `.sqlite`, not anything else.
-    let err = migrate_ledger(
+    let err = migrate_families(
         &db,
         &dir.join("aberp.db"),
         TENANT,
@@ -596,7 +596,7 @@ fn the_migrator_refuses_to_overwrite_an_existing_sqlite_file() {
     let lite = dir.join("aberp.sqlite");
     std::fs::write(&lite, b"someone else's work").unwrap();
 
-    let err = migrate_ledger(&db, &lite, TENANT, &snap, LedgerSource::Table)
+    let err = migrate_families(&db, &lite, TENANT, &snap, LedgerSource::Table)
         .expect_err("an existing target must be refused");
     assert!(err.to_string().contains("already exists"), "{err}");
     assert_eq!(std::fs::read(&lite).unwrap(), b"someone else's work");
@@ -615,7 +615,7 @@ fn the_gate_stops_and_routes_to_heal_when_the_mirror_is_ahead() {
     let db = seed(&dir, 4, 1);
     let snap = run_snapshot(&db, TENANT, None).unwrap();
     let lite = dir.join("aberp.sqlite");
-    migrate_ledger(&db, &lite, TENANT, &snap, LedgerSource::Table).unwrap();
+    migrate_families(&db, &lite, TENANT, &snap, LedgerSource::Table).unwrap();
 
     // Append one more mirror line than the table has, by hand: the mirror's
     // last record, re-emitted with the next seq.
@@ -647,7 +647,7 @@ fn the_gate_hard_stops_with_no_heal_when_the_table_is_ahead_of_the_mirror() {
     let db = seed(&dir, 4, 1);
     let snap = run_snapshot(&db, TENANT, None).unwrap();
     let lite = dir.join("aberp.sqlite");
-    migrate_ledger(&db, &lite, TENANT, &snap, LedgerSource::Table).unwrap();
+    migrate_families(&db, &lite, TENANT, &snap, LedgerSource::Table).unwrap();
 
     // Drop the mirror's last line.
     let mirror = aberp_audit_ledger::mirror_path_for(&db);

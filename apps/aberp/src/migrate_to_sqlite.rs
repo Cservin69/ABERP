@@ -172,6 +172,10 @@ pub struct MigrateOutcome {
     pub sqlite_path: PathBuf,
     pub entries_carried: u64,
     pub anchors_carried: u64,
+    /// ADR-0108 Step 5 — what the invoice family carried. All zeros when the
+    /// source is a ledger-only database (a legitimate shape; the gate holds the
+    /// two sides to it symmetrically).
+    pub billing: crate::migrate_billing::BillingCarry,
     /// SHA-256 of the DuckDB file, taken after the run. C-I says this must
     /// equal the digest taken before it (T-19 arm 2).
     pub duckdb_sha256_after: String,
@@ -183,7 +187,7 @@ pub struct MigrateOutcome {
 /// CLI face. Always [`LedgerSource::Table`] — the rejected mode has no
 /// operator-reachable path.
 pub fn run(args: &MigrateToSqliteArgs) -> Result<()> {
-    let out = migrate_ledger(
+    let out = migrate_families(
         &args.db,
         &args.to,
         &args.tenant,
@@ -195,6 +199,12 @@ pub fn run(args: &MigrateToSqliteArgs) -> Result<()> {
         out.sqlite_path.display(),
         out.entries_carried,
         out.anchors_carried
+    );
+    let b = out.billing;
+    println!(
+        "  invoice family: {} invoices, {} lines, {} reservations, {} sequence bucket(s), \
+         {} series",
+        b.invoices, b.invoice_lines, b.reservations, b.sequence_state, b.series
     );
     println!(
         "  DuckDB SHA-256 after the run: {} (C-I: must equal the pre-migration manifest's)",
@@ -209,10 +219,14 @@ pub fn run(args: &MigrateToSqliteArgs) -> Result<()> {
     Ok(())
 }
 
-/// Carry `audit_ledger` + `audit_ledger_anchors` from a **read-only** DuckDB
-/// into a fresh SQLite file. See the module docs for the four preconditions and
-/// the ledger inversion.
-pub fn migrate_ledger(
+/// Carry the fused transactional core from a **read-only** DuckDB into a fresh
+/// SQLite file: `audit_ledger` + `audit_ledger_anchors` (Step 4), and — when
+/// the source has it — the invoice family (Step 5, [`crate::migrate_billing`]).
+///
+/// See the module docs for the four preconditions and the ledger inversion.
+/// Both families cross under the same held writer lock and inside the same
+/// digest window, so C-I is measured once across the whole run.
+pub fn migrate_families(
     duckdb_path: &Path,
     sqlite_path: &Path,
     tenant: &str,
@@ -331,6 +345,22 @@ pub fn migrate_ledger(
         )?;
     }
     tx.commit()?;
+
+    // --- ADR-0108 Step 5 — the invoice family, same lock, same digest window.
+    //
+    // Conditional on the source HAVING the family, because a ledger-only
+    // database is a legitimate shape (Step 4's fixtures are exactly that). It
+    // is not a fail-open: `reconcile_billing` holds the two sides to the
+    // presence answer symmetrically, so "carried nothing because the tables
+    // were not there" and "carried nothing because the carry was skipped" are
+    // distinguishable at the gate.
+    let billing = if crate::migrate_billing::family_present_duckdb(&src)? {
+        crate::migrate_billing::ensure_billing_schema(&dst)?;
+        crate::migrate_billing::carry_billing(&src, &mut dst)?
+    } else {
+        crate::migrate_billing::BillingCarry::default()
+    };
+
     drop(dst);
     drop(src);
 
@@ -347,6 +377,7 @@ pub fn migrate_ledger(
         sqlite_path: sqlite_path.to_path_buf(),
         entries_carried: rows.len() as u64,
         anchors_carried: anchors.len() as u64,
+        billing,
         duckdb_sha256_after: after,
     })
 }
@@ -682,6 +713,12 @@ pub fn reconcile(duckdb_path: &Path, sqlite_path: &Path, tenant: &str) -> Result
     }
 
     classify_mirror(duckdb_path, duck_head.0, &mut r)?;
+
+    // ---- ADR-0108 Step 5 — the invoice family's arm ----
+    // Same two connections, so the same B4 guarantee holds: every number is
+    // re-derived from disk by the gate, none of them by the migrator.
+    crate::migrate_billing::reconcile_billing(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
+
     Ok(r)
 }
 

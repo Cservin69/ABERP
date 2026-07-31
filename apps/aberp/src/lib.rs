@@ -90,6 +90,11 @@ pub mod mes_boot;
 pub mod margin_profiles;
 pub mod mes_adapters_config;
 pub mod mes_manager;
+/// ADR-0108 Step 5 — the invoice family's STRICT DDL, its typed carry, and the
+/// reconciliation gate's arm for it. Same feature gate as the Step-4 migrator
+/// it plugs into.
+#[cfg(feature = "sqlite-engine")]
+pub mod migrate_billing;
 /// ADR-0108 Step 4 — the migrator + the reconciliation gate. Behind the
 /// default-OFF `sqlite-engine` feature: this is the ONE binary that links both
 /// engines, because it reads DuckDB and writes SQLite.
