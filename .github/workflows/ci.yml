@@ -38,7 +38,22 @@ jobs:
   check:
     name: build + lint + supply-chain
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 2026-07-31: raised 45 -> 70. MEASURED, not guessed. At `ae925a7` this job
+    # reached `cargo-audit` at 42m09s — three minutes of headroom under a 45m
+    # ceiling, on a job whose sqlite-engine arm alone costs 21m. The two
+    # test binaries the R-1/R-3 pins add (`adr0108_no_ddl_on_read_handle`,
+    # `adr0108_t21_nested_read_in_write`) cost ~2m in `Test` and are compiled
+    # AGAIN in the sqlite-engine arm, which consumed the remaining headroom: the
+    # next run was CANCELLED at 45:00 inside that arm, with `cargo-deny` and
+    # `cargo-audit` never reached.
+    #
+    # A cancelled gate proves nothing — it is indistinguishable from a pass and
+    # from a failure, which is the exact lesson cut-gate.yml's own timeout
+    # comment records. Raising the ceiling is the honest fix: the job's work
+    # genuinely grew, and trimming pins to fit a number is how a suite loses
+    # teeth. 70m leaves room for the next few additions while still catching a
+    # hung job in one coffee break rather than six hours.
+    timeout-minutes: 70
 
     steps:
       - name: Checkout
@@ -167,9 +182,15 @@ jobs:
         # with a 25-minute budget the probe suites already largely consume — it
         # was CANCELLED at exactly 25:00, and a cancelled gate proves nothing
         # (the same lesson that job's own timeout comment records). This job
-        # already holds a warm `Swatinem/rust-cache` and ran in 23 of its 45
-        # minutes, so the incremental cost is `libsqlite3-sys` plus a
-        # two-crate rebuild rather than a cold amalgamation build.
+        # already holds a warm `Swatinem/rust-cache`, so the incremental cost is
+        # `libsqlite3-sys` plus a two-crate rebuild rather than a cold
+        # amalgamation build.
+        #
+        # CORRECTED 2026-07-31: this comment used to say the job "ran in 23 of
+        # its 45 minutes". Measured, this arm alone costs ~21m and the whole job
+        # reached `cargo-audit` at 42m09s — three minutes of headroom, not
+        # twenty-two. The job's `timeout-minutes` is now 70; see the note on the
+        # job itself. Do not re-derive a budget from a stale comment.
         #
         # Scope is `-p aberp -p aberp-db` deliberately: the feature is a
         # pass-through to `aberp-db`, and those two crates are the only ones
