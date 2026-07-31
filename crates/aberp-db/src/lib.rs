@@ -359,6 +359,36 @@ impl Handle {
     /// instance would not replay the live writer's WAL, so post-commit
     /// (WAL-only) writes would be invisible to it; a `try_clone` of the shared
     /// instance is coherent.
+    ///
+    /// # ADR-0108 R-3 — the SQLite arm KEEPS `lock_recovering()`. Binding.
+    ///
+    /// Under `sqlite-engine` there is no shared instance to `try_clone`, so the
+    /// final step becomes a real open. Steps 1–3 below are a **free choice**,
+    /// and this is the record of it (read-fork audit 2026-07-31, finding R-3 —
+    /// T-21 was unwritable until the choice existed):
+    ///
+    /// **The SQLite arm takes the writer mutex via [`Self::lock_recovering`],
+    /// exactly as the DuckDB arm does.** Consequences, all intended:
+    ///
+    /// * A nested `read()`-inside-`write()` resolves against the **Rust**
+    ///   `std::sync::Mutex` — it panics on the tripwire in debug and deadlocks
+    ///   on the mutex in release. It **never reaches SQLite**, so `busy_timeout`
+    ///   is never involved and cannot downgrade rule 13's loud self-deadlock
+    ///   into a silent 5-second hang. Same shape as today: not a regression.
+    /// * Poison recovery keeps parity across engines — a reader is not bricked
+    ///   by another holder's panic on one engine and recovered on the other.
+    /// * [`Self::assert_not_reentrant`] stays load-bearing rather than becoming
+    ///   decoration, and "single-writer" (§2.4) keeps its meaning.
+    ///
+    /// The rejected alternative — open a fresh SQLite connection without the
+    /// mutex, so reads do not queue behind the writer — makes the nested case
+    /// *legal*, deletes the tripwire's premise, and would require a loud abort
+    /// to be deliberately re-added. It also trades a deterministic, immediately
+    /// visible failure for a timing-dependent one. If a future session wants the
+    /// read concurrency, that is a reopening of R-3 with its own measurement,
+    /// not an implementation detail of Step 5.
+    ///
+    /// Pinned by `crates/aberp-db/tests/adr0108_t21_nested_read_in_write.rs`.
     pub fn read(&self) -> Result<Connection, DbError> {
         // Re-entrancy tripwire (ADR-0099 H3): `read()` locks the SAME writer mutex
         // to `try_clone`, so a read issued while this thread holds the write guard

@@ -197,6 +197,15 @@ identical — rule 12's "should this exist at all" says no.
 - **Single-writer.** The writer `Mutex` stays. It stops being a correctness
   requirement and becomes a throughput choice, and it is still what makes the
   `BEGIN IMMEDIATE` discipline (M5) cheap to reason about in-process.
+  **R-3 (2026-07-31), binding:** `Handle::read()`'s SQLite arm **also** takes
+  that mutex (`lock_recovering()`), exactly as the DuckDB arm does — so a nested
+  `read()`-inside-`write()` resolves against the Rust mutex and never reaches
+  SQLite's busy handler, poison-recovery keeps engine parity, and the
+  re-entrancy tripwire stays load-bearing. Recorded on `Handle::read()`'s
+  doc-comment and pinned by T-21. **R-1 (2026-07-31):** "single-writer" was
+  *already* not quite true before this migration — three read paths ran DDL
+  through `read()`, escaping the mutex. Fixed; pinned tree-wide by
+  `apps/aberp/tests/adr0108_no_ddl_on_read_handle.rs`.
 - **`db_writer_lock` (F-E).** Unchanged, and per §1.1 G-7 it already spans both
   engines. **Not retired.** Its doc comment is re-scoped from "corruption guard" to
   "app-invariant guard" (M6) in Step 1.
@@ -1112,6 +1121,29 @@ that is ADR-0107's own "stop here having spent little" exit.
 > loudness removed. The number *is* the observability of the worst case, which is
 > why it is chosen here and not in Step 2 in isolation.
 >
+> > **CORRECTED 2026-07-31 by finding R-3 (read-fork audit). The paragraph above
+> > has an unexamined step, and the Q10↔Q11 coupling it asserts does not exist.**
+> > `Handle::read()` does not simply hand out a connection: it runs the debug
+> > re-entrancy tripwire, takes the writer `Mutex` via `lock_recovering()`, calls
+> > `ensure_open()`, and only then `try_clone`s. Under `sqlite-engine` only the
+> > last step changes. Whether the SQLite arm keeps the mutex was a **free choice
+> > nobody had made** — and T-21 was unwritable until it was made, because one arm
+> > makes the described race impossible and the other leaves no abort to assert.
+> >
+> > **The choice, now made and binding: the SQLite arm KEEPS `lock_recovering()`**
+> > (recorded on `Handle::read()`'s doc-comment, `crates/aberp-db/src/lib.rs`). A
+> > nested `read()`-inside-`write()` therefore resolves against the **Rust** mutex
+> > — panicking on the tripwire in debug, deadlocking on the mutex in release —
+> > and **never reaches SQLite**. `busy_timeout` is never involved and cannot
+> > downgrade rule 13's loud self-deadlock into a silent timed hang. The failure
+> > mode is unchanged from today: not a regression.
+> >
+> > Rejected: opening a fresh SQLite connection without the mutex. It makes the
+> > nested case *legal*, deletes the tripwire's premise, requires a loud abort to
+> > be deliberately re-added, and trades a deterministic failure for a
+> > timing-dependent one. Reopening it needs its own measurement, not a Step-5
+> > implementation detail.
+>
 > **Scope — exhaustive, and the denominator is stated so completeness is
 > checkable.** The 84 `Handle` sites split **50 `read()` / 34 `write()`**
 > (§1.2). The audit classifies **all 50 `read()` sites**, with the 34 `write()`
@@ -1134,16 +1166,30 @@ that is ADR-0107's own "stop here having spent little" exit.
 >   of asserted. Its in-transaction twin asserts the *opposite*: B inside `BEGIN`
 >   must **not** see the commit — so the test encodes the real semantics, not the
 >   convenient half.
-> - **T-21** — a nested `read()`-inside-`write()` **aborts loudly** rather than
->   waiting out `busy_timeout`. The loud abort is the point: rule 13's
->   self-deadlock is a *feature* of DuckDB's behaviour here, and a finite timeout
->   would silently downgrade it to a slow request.
+> - **T-21** *(rewritten 2026-07-31, R-3 — the original wording was unwritable;
+>   see the correction above)* — a nested `read()`-inside-`write()` **never
+>   reaches the storage engine**: it resolves against the Rust writer `Mutex`,
+>   panicking on the re-entrancy tripwire in debug and deadlocking on the mutex
+>   in release, so `busy_timeout` is never involved. Two arms, because a
+>   behavioural pin alone cannot see the decision reversed — `assert_not_reentrant`
+>   panics *before* the lock, so a SQLite arm that dropped `lock_recovering()`
+>   while keeping the tripwire would stay green with the invariant gone. The
+>   **structural** arm asserts `Handle::read()` still calls `lock_recovering()`
+>   and that no engine-gated arm returns before it. Landed:
+>   `crates/aberp-db/tests/adr0108_t21_nested_read_in_write.rs`, mutation-verified,
+>   green under the default build and `--features sqlite-engine`.
 > - **T-3d** (M7) asserts the chosen `busy_timeout` value is actually set.
 >
 > **The number, chosen conservatively and marked.** `busy_timeout = 5000 ms`,
 > **on the explicit condition that T-21 lands first** — with the nested case
-> aborting loudly, the timeout is only ever a backpressure knob for genuine
-> cross-process contention, never the thing that hides a deadlock. 5 s is long
+> resolving against the Rust mutex, the timeout is only ever a backpressure knob
+> for genuine cross-process contention, never the thing that hides a deadlock.
+> *(R-3: the condition is now satisfied — T-21 has landed in the R-3 shape. The
+> audit also measured that on the READ surface `busy_timeout` is close to
+> irrelevant: a WAL reader with a 0 ms timeout still succeeds against a live
+> `IMMEDIATE` writer, and a snapshot conflict returns `SQLITE_BUSY_SNAPSHOT`
+> immediately without invoking the busy handler at all. 5000 ms is a **write**-
+> contention ceiling, not a read knob.)* 5 s is long
 > enough that a checkpoint or a slow invoice write does not produce a spurious
 > `SQLITE_BUSY` on the NAV path, and short enough that a UI request fails visibly
 > rather than appearing to hang. Step 2 measures the real p99 write-hold under the
@@ -1276,7 +1322,7 @@ a pin (ADR-0107 §4.1, extended to security by PR #49).
 | **T-18** | **The tamper-evidence gate catches its own blocker** (B1). Run the migrator in the **rejected** mirror-as-source mode against a copy of the DEV DB; assert the reconciliation gate goes **red** on the non-NULL `event_sig` count and on the `audit_ledger_anchors` count. Also assert that `verify_chain`, `verify_chain_signed`, `PRAGMA integrity_check` and the head-hash equality all still pass on that same gutted output — **the point of the test is that four green checks and one red one is the true picture**, and that removing the two count checks makes the whole gate green on a signature-stripped ledger. | B1, §6.3 |
 | **T-19** | **The read-only DuckDB open** (B4, new capability — zero such opens exist today). Open `aberp.duckdb` read-only, attempt a write, assert the error; and assert the file's SHA-256 is byte-unchanged across a full migrator run against a copy. This is the single mechanism behind C-I. | B4, C-I, Step 4 |
 | **T-20** | **The WAL snapshot claim, pinned in both directions** (F7/Q10). Commit on connection A → read on a **pre-existing** connection B **in autocommit** → B sees it. Twin: B inside an explicit `BEGIN` → B does **not** see it. §2.4 asserted the first and never mentioned the second. | F7, Q10, §2.4 |
-| **T-21** | **Nested `read()`-inside-`write()` aborts loudly** rather than waiting out `busy_timeout` (F7/Q11). Rule 13's self-deadlock is the desired behaviour; a finite timeout must not downgrade it to a slow request. T-21 landing is the stated precondition for the 5000 ms `busy_timeout`. | F7, Q11, rule 13 |
+| **T-21** | **Nested `read()`-inside-`write()` NEVER REACHES THE ENGINE** (F7/Q11). *Rewritten 2026-07-31 by finding R-3 — the original "aborts loudly rather than waiting out `busy_timeout`" described a race that cannot occur, and was unwritable until the SQLite arm's mutex choice was made.* Per R-3 the SQLite arm **keeps `lock_recovering()`**, so the nested case resolves against the Rust `Mutex`: tripwire panic in debug, mutex deadlock in release, `busy_timeout` never involved. Two arms — behavioural (`#[should_panic]`, `debug_assertions`-gated) **and structural** (`Handle::read()` still calls `lock_recovering()`, with no engine-gated arm returning before it), because the tripwire panics *before* the lock and would mask the decision being reversed. **LANDED** — `crates/aberp-db/tests/adr0108_t21_nested_read_in_write.rs`. | F7, Q11, rule 13, R-3 |
 
 **On the existing gates.** ADR-0107 §4.1 Phase 2 says census entries and fork-gate
 baselines are *deleted* as each family crosses. **This plan does not delete them.**
@@ -1328,7 +1374,7 @@ result — Q2, Q5, Q7 and Q10.
 | **Q8** | Drop quoting job history rather than write an `f64 → Decimal` converter (§6.3) | **Closed — drop.** Correct for a disposable DEV DB; **wrong for prod**, and §11.1 carries that forward explicitly rather than inheriting it silently. | §6.3, §11.1 |
 | **Q9** | Keep the census / fork gates frozen instead of deleting per family (§8) | **Closed — keep, and the divergence from ADR-0107 §4.1 is the better call.** A gate deleted is a gate that cannot protect the state you roll back to. Under a rollback-only constraint that is a requirement, not a preference, and rule 12's objection to dead machinery does not reach machinery guarding a live rollback target. | §8 |
 | **Q10** | Is `read()` returning a real second connection a behaviour change anywhere? (§2.4) | **Was the plan's weakest claim; now audited, not assumed.** "Strictly sees more" is false inside an explicit transaction. Step 3 classifies **all 50 `read()` sites** on two axes, gates Step 5, and pins the WAL snapshot claim in **both** directions (T-20) plus the nesting abort (T-21). This is the class behind five of July's incidents. | Step 3, T-20/T-21 |
-| **Q11** | `busy_timeout` value (M7 said "explicit and finite", no number) | **Closed — 5000 ms, conditional on T-21 landing first,** revisable downward on Step 2's measurement. Decided together with Q10 because the number *is* the observability of Q10's worst case: without T-21's loud abort, a finite timeout turns rule 13's self-deadlock into a silent hang. | Step 3, M7, T-3d |
+| **Q11** | `busy_timeout` value (M7 said "explicit and finite", no number) | **Closed — 5000 ms; the T-21 condition is now SATISFIED** (T-21 landed 2026-07-31 in the R-3 shape). Revisable downward on Step 2's measurement. *R-3 correction: the stated Q10↔Q11 coupling does not exist — because the SQLite arm keeps `lock_recovering()`, a nested `read()` never reaches SQLite, so no finite timeout could ever have hidden that deadlock. 5000 ms is a **write**-contention ceiling (two `BEGIN IMMEDIATE` writers; a checkpointer behind a long reader), measured to be near-irrelevant on the read surface.* | Step 3, M7, T-3d, R-3 |
 
 ---
 
