@@ -207,16 +207,3 @@ jobs:
         # account and tax number) were untracked AND unignored before PR #51.
         # The pin has to run somewhere or the coverage can regress silently.
         run: bash run/tests/gitignore_migration_artefacts_test.sh
-
-      - name: ADR-0108 sqlite-engine arm — build + test
-        # S449 — WITHOUT this, the entire B1 tamper-evidence guarantee is
-        # untested in CI. `apps/aberp/src/migrate_to_sqlite.rs` and its 14-test
-        # `adr0108_migrator.rs` (T-18, T-19, the four count equalities, the
-        # zero-coverage preconditions) are all `#[cfg(feature =
-        # "sqlite-engine")]`, and so are the two-connection arms of
-        # `crates/aberp-db/tests/adr0108_seam.rs`. A default-features `cargo
-        # test` compiles none of it. The feature stays default-OFF; this job
-        # exists so the code behind it is not unverified.
-        run: |
-          cargo clippy -p aberp -p aberp-db --features sqlite-engine --all-targets --locked -- -D warnings
-          cargo test -p aberp -p aberp-db --features sqlite-engine --locked

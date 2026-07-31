@@ -153,6 +153,34 @@ jobs:
       - name: Clippy (warnings denied per ADR-0007 fail-loud posture)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: ADR-0108 sqlite-engine arm — clippy + test
+        # S449 — WITHOUT this the entire B1 tamper-evidence guarantee is
+        # unverified in CI. `apps/aberp/src/migrate_to_sqlite.rs` and all 14
+        # tests in `adr0108_migrator.rs` (T-18, T-19, the four count
+        # equalities, the zero-coverage preconditions) are
+        # `#[cfg(feature = "sqlite-engine")]`, as are the two-connection arms of
+        # `crates/aberp-db/tests/adr0108_seam.rs`. Every step above runs default
+        # features and compiles NONE of it.
+        #
+        # It lives HERE rather than in cut-gate.yml on purpose. The first
+        # attempt appended it to the opener-census job, which is a grep-gate job
+        # with a 25-minute budget the probe suites already largely consume — it
+        # was CANCELLED at exactly 25:00, and a cancelled gate proves nothing
+        # (the same lesson that job's own timeout comment records). This job
+        # already holds a warm `Swatinem/rust-cache` and ran in 23 of its 45
+        # minutes, so the incremental cost is `libsqlite3-sys` plus a
+        # two-crate rebuild rather than a cold amalgamation build.
+        #
+        # Scope is `-p aberp -p aberp-db` deliberately: the feature is a
+        # pass-through to `aberp-db`, and those two crates are the only ones
+        # that change under it. A `--workspace` build would drag `aberp-ui` and
+        # the whole Tauri runtime through a second full compile for nothing.
+        # The feature stays default-OFF; this step exists so the code behind it
+        # is not unverified.
+        run: |
+          cargo clippy -p aberp -p aberp-db --features sqlite-engine --all-targets --locked -- -D warnings
+          cargo test -p aberp -p aberp-db --features sqlite-engine --locked
+
       - name: Install cargo-deny and cargo-audit
         uses: taiki-e/install-action@v2
         with:
