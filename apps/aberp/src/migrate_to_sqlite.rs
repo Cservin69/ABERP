@@ -2,10 +2,16 @@
 //! abort point.
 //!
 //! This is where the exercise either proves out or stops having cost four
-//! scaffolding PRs. It carries the **ledger family only** — `audit_ledger` and
-//! `audit_ledger_anchors` — from a read-only DuckDB into a fresh
-//! `aberp.sqlite`, and then a **separate invocation** re-derives every number
-//! from both sides and compares.
+//! scaffolding PRs. It carries `audit_ledger` and `audit_ledger_anchors` from
+//! a read-only DuckDB into a fresh `aberp.sqlite`, and then a **separate
+//! invocation** re-derives every number from both sides and compares.
+//!
+//! **Step 5 extends it, it does not replace it.** The invoice family's DDL,
+//! carry and reconciliation live in [`crate::migrate_billing`] and plug in
+//! here: [`migrate_families`] carries both families under the same held writer
+//! lock and inside the same C-I digest window, and [`reconcile`] runs the
+//! billing arm on the same two connections, so B4's "no number the gate
+//! compares was produced by the migrator" holds for both.
 //!
 //! # The four preconditions, all refusals, none of which waits
 //!
