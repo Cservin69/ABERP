@@ -711,3 +711,53 @@ fn verify_refuses_a_manifest_from_a_different_tenant() {
         .expect_err("a cross-tenant manifest must be refused");
     assert!(err.to_string().contains("tenant"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// S449 — the restore's crash window
+// ---------------------------------------------------------------------------
+
+/// **S449 — an interrupted restore must not verify GREEN.**
+///
+/// `restore_from_snapshot` stages and digest-verifies everything before
+/// anything moves, but the placement itself is a loop of per-file `rename`s and
+/// POSIX has no way to make two of them atomic. The dangerous half is silent:
+/// when the manifest recorded no `.wal` (today's state — the DEV DB is cleanly
+/// closed) the live WAL is moved aside BEFORE the loop, so a crash in between
+/// leaves the ORIGINAL main file with its committed-but-unfolded WAL removed.
+/// Re-running the rollback then finds a main file that matches the manifest,
+/// no WAL to object to, and every count intact.
+///
+/// The marker cannot make the renames atomic; it makes that state NAMED, so the
+/// verification refuses instead of printing PASS over silently-lost committed
+/// data (CLAUDE.md rule 11).
+///
+/// Mutation-verify: delete the marker block from
+/// `verify_against_manifest_locked` and this goes red.
+#[test]
+fn s449_a_half_finished_restore_is_refused_by_the_verification() {
+    let dir = scratch("half-restore");
+    let db = seed_db(&dir, 5, 2);
+    let snap = run_snapshot(&db, "test", None).unwrap();
+    let manifest = snap.join(aberp::premigration::MANIFEST_FILENAME);
+
+    // The clean state verifies — otherwise the refusal below proves nothing.
+    let ok = aberp::premigration::run_verify(&db, "test", &manifest).unwrap();
+    assert!(ok.mismatches.is_empty(), "{:?}", ok.mismatches);
+
+    // Exactly what a killed restore leaves behind.
+    std::fs::write(
+        db.parent()
+            .unwrap()
+            .join(aberp::premigration::RESTORE_IN_PROGRESS_MARKER),
+        b"interrupted",
+    )
+    .unwrap();
+
+    let err = aberp::premigration::run_verify(&db, "test", &manifest)
+        .expect_err("a half-placed artefact set must not be reported as verified");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("did not finish") && msg.contains("pre-restore"),
+        "the refusal must name the state AND the recovery source: {msg}"
+    );
+}

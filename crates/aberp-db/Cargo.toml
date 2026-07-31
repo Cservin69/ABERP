@@ -59,3 +59,13 @@ rusqlite = { workspace = true }
 # values. Without a real decimal type the comparison would be against another
 # string compare, which proves nothing.
 rust_decimal = { workspace = true }
+
+# S449 — restored. PR #51 deleted this block while appending the two
+# dev-dependencies above, which made `aberp-db` the ONLY workspace member
+# without the shared lint configuration — and it is the crate that now carries
+# every line of new SQLite code. The workspace `[lints]` are `allow`s for this
+# tree's doc-comment prose, so dropping them makes `clippy -D warnings` fire on
+# `aberp-db` alone for a reason that has nothing to do with the code: a gate
+# that goes red on prose is a gate people learn to skip (CLAUDE.md rule 10).
+[lints]
+workspace = true

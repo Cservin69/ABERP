@@ -388,8 +388,48 @@ pub fn run_reconcile(args: &MigrateReconcileArgs) -> Result<()> {
 /// Re-open both databases independently and compare.
 pub fn reconcile(duckdb_path: &Path, sqlite_path: &Path, tenant: &str) -> Result<ReconcileReport> {
     crate::premigration::ensure_dev_only(duckdb_path)?;
+    // S449 — the target path was unguarded. `open_hardened` CREATES the file it
+    // is given, so a typo'd `--sqlite` under `~/.aberp/` would have written a
+    // fresh database into the production root before the first query failed.
+    // C-II is "nothing in ADR-0108 §7 may read, write, or stat production
+    // data", and the gate is the one command an operator runs by hand.
+    crate::premigration::ensure_dev_only(sqlite_path)?;
+    let prod_root = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".aberp"));
+    aberp_db::engine_path::engine_path_agrees(
+        aberp_db::engine_path::Engine::DuckDb,
+        duckdb_path,
+        prod_root.as_deref(),
+    )
+    .map_err(|e| anyhow!("source: {e}"))?;
+    aberp_db::engine_path::engine_path_agrees(
+        aberp_db::engine_path::Engine::Sqlite,
+        sqlite_path,
+        prod_root.as_deref(),
+    )
+    .map_err(|e| anyhow!("target: {e}"))?;
+
     let _writer_lock =
         crate::db_writer_lock::acquire_or_refuse(duckdb_path, tenant, "aberp migrate-reconcile")?;
+
+    // S449 (B4) — the precondition every OTHER DuckDB-reading entry point in
+    // this plan carries, and the only one that was missing it.
+    // `run_snapshot`, `verify_against_manifest_locked` and `migrate_ledger` all
+    // refuse on an unfolded WAL; the gate did not. The writer lock stops a
+    // CONCURRENT writer, not a previously CRASHED one — so a DuckDB build that
+    // wrote rows and died between the migrate and the gate leaves a WAL the
+    // read-only open cannot replay, and the gate would compare the full SQLite
+    // side against a SHORT DuckDB extraction. If those hidden rows are the ones
+    // the migrator already carried, every equality above matches and the gate
+    // reports PASS on a DuckDB file that is ahead of what was migrated.
+    if let Some(len) = aberp_db::readonly::unfolded_wal_len(duckdb_path)? {
+        bail!(
+            "refusing to reconcile: {} holds an unfolded WAL of {len} bytes. A read-only open \
+             cannot replay it, so every count below would be taken from a SHORT extraction and \
+             an equality against it would be meaningless. Boot the DuckDB build once for a \
+             clean shutdown, then re-run the gate.",
+            aberp_db::readonly::wal_path_for(duckdb_path).display()
+        );
+    }
 
     let src = aberp_db::readonly::open_read_only(duckdb_path)?;
     let dst = aberp_db::sqlite::open_hardened(sqlite_path)?;
@@ -429,6 +469,35 @@ pub fn reconcile(duckdb_path: &Path, sqlite_path: &Path, tenant: &str) -> Result
             x.get(0)
         })?;
 
+    // S449 — the OTHER TWO signature columns. `event_sig` alone is not the
+    // tamper-evidence: a signature is only checkable against the public key
+    // that made it, so a carry that keeps every `event_sig` and nulls
+    // `session_pubkey` leaves a ledger whose signatures can never be verified
+    // again — and the two equalities above are BLIND to it (both sides still
+    // count the same non-NULL `event_sig`s, the anchor counts still match, the
+    // `typeof` sweep only looks at non-NULL values, and `compute_entry_hash`
+    // excludes all three columns so the chain walk and the head hash are
+    // unmoved). The mirror-replay strip nulls all three at once, which is why
+    // the `event_sig` arm caught it and this gap did not show up in T-18.
+    //
+    // Steps 5-9 add more paths into this file than the two `LedgerSource` arms,
+    // so the gate is per-COLUMN or it is nothing — the same lesson §3.4 draws
+    // for the Q2 sweep.
+    let mut extra: Vec<(&str, i64, i64)> = Vec::new();
+    for col in ["session_id", "session_pubkey"] {
+        let d: i64 = src.query_row(
+            &format!("SELECT count(*) FROM audit_ledger WHERE {col} IS NOT NULL"),
+            [],
+            |x| x.get(0),
+        )?;
+        let l: i64 = dst.query_row(
+            &format!("SELECT count(*) FROM audit_ledger WHERE {col} IS NOT NULL"),
+            [],
+            |x| x.get(0),
+        )?;
+        extra.push((col, d, l));
+    }
+
     if duck_signed == 0 {
         r.hard_stops.push(
             "the DuckDB side has 0 audit_ledger rows with a non-NULL event_sig — there is no \
@@ -456,6 +525,23 @@ pub fn reconcile(duckdb_path: &Path, sqlite_path: &Path, tenant: &str) -> Result
         lite_anchors.to_string(),
         &mut r,
     );
+    // S449 — same shape, same non-zero precondition, for the two columns that
+    // make an `event_sig` checkable.
+    for (col, d, l) in &extra {
+        if *d == 0 {
+            r.hard_stops.push(format!(
+                "the DuckDB side has 0 audit_ledger rows with a non-NULL {col} — an \
+                 `event_sig` without its {col} can never be verified again, so an equality \
+                 here would be between two zeros (ADR-0108 B1)"
+            ));
+        }
+        eq(
+            &format!("audit_ledger rows with a non-NULL {col} (B1)"),
+            d.to_string(),
+            l.to_string(),
+            &mut r,
+        );
+    }
 
     // ---- row counts + head hash ----
     let duck_rows: i64 = src.query_row("SELECT count(*) FROM audit_ledger", [], |x| x.get(0))?;

@@ -100,6 +100,20 @@ pub enum EngineMismatch {
         expected: &'static str,
     },
 
+    /// **S449.** The path is URI-shaped, so the engine and every path-based
+    /// guard would disagree about which file it names.
+    #[error(
+        "URI-shaped DB path: `{path}` begins with a `file:` scheme. The bundled SQLite is \
+         compiled with `-DSQLITE_USE_URI` (libsqlite3-sys build.rs:140), so it parses such a \
+         name as a URI and opens the ABSOLUTE path inside it — while `Path` reads the same \
+         string as a RELATIVE path and every guard here, including the production-root check, \
+         clears it on that reading. Pass a plain filesystem path (ADR-0108 C-II)"
+    )]
+    UriShapedPath {
+        /// The URI-shaped path that was refused.
+        path: PathBuf,
+    },
+
     /// C-II. A `sqlite-engine` build resolved a path under the production root.
     #[error(
         "DEV-only violation: this is a `sqlite` build but the resolved DB path `{path}` \
@@ -134,6 +148,30 @@ pub fn engine_path_agrees(
     path: &Path,
     prod_root: Option<&Path>,
 ) -> Result<(), EngineMismatch> {
+    // S449 — the URI arm, FIRST, because it is the one that makes the two arms
+    // below unsound rather than merely incomplete. Both of them, and
+    // `premigration::ensure_dev_only`, decide from the string read as a
+    // `Path`. The bundled SQLite reads a leading `file:` as a URI scheme and
+    // opens the absolute path that follows, so for exactly these strings the
+    // guards and the opener are talking about different files —
+    // `file:/Users/x/.aberp/prod/aberp.sqlite` is a RELATIVE path to `Path`
+    // (first component `file:`), clears the production-root check, carries the
+    // extension `sqlite`, and opens production.
+    //
+    // Refused rather than normalised: rewriting a URI into the path it denotes
+    // would mean re-implementing SQLite's URI parser (query parameters, `%`
+    // escapes, `?vfs=`, authority) in a security guard, and being wrong there
+    // is the same failure with more code. Nothing in this tree passes a URI.
+    if path
+        .as_os_str()
+        .to_str()
+        .is_some_and(|s| s.starts_with("file:"))
+    {
+        return Err(EngineMismatch::UriShapedPath {
+            path: path.to_path_buf(),
+        });
+    }
+
     // C-I — extension agreement. `extension()` is None for `:memory:` and for
     // an extension-less path; both are refusals, not exemptions.
     let expected = engine.required_extension();
@@ -292,6 +330,51 @@ mod tests {
     fn unresolvable_prod_root_does_not_weaken_the_extension_arm() {
         engine_path_agrees(Engine::Sqlite, Path::new("/x/aberp.duckdb"), None)
             .expect_err("C-I holds regardless of whether the prod root is known");
+    }
+
+    /// **S449 — the URI arm.** The bypass this closes was measured, not
+    /// theorised: with the bundled amalgamation (`-DSQLITE_USE_URI`),
+    /// `open_hardened("file:<abs>/target.sqlite")` creates `<abs>/target.sqlite`
+    /// while every guard here clears the string as a harmless relative path
+    /// with the right extension. Both engines are refused: the DuckDB arm
+    /// matters because `serve` runs this on the default build too.
+    ///
+    /// Mutation-verify: delete the `starts_with("file:")` block in
+    /// [`engine_path_agrees`] and both halves below go red.
+    #[test]
+    fn a_uri_shaped_path_is_refused_before_any_other_arm() {
+        for engine in [Engine::Sqlite, Engine::DuckDb] {
+            let ext = engine.required_extension();
+            // Correct extension, NOT under the prod root as `Path` reads it —
+            // so C-I and C-II both clear it. Only the URI arm can catch this.
+            let p = format!("file:/Users/op/.aberp/prod/aberp.{ext}");
+            let err = engine_path_agrees(engine, Path::new(&p), Some(&prod_root()))
+                .expect_err("a URI-shaped path must be refused");
+            assert!(
+                matches!(err, EngineMismatch::UriShapedPath { .. }),
+                "expected the URI refusal for {engine}, got {err:?}"
+            );
+            // The premise, asserted rather than assumed: without the URI arm
+            // this exact string passes both other arms.
+            assert!(
+                Path::new(&p).is_relative() && !Path::new(&p).starts_with(prod_root()),
+                "the whole point is that C-II cannot see this path: {p}"
+            );
+        }
+    }
+
+    /// The URI arm must not swallow ordinary names that merely CONTAIN the
+    /// text. SQLite only parses a URI when the name *begins* with `file:`, so a
+    /// guard that refused more than that would reject legitimate paths and get
+    /// relaxed by the first person it inconveniences.
+    #[test]
+    fn a_path_that_merely_contains_file_colon_is_not_refused() {
+        engine_path_agrees(
+            Engine::Sqlite,
+            Path::new("/dev/apps/file:notauri/aberp.sqlite"),
+            Some(&prod_root()),
+        )
+        .expect("`file:` in a middle component is an ordinary directory name");
     }
 
     /// A sibling-named directory must not count as "under" the prod root:

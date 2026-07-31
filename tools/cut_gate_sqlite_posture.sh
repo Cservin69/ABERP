@@ -95,7 +95,12 @@ MANIFEST_COUNT="$(printf '%s\n' "$MANIFESTS" | wc -l | tr -d ' ')"
 MANIFEST_LINES="$(printf '%s\n' "$MANIFESTS" | tr '\n' '\0' | xargs -0 grep -n '' 2>/dev/null | grep -v ':[0-9]*:[[:space:]]*#' || true)"
 s1_fail=0
 for f in "${S1_BAD[@]}"; do
-  hits=$(printf '%s\n' "$MANIFEST_LINES" | grep "\"$f\"" || true)
+  # S449: the quote class is part of TOML's SYNTAX, not part of the feature
+  # NAME. `features = ['load_extension']` is valid TOML (a literal string) and
+  # cargo accepts it, so a gate that matches only `"load_extension"` is
+  # defeated by one keystroke. Mutation-verified in
+  # `cut_gate_sqlite_posture_probes.sh` probe P1. Match either quote.
+  hits=$(printf '%s\n' "$MANIFEST_LINES" | grep -E "[\"']${f}[\"']" || true)
   if [[ -n "$hits" ]]; then
     note "✗ FAIL (S1): forbidden rusqlite feature \"$f\" appears in a manifest:"
     printf '      %s\n' "$hits"
@@ -130,7 +135,15 @@ done
 
 # --- CHECK S3: no ATTACH in SQL ----------------------------------------------
 # Word-boundary match so `attachment` / `attached_pdf` do not trip it.
-attach_hits=$(printf '%s\n' "$SOURCE_STREAM" | grep -E '\bATTACH[[:space:]]+(DATABASE|'"'"')' | grep -v ':[0-9]*:[[:space:]]*//' || true)
+#
+# S449: `-i`. SQL keywords are CASE-INSENSITIVE — `attach database 'x' as y`
+# executes exactly like the upper-case form, and the case-sensitive pattern
+# waved it straight through (probe P2). The case in which a keyword is typed is
+# a style choice, so a gate keyed on it is keyed on style, not on shape.
+# Case-folding widens the false-positive surface to identifiers like
+# `attach database` in prose; the `\b` + `DATABASE|'` structure already carries
+# that, and comments are stripped below.
+attach_hits=$(printf '%s\n' "$SOURCE_STREAM" | grep -Ei '\bATTACH[[:space:]]+(DATABASE|'"'"')' | grep -v ':[0-9]*:[[:space:]]*//' || true)
 if [[ -n "$attach_hits" ]]; then
   note "✗ FAIL (S3): an ATTACH appears in SQL (M3 sets SQLITE_LIMIT_ATTACHED = 0):"
   printf '      %s\n' "$attach_hits"
@@ -154,8 +167,25 @@ SEAM="crates/aberp-db/src/sqlite.rs"
 # names `rusqlite::Error` in a `#[from]` variant while every `Connection::open`
 # in it is DuckDB's. That false positive is why the predicate is the import and
 # not the word.
+#
+# S449 — THE HOLE THIS CLOSES, and it is the one that matters most for Steps
+# 5-9. The predicate above only sees files that name `rusqlite`. But the whole
+# point of ADR-0108 §2.3's type seam is that NO file outside
+# `crates/aberp-db/src/engine.rs` ever names either engine crate again: from
+# Step 5 the tree writes `use aberp_db::engine::Connection`, and under
+# `--features sqlite-engine` that alias IS `rusqlite::Connection`. So a bare
+# `Connection::open(path)` in a migrated family is a bare rusqlite open that
+# this gate could not see — S4 would go structurally blind at exactly the step
+# it exists to police. Mutation-verified: probe P3 plants
+# `use crate::engine::Connection as EngineConn; EngineConn::open(p)` and the
+# pre-S449 gate reported "✓ S4" on it.
+#
+# The seam alias is therefore in scope too. That is not over-matching: a
+# migrated family must reach the DB through `aberp_db::Handle` (CLAUDE.md rule
+# 13), so a bare `engine::Connection::open` outside the seam is the defect
+# under BOTH engines, not only under SQLite.
 RUSQLITE_FILES=$(printf '%s\n' "$SOURCE_STREAM" \
-  | grep -E ':[0-9]+:[[:space:]]*(pub )?use rusqlite|:[0-9]+:.*rusqlite::Connection' \
+  | grep -E ':[0-9]+:[[:space:]]*(pub )?use rusqlite|:[0-9]+:.*rusqlite::Connection|:[0-9]+:[[:space:]]*(pub )?use (aberp_db|crate)::engine|:[0-9]+:.*(aberp_db|crate)::engine::Connection' \
   | cut -d: -f1 | sort -u || true)
 open_hits=""
 if [[ -n "$RUSQLITE_FILES" ]]; then

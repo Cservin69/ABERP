@@ -107,9 +107,23 @@ pub fn open_hardened(path: &Path) -> Result<Connection, DbError> {
     // table-level locking semantics in ways the single-writer discipline is not
     // written against, and rusqlite's default happening to omit it is not the
     // same as this tree requiring it omitted.
+    // S449 — `SQLITE_OPEN_URI` is deliberately ABSENT. Dropping it is worth
+    // doing (nothing here passes a URI; every caller passes a `&Path`) but be
+    // clear about what it does NOT achieve: **it does not turn URI filename
+    // parsing off.** `libsqlite3-sys` compiles the bundled amalgamation with
+    // `-DSQLITE_USE_URI` (`build.rs:140`), which enables URI interpretation
+    // globally, independent of this flag. Measured, not assumed — see
+    // `t2b_a_file_uri_is_treated_as_a_path_not_a_uri`, which was written as a
+    // fix for that and turned out to pin the hostile fact instead.
+    //
+    // The consequence is C-II's, not this function's: every guard upstream
+    // reads its argument as a PATH, and for a string beginning `file:` the
+    // guard and the engine name different files. That is refused at the guard
+    // layer (`engine_path::EngineMismatch::UriShapedPath` and
+    // `premigration::ensure_dev_only`), which is the only layer that can refuse
+    // it — by the time control reaches here there is nothing left to decide.
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
-        | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
 
@@ -515,5 +529,65 @@ mod tests {
         // float and not about the column being unwritable.
         conn.execute("INSERT INTO money VALUES (?)", [1234_i64])
             .unwrap();
+    }
+
+    /// **S449 / T-2b — the engine resolves `file:` URIs, so the GUARDS must
+    /// refuse them.**
+    ///
+    /// This test does not assert a fix; it pins the hostile fact the fix is
+    /// built on. `libsqlite3-sys` compiles the bundled amalgamation with
+    /// `-DSQLITE_USE_URI` (`build.rs:140`), which turns URI filename parsing on
+    /// **globally** — dropping the `SQLITE_OPEN_URI` open flag does not switch
+    /// it off, and the first attempt at this fix did exactly that and passed
+    /// vacuously.
+    ///
+    /// Why it matters: `premigration::ensure_dev_only` and
+    /// `engine_path::engine_path_agrees` both decide from the string read as a
+    /// `Path`. `file:/Users/x/.aberp/prod/aberp.sqlite` is RELATIVE to `Path`
+    /// (first component `file:`), so it is not under the production root, and
+    /// its extension really is `sqlite` — both guards cleared it, and this
+    /// function then opened production. That bypass is closed at the guard
+    /// layer (`EngineMismatch::UriShapedPath`), which is the only layer that
+    /// can close it, because the divergence is between two readings of the same
+    /// string rather than anything this function does with it.
+    ///
+    /// Note the argument must *begin* with `file:` — SQLite only parses a URI
+    /// in that position.
+    #[test]
+    fn t2b_a_file_uri_is_treated_as_a_path_not_a_uri() {
+        let scratch_db = scratch("uri");
+        let target = scratch_db.parent().unwrap().join("target.sqlite");
+        assert!(!target.exists());
+
+        // The exact bypass shape: a string that `Path` reads as a RELATIVE
+        // path (first component `file:`) and SQLite would read as a URI naming
+        // an absolute one. `premigration::ensure_dev_only` absolutises it
+        // against the CWD, so it is not under `~/.aberp` and passes; the
+        // extension is `sqlite`, so `engine_path_agrees` passes too.
+        let disguised = std::path::PathBuf::from(format!("file:{}", target.display()));
+        assert!(
+            disguised.is_relative(),
+            "the premise: every path-shaped guard upstream sees this as relative"
+        );
+
+        let opened = open_hardened(&disguised);
+        assert!(
+            target.is_file(),
+            "the premise of the guard-layer fix: this engine DOES resolve the URI and create \
+             {}. If this ever stops being true the refusals in `engine_path_agrees` and \
+             `premigration::ensure_dev_only` can be revisited — until then they are the only \
+             thing standing between a `file:` prefix and the production database.",
+            target.display()
+        );
+        // And note WHERE the failure lands, because it is the wrong place to
+        // rely on: `open_hardened` does return an error here, but only from
+        // `harden_permissions`, which chmods the LITERAL path and cannot find
+        // it. By then SQLite has already created the real file. An error after
+        // the write is not a guard.
+        assert!(
+            opened.is_err(),
+            "expected the permission step to fail on the literal name — if this changes, the \
+             comment above is stale, not the guard"
+        );
     }
 }

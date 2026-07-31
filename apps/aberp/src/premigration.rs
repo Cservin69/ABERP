@@ -133,6 +133,29 @@ pub struct PremigrationManifest {
 /// ordinary production operation; this *tool* has no business there either
 /// way).
 pub(crate) fn ensure_dev_only(db: &Path) -> Result<()> {
+    // S449 — a URI-shaped path defeats everything below it, so it is refused
+    // first. The absolutise-and-compare beneath reads the string as a `Path`;
+    // the bundled SQLite reads a leading `file:` as a URI scheme
+    // (`-DSQLITE_USE_URI`, libsqlite3-sys build.rs:140 — global, and NOT
+    // switched off by dropping the `SQLITE_OPEN_URI` open flag) and opens the
+    // absolute path inside it. So `file:$HOME/.aberp/prod/aberp.sqlite`
+    // absolutises to `<cwd>/file:/Users/…`, is not under the production root on
+    // that reading, and passes — while the opener writes into production.
+    // Refused, not normalised: re-implementing SQLite's URI parser inside a
+    // security guard is the same failure with more surface.
+    if db
+        .as_os_str()
+        .to_str()
+        .is_some_and(|s| s.starts_with("file:"))
+    {
+        bail!(
+            "URI-shaped path `{}`: the bundled SQLite parses a leading `file:` as a URI and \
+             opens the absolute path inside it, while this guard reads the same string as a \
+             relative path — so the two disagree about which file is being touched. Pass a \
+             plain filesystem path (ADR-0108 C-II)",
+            db.display()
+        );
+    }
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         // No HOME to compare against. Refuse rather than wave through: a tool
         // that touches the audit ledger does not get to fail open (rule 11).
@@ -573,13 +596,65 @@ pub fn restore_from_snapshot(snapshot_dir: &Path, db: &Path, preserve_dir: &Path
     }
 
     // --- the set moves ---
+    //
+    // S449 — THE CRASH WINDOW, and the marker that makes it survivable.
+    //
+    // The doc comment above says "the main file and its `.wal` move as one set.
+    // Never the main file alone." POSIX cannot deliver that: this is a loop of
+    // per-file `rename`s, and the artefact order puts the main file FIRST and
+    // its `.wal` second. Kill the process (or the machine) between those two
+    // renames and the result is exactly the pairing §6.2 calls the one failure
+    // in the plan with nothing behind it — a restored main file beside a
+    // foreign-generation WAL that DuckDB will replay over it on the next open.
+    //
+    // Worse is the other shape, because it is SILENT. When the manifest
+    // recorded no WAL (today's state — the DEV DB is cleanly closed) the live
+    // WAL is moved aside above, BEFORE the loop. A crash between those two
+    // steps leaves the ORIGINAL main file with its committed-but-unfolded WAL
+    // removed. Re-running `rollback_to_duckdb.sh` then finds a main file that
+    // still matches the manifest ("nothing to restore"), no WAL to object to,
+    // and every count intact — and prints PASS over a database that quietly
+    // lost committed data.
+    //
+    // A marker cannot make the moves atomic. It makes the incomplete state
+    // NAMED, so the next verification refuses instead of reporting PASS
+    // (CLAUDE.md rule 11). Recovery is `pre-restore/`, which
+    // `rollback_to_duckdb.sh` step 4 always populates first.
+    let marker = db_dir.join(RESTORE_IN_PROGRESS_MARKER);
+    std::fs::write(
+        &marker,
+        format!(
+            "ADR-0108 rollback restore of `{}` from `{}` did not finish.\n\
+             The artefact set is HALF-PLACED: the main file and its `.wal` may be from \
+             different generations, or a committed WAL may have been moved aside without its \
+             main file being replaced. DO NOT open this database — DuckDB replays the WAL.\n\
+             Recover from the `pre-restore/` directory inside the rollback dir, then delete \
+             this marker.\n",
+            db.display(),
+            snapshot_dir.display()
+        ),
+    )
+    .with_context(|| format!("write the restore-in-progress marker {}", marker.display()))?;
+
     for a in &m.artefacts {
         std::fs::rename(staging.join(&a.name), db_dir.join(&a.name))
             .with_context(|| format!("place {}", a.name))?;
     }
+
+    std::fs::remove_file(&marker)
+        .with_context(|| format!("clear the restore-in-progress marker {}", marker.display()))?;
     let _ = std::fs::remove_dir(&staging);
     Ok(())
 }
+
+/// S449 — written beside the DB for the duration of the artefact-set placement
+/// in [`restore_from_snapshot`], and removed when every rename has landed.
+///
+/// Its presence means a restore was interrupted mid-set, which is the one state
+/// in which the database on disk may be internally inconsistent in a way no
+/// count, digest or chain walk can see. [`verify_against_manifest_locked`]
+/// refuses on it.
+pub const RESTORE_IN_PROGRESS_MARKER: &str = ".aberp-restore-in-progress";
 
 /// CLI face of [`restore_from_snapshot`].
 pub fn run_rollback_restore(args: &crate::cli::RollbackRestoreArgs) -> Result<()> {
@@ -698,6 +773,25 @@ pub(crate) fn verify_against_manifest_locked(
         bail!(
             "manifest was taken for tenant `{}` but this run is for `{tenant}`",
             m.tenant
+        );
+    }
+
+    // S449 — an interrupted restore, first. Every number below is derived from
+    // a file set that a half-finished placement may have left mismatched in a
+    // way counts and digests cannot see; the silent shape (a committed WAL
+    // moved aside without its main file being replaced) verifies GREEN.
+    let marker = db
+        .parent()
+        .map(|d| d.join(RESTORE_IN_PROGRESS_MARKER))
+        .filter(|m| m.exists());
+    if let Some(marker) = marker {
+        bail!(
+            "refusing to verify: `{}` is present, so a previous rollback restore did not \
+             finish placing the artefact set. The main file and its `.wal` may be from \
+             different generations. Recover from the `pre-restore/` directory in the rollback \
+             dir and delete the marker — do NOT open the database first, DuckDB replays the \
+             WAL (ADR-0108 §6.2)",
+            marker.display()
         );
     }
 

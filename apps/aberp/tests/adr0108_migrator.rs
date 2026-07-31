@@ -223,10 +223,14 @@ fn t18_the_gate_hard_stops_on_a_signature_stripped_carry() {
             r.hard_stops
         );
     }
+    // S449: FOUR, not two. The mirror-replay strip nulls `session_id` and
+    // `session_pubkey` alongside `event_sig`, and those two now carry their own
+    // equalities — see `s449_the_gate_hard_stops_when_only_the_session_pubkey_
+    // is_stripped` for why an `event_sig`-only gate was not enough.
     assert_eq!(
         r.hard_stops.len(),
-        2,
-        "exactly the two tamper-evidence counts should have fired: {:?}",
+        4,
+        "exactly the four tamper-evidence counts should have fired: {:?}",
         r.hard_stops
     );
 }
@@ -234,34 +238,218 @@ fn t18_the_gate_hard_stops_on_a_signature_stripped_carry() {
 /// B1's non-zero precondition, at the gate. An equality between two zeros is
 /// not a check: a DuckDB side with no signatures and no anchors must hard-stop
 /// rather than report a green `0 == 0` forever.
+///
+/// **S449 — this test was vacuous and is rewritten.** As landed it stripped the
+/// signatures BEFORE taking the snapshot and then wrapped its only assertion in
+/// `if lite.exists()`. The migrator refused (the snapshot no longer verified
+/// against its own baseline), so `aberp.sqlite` was never created, so the
+/// assertion never ran — measured, not inferred: deleting BOTH `duck_signed ==
+/// 0` / `duck_anchors == 0` guards from `reconcile` left all 11 tests in this
+/// file GREEN. B1's headline "an equality between two zeros is not a check" was
+/// itself unchecked (CLAUDE.md rule 9).
+///
+/// The rewrite migrates a HEALTHY ledger first — so the carry succeeds and
+/// there is a real SQLite side to compare — and only then strips both sides to
+/// zero, which is the state the guard exists for: every equality matches
+/// (`0 == 0` four times over), `verify_chain` is happy, the link walk is happy,
+/// `integrity_check` is `ok`. Nothing but the non-zero preconditions can see
+/// it. The assertions are unconditional.
 #[test]
 fn the_gate_hard_stops_when_the_duckdb_side_has_no_tamper_evidence_at_all() {
     let dir = scratch("zero");
-    let db = seed(&dir, 4, 0);
+    let db = seed(&dir, 4, 2);
+    let snap_dir = dir.join("snap");
+    run_snapshot(&db, TENANT, Some(&snap_dir)).expect("snapshot of a healthy ledger");
+    let lite = dir.join("aberp.sqlite");
+    migrate_ledger(&db, &lite, TENANT, &snap_dir, LedgerSource::Table)
+        .expect("the healthy carry must succeed — otherwise there is nothing to gate");
+
+    // Now gut BOTH sides equally. This is the "green zero" shape: the counts
+    // agree, so every equality passes; only the preconditions can object.
     {
         let conn = duckdb::Connection::open(&db).unwrap();
-        conn.execute_batch("UPDATE audit_ledger SET event_sig = NULL;")
-            .unwrap();
+        conn.execute_batch(
+            "UPDATE audit_ledger
+                SET event_sig = NULL, session_id = NULL, session_pubkey = NULL;
+             DELETE FROM audit_ledger_anchors;",
+        )
+        .unwrap();
         conn.close().unwrap();
     }
-    let snap_dir = dir.join("snap");
-    // The snapshot's own baseline check will also flag this; the gate must not
-    // depend on that having happened.
-    let _ = run_snapshot(&db, TENANT, Some(&snap_dir));
-    let lite = dir.join("aberp.sqlite");
-    let _ = migrate_ledger(&db, &lite, TENANT, &snap_dir, LedgerSource::Table);
+    {
+        let conn = aberp_db::sqlite::open_hardened(&lite).unwrap();
+        conn.execute_batch(
+            "UPDATE audit_ledger
+                SET event_sig = NULL, session_id = NULL, session_pubkey = NULL;
+             DELETE FROM audit_ledger_anchors;",
+        )
+        .unwrap();
+    }
 
-    if lite.exists() {
-        let r = reconcile(&db, &lite, TENANT).unwrap();
+    let r = reconcile(&db, &lite, TENANT).expect("the gate itself must still run");
+
+    // The premise: every equality really does pass, so the hard stops below can
+    // only have come from the non-zero preconditions.
+    assert!(
+        !r.hard_stops
+            .iter()
+            .any(|s| s.contains("DuckDB 0, SQLite 0")),
+        "no equality should have fired — the two sides are identical: {:?}",
+        r.hard_stops
+    );
+    for want in [
+        "0 audit_ledger rows with a non-NULL event_sig",
+        "0 audit_ledger_anchors rows",
+        "0 audit_ledger rows with a non-NULL session_id",
+        "0 audit_ledger rows with a non-NULL session_pubkey",
+    ] {
         assert!(
-            r.hard_stops
-                .iter()
-                .any(|s| s.contains("0 audit_ledger rows")
-                    || s.contains("no tamper-evidence coverage")),
-            "a zero-signature DuckDB side must be reported as absent coverage: {:?}",
+            r.hard_stops.iter().any(|s| s.contains(want)),
+            "a zero-coverage DuckDB side must hard-stop on `{want}`: {:?}",
             r.hard_stops
         );
     }
+}
+
+/// **S449 (B4) — the gate must not compare against a STALE DuckDB extraction.**
+///
+/// `run_snapshot`, `verify_against_manifest_locked` and `migrate_ledger` all
+/// refuse on a non-empty `aberp.duckdb.wal`. `reconcile` did not, and it is the
+/// one that matters most: the writer lock stops a CONCURRENT writer, never a
+/// previously CRASHED one, so a DuckDB build that wrote rows and died between
+/// the carry and the gate leaves committed data a read-only open cannot replay.
+/// Every count on the DuckDB side is then short. If the hidden rows are ones
+/// the migrator already carried, all four B1 equalities match, the head hashes
+/// match, and the gate reports PASS over a source that is ahead of the copy.
+///
+/// Mutation-verify: delete the `unfolded_wal_len` block from `reconcile` and
+/// this goes red.
+#[test]
+fn s449_the_gate_refuses_when_an_unfolded_duckdb_wal_is_present() {
+    let dir = scratch("gate-wal");
+    let db = seed(&dir, 5, 2);
+    let snap_dir = dir.join("snap");
+    run_snapshot(&db, TENANT, Some(&snap_dir)).unwrap();
+    let lite = dir.join("aberp.sqlite");
+    migrate_ledger(&db, &lite, TENANT, &snap_dir, LedgerSource::Table).unwrap();
+
+    // The gate is green on the clean state — otherwise the refusal below could
+    // be coming from anywhere.
+    assert!(
+        reconcile(&db, &lite, TENANT).unwrap().hard_stops.is_empty(),
+        "the carry must reconcile cleanly before the WAL is planted"
+    );
+
+    // A crashed writer's leftovers. The bytes need not be a valid WAL: the
+    // point is that a NON-EMPTY one is unreplayable by a read-only open, so
+    // refusing on its presence is the only sound reading (same probe the other
+    // three entry points use).
+    std::fs::write(
+        aberp_db::readonly::wal_path_for(&db),
+        b"committed-but-unfolded",
+    )
+    .unwrap();
+
+    let err = reconcile(&db, &lite, TENANT)
+        .expect_err("a gate that reads a short extraction must refuse, not compare");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("unfolded WAL"),
+        "the refusal must name the WAL so the operator knows what to fold: {msg}"
+    );
+}
+
+/// **S449 (C-II) — the gate's TARGET path was unguarded.**
+///
+/// `reconcile` checked `ensure_dev_only` on the DuckDB path only, and
+/// `open_hardened` CREATES the file it is given — so a typo'd `--sqlite` under
+/// `~/.aberp/` wrote a fresh database into the production root before the first
+/// query failed. `migrate_ledger` guards both paths; the gate is the command an
+/// operator runs by hand, so it needed the same.
+#[test]
+fn s449_the_gate_refuses_a_sqlite_target_under_the_production_root() {
+    let dir = scratch("gate-target");
+    let db = seed(&dir, 3, 1);
+    let home = std::env::var("HOME").expect("HOME");
+    let prod_target = PathBuf::from(&home).join(".aberp/prod/s449-must-never-appear.sqlite");
+
+    let err = reconcile(&db, &prod_target, TENANT)
+        .expect_err("a target under the production root must be refused");
+    assert!(
+        format!("{err:#}").contains("DEV-only"),
+        "expected the C-II refusal, got: {err:#}"
+    );
+    assert!(
+        !prod_target.exists(),
+        "the refusal must come BEFORE the open — `open_hardened` would have created {}",
+        prod_target.display()
+    );
+}
+
+/// **S449 — the strip shape the two landed equalities could not see.**
+///
+/// PR #51's gate counted `event_sig IS NOT NULL` and the anchors, and nothing
+/// else. But a signature is only checkable against the key that made it: a
+/// carry that keeps every `event_sig` and drops `session_pubkey` produces a
+/// ledger whose tamper-evidence can never be verified again — and it passes
+/// both landed equalities, the row count, both head checks, `verify_chain` on
+/// the DuckDB side, the structural link walk, `PRAGMA integrity_check`, and the
+/// `typeof` sweep (which only inspects non-NULL values). Six green checks on a
+/// ledger with no usable signatures. That is B1 restated one column over.
+///
+/// It is unreachable through today's two `LedgerSource` arms — `Table` copies
+/// all three columns and `RejectedMirrorReplay` nulls all three — which is
+/// precisely why it needed a test rather than an argument: Steps 5-9 add paths
+/// into this file, and the gate has to hold for the ones not written yet.
+///
+/// Mutation-verify: delete the `session_pubkey` arm from `reconcile`'s
+/// `extra` loop and this goes red.
+#[test]
+fn s449_the_gate_hard_stops_when_only_the_session_pubkey_is_stripped() {
+    let dir = scratch("pubkey-strip");
+    let db = seed(&dir, 6, 2);
+    let snap_dir = dir.join("snap");
+    run_snapshot(&db, TENANT, Some(&snap_dir)).unwrap();
+    let lite = dir.join("aberp.sqlite");
+    migrate_ledger(&db, &lite, TENANT, &snap_dir, LedgerSource::Table).unwrap();
+
+    // The strip: SQLite side only, one column, signatures left intact.
+    {
+        let conn = aberp_db::sqlite::open_hardened(&lite).unwrap();
+        conn.execute_batch("UPDATE audit_ledger SET session_pubkey = NULL;")
+            .unwrap();
+    }
+
+    let r = reconcile(&db, &lite, TENANT).unwrap();
+    assert!(
+        r.hard_stops
+            .iter()
+            .any(|s| s.contains("non-NULL session_pubkey")),
+        "a pubkey-stripped carry must hard-stop: {:?}",
+        r.hard_stops
+    );
+    // And the reason this needed its own arm: everything else is still green.
+    for still_green in [
+        "non-NULL event_sig",
+        "audit_ledger_anchors row count",
+        "audit_ledger row count",
+        "head entry_hash",
+        "verify_chain",
+        "structural link walk",
+        "integrity_check",
+    ] {
+        assert!(
+            r.checks.iter().any(|c| c.contains(still_green)),
+            "`{still_green}` should still PASS — that is why the pubkey needed its own              equality. checks: {:?}",
+            r.checks
+        );
+    }
+    assert_eq!(
+        r.hard_stops.len(),
+        1,
+        "exactly the session_pubkey count should have fired: {:?}",
+        r.hard_stops
+    );
 }
 
 // ---------------------------------------------------------------------------
