@@ -285,6 +285,46 @@ fn guard_db_matches_tenant(db: &std::path::Path, tenant: &str) {
     }
 }
 
+/// ADR-0108 C-I / C-II — the **engine ↔ DB-path** guard, third in the boot
+/// guard trio.
+///
+/// [`guard_tenant_matches_build`] clears the tenant NAME;
+/// [`guard_db_matches_tenant`] clears the resolved PATH against the tenant.
+/// Neither knows which storage ENGINE this binary was compiled with, and that
+/// is the property the whole SQLite-migration reversibility argument rests on:
+///
+/// > A `sqlite-engine` build never opens `aberp.duckdb`. It opens
+/// > `aberp.sqlite`, so the DuckDB file is byte-unmodified for the entire
+/// > reversible window and rollback is "stop the SQLite binary, rebuild
+/// > default, start" (ADR-0108 §6.1).
+///
+/// This is the three-line caller ADR-0108 §7 Step 3 specifies. All the
+/// decision logic is the pure [`aberp_db::engine_path::engine_path_agrees`],
+/// which is why both arms could be unit- and mutation-tested back in Step 1
+/// with no feature enabled at all — the ordering rule being *a refusal whose
+/// test cannot be written yet is not landed yet*.
+///
+/// The `~/.aberp/` arm applies to the SQLite build **only**: production runs
+/// DuckDB under `~/.aberp/` and always has, so refusing that would take prod
+/// down. The migration is authorised for the DEV tenant only.
+fn guard_engine_matches_db_path(db: &std::path::Path) {
+    let engine = if cfg!(feature = "sqlite-engine") {
+        aberp_db::engine_path::Engine::Sqlite
+    } else {
+        aberp_db::engine_path::Engine::DuckDb
+    };
+    let prod_root = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".aberp"));
+    if let Err(e) = aberp_db::engine_path::engine_path_agrees(engine, db, prod_root.as_deref()) {
+        eprintln!("❌ FATAL: {e}");
+        eprintln!(
+            "   This binary was built with the `{engine}` storage engine. Point --db / \
+             ABERP_DB at a matching `.{}` file.",
+            engine.required_extension()
+        );
+        std::process::exit(1);
+    }
+}
+
 /// S165 / deliverable #3 — one-shot boot banner. PRODUCTION builds get a
 /// loud red/yellow REAL-NAV warning; dev builds get a dim one-liner.
 /// Bilingual (HU + EN) per the closed-vocab banner constraint. ANSI
@@ -819,6 +859,10 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // the keychain, and any DuckDB open — so a dev build handed prod's
     // `ABERP_DB` dies without having touched a single prod byte.
     guard_db_matches_tenant(&args.db, &args.tenant);
+
+    // ADR-0108 C-I/C-II — the ENGINE half of the same pair. Runs beside the
+    // other two and before anything is opened.
+    guard_engine_matches_db_path(&args.db);
 
     // S165 / deliverable #3 — one-shot boot banner naming the NAV
     // environment this build talks to. Loud + colourised on a real

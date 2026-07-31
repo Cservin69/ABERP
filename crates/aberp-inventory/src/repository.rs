@@ -536,7 +536,56 @@ pub struct LowStockRow {
 /// invariant `low-stock-iff-cache-below-min` holds with NULLs treated
 /// as 0 — there is no semantic difference between "stock is 0" and
 /// "no movement has landed yet."
+/// # ADR-0108 F1 / Q2 — the filter and the ordering moved into Rust
+///
+/// **This is the only lexicographic-ordering break in the tree**, and it is two
+/// breaks in one statement. Under the migration `stock_qty` and `min_stock`
+/// become R2 columns — `TEXT` holding a canonical `rust_decimal` string — and
+/// the SQL this function used to run stops meaning what it says:
+///
+/// * **The `WHERE`.** `COALESCE(stock_qty,0) < COALESCE(min_stock,0)` yields
+///   `TEXT` when the column is present and `INTEGER 0` when it is `NULL`.
+///   `TEXT < TEXT` is **lexicographic**: stock `'9'` against min `'10'`
+///   compares `'9' > '1…'` → **FALSE → the low-stock product is silently not
+///   flagged.** And where one side is `NULL`→`INTEGER 0`, SQLite's
+///   storage-class ordering puts INTEGER before TEXT *unconditionally*, so
+///   `0 < '<any text>'` is always TRUE.
+/// * **The `ORDER BY`.** `TEXT - TEXT` forces REAL coercion — float arithmetic
+///   on a quantity, exactly the class R1/R2 exist to eliminate.
+///
+/// The fold costs nothing: this function **already** parsed both columns into
+/// `Decimal` from the `CAST(… AS VARCHAR)` projections below, so the comparison
+/// and the ordering now happen on values that were being produced anyway. No
+/// new query, no new dependency, and the DuckDB behaviour is unchanged (a
+/// `DECIMAL` comparison in SQL and a `Decimal` comparison in Rust agree).
+///
+/// Its `COUNT`-only sibling [`count_low_stock_products`] carries the **same
+/// predicate**, 36 lines below and reached by a different caller. It is folded
+/// in the same commit — a fix scoped to this function alone would have left the
+/// identical break live. A sweep is per-predicate or it is nothing.
 pub fn low_stock_products(conn: &Connection, tenant: &str) -> anyhow::Result<Vec<LowStockRow>> {
+    let mut rows = low_stock_candidates(conn, tenant)?;
+    // The deficit ordering, in Rust over `Decimal`. `ORDER BY name ASC` was the
+    // tie-break and stays one.
+    rows.sort_by(|a, b| {
+        (a.stock_qty - a.min_stock)
+            .cmp(&(b.stock_qty - b.min_stock))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(rows)
+}
+
+/// Every non-deleted product in `tenant` whose cached `stock_qty` is below its
+/// `min_stock`, **unordered**, with the comparison done in Rust over `Decimal`.
+///
+/// Shared by [`low_stock_products`] and [`count_low_stock_products`] so the two
+/// cannot drift apart — which is how the second copy of the predicate came to
+/// exist in the first place.
+fn low_stock_candidates(conn: &Connection, tenant: &str) -> anyhow::Result<Vec<LowStockRow>> {
+    // The `COALESCE(_, 0)` on both columns stays: a freshly-created product's
+    // cache columns are NULL (`products::create_product` pre-dates this module),
+    // and the invariant `low-stock-iff-cache-below-min` holds with NULLs treated
+    // as 0. It is a projection, not a comparison, so it is safe under R2.
     let mut stmt = conn.prepare(
         "SELECT id, name,
                 CAST(COALESCE(stock_qty, 0) AS VARCHAR),
@@ -544,9 +593,7 @@ pub fn low_stock_products(conn: &Connection, tenant: &str) -> anyhow::Result<Vec
                 bin_location
          FROM products
          WHERE tenant_id = ?
-           AND deleted_at IS NULL
-           AND COALESCE(stock_qty, 0) < COALESCE(min_stock, 0)
-         ORDER BY (COALESCE(stock_qty, 0) - COALESCE(min_stock, 0)) ASC, name ASC;",
+           AND deleted_at IS NULL;",
     )?;
     let rows = stmt.query_map(params![tenant], |row| {
         let id: String = row.get(0)?;
@@ -559,15 +606,20 @@ pub fn low_stock_products(conn: &Connection, tenant: &str) -> anyhow::Result<Vec
     let mut out = Vec::new();
     for r in rows {
         let (product_id, name, stock_qty_str, min_stock_str, bin_location) = r?;
-        out.push(LowStockRow {
-            product_id,
-            name,
-            stock_qty: Decimal::from_str(&stock_qty_str)
-                .with_context(|| format!("parse stock_qty {stock_qty_str:?}"))?,
-            min_stock: Decimal::from_str(&min_stock_str)
-                .with_context(|| format!("parse min_stock {min_stock_str:?}"))?,
-            bin_location,
-        });
+        let stock_qty = Decimal::from_str(&stock_qty_str)
+            .with_context(|| format!("parse stock_qty {stock_qty_str:?}"))?;
+        let min_stock = Decimal::from_str(&min_stock_str)
+            .with_context(|| format!("parse min_stock {min_stock_str:?}"))?;
+        // THE predicate, once, in Rust.
+        if stock_qty < min_stock {
+            out.push(LowStockRow {
+                product_id,
+                name,
+                stock_qty,
+                min_stock,
+                bin_location,
+            });
+        }
     }
     Ok(out)
 }
@@ -576,17 +628,15 @@ pub fn low_stock_products(conn: &Connection, tenant: &str) -> anyhow::Result<Vec
 /// the headline number. Used by the operator dashboard tile
 /// (PR-231 / S235) which renders one integer and links the operator
 /// over to the full filtered list on click.
+/// ADR-0108 F1 — **the second instance of the same predicate.** It used to
+/// carry its own copy of `COALESCE(stock_qty,0) < COALESCE(min_stock,0)`, so it
+/// had the identical lexicographic break and would have been missed by a fix
+/// scoped to [`low_stock_products`]. The `COUNT(*)` is now the folded rows'
+/// length: one predicate, one place, and the tile can no longer disagree with
+/// the list it links to.
 pub fn count_low_stock_products(conn: &Connection, tenant: &str) -> anyhow::Result<u32> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*)
-         FROM products
-         WHERE tenant_id = ?
-           AND deleted_at IS NULL
-           AND COALESCE(stock_qty, 0) < COALESCE(min_stock, 0);",
-        params![tenant],
-        |row| row.get(0),
-    )?;
-    Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+    let count = low_stock_candidates(conn, tenant)?.len();
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
 /// Walk every product in the tenant and re-compute its `stock_qty`

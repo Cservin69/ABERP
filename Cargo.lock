@@ -132,6 +132,7 @@ dependencies = [
  "aberp-audit-ledger",
  "duckdb",
  "rusqlite",
+ "rust_decimal",
  "thiserror 1.0.69",
  "tracing",
 ]

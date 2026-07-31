@@ -75,8 +75,10 @@ pub mod debounce;
 // module is reachable from `Handle`; both are pure/one-shot capability the
 // migration tooling consumes. See their own module docs for why they live in
 // this crate (it is the sanctioned seam, excluded from the opener census).
+pub mod engine;
 pub mod engine_path;
 pub mod readonly;
+pub mod schema;
 // ADR-0108 Step 2 — the SQLite open path + its security posture. Behind the
 // default-OFF `sqlite-engine` feature; nothing consumes it yet.
 #[cfg(feature = "sqlite-engine")]
@@ -129,6 +131,15 @@ pub enum DbError {
     #[cfg(feature = "sqlite-engine")]
     #[error("sqlite security posture: {0}")]
     SqlitePosture(String),
+
+    /// ADR-0108 Step 3 (M8) — a schema operation could not be completed, or
+    /// completed but did not produce the columns it claimed to. Separate from
+    /// [`DbError::Duck`] / [`DbError::Sqlite`] because the post-condition
+    /// failure is OUR refusal on an engine that reported success: the whole
+    /// point of `ensure_columns` is that "the ALTER returned Ok" and "the
+    /// column is there" are different facts.
+    #[error("schema: {0}")]
+    Schema(String),
 }
 
 /// Tunables for a [`Handle`]. [`HandleConfig::default`] is the ADR-0099 H3

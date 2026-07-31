@@ -50,3 +50,12 @@ tracing = { workspace = true }
 # (unused here but matches the editions convention and is harmless).
 aberp-audit-ledger = { path = "../audit-ledger", features = ["test-support"] }
 duckdb = { workspace = true }
+# ADR-0108 Step 3 — `tests/adr0108_seam.rs` names `rusqlite` directly for the
+# two-connection arms (T-6's DEFERRED control, and the Q2 lexicographic
+# demonstration). Optional in `[dependencies]`; unconditional here so the test
+# file compiles whenever the `sqlite-engine` feature turns its arms on.
+rusqlite = { workspace = true }
+# Q2's demonstration compares a SQL `<` against a `Decimal` `<` on the SAME
+# values. Without a real decimal type the comparison would be against another
+# string compare, which proves nothing.
+rust_decimal = { workspace = true }
