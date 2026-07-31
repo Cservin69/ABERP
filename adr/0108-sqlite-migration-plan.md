@@ -88,7 +88,7 @@ baseline table.**
 | `Connection::open(` | 227 | incl. tests |
 | ADR-0098 frozen openers | 81 across 20 files | `adr0098_prod_opener_fingerprints.txt` |
 | ADR-0099 frozen read-forks | 33 | `adr0099_read_fork_structural_baseline.txt` |
-| `state.db.write()` / `.read()` call sites | 84 | the Handle seam's blast radius |
+| `Handle::write()` / `.read()` call sites (non-test) | **238** | the Handle seam's blast radius. **CORRECTED 2026-07-31 (finding R-2): was 84.** Re-measure with `tools/adr0108_handle_census.sh`, not a grep — see the note under this table. |
 | `ON CONFLICT` — executable | **5** | The raw grep returns 21; **16 are doc comments and 1 is a test assertion string** (`quote_pricing_jobs.rs:3112`). This is `ALTER COLUMN`'s exact error (G-1), reproduced. The 5 real sites are `material_inventory.rs:555`, `supplier_prices.rs:470`, `quote_pricing_jobs.rs:415`+`:476`, `restore_from_nav_outgoing.rs:326`. All 5 conflict targets are already the declared `PRIMARY KEY` → **zero index work**. See §4.3. |
 | `IS NOT DISTINCT FROM` | 8 | needs SQLite ≥ 3.39 |
 | `LIKE` | 2 | unescaped metacharacters (M11) |
@@ -96,9 +96,48 @@ baseline table.**
 | **SQL-side arithmetic on a money/quantity column** | **7** | §3.4 — the class neither source document names. The 7th is `aberp-inventory/src/repository.rs:549`, a `-` (subtraction) inside an `ORDER BY`. |
 | **SQL-side `<` comparison on an R2 (TEXT-decimal) column** | **2** | `repository.rs:548` (`low_stock_products`) and `repository.rs:585` (`count_low_stock_products`, whose own doc comment says "same predicate"). The only Q2 lexicographic-ordering breaks in the tree; the second was found re-running the sweep for this revision and is **not** in §13's F1. §3.4. |
 | **Read-only DuckDB opens** (`access_mode` / `read_only` / `READ_ONLY`) | **0** | Across `apps/`, `crates/`, `modules/`, non-test. Step 4's read-only open is capability **to build**, not to assume. §6.3, B4. |
-| `.read()` / `.write()` split of the 84 Handle sites | **50 / 34** | §7 Step 3's two-axis audit (F7) is over the 50 `read()` sites; the 34 `write()` sites are the nesting context for axis (b). |
+| `.read()` / `.write()` split of the 238 Handle sites | **102 / 136** | **CORRECTED 2026-07-31 (finding R-2): was 50 / 34.** §7 Step 3's two-axis audit (F7) is over the **102** `read()` sites; the **136** `write()` sites are the nesting context for axis (b). The script also reports the test surface separately (48 / 73 = 121 when the audit was taken); that number moves with the suite and is **not** the audit denominator. |
 | `duckdb::Error::DuckDBFailure` | 3 | the only `duckdb::` path with **no** same-named rusqlite twin |
 | DEV DB / mirror on disk | 20.4 MB / 1.3 MB, mode **0644** | confirms PR #49 F-5a |
+
+> **The Handle census was wrong by a factor of ~2.8, and how it was wrong
+> matters (finding R-2, read-fork audit 2026-07-31).** The original number came
+> from
+>
+> ```bash
+> grep -rn '\.db\.read()\|\.db\.write()' --include='*.rs' apps crates modules | wc -l   # 84
+> ```
+>
+> which is reproducible and wrong in two ways this repo had already been bitten
+> by:
+>
+> 1. **It is single-line.** `serve.rs` overwhelmingly formats these chains as
+>    `state\n    .db\n    .read()`, so receiver and method land on different
+>    lines and the pattern cannot match. This is exactly the defect PR #43 (D1a)
+>    found in the read-fork *scanner* and fixed there by going structural — the
+>    same defect survived here because the census was a one-line grep.
+> 2. **It requires the literal `.db.` prefix**, so every `Handle` bound to a
+>    local (`db.read()`, `handle.read()`, `h.read()`, `svc.deps.db.read()`,
+>    `state_for_task.db.read()`) is invisible.
+>
+> The census is now a script — **`tools/adr0108_handle_census.sh`** — which
+> rejoins rustfmt-wrapped chains, is receiver-agnostic, and excludes the
+> non-`Handle` `.read()`/`.write()` receivers **by name** (`boot_state`,
+> `self.inner`, `self.registry`, `self.smtp_password` — all `RwLock`s), so a new
+> non-Handle receiver shows up as a count change instead of being swallowed by a
+> clever regex. It is a measurement tool, not a gate: re-run it to check these
+> numbers are still true. Step 3's audit denominator is **102**, and an audit
+> over 50 of 102 would have been a 49 % sample presented as exhaustive.
+>
+> **Neither opener census is a superset of the other.** The ADR-0098 opener
+> census (81 openers / 41 fn-sites) and the ADR-0099 read-fork baseline (33
+> entries + an 11-entry allow-list) have partially disjoint coverage: **4**
+> fn-sites are in the opener census and in neither read-fork list, and **7**
+> baseline entries are absent from the opener census (`Handle::open_default` and
+> demo/new-tenant paths its token set does not recognise). Treat neither as the
+> complete set. Per finding R-5 the census that matters for the *durability*
+> hazard is the **ADR-0098 opener census (81)**, because the injury is a foreign
+> connection's `close`, which does not respect a read/write partition — see §9.
 
 ---
 
@@ -133,7 +172,7 @@ given binary.
 
 **Rejected: a runtime selector with both engines linked.** It sounds more
 reversible and is not. It requires the 449 `params!` sites, the 120
-`duckdb::Connection` signatures, and the 84 `Handle` call sites to dispatch through
+`duckdb::Connection` signatures, and the 238 `Handle` call sites to dispatch through
 a trait object or an enum, because `duckdb::Connection` and `rusqlite::Connection`
 are unrelated concrete types with unrelated `Row`, `Statement`, `Transaction`, and
 `Error` types. That is a multi-thousand-line abstraction built speculatively
@@ -193,7 +232,7 @@ identical — rule 12's "should this exist at all" says no.
   still returns a guard deref-ing to `&mut Connection`; `read()` still returns an
   owned connection. On SQLite `read()` becomes a genuine second connection rather
   than a `try_clone` — semantically *stronger* (it sees every prior commit) and
-  API-identical. 84 call sites are untouched.
+  API-identical. **238** call sites are untouched (R-2 — was stated as 84).
 - **Single-writer.** The writer `Mutex` stays. It stops being a correctness
   requirement and becomes a throughput choice, and it is still what makes the
   `BEGIN IMMEDIATE` discipline (M5) cheap to reason about in-process.
@@ -1145,9 +1184,13 @@ that is ADR-0107's own "stop here having spent little" exit.
 > > implementation detail.
 >
 > **Scope — exhaustive, and the denominator is stated so completeness is
-> checkable.** The 84 `Handle` sites split **50 `read()` / 34 `write()`**
-> (§1.2). The audit classifies **all 50 `read()` sites**, with the 34 `write()`
-> sites as the reachability context for axis (b). Two axes:
+> checkable.** The **238** non-test `Handle` sites split **102 `read()` / 136
+> `write()`** (§1.2 — *corrected 2026-07-31 by finding R-2; the ADR originally
+> said 84 / 50 / 34, measured with a single-line grep that could not see
+> rustfmt-wrapped chains or a `Handle` bound to a local*). The audit classifies
+> **all 102 `read()` sites**, with the 136 `write()` sites as the reachability
+> context for axis (b). Re-measure with `tools/adr0108_handle_census.sh`. Two
+> axes:
 >
 > - **(a) does it read inside an open transaction?** → the frozen-snapshot class.
 > - **(b) is it reached while a `write()` guard is live?** → the lock-contention
@@ -1156,9 +1199,13 @@ that is ADR-0107's own "stop here having spent little" exit.
 >   three frames below a `write()` guard is the case a local read misses.
 >
 > Any site that is **both** is a defect `try_clone` was masking, and it is fixed
-> in Step 3, not carried into its family's step. The output is a 50-row table in
-> the PR body — every site classified, none marked "probably fine". **An audit
-> with an unstated denominator is a sample.**
+> in Step 3, not carried into its family's step. The output is a **102**-site
+> table — every site classified, none marked "probably fine". **An audit with an
+> unstated denominator is a sample** — and a denominator measured with a grep
+> that cannot see two thirds of the tree's formatting makes it one anyway.
+> *(Delivered: `docs/findings/read-fork-audit-sqlite-20260731.md` §1 and §5.1 —
+> 99 SAFE as-is, 3 SAFE-with-a-required-change (R-1, now fixed), 0 to reroute;
+> both axes measured EMPTY.)*
 >
 > **Three pins, all mutation-verified:**
 > - **T-20** — commit on connection A → read on a **pre-existing** connection B in
@@ -1364,7 +1411,7 @@ result — Q2, Q5, Q7 and Q10.
 
 | # | Question | Disposition | Where it lives now |
 |---|---|---|---|
-| **Q1** | Compile-time cargo feature vs runtime engine selector (§2.2 D1) | **Closed — compile-time.** Reversibility comes from *two files*, not from the selector, which the B3 fix makes more true rather than less. A runtime toggle costs a trait layer over 449 + 120 + 84 sites and keeps every family simultaneously reachable on two engines — the half-migrated shape rule 14 forbids. If Ervin meant a runtime toggle, that is his to reopen; the case is made, not averaged. | §2.2 |
+| **Q1** | Compile-time cargo feature vs runtime engine selector (§2.2 D1) | **Closed — compile-time.** Reversibility comes from *two files*, not from the selector, which the B3 fix makes more true rather than less. A runtime toggle costs a trait layer over 449 + 120 + 238 sites (R-2) and keeps every family simultaneously reachable on two engines — the half-migrated shape rule 14 forbids. If Ervin meant a runtime toggle, that is his to reopen; the case is made, not averaged. | §2.2 |
 | **Q2** | `TEXT`-decimal vs scaled-integer for quantities/rates (§3.1 R2) | **Closed — `TEXT`, and the lexicographic risk is swept rather than deferred.** The per-column sweep over all ten R2 columns is **done, in §3.4**: exactly two hits, `repository.rs:548` and `:585`, both folded into Rust in Step 7. The original deferral said *`ORDER BY`* and would have missed the `WHERE` — the half that returns wrong rows. | §3.4, T-8, Step 7 |
 | **Q3** | `routings.est_cost_huf` → `TEXT` (R2) rather than `INTEGER` (R1) (§3.2 B) | **Closed — R2, the one documented R1 exception.** `Option<Decimal>` in Rust, never on the NAV wire, the PDF, or ledger totals. R1 would force a "what is HUF's minor unit for an *estimate*" product decision to serve consistency alone. | §3.2 B |
 | **Q4** | The five quoting `f64` money columns (§3.2 D) — Step 8, converted to `Decimal` | **Closed — convert, and the strictness stands.** §3.2 D's pre-commitment ("if Step 8 overruns, *stop* — do not migrate as `REAL`") is the rule-11 guard that stops a later session taking the easy branch. Not softened. | §3.2 D, Step 8 |
@@ -1373,7 +1420,7 @@ result — Q2, Q5, Q7 and Q10.
 | **Q7** | Does the ledger cross by mirror replay or table copy? (§6.3) | **Inverted — table copy is the source, the mirror is a three-arm cross-check.** The circularity this question asked about was not the defect; the **lossiness** was. And the durability argument for mirror-as-source misread its own incident: on 2026-07-19 the *mirror* was ahead and divergent and the **DB was authoritative**. See B1. | §6.3, T-18 |
 | **Q8** | Drop quoting job history rather than write an `f64 → Decimal` converter (§6.3) | **Closed — drop.** Correct for a disposable DEV DB; **wrong for prod**, and §11.1 carries that forward explicitly rather than inheriting it silently. | §6.3, §11.1 |
 | **Q9** | Keep the census / fork gates frozen instead of deleting per family (§8) | **Closed — keep, and the divergence from ADR-0107 §4.1 is the better call.** A gate deleted is a gate that cannot protect the state you roll back to. Under a rollback-only constraint that is a requirement, not a preference, and rule 12's objection to dead machinery does not reach machinery guarding a live rollback target. | §8 |
-| **Q10** | Is `read()` returning a real second connection a behaviour change anywhere? (§2.4) | **Was the plan's weakest claim; now audited, not assumed.** "Strictly sees more" is false inside an explicit transaction. Step 3 classifies **all 50 `read()` sites** on two axes, gates Step 5, and pins the WAL snapshot claim in **both** directions (T-20) plus the nesting abort (T-21). This is the class behind five of July's incidents. | Step 3, T-20/T-21 |
+| **Q10** | Is `read()` returning a real second connection a behaviour change anywhere? (§2.4) | **Was the plan's weakest claim; now audited, not assumed.** "Strictly sees more" is false inside an explicit transaction. Step 3 classifies **all 102 `read()` sites** (R-2 — the stated 50 was a 49 % sample) on two axes, gates Step 5, and pins the WAL snapshot claim in **both** directions (T-20, corrected by R-4) plus the nesting behaviour (T-21, rewritten by R-3). This is the class behind five of July's incidents. **Audit delivered 2026-07-31: both axes EMPTY, one required change (R-1), now fixed.** | Step 3, T-20/T-21 |
 | **Q11** | `busy_timeout` value (M7 said "explicit and finite", no number) | **Closed — 5000 ms; the T-21 condition is now SATISFIED** (T-21 landed 2026-07-31 in the R-3 shape). Revisable downward on Step 2's measurement. *R-3 correction: the stated Q10↔Q11 coupling does not exist — because the SQLite arm keeps `lock_recovering()`, a nested `read()` never reaches SQLite, so no finite timeout could ever have hidden that deadlock. 5000 ms is a **write**-contention ceiling (two `BEGIN IMMEDIATE` writers; a checkpointer behind a long reader), measured to be near-irrelevant on the read surface.* | Step 3, M7, T-3d, R-3 |
 
 ---
@@ -1518,7 +1565,7 @@ at a disposable database.
 | **Q7** | **NO-GO as written (B1). The plan asked the adversarial to check the comparison for circularity; the circularity is not there — the *lossiness* is.** | The three-way head-hash comparison is **not** circular: `verify_chain` recomputes `compute_entry_hash` (`chain/verify.rs:50`), so a BLOB/TEXT class error would surface. The defect is elsewhere and larger. `MirrorEntry` carries no signing columns and `to_entry()` nulls all three; mirror-as-source therefore strips S441/ADR-0087 from the whole migrated ledger, drops `audit_ledger_anchors`, and passes every gate — because `compute_entry_hash` deliberately excludes those fields. Separately, the flat head-equality would **hard-stop on mirror-ahead-of-DB**, i.e. on the 2026-07-19 scenario cited as the *justification* for mirror replay. Both fixed above. |
 | **Q8** | **Acceptable-open.** | Dropping quoting job history is correct for a disposable DEV DB, and §11.1 already carries the "wrong for prod" flag forward explicitly. |
 | **Q9** | **Resolved-in-plan — and the divergence from ADR-0107 §4.1 is the better call.** | A gate deleted is a gate that cannot protect the state you roll back to. Under a rollback-only constraint that is not a preference, it is a requirement. Rule 12's objection to dead machinery does not apply to machinery guarding a live rollback target. |
-| **Q10** | **Must-fix (F7).** | The plan's "assumed safe — it strictly sees *more*" is the one place a load-bearing engine-semantics claim is asserted rather than pinned, over 84 sites, in the class that caused five of July's incidents, deferred to a step that runs beside the family it guards. It is also **coupled to Q11** in a way the plan does not notice: a finite `busy_timeout` is what converts a nested `read()`-inside-`write()` from an immediate self-deadlock into a silent hang. |
+| **Q10** | **Must-fix (F7).** | The plan's "assumed safe — it strictly sees *more*" is the one place a load-bearing engine-semantics claim is asserted rather than pinned, over 238 sites (R-2 — the review said 84), in the class that caused five of July's incidents, deferred to a step that runs beside the family it guards. It is also **coupled to Q11** in a way the plan does not notice: a finite `busy_timeout` is what converts a nested `read()`-inside-`write()` from an immediate self-deadlock into a silent hang. |
 | **Q11** | **Acceptable-open, folded into F7.** | Leaving the number to a Step-2 measurement is fine. Choosing it *without* Q10's nesting audit in hand is not — the audit tells you whether a timeout is a backpressure knob or a hang. Decide them together. |
 
 ### 13.3 Deferral ledger additions
@@ -1558,7 +1605,7 @@ nothing below is carried over on §13's word. Line numbers are as-measured.
 | **F4** | Three non-existent table names removed; `invoice_line.quantity_dec` added; every remaining name re-grepped. | `purchase_order_sequence` → **`po_number_state`** (`apps/aberp/src/purchasing.rs`); `purchase_order`/`purchase_order_line` → **plural**; `supplier_prices` → **`quote_price_snapshots`** — `CREATE TABLE … supplier_prices` / `FROM supplier_prices` / `INTO supplier_prices` all return **zero**; it is a module name and the column is declared at `supplier_prices.rs:428`. `quantity_dec` added to §3.2 C with the S157 ladder (`MIGRATE_S157_SQL`, `duckdb_store.rs:355–358`) and its trigger `quantity_column_is_integer` (`:423`, `.ok()` → `false`). |
 | **F5** | **Recorded explicitly as a live pre-existing production defect**, with the in-migration-vs-separate-cut question answered rather than folded in silently. | `apps/aberp/src/reports.rs:872` = `Ok(decimal_str_to_i64(&s).unwrap_or(0))`, on the ÁFA report, running on DuckDB **today**. Siblings found at `:827` and `:1279` (also new this revision). Disposition, stated in **both** §3.4 and §9: **fixed in-migration**, Step 5, same commit as the `:861` fold — because the fix *is* the fold (its `Result` replaces the swallow) and splitting a fail-open from the code that makes it reachable is how it survives. Two guards attached: the Step-5 PR body must name it as pre-existing so it is not miscounted as migration collateral, and §9 states that if Step 5 is deferred or the engine decision reopens at Step 4, it **reverts to owing its own PR** rather than lapsing. |
 | **F6** | The engine↔path refusal becomes a **pure function taking the engine as an argument**, so both arms are mutation-verifiable in Step 1 with no feature enabled. | Step 1, with the signature written out: `engine_path_agrees(engine: Engine, path: &Path) -> Result<(), EngineMismatch>` — no `cfg!`, no env, no fs. Step 3 adds only the three-line `cfg!` caller and re-runs T-13 end-to-end. The generalised rule is stated: *a refusal whose test cannot be written yet is not landed yet.* This closes the gap where C-I's load-bearing property would have been unpinned across Step 2 — the step that links `rusqlite`. |
-| **F7** | Q10's audit is **exhaustive, gates Step 5, has a stated denominator**, and Q11's number is chosen with it. | Step 3, rewritten. Denominator measured and published: the 84 Handle sites are **50 `read()` / 34 `write()`** (§1.2), so the audit covers **all 50** with the 34 as axis-(b) reachability context, closed under calls (ADR-0106's discipline, not line-local). Output is a 50-row table in the PR body — *"an audit with an unstated denominator is a sample."* Three pins: **T-20** pins the WAL snapshot claim in **both** directions (autocommit sees the commit; in-transaction must **not**), **T-21** pins the loud abort on nested `read()`-inside-`write()`, **T-3d** asserts the pragma value. **Q11 closed: `busy_timeout = 5000 ms`, conditional on T-21 landing first**, revisable downward on Step 2's measurement, raising it requires re-arguing T-21. |
+| **F7** | Q10's audit is **exhaustive, gates Step 5, has a stated denominator**, and Q11's number is chosen with it. | Step 3, rewritten. Denominator measured and published: the **238** non-test Handle sites are **102 `read()` / 136 `write()`** (§1.2), so the audit covers **all 102** with the 136 as axis-(b) reachability context, closed under calls (ADR-0106's discipline, not line-local). *(**R-2, 2026-07-31:** this row originally said 84 = 50 / 34 and "all 50". The denominator **was** stated — and measured with a single-line, `.db.`-prefixed grep that cannot see rustfmt-wrapped chains or a `Handle` bound to a local. Stating a denominator is not the same as measuring one; `tools/adr0108_handle_census.sh` is now the measurement.)* Three pins: **T-20** pins the WAL snapshot claim in **both** directions — *its in-transaction half was worded falsely; see R-4* — **T-21** pins the nested `read()`-inside-`write()` behaviour *(rewritten by R-3: it never reaches the engine)*, **T-3d** asserts the pragma value. **Q11 closed: `busy_timeout = 5000 ms`; the T-21 condition is satisfied**, revisable downward on Step 2's measurement, raising it requires re-arguing R-3. |
 
 ### 14.3 What was preserved
 
