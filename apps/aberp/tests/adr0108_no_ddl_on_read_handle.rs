@@ -152,16 +152,12 @@ fn scan(path: &str, source: &str) -> Vec<Hit> {
             continue;
         };
         let mut depth: i32 = 0;
-        for k in i..joined.len() {
-            if k > i && ddl_on(&var, &joined[k].text) {
-                hits.push((
-                    path.to_string(),
-                    joined[k].line_no,
-                    joined[k].text.trim().to_string(),
-                ));
+        for (k, line) in joined.iter().enumerate().skip(i) {
+            if k > i && ddl_on(&var, &line.text) {
+                hits.push((path.to_string(), line.line_no, line.text.trim().to_string()));
             }
-            depth += joined[k].text.matches('{').count() as i32;
-            depth -= joined[k].text.matches('}').count() as i32;
+            depth += line.text.matches('{').count() as i32;
+            depth -= line.text.matches('}').count() as i32;
             if depth < 0 {
                 break;
             }
