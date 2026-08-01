@@ -1,61 +1,76 @@
-# ADR-0109 — A storage-engine-agnostic repository seam: finishing what ADR-0019 §1 decided
+# ADR-0109 — Storage-engine-agnostic repository seam: the post-cutover blueprint
 
-- **Status:** Proposed — **sequencing decision requested from Ervin (§6)**. No code
-  is authorised by this document. It changes no runtime behaviour, touches no
-  in-flight migration branch, and touches nothing under `~/.aberp/**`.
+- **Status:** Proposed — **blueprint, not a decision request.** The sequencing is
+  already decided (§0) and is not reopened here.
 - **Date:** 2026-08-01
 - **Deciders:** Ervin
-- **Supersedes:** nothing.
 - **Executes:** **ADR-0019 §1** (cornerstone, Accepted 2026-05-19) — which already
-  decided this seam, in these words, and which is measurably unbuilt. This ADR is
-  its execution plan, amended by what ADR-0108 measured.
-- **Related:** ADR-0003 (superseded by 0019; its Decision section is the same
-  decision), ADR-0006 (module boundaries — the input to where the port lines go),
-  ADR-0008/0030 (audit ledger + fsync mirror), ADR-0059 / ADR-0100 (SaaS —
-  Postgres-per-tenant, the *named second consumer* that makes this non-speculative),
-  ADR-0107 (engine evaluation), ADR-0108 (the SQLite migration in flight),
-  CLAUDE.md rules 2, 7, 12, 13, 14, 15, the memory pins `[[no-sql-specific]]`,
-  `[[project_aberp_saas_migration_adr0100]]`.
+  decided this seam, in these words, and which is measurably unbuilt.
+- **Executes at:** **step 5 of the decided sequence (§0)** — after the PROD
+  cutover and after step 4's consequences pass. §2 of this document *is* the
+  evidence base step 4 works from.
+- **Related:** ADR-0003 (superseded by 0019; same Decision), ADR-0006 (module
+  boundaries — the input to where the port lines go), ADR-0008 / ADR-0030 (audit
+  ledger + fsync mirror), ADR-0059 / ADR-0100 (SaaS — Postgres-per-tenant, the
+  named next engine), ADR-0107 (engine evaluation), ADR-0108 (the SQLite
+  migration), CLAUDE.md rules 2, 3, 7, 11, 12, 13, 14, 15, `[[no-sql-specific]]`.
 
-> **Cross-reference caveat, stated up front.** ADR-0107 and ADR-0108 are **not on
-> `main`** as of this writing (`origin/main` = `3f062ac`). They live on
-> `adr-db-engine-evaluation` and `adr0108/*` / PR #53. Every `adr/0107-*` and
-> `adr/0108-*` link below dangles until those land. Every *measurement* in §1 was
-> taken on `main` @ `3f062ac` — the pristine pre-migration tree — and is labelled
-> as such; branch-only artefacts are labelled with their branch.
+> ### ⛔ Nothing here is authorised now
+>
+> This document changes no runtime behaviour, adds no engine code, and touches no
+> in-flight migration branch. **It must not be executed during steps 1–3.** A
+> session that reads §3 and starts building `aberp-storage` before the PROD
+> cutover has misread this ADR and is working against the decided order.
+>
+> Its two jobs today are: (a) capture the coupling evidence **while the migration
+> is exposing it** — evidence is perishable, and this is the only moment it is
+> being paid for in full; (b) hold the seam design so step 5 starts from a
+> reviewed blueprint rather than a blank page.
 
----
-
-## Context
-
-Ervin's framing, 2026-08-01, in his words: *the DuckDB→SQLite migration taking days
-is itself the evidence that the engine-swappability goal is unmet. "Safe" and
-"fast" should be the same path, and the way to make them converge is a real
-abstraction seam.*
-
-That framing is correct, and the measurement below is worse than the framing
-implies. The goal is not merely unmet — **it was decided, written down as a
-cornerstone ADR, and then not built**, and nothing in the tree has ever been able
-to tell us so. This ADR's first job is therefore not to propose an abstraction. It
-is to establish, with counts and line numbers, that the abstraction ADR-0019
-mandates does not exist; to explain the specific mechanism by which it decayed;
-and only then to specify what completing it costs.
-
-The distinction matters because it changes the recommendation. "We need a seam" is
-a design argument that CLAUDE.md rules 2 and 12 are entitled to attack as
-speculative. "ADR-0019 §1 is Accepted, its five concrete deliverables are 1-for-5
-built, and the missing four are exactly the four the SQLite migration is currently
-paying for by hand" is not a design argument. It is a defect report against the
-architecture of record.
+> ### Cross-reference caveat
+>
+> ADR-0107 and ADR-0108 are **not on `main`** (`origin/main` = `3f062ac`). They
+> live on `adr-db-engine-evaluation` and `adr0108/*` (PR #53, tip `349dc94`). Every
+> `adr/0107-*` / `adr/0108-*` link below dangles until those land. Measurements are
+> labelled with the ref they were taken on: **`main` @ `3f062ac`** (the pristine
+> pre-migration tree) or **PR #53 @ `349dc94`** (the migration's current tip).
+> Scope for both: `crates/ apps/ modules/`; "src" excludes `/tests/`.
 
 ---
 
-## 1. Ground truth — the measured gap
+## 0. The decided sequence — accepted context
 
-All counts: `main` @ `3f062ac`, scope `crates/ apps/ modules/`, `--include='*.rs'
---include='*.sql'`. "src" excludes `/tests/` paths.
+Ervin decided the order on 2026-08-01. It is fixed, it is not re-argued here, and
+this ADR is written to fit inside it:
 
-### 1.1 What ADR-0019 §1 decided
+| Step | | Owner |
+|---:|---|---|
+| **1** | Finish the SQLite migration on the safe track (ADR-0108 Steps 7–9) | in flight, PR #53 |
+| **2** | DEV test | |
+| **3** | **PROD cutover** | **Ervin's gate** |
+| **4** | Deduce consequences | ← **§2 of this document is that ledger** |
+| **5** | Redesign the abstraction | ← **§3–§5 of this document is that blueprint** |
+
+**The one consequence of this order that must be stated rather than buried**
+(rule 11): because the seam lands *after* the cutover, the remaining families
+(quoting, inventory, work-orders, email, dispatch, qa) are hand-translated **once
+more**, and the retrofit in §5 starts from zero rather than from a partial seam.
+That is a real cost — §5 prices it at **10–15 sessions** instead of the 4–7 an
+interleaved order would have cost.
+
+It is also the right trade, and this ADR says so rather than sulking about it: the
+cutover moves a legally-binding tax ledger with 8-year statutory retention
+(ADR-0009) onto a new engine. Doing that on a plan that is already designed,
+gated, mutation-pinned and reversible (ADR-0108 §5, §6) beats doing it on a plan
+being redesigned underneath it. **Steps 1–3 are the risk; step 5 is a
+behaviour-preserving refactor** (§5.3). Ordering the risky thing first, on a
+finished plan, is correct.
+
+---
+
+## 1. The gap this blueprint closes
+
+### 1.1 ADR-0019 §1 decided this seam and it was never built
 
 Verbatim, from `adr/0019-storage-strategy-no-fks.md` (Accepted, cornerstone):
 
@@ -68,149 +83,286 @@ Verbatim, from `adr/0019-storage-strategy-no-fks.md` (Accepted, cornerstone):
 > `_aberp_migrations` table per tenant […] **a transaction handle type that modules
 > use without naming the backend.**
 
-Five deliverables. Their state today:
+Five deliverables. State on `main` @ `3f062ac`:
 
-| ADR-0019 §1 deliverable | Built? | Evidence (`main` @ `3f062ac`) |
+| ADR-0019 §1 deliverable | Built? | Evidence |
 |---|---|---|
-| Per-module storage **port trait** | **1 of ~21** | Exactly one domain port exists tree-wide: `modules/billing/src/ports/storage.rs:177` `pub trait BillingStore` (8 methods). The only other `trait *Store` is `crates/aberp-secret-store/src/lib.rs:52` — secrets, not storage. |
-| **In-memory adapter** per module | **1** | `modules/billing/src/adapters/in_memory_store.rs:39` `impl BillingStore for InMemoryBillingStore`. |
-| *"The string `duckdb` does not appear in the domain or app layers"* | **violated 74×** | 74 non-test src files import `duckdb::`, across 11 crates/apps — **49 of them in `apps/aberp` alone** (121 files including tests). Including, precisely, the app layer of the one module that has a port: `modules/billing/src/app/error.rs:14` — `Storage(#[from] duckdb::Error)`. |
-| Shared **`aberp-storage` crate** | **does not exist** | `ls crates/` — no `aberp-storage`. |
-| Versioned **migration runner** / `_aberp_migrations` | **does not exist** | Tree-wide grep for `_aberp_migrations`: **0**. |
-| **Backend-agnostic transaction handle** | **does not exist** | 148 src fn signatures take `&(mut) Connection` / `&(mut) Transaction` directly (§1.3). |
+| Per-module storage **port trait** | **1 of ~21** | The only domain port tree-wide: `modules/billing/src/ports/storage.rs:177` `pub trait BillingStore` (8 methods). The only other `trait *Store` is `crates/aberp-secret-store/src/lib.rs:52` — secrets, not storage. |
+| **In-memory adapter** per module | **1** | `modules/billing/src/adapters/in_memory_store.rs:39`. |
+| *"`duckdb` never appears in the domain or app layers"* | **violated, 74 src files** | 74 non-test src files import `duckdb::` across 11 crates/apps, 49 in `apps/aberp` (121 files incl. tests). Including the app layer of the one module that *has* a port: `modules/billing/src/app/error.rs:14` — `Storage(#[from] duckdb::Error)`. |
+| Shared **`aberp-storage`** crate | **absent** | no such crate in `crates/`. |
+| Migration runner / `_aberp_migrations` | **absent** | tree-wide grep: **0**. |
+| **Backend-agnostic transaction handle** | **absent** | 148 src fn signatures take `&(mut) Connection` (145) or `&(mut) Transaction` (3). |
 
-The sharpest single line in the tree is the pair two files apart inside the
-exemplar module:
+The sharpest artefact in the tree is a pair two files apart, inside the exemplar
+module:
 
 ```
 modules/billing/src/ports/storage.rs:5   //! The SQL string `duckdb` does not appear in domain or app layers.
 modules/billing/src/app/error.rs:14          Storage(#[from] duckdb::Error),
 ```
 
-The doc comment asserting the invariant and the app-layer type violating it have
-coexisted long enough that neither has been read against the other. **Nothing in
-the tree can detect this.** There is no gate, no test, and no census for
-"engine type named outside an adapter" — while there *are* six cut gates and 3 712
-lines of scanner machinery for the opener census (ADR-0107 §2). We built a ratchet
-for the symptom and none for the cause.
+**Nothing in the tree can detect this.** There is no gate, no test, no census for
+"engine type named outside an adapter" — while there *are* six cut gates and
+~3 712 LOC of scanner machinery for the opener census (ADR-0107 §2). We built a
+ratchet for the symptom and none for the cause. That asymmetry is the root
+consequence, and every row of §2 is a leaf of it.
 
-### 1.2 The seam that existed for one day
+### 1.2 Why a seam is not enough: `StorageEngine` survived one day
 
 ADR-0107 §3 (Option B, reason 5) cites, as evidence the migration is cheap:
 
 > An engine-swap seam already exists in code: S410 step 4 introduced `StorageEngine`
-> + `DuckDbEngine` + `const STORAGE_ENGINE` in the snapshot layer, moving
-> `CHECKPOINT` behind `fold_wal` and `PRAGMA verify_external_invariants` behind
-> `verify_integrity`.
+> + `DuckDbEngine` + `const STORAGE_ENGINE` in the snapshot layer […]
 
-**Measured: it does not exist and has not existed since 2026-06-15.** A tree-wide
-search for `StorageEngine` / `fold_wal` / `verify_integrity` / `STORAGE_ENGINE`
-returns **zero**. `git log -S` gives the whole life:
+**Measured: it does not exist, and has not since 2026-06-15.** Tree-wide search for
+`StorageEngine` / `DuckDbEngine` / `STORAGE_ENGINE` / `fold_wal` /
+`verify_integrity` returns **zero**. `git log -S` gives the whole life:
 
 | Commit | Date | Effect |
 |---|---|---|
 | `ee56d2e` (S410) | 2026-06-14 | Adds `trait StorageEngine`, `impl StorageEngine for DuckDbEngine`, `const STORAGE_ENGINE`. |
-| `a1edbb0` (S426) | 2026-06-15 | Deletes all of it. `CHECKPOINT` returns inline — `crates/aberp-snapshot/src/take.rs:324`, `crates/aberp-snapshot/src/crash_safe.rs:230`. |
+| `a1edbb0` (S426) | 2026-06-15 | Deletes all of it. `CHECKPOINT` returns inline — `crates/aberp-snapshot/src/take.rs:324`, `crash_safe.rs:230`. |
 
-**The seam survived one day.** Six weeks later a decision document cited it as
-standing infrastructure, and the memory index still records it as landed.
+**One day.** Six weeks later a decision document cited it as standing
+infrastructure, and the memory index still records it as landed.
 
-This is the mechanism, and it is the most important paragraph in this ADR: **a
-port with one implementation is not a seam; it is a wrapper, and the next
-refactor is correct to delete it** (rule 12 — "optimising a thing that shouldn't
-exist"). S426 was not wrong. `StorageEngine` had one impl, no second consumer, and
-no test that could go red when it was inlined. It had no reason to survive and it
-did not.
+S426 was not wrong. **A port with one implementation is a wrapper, and the next
+refactor is right to delete it** (rule 12 — "optimising a thing that shouldn't
+exist"). It had one impl, no second consumer, and no test that could go red when
+it was inlined.
 
-Any seam this ADR proposes must therefore answer, before anything else: *what
-keeps it alive?* §4.3 is that answer, and it is the reason the in-memory adapter
-is not optional.
+The same decay is visible in the port that *did* survive: `impl BillingStore` spans
+`modules/billing/src/adapters/duckdb_store.rs:923–1082` — **160 of 1 492 lines.**
+~89% of the "adapter" is inherent methods and DDL reachable without touching the
+port; callers name the concrete `DuckDbBillingStore` **46** times against **13**
+references to the trait (`apps/` + `crates/`). `BillingStore` is a door in a wall
+with no other walls.
 
-### 1.3 The coupling census — what a swap actually costs today
+**Consequence for §3, and it is the design constraint that outranks the trait
+shapes:** a seam is not the deliverable. **The seam plus what keeps it alive** is
+(§4.3). Any step-5 session that ships the traits and skips the ratchet has
+rebuilt `StorageEngine` at 20× the size.
 
-| Coupling | Count | Note |
-|---|---:|---|
-| `params![` call sites | **449** | matches ADR-0107 §1.4 |
-| `duckdb::Connection` mentions | **120** | matches ADR-0107 §1.4 |
-| src files importing `duckdb::` | **74** | 121 including tests |
-| **src fn signatures taking `&(mut) Connection`** | **145** | the seam-crossing count |
-| src fn signatures taking `&(mut) Transaction` | **3** | |
-| `.transaction(` / `.prepare(` / `.execute(` / `.query_row(` / `.query_map(` / `.execute_batch(` (src) | 221 / 157 / 214 / 117 / 117 / 105 | |
-| `state.db.write()` / `.read()` | 84 | (ADR-0108 R-2 measures 238 total `Handle` call sites, 102 `read()`, via `tools/adr0108_handle_census.sh` — **use that, never a grep**) |
-| SQL statement literals, src: `SELECT`/`INSERT`/`UPDATE`/`DELETE` | 272 / 114 / 177 / 11 | **574** DML |
-| SQL DDL literals, src: `CREATE TABLE`/`ALTER TABLE`/`CREATE INDEX` | 56 / 95 / 32 | **183** DDL |
-| `ADD COLUMN IF NOT EXISTS` | **119** raw (ADR-0108 measures **114** src + tests separately) | |
-| `.sql` migration files | **7** | dispatch ×1, qa ×2, work-orders ×3, inventory ×1 |
+---
 
-**757 SQL statements in 74 files behind 148 engine-typed function signatures.**
-That is the number Ervin's "days, not hours" observation is measuring. It is not
-that SQLite is hard; it is that there is no single place where SQL is written, so
-every dialect difference is a search-and-replace across the product.
+## 2. The consequences ledger — what this migration exposed
 
-Distribution matters as much as the total. `apps/aberp/src/serve.rs` is **33 242
-lines** and imports `duckdb::` — but it holds only ~3 SQL literals and 42
-`.db.write()/.read()` calls. serve.rs is not writing SQL; it is **acquiring
-engine handles and passing them down**. That is the coupling in its purest form:
-the HTTP layer's job is transaction orchestration expressed in the engine's
-vocabulary. A domain repository would take that job away from it entirely.
+**This section is the deliverable for step 4.** Each row is a coupling class the
+DuckDB→SQLite crossing surfaced, measured with a citation, with what it cost and
+what the seam does about it. It is written now, while the migration is paying for
+it, because this evidence is perishable: once the cutover lands, the *reason* each
+of these was expensive stops being visible in the diff.
 
-### 1.4 The dialect leaks the migration is currently hand-translating
+### 2.0 Headline
 
-Each of these is a *symptom of the same cause* — the app speaks the engine's
-dialect directly, so every dialect difference is an app-wide edit:
+**757 SQL statements in 74 src files behind 148 engine-typed function
+signatures.** That, not SQLite's difficulty, is what "days, not hours" measures.
 
-| Leak | Sites (`main`) | What breaks on a swap |
+| Coupling | `main` @ `3f062ac` |
+|---|---:|
+| SQL literals, src: `SELECT` / `INSERT` / `UPDATE` / `DELETE` | 272 / 114 / 177 / 11 = **574** |
+| DDL literals, src: `CREATE TABLE` / `ALTER TABLE` / `CREATE INDEX` | 56 / 95 / 32 = **183** |
+| `params![` sites | **389** src (**449** incl. tests — the ADR-0107 §1.4 figure) |
+| `duckdb::Connection` mentions | **120** |
+| src files importing `duckdb::` | **74** (121 incl. tests) |
+| **src fn signatures taking `&(mut) Connection` / `Transaction`** | **145 / 3 = 148** |
+| `ADD COLUMN IF NOT EXISTS` | **114** src (ADR-0108's measured figure, confirmed) |
+| `.sql` migration files | **7** |
+
+**Distribution is the finding, not the total.** `apps/aberp/src/serve.rs` is
+**33 242 lines**, imports `duckdb::`, and holds only ~3 SQL literals against 42
+`.db.write()/.read()` calls. serve.rs is not writing SQL — it is **acquiring engine
+handles and passing them down**. The HTTP layer's job is transaction orchestration
+expressed in the engine's vocabulary. That is the coupling in its purest form, and
+it is invisible to any count of SQL strings.
+
+> ⚠ For `Handle` call sites use `tools/adr0108_handle_census.sh` (238 total / 102
+> `read()` / 136 `write()`), **never a grep** — a naive `.db.write()|.db.read()`
+> grep returns 84 and is wrong by 2.8×.
+
+### 2.1 DDL — 114 sites, and the fail-open hiding in each one
+
+SQLite has no `IF NOT EXISTS` on `ADD COLUMN`, so all 114 sites become
+read-the-columns-then-decide. ADR-0108's own `crates/aberp-db/src/schema.rs:5–17`
+(PR #53) states the breakdown and the hazard precisely: **105 in 12 `.rs` files, 8
+in 3 `.sql` files, 1 already const-driven** — and PR #49 F-1c identifies the
+rewrite as reproducing **D2a's exact fail-open shape**: a column silently not added
+→ a later read `.unwrap_or_default()`s → an ADR-0101 guard passes vacuously → an
+exempt ÁFA base re-files to NAV at 0%.
+
+Top sites (ADR-0108 §4.2): `modules/billing/src/adapters/duckdb_store.rs` **25**,
+`crates/aberp-quote-intake/src/log_table.rs` 17, `apps/aberp/src/quote_intake_query.rs`
+15, `apps/aberp/src/partners.rs` 12, `quote_pricing_jobs.rs` 10.
+
+**Cost paid:** one helper (`ensure_columns`) plus 114 hand-threaded call sites plus
+a delivery decision for the `.sql` files (ADR-0108 §4.2 Q6 — split `CREATE` from
+`ALTER`, 8 lines move). **Under the seam:** ~15 adapter `ensure_schema` impls over
+a per-port `const SCHEMA`. The `&'static str` identifier rule and the step-4
+post-condition (`schema.rs:22–25`) are already correct and are adopted verbatim.
+
+### 2.2 Money and decimals — `STRICT` does not protect an R2 column
+
+ADR-0108 §3.1 sets three representation rules: **R1** money = `INTEGER` minor
+units; **R2** exact non-integers = `TEXT` holding a canonical `rust_decimal`
+string; **R3** hashes = `BLOB`.
+
+The measured correction (S450, ADR-0108 §3.1) is the one to carry forward:
+
+| declared | given a REAL | result |
 |---|---|---|
-| `ADD COLUMN IF NOT EXISTS` | 119 | SQLite has no `IF NOT EXISTS` on `ADD COLUMN`. ADR-0108 §4.1 answers with one `ensure_columns` helper — **the right answer, and it is a repository-layer function that currently has to be threaded to 119 call sites by hand.** |
-| `information_schema.{tables,columns}` | 7 src | No `information_schema` in SQLite (`pragma_table_info` / `sqlite_master`). `apps/aberp/src/print_invoice.rs:922` carries the comment *"information_schema is the portable path here"* — written in good faith, false for the engine we are migrating to, and unfalsifiable by any test in the tree. |
-| SQL `LOWER()` as a **correctness** guard | 8 src | `apps/aberp/src/partners.rs:1001–1005` is the duplicate-partner guard. SQLite's `LOWER()` is **ASCII-only**, so on crossing it stops folding `Á`/`Ű`/`Ő` and **admits** the duplicate (ADR-0108 M11/T-12, deliberately still open on PR #53). |
-| …and the same shape, **outside M11's scope** | 2 | `apps/aberp/src/products.rs:367` `AND LOWER(name) = LOWER(?)` — the product-name dedup guard — and `:402` (a `LOWER(...) LIKE`). ADR-0108's M11 row names only `partners.rs`. **New finding; recorded in §8.** |
-| `ON CONFLICT` | 21 raw / **5 executable** | ADR-0108 §4.3 resolved this to empty work (all 5 targets are declared PKs). Note the shape of the error: the raw grep was 21 because 16 were doc comments. A repository layer makes this measurable by construction — upserts would be *methods*, and you count methods. |
-| `IS NOT DISTINCT FROM` | 8 | Fine ≥3.39; portability confirmed only by having read the SQLite release notes, not by anything in the tree. |
-| `DECIMAL(p,s)` declarations | 28 | SQLite has no decimal type; a `DECIMAL` declaration takes NUMERIC affinity and can become `f64` — the PR #49 money regression, closed by ADR-0108 §3's R1/R2/R3 rules. |
+| `INTEGER` (R1, money) | `1234.56` | `SQLITE_CONSTRAINT_DATATYPE` — **enforced** |
+| `TEXT` (R2, quantity/rate) | `0.1 + 0.2` | **accepted, stored `'0.30000000000000004'`** |
+| `BLOB` (R3, hash) | `'abc'` | `SQLITE_CONSTRAINT_DATATYPE` — **enforced** |
 
-### 1.5 The rule-7 divergences a seam would have made impossible
+**`STRICT` enforces R1 and R3 and does nothing for R2**, and `typeof()` reads
+`'text'` either way, so the T-2 sweep is blind to it too. R2's guards are therefore
+exactly two, both outside the engine: the Rust-side `Decimal` bind, and
+`tools/cut_gate_money_arith.sh` (T-8) keeping arithmetic out of SQL — a gate that
+**did not exist until 2026-08-01** while three landed artefacts cited it
+(ADR-0108 M-1).
 
-CLAUDE.md rule 7: *surface conflicts, don't average them.* Two representations of
-one physical quantity, both live, in the same product:
+28 `DECIMAL(p,s)` declarations exist on `main`; a `DECIMAL` declaration in SQLite
+takes NUMERIC affinity and can become an `f64` — the PR #49 money regression.
+
+**Cost paid:** a full column census (ADR-0108 §3.2, five classes A–F), a
+representation ruling per column, a bespoke scanner over **672 SQL statements in
+295 files**, and a 14-probe teeth suite. **Under the seam:** `bind_money` /
+`read_money` / `bind_decimal` / `read_decimal` in `aberp-storage::codec`. A money
+column cannot be bound as anything else because no other bind function accepts a
+`Money`. T-8 keeps its job at ~1/20th the scope — the adapter directory.
+
+### 2.3 Case-folding — `LOWER()` is a correctness guard, and it is ASCII-only
+
+SQLite's `LOWER()` folds ASCII only. `apps/aberp/src/partners.rs:1001–1005` uses
+five `LOWER()` comparisons as the **duplicate-partner guard**; on crossing it stops
+folding `Á`/`Ű`/`Ő` and **admits** the duplicate — a false negative, the direction
+that does not announce itself (ADR-0108 M11 / T-12, deliberately still open on
+PR #53 because the queries have not yet crossed). `:1049` adds two unescaped `LIKE`
+patterns.
+
+🔴 **New finding, and it is outside M11's stated scope.**
+`apps/aberp/src/products.rs:367` — `AND LOWER(name) = LOWER(?)`, the **product-name
+dedup guard** — and `:402` (`LOWER(...) LIKE ?`) carry the identical shape. M11
+names `partners.rs` only. The per-column sweep is complete: **8 `LOWER(` src sites
+— 6 partners, 2 products, 0 elsewhere.** Exposure today is zero (no SQLite
+connection runs these). It needs a T-12-shaped pin in the products family's
+crossing, and it should be added to ADR-0108 §9 by whoever next touches it.
+
+**The general lesson, which is the one worth keeping:** a case-fold that is a
+*correctness guard* was written in SQL, where its semantics belong to the engine.
+**Under the seam** the fold happens in Rust (`to_lowercase()`) before the bind, in
+one port method, for both tables at once — which is exactly M11's prescription,
+finally given somewhere to live.
+
+### 2.4 The rest of the dialect surface
+
+| Leak | Sites (`main`) | What it cost |
+|---|---:|---|
+| `information_schema.{tables,columns}` | **7 src** | No `information_schema` in SQLite. `apps/aberp/src/print_invoice.rs:922` carries the comment *"information_schema is the portable path here"* — written in good faith, **false for the engine we are migrating to, and unfalsifiable by anything in the tree**. ADR-0108 §4.3 also requires `duckdb_store.rs:427` to fail loud on "table absent" rather than return `false`, or the S157 quantity widen silently never runs. |
+| `ON CONFLICT` | **21 raw / 5 executable** | ADR-0108 §4.3 resolved this to **empty work** — all 5 targets are the declared `PRIMARY KEY`, verified statement-by-statement. Note the shape of the error though: the raw grep said 21 because **16 were doc comments and 1 a test-assertion string**. A count over SQL-as-text is not a count of behaviour. Under the seam, upserts are *methods* — you count methods. |
+| `IS NOT DISTINCT FROM` | 8 | Portable ≥3.39. Confirmed by reading SQLite release notes, not by anything in the tree. |
+| `DROP COLUMN IF EXISTS` | 2 | `duckdb_store.rs:357`, `quoting_materials.rs:132` — guard on `pragma_table_info`, then bare `DROP`. |
+| `DuckDBFailure` → `SqliteFailure` | **3** | `incoming_invoices.rs:720`, `quote_intake_query.rs:438`, `:499`. ADR-0108 §2.3: *the only error variant with no twin*, wrapped behind `is_engine_failure`. Under the seam it is one `match` in one adapter mapping to a domain `StoreError`. |
+
+### 2.5 SQL-side arithmetic and comparison — the sharpest class
+
+ADR-0108 §3.4 enumerates **seven arithmetic sites plus one comparison**, and two of
+them are worth carrying into the ledger because they are *silent wrong answers*,
+not errors:
+
+- **`aberp-inventory/src/repository.rs:548`** — `WHERE COALESCE(stock_qty,0) <
+  COALESCE(min_stock,0)`. Under R2 both columns are `TEXT`, so `TEXT < TEXT` is
+  **lexicographic**: stock `'9'` vs min `'10'` compares `'9' > '1…'` → FALSE →
+  **the low-stock product is silently not flagged.** `:549`'s deficit ordering
+  additionally forces `TEXT - TEXT` → REAL. And `:585` is *the same predicate, 36
+  lines below, reached by a different caller* — found only because the sweep was
+  redone per-column instead of per-function.
+- **`apps/aberp/src/reports.rs:800`** (M-2) — the ÁFA report and the NAV filing
+  rounded differently: the filing truncates per line (`floor(net × bp / 10_000)`,
+  `invoice.rs:92`), the report rounded half-even over an unrounded aggregate. Two
+  27% lines of 50 Ft net: filed **26 Ft**, reported **27 Ft**, always in the same
+  direction. Fixed 2026-08-01 by making both call the *same* functions
+  (`line_net_total` / `line_vat_amount`) — *not* by writing equivalent arithmetic,
+  because equivalent arithmetic would have tied on most invoices and diverged on
+  exactly the `.5` remainders.
+
+**The lesson for the seam is the second one.** These are not portability bugs. They
+are what happens when a *domain calculation* is expressible in two places. **Under
+the seam ports return rows and folds are domain functions** — so `repository.rs:548`
+has no expression at all, because there is no SQL for a domain author to write.
+
+### 2.6 Rule-7: two representations of one physical quantity
 
 ```
 apps/aberp/src/material_inventory.rs:229-231   on_hand_qty / reserved_qty / committed_qty   DOUBLE
 crates/aberp-inventory/migrations/V001__inventory.sql:53   qty_delta                        DECIMAL(18,6)
 ```
 
-ADR-0108 §9 records this as out of scope, correctly — *"migrating both as-is under
-`STRICT` makes the divergence look sanctioned."* But note **how it arose**: two
-authors, two files, two years apart, each choosing a column type at the point of
-use, with no place where "how does ABERP represent a physical quantity" is written
-down as code. The money types exist and are excellent
-(`modules/billing/src/domain/money.rs:27` `Huf(i64)`, `:74` `Eur(i64)`, `:180`
-`enum Money`) — and they stop at the billing module's edge. Inventory quantities
-never got one.
+ADR-0108 §9 correctly holds this out of scope — *"migrating both as-is under
+`STRICT` makes the divergence look sanctioned."* What the ledger adds is **how it
+arose**: two authors, two files, choosing a column type at the point of use, with
+no place where "how does ABERP represent a physical quantity" is written as code.
+The money types exist and are excellent (`modules/billing/src/domain/money.rs:27`
+`Huf(i64)`, `:74` `Eur(i64)`, `:180` `enum Money`) — and they stop at the billing
+module's edge. Inventory quantities never got one.
 
-**A repository seam is where a representation decision becomes unavoidable**,
-because there is exactly one function that binds a quantity and exactly one that
-reads it back. That is not a hypothetical benefit; it is the specific defect
-class above, and ADR-0108 §3.1's R1/R2/R3 rules are that decision, written down —
-but written down in a *document*, enforced by a *grep gate*
-(`tools/cut_gate_money_arith.sh`, PR #53) rather than by a type.
+A repository seam is where a representation decision becomes **unavoidable**,
+because there is exactly one function that binds a quantity and one that reads it
+back. ADR-0108 §3.1's R1/R2/R3 *is* that decision — written in a document and
+enforced by a grep gate, rather than by a type.
 
----
+### 2.7 What the nascent seam already covers — and what is missing
 
-## 2. Diagnosis, in one paragraph
+The migration has been forced to build the bottom of the seam. This is real and it
+should be built on, not restarted. Measured on **PR #53 @ `349dc94`**:
 
-ABERP's architecture of record (ADR-0003 → ADR-0019 §1) specified a
-domain-repository seam. What was actually built is a *dialect-portability
-discipline*: no foreign keys, no engine-minted identity, no CHECK constraints,
-ANSI-only SQL, app-minted ULIDs, invariants in Rust (`[[no-sql-specific]]`, S410).
-That discipline is real and it is why ADR-0107 could honestly call the migration
-"weeks, not months" instead of "a rewrite" — **it removes semantic obstacles**.
-What it does not do is remove *sites*. 757 statements in 74 files is 757 statements
-in 74 files whether or not each one is portable. The discipline made each edit
-easy and left the number of edits untouched. A seam attacks the number of edits.
-That is precisely the gap between "safe" (which the discipline delivers) and
-"fast" (which it does not), and it is why Ervin's two words currently name two
-different paths.
+| Artefact | What it covers | LOC |
+|---|---|---:|
+| `crates/aberp-db/src/engine.rs:42/48` | The **type-alias re-export** (ADR-0108 D2) — `pub use duckdb::{…}` / `pub use rusqlite::{…}` behind the `sqlite-engine` feature. The *only* place either engine crate is named. | 164 |
+| `engine.rs:59` `is_engine_failure` | The one error variant with no twin (§2.4). | |
+| `engine.rs:96` `begin_immediate` | `BEGIN IMMEDIATE` discipline (M5), engine-neutral. | |
+| `crates/aberp-db/src/schema.rs:119` `ensure_columns` | The **one way a column is added**, with the fail-loud post-condition. | 386 |
+| `crates/aberp-db/src/sqlite.rs` | The **only way a SQLite connection is opened**, with the PR #49 security posture pinned before anything can write through it. | |
+| `crates/aberp-db/src/readonly.rs` | Read-only DuckDB open — **new capability**; a sweep for `access_mode`/`read_only` returned **zero** non-test hits beforehand. | |
+| `crates/aberp-db/src/engine_path.rs` | Boot cross-check: a `sqlite-engine` build whose path is not `*.sqlite` **aborts**. Fail loud, not fail open. | |
+| `Handle` (`lib.rs:297` `write()`, `:328` `read()`) | Single-writer, poison recovery, `lock_recovering()` on **both** arms (R-3, binding). | 705 |
+
+**That is a genuine foundation and §3 builds directly on it.** What is missing is
+everything above the connection:
+
+| Missing | Consequence |
+|---|---|
+| **A domain-typed port layer** | The seam abstracts the *crate name*, not the *layer*. `Connection` is still passed to 148 signatures. |
+| **A backend-agnostic transaction handle** | ADR-0019 §1's named deliverable. Without it, rule 15's cross-module atomicity cannot be expressed through ports at all (§3.2). |
+| **Per-engine adapters holding all SQL** | SQL is still in 74 files, each of which chooses its own dialect. |
+| **A conformance suite** | Every mitigation (M1–M12, T-1…T-21) is written for *one* crossing. Nothing is reusable for swap #2. |
+| **A ratchet** | See §1.1. Nothing can detect the seam's absence or its decay. |
+
+**Adoption, measured, and it is the number that matters:** of 81 src files that
+name `duckdb::` on PR #53, **6** import `aberp_db::engine` — and **5 of those 6 are
+the migrator binaries** (`migrate_billing.rs`, `migrate_partners.rs`,
+`migrate_to_sqlite.rs`, `premigration.rs`) plus `serve.rs`. `ensure_columns` has
+**10 call sites outside `aberp-db`, all in migrator binaries**, against **118**
+remaining `ADD COLUMN IF NOT EXISTS`. **The nascent seam is adopted by the
+migration's tooling and by essentially none of the product.** That is correct for
+where the plan is — families cross from Step 5 onward — and it is exactly why §5's
+retrofit is priced from zero.
+
+### 2.8 The counter-metric
+
+On `main`, **74** src files name `duckdb::`. On PR #53's tip, **81**. Src
+`params![` went 389 → 396; `ADD COLUMN IF NOT EXISTS` 114 → 118.
+
+**Halfway through a migration whose purpose is to leave DuckDB, the number of files
+naming DuckDB went up.** This is not a defect in ADR-0108 — the additions are
+migrator tooling that must speak both engines by construction, and they are deleted
+at cutover. It is recorded because it is the cleanest possible statement of the
+problem: **with no seam, even the act of leaving an engine has to be written in
+that engine's vocabulary.**
+
+It also has an operational consequence that corrects an earlier recommendation of
+mine — see §5.4.
 
 ---
 
@@ -228,26 +380,29 @@ Four layers. Only the bottom two may name an engine type.
                          LedgerStore, … — domain verbs, domain types,
                          `&mut Tx<'_>` for composition.  NO SQL.
   ───────────────────────────────────────────────────────────────────────────
-  ③  adapters            duckdb/…  sqlite/…  in_memory/…  — ALL SQL lives here,
+  ③  adapters            sqlite/…  postgres/…  in_memory/…  — ALL SQL lives here,
                          one file per port per engine.  The ONLY place `params!`,
                          `Connection`, DDL text, or a dialect quirk appears.
   ───────────────────────────────────────────────────────────────────────────
-  ④  aberp-storage       Tx / ReadTx (opaque) · the single-writer Handle ·
-     (new crate, absorbs   ensure_columns · migration runner · commit ordering
-      aberp-db)            (business rows → audit append → mirror fsync)
+  ④  aberp-storage       Tx / ReadTx (opaque) · single-writer Handle · codec ·
+     (absorbs aberp-db,   ensure_columns · engine.rs alias · commit ordering
+      incl. §2.7's work)  (business rows → audit append → mirror fsync)
 ```
 
-Rule 14 (all-or-nothing per subsystem) is unchanged and is the retrofit boundary:
-**a family's ports, its adapter, and all its call sites cross together, in one
-commit.**
+Rule 14 (all-or-nothing per subsystem) is the retrofit boundary, unchanged: **a
+family's ports, its adapter, and all its call sites cross together, in one commit.**
 
-### 3.2 The load-bearing design decision: the transaction handle
+Note the adapter row says `sqlite/` and `postgres/`, not `duckdb/`. By step 5 the
+DuckDB adapter is gone — which means **the seam's second implementation is not a
+second engine**. See §4.3; this is the whole reason the in-memory adapter is
+load-bearing rather than a testing nicety.
 
-This is the piece ADR-0019 §1 named ("a transaction handle type that modules use
-without naming the backend"), never built, and the reason the whole seam is
-non-trivial. **A naive port-per-module seam is incompatible with CLAUDE.md rule
-15.** Rule 15 requires business `INSERT`s and the audit `append_in_tx` to commit in
-*one* transaction on *one* `WriteGuard` (`create_ncr` is the reference). If
+### 3.2 The load-bearing decision: the transaction handle
+
+This is the piece ADR-0019 §1 named, never built, and the reason the seam is not
+trivial. **A naive port-per-module seam is incompatible with CLAUDE.md rule 15.**
+Rule 15 requires business `INSERT`s and the audit `append_in_tx` to commit in *one*
+transaction on *one* `WriteGuard` (`create_ncr` is the reference). If
 `InvoiceStore` and `LedgerStore` are independent traits, they cannot compose into
 one transaction without either passing the engine's `Transaction` through the port
 — re-leaking exactly what the seam removes — or a unit-of-work type.
@@ -264,7 +419,6 @@ impl Storage {                       // absorbs today's aberp_db::Handle
     pub fn read<R>(&self,  f: impl FnOnce(&ReadTx<'_>) -> Result<R>) -> Result<R>;
 }
 
-// Ports take the opaque handle. Domain code never sees inside it.
 pub trait InvoiceStore {
     fn insert_issued(&self, tx: &mut Tx<'_>, inv: &IssuedInvoice) -> Result<(), StoreError>;
 }
@@ -273,456 +427,384 @@ pub trait LedgerStore {
 }
 ```
 
-Three properties fall out, and they are the seam's whole value:
+Three properties fall out:
 
 1. **Rule 15 becomes the only expressible shape.** Both ports take the same
-   `&mut Tx`, so composing them in one transaction is the *natural* call and
-   "business-commit-then-audit-append" (the torn-row shape rule 15 forbids) becomes
-   awkward to write. Today the correct shape is a rule in a markdown file.
-2. **Rule 13 ("one Handle, all access") becomes a type, not a rule.** `Tx` cannot
-   be constructed outside `aberp-storage`. A caller that wants a transaction must
-   go through `Storage::write`. There is no second way.
-3. **Fork-zero narrows from a gate to a visibility boundary** — see §3.4.
+   `&mut Tx`, so composing them in one transaction is the *natural* call, and
+   "business-commit-then-audit-append" — the torn written-but-unaudited row rule 15
+   forbids — becomes awkward to write. Today the correct shape is a markdown rule.
+2. **Rule 13 becomes a type.** `Tx` cannot be constructed outside `aberp-storage`.
+   A caller wanting a transaction must go through `Storage::write`. There is no
+   second way.
+3. **Fork-zero narrows from a gate to a visibility boundary** (§3.4).
 
-The closure form (`write(|tx| …)`) rather than a returned guard is deliberate: it
-makes the nested-`read()`-inside-`write()` self-deadlock (CLAUDE.md rule 13's last
-clause, ADR-0108 R-3) a *borrow-checker* problem rather than a runtime one, since
-`&mut Tx` is already exclusively borrowed. **Honest caveat:** it does not fully
+The closure form rather than a returned guard is deliberate: it makes the nested
+`read()`-inside-`write()` self-deadlock (rule 13's last clause; ADR-0108 R-3) a
+borrow-checker problem rather than a runtime one. **Honest caveat:** it does not
 eliminate it — a closure can still call `Storage::read` on a captured `&Storage`.
-The mutex-based `lock_recovering()` behaviour ADR-0108 R-3 pins as *binding* must
-survive inside `Storage` regardless. The seam reduces this hazard; it does not
-retire it, and any claim otherwise should be attacked.
+The mutex behaviour R-3 pins as *binding* must survive inside `Storage` regardless.
+The seam reduces this hazard; it does not retire it.
 
 ### 3.3 Where the cross-cutting concerns live — each written once
 
-| Concern | Lives in | Written once because |
+| Concern | Lives in | Replaces (from §2) |
 |---|---|---|
-| **Money** | `aberp-storage::codec` — `bind_money(i64)` / `read_money() -> i64`. Ports take `Money`/`Huf`/`Eur`; adapters call the codec. | ADR-0108 §3.1 R1 becomes one function pair per engine instead of a gate over 672 statements. A money column cannot be bound as anything else because no other bind function accepts a `Money`. |
-| **Exact decimals** (quantity, rate) | `aberp-storage::codec` — `bind_decimal` / `read_decimal`. | R2 today is guarded by *two* things (the Rust bind, and `tools/cut_gate_money_arith.sh` — ADR-0108 M-1, built 2026-08-01). Under the seam the second guard's job shrinks to "the adapter directory", because SQL exists nowhere else. |
-| **No arithmetic on money/qty in SQL** | Structurally: ports return rows; folds are domain functions (`aberp_billing::domain::invoice::{line_net_total, line_vat_amount}` — the M-2 fix, landed 2026-08-01). | The T-8 scanner keeps its job but its scope collapses from 295 files to ~15 adapter files. |
-| **DDL / `ensure_columns`** | `aberp-storage` (ADR-0108 §4.1's helper, promoted from `aberp-db`) + a per-port `const SCHEMA`. | 119 sites become ~15 adapter `ensure_schema` impls. The `&'static str` identifier rule (ADR-0108 §4.1) is preserved verbatim — it is already the right design. |
-| **Upsert** | A port method (`upsert_balance`, not `ON CONFLICT`). | 5 executable sites; the adapter chooses `ON CONFLICT DO NOTHING`, `INSERT OR IGNORE`, or `MERGE`. The `changes() == 0` idempotency signal becomes a documented return value (`Inserted`/`Skipped`), not an engine artefact. |
-| **Case-folded lookup** | A port method (`find_duplicate_partner(&Normalized)`), with the fold done in **Rust** (`to_lowercase()`) before the bind. | Kills the `LOWER()` ASCII trap at its root, for `partners.rs` *and* `products.rs`, once. This is ADR-0108 M11's prescription — the seam is where it has a home. |
-| **`LIKE` escaping** | Same: a port method takes a `SearchNeedle` newtype that escapes `%`/`_`/`\` in its constructor. | A raw `String` cannot reach a `LIKE` pattern. |
-| **Ordering / comparison on decimals** | Ports return rows; filtering and ordering are Rust folds. | ADR-0108 §3.4's site 7 (`repository.rs:548/585`, lexicographic `TEXT < TEXT` silently un-flagging a low-stock product) has no expression: there is no SQL for a domain author to write. |
-| **Error classification** | `StoreError` — a domain enum (`UniqueViolation`, `NotFound`, `Busy`, `Backend`). Adapters map. | The 3 `duckdb::Error::DuckDBFailure` sites (`incoming_invoices.rs:720`, `quote_intake_query.rs:438`, `:499`) that ADR-0108 §2.3 flags as *the only variant with no twin* stop being a portability problem: they are one `match` in one adapter. |
+| **Money** | `aberp-storage::codec` — `bind_money(Money)` / `read_money() -> i64`. Ports take `Money`/`Huf`/`Eur`. | §2.2 R1, enforced by a type instead of by `STRICT` + a census |
+| **Exact decimals** | `codec::bind_decimal` / `read_decimal`. | §2.2 R2 — the rule `STRICT` **cannot** enforce. The bind function is the enforcement. |
+| **Hashes** | `codec::bind_hash(&[u8])`. | §2.2 R3 / the PR #40 BLOB-vs-TEXT chain-link miss |
+| **No money arithmetic in SQL** | Structural: ports return rows, folds are domain functions (`line_net_total` / `line_vat_amount`). | §2.5 — `repository.rs:548` has no expression; the M-2 class cannot recur because there is one implementation, not two agreeing |
+| **DDL** | `aberp-storage::ensure_columns` (§2.7, promoted as-is) + a per-port `const SCHEMA`. | §2.1's 114 sites → ~15 adapter `ensure_schema` impls |
+| **Upsert** | A port method (`upsert_balance` → `Inserted` / `Skipped`), never `ON CONFLICT` at a call site. | §2.4 — and `changes() == 0` becomes a documented return value, not an engine artefact |
+| **Case-fold + `LIKE`** | A port method taking `Normalized` / `SearchNeedle` newtypes that fold and escape in their constructors. | §2.3 — partners *and* products, once. A raw `String` cannot reach a `LIKE` pattern. |
+| **Ordering / comparison on decimals** | Rust folds over `Decimal`. | §2.5's lexicographic silent-un-flag |
+| **Schema probing** | `aberp-storage` (`pragma_table_info` / `sqlite_master` / `information_schema` — adapter's choice). | §2.4's 7 `information_schema` sites and `print_invoice.rs:922`'s false portability claim |
+| **Error classification** | `StoreError` — `UniqueViolation` / `NotFound` / `Busy` / `Backend`. Adapters map. | §2.4's 3 `DuckDBFailure` sites |
 
 ### 3.4 Where the Handle, the mirror, and fork-zero sit
 
 - **Single-writer `Handle`** becomes `aberp-storage`'s private implementation of
-  `Storage::write`. Its API is *narrowed*, not widened: it stops handing out
-  `Connection` and hands out `&mut Tx`. Everything ADR-0108 §2.4 preserves
-  (the writer mutex, `lock_recovering()` on the read arm per R-3, `db_writer_lock`
-  / F-E cross-process fencing) is preserved unchanged and moves inside.
-- **Audit ledger + fsync mirror.** The commit ordering — business rows, audit
-  `append_in_tx`, mirror fsync — becomes `Tx::commit`'s single implementation
-  instead of a convention spread across call sites. ADR-0030's mirror keeps its
-  tamper-evidence role untouched; the seam changes *where the ordering is
-  written*, not what it is. **Explicitly out of scope:** whether the mirror's
-  *durability* role retires post-cutover (ADR-0107 §2, ADR-0108 §2.4 — both
-  correctly defer it).
-- **Fork-zero.** Today: 6 cut gates, ~3 712 LOC of scanners, a frozen 81-opener
-  census, 33 read-forks (14 live in-serve) frozen not fixed, and R-5 — *a foreign
-  connection's `close` silently destroys every later commit's durability*, **live
-  in production on 13 in-serve routes**. Under the seam, `Connection` is nameable
-  only inside `aberp-storage` and the adapter directory. A route handler
-  *cannot* open a connection, because it cannot name the type.
+  `Storage::write`. Its API is **narrowed, not widened**: it stops handing out
+  `Connection` and hands out `&mut Tx`. Everything ADR-0108 §2.4 preserves — the
+  writer mutex, `lock_recovering()` on the read arm (R-3), `db_writer_lock` /
+  F-E cross-process fencing — is preserved unchanged and moves inside.
+- **Audit ledger + fsync mirror.** The commit ordering (business rows → audit
+  `append_in_tx` → mirror fsync) becomes `Tx::commit`'s single implementation
+  instead of a convention spread across call sites. ADR-0030's tamper-evidence role
+  is untouched. **Out of scope:** whether the mirror's *durability* role retires
+  post-cutover — ADR-0107 §2 and ADR-0108 §2.4 both defer it, correctly.
+- **Fork-zero.** Under the seam, `Connection` is nameable only inside
+  `aberp-storage` and the adapter directory. A route handler *cannot* open a
+  connection, because it cannot name the type.
 
   **Two honest limits, because this is the claim most worth attacking.**
-  (a) An adapter still can, so the surface shrinks from **74 files to ~15
-  adapter files** — a ~5× reduction, in one greppable directory. That is a
-  narrowing, not an elimination, and the opener census should be *kept and
-  re-scoped to the adapter directory*, not deleted. (b) **This does not fix R-5.**
-  R-5 is live on DuckDB in production today and ADR-0108 §9 rules it must get its
-  own PR, before and independent of any migration. Nothing here changes that, and
-  a reader who takes "fork-zero becomes structural" as licence to defer R-5 has
-  misread this section.
+  (a) An adapter still can, so the surface shrinks from **74 files to ~15 adapter
+  files** — ~5×, in one greppable directory. A narrowing, not an elimination: keep
+  the opener census and **re-scope** it to the adapter directory rather than
+  deleting it (ADR-0108 Q9's reasoning holds).
+  (b) **This does not fix R-5** — *a foreign connection's `close` silently destroys
+  every later commit's durability*, live in production on 13 in-serve routes.
+  ADR-0108 §9 rules it gets its own PR, before and independent of the migration.
+  Nothing here changes that. A reader who takes "fork-zero becomes structural" as
+  licence to defer R-5 has misread this section.
 
 ### 3.5 What the seam deliberately does **not** abstract (rule 12)
 
-Named explicitly, because an unbounded seam is the failure mode rule 2 exists to
-stop:
-
 - **Not a query builder, not an ORM.** ADR-0019 §1 already forbids the ORM;
-  adapters write SQL directly, parameterized. Unchanged.
-- **Not a runtime engine selector.** ADR-0108 §2.2 D1 rejected linking both
-  engines and this ADR does not reopen it. Adapter selection stays compile-time
-  (`sqlite-engine` feature). **The seam and D1 are orthogonal** — D1 is about which
-  engine crate links; the seam is about which *layer* may name it.
-- **Not a replacement for `aberp_db::engine`'s type alias** (ADR-0108 §2.3 D2,
-  on PR #53). The re-export is a *good* cheap trick and stays as the adapter's
-  own import path. It abstracts the crate name; the seam abstracts the layer.
-  They compose.
-- **Not `aberp-snapshot`.** Snapshot/restore is engine-specific by nature. It gets
-  a small port (`fold_wal` / `verify_integrity` / `snapshot_to`) **only when a
-  second engine implements it** — i.e. it is `StorageEngine` (§1.2) done at the
-  moment it has two consumers instead of one day too early.
-- **Not the search/projection layer** (ADR-0019 §2). Projections stay projections.
-- **No in-memory adapter for a family until that family's port exists.** The
-  in-memory adapters are the ratchet (§4.3), not a testing-convenience side quest.
+  adapters write SQL directly, parameterized.
+- **Not a runtime engine selector.** ADR-0108 §2.2 D1 (compile-time cargo feature)
+  stands and is not reopened. **The seam and D1 are orthogonal:** D1 governs which
+  engine crate links; the seam governs which *layer* may name it.
+- **Not a replacement for `engine.rs`'s type alias** (§2.7). That re-export is a
+  good cheap trick and becomes the adapter's own import path. It abstracts the
+  crate name; the seam abstracts the layer. They compose.
+- **Not `aberp-snapshot`.** Engine-specific by nature. It gets a small port
+  (`fold_wal` / `verify_integrity` / `snapshot_to`) **only when a second engine
+  implements it** — i.e. `StorageEngine` (§1.2) done at the moment it has two
+  consumers instead of one day too early.
+- **Not the search/projection layer** (ADR-0019 §2).
+- **No in-memory adapter for a family until that family's port exists.**
 
 ---
 
-## 4. How "safe == fast" falls out
+## 4. The conformance suite — what makes swap #2 cheap
 
 ### 4.1 The swap recipe, after the seam
 
-A future engine swap (SQLite → Postgres for the SaaS lane, ADR-0059 / ADR-0100)
-becomes exactly three things:
+A future engine swap — SQLite → Postgres for the SaaS lane (ADR-0059 / ADR-0100) —
+becomes three things:
 
-1. **Implement one adapter directory** — ~15 files, one per port, containing SQL
-   only. No call site outside it changes. No domain type changes. No signature
-   in the 148-site set changes, because there are no engine-typed signatures left.
+1. **Implement one adapter directory** — ~15 files, SQL only. No call site outside
+   it changes; no domain type changes; no engine-typed signature changes, because
+   there are none left.
 2. **Pass the conformance suite** (§4.2). Every adapter must. This is the gate.
 3. **Migrate the data**, with the reconciliation gate ADR-0108 §6.3 already
    specifies (per-table row counts, per-money-column sums, `verify_chain`
    genesis→head).
 
-Steps 1 and 3 are unavoidable under any design. **Step 2 is what converts "safe"
-and "fast" into the same path**: today the safety of a crossing is established by
-a bespoke, per-family, hand-written argument (ADR-0108's twelve mitigations, T-1…T-21,
-each mutation-verified — excellent work, and *written once for one crossing*).
-With the suite, the safety argument is a **standing asset**: it was paid for on
-crossing #1 and it runs unchanged on crossings #2 and #3.
+Steps 1 and 3 are unavoidable under any design. **Step 2 is what makes "safe" and
+"fast" the same path.** Today the safety of a crossing is a bespoke, per-family,
+hand-written argument — ADR-0108's twelve mitigations and T-1…T-21, each
+mutation-verified, excellent work, and **written once, for one crossing**. With the
+suite, the safety argument becomes a standing asset: paid for once, run unchanged
+on every crossing after.
 
-That is the concrete mechanism, and it should be stated without inflation: the
-seam does not make the *first* crossing cheaper. It makes every crossing after
-the first cheap, and it makes them cheap by making them *safe by the same
-artefact*.
+Stated without inflation: **the seam does not make crossing #1 cheaper.** It makes
+every crossing after the first cheap, and it makes them cheap by making them *safe
+by the same artefact*.
 
-### 4.2 What the conformance suite pins
+### 4.2 What the suite pins
 
-Two tiers. Tier 1 is semantics — every adapter, including in-memory. Tier 2 is
-durability — persistent adapters only.
+Tier 1 = semantics, every adapter including in-memory. Tier 2 = durability,
+persistent adapters only.
 
-**Tier 1 — semantics (every adapter):**
+| # | Pin | Red when | From |
+|---|---|---|---|
+| **C1** | Money round-trip: `Huf`/`Eur` in → identical out, incl. `i64::MIN/MAX`, negative, zero | any float path, any lossy affinity | §2.2 R1 |
+| **C2** | Money overflow is **loud** — a sum overflowing `i64` returns `Err` | silent wrap | §2.2 |
+| **C3** | Exact decimal round-trip at scale 6, trailing zeros, negatives; `0.1+0.2` never appears | `TEXT`-affinity float stringification — **the hole `STRICT` does not close** | §2.2 R2 |
+| **C4** | BLOB ≠ TEXT: a hash written `&[u8]` is found by `&[u8]`, **not** by the equivalent `&str` | the PR #40 chain-link-not-found shape | §2.2 R3 |
+| **C5** | Upsert: existing PK → `Skipped`, mutates nothing; new PK → `Inserted` | `changes()` divergence | §2.4 |
+| **C6** | Case-fold: `Árvíztűrő tükörfúrógép Kft.` ≡ `ÁRVÍZTŰRŐ TÜKÖRFÚRÓGÉP KFT.`; same for the products guard | **any ASCII-only fold** | §2.3 — would have caught M11 pre-crossing |
+| **C7** | `LIKE` needle escaping: `100% Precision _ Machining` matches only itself | metacharacter over-match | §2.3 |
+| **C8** | Ordering & comparison: `9 < 10` on a quantity column; `NULL` ordering explicit; no storage-class ordering leak | the `repository.rs:548/585` silent un-flag | §2.5 |
+| **C9** | DDL idempotence + fail-loud: twice = no-op; missing table = `Err`; post-condition re-read asserts every column present | ADR-0108 M8 / PR #49 F-1c | §2.1 |
+| **C10** | Empty result is explicit — `Ok(vec![])` distinguishable; **no port method has a `Default` fallback** | the D2a shape (`.unwrap_or_default()` → vacuous guard → 0% ÁFA re-file) | §2.1 |
+| **C11** | Error classification: PK violation → `StoreError::UniqueViolation`, not `Backend` | the 3 `DuckDBFailure` sites' string-sniffing | §2.4 |
+| **C12** | Rule-15 atomicity: business insert + audit append in one `Tx`; an `Err` from the audit arm leaves **zero** business rows | torn written-but-unaudited row | §3.2 |
+| **C13** | Commit survives `SIGKILL`: `commit()` returned `Ok` ⇒ row present after kill + reopen | the July class (ADR-0107 §1.1) | Tier 2 |
+| **C14** | A second connection **cannot un-durable a prior commit** — open a foreign connection, close it, assert prior commits survive *and* later commits land | **R-5** | Tier 2 |
+| **C15** | Monotonic sequence floor: after kill+reopen the allocator never re-issues | S444 / PR #46 | Tier 2 |
+| **C16** | Single-writer + nesting: writers serialize; `read` inside `write` does not deadlock | ADR-0108 R-3 / T-21 | Tier 2 |
+| **C17** | Durability pragmas configured **and mutation-verified** | ADR-0107 §4.1: a pragma no test can red is not configured | Tier 2 |
 
-| # | Pin | Red when |
-|---|---|---|
-| C1 | **Money round-trip.** `Huf(i64)`/`Eur(i64)` in → identical out, incl. `i64::MIN/MAX`, negative, zero. | any float path; any lossy affinity |
-| C2 | **Money overflow is loud.** A sum that overflows `i64` returns `Err`, never a wrapped or coerced value. | silent wrap (ADR-0108 §3.1's rejected scaled-integer hazard) |
-| C3 | **Exact decimal round-trip.** `Decimal` at scale 6, trailing zeros, negatives, `0.1+0.2` never appears. | `TEXT`-affinity float stringification (the exact hole `STRICT` does **not** close — ADR-0108 §3.1 correction) |
-| C4 | **BLOB ≠ TEXT.** A hash written as `&[u8]` is found by a `&[u8]` lookup and **not** by the equivalent `&str`. | the PR #40 chain-link-not-found shape |
-| C5 | **Upsert.** `upsert` on an existing PK returns `Skipped` and mutates nothing; on a new PK returns `Inserted`. | `changes()` semantics divergence |
-| C6 | **Case-fold.** `Árvíztűrő tükörfúrógép Kft.` and `ÁRVÍZTŰRŐ TÜKÖRFÚRÓGÉP KFT.` are the same partner; `products.rs`' name guard likewise. | **any ASCII-only fold** — this is the pin that would have caught ADR-0108 M11 before the crossing |
-| C7 | **`LIKE` needle escaping.** A needle containing `%` and `_` matches only the literal (`100% Precision _ Machining`). | unescaped metacharacter over-match |
-| C8 | **Ordering & comparison.** `9 < 10` on a quantity column ordering; `NULL` ordering explicit; no storage-class ordering leak. | the `repository.rs:548/585` lexicographic silent-un-flag |
-| C9 | **DDL idempotence + fail-loud.** `ensure_schema` twice is a no-op; a missing table is `Err`, never `Ok(())`; the post-condition re-read asserts every requested column present. | ADR-0108 §4.1's M8 / F-1c fail-open |
-| C10 | **Empty result is explicit.** A no-rows query returns `Ok(vec![])` distinguishably; **no port method has a `Default` fallback.** | the D2a shape — `.unwrap_or_default()` making an ADR-0101 guard pass vacuously |
-| C11 | **Error classification.** A PK violation → `StoreError::UniqueViolation`, not `Backend`. | the 3 `DuckDBFailure` sites' string-sniffing |
-| C12 | **Rule-15 atomicity.** A business insert + audit append in one `Tx`; an `Err` from the audit arm leaves **zero** business rows. | torn written-but-unaudited row |
-
-**Tier 2 — durability (persistent adapters only):**
-
-| # | Pin | Red when |
-|---|---|---|
-| C13 | **Commit survives `SIGKILL`.** `commit()` returned `Ok` ⇒ the row is present after kill + reopen. | the July class (ADR-0107 §1.1) |
-| C14 | **A second connection cannot un-durable a prior commit.** Open a foreign connection on the same path, close it, assert every prior commit survives *and* every later commit lands. | **R-5** — this is the pin that would have caught it |
-| C15 | **Monotonic sequence floor.** After kill+reopen, the allocator never re-issues an already-issued number. | S444 / PR #46 |
-| C16 | **Single-writer + nesting.** Concurrent writers serialize; a `read` inside a `write` does not deadlock (ADR-0108 R-3 / T-21). | |
-| C17 | **`fullfsync` / durability pragmas are configured *and* mutation-verified.** | ADR-0107 §4.1's rule: a pragma no test can red is not configured |
-
-Seventeen pins. **Every one of them already exists somewhere** — as a
-DuckDB-specific test, an ADR-0108 mitigation (M1…M12), a cut gate, or a defect
-write-up. The suite's novelty is not the assertions; it is that they become
-**adapter-parametric** and therefore reusable. That is worth stating plainly
-because it is also the honest cost: writing the suite is largely a *port* of
-existing test intent, which is why §5 scores it as the largest genuinely-new item
-but not an unbounded one.
+Seventeen pins. **Every one already exists somewhere** — as an engine-specific
+test, an ADR-0108 mitigation, a cut gate, or a defect write-up. The novelty is not
+the assertions; it is that they become **adapter-parametric and therefore
+reusable**. That is also the honest cost: writing the suite is largely a *port of
+existing test intent*, which is why §5 scores it as the largest genuinely-new item
+but a bounded one.
 
 ### 4.3 What keeps the seam alive
 
-§1.2's lesson, answered directly. A seam with one implementation dies. The seam
-therefore ships with **two permanent implementations and one ratchet**:
+§1.2's lesson, answered structurally. After cutover the DuckDB adapter is deleted,
+so the seam is back to **one engine adapter** — the exact condition that killed
+`StorageEngine`. Three things prevent the repeat:
 
 1. **The in-memory adapter** (ADR-0019 §1 already mandates it) is the *permanent*
-   second implementation. It cannot be inlined away by a refactor because the
-   conformance suite runs against it and module tests depend on it. It is the
-   reason `StorageEngine` died and `BillingStore` did not.
+   second implementation. It cannot be inlined away because the conformance suite
+   runs against it and module tests depend on it. This is not a testing nicety; it
+   is the seam's structural reason to exist between swaps.
 2. **The conformance suite** is the executable definition of the port contract. A
-   port method with no C-pin is a port method nobody can safely reimplement.
-3. **A `no-engine-types-outside-adapters` cut gate** — structural (per PR #43's
-   lesson: match the *shape*, and per `c065351`'s lesson: survive `rustfmt`). It
-   asserts that `duckdb::` / `rusqlite::` / `Connection` / `params!` appear only
-   under an adapter path. Today that gate would report **74 violations**; it lands
-   as a ratchet at 74 and can only shrink. **This is the artefact that has been
-   missing since 2026-05-19** — the reason nobody noticed ADR-0019 §1 was unbuilt
-   is that no gate could say so.
+   port method with no C-pin is a method nobody can safely reimplement.
+3. **A `no-engine-types-outside-adapters` cut gate** — structural (PR #43's lesson:
+   match the *shape*; `c065351`'s lesson: survive `rustfmt`). It asserts that
+   `rusqlite::` / `Connection` / `params!` appear only under an adapter path. **This
+   is the artefact that has been missing since 2026-05-19** — the reason nobody
+   noticed ADR-0019 §1 was unbuilt is that no gate could say so. Its timing is
+   §5.4.
 
 ---
 
-## 5. Honest cost
+## 5. Honest cost, and the risk
 
 ### 5.1 The estimate
 
-Ranges, not points. Basis stated for each so the estimate is attackable.
+Ranges, with the basis stated so each is attackable. Assumes step 5 starts from the
+post-cutover tree: SQLite only, DuckDB adapter deleted, §2.7's foundation intact.
 
-| Work item | Net-new LOC | Moved LOC | Judgment or mechanical |
+| Work item | Net-new LOC | Moved LOC | Kind |
 |---|---:|---:|---|
-| `aberp-storage` crate: `Tx`/`ReadTx`, `Storage`, codec, `ensure_columns`, commit ordering — absorbing today's `aberp-db` (705 LOC lib + the crate's 1 585 total per ADR-0107 §2) | 400–700 | ~1 600 | **Judgment** — the `Tx` design (§3.2) is the hard part |
-| ~15 port traits, ~180–220 methods (basis: 757 src SQL statements at ~3–4 statements per domain operation; sanity-checked against `BillingStore`'s 8 methods, which under-cover their own family — §8.3) | 800–1 200 | 0 | **Judgment** — where the port lines go (ADR-0006 is the input) |
-| Adapter impls (DuckDB): 757 SQL statements relocated + one wrapper fn each | 2 000–3 000 | ~4 000–6 000 | **Mechanical** — the SQL text is already written and already portable |
-| Call-site rewrite: 148 engine-typed signatures + their callers | 300–600 (net delta) | — | **Mechanical**, but 74 files × rule 14 |
-| **Conformance suite** (17 pins × 2–4 cases, adapter-parametric harness) | **1 500–2 200** | ~800 (ported intent) | **Judgment** — the highest-value item |
-| In-memory adapters (~15) | 1 200–1 800 | ~235 (billing's, as the template) | Mostly **mechanical** |
-| The `no-engine-types-outside-adapters` gate + probes (basis: existing gates run 300–600 LOC each incl. probe suites) | 400–700 | 0 | **Mechanical**, with one judgment call: the ratchet's initial baseline |
-| **Total** | **≈ 6 600 – 10 200 net-new** | **≈ 6 600 – 8 600 moved** | |
+| `aberp-storage`: `Tx`/`ReadTx`, `Storage`, codec, commit ordering — absorbing `aberp-db` (705 LOC lib; 1 585 crate total per ADR-0107 §2) plus §2.7's `engine.rs` (164) / `schema.rs` (386) / `sqlite.rs` / `engine_path.rs` | 400–700 | ~2 200 | **Judgment** — `Tx` (§3.2) is the hard part |
+| ~15 port traits, ~180–220 methods (basis: 757 src SQL statements at ~3–4 per domain operation; sanity-checked against `BillingStore`'s 8, which under-cover their own family — §1.2) | 800–1 200 | 0 | **Judgment** — where the port lines go |
+| Adapter impls (SQLite): 757 statements relocated + one wrapper fn each | 2 000–3 000 | ~4 000–6 000 | **Mechanical** — the SQL text already exists |
+| Call-site rewrite: 148 engine-typed signatures + their callers | 300–600 net | — | **Mechanical**, but 74 files × rule 14 |
+| **Conformance suite** (17 pins × 2–4 cases + adapter-parametric harness) | **1 500–2 200** | ~800 ported intent | **Judgment** — highest value |
+| In-memory adapters (~15) | 1 200–1 800 | ~235 (billing's, as template) | Mostly **mechanical** |
+| `no-engine-types-outside-adapters` gate + probes (basis: existing gates run 300–600 LOC each incl. probes) | 400–700 | 0 | **Mechanical**; one judgment call — the ratchet's baseline |
+| **Total** | **≈ 6 600 – 10 200 net-new** | **≈ 7 200 – 9 200 moved** | |
 
-**Effort.** ~15 gated steps, one per family, sized like ADR-0108's steps (which
-have been landing at roughly one per session). **Standalone: 10–15 sessions.**
-Folded into the remaining ADR-0108 crossings (§6): **4–7 additional sessions**,
-because the SQL relocation happens during a crossing anyway — the marginal work is
-writing the trait and the in-memory impl, not moving the SQL.
+**Effort: ~15 gated steps, one per family, sized like ADR-0108's — which have been
+landing at roughly one per session. Call it 10–15 sessions.**
 
-**Where I would be most wrong:** the port-count. I estimate ~15 ports from the
-family decomposition ADR-0108 §7 already uses (invoice, partners, inventory,
-work-orders, quoting, ledger, email, dispatch, qa, purchasing, …). If the real
-answer is 25 ports because families do not decompose as cleanly as the migration's
-step boundaries suggest, the trait and in-memory rows both scale ~1.6× and the
-total lands near 14 000. That is the single number an adversarial should push on.
+That figure assumes the decided order (§0): the retrofit starts from zero because
+each remaining family will already have been hand-translated during steps 1–2. An
+interleaved order would have cost 4–7; the difference is the accepted price of
+finishing the cutover on a stable plan.
 
-### 5.2 Mechanical vs judgment, stated sharply
+**Where I am most likely wrong: the port count.** ~15 comes from ADR-0108 §7's
+family decomposition (invoice, partners, inventory, work-orders, quoting, ledger,
+email, dispatch, qa, purchasing, …). If the real answer is 25 because families do
+not decompose as cleanly as the migration's step boundaries suggest, the trait and
+in-memory rows both scale ~1.6× and the total lands near **14 000**. That is the
+number an adversarial should push on first.
 
-**Mechanical (≈70% of the LOC, ≈30% of the risk):** relocating SQL text into
-adapters; the `use duckdb::X` → adapter-local import rewrite; wrapping each
-statement in a function; the `params!` sites, which **do not change at all** —
-they move.
+### 5.2 Mechanical vs judgment
 
-**Judgment (≈30% of the LOC, ≈70% of the risk), four items:**
+**Mechanical (≈70% of LOC, ≈30% of risk):** relocating SQL text into adapters; the
+import rewrite; wrapping each statement in a function; the `params!` sites, which
+**do not change at all** — they move.
 
-1. **`Tx` composition (§3.2).** Get this wrong and rule 15 becomes unexpressible,
-   or `Tx` leaks the engine and the seam is theatre. This is the one piece that
-   must be designed before any family moves.
-2. **Port boundaries.** A port too fine is an ORM by accretion; too coarse and
-   cross-family reads force either a god-port or an engine-typed escape hatch.
-   ADR-0006 module boundaries is the input, but the invoice↔ledger↔numbering fusion
-   (ADR-0108's Step-5 "fused family") does not respect module lines and will need a
-   ruling.
+**Judgment (≈30% of LOC, ≈70% of risk), four items:**
+
+1. **`Tx` composition (§3.2).** Get it wrong and rule 15 becomes unexpressible, or
+   `Tx` leaks the engine and the seam is theatre. Must be designed before any
+   family moves.
+2. **Port boundaries.** Too fine is an ORM by accretion; too coarse forces a
+   god-port or an engine-typed escape hatch. ADR-0006 is the input, but the
+   invoice↔ledger↔numbering fusion (ADR-0108's Step-5 "fused family") does not
+   respect module lines and needs a ruling.
 3. **What stays out (§3.5).** Every "while we're here" is 200 lines deleted next
    quarter (rule 2).
-4. **The 17 C-pins' *contents*.** A pin that cannot go red is worse than no pin —
+4. **The 17 pins' *contents*.** A pin that cannot go red is worse than no pin —
    ADR-0108's own M-1 is the case study: three landed artefacts cited T-8 while
    `tools/` held no implementation.
 
 ### 5.3 The risk of doing it
 
-Stated as an auditor would:
-
-- **This is a large refactor over a legally-binding tax ledger with 8-year
-  statutory retention (ADR-0009).** That is the top-line risk and it does not
-  reduce to zero.
-- **Mitigating fact, and it is a real one:** the retrofit is **behaviour-preserving
-  by construction**. No file moves, no schema changes, no data migration, the same
-  SQL text executes against the same engine. This is categorically different from
-  ADR-0108's crossing, which changes storage. The available proof technique is the
-  one that already worked: ADR-0108's **T-4 byte-identity** test (landed, *zero
-  divergence* across mixed-rate, storno, and modification invoices). A retrofit
-  step that keeps T-4 green has not changed the filed artefact.
+- **It is a large refactor over a legally-binding tax ledger with 8-year statutory
+  retention (ADR-0009).** That does not reduce to zero.
+- **The mitigating fact is structural and real:** the retrofit is
+  **behaviour-preserving by construction** — no file moves, no schema change, no
+  data migration, the same SQL text against the same engine. This is categorically
+  different from the cutover, which changes storage. **That asymmetry is exactly
+  why the decided order is right** (§0): the dangerous step happens first, on a
+  finished plan; the seam happens second, when it cannot lose data.
+- **The proof technique already exists and already worked:** ADR-0108's **T-4
+  byte-identity** test (landed, *zero divergence* across mixed-rate, storno and
+  modification invoices). A retrofit step that keeps T-4 green has not changed the
+  filed artefact. Each family step should carry a byte-identity or differential
+  gate of its own.
 - **Blast radius is bounded by rule 14** — per family, per step, each landing on a
   gate-green base, each independently revertable, because no step changes storage.
 - **The genuine hazard is a silent behaviour change during relocation** — a
   `.unwrap_or_default()` reintroduced, an error arm collapsed, a `NULL` handling
-  difference. C10 and C11 exist for exactly this, and per-family byte-identity or
-  differential tests should gate each step. **This is where a step will actually go
+  difference. C10 and C11 exist for this. **This is where a step will actually go
   wrong**, not in the design.
-- **Concurrency with ADR-0108.** PR #53 is live and has landed money-path changes
-  (the M-2 ÁFA rounding fix *moves published figures*). Any seam work must not
-  collide. §6 is entirely about this.
+- **A post-cutover-specific hazard:** step 5 runs on the *production* line, not on
+  a reversible DEV branch. ADR-0108's rollback (§6.2) protects the engine change,
+  not this refactor. Step 5's safety net is the gates and T-4-style differential
+  pins, and it should be planned as such from the first step rather than
+  discovered at step 8.
+
+### 5.4 A correction to my own earlier recommendation
+
+An earlier draft of this ADR recommended landing the
+`no-engine-types-outside-adapters` gate **immediately and standalone**, on the
+grounds that it is behaviour-neutral and pays off under every branch.
+
+**§2.8 says that is wrong, and the measurement is the reason.** During steps 1–3
+the count legitimately *rises* — 74 → 81 — because migrator tooling must name both
+engines by construction. A ratchet that has to be raised twice while it is being
+installed is not a ratchet; it is a nuisance that teaches the next session to
+raise it again. Landing it now would also put a new red gate across an in-flight
+PR, which §0 forbids.
+
+**It belongs at step 4**, where the migrator binaries have been deleted, the count
+has settled at its true post-cutover value, and the baseline it freezes is a number
+worth defending. It is still the cheapest item in this ADR and still the one that
+pays off even if the rest of the seam is never built — just not yet.
 
 ---
 
-## 6. Sequencing — the decision for Ervin
+## 6. Execution — what step 4 hands to step 5
 
-### Option A — finish ADR-0108's safe-track first, then seam-and-retrofit
+**Step 4's output** (the "deduce consequences" step) is: this §2, re-measured
+against the post-cutover tree, plus whatever the cutover itself adds. Three things
+specifically will have changed and must be re-measured rather than inherited:
 
-Complete Steps 7–9 (inventory, work-orders, email; quoting; cutover prep) on the
-current type-alias approach. Then build `aberp-storage`, the ports, the conformance
-suite, and retrofit the completed SQLite path family by family.
+1. **The counts.** §2.0's census is a `main`-@-`3f062ac` snapshot. Post-cutover,
+   the migrator binaries are gone and every family has crossed; the true retrofit
+   surface is smaller than 757/74/148 and must be re-taken, not extrapolated.
+2. **Which §2 rows survived as *defects* rather than as costs.** M11/T-12 (§2.3),
+   the products finding, the `DOUBLE` vs `DECIMAL` divergence (§2.6) and R-5 are
+   open items with owners; step 4 confirms each is closed or carries it forward.
+3. **The `no-engine-types-outside-adapters` baseline** (§5.4) — measured and frozen
+   at step 4, ratcheting from there.
 
-**For:**
-- **The seam's shape is an *output* of two working adapters, not an input.**
-  ADR-0019 §1 says this in its own words: *"The trait shape is constrained by what
-  **two** real backends need."* Under A, both adapters exist and the trait is
-  **extracted** — mechanical and verifiable. Under B it is **designed** — judgment,
-  against one working engine and one half-crossed one, which is the worst possible
-  input.
-- The retrofit becomes a **pure behaviour-preserving refactor** (§5.3) — a
-  fundamentally lower-risk operation than a mid-flight pivot on a legal ledger.
-- ADR-0108 is ~⅔ landed (Steps 1–4, 5's migrator half, 7A, 7B, T-8) with a working
-  rollback (§6.2) and a live PR. Its remaining steps are known and scoped.
-- Nothing landed is thrown away: the type alias (D2) becomes the adapter's import;
-  `ensure_columns` becomes `aberp-storage`'s; the R1/R2/R3 rules become the codec;
-  T-8's scanner keeps its job at 1/20th the scope.
+**Step 5's first commit is not a port.** It is `aberp-storage`'s `Tx` (§3.2),
+because every port signature depends on it and getting it wrong invalidates all
+~200 methods. Design it, pin C12 against it, and only then cross the first family.
 
-**Against:**
-- The remaining crossings (quoting is ~55 DDL sites; inventory + work-orders carry
-  the §3.4 fold sites) get hand-translated **once more** — the very thing Ervin is
-  objecting to.
-- "Then" is where architectural work goes to die. §1.2 is the precedent: a seam
-  scheduled after the urgent thing lasted one day.
-
-### Option B — pivot now to seam-first
-
-Pause ADR-0108 after the current step, build `aberp-storage` + ports + the
-conformance suite against the DuckDB adapter, then let the seam carry the
-remaining families across.
-
-**For:**
-- Purer. The remaining ~5 families cross once, through the seam.
-- Ervin's driver taken at face value: stop hand-translating, build the thing that
-  makes translation unnecessary.
-
-**Against:**
-- **Designs the trait against one-and-a-half engines** — the failure mode ADR-0019
-  §1 explicitly warned about.
-- **Doubles the blast radius per family.** Each remaining family would cross the
-  engine seam *and* the repository seam in one commit, on the invoice/ÁFA/NAV
-  path. Rule 14 is satisfied per family but the change per step is ~2×.
-- **Mid-flight turn on a live PR with landed money-path changes.** PR #53 carries
-  the M-2 rounding fix that moves published ÁFA figures. A pause here leaves the
-  tree in a state where some families have crossed and some have not — ADR-0108's
-  rollback (§6.2) is designed for that, but it is designed for a *pause*, not for a
-  months-long parallel architecture programme.
-- The seam does not make crossing #1 cheaper (§4.1). B pays the seam's full cost
-  *and* the migration's remaining cost, in series, before either delivers.
-
-### Recommendation: **A**, with one non-optional modification
-
-**Take Option A.** The decisive argument is not schedule risk; it is that
-**ADR-0019 §1's own rule says the trait must be shaped by two real backends, and
-under B there is only one.** Building the seam now means guessing at the contract
-and then discovering it — which is how we get a `StorageEngine` that lasts a day,
-or a `BillingStore` that 46 concrete `DuckDbBillingStore` references route around.
-Under A the contract is *read off* two working adapters. That is the difference
-between extraction and invention, and extraction is the one that survives.
-
-The modification, which is **part of the recommendation and not a third option**:
-
-> **Each remaining ADR-0108 crossing puts its family's SQL behind a module-local
-> port as part of the crossing commit** — trait + adapter + in-memory impl, no
-> generic `aberp-storage` layer, no `Tx` type, no cross-family design. Just: this
-> family's SQL now lives in one file behind one trait.
-
-This is rule-14-shaped (one family, writers and readers together, one commit), and
-rule-2-safe (each port has two consumers *immediately* — the DuckDB adapter that
-backs rollback, and the SQLite one). It costs **~30–40% more per remaining step**
-and it means the §5 retrofit starts from ~40% done instead of zero — which is what
-turns "10–15 sessions" into "4–7".
-
-**And the escape clause, because a modification that endangers the primary goal is
-a bad modification (rule 3):** if it threatens Steps 7–9's gate-green cadence,
-**drop it** and retrofit wholesale afterwards. The migration finishing is the
-higher-priority objective. Say so in the step's PR body rather than letting it
-lapse silently.
-
-**What would change my recommendation to B.** If Ervin's roadmap moves the SaaS
-lane (ADR-0059 / ADR-0100 — Postgres-per-tenant) inside ~6 months, then swap #2
-arrives before A's retrofit would finish, the seam's payoff moves from swap #3 to
-swap #2, and B's "pay it once" argument wins on arithmetic. **That is a roadmap
-question I cannot answer from the tree, and it is the single input that flips
-this.** ADR-0107 §4 makes the same conditional call in the same direction and
-should be read alongside.
+**Suggested family order for step 5**, and the reason: start with a *leaf* family
+with no cross-module transaction (dispatch or qa), to shake out the port shape
+cheaply; take the invoice↔ledger↔numbering fusion **second**, while the C12
+atomicity pin is fresh and before ~13 more ports have been shaped by families that
+never exercised it. Do not save the hard one for last — the fused family is the one
+that determines whether `Tx` is right, and discovering it is wrong at step 12 costs
+everything built before it.
 
 ---
 
 ## 7. Consequences
 
-**If accepted (A + the modification):**
+**If this blueprint is executed at step 5:**
 
 - ADR-0019 §1 stops being aspirational. Its "never imports DuckDB types" clause
-  becomes a gate (§4.3.3) that can go red, at a ratchet baseline of 74.
+  becomes a gate that can go red.
 - Engine swap #2 (SQLite → Postgres, SaaS) costs one adapter directory plus a
   conformance run instead of a second full hand-translation.
 - Rules 13 and 15 move from markdown into the type system (§3.2). Rule 14 stays —
   it is a *migration* rule, not an engine one.
-- The fork-zero surface narrows 74 → ~15 files. The census and gates are
-  **re-scoped, not deleted** (ADR-0108 Q9's reasoning holds: a gate deleted cannot
-  protect the state you roll back to).
-- The quantity-representation divergence (§1.5) gets a place to be decided.
-- **Cost:** 6 600–10 200 net-new LOC and 4–7 extra sessions folded into ADR-0108's
-  remaining steps, on top of ADR-0108's own remaining cost. Each remaining
-  crossing step gets ~30–40% larger.
+- The fork-zero surface narrows 74 → ~15 files; the census is **re-scoped, not
+  deleted**.
+- The quantity-representation divergence (§2.6) gets a place to be decided.
+- **Cost:** 6 600–10 200 net-new LOC, 10–15 sessions (§5.1).
 - **Locked in:** SQL lives in adapters, forever. Any future "just one quick query
-  here" in a route handler is a gate violation. That is the point, and it is also
-  a permanent tax on small changes — worth naming as a cost, not only a benefit.
+  here" in a route handler becomes a gate violation. That is the point, and it is
+  also a permanent tax on small changes — named as a cost, not only a benefit.
 
-**If rejected:** ADR-0019 §1 should be **amended to say what we actually do** —
-dialect-portability discipline (`[[no-sql-specific]]`), not a repository seam.
-Leaving an Accepted cornerstone ADR describing infrastructure that does not exist
-is worse than either building it or retracting it, because the next engine
-decision will be costed against the ADR rather than against the tree — which is
-exactly what happened to ADR-0107 §3's `StorageEngine` citation.
+**If it is never executed:** ADR-0019 §1 should be **amended to say what we
+actually do** — dialect-portability discipline (`[[no-sql-specific]]`), not a
+repository seam. Leaving an Accepted cornerstone ADR describing infrastructure that
+does not exist is worse than either building it or retracting it, because the next
+engine decision will be costed against the ADR rather than against the tree. That
+is not hypothetical: it is exactly what happened to ADR-0107 §3's `StorageEngine`
+citation (§1.2).
 
 ---
 
 ## 8. Adversarial review — three concerns answered in advance
 
-**1. "This is the speculative abstraction rules 2 and 12 forbid. You are proposing
-a wrapper for a swap that may never happen."**
-Partly conceded, and the concession is specific. It would be speculative if the
-second consumer were hypothetical. It is not: ADR-0059 and ADR-0100 both name
-Postgres-per-tenant for the SaaS lane, and ADR-0019 §1 names it as the second
-backend the trait must be shaped by. Two named consumers, one of them already
-in a phased plan. **But** the rule-12 objection lands squarely on §1.2's lesson,
-and the answer must be structural rather than rhetorical: the seam ships with a
-permanent second implementation (in-memory), an executable contract (the 17 pins),
-and a ratchet gate — because a seam without those is exactly the thing S426 was
-right to delete.
+**1. "Why write this now? The consequences do not exist yet — you are documenting a
+migration that has not finished."**
+Half conceded, and the half that is conceded is scoped: §2's *counts* are a
+pre-cutover snapshot and §6 requires them re-measured. What is **not** premature is
+the *classes*: the 114 DDL sites, the `STRICT`-does-not-protect-R2 correction, the
+ASCII `LOWER()`, the lexicographic `TEXT` comparison, the M-2 rounding fork. Those
+were discovered *by* the crossing and each cost real engineering to find. Writing
+them down after the cutover means writing them from memory and a diff, six weeks
+later — which is precisely how ADR-0107 came to cite a seam that had been deleted
+(§1.2). **Evidence is perishable; this ADR is the container, and the timing is the
+point.**
 
-**2. "You are proposing a large refactor over a legally-binding tax ledger, on top
-of an in-flight migration of the same ledger. The risk is not worth it."**
-The risk is real and §5.3 does not minimise it. Three things bound it: the
-retrofit changes **no storage** and is behaviour-preserving by construction; it is
-per-family under rule 14 with each step independently revertable; and the proof
-technique already exists and already returned zero divergence (T-4 byte-identity,
-landed). The recommendation is also the *conservative* branch — A explicitly
-refuses to turn the migration mid-flight, and the modification carries an escape
-clause that subordinates the seam to the migration's cadence.
+**2. "This is the speculative abstraction rules 2 and 12 forbid."**
+It would be, if the second consumer were hypothetical. ADR-0059 and ADR-0100 both
+name Postgres-per-tenant for the SaaS lane, and ADR-0019 §1 names it as the second
+backend the trait must be shaped by. **But** the rule-12 objection lands squarely
+on §1.2 and must be answered structurally, not rhetorically: after cutover the
+DuckDB adapter is deleted and the seam is back to *one engine*. That is why the
+in-memory adapter is load-bearing (§4.3) — without it, §5's 10 000 lines are a
+wrapper waiting for its own `a1edbb0`.
 
-**3. "Your central evidence — that the seam decayed — proves the opposite of your
-thesis. It shows this codebase does not sustain seams. Why will this one survive?"**
-This is the strongest attack and it deserves the honest answer: **on the current
-evidence, it would not.** `StorageEngine` lasted one day; `BillingStore` survives
-but is routed around (46 concrete `DuckDbBillingStore` references vs 13 to the
-trait, in `apps/` + `crates/`; and 922 of `duckdb_store.rs`'s 1 492 lines sit
-*outside* the `impl BillingStore` block at `:923`). Both decayed for the same
-reason: **nothing could measure the decay.**
-
-To put the second one precisely, because it is the more instructive: the
-`impl BillingStore` block spans `duckdb_store.rs:923–1082` — **160 lines of
-1 492**. Roughly 89% of the "adapter" is inherent methods and DDL reachable
-without touching the port at all. `BillingStore` is not a seam either; it is a
-door in a wall with no other walls.
-
-The seam is therefore not the proposal — the seam *plus its ratchet* is. If Ervin takes this ADR's design and
-declines §4.3's gate, the honest prediction is that the seam is ~60% intact in six
-months and cited as complete in the ADR after next. The gate is not a nice-to-have;
-it is the only part of this proposal with a track record in this repository.
+**3. "Your own evidence proves the opposite of your thesis. This codebase does not
+sustain seams. Why will this one survive?"**
+The strongest attack, and the honest answer is: **on the current evidence, it would
+not.** `StorageEngine` lasted a day; `BillingStore` survives but is routed around
+(160 of 1 492 adapter lines inside the `impl`; 46 concrete references vs 13 to the
+trait). Both decayed for one reason: **nothing could measure the decay.** So the
+proposal is not the seam — it is the seam *plus* the in-memory adapter, the 17
+pins, and the ratchet gate. If step 5 ships the traits and declines §4.3, the
+honest prediction is that the seam is ~60% intact in six months and cited as
+complete in the ADR after next. The gate is not a nice-to-have; **it is the only
+part of this proposal with a track record in this repository.**
 
 ---
 
 ## 9. Deferral ledger (CLAUDE.md rule 3)
 
-Found while grounding this ADR. **None fixed here** — this is a docs-only change.
+Found while grounding this ADR. **None fixed here** — docs-only.
 
 | Item | Closed by |
 |---|---|
-| **ADR-0107 §3 (Option B, reason 5) cites `StorageEngine` / `DuckDbEngine` / `const STORAGE_ENGINE` as an existing engine-swap seam. It was deleted at `a1edbb0` (2026-06-15), one day after `ee56d2e` added it — six weeks before ADR-0107 was written.** It is also recorded as landed in the memory index (`project_aberp_s410_no_sql_specific_sweep`, step 4). The citation is one of six reasons for the B recommendation and its removal does not change that recommendation, but it overstates the "already paid for" argument. | A correction line in ADR-0107 §3 when it next lands (it is not on `main`), plus a memory correction. **Not fixed here** — ADR-0107 lives on `adr-db-engine-evaluation` and this ADR does not touch in-flight branches. |
-| **`apps/aberp/src/products.rs:367` (`AND LOWER(name) = LOWER(?)`, the product-name dedup guard) and `:402` (`LOWER(...) LIKE ?`) carry the identical ASCII-fold / unescaped-`LIKE` hazard as `partners.rs:1001–1005` / `:1049`, and are OUTSIDE ADR-0108 M11's stated scope.** M11 names `partners.rs` only. On crossing, SQLite's ASCII-only `LOWER()` makes the products guard **admit** a duplicate that differs only in a Hungarian diacritic — the direction that does not announce itself, exactly as ADR-0108's M11 note warns for partners. **Exposure today is zero** (no SQLite connection runs these queries). | **The products family's crossing**, as its first commit, with a T-12-shaped pin — the same sequencing M11/T-12 got. Should be added to ADR-0108 §9 by whoever next touches it. A per-column sweep for `LOWER(` returns 8 src sites; **6 are partners, 2 are products, 0 elsewhere** — the sweep is complete, so this is the whole residue. |
-| The `no-engine-types-outside-adapters` gate does not exist, so ADR-0019 §1's central clause has been unenforced since 2026-05-19. Baseline today would be **74**. | §4.3.3, with the seam. Could land *standalone and early* as a pure ratchet at 74 — it is ~400–700 LOC, changes no behaviour, and would immediately stop the count growing. **Cheapest single item in this ADR and the only one that pays off even if the seam is rejected.** |
-| `apps/aberp/src/print_invoice.rs:922`'s comment asserts `information_schema` "is the portable path here". It is not portable to SQLite. | ADR-0108 §4.3 already schedules the rewrite (`sqlite_master`); the *comment* should go with it so the next reader does not re-derive the claim. |
-| `material_inventory.rs:229–231` `DOUBLE` vs `V001__inventory.sql:53` `DECIMAL(18,6)` — two representations of one physical quantity (rule 7). Already in ADR-0108 §9 as out of scope. | Unchanged — out of scope. Re-recorded because §1.5 uses it as evidence and a reader should not infer this ADR closes it. |
-| **R-5 is live in production today** (foreign `close` destroys later commits' durability, 13 in-serve routes). §3.4 narrows the *future* surface and **does not fix it**. | ADR-0108 §9's ruling stands: **its own PR, before anything else.** Recorded here so §3.4's "fork-zero becomes structural" is never read as licence to defer it. |
+| 🔴 **`apps/aberp/src/products.rs:367` (`AND LOWER(name) = LOWER(?)`, the product-name dedup guard) and `:402` carry the identical ASCII-fold / unescaped-`LIKE` hazard as `partners.rs:1001–1005` / `:1049`, and are OUTSIDE ADR-0108 M11's stated scope.** On crossing, SQLite's ASCII-only `LOWER()` makes the guard **admit** a diacritic duplicate. Exposure today zero. Sweep is complete: 8 `LOWER(` src sites — 6 partners, 2 products, 0 elsewhere. | **Step 1** — the products family's crossing, as its first commit, with a T-12-shaped pin (the sequencing M11/T-12 already got). Should be added to ADR-0108 §9 by whoever next touches it. **This is the one item in this ledger that belongs to step 1, not step 4.** |
+| **ADR-0107 §3 (Option B, reason 5) cites `StorageEngine` / `DuckDbEngine` / `const STORAGE_ENGINE` as an existing engine-swap seam. Deleted at `a1edbb0` (2026-06-15), one day after `ee56d2e` added it, six weeks before ADR-0107 was written.** Also recorded as landed in the memory index. Does not change ADR-0107's recommendation; does overstate its "already paid for" argument. | A correction line in ADR-0107 §3 when it next lands (it is not on `main`), plus a memory correction. **Not fixed here** — this ADR does not touch in-flight branches (§0). |
+| The `no-engine-types-outside-adapters` gate does not exist, so ADR-0019 §1's central clause has been unenforced since 2026-05-19. | **Step 4** — see §5.4 for why *not* now. |
+| `apps/aberp/src/print_invoice.rs:922` asserts `information_schema` "is the portable path here". It is not portable to SQLite. | ADR-0108 §4.3 already schedules the rewrite (`sqlite_master`); the **comment** should go with it so the next reader does not re-derive the claim. Step 1. |
+| `material_inventory.rs:229–231` `DOUBLE` vs `V001__inventory.sql:53` `DECIMAL(18,6)` — two representations of one physical quantity (rule 7). Already in ADR-0108 §9 as out of scope. | Unchanged — out of scope. Re-recorded because §2.6 uses it as evidence and a reader should not infer this ADR closes it. **Step 4** should confirm it survived the cutover unchanged. |
+| **R-5 is live in production today** (a foreign connection's `close` destroys every later commit's durability, 13 in-serve routes). §3.4 narrows the *future* surface and **does not fix it**. | ADR-0108 §9's ruling stands: **its own PR, before anything else.** Recorded here so §3.4 is never read as licence to defer it. |
+| §2.0's census is a `main` @ `3f062ac` snapshot and will be stale at step 5. | **Step 4 re-measures it** (§6). Do not extrapolate. |
 
 ---
 
 ## 10. Open questions
 
+Each is resolved *inside* step 5 unless stated. None blocks steps 1–3.
+
 | # | Question | Resolved by |
 |---|---|---|
-| **Q1** | **Does the SaaS lane (Postgres-per-tenant) land inside ~6 months?** This is the single input that flips the §6 recommendation from A to B. | Ervin / ADR-0100 phasing. **Blocking for the sequencing decision, not for the design.** |
-| **Q2** | How many ports? §5.1 assumes ~15 from ADR-0108 §7's family decomposition; 25 puts the estimate near 14 000 LOC. | Measured in the first retrofit step, by decomposing one family for real. |
-| **Q3** | Does the invoice↔ledger↔numbering fusion (ADR-0108's Step-5 "fused family") get one port or three composed through `Tx`? Three is cleaner and leans entirely on §3.2 being right. | The `Tx` design step, before any family moves. |
-| **Q4** | Does `aberp-snapshot` get a port, and when? §3.5 says "only when a second engine implements it" — i.e. at ADR-0108's Phase 3, not before. | ADR-0108 cutover. |
-| **Q5** | Do the in-memory adapters implement the *full* port or a subset? A subset weakens the §4.3 ratchet; the full port is ~1 200–1 800 LOC of test-only code. | First retrofit step; recommend full, and let §5.1's estimate carry it. |
-| **Q6** | Should the §4.3.3 gate land **now**, standalone, ahead of any decision? It is behaviour-neutral, ~400–700 LOC, and pays off under every branch including rejection. **My recommendation is yes.** | Ervin, independently of §6. |
+| **Q1** | How many ports? §5.1 assumes ~15 from ADR-0108 §7's family decomposition; 25 puts the estimate near 14 000 LOC. | Step 5's first family, decomposed for real. |
+| **Q2** | Does the invoice↔ledger↔numbering fusion (ADR-0108's Step-5 "fused family") get one port or three composed through `Tx`? Three is cleaner and leans entirely on §3.2 being right. | The `Tx` design commit, before any family moves — and §6 puts the fused family **second** precisely so this is answered early. |
+| **Q3** | Do the in-memory adapters implement the **full** port or a subset? A subset weakens the §4.3 ratchet; the full port is ~1 200–1 800 LOC of test-only code. | Step 5, first family. Recommend full; §5.1 already carries the cost. |
+| **Q4** | Does `aberp-snapshot` get a port, and when? §3.5 says only when a second engine implements it. | The SaaS/Postgres lane, not step 5. |
+| **Q5** | Does the SaaS/Postgres lane (ADR-0059 / ADR-0100) land close enough behind step 5 that the port shape should be validated against Postgres semantics *while* it is being written (`NUMERIC`, real `information_schema`, different upsert)? This does not change **whether** to build the seam — only how much Postgres-shaped scrutiny the port review gets. | Ervin / ADR-0100 phasing. Not blocking. |
+| **Q6** | Does step 5 need its own reversibility mechanism, given it runs on the production line without ADR-0108 §6.2's rollback? §5.3 says gates + T-4-style differential pins; that should be confirmed rather than assumed. | Step 5's plan, before its first commit. |
