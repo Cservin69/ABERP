@@ -20,12 +20,23 @@
 //!     aggregator needs (state classification, storno-self flag,
 //!     payment record, ack status). Reuses the same payload-typed-decode
 //!     posture `serve::list_invoices` takes.
-//!   - **SQL aggregation** for line-level VAT-rate breakdown. Per-line
-//!     rounding is intentionally NOT applied at SUM time — the dashboard
-//!     is a management view, not a regulatory document. NAV-byte-perfect
-//!     totals live in the bevallás flow per ADR-0009 §1; the v2.2.0
-//!     dashboard surfaces approximate aggregates within rounding tolerance
-//!     of the per-line figures.
+//!   - **Per-line aggregation** for the line-level VAT-rate breakdown, folded
+//!     in Rust through the *filing's own* functions
+//!     (`aberp_billing::domain::invoice::{line_net_total, line_vat_amount}`),
+//!     which are what `nav_xml::write_summary` sums. So the ÁFA figures this
+//!     dashboard shows are the figures NAV was sent — see
+//!     [`fold_outgoing_lines`].
+//!
+//!     ADR-0108 M-2 changed this, and the change moves published numbers.
+//!     Until 2026-08-01 the breakdown summed the *unrounded*
+//!     `quantity × unit_price` products in SQL, rounded once half-even, and
+//!     derived VAT as `round_half_even(group_net × bp / 10_000)` — documented
+//!     at the time as a deliberate "management view, approximate within
+//!     rounding tolerance". It was approximate in a specific and unhelpful
+//!     direction: on two 27% lines of 50 Ft it printed 27 Ft of VAT where the
+//!     filing carried 26. A management view that disagrees with the filing is
+//!     a reconciliation problem, not a simplification, so the report now ties
+//!     to the filing exactly. No arithmetic on money happens in SQL (§3.4).
 //!   - **Closed-vocab date basis** (`teljesites` | `issued`) per
 //!     `[[aberp-invoice-dates]]`. The default `teljesites` (delivery date)
 //!     is the regulatory anchor for monthly bevallás per HU VAT law;
@@ -55,11 +66,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use aberp_audit_ledger::{BinaryHash, Entry, EventKind, Ledger, TenantId};
+use aberp_billing::domain::invoice::{line_net_total, line_vat_amount};
+use aberp_billing::domain::money::Huf;
+use aberp_billing::domain::vat_rate_kind::VatRateKind;
 use anyhow::{anyhow, Context, Result};
 use duckdb::{params, Connection};
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use time::macros::format_description;
 use time::{Date, Month, OffsetDateTime};
 
@@ -735,7 +749,29 @@ struct OutgoingLineGroup {
     fulfillment_date: String,
     payment_deadline: Option<String>,
     vat_rate_basis_points: i32,
+    /// Sum of the group's **per-line** `net_total()`s, in whole minor units.
+    /// Positive; [`aggregate_outgoing`] applies the storno sign.
     net_minor: i64,
+    /// ADR-0108 M-2 — sum of the group's **per-line** `vat_amount()`s, in
+    /// whole minor units. Carried on the group rather than derived from
+    /// `net_minor × basis_points` at aggregation time, because the filing's
+    /// VAT is a per-line truncation and the group net has already lost the
+    /// per-line remainders. Positive; the storno sign is applied with
+    /// `net_minor`'s.
+    vat_minor: i64,
+}
+
+/// One `invoice_line` row as the ÁFA report reads it — the raw column values,
+/// with **no arithmetic done in SQL** (ADR-0108 §3.4 / T-8).
+struct OutgoingLineRow {
+    invoice_id: String,
+    currency: String,
+    fulfillment_date: String,
+    payment_deadline: Option<String>,
+    vat_rate_basis_points: i32,
+    vat_rate_kind: Option<String>,
+    quantity: Decimal,
+    unit_price: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -791,22 +827,25 @@ fn query_outgoing_groups(
 ) -> Result<Vec<OutgoingLineGroup>> {
     let date_col = date_col_sql_invoice(basis);
     let (where_clause, has_from, has_to) = build_date_where(window);
+    // ADR-0108 §3.4 site 1 / T-8: NO arithmetic in SQL. The statement projects
+    // the raw columns and the fold happens in Rust, below. `quantity` crosses
+    // as `TEXT` (it is `DECIMAL(18,6)` on DuckDB and R2 `TEXT` on SQLite; the
+    // `CAST(… AS VARCHAR)` renders both identically) and `unit_price` as the
+    // R1 `INTEGER` it already is.
     let sql = format!(
         "SELECT i.id,
                 COALESCE(i.currency, 'HUF') AS currency,
                 {date_col} AS fulfillment_date,
                 CAST(i.payment_deadline AS VARCHAR) AS payment_deadline,
                 il.vat_rate_basis_points,
-                CAST(SUM(CAST(il.quantity AS DECIMAL(38,6)) * il.unit_price) AS VARCHAR) AS net_decimal
+                il.vat_rate_kind,
+                CAST(il.quantity AS VARCHAR) AS quantity,
+                il.unit_price
            FROM invoice i
            JOIN invoice_line il ON i.id = il.invoice_id
-          {where_clause}
-          GROUP BY i.id, currency, fulfillment_date, payment_deadline,
-                   il.vat_rate_basis_points",
+          {where_clause}",
     );
-    let mut stmt = conn
-        .prepare(&sql)
-        .context("prepare outgoing aggregate SQL")?;
+    let mut stmt = conn.prepare(&sql).context("prepare outgoing line SQL")?;
     let from_s = window.from.map(date_str);
     let to_s = window.to.map(date_str);
     let rows = match (has_from, has_to) {
@@ -815,24 +854,127 @@ fn query_outgoing_groups(
         (false, true) => stmt.query_map(params![to_s.unwrap()], row_to_outgoing)?,
         (false, false) => stmt.query_map([], row_to_outgoing)?,
     };
-    let mut out = Vec::new();
+    let mut lines = Vec::new();
     for r in rows {
-        out.push(r?);
+        lines.push(r?);
     }
-    Ok(out)
+    fold_outgoing_lines(lines)
 }
 
-fn row_to_outgoing(row: &duckdb::Row) -> duckdb::Result<OutgoingLineGroup> {
-    let net_str: String = row.get(5)?;
-    let net = decimal_str_to_i64(&net_str).unwrap_or(0);
-    Ok(OutgoingLineGroup {
+fn row_to_outgoing(row: &duckdb::Row) -> duckdb::Result<OutgoingLineRow> {
+    let quantity_str: String = row.get(6)?;
+    let quantity = Decimal::from_str(&quantity_str).map_err(|_| {
+        duckdb::Error::FromSqlConversionFailure(
+            6,
+            duckdb::types::Type::Text,
+            format!("invoice_line.quantity is not a decimal: {quantity_str:?}").into(),
+        )
+    })?;
+    Ok(OutgoingLineRow {
         invoice_id: row.get(0)?,
         currency: row.get(1)?,
         fulfillment_date: row.get(2)?,
         payment_deadline: row.get(3)?,
         vat_rate_basis_points: row.get(4)?,
-        net_minor: net,
+        vat_rate_kind: row.get(5)?,
+        quantity,
+        unit_price: row.get(7)?,
     })
+}
+
+/// ADR-0108 M-2 — fold the per-line rows into `(invoice, vat_rate)` groups
+/// **through the same two functions the NAV filing uses**.
+///
+/// # Why per-line, and what it changes
+///
+/// Before this fold the report summed the *unrounded* `quantity × unit_price`
+/// products per group in SQL and rounded **once**, half-even, at the i64
+/// boundary; VAT was then `round_half_even(group_net × bp / 10_000)`. The
+/// filing does neither: `nav_xml::write_summary` sums
+/// [`line_net_total`] — round-half-even **per line** — and
+/// [`line_vat_amount`] — `floor(net × bp / 10_000)`, i.e. **truncated**,
+/// per line. Two independent divergences, granularity *and* rounding mode.
+///
+/// Worked example, and the T-5(c) regression fixture: two 27% lines of 50 Ft
+/// net each. Filed VAT is `50 × 2700 / 10_000 = 13` twice → **26 Ft**. The old
+/// report computed `round_half_even(100 × 2700 / 10_000) = 27` → **27 Ft**.
+/// The report published a figure the tax authority never received.
+///
+/// Ervin's M-2 ruling is per-line: the ÁFA report shows what was filed. So the
+/// arithmetic is not merely *equivalent* to the filing's, it is literally the
+/// filing's functions — anything less is a rule-7 fork that survives until the
+/// first edit to either copy.
+///
+/// The storno sign is applied later, by [`aggregate_outgoing`], and that is
+/// safe: negation commutes with both roundings. Half-even is symmetric about
+/// zero, and Rust's `i64 / i64` truncates *toward zero*, so
+/// `-trunc(|x|) == trunc(-|x|)`. The filing negates `quantity`
+/// (`nav_xml::negate_line`, S381) and reaches the same magnitudes.
+fn fold_outgoing_lines(lines: Vec<OutgoingLineRow>) -> Result<Vec<OutgoingLineGroup>> {
+    let mut out: Vec<OutgoingLineGroup> = Vec::new();
+    for line in lines {
+        // ADR-0101, mirroring `duckdb_store`'s read path exactly: NULL
+        // (pre-0101, pre-backfill) → Percent; a present value that does not
+        // parse is a corrupt row and fails loud (rule 11) rather than
+        // defaulting to Percent, which would invent VAT on an exempt line.
+        let kind = match line.vat_rate_kind.as_deref() {
+            None => VatRateKind::Percent,
+            Some(s) => VatRateKind::from_db_str(s).with_context(|| {
+                format!(
+                    "invoice {} carries an unknown invoice_line.vat_rate_kind {s:?}",
+                    line.invoice_id
+                )
+            })?,
+        };
+        let basis_points: u16 = line.vat_rate_basis_points.try_into().with_context(|| {
+            format!(
+                "invoice {} carries an out-of-range vat_rate_basis_points {}",
+                line.invoice_id, line.vat_rate_basis_points
+            )
+        })?;
+        let net = line_net_total(Huf(line.unit_price), line.quantity).with_context(|| {
+            format!(
+                "net total overflows on a line of invoice {}",
+                line.invoice_id
+            )
+        })?;
+        let vat = line_vat_amount(net, kind, basis_points).with_context(|| {
+            format!(
+                "VAT amount overflows on a line of invoice {}",
+                line.invoice_id
+            )
+        })?;
+
+        let key = (line.invoice_id.as_str(), line.vat_rate_basis_points);
+        let idx = match out
+            .iter()
+            .position(|g| (g.invoice_id.as_str(), g.vat_rate_basis_points) == key)
+        {
+            Some(idx) => idx,
+            None => {
+                out.push(OutgoingLineGroup {
+                    invoice_id: line.invoice_id.clone(),
+                    currency: line.currency,
+                    fulfillment_date: line.fulfillment_date,
+                    payment_deadline: line.payment_deadline,
+                    vat_rate_basis_points: line.vat_rate_basis_points,
+                    net_minor: 0,
+                    vat_minor: 0,
+                });
+                out.len() - 1
+            }
+        };
+        let g = &mut out[idx];
+        g.net_minor = g
+            .net_minor
+            .checked_add(net.as_i64())
+            .with_context(|| format!("net overflows on invoice {}", g.invoice_id))?;
+        g.vat_minor = g
+            .vat_minor
+            .checked_add(vat.as_i64())
+            .with_context(|| format!("VAT overflows on invoice {}", g.invoice_id))?;
+    }
+    Ok(out)
 }
 
 /// S262 / PR-251 — sum of `huf_equivalent_total` (snapshot-rate HUF
@@ -857,8 +999,13 @@ fn query_eur_huf_equivalent(
     } else {
         format!("{date_where} AND {currency_pred}")
     };
+    // ADR-0108 §3.4 site 2 / T-8: no `SUM` in SQL. `huf_equivalent_total` is
+    // R1 (`INTEGER` minor units, §3.2 B), where SQL `SUM` is exact but *raises*
+    // on i64 overflow — and its former reader swallowed the failure to 0. The
+    // column is projected and folded with `checked_add` here instead, so an
+    // overflow is a loud error rather than a plausible-looking HUF figure.
     let sql = format!(
-        "SELECT CAST(COALESCE(SUM(i.huf_equivalent_total), 0) AS VARCHAR) AS eur_huf
+        "SELECT i.huf_equivalent_total
            FROM invoice i
           {where_clause}",
     );
@@ -867,20 +1014,23 @@ fn query_eur_huf_equivalent(
         .context("prepare EUR huf-equivalent SQL")?;
     let from_s = window.from.map(date_str);
     let to_s = window.to.map(date_str);
-    let read = |row: &duckdb::Row| -> duckdb::Result<i64> {
-        let s: String = row.get(0)?;
-        Ok(decimal_str_to_i64(&s).unwrap_or(0))
-    };
-    let mut rows = match (has_from, has_to) {
+    // NULL for HUF-native invoices; the `= 'EUR'` predicate already excludes
+    // them, so a NULL here contributes nothing rather than failing.
+    let read = |row: &duckdb::Row| -> duckdb::Result<Option<i64>> { row.get(0) };
+    let rows = match (has_from, has_to) {
         (true, true) => stmt.query_map(params![from_s.unwrap(), to_s.unwrap()], read)?,
         (true, false) => stmt.query_map(params![from_s.unwrap()], read)?,
         (false, true) => stmt.query_map(params![to_s.unwrap()], read)?,
         (false, false) => stmt.query_map([], read)?,
     };
-    match rows.next() {
-        Some(r) => Ok(r?),
-        None => Ok(0),
+    let mut total: i64 = 0;
+    for r in rows {
+        let Some(v) = r? else { continue };
+        total = total
+            .checked_add(v)
+            .context("EUR->HUF equivalent total overflows i64")?;
     }
+    Ok(total)
 }
 
 fn query_ap_rows(
@@ -1006,18 +1156,6 @@ fn build_date_where(window: DateWindow) -> (String, bool, bool) {
     }
 }
 
-fn decimal_str_to_i64(s: &str) -> Option<i64> {
-    // The aggregate is `SUM(quantity * unit_price)` where quantity is
-    // DECIMAL(18,6) and unit_price is BIGINT — the product fits a wide
-    // DECIMAL. We round-half-even to whole minor units at the i64
-    // boundary; per-line rounding would match NAV byte-perfect but the
-    // dashboard is a management view (see module-level note).
-    use rust_decimal::RoundingStrategy;
-    let d: Decimal = s.parse().ok()?;
-    d.round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven)
-        .to_i64()
-}
-
 // ──────────────────────────────────────────────────────────────────────
 // Aggregation.
 // ──────────────────────────────────────────────────────────────────────
@@ -1066,11 +1204,13 @@ fn aggregate_outgoing(
             CountedKind::Counted { is_storno_self } => {
                 let sign: i64 = if is_storno_self { -1 } else { 1 };
                 let net_signed = group.net_minor.saturating_mul(sign);
-                // Round-half-even on VAT to whole minor units.
-                let vat_signed = round_half_even_div(
-                    net_signed.saturating_mul(group.vat_rate_basis_points as i64),
-                    10_000,
-                );
+                // ADR-0108 M-2 — the VAT is the group's per-line sum computed
+                // in `fold_outgoing_lines` through the filing's own
+                // `line_vat_amount`, signed here. It is NOT re-derived from
+                // `net_signed × basis_points`: the group net has already lost
+                // the per-line truncation remainders, so re-deriving would
+                // reintroduce the very divergence this fold removes.
+                let vat_signed = group.vat_minor.saturating_mul(sign);
                 let entry = agg
                     .vat_breakdown
                     .entry((group.currency.clone(), group.vat_rate_basis_points))
@@ -1260,23 +1400,6 @@ fn aging_bucket_for(today: Date, deadline: Date) -> AgingBucket {
     } else {
         AgingBucket::Days90Plus
     }
-}
-
-/// Round-half-even integer division (banker's rounding) — matches the
-/// `huf_equivalent_round_half_even` posture in `modules/billing` for
-/// the VAT minor-unit rounding pass. `divisor` is assumed positive
-/// (10000 for basis-points-to-fraction conversion).
-fn round_half_even_div(numerator: i64, divisor: i64) -> i64 {
-    if divisor == 0 {
-        return 0;
-    }
-    let n = Decimal::from(numerator);
-    let d = Decimal::from(divisor);
-    let q = n.checked_div(d).unwrap_or(Decimal::ZERO);
-    use rust_decimal::RoundingStrategy;
-    q.round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven)
-        .to_i64()
-        .unwrap_or(0)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1896,16 +2019,74 @@ mod tests {
         ));
     }
 
+    /// ADR-0108 M-2 — the regression fixture, at the unit level. Two 27%
+    /// lines of 50 Ft net each: the filing truncates per line to 13 + 13 =
+    /// **26 Ft**; the pre-M-2 report rounded the 100 Ft group net once,
+    /// half-even, to **27 Ft**. The report now publishes 26.
+    ///
+    /// This test fails if the fold is ever re-derived from the group net —
+    /// `round_half_even(100 × 2700 / 10_000)` is 27, and so is
+    /// `floor(100 × 2700 / 10_000)`, so *only* per-line granularity produces
+    /// 26. It is the one arithmetic shape that distinguishes them.
     #[test]
-    fn round_half_even_div_banker_rounding() {
-        // 5 / 2 = 2.5 → round-half-even → 2 (even).
-        assert_eq!(round_half_even_div(5, 2), 2);
-        // 7 / 2 = 3.5 → round-half-even → 4 (even).
-        assert_eq!(round_half_even_div(7, 2), 4);
-        // Exact divisions don't round.
-        assert_eq!(round_half_even_div(10, 2), 5);
-        // Negative numerator preserves direction.
-        assert_eq!(round_half_even_div(-7, 2), -4);
+    fn two_27pct_lines_fold_to_the_filed_vat_not_the_group_rounded_one() {
+        let row = |unit_price: i64| OutgoingLineRow {
+            invoice_id: "inv_m2".into(),
+            currency: "HUF".into(),
+            fulfillment_date: "2026-08-01".into(),
+            payment_deadline: None,
+            vat_rate_basis_points: 2700,
+            vat_rate_kind: Some("Percent".into()),
+            quantity: Decimal::ONE,
+            unit_price,
+        };
+        let groups = fold_outgoing_lines(vec![row(50), row(50)]).unwrap();
+        assert_eq!(groups.len(), 1, "one (invoice, rate) group");
+        assert_eq!(groups[0].net_minor, 100);
+        assert_eq!(
+            groups[0].vat_minor, 26,
+            "per-line truncation: 13 + 13. 27 means the group net was rounded instead"
+        );
+    }
+
+    /// A non-`Percent` kind contributes ZERO VAT regardless of its stored
+    /// basis points (ADR-0103 Invariant V) — the report inherits that from
+    /// `line_vat_amount`, the filing's own function. The old report derived
+    /// VAT from basis points alone and would have invented 27 Ft of VAT on an
+    /// exempt line admitted by a gate-bypassing door.
+    #[test]
+    fn non_percent_kind_contributes_zero_vat_even_with_a_stored_rate() {
+        let groups = fold_outgoing_lines(vec![OutgoingLineRow {
+            invoice_id: "inv_aam".into(),
+            currency: "HUF".into(),
+            fulfillment_date: "2026-08-01".into(),
+            payment_deadline: None,
+            vat_rate_basis_points: 2700,
+            vat_rate_kind: Some("AamExempt".into()),
+            quantity: Decimal::ONE,
+            unit_price: 100,
+        }])
+        .unwrap();
+        assert_eq!(groups[0].net_minor, 100);
+        assert_eq!(groups[0].vat_minor, 0);
+    }
+
+    /// Rule 11 — an unparseable `vat_rate_kind` is a corrupt row and fails
+    /// loud. Defaulting it to `Percent` would silently invent VAT.
+    #[test]
+    fn unknown_vat_rate_kind_fails_loud() {
+        let err = fold_outgoing_lines(vec![OutgoingLineRow {
+            invoice_id: "inv_bad".into(),
+            currency: "HUF".into(),
+            fulfillment_date: "2026-08-01".into(),
+            payment_deadline: None,
+            vat_rate_basis_points: 2700,
+            vat_rate_kind: Some("NotAKind".into()),
+            quantity: Decimal::ONE,
+            unit_price: 100,
+        }])
+        .unwrap_err();
+        assert!(format!("{err}").contains("unknown invoice_line.vat_rate_kind"));
     }
 
     #[test]

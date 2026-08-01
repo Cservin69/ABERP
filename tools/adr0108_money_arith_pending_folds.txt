@@ -20,32 +20,31 @@
 # unrelated edit that shifts lines cannot red the gate, while moving the SQL to
 # a different function reds it correctly.
 #
-# EXPOSURE TODAY IS ZERO and this is why the register is safe to ship with four
-# sites in it: `modules/billing` and `aberp-inventory` have NOT crossed the
-# engine seam, so every statement below still executes on DuckDB, where
-# `DECIMAL` is a real decimal type and none of these coerce. The register's
-# entries are the exact set that must empty BEFORE their family crosses.
-# Emptying them is Step 7's work (inventory) and the `reports.rs` fold that
-# waits on §3.4's rounding question (M-2, Ervin's call — `reports.rs:800` sums
-# unrounded products and rounds once, `checked_mul_decimal` rounds per line, and
-# the two are not the same number).
+# EXPOSURE TODAY IS ZERO and this is why the register is safe to ship with the
+# sites still in it: `aberp-inventory` has NOT crossed the engine seam, so every
+# statement below still executes on DuckDB, where `DECIMAL` is a real decimal
+# type and none of these coerce. The register's entries are the exact set that
+# must empty BEFORE their family crosses.
 #
-# --- §3.4 site 1: the ÁFA outgoing report, the sharp one ---------------------
-# `CAST(SUM(CAST(il.quantity AS DECIMAL(38,6)) * il.unit_price) AS VARCHAR)`.
-# Under R2 `quantity` is TEXT; `TEXT * INTEGER` coerces to REAL and the ÁFA
-# report silently becomes float money. Four records: the `*` and the `SUM` seen
-# once per class, because the statement touches one column of each.
-apps/aberp/src/reports.rs|query_outgoing_groups|R1|agg-sum|unit_price
-apps/aberp/src/reports.rs|query_outgoing_groups|R1|arith-mul|unit_price
-apps/aberp/src/reports.rs|query_outgoing_groups|R2|agg-sum|quantity
-apps/aberp/src/reports.rs|query_outgoing_groups|R2|arith-mul|quantity
+# --- §3.4 sites 1 and 2: the ÁFA report — FOLDED 2026-08-01, entries DELETED --
+# Both `reports.rs` sites are gone, and the four + one records with them:
 #
-# --- §3.4 site 2: the EUR->HUF equivalent aggregate ---------------------------
-# `SUM(i.huf_equivalent_total)` over what §3.2 B converts to INTEGER. Exact,
-# but it RAISES on i64 overflow, and its reader `decimal_str_to_i64(&s)
-# .unwrap_or(0)` (`reports.rs:872`) would then print 0 HUF on the ÁFA report.
-# §3.4 requires the fold and the `unwrap_or(0)` to be deleted in ONE commit.
-apps/aberp/src/reports.rs|query_eur_huf_equivalent|R1|agg-sum|huf_equivalent_total
+#   * `query_outgoing_groups` no longer sums or multiplies in SQL. It projects
+#     `quantity` / `unit_price` / `vat_rate_kind` and folds per line in Rust
+#     through `aberp_billing::domain::invoice::{line_net_total, line_vat_amount}`
+#     — literally the functions `nav_xml::write_summary` sums, so the ÁFA report
+#     equals the filing (T-5(c), `adr0108_step7_report_ties_to_filing.rs`).
+#   * `query_eur_huf_equivalent` no longer `SUM`s: it projects the R1 column and
+#     folds with `checked_add`, and the `decimal_str_to_i64(&s).unwrap_or(0)`
+#     that would have printed 0 HUF on an overflow died in the same commit,
+#     along with its two siblings.
+#
+# This is T8-4's ratchet doing its job: leaving the entries here after the fold
+# landed would have RED the gate, which is the whole point of a register that
+# can only shrink.
+#
+# M-2, which the ÁFA fold waited on, is CLOSED — Ervin ruled per-line: the
+# report shows what was filed.
 #
 # --- §3.4 sites 3 and 4: the stock-cache rebuild, which is a WRITE ------------
 # `SUM(qty_delta)` becomes REAL under R2 and writes a float `stock_qty` back
