@@ -515,8 +515,9 @@ and it is written here so a later session cannot quietly take the easy branch.
 `min_margin`, `exotic_material_tax`, `setup_base_min`, `cad_cam_base_hours`,
 `multiplier`, `base_time_minutes`, `setup_penalty_minutes`,
 `inspection_minutes_per_feature`; `quote_calibration.estimated_minutes`,
-`actual_minutes`; `material_inventory.on_hand_qty`, `reserved_qty`,
-`committed_qty`, `consumed_qty`, `qty`; `work_orders.actual_machining_minutes`;
+`actual_minutes`; ~~`material_inventory.on_hand_qty`, `reserved_qty`,
+`committed_qty`, `consumed_qty`, `qty`~~ (**moved out of E — see the correction
+below**); `work_orders.actual_machining_minutes`;
 `qc_inspection_plans.nominal_value`, `upper_tol`, `lower_tol`;
 `qc_inspections.nominal_value`, `upper_tol`, `lower_tol`, `actual_value`,
 `deviation`.
@@ -527,6 +528,27 @@ and it is written here so a later session cannot quietly take the easy branch.
 > (rule 7). Neither source document notices. This plan does **not** fix it (out of
 > scope, rule 3) but records it in the deferral ledger, because migrating both
 > as-is preserves the divergence under `STRICT`, which makes it look sanctioned.
+>
+> > ⚠ **RESOLVED AT THE STORAGE LAYER 2026-08-01 (S455, Step 7 Part C), and the
+> > "out of scope" above is narrowed rather than kept.** The adversarial's own
+> > sentence is the argument: carrying them as `REAL` would have shipped a
+> > `STRICT` schema, blessed by a green reconciliation gate, declaring a
+> > quantity to be a float in one half of the product and exact in the other.
+> > **All five columns cross as R2 `TEXT`** — the same canonical
+> > `rust_decimal::Decimal` string `stock_movements.qty_delta` already uses —
+> > **with zero value change**, enforced per value rather than asserted:
+> > `migrate_products::canonical_decimal_from_f64` renders each `f64` as the
+> > shortest decimal that round-trips it, refuses anything above the canonical
+> > quantity scale of 6 (`DECIMAL(18,6)`'s), and refuses again unless the
+> > `Decimal` converts back to the identical `f64`. **A value that cannot cross
+> > exactly fails the migration; it is never rounded into range** (rule 11).
+> > The five columns are therefore **out of category E and into category C**.
+> >
+> > What is *not* resolved is the **app-layer** modelling: `material_inventory.rs`
+> > still holds these as `f64` in Rust while `aberp-inventory` holds its side as
+> > `Decimal`. That is a change to a saga's arithmetic and its callers, it has
+> > nothing to do with the engine, and it gets its **own §9 row** with the exact
+> > tables and columns rather than riding along here (rule 3).
 > (b) `qc_inspections.deviation` is a *derived* float on a dimensional-inspection
 > record used for a pass/fail verdict. It is not money. Keeping it `REAL` is the
 > conservative no-change call, flagged.
@@ -1111,7 +1133,7 @@ goes red**. A gate against B1 that has never been shown to catch B1 is not a gat
 |---|---|---|
 | **invoice / invoice_line / sequence tables** | **Row-by-row carry** through `duckdb_store`'s own read path → the new SQLite writer. | These are the legally-binding records (ADR-0009, 8-year). They must cross with byte-identical NAV/PDF output (T-4). Rebuilding them from the ledger is possible but would re-derive a regulatory record from a derived source — wrong direction. |
 | **partners / products / purchasing** | Row-by-row carry. | Operator-entered master data; cheap; needed for the customer-journey e2e. |
-| **inventory (`stock_movements`, cache cols)** | Carry `stock_movements` (append-only ledger); **rebuild** the `products.stock_qty` cache from `SUM(qty_delta)` **in Rust** via the existing `rebuild-stock-cache` path. | The cache is derived by definition, and rebuilding it exercises §3.4's Rust-side fold on real data. |
+| **inventory (`stock_movements`, cache cols)** | ~~Carry `stock_movements` (append-only ledger); **rebuild** the `products.stock_qty` cache from `SUM(qty_delta)` **in Rust** via the existing `rebuild-stock-cache` path.~~ **CORRECTED 2026-08-01 (S455): carry everything, including the cache columns, verbatim.** | ~~The cache is derived by definition, and rebuilding it exercises §3.4's Rust-side fold on real data.~~ **The rebuild would disarm the gate.** The reconciliation arm compares the two sides row-for-row; a migrator that re-derived `stock_qty` would make a DuckDB cache that had legitimately drifted — the exact condition ADR-0061 §3's `rebuild-stock-cache` recovery path exists for — show as a per-row difference, and the only way back to green would be to teach the gate the transformation, i.e. **to verify the extraction against itself (B4)**. It would also make the migration a repair tool, which §6.3's own mirror argument rules out three paragraphs above: *a migration is not a repair tool.* A cache that is wrong on DuckDB must cross as wrong and be repaired by the path that owns that repair. |
 | **work orders / BOM / QA / QC / dispatch** | Row-by-row carry. | Small; the customer-journey e2e traverses them. |
 | **quoting (`quote_pricing_jobs`, `quote_intake_log`, `quoting_*`, `supplier_prices`)** | **Drop and re-seed from the tunables defaults; do not carry job history.** | Step 8 changes five columns from `f64` to `Decimal` (§3.2 D). Carrying `f64` job history means writing a lossy `f64 → Decimal` converter for data that is DEV scratch. `[[feedback_dev_db_disposable]]` is exactly the licence to not build that. **The tunables/materials/machines rows ARE carried** (they are operator-configured, not scratch) — through the `Decimal` types, with a loud refusal on any value that does not round-trip. |
 | **`quote_pricing_jobs` CAD artefacts** | Not touched. | Filesystem, AES-GCM, keychain-keyed. The DB holds a path; the path is carried verbatim. |
@@ -1647,6 +1669,53 @@ email/relay.
 > `typeof` sweep are all blind to that mutation, so that arm is the only thing
 > between a silently-corrupted partner record and a green gate.
 
+> **Step 7 Part C — the PRODUCTS/INVENTORY family crossed, 2026-08-01 (S455),
+> and §3.2 E's rule-7 divergence is resolved at the storage layer rather than
+> carried.** `apps/aberp/src/migrate_products.rs` +
+> `apps/aberp/tests/adr0108_step7_products_family.rs`, plugged into
+> `migrate_families` and `reconcile` beside the Step-5 and Part-B arms.
+>
+> **Four tables, two owning modules, 46 columns**: `products` (14 — `products.rs`
+> plus `V001__inventory.sql`'s four-column ladder), `stock_movements` (11),
+> `inventory_balances` (12 — `material_inventory.rs`, plus S432's four-column
+> ladder), `inventory_reservations` (9, plus S275's one). Because two
+> independent `ensure_schema` calls build the four, **presence is checked and
+> held symmetrically per TABLE, not per family** — a products-only database and
+> a material-inventory-only one are both legitimate shapes.
+>
+> **THE RULE-7 RESOLUTION is the substance of this commit.** All five `DOUBLE`
+> quantity columns cross as R2 `TEXT`, value-neutrally, refusing rather than
+> rounding. See the correction block in §3.2 E and the §9 row. Pinned by a
+> **deterministic property sweep of 4096 generated quantities plus 20
+> adversarial ones**, asserting the disjunction that matters: each value either
+> round-trips to the identical `f64` *or* is refused with a message that says
+> why — a test that asserted only the happy arm would pass on a carry that
+> silently rounded everything to six places. Both arms are required to fire.
+>
+> ⚠ **Same split as Steps 5 and 7B: the MIGRATOR HALF only.** DuckDB remains the
+> source of truth; `products.rs`, `material_inventory.rs` and
+> `aberp-inventory/src/repository.rs` are untouched and every one of their
+> queries still runs against DuckDB.
+>
+> ⚠ **§3.4's three cache-rebuild folds did NOT land here, and this line
+> ("incl. §3.4's three cache-rebuild folds") is corrected in §9** — on exactly
+> the precedent Part B set for M11/T-12, and for the same reason. The T-8
+> pending-fold register keeps its two entries; both still match a live
+> statement, so T8-3/T8-4 are green because the sites are *there*, not because
+> the gate cannot see them. **The migrator's own code holds to T-8
+> unconditionally**: no `SUM`/`AVG`/`*`/`+`/`-` on a money or quantity column
+> appears in it, and every fold in it is Rust over `Decimal` / `i64`.
+>
+> ⚠ **§6.3's inventory row is corrected, not executed**: the cache columns are
+> carried verbatim rather than rebuilt, because rebuilding them would force the
+> gate to verify the extraction against itself (B4). See §6.3.
+>
+> **The load-bearing pin is `a_qty_delta_rewrite_that_preserves_the_sum_still_reds_the_gate`**
+> — two movements on one product are rewritten so that `Σ qty_delta` is
+> unchanged. The row count, the `Σ` fold and the `typeof` sweep are all green on
+> that mutation, so the per-row arm is the only thing between a rewritten
+> movement history and a green gate.
+
 **Step 8 — The quoting family, including the five `f64` money columns (§3.2 D).**
 - *Changes:* 17 + 15 + 10 + 7 + 6 = 55 DDL sites; `total_price_eur` ×2,
   `cost_per_kg_eur` ×2, and the two rate tunables `f64 → Decimal` at the Rust type;
@@ -1728,7 +1797,9 @@ it or an explicit "out of scope".
 | `nav_xml.rs:1788` write path is `f64` while `:2658` read path is exact `Decimal` — a **rule-7 fork on the NAV VAT rate**, pre-existing and engine-independent; value-exact for all four legal HU rates, so not a filing defect | Closed by the Step-5 `Decimal` conversion (B2, §3.3), which also empties T-5(e)'s allowlist |
 | `MirrorEntry` cannot round-trip a signed entry — the mirror is a divergence detector, not a backup, and its own comment says so (`mirror.rs:211–214`) | **Out of scope.** Recorded because B1 was the first time that design limit had a consumer that assumed otherwise. If the mirror is ever to be a recovery source, that is its own ADR — and it would have to add three columns and a signature-preserving encoder first. |
 | `verify_chain_signed`'s anti-strip check is keyed on `session_id` surviving (`verify.rs:138–146`), so it cannot see a strip that nulls `session_id` too; and `ChainVerdict.fully_anchored` reads `true` on a ledger with zero anchors (`:188`) | **Out of scope for this plan, and worked around inside it** — §6.3's gate asserts counts rather than the verdict flags. Flagged because a *future* consumer will reach for `fully_anchored` and get the reassuring answer. Its own PR. |
-| `material_inventory.*_qty` is `DOUBLE` while `stock_movements.qty_delta` is `DECIMAL` — **two representations of one physical quantity** (rule 7) | **Out of scope.** Recorded because migrating both as-is under `STRICT` makes the divergence look sanctioned. Needs its own decision. |
+| `material_inventory.*_qty` is `DOUBLE` while `stock_movements.qty_delta` is `DECIMAL` — **two representations of one physical quantity** (rule 7) | ~~**Out of scope.** Recorded because migrating both as-is under `STRICT` makes the divergence look sanctioned. Needs its own decision.~~ ✅ **RESOLVED AT THE STORAGE LAYER 2026-08-01 (S455, Step 7 Part C).** Conservative resolution, taken rather than deferred because the deferral's own stated cost — a `STRICT` schema blessed by a green gate that says a quantity is a float here and exact there — is paid the moment the family crosses. **All five columns** (`inventory_balances.on_hand_qty` / `reserved_qty` / `committed_qty` / `consumed_qty`, `inventory_reservations.qty`) **cross as R2 `TEXT` with zero value change**, enforced per value in `migrate_products::canonical_decimal_from_f64`: shortest round-trip rendering → refuse above the canonical quantity scale of 6 → refuse unless the `Decimal` converts back to the identical `f64`. **Refuse, never round.** §3.2 E carries the correction block; the five columns move from category E to category C. |
+| **The APP-LAYER half of the same rule-7 divergence is still open, and it is not the storage one.** `apps/aberp/src/material_inventory.rs` models these quantities as `f64` in Rust — `Balance.{on_hand_qty, reserved_qty, committed_qty, consumed_qty}` (`:302–305`) plus the derived `Balance.available_qty` (`:313`), the `f64` bind/read of `inventory_reservations.qty`, and `MaterialInventoryError::InsufficientMaterial`'s four `f64` fields (`:206–212`) — while `aberp-inventory` models the *same physical quantity* as `rust_decimal::Decimal` (`StockMovement.qty_delta`, `products.stock_qty`). After S455 the two agree in **storage** and still disagree in **Rust**, which is the narrower and more honest statement of the divergence. Exposure is bounded but real: the DEAL saga's sufficiency check (`requested + reserved + committed <= on_hand`) is float arithmetic, so it can admit or refuse a marginal reservation on a representation artefact. | **Its own PR, not this plan, and not Step 8.** It is a change to the saga's arithmetic, its 409 error payload, the SPA toast that renders those four numbers, and the calibration tests — none of it engine-related, all of it reachable today on DuckDB. Recorded with the exact symbols so the next session does not have to re-derive the surface. **Do not fold it into a migration commit**: mixed with a storage change it would be indistinguishable from migration collateral, which is precisely how the original divergence survived unnoticed in two source documents. |
+| **§3.4's three cache-rebuild folds did NOT land with the products/inventory family, and §7's Step-7 line ("incl. §3.4's three cache-rebuild folds") is corrected to say so.** They are `SUM(qty_delta)` inside `aberp_inventory::repository::{record_movement, rebuild_stock_cache_for_tenant}` (the third §3.4 row, `bin/rebuild_stock_cache.rs`, carries no SQL of its own — it calls the second). Part C landed the **migrator half** — DDL, carry, gate — and changed no query: both statements still execute on a DuckDB `Connection`, where `DECIMAL` is a real decimal type and `SUM` does not coerce. **Exposure today is ZERO**, and the mutation that proves the fold matters — a `REAL`-coerced `SUM` writing a float `stock_qty` back into the products cache — is unreachable until the queries cross. | **The family's Rust-side crossing (the cutover), as its first commit** — the same sequencing M-1 and M11/T-12 got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* The T-8 **pending-fold register keeps both entries** and stays honest doing it: each still matches a live statement, so T8-3 (nothing new may join) and T8-4 (a folded site may not linger) are green because the sites are *there*, not because the gate is blind. ⚠ **Note for whoever writes it**: the fold is not "sum the same thing in Rust" — `record_movement`'s `SUM` runs **inside the movement-recording transaction** and its result is written straight back to `products.stock_qty`, so the fold must stay in that transaction and must not become a second round trip that could see a torn read. |
 | `qc_inspections.deviation` is a derived `REAL` driving a pass/fail verdict | Out of scope; flagged in §3.2 E |
 | ADR-0107 / the frozen baseline / its header disagree on the in-serve read-fork count (**14 / 13 / 9**) | Out of scope for the migration; a stale frozen baseline is the exact class PR #43 existed to prevent → its own PR |
 | `aberp-mes::ledger_writer::write_one` appends through a fresh in-serve connection while the write-fork gate reports ZERO | ADR-0107 §5 says close it **by hand now** — a forked *append* forks the ledger under **any** engine. Independent of this plan; should land before Step 5. |

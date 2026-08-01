@@ -100,6 +100,12 @@ pub mod migrate_billing;
 /// migrator it plugs into.
 #[cfg(feature = "sqlite-engine")]
 pub mod migrate_partners;
+/// ADR-0108 Step 7 Part C — the products/inventory family's STRICT schema,
+/// carry and gate arm, including the rule-7 resolution that brings the five
+/// `DOUBLE` quantity columns onto the same exact representation as
+/// `stock_movements.qty_delta`.
+#[cfg(feature = "sqlite-engine")]
+pub mod migrate_products;
 /// ADR-0108 Step 4 — the migrator + the reconciliation gate. Behind the
 /// default-OFF `sqlite-engine` feature: this is the ONE binary that links both
 /// engines, because it reads DuckDB and writes SQLite.

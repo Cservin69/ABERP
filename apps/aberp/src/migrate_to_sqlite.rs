@@ -186,6 +186,10 @@ pub struct MigrateOutcome {
     /// source has no `partners` table (a legitimate shape; the gate holds the
     /// two sides to it symmetrically).
     pub partners: crate::migrate_partners::PartnersCarry,
+    /// ADR-0108 Step 7 Part C — what the products/inventory family carried. All
+    /// zeros when the source has none of its four tables. Presence is held
+    /// symmetrically **per table**, because two modules own the four.
+    pub products: crate::migrate_products::ProductsCarry,
     /// SHA-256 of the DuckDB file, taken after the run. C-I says this must
     /// equal the digest taken before it (T-19 arm 2).
     pub duckdb_sha256_after: String,
@@ -217,6 +221,12 @@ pub fn run(args: &MigrateToSqliteArgs) -> Result<()> {
         b.invoices, b.invoice_lines, b.reservations, b.sequence_state, b.series
     );
     println!("  partners family: {} partner(s)", out.partners.partners);
+    let p = out.products;
+    println!(
+        "  products/inventory family: {} product(s), {} stock movement(s), {} material \
+         balance(s), {} reservation(s)",
+        p.products, p.stock_movements, p.inventory_balances, p.inventory_reservations
+    );
     println!(
         "  DuckDB SHA-256 after the run: {} (C-I: must equal the pre-migration manifest's)",
         out.duckdb_sha256_after
@@ -381,6 +391,13 @@ pub fn migrate_families(
         crate::migrate_partners::PartnersCarry::default()
     };
 
+    // --- ADR-0108 Step 7 Part C — the products/inventory family, same lock,
+    //     same digest window. Its presence contract is per TABLE rather than
+    //     per family (`products.rs` and `material_inventory.rs` build two of
+    //     the four each), so the carry decides table by table and the gate
+    //     holds each one symmetrically.
+    let products = crate::migrate_products::carry_products(&src, &mut dst)?;
+
     drop(dst);
     drop(src);
 
@@ -399,6 +416,7 @@ pub fn migrate_families(
         anchors_carried: anchors.len() as u64,
         billing,
         partners,
+        products,
         duckdb_sha256_after: after,
     })
 }
@@ -742,6 +760,9 @@ pub fn reconcile(duckdb_path: &Path, sqlite_path: &Path, tenant: &str) -> Result
 
     // ---- ADR-0108 Step 7 Part B — the partners family's arm ----
     crate::migrate_partners::reconcile_partners(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
+
+    // ---- ADR-0108 Step 7 Part C — the products/inventory family's arm ----
+    crate::migrate_products::reconcile_products(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
 
     Ok(r)
 }

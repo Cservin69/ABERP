@@ -663,7 +663,7 @@ pub fn read_invoice_lines(conn: &duckdb::Connection) -> Result<Vec<InvoiceLineRo
 /// stay `"1.500000"`, because the formatters `.normalize()` and re-rendering
 /// here would make the migration's trailing-zero behaviour depend on when a
 /// row happened to be written.
-fn canonical_decimal(raw: &str, key: &str, column: &str) -> Result<String> {
+pub(crate) fn canonical_decimal(raw: &str, key: &str, column: &str) -> Result<String> {
     Decimal::from_str(raw).map_err(|e| {
         anyhow::anyhow!(
             "{column} on {key} is {raw:?}, which rust_decimal cannot parse ({e}). Refusing to \
@@ -997,7 +997,7 @@ pub(crate) fn fold_i64(values: impl Iterator<Item = i64>, what: &str) -> Result<
 /// The `Decimal` fold for an R2 column. `SUM` on a `TEXT` column coerces to
 /// `REAL` in SQLite, which is the float-money class this migration exists to
 /// remove — so the sum is never asked of the engine.
-fn fold_decimal<'a>(values: impl Iterator<Item = &'a str>) -> Result<Decimal> {
+pub(crate) fn fold_decimal<'a>(values: impl Iterator<Item = &'a str>) -> Result<Decimal> {
     let mut acc = Decimal::ZERO;
     for v in values {
         let d = Decimal::from_str(v)
