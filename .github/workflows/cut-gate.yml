@@ -200,6 +200,38 @@ jobs:
         # difference the holes lived in.
         run: bash tools/cut_gate_sqlite_posture_probes.sh
 
+      - name: ADR-0108 T-8 — no SQL arithmetic on a money/quantity/rate column
+        # S452 — the OTHER half of the SQLite money posture, and the one that
+        # was cited by three landed artefacts and implemented by none until
+        # now (Step 6's M-1). §3.1 measured that `STRICT` does NOT protect an
+        # R2 TEXT-decimal column: REAL -> TEXT converts losslessly, so a float
+        # written into `quantity` is accepted, stringified, and reads back as
+        # `typeof() = 'text'`. R2's guards are the Rust-side `Decimal` bind and
+        # THIS gate — until it ran, R2 had one.
+        #
+        # It is wired HERE, beside the posture gate, and not into the ci.yml
+        # `sqlite-engine` arm: this is a source-tree scan with no compile step,
+        # and the Step-4 adversarial's trap was a gate that existed in `tools/`
+        # while no workflow invoked it. The register it enforces
+        # (`tools/adr0108_money_arith_pending_folds.txt`) is a RATCHET — a fold
+        # that lands without deleting its entry reds T8-4.
+        #
+        # Measured cost against this job's 25-minute budget (the one that has
+        # cancelled a step before): gate 4.7s, probes 37.3s — together less
+        # than the posture probes already in this job at 55.7s.
+        run: bash tools/cut_gate_money_arith.sh
+
+      - name: Prove the T-8 money-arithmetic gate has teeth (negative probes)
+        # 14 mutations in throwaway tree copies. The load-bearing ones are the
+        # shape a naive grep cannot see — `COALESCE(stock_qty,0) <
+        # COALESCE(min_stock,0)`, where the operand beside `<` is a `)` — and
+        # its deficit `ORDER BY (… - …)`, mutated SEPARATELY because reddening
+        # on one of §3.4's two breaks is not evidence of coverage for the
+        # other (F2). P11 neuters the scanner's `emit` and requires T8-2's
+        # liveness fixture to catch it: a rule-less scanner finds nothing,
+        # which reads exactly like a clean tree (the F4 silent-green shape).
+        run: bash tools/cut_gate_money_arith_probes.sh
+
       - name: ADR-0108 T-17 — migration artefacts are git-ignored
         # This repository is PUBLIC. `aberp.sqlite`, its WAL siblings, and BOTH
         # snapshot directories (each holding a byte copy of the entire DuckDB

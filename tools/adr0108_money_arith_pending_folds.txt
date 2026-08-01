@@ -1,0 +1,67 @@
+# ADR-0108 T-8 — the PENDING-FOLD REGISTER.
+#
+# Format: <file>|<enclosing_fn>|<class>|<arm>|<column>[+<column>...]
+#         ('#' comments and blank lines ignored; matching is EXACT and whole-line)
+#
+# One line per SQL-side arithmetic site that §3.4 schedules for a fold into
+# Rust and that has NOT been folded yet. It is a RATCHET, not an allowlist:
+#
+#   * a finding that is not here reds T8-3 — nothing new may be added to SQL;
+#   * an entry here that matches nothing reds T8-4 — when the fold lands, the
+#     entry MUST be deleted in the same commit.
+#
+# So the file can only shrink, and it empties itself. That is deliberate: a
+# permanent exemption is how "temporary" becomes "sanctioned" (§3.3 makes the
+# same call about N-2's one-entry `f64` allowlist, and §3.2 E's
+# `material_inventory` divergence is the same mechanism one product-cycle on).
+#
+# Records are keyed on the ENCLOSING FUNCTION, never on a line number — the
+# ADR-0098 opener-fingerprint and ADR-0106 door-record convention — so an
+# unrelated edit that shifts lines cannot red the gate, while moving the SQL to
+# a different function reds it correctly.
+#
+# EXPOSURE TODAY IS ZERO and this is why the register is safe to ship with four
+# sites in it: `modules/billing` and `aberp-inventory` have NOT crossed the
+# engine seam, so every statement below still executes on DuckDB, where
+# `DECIMAL` is a real decimal type and none of these coerce. The register's
+# entries are the exact set that must empty BEFORE their family crosses.
+# Emptying them is Step 7's work (inventory) and the `reports.rs` fold that
+# waits on §3.4's rounding question (M-2, Ervin's call — `reports.rs:800` sums
+# unrounded products and rounds once, `checked_mul_decimal` rounds per line, and
+# the two are not the same number).
+#
+# --- §3.4 site 1: the ÁFA outgoing report, the sharp one ---------------------
+# `CAST(SUM(CAST(il.quantity AS DECIMAL(38,6)) * il.unit_price) AS VARCHAR)`.
+# Under R2 `quantity` is TEXT; `TEXT * INTEGER` coerces to REAL and the ÁFA
+# report silently becomes float money. Four records: the `*` and the `SUM` seen
+# once per class, because the statement touches one column of each.
+apps/aberp/src/reports.rs|query_outgoing_groups|R1|agg-sum|unit_price
+apps/aberp/src/reports.rs|query_outgoing_groups|R1|arith-mul|unit_price
+apps/aberp/src/reports.rs|query_outgoing_groups|R2|agg-sum|quantity
+apps/aberp/src/reports.rs|query_outgoing_groups|R2|arith-mul|quantity
+#
+# --- §3.4 site 2: the EUR->HUF equivalent aggregate ---------------------------
+# `SUM(i.huf_equivalent_total)` over what §3.2 B converts to INTEGER. Exact,
+# but it RAISES on i64 overflow, and its reader `decimal_str_to_i64(&s)
+# .unwrap_or(0)` (`reports.rs:872`) would then print 0 HUF on the ÁFA report.
+# §3.4 requires the fold and the `unwrap_or(0)` to be deleted in ONE commit.
+apps/aberp/src/reports.rs|query_eur_huf_equivalent|R1|agg-sum|huf_equivalent_total
+#
+# --- §3.4 sites 3 and 4: the stock-cache rebuild, which is a WRITE ------------
+# `SUM(qty_delta)` becomes REAL under R2 and writes a float `stock_qty` back
+# into the products cache. `record_movement` is the in-transaction single-product
+# rebuild; `rebuild_stock_cache_for_tenant` is the batch one (also the body
+# behind `bin/rebuild_stock_cache.rs`, which carries no SQL of its own — §3.4's
+# third inventory row cites its usage string, not a statement).
+crates/aberp-inventory/src/repository.rs|record_movement|R2|agg-sum|qty_delta
+crates/aberp-inventory/src/repository.rs|rebuild_stock_cache_for_tenant|R2|agg-sum|qty_delta
+#
+# --- what is NOT here, and was expected to be --------------------------------
+# §3.4's site 7 (`repository.rs:548-549`, `low_stock_products`) and its twin at
+# `:585` (`count_low_stock_products`) — the tree's only Q2 lexicographic break.
+# Both are ALREADY FOLDED on this branch: the predicate and the deficit ordering
+# now run in Rust over `Decimal` in `low_stock_candidates`, and the surviving
+# `COALESCE(stock_qty, 0)` there is a PROJECTION, not a comparison. The gate is
+# green on them because they are fixed, not because it cannot see them — T8-2's
+# liveness fixture runs that exact statement and requires the `cmp-lt`,
+# `arith-sub` and `cmp-orderby` arms to fire on it.
