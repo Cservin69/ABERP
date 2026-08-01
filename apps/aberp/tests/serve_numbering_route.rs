@@ -26,13 +26,33 @@ use aberp::numbering::{
     YearDigits,
 };
 
+/// A scratch directory that is unique **per call**, not merely per process.
+///
+/// ADR-0108 §9 recorded this binary as "flakes; cross-test interference on
+/// shared state" and left the cause open. It is here: keying only on
+/// `(pid, nanos)` is not unique when two `#[test]` threads read the clock
+/// within the same tick, and then both tests write `seller.toml` into the
+/// *same* directory — one clobbering the other's `[seller]` identity and bank
+/// sections. That is the observed signature exactly:
+/// `put_preserves_identity_and_bank_sections` read back a file containing only
+/// `[seller.numbering]`, i.e. the one `put_then_get_round_trips_template`
+/// wrote. It reproduces on either feature arm and is green in isolation,
+/// which is why it read as a mystery rather than a race.
+///
+/// The `AtomicU64` is the fix and it is the pattern the ADR-0108 test files
+/// already use (`adr0108_step5_billing_family.rs::scratch`,
+/// `crates/aberp-db/src/sqlite.rs::scratch`) — a monotonic per-call counter is
+/// the only part of the name that cannot collide.
 fn unique_tmpdir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("aberp-pr89-numbering-{pid}-{nanos}"));
+    let seq = N.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("aberp-pr89-numbering-{pid}-{nanos}-{seq}"));
     std::fs::create_dir_all(&dir).expect("mkdir tmpdir");
     dir
 }

@@ -594,6 +594,34 @@ true against the tree at `b7d5c61`, and both are enforceable:
 > `nav_xml.rs:1788`, over the four legal Hungarian ÁFA rates. **The allowlist has
 > one entry and it may only shrink.**
 
+> ✅ **N-2's "value-exact" is now MEASURED over the whole domain, not asserted
+> over the intended one (Step 6, S451).** The clause "value-exact over the
+> closed set of values the column can hold" was doing more work than it could
+> carry: the column's Rust type is `u16`, so *what the column can hold* is
+> 65 536 values, and "the four legal rates" is a property of the **doors**, not
+> of the type. Swept:
+>
+> - The `f64` render and the exact `Decimal` render (`Decimal::from(bp) /
+>   Decimal::from(10000)`, `round_dp(2)`, `{:.2}` — the exact shape §3.3's
+>   conservative call prescribes) agree on **every** `u16` value **except**
+>   those that are an exact tie at the second decimal place (`bp % 100 == 50`),
+>   where the `f64`'s binary approximation decides the tie and the exact value
+>   decides it by the rounding strategy.
+> - **No legal Hungarian rate is in that class** (0 / 500 / 1800 / 2700 all
+>   have `bp % 100 == 0`). N-2 is therefore sound, and for a stated reason
+>   rather than a hopeful one.
+> - The practical consequence for the session that lands the B2 conversion:
+>   **it moves no filed byte for any rate the product can issue**, and the
+>   sweep says so before the change rather than after it.
+>
+> Pinned by `the_permitted_f64_vat_rate_render_is_exact_except_on_second_decimal_ties`
+> and `the_legal_hu_rates_round_trip_through_the_f64_render_and_the_exact_parse`
+> (`apps/aberp/src/nav_xml.rs`, unit tests). The second closes the §9 rule-7
+> fork row against `:2658`'s exact parse in the direction that matters: the
+> forward render round-trips back to the original basis points on all four
+> rates. The sweep asserts its divergent set is **non-empty**, so it cannot
+> pass vacuously.
+
 The distinction is the whole point and it is not a hedge: N-1 is about a *value*
 that must round-trip exactly at arbitrary precision, N-2 is about a *rendering* of
 a value whose exact form is the integer that stays in storage. `vat_rate_basis_points`
@@ -894,6 +922,49 @@ run/rollback_to_duckdb.sh [--from <snapshot-dir>]
 `rollback_to_duckdb.sh` and confirming a green DEV boot on DuckDB, then
 re-applying the step.* A rollback path exercised once at the end is a rollback path
 that has never been exercised.
+
+### 6.2.1 How to reach a genuinely green drill — the demonstration plan (Step 6, S451)
+
+S-1 and S-2 make step 7's verification unreachable against the DEV tenant *as it
+stands today*. Neither is fixed by weakening a check. The DEV DB is disposable
+([[feedback_dev_db_disposable]]), and that is the lever: **give the drill a
+tenant that has something to protect.** Four operations, in order, each with its
+own exit condition, none of them a change to `premigration.rs`:
+
+1. **Reconcile the mirror first (closes S-2).** Run the existing
+   `docs/runbooks/audit-mirror-defork-20260719.md` heal against the DEV tenant.
+   *Exit:* `head_seq == mirror_tail_seq`, `verify-chain` genesis→head `OK`.
+   Its own focused session — a migration is not a repair tool, and neither is an
+   adversarial review.
+2. **Stand up a signed DEV tenant (closes S-1).** Not by editing the existing
+   one: create a **fresh tenant** in `tenants.toml` with `dap_enabled = true`
+   (a non-production build — a production build refuses to start on that flag,
+   `serve.rs:2945`), boot it, and drive the customer journey through it. Boot
+   alone opens a service session and takes an anchor; the heartbeat takes more.
+   *Exit:* `signed_entry_count > 0` **and** `anchor_count > 0` measured through
+   `premigration::run_snapshot`, i.e. through the same reader the gate uses.
+3. **Run T-15 on that tenant** — quote → order → work order → dispatch →
+   invoice → NAV submit (test endpoint) → PDF → email — so the ledger carries
+   *business* entries interleaved with the signed session entries, and the
+   invoice family carries real rows. *Exit:* the journey completes and the
+   invoice number, the ÁFA breakdown and the PDF bytes assert.
+4. **Then the drill, in place, on that tenant:** snapshot → migrate → reconcile
+   → `rollback_to_duckdb.sh` → green DuckDB boot → re-apply. *Exit:* §6.2 step
+   7 prints **PASS** with all six checks green, including the two B1 counts —
+   which is now a real equality between two non-zero numbers rather than an
+   unreachable one.
+
+**Note what step 2 exposes and do not let it pass silently.** Because
+`append_in_tx` hard-passes `None` for the session, only session-lifecycle
+entries are ever signed; a signed DEV tenant will show `signed_entry_count` in
+the single digits against hundreds of business entries. That is enough to make
+B1 a real check, and it is **not** enough to call the chain "tamper-evident" in
+any operator-facing sense. §11's production-cutover list must carry that
+distinction explicitly, because on a production build `dap_enabled = true` is a
+hard refusal today — so **a production tenant cannot satisfy B1's precondition
+at all**, and the prod cutover therefore owes either the ADR-0099 fork fix that
+unblocks DÁP or a stated, testable exemption. That is a larger finding than
+S-1's DEV symptom and it is where S-1 actually points.
 
 ### 6.3 What data crosses, and how — per family
 
@@ -1398,6 +1469,81 @@ invoice-sequence allocation.** *(the whole point of the exercise)*
 adversarial review for the invoice→NAV/ÁFA path; Step 5 *is* that path. No further
 family crosses until this closes.
 
+> **Step 6 RAN, 2026-08-01 (S451). Verdict: GO to Step 7, conditional on the
+> four must-fixes below.** Test-hardening only; no production code changed.
+>
+> **What was attacked, and what held.**
+>
+> 1. **N-1 re-swept over the emission reach set** (`apps/aberp/src/nav_xml.rs`
+>    + `modules/billing/src` + `crates/invoice-pdf/src`, recursive, `f64`/`f32`
+>    /float-literal): **one** live `f64` and it is `nav_xml.rs:1788`, the VAT
+>    *rate* render. `invoice-pdf`'s `f32`s are page geometry and RGB colour;
+>    `modules/billing`'s only hit is a doc comment stating the opposite policy.
+>    No monetary amount and no quantity touches a float between column and
+>    emitted byte. The whole arithmetic chain is `i64` / `Decimal`:
+>    `checked_mul_decimal` → `round_dp_with_strategy(0, MidpointNearestEven)`,
+>    `vat_amount` → `i64` × `bp` / 10 000, `huf_equivalent_round_half_even` →
+>    `Decimal` throughout, `format_native_amount` → integer string / `abs/100 .
+>    abs%100`. **N-1 holds.**
+> 2. **B2 measured rather than asserted** — see §3.3's ✅ block above.
+> 3. **T-4 LANDED and green, with an in-suite mutation proof.** The gap Step 5
+>    left ("only meaningful once something reads the SQLite side") is closed by
+>    reading the SQLite side *in the test*: every seeded invoice is
+>    reconstructed from **both** engines and driven through the production
+>    `nav_xml` renderer — the fresh-issuance body, the storno body and the
+>    modification body — and the three byte strings are compared. **Zero
+>    divergence.** The fixture adds the shapes Step 5's own fixture did not
+>    have: a **mixed-rate** invoice carrying all four legal ÁFA rates (four
+>    `summaryByVatRate` buckets) and a uniform **non-`Percent`** (`AamExempt`)
+>    invoice, where a kind that failed to cross changes the *element name*, not
+>    a digit. `apps/aberp/tests/adr0108_step6_nav_byte_identity.rs`.
+> 4. **The PDF half of T-4 is discharged by reduction, stated not assumed.**
+>    `print_invoice.rs` builds every money-bearing `PdfLine` field from the
+>    **on-disk NAV XML**, not from the database; the only DB-sourced PDF inputs
+>    are the buyer-facing notes and the rate metadata, and both are compared in
+>    the same test. Byte-identical XML + verbatim notes **is** the PDF claim.
+>    If a later change sources an amount from the DB, the reduction breaks —
+>    the test's module docs say so at the point of reliance.
+> 5. **Q2, re-swept for the invoice family specifically.** Every SQL statement
+>    in the tree mentioning `quantity` / `exchange_rate` / `huf_equivalent_total`
+>    / `unit_price` / `vat_rate_basis_points`, filtered for `ORDER BY` / `MIN` /
+>    `MAX` / `BETWEEN` / range predicates: **the only orderings are on `id` and
+>    `(invoice_id, ordinal)`**, both identity columns, both inside the migrator.
+>    **No ordering, range or extremum on an R2 column feeds a NAV total or a
+>    PDF subtotal.** §3.4's two Q2 hits remain the tree's only ones and both are
+>    inventory, i.e. Step 7.
+> 6. **The R2 bind census is trivially closed *today* and that is the point.**
+>    Because `modules/billing` has not crossed the seam, the tree's **only**
+>    SQLite bind path into an R2 column is `migrate_billing.rs::carry_billing`,
+>    and it binds a `String` produced by `canonical_decimal` (a validating
+>    pass-through, never a re-render) with `unit_price` / `huf_equivalent_total`
+>    as `i64` via `money_minor_units`, which **refuses** a non-integral value
+>    rather than casting it. There is no `f64` bind site to find. The exposure
+>    is entirely **prospective**: it arrives with the cutover, when
+>    `duckdb_store.rs`'s writers become the SQLite writers — which is exactly
+>    when T-8 has to already exist. See the must-fix.
+>
+> **Must-fix before Step 7 lands, all four recorded in §9.**
+>
+> - **M-1 (blocking Step 7): T-8 does not exist.** §3.1's 2026-07-31 correction
+>   states R2's guards are "exactly two, and they are now known to be the only
+>   two" — the Rust `Decimal` bind and T-8's no-arithmetic-in-SQL cut-gate.
+>   Measured: `tools/` carries `cut_gate_sqlite_posture.sh` and its probes and
+>   nothing else; neither workflow runs a T-8 step; a tree-wide search for
+>   `T-8` returns **three doc-comment citations and zero implementations**.
+>   **R2 has one guard, not two**, and three landed artefacts assert otherwise.
+> - **M-2: §3.4's prescribed fold is not value-neutral, and T-5(c) pins that it
+>   is.** See §9.
+> - **M-3: S-1's ruling** — B1 stands; the drill needs a signed tenant. §9.
+> - **M-4: S-2's ruling** — DEV-only artefact, reconcile before any real-DEV
+>   run. §9.
+>
+> **What Step 6 did NOT do, deliberately (rule 3).** It did not build T-8: the
+> gate's mutation targets are `repository.rs:548/549/585`, which are Step 7's
+> commit, and a gate landed here would either red on day one or ship with an
+> allowlist for its own two known sites. It did not cross a family, run the
+> real-DEV drill, or touch `~/.aberp/**`.
+
 **Step 7 — The remaining non-quoting families,** one at a time, rule-14 fused:
 partners (+ **M11**, T-12) → products/inventory (incl. §3.4's three cache-rebuild
 folds **and both low-stock predicate folds, `repository.rs:548–549` and `:585`,
@@ -1475,8 +1621,10 @@ it or an explicit "out of scope".
 
 | Item | Closed by |
 |---|---|
-| **S-1 — THE DEV TENANT HAS NO TAMPER-EVIDENCE COVERAGE AT ALL, so Step 5's stated exit criterion cannot be met and neither can §6.2's rollback verification.** Measured 2026-07-31 against a byte-identical copy of `apps/aberp-ui/aberp.duckdb` (240 `audit_ledger` rows): **`signed_entry_count = 0`, `anchor_count = 0`.** The S441 / ADR-0087 per-entry signature layer and the qualified-timestamp anchors are simply not populated on this tenant. B1's non-zero precondition therefore hard-stops the migrator *and* `rollback_to_duckdb.sh`, both correctly — an equality between two zeros is not a check. But the consequence is sharper than "the gate is strict": **§6.2 step 7's verification can never report PASS against the actual DEV database**, and §6.2's own argument is that "a rollback path exercised once at the end is a rollback path that has never been exercised". Every other check in the drill passed (all 40-odd per-table row counts, the WAL check, the artefact digests); only these two fail. | **Step 6's adversarial, as an input rather than a finding to fix in flight.** Two candidate dispositions and they are genuinely different: (a) the DEV ledger's signature/anchor layer is *supposed* to be populated and is not — a live defect in S441/ADR-0087's wiring, which would make this the most valuable thing Step 5 found; or (b) it is expected to be empty on a DEV tenant that has never opened a signed session, in which case B1's non-zero precondition needs a stated, testable exemption rather than an unreachable PASS. **Do not soften the precondition to make the drill green** — that is the exact fail-open B1 exists to stop. |
-| **S-2 — THE DEV TENANT'S AUDIT MIRROR IS AHEAD OF THE DB TABLE BY 5 ENTRIES, TODAY.** Measured in the same snapshot: `head_seq = 240`, `mirror_tail_seq = 245`. This is the **2026-07-19 shape** (`docs/runbooks/audit-mirror-defork-20260719.md`), recurring — five committed audit appends that the fsync'd mirror kept and the DB table lost. It is what R-5 looks like from the outside. `classify_mirror` classifies it correctly and routes to `heal_from_mirror_ahead` with "STOP: a migration is not a repair tool", so the migrator would refuse here too even with S-1 resolved. | **The existing heal path, run by the operator, before any real-DEV migration** — not by this migration and not by a session doing something else. Recorded here because it is a *second*, independent reason the Step-5 exit criterion is unreachable today, and because a session that fixed only S-1 would then hit this and might read it as a Step-5 regression. |
+| **S-1 — THE DEV TENANT HAS NO TAMPER-EVIDENCE COVERAGE AT ALL, so Step 5's stated exit criterion cannot be met and neither can §6.2's rollback verification.** Measured 2026-07-31 against a byte-identical copy of `apps/aberp-ui/aberp.duckdb` (240 `audit_ledger` rows): **`signed_entry_count = 0`, `anchor_count = 0`.** The S441 / ADR-0087 per-entry signature layer and the qualified-timestamp anchors are simply not populated on this tenant. B1's non-zero precondition therefore hard-stops the migrator *and* `rollback_to_duckdb.sh`, both correctly — an equality between two zeros is not a check. But the consequence is sharper than "the gate is strict": **§6.2 step 7's verification can never report PASS against the actual DEV database**, and §6.2's own argument is that "a rollback path exercised once at the end is a rollback path that has never been exercised". Every other check in the drill passed (all 40-odd per-table row counts, the WAL check, the artefact digests); only these two fail. | **Step 6's adversarial, as an input rather than a finding to fix in flight.** Two candidate dispositions and they are genuinely different: (a) the DEV ledger's signature/anchor layer is *supposed* to be populated and is not — a live defect in S441/ADR-0087's wiring, which would make this the most valuable thing Step 5 found; or (b) it is expected to be empty on a DEV tenant that has never opened a signed session, in which case B1's non-zero precondition needs a stated, testable exemption rather than an unreachable PASS. **Do not soften the precondition to make the drill green** — that is the exact fail-open B1 exists to stop. **RULED 2026-08-01 (Step 6): disposition (b), and the root cause is in the code, not inferred.** `serve.rs:2922` reads `tenant_dap_config`; `spawn_dap_audit_chain` runs **only** when the tenant's `dap_enabled` is true, and `tenant_registry.rs:255/280` default it to **`false`** — `serve.rs:2966` even fails *safe* to OFF when the registry cannot be read ("assuming OFF (unsigned chain)"). The DEV `test` tenant has never opened a signed session, so `signed_entry_count = 0` and `anchor_count = 0` are the **correct** state, not a wiring defect. Two sharpenings the ledger row did not have: (i) a **PRODUCTION build REFUSES TO START** with `dap_enabled = true` (`serve.rs:2945`, the ADR-0099 scanner-blind-fork guard), so signed entries are today **unreachable in prod by construction** — which means B1's precondition can never be satisfied on a prod-shaped tenant either, and §11's cutover list must say so; (ii) even with `dap_enabled = true`, **business appends are never signed** — `append_in_tx` (`storage/mod.rs:615`) hard-passes `None` for the session, so only session-lifecycle entries carry an `event_sig`. `signed_entry_count` is therefore a *small non-zero* number under DÁP, never "all entries", and any future gate that assumes otherwise is wrong. **B1's refusal is CORRECT and MUST NOT be softened**: it says "this database has no tamper-evidence to verify", which is true, and turning it into a green two-zero equality would be the fail-open. The drill is made green by giving it something to protect — see the demonstration plan in the §9 row below. |
+| **S-2 — THE DEV TENANT'S AUDIT MIRROR IS AHEAD OF THE DB TABLE BY 5 ENTRIES, TODAY.** Measured in the same snapshot: `head_seq = 240`, `mirror_tail_seq = 245`. This is the **2026-07-19 shape** (`docs/runbooks/audit-mirror-defork-20260719.md`), recurring — five committed audit appends that the fsync'd mirror kept and the DB table lost. It is what R-5 looks like from the outside. `classify_mirror` classifies it correctly and routes to `heal_from_mirror_ahead` with "STOP: a migration is not a repair tool", so the migrator would refuse here too even with S-1 resolved. | **The existing heal path, run by the operator, before any real-DEV migration** — not by this migration and not by a session doing something else. Recorded here because it is a *second*, independent reason the Step-5 exit criterion is unreachable today, and because a session that fixed only S-1 would then hit this and might read it as a Step-5 regression. **RULED 2026-08-01 (Step 6): a DEV-only data artefact, safe to reconcile, and the migration must NOT learn to handle it.** The mirror is an append-only fsync'd sidecar; a DuckDB checkpoint folds and truncates the DB's WAL but cannot touch the mirror, so "mirror ahead by N" is the outside view of R-5's fork-close (see the R-5 row) and nothing about it is engine-specific or migration-specific. `classify_mirror` already routes it to `heal_from_mirror_ahead` with "STOP: a migration is not a repair tool", which is the right refusal: a migrator that reconciled a divergent chain would be *writing* history under the guise of copying it. **The reconcile is the existing heal path, run by the operator, in its own focused session** — `docs/runbooks/audit-mirror-defork-20260719.md`, repair FIRST and only then re-run the drill. Not run here: this session is analysis + test-hardening and does not touch `~/.aberp/**` or the live DEV tenant. |
+| **M-1 — T-8 DOES NOT EXIST, AND §3.1 ASSERTS IT DOES. R2's guard count is ONE, not two.** Measured 2026-08-01 (Step 6): `tools/` contains `cut_gate_sqlite_posture.sh` + `cut_gate_sqlite_posture_probes.sh` and no arithmetic/comparison gate; neither `.github/workflows/ci.yml` nor `cut-gate.yml` runs a T-8 step; a tree-wide search for `T-8` / `t8_` returns **three doc-comment citations and zero implementations** (`crates/aberp-db/tests/adr0108_money_representation.rs:25` and `:109`, `apps/aberp/tests/adr0108_step5_billing_family.rs:344`). §3.1's corrected note says R2's guards "are exactly two, and they are now known to be the only two" — the Rust `Decimal` bind and T-8. **One of the two is not built**, so three landed artefacts document a mitigation that has never run. **Exposure today is ZERO** — `modules/billing` has not crossed the seam, so the only SQLite bind path into an R2 column is `carry_billing`, which binds validated `String`s and `i64`s. The exposure arrives with the family's Rust-side crossing. | **Step 7's FIRST commit, before any family crosses**, and it is a blocker rather than a nicety: §8 T-8's mutation targets (`repository.rs:548` `<`, `:549` `-`, `:585` `<`) are Step 7's own fold sites, so the gate and its mutation proof land together — which is why Step 6 did not build it here (rule 3; a gate landed early would either red on day one or ship with an allowlist for the two sites it exists to catch). Until it lands, **§3.1's "exactly two" sentence is wrong and is corrected to "one guard today; T-8 is owed"**. |
+| **M-2 — §3.4's PRESCRIBED FOLD IS NOT VALUE-NEUTRAL, AND T-5(c) PINS THAT IT IS.** §3.4 says `reports.rs:800` becomes a Rust fold "with `Money::checked_mul_decimal` … + the existing `decimal_str_to_i64` round-half-even". Those are two *different* rounding orders. Today the SQL sums the **unrounded** `DECIMAL(38,6)` products per `(invoice, vat_rate)` group and rounds **once**, at `decimal_str_to_i64`; `checked_mul_decimal` rounds **per line** and then the fold sums whole minor units. On any invoice with a fractional quantity these differ. `reports.rs:1010–1014` already **documents** the choice ("per-line rounding would match NAV byte-perfect but the dashboard is a management view"), so it is a known, deliberate divergence between the ÁFA dashboard and the NAV filing — but §3.4 does not say the fold changes it, and **§8 T-5(c) asserts the folded result "equals the pre-migration DuckDB `DECIMAL(38,6)` aggregate for every invoice"**, which is the opposite claim. A session executing §3.4 literally will write the fold, watch T-5(c) red, and repair whichever of the two is cheaper to change — the shape ADR-0107 §4.1 exists to stop. | **Step 7 / the cutover session, as an explicit product decision, taken BEFORE the fold is written.** Either (a) keep the single-rounding management view — then the fold must sum `Decimal` products and round once, and §3.4's `checked_mul_decimal` wording is wrong; or (b) move the report to per-line rounding so it ties to the filing — then §3.4 is right, T-5(c) must be restated as "equals the pre-migration aggregate **for invoices with integral quantities**", and the change of published figures needs saying out loud. **Not decided here** — it is Ervin's call which number the ÁFA dashboard should show. Recorded because the plan currently contains both answers. |
 | **R-5 — A FOREIGN CONNECTION'S `close` SILENTLY DESTROYS EVERY SUBSEQUENT COMMIT'S DURABILITY. Live in production today, on DuckDB, on 13 in-serve routes. Measured, deterministic (3/3), with a no-fork control and a mutation.** The `Handle` sets `disable_checkpoint_on_shutdown` + `wal_autocheckpoint='1TB'` (`lib.rs:648`) so its commits stay WAL-resident *by design*. A co-resident `Connection::open` carries neither pragma, so **its close checkpoints**: the WAL is folded into the main file and truncated to zero. From that moment the writer's WAL is gone and does not come back — 10 further commits returned `Ok` and were written **nowhere**; on process exit they are gone. **The read-fork class is not a stale read.** The forked read itself is coherent (DuckDB replays the WAL on open); the stale read is a *symptom of a prior fork's close*. **Consequences for this plan's framing:** (i) read/write is the wrong axis — the injury is the `close`, so the census that matters is the **ADR-0098 opener census (81)**, not the read-fork subset (33); (ii) the 13 GROUP-A in-serve entries are not stale-read nuisances — the **first** hit of any one of them ends that `serve` process's write durability for invoices, audit rows and the invoice-number floor; (iii) it settles ADR-0107 §1.3 F1. | **ITS OWN PR, BEFORE ANYTHING ELSE — explicitly NOT folded into this migration** (CLAUDE.md rule 3). This plan is DEV-only (§11 authorises no cutover), so **prod stays on DuckDB and this stays live for as long as it does; the migration is not its fix.** Two shapes, in preference order: **(1) containment — make every opener carry the two pragmas** at every `Connection::open` on a live tenant DB (measured to reduce the loss to zero; hours of work; the forks remain, so it is containment, not a fix); **(2) migrate the 13 GROUP-A routes to the `Handle`**, which is what the frozen baseline says should happen — larger, and it is product work on live invoice/NAV routes. The containment should land first regardless, because it stops the bleeding on a defect that is live today. Evidence: `docs/findings/read-fork-audit-sqlite-20260731.md` §3, `duckdb_a_foreign_close_silently_destroys_every_later_commit`. |
 | The frozen baseline's GROUP-A rationale states the mechanism as a stale read of "the last-checkpointed **SUBSET**" (`tools/adr0099_read_fork_structural_baseline.txt`). **Measured false** — see R-5. | Same PR as R-5: the baseline's header text is where the next reader learns the mechanism, so leaving it wrong there is worse than leaving it unfixed. |
 | The read-fork gate and the write-fork gate partition on read/write, but the hazard is the **close** and does not respect that partition. | Recorded here; a gate change belongs with R-5, **not** with this migration. |
@@ -1491,7 +1639,7 @@ it or an explicit "out of scope".
 | `aberp-mes::ledger_writer::write_one` appends through a fresh in-serve connection while the write-fork gate reports ZERO | ADR-0107 §5 says close it **by hand now** — a forked *append* forks the ledger under **any** engine. Independent of this plan; should land before Step 5. |
 | The S392 NAV pre-flight is dead (0 `check_performed` in 225 mirror entries) | Orthogonal, engine-independent, and ADR-0107 §5 calls it the most under-weighted open item. Not this plan. |
 | ~~ADR-0107 §1.3 finding F1 (is a forked read stale, or was D2a row loss?) is unsettled~~ | **CLOSED 2026-07-31 by the measurement in R-5 above.** Neither: the forked read is *coherent*, and the loss is the fork's **close** truncating the writer's WAL. The migration does not make it moot on prod — prod stays on DuckDB. Tracked as R-5, its own PR. |
-| `apps/aberp/tests/serve_numbering_route.rs::put_then_get_round_trips_template` **flaked once** under the CI-shaped `cargo test -p aberp -p aberp-db --features sqlite-engine` arm (read back `start_value: 1247` instead of the `1` just written). Green in isolation and green on an immediate identical re-run; green in the default `--workspace` run. Cross-test interference on shared state, not an engine defect — the `sqlite-engine` feature changes no storage yet (Steps 1–4 are the reversible foundation). | **Out of scope**, recorded 2026-07-31 so a future session does not misread it as a Step-5 regression. If it recurs, it is a test-isolation defect in the numbering route's fixtures and needs its own PR — not a retry loop. |
+| `apps/aberp/tests/serve_numbering_route.rs::put_then_get_round_trips_template` **flaked once** under the CI-shaped `cargo test -p aberp -p aberp-db --features sqlite-engine` arm (read back `start_value: 1247` instead of the `1` just written). Green in isolation and green on an immediate identical re-run; green in the default `--workspace` run. Cross-test interference on shared state, not an engine defect — the `sqlite-engine` feature changes no storage yet (Steps 1–4 are the reversible foundation). | ~~**Out of scope**, recorded 2026-07-31 so a future session does not misread it as a Step-5 regression.~~ **CLOSED 2026-08-01 (Step 6) — it recurred on the DEFAULT `--workspace` arm (which this row said was green), on the sibling test `put_preserves_identity_and_bank_sections`, and the cause is a two-line test-isolation defect exactly as predicted.** `unique_tmpdir()` (`serve_numbering_route.rs:29`) keyed the scratch directory on `(pid, nanos)` with **no per-call counter**, so two `#[test]` threads reading the clock in the same tick get the *same* directory and both write `seller.toml` into it. The observed failure is that signature verbatim: the identity/bank assertion read back a file containing only `[seller.numbering]` — the one the *other* test wrote. Fixed here with the `AtomicU64` per-call counter the ADR-0108 test files already use. Test-only, two lines; folded in rather than deferred because a non-deterministic suite makes **every** subsequent step's gate untrustworthy, and rule 4 makes the gates the per-step trust surface. Named in the Step-6 commit body so it is not miscounted as adversarial collateral. |
 | ADR-0107 §2 lists `db_writer_lock` as retirable; ADR-0107 §3 B-cost-1 says money is already integer; ADR-0107 §4.1 Phase 0 does not scope the DDL rewrites | Amended in Step 1's PR body per PR #49's own deferral ledger, plus §1.1 G-2's `.sql` correction which PR #49 also missed |
 
 ---
