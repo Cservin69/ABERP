@@ -663,7 +663,7 @@ pub fn read_invoice_lines(conn: &duckdb::Connection) -> Result<Vec<InvoiceLineRo
 /// stay `"1.500000"`, because the formatters `.normalize()` and re-rendering
 /// here would make the migration's trailing-zero behaviour depend on when a
 /// row happened to be written.
-pub(crate) fn canonical_decimal(raw: &str, key: &str, column: &str) -> Result<String> {
+pub fn canonical_decimal(raw: &str, key: &str, column: &str) -> Result<String> {
     Decimal::from_str(raw).map_err(|e| {
         anyhow::anyhow!(
             "{column} on {key} is {raw:?}, which rust_decimal cannot parse ({e}). Refusing to \

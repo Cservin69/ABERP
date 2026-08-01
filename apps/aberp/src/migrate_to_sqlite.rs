@@ -190,6 +190,11 @@ pub struct MigrateOutcome {
     /// zeros when the source has none of its four tables. Presence is held
     /// symmetrically **per table**, because two modules own the four.
     pub products: crate::migrate_products::ProductsCarry,
+    /// ADR-0108 Step 7 Part D — what the work-orders/BOM family carried. All
+    /// zeros when the source has none of its four tables. Presence is held
+    /// symmetrically **per table**, because `bom_revisions` arrives with a later
+    /// migration than the other three.
+    pub work_orders: crate::migrate_work_orders::WorkOrdersCarry,
     /// SHA-256 of the DuckDB file, taken after the run. C-I says this must
     /// equal the digest taken before it (T-19 arm 2).
     pub duckdb_sha256_after: String,
@@ -226,6 +231,12 @@ pub fn run(args: &MigrateToSqliteArgs) -> Result<()> {
         "  products/inventory family: {} product(s), {} stock movement(s), {} material \
          balance(s), {} reservation(s)",
         p.products, p.stock_movements, p.inventory_balances, p.inventory_reservations
+    );
+    let w = out.work_orders;
+    println!(
+        "  work-orders/BOM family: {} work order(s), {} BOM line(s), {} routing op(s), \
+         {} BOM revision(s)",
+        w.work_orders, w.boms, w.routings, w.bom_revisions
     );
     println!(
         "  DuckDB SHA-256 after the run: {} (C-I: must equal the pre-migration manifest's)",
@@ -398,6 +409,13 @@ pub fn migrate_families(
     //     holds each one symmetrically.
     let products = crate::migrate_products::carry_products(&src, &mut dst)?;
 
+    // --- ADR-0108 Step 7 Part D — the work-orders/BOM family, same lock, same
+    //     digest window. Presence is per TABLE like Part C's, but for a
+    //     different reason: one `ensure_schema` builds all four, and V003
+    //     (ADR-0105) added `bom_revisions` after V001, so a DuckDB file written
+    //     before that migration legitimately has three of the four.
+    let work_orders = crate::migrate_work_orders::carry_work_orders(&src, &mut dst)?;
+
     drop(dst);
     drop(src);
 
@@ -417,6 +435,7 @@ pub fn migrate_families(
         billing,
         partners,
         products,
+        work_orders,
         duckdb_sha256_after: after,
     })
 }
@@ -763,6 +782,14 @@ pub fn reconcile(duckdb_path: &Path, sqlite_path: &Path, tenant: &str) -> Result
 
     // ---- ADR-0108 Step 7 Part C — the products/inventory family's arm ----
     crate::migrate_products::reconcile_products(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
+
+    // ---- ADR-0108 Step 7 Part D — the work-orders/BOM family's arm ----
+    crate::migrate_work_orders::reconcile_work_orders(
+        &src,
+        &dst,
+        &mut r.checks,
+        &mut r.hard_stops,
+    )?;
 
     Ok(r)
 }

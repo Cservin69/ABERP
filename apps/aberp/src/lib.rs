@@ -111,6 +111,12 @@ pub mod migrate_products;
 /// engines, because it reads DuckDB and writes SQLite.
 #[cfg(feature = "sqlite-engine")]
 pub mod migrate_to_sqlite;
+/// ADR-0108 Step 7 Part D — the work-orders/BOM family's STRICT schema, carry
+/// and gate arm. Carries the tree's one money column that is R2 rather than R1
+/// (`routings.est_cost_huf`, §3.2 B) and the family's one remaining float
+/// (`work_orders.actual_machining_minutes`, §3.2 E).
+#[cfg(feature = "sqlite-engine")]
+pub mod migrate_work_orders;
 pub mod mnb_rates_provider;
 pub mod nav_number_probe;
 pub mod nav_xml;

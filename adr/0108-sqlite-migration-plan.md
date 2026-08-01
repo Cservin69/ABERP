@@ -458,6 +458,18 @@ converts data. **Sources: `.rs` DDL and the 7 `.sql` migration files (§1.1 G-2)
 > operator estimate on a routing op; it never reaches NAV, the PDF, or the ledger
 > totals. R2 keeps it exact and changes no Rust type. → flagged for the
 > adversarial as the one money column that does not follow R1.
+>
+> > ✅ **LANDED AS R2 2026-08-01 (S456, Step 7 Part D), and the flag stands.**
+> > `migrate_work_orders` declares the column `TEXT` in a `STRICT` table and
+> > carries the DuckDB string **verbatim** through
+> > `migrate_billing::canonical_decimal` — the same validate-and-carry the Step-5
+> > invoice family uses for `exchange_rate` and `quantity`, so the exception
+> > introduces no new mechanism, only a different rule for one column. The gate
+> > asserts `typeof(routings.est_cost_huf) = 'text'` on every row and folds the
+> > column in Rust over `Decimal`; a `'real'` there would be F-6a's float-money
+> > class arriving through this exception, which is the specific thing worth
+> > watching. **This remains the only money column in the tree that is not R1**,
+> > and the adversarial review it was flagged for has not happened yet.
 
 #### C — exact non-integer, `DECIMAL` → `TEXT` (R2). No Rust type change; bind/read already string.
 
@@ -552,6 +564,27 @@ below**); `work_orders.actual_machining_minutes`;
 > (b) `qc_inspections.deviation` is a *derived* float on a dimensional-inspection
 > record used for a pass/fail verdict. It is not money. Keeping it `REAL` is the
 > conservative no-change call, flagged.
+>
+> > ✅ **`work_orders.actual_machining_minutes` CROSSED AS `REAL`, UNCHANGED,
+> > 2026-08-01 (S456, Step 7 Part D) — category E holds for it, and the reason it
+> > did not follow S455's five is worth stating rather than leaving to
+> > inference.** S455 moved five columns out of E because they were one half of a
+> > **measured** rule-7 divergence: the same physical quantity was `DECIMAL` in
+> > `stock_movements` and `DOUBLE` in `inventory_balances`, so carrying both
+> > as-is would have blessed the fork. `actual_machining_minutes` has no exact
+> > counterpart — `routings.est_time_min` is an `INTEGER` *estimate* at a
+> > different granularity (per-op, not per-WO), and the calibration consumer's own
+> > columns (`quote_calibration.estimated_minutes` / `actual_minutes`) are
+> > `DOUBLE` as well. There is no fork to close.
+> >
+> > **And the risk runs the other way for a measured duration.** R2 refuses
+> > anything above the canonical quantity scale of 6, so an R2 carry would
+> > **hard-fail the whole migration** on an ordinary row like `12.3456789` —
+> > refusing a value that carries no exactness requirement, on a column that is
+> > not money and never reaches a filing. `DOUBLE` → `REAL` is bit-exact and adds
+> > nothing new. The gate proves it per row (the `f64` read back from SQLite must
+> > equal the `f64` DuckDB held, a `NaN` therefore hard-stopping), and the
+> > fixture's `wo-02` carries exactly the scale-7 duration the argument turns on.
 
 #### F — integers and identity: `BIGINT`/`INTEGER` → `INTEGER`, unchanged
 
@@ -1716,6 +1749,69 @@ email/relay.
 > that mutation, so the per-row arm is the only thing between a rewritten
 > movement history and a green gate.
 
+> **Step 7 Part D — the WORK-ORDERS / BOM family crossed, 2026-08-01 (S456).**
+> `apps/aberp/src/migrate_work_orders.rs` +
+> `apps/aberp/tests/adr0108_step7_work_orders_family.rs`, plugged into
+> `migrate_families` and `reconcile` beside the Step-5, Part-B and Part-C arms.
+> (The brief called it "Part B"; B and C were already taken, so it is D — named
+> rather than silently renumbered.)
+>
+> **Four tables, one owning crate, 43 columns**: `work_orders` (16 — V001's 13
+> plus V002's two and V003's one), `boms` (8 — V001's 7 plus V003's one),
+> `routings` (10, V001), `bom_revisions` (9, V003). A **single**
+> `aberp_work_orders::ensure_schema` builds all four, so unlike Part C the family
+> has one construction path — and **presence is still held per TABLE**, because
+> `bom_revisions` and the two `bom_rev_id` columns arrive with V003 (ADR-0105)
+> and a DuckDB file written before that migration legitimately has three of the
+> four. Per-table is strictly the safer of the two available shapes: an asymmetry
+> is still a hard stop, and only the genuinely legitimate partial shape passes.
+> Pinned by `a_pre_adr0105_source_without_bom_revisions_still_crosses`.
+>
+> ⚠ **`routings.est_cost_huf` crossed as R2 `TEXT`, not R1 `INTEGER` — the one
+> money column in the tree that does not follow R1, exactly as §3.2 B's note
+> pre-decided.** It is flagged again here because it is the single exception and
+> a later reader must not discover it by grep. Two things make the exception safe
+> rather than merely stated: the value is carried **verbatim** through
+> `migrate_billing::canonical_decimal`, which refuses anything `rust_decimal`
+> cannot restore; and the gate folds it in Rust over `Decimal`, never as a SQL
+> `SUM`. `typeof(routings.est_cost_huf) = 'text'` is asserted on every row —
+> a `'real'` there would be F-6a's float-money class arriving through the
+> exception.
+>
+> ⚠ **`work_orders.actual_machining_minutes` stayed `REAL`, and Part C's five
+> `DOUBLE`s did NOT set a precedent for it.** Part C's five were one half of a
+> *measured* rule-7 divergence with an exact counterpart; this one has none
+> (`routings.est_time_min` is an `INTEGER` estimate at a different granularity,
+> and `quote_calibration.{estimated,actual}_minutes` are `DOUBLE` too). And the
+> risk runs the other way: R2 refuses above the canonical quantity scale of 6, so
+> an R2 carry would **hard-fail the migration** on an ordinary measured duration
+> like `12.3456789` — refusing a value that carries no exactness requirement, on
+> a column that is not money. The fixture's `wo-02` holds exactly that value so
+> the argument is exercised rather than asserted. §3.2 E carries the
+> confirmation.
+>
+> ⚠ **Same split as Steps 5, 7B and 7C: the MIGRATOR HALF only.** DuckDB remains
+> the source of truth; `crates/aberp-work-orders/src/repository.rs` is untouched
+> and all of its queries still run against DuckDB. §9 carries the row.
+>
+> **No §3.4 fold is owed by this family and none is deferred** — §3.4's seven
+> sites contain no work-orders statement, §5's mitigations name none, and §6.3's
+> row says "row-by-row carry". **The T-8 pending-fold register is unchanged by
+> this commit**: nothing joined it and nothing left it.
+>
+> **Nine pins.** The load-bearing one is
+> `a_single_changed_column_on_a_single_row_reds_the_gate`, run three times over
+> the three column classes: the money column, a `qty_per_unit` **swap that leaves
+> `Σ` unchanged**, and an ordinary `wo_number` that no fold and no `typeof` sweep
+> touches at all. The disjunction sweep is 4096 generated decimal renderings plus
+> an 18-row adversarial table, asserting that each value either crosses
+> **byte-identically** or is refused with a message naming the column and the row
+> — and requiring **both arms to fire** (measured: 3923 carried, 191 refused).
+> Two properties of the shared R2 validator were *measured rather than assumed*
+> and both are recorded in the table itself: `Decimal::from_str` accepts exponent
+> form, and it **rounds** past 28 significant digits rather than erroring. See
+> the §9 row.
+
 **Step 8 — The quoting family, including the five `f64` money columns (§3.2 D).**
 - *Changes:* 17 + 15 + 10 + 7 + 6 = 55 DDL sites; `total_price_eur` ×2,
   `cost_per_kg_eur` ×2, and the two rate tunables `f64 → Decimal` at the Rust type;
@@ -1800,6 +1896,8 @@ it or an explicit "out of scope".
 | `material_inventory.*_qty` is `DOUBLE` while `stock_movements.qty_delta` is `DECIMAL` — **two representations of one physical quantity** (rule 7) | ~~**Out of scope.** Recorded because migrating both as-is under `STRICT` makes the divergence look sanctioned. Needs its own decision.~~ ✅ **RESOLVED AT THE STORAGE LAYER 2026-08-01 (S455, Step 7 Part C).** Conservative resolution, taken rather than deferred because the deferral's own stated cost — a `STRICT` schema blessed by a green gate that says a quantity is a float here and exact there — is paid the moment the family crosses. **All five columns** (`inventory_balances.on_hand_qty` / `reserved_qty` / `committed_qty` / `consumed_qty`, `inventory_reservations.qty`) **cross as R2 `TEXT` with zero value change**, enforced per value in `migrate_products::canonical_decimal_from_f64`: shortest round-trip rendering → refuse above the canonical quantity scale of 6 → refuse unless the `Decimal` converts back to the identical `f64`. **Refuse, never round.** §3.2 E carries the correction block; the five columns move from category E to category C. |
 | **The APP-LAYER half of the same rule-7 divergence is still open, and it is not the storage one.** `apps/aberp/src/material_inventory.rs` models these quantities as `f64` in Rust — `Balance.{on_hand_qty, reserved_qty, committed_qty, consumed_qty}` (`:302–305`) plus the derived `Balance.available_qty` (`:313`), the `f64` bind/read of `inventory_reservations.qty`, and `MaterialInventoryError::InsufficientMaterial`'s four `f64` fields (`:206–212`) — while `aberp-inventory` models the *same physical quantity* as `rust_decimal::Decimal` (`StockMovement.qty_delta`, `products.stock_qty`). After S455 the two agree in **storage** and still disagree in **Rust**, which is the narrower and more honest statement of the divergence. Exposure is bounded but real: the DEAL saga's sufficiency check (`requested + reserved + committed <= on_hand`) is float arithmetic, so it can admit or refuse a marginal reservation on a representation artefact. | **Its own PR, not this plan, and not Step 8.** It is a change to the saga's arithmetic, its 409 error payload, the SPA toast that renders those four numbers, and the calibration tests — none of it engine-related, all of it reachable today on DuckDB. Recorded with the exact symbols so the next session does not have to re-derive the surface. **Do not fold it into a migration commit**: mixed with a storage change it would be indistinguishable from migration collateral, which is precisely how the original divergence survived unnoticed in two source documents. |
 | **§3.4's three cache-rebuild folds did NOT land with the products/inventory family, and §7's Step-7 line ("incl. §3.4's three cache-rebuild folds") is corrected to say so.** They are `SUM(qty_delta)` inside `aberp_inventory::repository::{record_movement, rebuild_stock_cache_for_tenant}` (the third §3.4 row, `bin/rebuild_stock_cache.rs`, carries no SQL of its own — it calls the second). Part C landed the **migrator half** — DDL, carry, gate — and changed no query: both statements still execute on a DuckDB `Connection`, where `DECIMAL` is a real decimal type and `SUM` does not coerce. **Exposure today is ZERO**, and the mutation that proves the fold matters — a `REAL`-coerced `SUM` writing a float `stock_qty` back into the products cache — is unreachable until the queries cross. | **The family's Rust-side crossing (the cutover), as its first commit** — the same sequencing M-1 and M11/T-12 got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* The T-8 **pending-fold register keeps both entries** and stays honest doing it: each still matches a live statement, so T8-3 (nothing new may join) and T8-4 (a folded site may not linger) are green because the sites are *there*, not because the gate is blind. ⚠ **Note for whoever writes it**: the fold is not "sum the same thing in Rust" — `record_movement`'s `SUM` runs **inside the movement-recording transaction** and its result is written straight back to `products.stock_qty`, so the fold must stay in that transaction and must not become a second round trip that could see a torn read. |
+| **The work-orders / BOM family crossed as its MIGRATOR HALF only (Step 7 Part D), so `crates/aberp-work-orders/src/repository.rs` still runs every one of its queries against DuckDB.** Same shape as Steps 5, 7B and 7C and recorded for the same reason: the STRICT DDL, the typed carry and the gate's arm are landed and green, and none of that makes the product read or write the SQLite copy. **Exposure today is ZERO** — no SQLite connection in the tree touches `work_orders`, `boms`, `routings` or `bom_revisions` outside the migrator and its test. ⚠ The specific thing a later session must not misread: `routings.est_cost_huf` is now **R2 `TEXT` in the SQLite schema and still `DECIMAL(18,2)` in DuckDB**, and `repository.rs:1544/1625/1954` already read it as `CAST(est_cost_huf AS VARCHAR)` → `Decimal`, so the Rust-side crossing needs no type change there — but it does need the R2 bind discipline (`Decimal`, never `f64`) on the **write** side, because `STRICT` will not enforce it (§3.1's corrected note). | **The family's Rust-side crossing (the cutover), as its own commit** — the same sequencing M-1, M11/T-12 and §3.4's inventory folds got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* |
+| **The migrator's two R2 validators differ in strictness, and the difference is now MEASURED rather than assumed.** `migrate_billing::canonical_decimal` (used by the invoice, work-orders and BOM families for a verbatim `DECIMAL` → `TEXT` carry) is built on `Decimal::from_str`, which **accepts exponent form** (`"1e6"`) and **rounds past 28 significant digits rather than erroring**. `migrate_products::canonical_decimal_from_f64` (used for the five rule-7 `DOUBLE`s) is built on `Decimal::from_str_exact`, which errors on both. Both behaviours are pinned in `adr0108_step7_work_orders_family::every_carried_decimal_either_round_trips_byte_identically_or_is_refused`'s adversarial table, with the measurement written beside each row. | **Nothing, today — and the condition under which that stops being true is the point of recording it.** Exposure is zero for every family that has crossed: the source is always a `DECIMAL(18,6)` or `DECIMAL(18,2)` column, which has 18 digits and cannot reach 28, and DuckDB's `CAST(… AS VARCHAR)` never emits exponent form. The lenient validator is also *correct* for a verbatim carry — the string is stored unchanged, so the SQLite read path applies the same `from_str` rounding the DuckDB reader already applied and both sides see one value. **It stops being zero for a family whose R2 source is not a `DECIMAL` column** — i.e. Step 8's §3.2 D columns, which are `DOUBLE` today. Step 8 must use the `from_str_exact` path (`canonical_decimal_from_f64`) for those, not `canonical_decimal`; picking the lenient one would silently admit a value the column cannot represent. |
 | `qc_inspections.deviation` is a derived `REAL` driving a pass/fail verdict | Out of scope; flagged in §3.2 E |
 | ADR-0107 / the frozen baseline / its header disagree on the in-serve read-fork count (**14 / 13 / 9**) | Out of scope for the migration; a stale frozen baseline is the exact class PR #43 existed to prevent → its own PR |
 | `aberp-mes::ledger_writer::write_one` appends through a fresh in-serve connection while the write-fork gate reports ZERO | ADR-0107 §5 says close it **by hand now** — a forked *append* forks the ledger under **any** engine. Independent of this plan; should land before Step 5. |
