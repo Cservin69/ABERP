@@ -981,7 +981,7 @@ fn read_sqlite_line_money(conn: &SqliteConn) -> Result<BTreeMap<(String, i32), (
 /// §3.4 — the fold that replaces SQL `SUM` on a money column. `checked_add`,
 /// because `SUM` over INTEGER raises on i64 overflow and a silent wrap here
 /// would be a wrong total on an ÁFA report.
-fn fold_i64(values: impl Iterator<Item = i64>, what: &str) -> Result<i64> {
+pub(crate) fn fold_i64(values: impl Iterator<Item = i64>, what: &str) -> Result<i64> {
     let mut acc: i64 = 0;
     for v in values {
         acc = acc.checked_add(v).ok_or_else(|| {

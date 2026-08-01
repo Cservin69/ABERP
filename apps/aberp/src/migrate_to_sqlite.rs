@@ -182,6 +182,10 @@ pub struct MigrateOutcome {
     /// source is a ledger-only database (a legitimate shape; the gate holds the
     /// two sides to it symmetrically).
     pub billing: crate::migrate_billing::BillingCarry,
+    /// ADR-0108 Step 7 Part B — what the partners family carried. Zero when the
+    /// source has no `partners` table (a legitimate shape; the gate holds the
+    /// two sides to it symmetrically).
+    pub partners: crate::migrate_partners::PartnersCarry,
     /// SHA-256 of the DuckDB file, taken after the run. C-I says this must
     /// equal the digest taken before it (T-19 arm 2).
     pub duckdb_sha256_after: String,
@@ -212,6 +216,7 @@ pub fn run(args: &MigrateToSqliteArgs) -> Result<()> {
          {} series",
         b.invoices, b.invoice_lines, b.reservations, b.sequence_state, b.series
     );
+    println!("  partners family: {} partner(s)", out.partners.partners);
     println!(
         "  DuckDB SHA-256 after the run: {} (C-I: must equal the pre-migration manifest's)",
         out.duckdb_sha256_after
@@ -367,6 +372,15 @@ pub fn migrate_families(
         crate::migrate_billing::BillingCarry::default()
     };
 
+    // --- ADR-0108 Step 7 Part B — the partners family, same lock, same digest
+    //     window, same presence-symmetry contract.
+    let partners = if crate::migrate_partners::family_present_duckdb(&src)? {
+        crate::migrate_partners::ensure_partners_schema(&dst)?;
+        crate::migrate_partners::carry_partners(&src, &mut dst)?
+    } else {
+        crate::migrate_partners::PartnersCarry::default()
+    };
+
     drop(dst);
     drop(src);
 
@@ -384,6 +398,7 @@ pub fn migrate_families(
         entries_carried: rows.len() as u64,
         anchors_carried: anchors.len() as u64,
         billing,
+        partners,
         duckdb_sha256_after: after,
     })
 }
@@ -724,6 +739,9 @@ pub fn reconcile(duckdb_path: &Path, sqlite_path: &Path, tenant: &str) -> Result
     // Same two connections, so the same B4 guarantee holds: every number is
     // re-derived from disk by the gate, none of them by the migrator.
     crate::migrate_billing::reconcile_billing(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
+
+    // ---- ADR-0108 Step 7 Part B — the partners family's arm ----
+    crate::migrate_partners::reconcile_partners(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
 
     Ok(r)
 }

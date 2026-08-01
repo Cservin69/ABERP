@@ -1583,13 +1583,69 @@ family crosses until this closes.
 > allowlist. T-8 landed on that branch; §8 T-8 records it.
 
 **Step 7 — The remaining non-quoting families,** one at a time, rule-14 fused:
-partners (+ **M11**, T-12) → products/inventory (incl. §3.4's three cache-rebuild
+partners (+ **M11**, T-12 — *corrected: M11/T-12 belong to the family's
+Rust-side crossing, not to its migrator half; see §9*) → products/inventory (incl. §3.4's three cache-rebuild
 folds **and both low-stock predicate folds, `repository.rs:548–549` and `:585`,
 in one commit** — F1/Q2) → work orders/BOM → QA/QC → dispatch → purchasing →
 email/relay.
 - *Verified by:* per-family reconciliation + the family's existing round-trip tests
   + T-15 (customer-journey e2e) re-run after each.
 - *Rollback:* per family; each is its own PR.
+
+> **Step 7 Part A LANDED 2026-08-01 (S453)** — M-2's per-line ÁFA fold, before
+> any family crossed. See the §9 M-2 row.
+>
+> **Step 7 Part B — the PARTNERS family crossed, 2026-08-01 (S454).**
+> `apps/aberp/src/migrate_partners.rs` +
+> `apps/aberp/tests/adr0108_step7_partners_family.rs`, plugged into
+> `migrate_families` and `reconcile` beside the Step-5 billing arm.
+>
+> **Same split as Step 5, and Ervin's same constraint: the MIGRATOR HALF only.**
+> DuckDB remains the source of truth; `partners.rs`'s 12 DDL sites and all of its
+> queries are untouched and still run against DuckDB. What landed: the `STRICT`
+> DDL (17-column base `CREATE` + the two indexes, then PR-97 / S361 / S428 as
+> **three `ensure_columns` ladders**, 7 columns, so M8's post-condition is
+> exercised rather than no-op'd), the typed row-by-row carry inside one
+> `BEGIN IMMEDIATE`, and the gate's arm.
+>
+> **The family has no money in it at all.** One table, 24 columns, and the only
+> non-string column is `issued_invoice_count` (§3.2 F — a count). §3's R1/R2
+> rules have nothing to bite on, which is why it is the right family to go
+> first: the machinery gets one more real exercise where a mistake cannot move a
+> filed figure. The gate's arm is correspondingly **per-column over all 24**
+> rather than money-only — on a table with no money the regulatory payload is
+> `tax_number` / `eu_vat_number` (the NAV buyer identifiers) plus the five
+> identity columns the dedup guard keys on, and "the important ones" would have
+> been the wrong subset to pick.
+>
+> ⚠ **M11 and T-12 did NOT land, deliberately.** M11 is "escape the `LIKE`
+> metacharacters and replace SQL `LOWER()` with Rust `to_lowercase()` on both
+> sides", over `partners.rs:1001–1005` (the duplicate-partner guard) and `:1049`
+> (the typeahead filter). Nothing in Part B makes those queries run against
+> SQLite, so a T-12 written now could only assert that **DuckDB's** `LOWER()`
+> still folds `Á` — true, and not the property M11 exists to protect. §7's own
+> ordering rule decides it: *a refusal whose test cannot be written yet is not
+> landed yet.* Both move to the family's Rust-side crossing; §9 carries the row.
+> The DEV-shaped fixture already seeds the two values a real T-12 needs
+> (`Árvíztűrő tükörfúrógép` and a stored literal `%` / `_`).
+>
+> ⚠ **Measured, and it narrowed the fixture rather than the code:**
+> `partners.customer_vat_status` and `issued_invoice_count` **cannot be NULL** on
+> any `partners` table built from the base `CREATE` — it declares both
+> `NOT NULL DEFAULT`, and DuckDB refuses the INSERT. Their nullable history
+> exists only on a genuinely pre-PR-97 table (where the PR-97 ladder adds them
+> unconstrained because DuckDB rejects a constraint on `ADD COLUMN`), and even
+> there the ladder's follow-on `UPDATE` backfills them at the next boot. **The
+> SQLite columns are declared nullable anyway** — nullable is the shape that
+> carries *both* histories, and re-deriving the backfill in the migrator is the
+> "verify the extraction against itself" shape B4 forbids.
+>
+> **Six pins**, including the one that matters most: the per-row equality arm is
+> **shown to go red** on a single changed column on a single row
+> (`a_single_changed_column_on_a_single_row_reds_the_gate`, mutating
+> `tax_number`) — the row count, the `Σ issued_invoice_count` fold and the
+> `typeof` sweep are all blind to that mutation, so that arm is the only thing
+> between a silently-corrupted partner record and a green gate.
 
 **Step 8 — The quoting family, including the five `f64` money columns (§3.2 D).**
 - *Changes:* 17 + 15 + 10 + 7 + 6 = 55 DDL sites; `total_price_eur` ×2,
@@ -1667,6 +1723,7 @@ it or an explicit "out of scope".
 | The frozen baseline's GROUP-A rationale states the mechanism as a stale read of "the last-checkpointed **SUBSET**" (`tools/adr0099_read_fork_structural_baseline.txt`). **Measured false** — see R-5. | Same PR as R-5: the baseline's header text is where the next reader learns the mechanism, so leaving it wrong there is worse than leaving it unfixed. |
 | The read-fork gate and the write-fork gate partition on read/write, but the hazard is the **close** and does not respect that partition. | Recorded here; a gate change belongs with R-5, **not** with this migration. |
 | **`reports.rs:872` `decimal_str_to_i64(&s).unwrap_or(0)` — a LIVE ÁFA-report fail-open running in production today, on DuckDB, independent of this migration.** A parse failure prints **0 HUF** instead of failing. Siblings at `:827` and `:1279`. | **Fixed in-migration**, Step 5, in the same commit as the `reports.rs:861` fold — the fold's `Result` replaces the swallow, and the two are the same three lines (§3.4). **Not a separate cut**, and the Step-5 PR body must name it as a pre-existing production defect so it is not miscounted as migration collateral. If Step 5 is deferred or the engine decision reopens at Step 4, **this reverts to owing its own PR** and does not lapse.<br><br>✅ **CLOSED 2026-08-01 (S453), in Step 7's first commit rather than Step 5's** — Step 5 landed only its migrator half and the escape clause above kept the debt alive, which is exactly what it was written for. **All three are gone**, and none by adding an `expect`: `:827`'s enclosing `row_to_outgoing` no longer parses an aggregate at all (the fold reads the raw columns and a non-decimal `quantity` is a hard `FromSqlConversionFailure`); `:872`'s reader is replaced by a `checked_add` fold whose overflow propagates as `Err`; `:1279` was inside `round_half_even_div`, which the M-2 fold made dead and which was deleted with its test. **The ÁFA report can no longer print 0 HUF in place of a figure it failed to compute.** |
+| **M11 / T-12 are NOT closed by Step 7 Part B's partners crossing, and §7's Step-7 line ("partners (+ M11, T-12)") is corrected to say so.** M11 is `partners.rs:1001–1005` (the duplicate-partner guard: five `LOWER()` comparisons) and `:1049` (the typeahead's two unescaped `LIKE` patterns). Part B landed the **migrator half** — DDL, carry, gate — and changed no query: all six sites still execute on a DuckDB `Connection`. A T-12 written against today's tree could therefore only assert that **DuckDB's** `LOWER()` folds `Á` and that DuckDB's `LIKE` over-matches on a `%` needle. Both are true, neither is the property M11 exists to protect, and pinning them would produce a green T-12 with the mitigation absent — the same "three landed artefacts document a mitigation that has never run" shape M-1 was. **Exposure today is ZERO**: no SQLite connection in the tree runs a `LOWER()` or a `LIKE` against `partners`. | **The partners family's Rust-side crossing (the cutover), as its first commit** — the same sequencing M-1 got, and for the same reason: the mitigation and its mutation-verifiable pin land together, in the commit that first makes the queries reachable on SQLite. §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* Part B pre-positions what T-12 will need — the DEV-shaped fixture in `adr0108_step7_partners_family.rs` already seeds `Árvíztűrő tükörfúrógép Kft.` / its all-caps legal name **and** a row carrying a literal `%` and `_` (`100% Precision _ Machining`), so T-12 is a test to write, not a fixture to build. ⚠ Note for whoever writes it: SQLite's `LOWER()` is **ASCII-only**, so the guard silently stops matching `Á`/`Ű`/`Ő` the moment the query crosses — a *false negative on a duplicate-partner check*, i.e. it admits the duplicate rather than blocking a good row, which is the direction that does not announce itself. |
 | DEV DB measured mode **0644**; no code chmods the tenant DB — **true today, engine-independent** | M9 / Step 2, or a standalone 5-line PR now (PR #49 already flagged this) |
 | `nav_xml.rs:1788` write path is `f64` while `:2658` read path is exact `Decimal` — a **rule-7 fork on the NAV VAT rate**, pre-existing and engine-independent; value-exact for all four legal HU rates, so not a filing defect | Closed by the Step-5 `Decimal` conversion (B2, §3.3), which also empties T-5(e)'s allowlist |
 | `MirrorEntry` cannot round-trip a signed entry — the mirror is a divergence detector, not a backup, and its own comment says so (`mirror.rs:211–214`) | **Out of scope.** Recorded because B1 was the first time that design limit had a consumer that assumed otherwise. If the mirror is ever to be a recovery source, that is its own ADR — and it would have to add three columns and a signature-preserving encoder first. |
