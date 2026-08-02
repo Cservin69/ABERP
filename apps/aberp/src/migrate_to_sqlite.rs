@@ -204,6 +204,12 @@ pub struct MigrateOutcome {
     /// symmetrically **per table**, because two modules own the two and
     /// `wo_part_marks` (S432) arrives three sprints after `dispatches` (S234).
     pub dispatch: crate::migrate_dispatch::DispatchCarry,
+    /// ADR-0108 Step 7 Part G — what the purchasing family carried. All zeros
+    /// when the source has none of its four tables. Presence is held
+    /// symmetrically **per table**, which here detects a dropped arm of the
+    /// carry rather than a legitimately partial source: one module builds all
+    /// four in one batch, so a real database has four or none.
+    pub purchasing: crate::migrate_purchasing::PurchasingCarry,
     /// SHA-256 of the DuckDB file, taken after the run. C-I says this must
     /// equal the digest taken before it (T-19 arm 2).
     pub duckdb_sha256_after: String,
@@ -262,6 +268,12 @@ pub fn run(args: &MigrateToSqliteArgs) -> Result<()> {
     println!(
         "  dispatch family: {} dispatch(es), {} part mark(s)",
         d.dispatches, d.wo_part_marks
+    );
+    let po = out.purchasing;
+    println!(
+        "  purchasing family: {} purchase order(s), {} PO line(s), {} receipt(s), {} PO number \
+         bucket(s)",
+        po.purchase_orders, po.purchase_order_lines, po.purchase_order_receipts, po.po_number_state
     );
     println!(
         "  DuckDB SHA-256 after the run: {} (C-I: must equal the pre-migration manifest's)",
@@ -458,6 +470,15 @@ pub fn migrate_families(
     //     cannot span two engines (rule 14).
     let dispatch = crate::migrate_dispatch::carry_dispatch(&src, &mut dst)?;
 
+    // --- ADR-0108 Step 7 Part G — the purchasing family, same lock, same digest
+    //     window. Four tables from ONE module's one `CREATE TABLE IF NOT EXISTS`
+    //     batch (`purchasing.rs:171`), so unlike Parts C–F the per-table presence
+    //     hold is about catching a dropped carry arm rather than a legitimately
+    //     partial source. `avl_vendors` and `ncrs` are deliberately NOT in this
+    //     family: `purchasing.rs` has zero JOINs and every one of its statements
+    //     names exactly one purchasing table (rule 14's boundary, measured).
+    let purchasing = crate::migrate_purchasing::carry_purchasing(&src, &mut dst)?;
+
     drop(dst);
     drop(src);
 
@@ -480,6 +501,7 @@ pub fn migrate_families(
         work_orders,
         quality,
         dispatch,
+        purchasing,
         duckdb_sha256_after: after,
     })
 }
@@ -840,6 +862,9 @@ pub fn reconcile(duckdb_path: &Path, sqlite_path: &Path, tenant: &str) -> Result
 
     // ---- ADR-0108 Step 7 Part F — the dispatch/shipment family's arm ----
     crate::migrate_dispatch::reconcile_dispatch(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
+
+    // ---- ADR-0108 Step 7 Part G — the purchasing family's arm ----
+    crate::migrate_purchasing::reconcile_purchasing(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
 
     Ok(r)
 }

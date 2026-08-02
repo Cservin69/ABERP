@@ -114,6 +114,14 @@ pub mod migrate_partners;
 /// `stock_movements.qty_delta`.
 #[cfg(feature = "sqlite-engine")]
 pub mod migrate_products;
+/// ADR-0108 Step 7 Part G — the purchasing / purchase-order family's STRICT
+/// schema, carry and gate arm. Four tables from one owning module, and the
+/// family that carries **most of the tree's remaining money**: five §3.2 A
+/// `BIGINT` → `INTEGER` minor-unit columns. Its quantities are exact `i64`
+/// counts (§3.2 F), not R2 decimals, and none of its four tables has a
+/// `PRIMARY KEY` for the gate's per-row arm to rely on.
+#[cfg(feature = "sqlite-engine")]
+pub mod migrate_purchasing;
 /// ADR-0108 Step 7 Part E — the QA/QC family's STRICT schema, carry and gate
 /// arm. Six tables across two owning modules, **no money and no quantity**: its
 /// only numbers are one sequence integer (§3.2 F), eight dimensional

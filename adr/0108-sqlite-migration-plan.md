@@ -625,6 +625,27 @@ below**); `work_orders.actual_machining_minutes`;
 `audit_ledger.seq`, `audit_ledger.time_mono`, `bom_revisions.rev_number`,
 `bom_revisions.line_count`, `routings.sequence`, `routings.est_time_min`.
 
+> ⚠ **CORRECTED 2026-08-02 (S459, Step 7 Part G): this enumeration was
+> incomplete, and the gap was on the purchasing family.** The list above names
+> `po_number_state.next_number` and stops there, but the family carries **six**
+> more §3.2 F columns and the census named none of them:
+> `purchase_orders.vat_rate_pct`, `purchase_order_lines.seq` / `.quantity` /
+> `.received_quantity`, `purchase_order_receipts.received_quantity`, and
+> `po_number_state.year`. All six are `BIGINT`/`INTEGER` on DuckDB and `i64`/`i32`
+> in Rust (`PoLine`/`PoReceiptLine`, `purchasing.rs:267/272/285`), so §3.2 H's
+> mechanical `BIGINT` → `INTEGER` rename settles them and no new decision was
+> needed — but §3.2's own rule is that *a name that does not exist returns zero
+> hits*, and a session grepping the census for `quantity` would have found only
+> the R2 rows and could have concluded the purchasing quantities were R2 too.
+>
+> **They are NOT R2.** Part C's five `DOUBLE` quantities became `TEXT` because
+> they were **floats**; these are exact whole-unit counts. Rendering an `i64`
+> count as a decimal string would *introduce* a representation rather than
+> preserve one, and would break the running product's
+> `received_quantity = received_quantity + ?` (`purchasing.rs:1109`) at cutover.
+> Recorded in §9 as well, because the correction is to the census and not only
+> to one family's reading of it.
+
 **`vat_rate_basis_points INTEGER` is why VAT never touches a float *in storage*** —
 27% is `2700`, not `0.27`. The **storage** property is preserved verbatim, and
 F-6a's storage-side float-coercion class cannot reach the VAT rate. F-6a reaches
@@ -2017,6 +2038,101 @@ email/relay.
 > against both tables, so unlike partners this family's cutover owes no ASCII-fold
 > fix.
 
+> **Step 7 Part G — the PURCHASING / PURCHASE-ORDER family crossed, 2026-08-02
+> (S459).** `apps/aberp/src/migrate_purchasing.rs` +
+> `apps/aberp/tests/adr0108_step7_purchasing_family.rs`, plugged into
+> `migrate_families` and `reconcile` beside the Step-5 and Part-B…F arms.
+>
+> **Same split, same constraint: the MIGRATOR HALF only.**
+> `apps/aberp/src/purchasing.rs` is untouched; every one of its queries still
+> runs against DuckDB. §9 carries the row.
+>
+> **Four tables, ONE owning module, 46 columns** — `purchase_orders` (18),
+> `purchase_order_lines` (12), `purchase_order_receipts` (12), `po_number_state`
+> (4), all built by one `CREATE TABLE IF NOT EXISTS` batch at
+> `purchasing.rs:171–225`. The table set was **grepped, not recalled**, and the
+> grep settles one thing a session could easily get wrong: **there is no
+> `supplier_prices` table and no vendor-price table anywhere in the tree.** §6.3's
+> quoting row names `supplier_prices` by name; a `CREATE TABLE` sweep returns
+> **zero hits for it**, because ADR-0104's supplier price ingestion writes
+> `products.unit_price_minor`, which crossed with Part C. Zero hits read as
+> "already done" is the silent-skip shape rule 11 exists to stop.
+>
+> **`avl_vendors` is NOT in this family, and the boundary is measured.**
+> `create_po` reads it (`purchasing.rs:600–611`, `resolve_avl`) — but as its own
+> separate `SELECT` on the shared writer guard, *before* the PO transaction
+> opens. `JOIN` returns **zero** hits across `purchasing.rs`, and every one of
+> the module's fifteen SQL statements names exactly one purchasing table. Part
+> F's boundary test was *one statement spanning two tables*; nothing here meets
+> it. Same for `ncrs` (`create_ncr` at `:1160`) and for `audit_ledger`
+> (`append_event`, which every family does). ⚠ **That is a boundary for the
+> migrator half and a SEQUENCING constraint for the cutover, and the two must not
+> be confused** — §9 carries the row, and `avl_vendors` has not crossed in any
+> Part.
+>
+> **This is the family that carries most of the tree's remaining money, and §3.2
+> A had already named every column of it**: `purchase_orders.subtotal_minor` /
+> `vat_minor` / `total_minor` and `purchase_order_lines.unit_price_minor` /
+> `line_total_minor`, `BIGINT` `i64` → **`INTEGER`, representation unchanged**. So
+> **R1 applies and R2 does not**: there is no `DECIMAL` and no `DOUBLE` anywhere
+> in the family, and therefore nothing for `canonical_decimal`,
+> `canonical_decimal_from_f64` or `finite_measurement` to guard. The fixture
+> proves the claim over the whole range rather than on plausible values — one row
+> carries `total_minor = i64::MIN` and another `i64::MAX`, ordered min-before-max
+> so the gate's `checked_add` Σ dips and returns rather than overflowing.
+>
+> ⚠ **The two quantity columns are INTEGER, not R2 `TEXT`, and this is the one
+> place the family diverges from the shape Part C took.** Measured, not
+> preferred: `purchase_order_lines.quantity` / `.received_quantity` and
+> `purchase_order_receipts.received_quantity` are `BIGINT` on DuckDB and `i64` in
+> Rust — whole-unit counts, never fractional. Part C's five quantities became R2
+> because they were **floats**. §3.2 F's enumerated list named none of these six
+> integer columns; **§3.2 F now carries the correction**, and §9 has the row.
+>
+> **The first two booleans outside QA/QC** (§3.2 H):
+> `purchase_order_lines.expected_heat_lot_required` and
+> `purchase_order_receipts.inspection_pass`, both `BOOLEAN` → `INTEGER`, read and
+> bound as `bool` on both sides. `inspection_pass` is load-bearing — it is what
+> mints the S439 auto-NCR — so a `"false"` bound as text, which every Rust `bool`
+> read would see as `false`, would turn every *passing* incoming inspection into
+> a failure. The fixture carries **both arms of both booleans**, and the drift
+> test flips each in **both directions**: a carry that bound `true` for every row
+> would still round-trip a fixture that only had `true`s.
+>
+> **THE REFUSAL IS PART F'S, REUSED RATHER THAN RE-IMPLEMENTED — and here a
+> duplicate does more than blind the gate.** None of the four tables has a
+> `PRIMARY KEY`, a `UNIQUE` or an index; `purchasing.rs:169–171` states the
+> posture in as many words. So `migrate_dispatch::unique_natural_keys` is called
+> on all four, and its message ("no PRIMARY KEY, no UNIQUE and no index") is true
+> of every one of them. **`po_number_state` is the sharp case.** Its key is the
+> genuine composite `(tenant_id, year)`, nothing enforces it, and
+> `reserve_po_number` (`purchasing.rs:569–588`) reads it with `rows.next()` — it
+> takes the **first** row and advances that one. Two rows for one
+> `(tenant, year)` are therefore two independent counters issuing **the same
+> `PO-YYYY-NNNN` twice**, which is the exact shape of the invoice-number reuse
+> fixed in v2.33.4 (`c053cd0`). The family test seeds that duplicate into a real
+> DuckDB file and requires the migration to fail.
+>
+> **Presence is per TABLE**, and for a different reason than Parts C–F: there,
+> two or three modules built a family's tables sprints apart, so a partial source
+> was a shape the *product* could produce. Here one batch builds all four and a
+> real source has four or none, so the per-table hold detects a **dropped carry
+> arm** rather than a legitimately partial source. `ALTER TABLE` returns **zero**
+> hits against all four, so there is no `ensure_columns` ladder and M8's
+> post-condition has nothing to exercise.
+>
+> **No §3.4 fold is owed and none is deferred.** §3.4's seven arithmetic sites
+> contain no purchasing statement and §6.3's row for "partners / products /
+> **purchasing**" says row-by-row carry. The module has exactly one piece of
+> SQL-side arithmetic — `SET received_quantity = received_quantity + ?3`
+> (`purchasing.rs:1109`) — and it is **not** a §3.4 site: §3.4's class is
+> arithmetic over a column R2 turns into `TEXT`, and this column is `INTEGER` on
+> both engines. The T-8 pending-fold register is **unchanged by this commit**:
+> nothing joined it and nothing left it. One narrow cutover note on that
+> statement is in §9, and it is about SQLite's integer-overflow behaviour rather
+> than about a fold. **Nor is there an M11-shaped hazard**: `LOWER(` and `LIKE`
+> both return **zero** hits across `purchasing.rs`.
+
 **Step 8 — The quoting family, including the five `f64` money columns (§3.2 D).**
 - *Changes:* 17 + 15 + 10 + 7 + 6 = 55 DDL sites; `total_price_eur` ×2,
   `cost_per_kg_eur` ×2, and the two rate tunables `f64 → Decimal` at the Rust type;
@@ -2107,7 +2223,11 @@ it or an explicit "out of scope".
 | **The QA/QC family crossed as its MIGRATOR HALF only (Step 7 Part E), so `apps/aberp/src/quality.rs` and `crates/aberp-qa/src` still run every one of their queries against DuckDB.** Same shape as Steps 5, 7B, 7C and 7D and recorded for the same reason: the STRICT DDL, the typed carry and the gate's arm are landed and green, and none of that makes the product read or write the SQLite copy. **Exposure today is ZERO** — no SQLite connection in the tree touches `ncrs`, `ncr_transitions`, `capas`, `qa_inspections`, `qc_inspection_plans` or `qc_inspections` outside the migrator and its test. ⚠ Three things a later session must not misread. (i) **This family has no money and no quantity at all** — its only numbers are `seq`, eight §3.2 E measurements and two booleans — so the Rust-side crossing owes no R1/R2 bind discipline; what it *does* owe is the `bool` bind on the two §3.2 H columns, because a `"true"` bound as `&str` would read back as `false`. (ii) **The M11 hazard has no site here**, measured: `LOWER(` and `LIKE` return zero hits against all six tables, so unlike partners this family's cutover owes no ASCII-fold fix. (iii) **`finite_measurement` guards the migrator's read path only**; the product's own write path into the eight `REAL` columns is unguarded, so the Rust-side crossing must decide whether a non-finite measurement can be *written* at all — today it can, on DuckDB, and nothing rejects it. | **The family's Rust-side crossing (the cutover), as its own commit** — the same sequencing M-1, M11/T-12, §3.4's inventory folds and Part D got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* |
 | **The dispatch/shipment family crossed as its MIGRATOR HALF only (Step 7 Part F), so `crates/aberp-dispatch/src` and `apps/aberp/src/part_marking.rs` still run every one of their queries against DuckDB.** Same shape as Steps 5, 7B, 7C, 7D and 7E and recorded for the same reason: the STRICT DDL, the typed carry and the gate's arm are landed and green, and none of that makes the product read or write the SQLite copy. **Exposure today is ZERO** — no SQLite connection in the tree touches `dispatches` or `wo_part_marks` outside the migrator and its test. ⚠ Three things a later session must not misread. (i) **This family has no money, no quantity, no float and no boolean** — its only number is `wo_part_marks.unit_index` (§3.2 F) — so the Rust-side crossing owes no R1/R2 bind discipline and no `finite_measurement`; what it *does* owe is nothing type-shaped at all, which is why the whole of the risk sits in the keying instead. (ii) **The M11 hazard has no site here**, measured: `LOWER(` and `LIKE` return zero hits against both tables, so unlike partners this family's cutover owes no ASCII-fold fix. (iii) **`unique_natural_keys` guards the migrator's read path only**; the product's own write path into `wo_part_marks` enforces the composite key with a Rust `COUNT(*)` inside the mark-parts transaction (`part_marking.rs:187`) and nothing in the DDL backs it, so the Rust-side crossing must decide whether that stays sufficient once the write goes through SQLite. | **The family's Rust-side crossing (the cutover), as its own commit** — the same sequencing M-1, M11/T-12, §3.4's inventory folds, Part D and Part E got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* |
 | **THE DISPATCH CUTOVER IS SEQUENCED BEHIND WORK-ORDERS' AND PARTNERS', because `dispatches` is JOINed to both — and this is a constraint on the ORDER of the Rust-side crossings that §7's family list does not carry.** Measured, not inferred: `crates/aberp-dispatch/src/repository.rs:249` reads `work_orders` inside `create_dispatch`'s transaction, `:726` and `:788` are `FROM work_orders wo … NOT EXISTS (SELECT 1 FROM dispatches d …)` (the dispatchable-WO list and its count), and `:283` reads `partners`. `part_marking.rs:504–505` additionally JOINs `wo_part_marks` to `dispatches`, which is why Part F crossed those two together in the first place. **Nothing is split today** — work-orders and partners crossed as migrator halves too, so all four statements still execute on one DuckDB connection — and that is exactly the point: the split becomes possible only at cutover, and a session that crossed dispatch's Rust half before work-orders' would produce a cross-engine JOIN that cannot be written at all. | **The cutover sequence, stated before the first family's Rust half moves.** Not a code change and nothing to fix here; recorded because §7's Step-7 line reads as a list of independent families and this pair of edges is the one place that is false. |
-| **`wo_part_marks` (Part F), `ncr_transitions` (Part E) and `invoice_line` (Step 5) all key the gate's per-row `BTreeMap` on a COMPOSITE that no DDL enforces — and only Part F's is guarded.** Part F added `migrate_dispatch::unique_natural_keys` because `wo_part_marks` has no `PRIMARY KEY`, no `UNIQUE` and no index of any kind, so a duplicate `(tenant_id, wo_id, unit_index)` is reachable from a real DuckDB source; it collapses two rows onto one map entry, and the row count, the `typeof` sweep and the per-row arm all stay green while one row is compared twice and the other never. **The other two are the same mechanism with a different amount of luck**: `ncr_transitions`'s `seq` is app-issued monotonically per NCR and `invoice_line`'s `ordinal` is app-issued per invoice, so a duplicate requires a *product* defect rather than only a missing constraint — but neither table has a `PRIMARY KEY` either, and the gate's blindness is identical in all three. ⚠ **Exposure is UNMEASURED, and stating that plainly is the honest form**: this session is DEV-only and does not touch `~/.aberp/**`, so no count of duplicate `(ncr_id, seq)` or `(invoice_id, ordinal)` rows on the real DEV tenant was taken. The argument above is about the *mechanism*, not about the data. | **Its own PR — deliberately NOT retrofitted here** (rule 3: this commit crosses one family and does not improve adjacent ones), and it is three lines plus a test per family, not a redesign: hoist `unique_natural_keys` to a shared helper and call it from `migrate_billing`'s and `migrate_quality`'s read sides. ⚠ **Do not fold it into a family commit** — mixed with a storage change it would be indistinguishable from migration collateral, which is the same argument the two app-layer rows above make. |
+| **`wo_part_marks` (Part F), `ncr_transitions` (Part E) and `invoice_line` (Step 5) all key the gate's per-row `BTreeMap` on a COMPOSITE that no DDL enforces — and only Part F's is guarded.** Part F added `migrate_dispatch::unique_natural_keys` because `wo_part_marks` has no `PRIMARY KEY`, no `UNIQUE` and no index of any kind, so a duplicate `(tenant_id, wo_id, unit_index)` is reachable from a real DuckDB source; it collapses two rows onto one map entry, and the row count, the `typeof` sweep and the per-row arm all stay green while one row is compared twice and the other never. **The other two are the same mechanism with a different amount of luck**: `ncr_transitions`'s `seq` is app-issued monotonically per NCR and `invoice_line`'s `ordinal` is app-issued per invoice, so a duplicate requires a *product* defect rather than only a missing constraint — but neither table has a `PRIMARY KEY` either, and the gate's blindness is identical in all three. ⚠ **Exposure is UNMEASURED, and stating that plainly is the honest form**: this session is DEV-only and does not touch `~/.aberp/**`, so no count of duplicate `(ncr_id, seq)` or `(invoice_id, ordinal)` rows on the real DEV tenant was taken. The argument above is about the *mechanism*, not about the data. ⚠ **AMENDED 2026-08-02 (S459): "only Part F's is guarded" is now "Parts F and G are guarded".** Part G reused `migrate_dispatch::unique_natural_keys` verbatim on **all four** purchasing tables — none of which has a `PRIMARY KEY` either — so the guard already has two callers and the hoist below is a move, not a generalisation. `ncr_transitions` and `invoice_line` remain the two unguarded ones, and this row's disposition is unchanged. | **Its own PR — deliberately NOT retrofitted here** (rule 3: this commit crosses one family and does not improve adjacent ones), and it is three lines plus a test per family, not a redesign: hoist `unique_natural_keys` to a shared helper and call it from `migrate_billing`'s and `migrate_quality`'s read sides. ⚠ **Do not fold it into a family commit** — mixed with a storage change it would be indistinguishable from migration collateral, which is the same argument the two app-layer rows above make. |
+| **The purchasing family crossed as its MIGRATOR HALF only (Step 7 Part G), so `apps/aberp/src/purchasing.rs` still runs every one of its queries against DuckDB.** Same shape as Steps 5, 7B, 7C, 7D, 7E and 7F and recorded for the same reason: the STRICT DDL, the typed carry and the gate's arm are landed and green, and none of that makes the product read or write the SQLite copy. **Exposure today is ZERO** — no SQLite connection in the tree touches `purchase_orders`, `purchase_order_lines`, `purchase_order_receipts` or `po_number_state` outside the migrator and its test. ⚠ Three things a later session must not misread. (i) **This is the family that carries most of the tree's remaining money** — five §3.2 A columns — so unlike Parts E and F the Rust-side crossing DOES owe R1 bind discipline: `i64` minor units, never a float, on the write side, because `STRICT` will accept a bound `f64` into an `INTEGER` column when it is integral. (ii) **Its quantities are exact `i64` counts and must stay `INTEGER`**, not be "made consistent" with Part C's R2 `TEXT` quantities — the two are different physical things (see the census row below). (iii) **The M11 hazard has no site here**, measured: `LOWER(` and `LIKE` return zero hits across `purchasing.rs`. | **The family's Rust-side crossing (the cutover), as its own commit** — the same sequencing M-1, M11/T-12, §3.4's inventory folds and Parts D, E and F got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* |
+| **THE PURCHASING CUTOVER IS SEQUENCED BEHIND `avl_vendors`' AND QA/QC's — and `avl_vendors` HAS NOT CROSSED IN ANY PART.** Measured, not inferred, and the mechanism is different from the dispatch row above: `purchasing.rs` contains **zero JOINs**, so nothing here is fused by a statement. What fuses it is the **shared writer guard**. `create_po` calls `resolve_avl` → `avl_vendors::get_vendor_by_partner(&guard, …)` (`purchasing.rs:605`) and then opens the PO transaction on that same guard; `receive_delivery` calls `quality::create_ncr(&mut guard, …)` (`:1160`) between two purchasing transactions and stamps the returned `ncr_id` back onto `purchase_order_receipts` (`:1185`). A guard is one engine's connection, so the Rust-side crossing of purchasing cannot precede `avl_vendors`' — **a family no Part has crossed at all** — nor quality's, which crossed as a migrator half in Part E. Three more columns point out of the family (`vendor_partner_id` → `partners`, `product_id` → `products`, `ncr_id` → `ncrs`) and **none of them is a JOIN**; all three are resolved in Rust by the callers. **Nothing is split today**, because every one of those calls still executes on one DuckDB connection. | **The cutover sequence, and `avl_vendors` needs a Part of its own before purchasing's Rust half can move.** Not a code change and nothing to fix here; recorded because §7's Step-7 line reads as a list of independent families and, as with dispatch, this pair of edges is where that is false. ⚠ The narrower point worth keeping: **rule 14's fused boundary has two shapes, not one** — a JOIN (Part F) and a shared guard (Part G) — and the migrator half is blind to the second, because a migrator never holds the product's guard. |
+| **§3.2 F's enumerated integer list was INCOMPLETE, and the gap was on the purchasing family: six columns crossed under a category that never named them.** `purchase_orders.vat_rate_pct`, `purchase_order_lines.seq` / `.quantity` / `.received_quantity`, `purchase_order_receipts.received_quantity` and `po_number_state.year` are all `BIGINT`/`INTEGER` on DuckDB and `i64`/`i32` in Rust, so §3.2 H's mechanical rename settles them and **no new decision was needed** — but §3.2's own rule is that a name absent from the census returns zero hits, and a session grepping it for `quantity` would have found only the R2 rows. **The disposition taken, and it is a rule-7 call rather than a default: they cross as `INTEGER`, not as R2 `TEXT`.** Part C's five quantities became `TEXT` because they were **`DOUBLE`s**; these are exact whole-unit counts, and rendering an `i64` as a decimal string would *introduce* a representation rather than preserve one — as well as breaking `purchasing.rs:1109`'s in-SQL `received_quantity + ?` at cutover. Two representations of "a quantity" now exist in the migrated tree on purpose, because two different physical things are being counted. ⚠ Also worth one line: `purchase_orders.vat_rate_pct` is a **whole percent** where billing stores `vat_rate_basis_points` — two representations of one concept (rule 7), exact integers on both engines either way, **not this commit's to reconcile**. | **§3.2 F carries the correction block, landed with Part G.** Nothing further is owed at the storage layer. The `vat_rate_pct`-vs-basis-points divergence is its own product question and does not belong in a migration commit. |
+| **`purchasing.rs:1109` — `UPDATE purchase_order_lines SET received_quantity = received_quantity + ?3` — is in-SQL arithmetic on a column this migration keeps as `INTEGER`, and the two engines DISAGREE on what an overflow does.** It is deliberately **not** a §3.4 site: §3.4's class is arithmetic over a column R2 turns into `TEXT`, and this column stays `INTEGER` on both sides, so the addition is exact and no fold is owed. What differs is the edge: DuckDB **raises** on `BIGINT` overflow, while SQLite silently converts an overflowing integer addition to `REAL` — a float landing in a `STRICT INTEGER` column's `UPDATE`, which is the one class T-8 exists for. **Exposure today is ZERO and bounded by the app rather than by the engine**: `receive_delivery` refuses `received_quantity > line.quantity - line.received_quantity` (`purchasing.rs:1047–1053`) and `create_po` refuses a non-positive quantity (`:641`), so the running sum cannot exceed a value already stored as `i64`. The exposure is that the bound is in Rust and nothing in the DDL backs it. | **The family's Rust-side crossing (the cutover), as a decision rather than a fix**: either keep the in-SQL increment and accept that its overflow guard is app-layer only, or read-modify-write the counter in Rust with a `checked_add` — the same shape §3.4 chose everywhere else. Recorded rather than changed here because touching a live `UPDATE` in a migrator-half commit would be exactly the migration collateral the rows above refuse. |
 | **`part_marking.rs` reads `unit_index` as `r.get::<_, i64>(?)?.max(0) as u32` at `:203` and `:455`, silently CLAMPING a negative ordinal to 0.** DuckDB's `INTEGER` is signed 32-bit, so a negative `unit_index` is storable; the clamp then maps it onto the same in-Rust identity as unit 0, which on a table whose natural key *is* `(tenant_id, wo_id, unit_index)` means two distinct physical units collapsing onto one traceability record. **Not a storage or migration defect** — Part F's carry is `i64` → `i64` and exact, the gate keys on the raw value, and both sides agree — which is precisely why it is recorded here rather than guarded in the migrator: refusing it at the migrator would be the migration acting as a validator for an app-layer clamp, and §6.3's own rule is that *a migration is not a repair tool*. **Exposure today is bounded, and this part IS measured**: `PartMark.unit_index` is a `u32` (`part_marking.rs:170`) bound as `m.unit_index as i64` (`:281`), so the product's own write path cannot mint a negative ordinal — reaching this needs a hand-edited row or a future adapter that writes the table directly. | **Its own PR, not this plan.** It is a change to `part_marking.rs`'s read path (and to whether the write path should reject a negative ordinal outright), reachable today on DuckDB and none of it engine-related. **Do not fold it into a migration commit.** |
 | ADR-0107 / the frozen baseline / its header disagree on the in-serve read-fork count (**14 / 13 / 9**) | Out of scope for the migration; a stale frozen baseline is the exact class PR #43 existed to prevent → its own PR |
 | `aberp-mes::ledger_writer::write_one` appends through a fresh in-serve connection while the write-fork gate reports ZERO | ADR-0107 §5 says close it **by hand now** — a forked *append* forks the ledger under **any** engine. Independent of this plan; should land before Step 5. |
