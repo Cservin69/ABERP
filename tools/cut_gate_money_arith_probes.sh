@@ -44,6 +44,11 @@
 #        purchasing gets switched off within a week
 #   P13  the hazard inside a `#[cfg(test)]` item must stay GREEN — the tree's
 #        own proofs contain the forbidden shapes on purpose
+#   P14  the scanner's R2 CENSUS is narrowed back to its pre-B1 thirteen names
+#        — S455's five inventory quantities go blind and the live
+#        `committed_qty + ?` site vanishes. The one defect class no
+#        statement-planting probe above can reach: a missed COLUMN, not a
+#        missed statement
 #
 # Exit 0 = every probe behaved.
 
@@ -263,6 +268,29 @@ mod t8_probe_p13 {
 }
 EOF
 expect_green "P13 the hazard inside a \`#[cfg(test)]\` item (proof, not prohibition)" "$d"
+
+# --- P14: the R2 CENSUS ITSELF is narrowed back (B1's regression pin) ---------
+# The defect B1 found was not a missed statement — it was a missed COLUMN. S455
+# moved five `inventory_balances` / `inventory_reservations` quantities into R2
+# and the scanner's census was never widened, so the gate looked straight at a
+# live `SET committed_qty = committed_qty + ?1` and reported nothing. Every
+# probe above plants a STATEMENT; not one of them can catch that, because a
+# narrowed census makes the planted statement invisible too.
+#
+# So this probe narrows the census back and requires the gate to red. It reds
+# through T8-4 rather than T8-3, and that is the part worth reading: the
+# register entry for `commit_material_in_tx` stops matching anything, and the
+# RATCHET — built to catch a fold that left its entry behind — turns out to
+# also catch a scanner that went blind to the site. A census that silently
+# shrinks is the same failure as a scanner that silently stops firing (P11),
+# one level up.
+d="$(fresh)"
+perl -0pi -e 's/ on_hand_qty reserved_qty committed_qty consumed_qty qty"/"/' "$d/$SCAN"
+if grep -q 'consumed_qty qty"' "$d/$SCAN"; then
+  printf '  ! P14 could not narrow the R2 census — probe is vacuous\n'; bad=$((bad+1))
+else
+  expect_red "P14 the R2 census narrowed back to 13 — S455's five columns go blind" "$d" "FAIL (T8-4)"
+fi
 
 echo
 if [[ "$bad" -eq 0 ]]; then echo "PROBES: ✓ $pass/$pass behaved"; exit 0; fi

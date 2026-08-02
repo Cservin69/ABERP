@@ -223,8 +223,22 @@ BEGIN {
   # `quantity_dec` (C's transient S157 ladder column) and BOTH
   # `quoting_parameters` rate columns, which §3.2 D does list. The census here
   # is the union of the TABLES in §3.2, not the prose count.
+  #
+  # ⚠ CORRECTED 2026-08-02 (B1). The R2 list carried THIRTEEN names and was
+  # missing FIVE: S455 (Step 7 Part C) moved `inventory_balances.on_hand_qty` /
+  # `reserved_qty` / `committed_qty` / `consumed_qty` and
+  # `inventory_reservations.qty` OUT of §3.2 E and INTO R2 TEXT — recorded in
+  # the §9 ledger row, never propagated here. The gate was therefore BLIND to
+  # them for the whole of Parts C-I, and there is a live SQL `+` on one of them
+  # (`material_inventory.rs::commit_material_in_tx`). R2 is now FIFTEEN columns
+  # (§3.4's per-column sweep count) plus `quantity_dec` and `est_cost_huf`.
+  #
+  # `qty` is the shortest name in the census and the one worth a word: it is
+  # marked only as a WHOLE identifier (`mark_one` refuses when either neighbour
+  # is a word character), so `qty_delta`, `qty_target`, `qty_per_unit` and
+  # `stock_qty` are matched by their own entries and never twice by this one.
   split("unit_price unit_price_minor total_net_minor total_vat_minor total_gross_minor line_total_minor subtotal_minor vat_minor total_minor huf_equivalent_total", R1, " ")
-  split("est_cost_huf exchange_rate quantity quantity_dec qty_target qty_per_unit qty_delta stock_qty min_stock total_price_eur cost_per_kg_eur cad_cam_rate_eur_per_hour machining_rate_eur_per_minute", R2, " ")
+  split("est_cost_huf exchange_rate quantity quantity_dec qty_target qty_per_unit qty_delta stock_qty min_stock total_price_eur cost_per_kg_eur cad_cam_rate_eur_per_hour machining_rate_eur_per_minute on_hand_qty reserved_qty committed_qty consumed_qty qty", R2, " ")
   NCOL = 0
   for (i in R1) { NCOL++; COLNAME[NCOL] = R1[i]; COLCLASS[NCOL] = "R1" }
   for (i in R2) { NCOL++; COLNAME[NCOL] = R2[i]; COLCLASS[NCOL] = "R2" }

@@ -410,7 +410,7 @@ symptom that already cost PR #40. `STRICT` + a `typeof()` assertion over every r
 
 **And the rule that makes R1/R2 hold at runtime: no arithmetic on a money,
 rate, or quantity column in SQL.** Not `SUM`, not `*`, not `+`, not `AVG`. Fold in
-Rust over `Decimal` / `i64`. §3.4 enumerates the six sites; §8 T-8 is the cut-gate
+Rust over `Decimal` / `i64`. §3.4 enumerates the eight sites; §8 T-8 is the cut-gate
 grep that keeps it true.
 
 ### 3.2 The complete column census
@@ -809,7 +809,24 @@ conversion (`huf_equivalent_round_half_even`, ADR-0037 §1.c / C11) already runs
 round-trip that stood between that `i64` and the column. The property test T-5
 (§8) is what makes this claim falsifiable rather than asserted.
 
-### 3.4 The **seven** SQL-side arithmetic sites that must move to Rust — and the one comparison
+### 3.4 The **eight** SQL-side arithmetic sites that must move to Rust — and the one comparison
+
+> ⚠ **CORRECTED 2026-08-02 (B1): this section said SEVEN and the count was a
+> consequence of a stale census, not a measurement.** S455 (Step 7 Part C) moved
+> `inventory_balances.on_hand_qty` / `reserved_qty` / `committed_qty` /
+> `consumed_qty` and `inventory_reservations.qty` out of §3.2 E and into R2
+> `TEXT`; the §9 ledger row recorded the move and **neither this section nor
+> T-8's scanner census was widened to match**. The gate's R2 list stayed at
+> thirteen names for the whole of Parts C–I, so it read every statement on those
+> five columns and reported nothing. **Site 8 below is what that blindness was
+> hiding**, and it is a *write*, inside a transaction.
+>
+> The scanner census is now the full R2 set and the tree-wide re-scan — the gate's
+> own, `tools/cut_gate_money_arith.sh` over 753 statements in 303 files — returns
+> **exactly one** newly-visible site. That is the measured number, not a sample:
+> the other occurrences of the five columns (`material_inventory.rs:369`, `:416`,
+> `:965`, `quote_deal.rs:1174`) are bare projections, and the saga's own
+> sufficiency comparison at `:565` is already in Rust.
 
 | Site | Statement | Why it breaks | Fix |
 |---|---|---|---|
@@ -820,6 +837,7 @@ round-trip that stood between that `i64` and the column. The property test T-5
 | `aberp-inventory/src/bin/rebuild_stock_cache.rs:29` | same, CLI one-shot | same | same |
 | **`aberp-inventory/src/repository.rs:548–549`** (`low_stock_products`) — **site 7, and the tree's only Q2 break** | `WHERE COALESCE(stock_qty,0) < COALESCE(min_stock,0)` (`:548`)<br>`ORDER BY (COALESCE(stock_qty,0) - COALESCE(min_stock,0)) ASC, name ASC` (`:549`) | **Two distinct breaks in one statement.** (a) *The comparison* (`:548`). Both columns are R2/`TEXT` after migration, so `COALESCE(col, 0)` yields `TEXT` when the column is present and `INTEGER 0` when it is `NULL`. `TEXT < TEXT` is **lexicographic**: stock `'9'` vs min `'10'` compares `'9' > '1…'` → **FALSE → the low-stock product is silently not flagged.** And where one side is `NULL`→`INTEGER 0`, SQLite's storage-class ordering places INTEGER before TEXT *unconditionally*, so `0 < '<any text>'` is always TRUE. (b) *The ordering* (`:549`). `TEXT - TEXT` forces REAL coercion → **float arithmetic on a quantity**, exactly R1/R2's target class. | Select `stock_qty`, `min_stock` as `TEXT`; do **both** the `<` filter and the deficit ordering in Rust over `Decimal` — the function already parses both columns into `Decimal` from the `CAST(… AS VARCHAR)` projections at `:542–543`, so the fold has no new dependency and no new query. Lands with inventory in **Step 7**. |
 | **`aberp-inventory/src/repository.rs:585`** (the low-stock *count*) | `WHERE COALESCE(stock_qty,0) < COALESCE(min_stock,0)` | The **same** lexicographic comparison, in a second statement 36 lines below the first, reached by a different caller. Found by the same per-column sweep; it would have been missed by a fix scoped to `low_stock_products` alone. | Same fold, or delete the query and count the folded rows. **Step 7, same commit.** |
+| **`apps/aberp/src/material_inventory.rs:585`** (`commit_material_in_tx`) — **site 8, added 2026-08-02 by B1** | `UPDATE inventory_balances SET committed_qty = committed_qty + ?1` | `committed_qty` became R2 `TEXT` at S455, so after the cutover this is `TEXT + <bound f64>` → **REAL coercion, a float written back into a quantity column** — the write-side shape sites 3–5 are, inside the DEAL saga's commit transaction. On DuckDB today it is `DOUBLE + DOUBLE` and exact. | Read-modify-write in Rust over `Decimal`, **inside the same transaction**. The fold has no new dependency: `commit_material_in_tx` already reads the balance row two statements earlier (`read_balance_in_tx_inner`, `:562`) for its sufficiency check, so it is holding the value it needs. Lands with the family's Rust-side crossing; registered in T-8's pending-fold register until then. |
 | `reports.rs` `MAX(...)` / `COUNT(*)` sites | — | unaffected (no money arithmetic) | none |
 
 **This work is not optional and not deferrable to a cleanup phase.** Three of the
@@ -854,12 +872,13 @@ step as their family (Steps 5 and 7).
 > the identical shape two functions away.
 
 > **This closes Q2, in the plan, not in a future step.** A per-column sweep of
-> every `ORDER BY`, `MIN`/`MAX`, `<`/`>`/`<=`/`>=`, and `BETWEEN` over all ten
-> R2 (TEXT-decimal) columns — `exchange_rate`, `quantity`, `qty_target`,
-> `qty_per_unit`, `qty_delta`, `stock_qty`, `min_stock`, `est_cost_huf`,
-> `total_price_eur`, `cost_per_kg_eur` — returns **exactly two hits in the whole
-> tree: `repository.rs:548` and `repository.rs:585`,** both the same predicate on
-> the same two columns. Every other comparison on these values
+> every `ORDER BY`, `MIN`/`MAX`, `<`/`>`/`<=`/`>=`, and `BETWEEN` over all
+> **fifteen** R2 (TEXT-decimal) columns — `exchange_rate`, `quantity`,
+> `qty_target`, `qty_per_unit`, `qty_delta`, `stock_qty`, `min_stock`,
+> `est_cost_huf`, `total_price_eur`, `cost_per_kg_eur`, **`on_hand_qty`,
+> `reserved_qty`, `committed_qty`, `consumed_qty`, `qty`** — returns **exactly
+> two hits in the whole tree: `repository.rs:548` and `repository.rs:585`,** both
+> the same predicate on the same two columns. Every other comparison on these values
 > (`repository.rs:449`, `:502`; `work-orders/repository.rs:232`, `:699`) is
 > already in Rust over `Decimal`.
 >
@@ -870,6 +889,21 @@ step as their family (Steps 5 and 7).
 > actually returns wrong rows; and the first sweep found one site where there are
 > two, because it stopped at the function §13 named instead of at the predicate.
 > **A sweep is per-column or it is nothing.**
+>
+> ⚠ **RE-RUN 2026-08-02 over the widened fifteen (B1), and the comparison count
+> is UNCHANGED at two.** The five columns S455 promoted carry no SQL comparison
+> and no `ORDER BY` anywhere in the tree — the saga's own sufficiency test
+> (`projected_available < 0.0`, `material_inventory.rs:565`) is already in Rust
+> over the values it read, which is the shape §3.4 prescribes. The five
+> contributed **one arithmetic hit** (site 8) and **zero comparison hits**.
+>
+> **And there is a third lesson, which is the one B1 cost.** Both lessons above
+> are about the sweep's *predicate coverage*; this section's own count went stale
+> for a different reason — the sweep's **column set** silently fell behind a
+> decision recorded elsewhere. A sweep is per-column, and *which* columns is a
+> fact that has to be re-derived from §3.2 rather than carried forward. T-8's
+> P14 probe now pins exactly that: narrowing the scanner's R2 census back reds
+> the gate.
 
 ---
 
@@ -2082,7 +2116,7 @@ email/relay → **approved-vendor list (`avl_vendors`)**.
 > to exercise — the schema evolution here happened by *adding a table*, not by
 > adding columns.
 >
-> **No §3.4 fold is owed and none is deferred.** §3.4's seven arithmetic sites
+> **No §3.4 fold is owed and none is deferred.** §3.4's eight arithmetic sites
 > contain no dispatch statement and §6.3's row says "row-by-row carry". The only
 > aggregate anywhere in the two modules is `COUNT(*)`
 > (`repository.rs:760/787/811`, `part_marking.rs:187`), which counts rows rather
@@ -2175,7 +2209,7 @@ email/relay → **approved-vendor list (`avl_vendors`)**.
 > hits against all four, so there is no `ensure_columns` ladder and M8's
 > post-condition has nothing to exercise.
 >
-> **No §3.4 fold is owed and none is deferred.** §3.4's seven arithmetic sites
+> **No §3.4 fold is owed and none is deferred.** §3.4's eight arithmetic sites
 > contain no purchasing statement and §6.3's row for "partners / products /
 > **purchasing**" says row-by-row carry. The module has exactly one piece of
 > SQL-side arithmetic — `SET received_quantity = received_quantity + ?3`
@@ -2403,7 +2437,7 @@ a pin (ADR-0107 §4.1, extended to security by PR #49).
 | **T-5(e)** | **N-2, a one-entry shrinking allowlist.** The set of `f64` constructions in the billing→`nav_xml`→`invoice-pdf` reach set is **exactly** `{nav_xml.rs:1788}` — a *percentage rendering* of an INTEGER basis-point count, value-exact over the four legal HU rates. Any second entry reds the gate. **Step 5 converts that site to `Decimal`, after which the allowlist is empty and T-5(e) asserts zero.** The allowlist may only shrink; growing it requires amending §3.3. | §3.3 N-2, B2 |
 | **T-6** | Two connections interleave read-head → append; must **not** produce two links off one `prev_hash`. Run with and without `BEGIN IMMEDIATE` | M5 / F-7a |
 | **T-7** | `db_writer_lock_e2e` re-pointed at SQLite; **plus** a cross-engine test: a DuckDB `serve` holding the lock refuses a SQLite `serve` on the same tenant+dir | M6 / F-7b / §1.1 G-7 |
-| **T-8** | Cut-gate grep over any §3.2 A–D column name appearing in any SQL string, for **arithmetic**: `SUM(` `AVG(` `*` `+` **`-` `/`** — and for **comparison**: **`<` `>` `<=` `>=` `BETWEEN` `MIN(` `MAX(` `ORDER BY`** (F2). The first draft's pattern had `SUM(`/`*`/`+`/`AVG(` only: it omitted subtraction and division, and had **no comparison arm at all**, so it was structurally incapable of seeing `repository.rs:548–549` — the one statement §3.4 and Q2 both turn on. A gate that cannot red on the plan's own worst example is PR #43's name-vs-shape lesson, unlearned. **Mutation-verify against both known sites specifically:** restore the original `low_stock_products` query (`:548` `<` and `:549` `-`), watch T-8 red; restore `count_low_stock_products` (`:585` `<`), watch T-8 red **again** — one site's mutation passing is not evidence the other is covered. Also verified to red on `COALESCE(col, 0)`-wrapped operands, since that is the form both real sites take.<br><br>✅ **BUILT 2026-08-01 (S452), closing M-1.** `tools/cut_gate_money_arith.sh` + `tools/adr0108_money_arith_scan.awk` + `tools/adr0108_money_arith_pending_folds.txt` + `tools/cut_gate_money_arith_probes.sh`, wired into `cut-gate.yml` beside the SQLite posture gate. Green over 672 SQL statements in 295 files, register exact at 7 records / 4 sites. Four corrections to the spec above, each measured rather than assumed:<br>(a) **It is not a grep.** `COALESCE(stock_qty,0) < COALESCE(min_stock,0)` puts a `)` — not a column — beside the operator, so no operator/column pattern can see it. The scanner marks census columns, then collapses parenthesised groups innermost-first, propagating the taint through wrappers, and tests operator adjacency at every collapse. `CAST(SUM(CAST(il.quantity AS DECIMAL(38,6)) * il.unit_price) AS VARCHAR)` reduces to `SUM(~m~ * ~m~)` and fires four records across two classes.<br>(b) **The comparison arm is R2-only, and the "A–D" above is corrected to that.** Comparing or ordering an R1 `INTEGER` money column in SQLite is exact and correct; reddening on `ORDER BY unit_price` would be crying wolf, and a gate that cries wolf gets switched off — the same call §3.3 makes for T-5(d)/(e). §3.4's own Q2 sweep is per-column over the **R2 ten**, and that is the hazard's real boundary. The arithmetic arm stays over all of A–D (`SUM` on R1 is exact but raises on i64 overflow).<br>(c) **The named mutation targets are already fixed, so the mutations are synthetic and the proof is stronger for it.** `repository.rs:548/549/585` were folded into `low_stock_candidates` on this branch before T-8 landed; the gate is green on them because they are *fixed*, not because it is blind. P2/P3/P4 plant those exact statements — the `<`, the `-` deficit `ORDER BY`, and the second function's twin — as **three separate mutations**, honouring F2's "one site's mutation passing is not evidence the other is covered."<br>(d) **The census is wider than §3.4's prose.** "All ten R2 columns" omits `quantity_dec` and both `quoting_parameters` rate columns, which §3.2 D does list. The const list is the union of §3.2's tables: 10 R1 + 13 R2 names. | §3.4, Q2, F1, F2 |
+| **T-8** | Cut-gate grep over any §3.2 A–D column name appearing in any SQL string, for **arithmetic**: `SUM(` `AVG(` `*` `+` **`-` `/`** — and for **comparison**: **`<` `>` `<=` `>=` `BETWEEN` `MIN(` `MAX(` `ORDER BY`** (F2). The first draft's pattern had `SUM(`/`*`/`+`/`AVG(` only: it omitted subtraction and division, and had **no comparison arm at all**, so it was structurally incapable of seeing `repository.rs:548–549` — the one statement §3.4 and Q2 both turn on. A gate that cannot red on the plan's own worst example is PR #43's name-vs-shape lesson, unlearned. **Mutation-verify against both known sites specifically:** restore the original `low_stock_products` query (`:548` `<` and `:549` `-`), watch T-8 red; restore `count_low_stock_products` (`:585` `<`), watch T-8 red **again** — one site's mutation passing is not evidence the other is covered. Also verified to red on `COALESCE(col, 0)`-wrapped operands, since that is the form both real sites take.<br><br>✅ **BUILT 2026-08-01 (S452), closing M-1.** `tools/cut_gate_money_arith.sh` + `tools/adr0108_money_arith_scan.awk` + `tools/adr0108_money_arith_pending_folds.txt` + `tools/cut_gate_money_arith_probes.sh`, wired into `cut-gate.yml` beside the SQLite posture gate. Green over 672 SQL statements in 295 files, register exact at 7 records / 4 sites. Four corrections to the spec above, each measured rather than assumed:<br>(a) **It is not a grep.** `COALESCE(stock_qty,0) < COALESCE(min_stock,0)` puts a `)` — not a column — beside the operator, so no operator/column pattern can see it. The scanner marks census columns, then collapses parenthesised groups innermost-first, propagating the taint through wrappers, and tests operator adjacency at every collapse. `CAST(SUM(CAST(il.quantity AS DECIMAL(38,6)) * il.unit_price) AS VARCHAR)` reduces to `SUM(~m~ * ~m~)` and fires four records across two classes.<br>(b) **The comparison arm is R2-only, and the "A–D" above is corrected to that.** Comparing or ordering an R1 `INTEGER` money column in SQLite is exact and correct; reddening on `ORDER BY unit_price` would be crying wolf, and a gate that cries wolf gets switched off — the same call §3.3 makes for T-5(d)/(e). §3.4's own Q2 sweep is per-column over the R2 set, and that is the hazard's real boundary. The arithmetic arm stays over all of A–D (`SUM` on R1 is exact but raises on i64 overflow).<br>(c) **The named mutation targets are already fixed, so the mutations are synthetic and the proof is stronger for it.** `repository.rs:548/549/585` were folded into `low_stock_candidates` on this branch before T-8 landed; the gate is green on them because they are *fixed*, not because it is blind. P2/P3/P4 plant those exact statements — the `<`, the `-` deficit `ORDER BY`, and the second function's twin — as **three separate mutations**, honouring F2's "one site's mutation passing is not evidence the other is covered."<br>(d) **The census is wider than §3.4's prose.** "All ten R2 columns" omits `quantity_dec` and both `quoting_parameters` rate columns, which §3.2 D does list. The const list is the union of §3.2's tables: 10 R1 + 13 R2 names.<br><br>(e) ⚠ **CORRECTED 2026-08-02 (B1): (d) was right about the MECHANISM and wrong about the SET.** The R2 list shipped with **13** names and S455 had already promoted **five more** — `inventory_balances.on_hand_qty` / `reserved_qty` / `committed_qty` / `consumed_qty` and `inventory_reservations.qty` — out of §3.2 E and into R2 `TEXT`. The census is now **18 R2 names** (the fifteen §3.4 sweeps, plus `quantity_dec` and the two `quoting_parameters` rate columns (d) already named), and the tree-wide re-scan surfaces exactly one previously-invisible site: `material_inventory.rs::commit_material_in_tx`'s `SET committed_qty = committed_qty + ?1`, now §3.4 site 8 and registered as a cutover-owed fold. **The general failure is that this census is a COPY of a decision recorded elsewhere, and copies go stale silently** — and a narrowed census makes every statement-planting probe vacuous at once, which is why P14 mutates the census itself rather than a statement. | §3.4, Q2, F1, F2 |
 | **T-9** | `ensure_columns`: seeds a pre-migration schema and asserts every expected column exists after `ensure_schema`; **and** asserts `Err` when a column cannot be added, and `Err` when the table is absent | M8 / F-1c / D2a's shape |
 | **T-10** | mode of `aberp.sqlite`, `-wal`, `-shm` == `0600`; tenant dir `0700` | M9 / F-5a |
 | **T-11** | `sqlite3_libversion_number() >= 3051003` | M10 / M12 |
@@ -2473,6 +2507,7 @@ it or an explicit "out of scope".
 | The S392 NAV pre-flight is dead (0 `check_performed` in 225 mirror entries) | Orthogonal, engine-independent, and ADR-0107 §5 calls it the most under-weighted open item. Not this plan. |
 | ~~ADR-0107 §1.3 finding F1 (is a forked read stale, or was D2a row loss?) is unsettled~~ | **CLOSED 2026-07-31 by the measurement in R-5 above.** Neither: the forked read is *coherent*, and the loss is the fork's **close** truncating the writer's WAL. The migration does not make it moot on prod — prod stays on DuckDB. Tracked as R-5, its own PR. |
 | `apps/aberp/tests/serve_numbering_route.rs::put_then_get_round_trips_template` **flaked once** under the CI-shaped `cargo test -p aberp -p aberp-db --features sqlite-engine` arm (read back `start_value: 1247` instead of the `1` just written). Green in isolation and green on an immediate identical re-run; green in the default `--workspace` run. Cross-test interference on shared state, not an engine defect — the `sqlite-engine` feature changes no storage yet (Steps 1–4 are the reversible foundation). | ~~**Out of scope**, recorded 2026-07-31 so a future session does not misread it as a Step-5 regression.~~ **CLOSED 2026-08-01 (Step 6) — it recurred on the DEFAULT `--workspace` arm (which this row said was green), on the sibling test `put_preserves_identity_and_bank_sections`, and the cause is a two-line test-isolation defect exactly as predicted.** `unique_tmpdir()` (`serve_numbering_route.rs:29`) keyed the scratch directory on `(pid, nanos)` with **no per-call counter**, so two `#[test]` threads reading the clock in the same tick get the *same* directory and both write `seller.toml` into it. The observed failure is that signature verbatim: the identity/bank assertion read back a file containing only `[seller.numbering]` — the one the *other* test wrote. Fixed here with the `AtomicU64` per-call counter the ADR-0108 test files already use. Test-only, two lines; folded in rather than deferred because a non-deterministic suite makes **every** subsequent step's gate untrustworthy, and rule 4 makes the gates the per-step trust surface. Named in the Step-6 commit body so it is not miscounted as adversarial collateral. |
+| **B1 — T-8's R2 CENSUS WAS THIRTEEN NAMES AND §3.2 HAD FIFTEEN, so the gate was BLIND to five columns for the whole of Parts C–I — and there is a live SQL `+` on one of them.** S455 (Step 7 Part C) moved `inventory_balances.on_hand_qty` / `reserved_qty` / `committed_qty` / `consumed_qty` and `inventory_reservations.qty` out of §3.2 E and into R2 `TEXT`, with a §9 row recording the move; `tools/adr0108_money_arith_scan.awk:227`'s const list was never widened to match. The gate read `material_inventory.rs::commit_material_in_tx`'s `UPDATE inventory_balances SET committed_qty = committed_qty + ?1` — inside the DEAL saga's commit transaction — and reported nothing, on every run, green. **This is the census-copy failure §3.2 A's own note warns about, one level up**: not a table name that does not exist, but a decision taken in one artefact and not propagated to the artefact that enforces it. | ✅ **CLOSED 2026-08-02 (B1).** The five names are in the census; the tree-wide re-scan (the gate's own, **753 statements in 303 files**) surfaces **exactly one** newly-visible site, and that is a measured count — the five columns' other occurrences (`material_inventory.rs:369`, `:416`, `:965`, `quote_deal.rs:1174`) are bare projections and the saga's sufficiency comparison at `:565` is already in Rust. The site is **registered, not folded and not silenced**: `apps/aberp/src/material_inventory.rs|commit_material_in_tx|R2|arith-add|committed_qty` is now a cutover-owed pending fold, so T8-3 sees it and T8-4 will red if it lingers after the fold lands. **The DuckDB write path is unchanged** — folding a live saga `UPDATE` in a migrator-half commit is the migration collateral every row above refuses — and **EXPOSURE TODAY IS ZERO**, because `material_inventory.rs` has not crossed the seam. §3.4 is re-titled **eight** sites and carries site 8; its Q2 sweep is re-run over the widened fifteen and returns the **same two** comparison hits. Pinned by **probe P14**, which narrows the census back and requires the gate to red — the one defect class no statement-planting probe can reach, because a narrowed census makes the planted statement invisible too. ⚠ The fold itself is **still owed at cutover**, and it is a read-modify-write that must stay inside the saga's transaction. |
 | ADR-0107 §2 lists `db_writer_lock` as retirable; ADR-0107 §3 B-cost-1 says money is already integer; ADR-0107 §4.1 Phase 0 does not scope the DDL rewrites | Amended in Step 1's PR body per PR #49's own deferral ledger, plus §1.1 G-2's `.sql` correction which PR #49 also missed |
 
 ---
@@ -2487,7 +2522,7 @@ result — Q2, Q5, Q7 and Q10.
 | # | Question | Disposition | Where it lives now |
 |---|---|---|---|
 | **Q1** | Compile-time cargo feature vs runtime engine selector (§2.2 D1) | **Closed — compile-time.** Reversibility comes from *two files*, not from the selector, which the B3 fix makes more true rather than less. A runtime toggle costs a trait layer over 449 + 120 + 238 sites (R-2) and keeps every family simultaneously reachable on two engines — the half-migrated shape rule 14 forbids. If Ervin meant a runtime toggle, that is his to reopen; the case is made, not averaged. | §2.2 |
-| **Q2** | `TEXT`-decimal vs scaled-integer for quantities/rates (§3.1 R2) | **Closed — `TEXT`, and the lexicographic risk is swept rather than deferred.** The per-column sweep over all ten R2 columns is **done, in §3.4**: exactly two hits, `repository.rs:548` and `:585`, both folded into Rust in Step 7. The original deferral said *`ORDER BY`* and would have missed the `WHERE` — the half that returns wrong rows. | §3.4, T-8, Step 7 |
+| **Q2** | `TEXT`-decimal vs scaled-integer for quantities/rates (§3.1 R2) | **Closed — `TEXT`, and the lexicographic risk is swept rather than deferred.** The per-column sweep — over all **fifteen** R2 columns since B1 widened it 2026-08-02 — is **done, in §3.4**: exactly two hits, `repository.rs:548` and `:585`, both folded into Rust in Step 7. The original deferral said *`ORDER BY`* and would have missed the `WHERE` — the half that returns wrong rows. | §3.4, T-8, Step 7 |
 | **Q3** | `routings.est_cost_huf` → `TEXT` (R2) rather than `INTEGER` (R1) (§3.2 B) | **Closed — R2, the one documented R1 exception.** `Option<Decimal>` in Rust, never on the NAV wire, the PDF, or ledger totals. R1 would force a "what is HUF's minor unit for an *estimate*" product decision to serve consistency alone. | §3.2 B |
 | **Q4** | The five quoting `f64` money columns (§3.2 D) — Step 8, converted to `Decimal` | **Closed — convert, and the strictness stands.** §3.2 D's pre-commitment ("if Step 8 overruns, *stop* — do not migrate as `REAL`") is the rule-11 guard that stops a later session taking the easy branch. Not softened. | §3.2 D, Step 8 |
 | **Q5** | The `ON CONFLICT` sites: add `UNIQUE` indexes, or rewrite as `SELECT`-then-write? (§4.3) | **Dissolved.** There are **5**, not 21 (16 doc comments + 1 test string), and all 5 conflict targets are **already the declared `PRIMARY KEY`**, verified statement-by-statement. Zero indexes, zero rewrites — so the `[[no-sql-specific]]` tension the question was built around never existed. Step 3's obligation is 5 confirmation tests. | §1.2, §4.3, M12 |

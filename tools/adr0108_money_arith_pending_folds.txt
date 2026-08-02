@@ -55,6 +55,36 @@
 crates/aberp-inventory/src/repository.rs|record_movement|R2|agg-sum|qty_delta
 crates/aberp-inventory/src/repository.rs|rebuild_stock_cache_for_tenant|R2|agg-sum|qty_delta
 #
+# --- the FIVE columns the R2 census had never carried, and the ONE live site --
+# ADDED 2026-08-02 (B1). S455 (Step 7 Part C) moved `inventory_balances.
+# on_hand_qty` / `reserved_qty` / `committed_qty` / `consumed_qty` and
+# `inventory_reservations.qty` out of §3.2 E and into R2 TEXT. The scanner's R2
+# census was never widened to match, so for the whole of Parts C-I the gate
+# looked at these five columns and saw nothing. Widening it makes exactly ONE
+# site visible tree-wide (measured, not assumed — the scan is the gate's own,
+# over all 753 statements in 303 files):
+#
+#   `commit_material_in_tx` does `SET committed_qty = committed_qty + ?1` inside
+#   the DEAL saga's commit transaction. Today that is a DuckDB `DOUBLE + DOUBLE`
+#   and it is fine. At the family's cutover the column is R2 `TEXT`, and
+#   `TEXT + <bound f64>` coerces to REAL — a float written back into a quantity
+#   column, which is the exact class R2 exists to prevent, on the write side,
+#   inside a transaction. The bound `?1` is an `f64` today as well.
+#
+# It is registered rather than folded HERE for the reason every other row in
+# this file is: the fold is a change to a live DuckDB write on the saga's
+# transaction, and §9's own rule is that a migrator-half commit does not touch
+# the product's write path — mixed in, it would be indistinguishable from
+# migration collateral. EXPOSURE TODAY IS ZERO: `material_inventory.rs` has not
+# crossed the seam, so the statement executes on DuckDB.
+#
+# ⚠ The fold is NOT "sum the same thing in Rust". `commit_material_in_tx`
+# already reads the balance row two statements earlier (`read_balance_in_tx_inner`
+# at `:562`) for its sufficiency check, so the fold is a read-modify-write on a
+# value it is ALREADY holding — and it must stay inside that transaction, for
+# the same reason `record_movement`'s does.
+apps/aberp/src/material_inventory.rs|commit_material_in_tx|R2|arith-add|committed_qty
+#
 # --- what is NOT here, and was expected to be --------------------------------
 # §3.4's site 7 (`repository.rs:548-549`, `low_stock_products`) and its twin at
 # `:585` (`count_low_stock_products`) — the tree's only Q2 lexicographic break.
