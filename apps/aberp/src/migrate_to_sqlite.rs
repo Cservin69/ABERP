@@ -199,6 +199,11 @@ pub struct MigrateOutcome {
     /// the source has none of its six tables. Presence is held symmetrically
     /// **per table**, because THREE migrations build the six.
     pub quality: crate::migrate_quality::QualityCarry,
+    /// ADR-0108 Step 7 Part F — what the dispatch/shipment family carried. All
+    /// zeros when the source has neither of its two tables. Presence is held
+    /// symmetrically **per table**, because two modules own the two and
+    /// `wo_part_marks` (S432) arrives three sprints after `dispatches` (S234).
+    pub dispatch: crate::migrate_dispatch::DispatchCarry,
     /// SHA-256 of the DuckDB file, taken after the run. C-I says this must
     /// equal the digest taken before it (T-19 arm 2).
     pub duckdb_sha256_after: String,
@@ -252,6 +257,11 @@ pub fn run(args: &MigrateToSqliteArgs) -> Result<()> {
         q.qa_inspections,
         q.qc_inspection_plans,
         q.qc_inspections
+    );
+    let d = out.dispatch;
+    println!(
+        "  dispatch family: {} dispatch(es), {} part mark(s)",
+        d.dispatches, d.wo_part_marks
     );
     println!(
         "  DuckDB SHA-256 after the run: {} (C-I: must equal the pre-migration manifest's)",
@@ -439,6 +449,15 @@ pub fn migrate_families(
     //     and one predating S439 has only `qa_inspections`.
     let quality = crate::migrate_quality::carry_quality(&src, &mut dst)?;
 
+    // --- ADR-0108 Step 7 Part F — the dispatch/shipment family, same lock, same
+    //     digest window. Presence is per TABLE again: `aberp_dispatch`'s V001
+    //     builds `dispatches` (S234) and `part_marking.rs`'s batch builds
+    //     `wo_part_marks` (S432), so a database predating S432 legitimately has
+    //     one of the two. The two are one family because `trace_customer`
+    //     (`part_marking.rs:504`) JOINs them in a single statement, and a JOIN
+    //     cannot span two engines (rule 14).
+    let dispatch = crate::migrate_dispatch::carry_dispatch(&src, &mut dst)?;
+
     drop(dst);
     drop(src);
 
@@ -460,6 +479,7 @@ pub fn migrate_families(
         products,
         work_orders,
         quality,
+        dispatch,
         duckdb_sha256_after: after,
     })
 }
@@ -817,6 +837,9 @@ pub fn reconcile(duckdb_path: &Path, sqlite_path: &Path, tenant: &str) -> Result
 
     // ---- ADR-0108 Step 7 Part E — the QA/QC family's arm ----
     crate::migrate_quality::reconcile_quality(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
+
+    // ---- ADR-0108 Step 7 Part F — the dispatch/shipment family's arm ----
+    crate::migrate_dispatch::reconcile_dispatch(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
 
     Ok(r)
 }

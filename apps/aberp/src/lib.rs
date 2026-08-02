@@ -95,6 +95,14 @@ pub mod mes_manager;
 /// it plugs into.
 #[cfg(feature = "sqlite-engine")]
 pub mod migrate_billing;
+/// ADR-0108 Step 7 Part F — the dispatch/shipment family's STRICT schema, carry
+/// and gate arm. Two tables across two owning modules, fused by the one SQL
+/// statement that joins them (`part_marking.rs:504`). **No money, no quantity
+/// and no float at all**: its only number is `wo_part_marks.unit_index` (§3.2
+/// F). Its one refusal is a duplicate natural key, because `wo_part_marks` has
+/// no `PRIMARY KEY` for the gate's per-row arm to rely on.
+#[cfg(feature = "sqlite-engine")]
+pub mod migrate_dispatch;
 /// ADR-0108 Step 7 Part B — the partners family's STRICT DDL, its typed carry,
 /// and the reconciliation gate's arm for it. Same feature gate as the Step-4
 /// migrator it plugs into.

@@ -1930,6 +1930,92 @@ email/relay.
 > arithmetic sites contain no QA/QC statement and §6.3's row says "row-by-row
 > carry". The T-8 pending-fold register is **unchanged by this commit**: nothing
 > joined it and nothing left it.
+>
+> **Step 7 Part F — the DISPATCH / SHIPMENT family crossed, 2026-08-02 (S458).**
+> `apps/aberp/src/migrate_dispatch.rs` +
+> `apps/aberp/tests/adr0108_step7_dispatch_family.rs`, plugged into
+> `migrate_families` and `reconcile` beside the Step-5, Part-B, Part-C, Part-D
+> and Part-E arms.
+>
+> **Same split, same constraint: the MIGRATOR HALF only.**
+> `crates/aberp-dispatch/src` and `apps/aberp/src/part_marking.rs` are untouched;
+> every one of their queries still runs against DuckDB. §9 carries the row.
+>
+> **Two tables, two owning modules, 21 columns** — `dispatches` (V001, 12
+> columns) and `wo_part_marks` (`part_marking.rs`'s batch, 9 columns). The table
+> set was **grepped, not recalled**, per §3.2's own rule, and the grep is what
+> settles the family's *shape*: a tree-wide sweep of every `CREATE TABLE` in
+> `apps/`, `crates/` and `modules/` returns **no `shipments`, no
+> `delivery_notes`, no `dispatch_lines`** and no packing-list table of any name.
+> ADR-0064 §"Out of scope" says why — partial shipments are not modelled, so
+> there is one dispatch per WO and therefore no line table. A session that
+> assumed a header/line pair would have gone looking for a table that does not
+> exist and read the zero hits as "already done", which is the silent-skip shape
+> rule 11 exists to stop.
+>
+> **`wo_part_marks` is in this family because rule 14's fused boundary is
+> MEASURED here, not assumed.** `part_marking.rs:504–505` (`trace_customer`)
+> joins the two tables in **one SQL statement** and `:496` calls
+> `aberp_dispatch::ensure_schema` to guarantee the joined table exists. A JOIN
+> cannot span two engines, so crossing `dispatches` alone would split a pair one
+> statement reads together — the half-migrated shape rule 14 calls *worse than
+> unmigrated*. It is not taken from another family: Part D crossed the four
+> tables the `aberp-work-orders` crate owns, and this one is built by
+> `apps/aberp/src/part_marking.rs`. It had simply not crossed.
+>
+> **This family has NO money, NO quantity, NO float and NO boolean** — §3.2's A,
+> B, C, D, E, G and H-boolean categories are **all empty here**, measured rather
+> than hedged: neither table declares a `DECIMAL`, a `DOUBLE`, a `BOOLEAN`, a
+> `BIGINT` or a `BLOB`. Twenty of the 21 columns are `VARCHAR` → `TEXT`; the
+> twenty-first is `wo_part_marks.unit_index`, §3.2 F's `INTEGER` → `INTEGER`.
+> **Part E's `finite_measurement` therefore has no site here** — this is the
+> first family in the migration to carry no float at all — and a unit pin
+> (`no_column_in_this_family_is_money_or_quantity`) reds if a later session adds
+> a freight cost, a shipped quantity or a package weight without deciding its
+> representation. The gate's arm is correspondingly **per column over all 21**:
+> on a dispatch record the payload is which part UID, with which heat lot, went
+> to which customer on which date — the defense/aerospace traceability chain
+> `part_marking.rs`'s shipment gate exists to protect.
+>
+> **THE FAMILY'S ONE REFUSAL IS ABOUT IDENTITY, NOT REPRESENTATION, AND IT IS THE
+> part worth reading.** With no R2 column and no float there is nothing for
+> `canonical_decimal` or `finite_measurement` to guard — but `wo_part_marks` has
+> **no `PRIMARY KEY`, no `UNIQUE` and no index of any kind**
+> (`part_marking.rs:141–143` states the posture; uniqueness is a Rust-side
+> `COUNT(*)` inside the mark-parts transaction at `:187`). The gate's per-row arm
+> keys a `BTreeMap` on the natural composite `(tenant_id, wo_id, unit_index)`,
+> the way every family since Step 5 has. **A duplicate key collapses two SQLite
+> rows onto one map entry**: the row count still matches, the `typeof` sweep
+> still passes, and the per-row comparison checks the surviving row *twice* while
+> the shadowed row is *never compared at all*. A green gate over a row nobody
+> checked — B4's fail-open shape, one level down, and invisible to every other
+> check in the set. `migrate_dispatch::unique_natural_keys` refuses it on the
+> **DuckDB read side**, naming the table and the key, so the message names the
+> source's defect rather than the copy's symptom. It is applied to `dispatches`
+> too, where `dsp_id` **is** a `PRIMARY KEY`: one `BTreeSet` insert asserting the
+> source's own key held. One function, two uses — not two mechanisms.
+>
+> ⚠ **The same un-guarded shape exists in two already-landed families** —
+> `ncr_transitions` (`ncr_id#seq`, Part E) and `invoice_line`
+> (`invoice_id#ordinal`, Step 5). Not fixed here (rule 3); its own §9 row.
+>
+> **Presence is per TABLE**, and for the plainest reason of the five families so
+> far: two modules build the two tables three sprints apart (`dispatches` at
+> S234, `wo_part_marks` at S432), so a database predating S432 legitimately has
+> one of the two. `ALTER TABLE` returns **zero** hits against both, so there is
+> no `ensure_columns` ladder in this family and M8's post-condition has nothing
+> to exercise — the schema evolution here happened by *adding a table*, not by
+> adding columns.
+>
+> **No §3.4 fold is owed and none is deferred.** §3.4's seven arithmetic sites
+> contain no dispatch statement and §6.3's row says "row-by-row carry". The only
+> aggregate anywhere in the two modules is `COUNT(*)`
+> (`repository.rs:760/787/811`, `part_marking.rs:187`), which counts rows rather
+> than folding a money, rate or quantity column. The T-8 pending-fold register is
+> **unchanged by this commit**: nothing joined it and nothing left it. **Nor is
+> there an M11-shaped hazard**: `LOWER(` and `LIKE` both return **zero** hits
+> against both tables, so unlike partners this family's cutover owes no ASCII-fold
+> fix.
 
 **Step 8 — The quoting family, including the five `f64` money columns (§3.2 D).**
 - *Changes:* 17 + 15 + 10 + 7 + 6 = 55 DDL sites; `total_price_eur` ×2,
@@ -2019,6 +2105,10 @@ it or an explicit "out of scope".
 | **The migrator's two R2 validators differ in strictness, and the difference is now MEASURED rather than assumed.** `migrate_billing::canonical_decimal` (used by the invoice, work-orders and BOM families for a verbatim `DECIMAL` → `TEXT` carry) is built on `Decimal::from_str`, which **accepts exponent form** (`"1e6"`) and **rounds past 28 significant digits rather than erroring**. `migrate_products::canonical_decimal_from_f64` (used for the five rule-7 `DOUBLE`s) is built on `Decimal::from_str_exact`, which errors on both. Both behaviours are pinned in `adr0108_step7_work_orders_family::every_carried_decimal_either_round_trips_byte_identically_or_is_refused`'s adversarial table, with the measurement written beside each row. | **Nothing, today — and the condition under which that stops being true is the point of recording it.** Exposure is zero for every family that has crossed: the source is always a `DECIMAL(18,6)` or `DECIMAL(18,2)` column, which has 18 digits and cannot reach 28, and DuckDB's `CAST(… AS VARCHAR)` never emits exponent form. The lenient validator is also *correct* for a verbatim carry — the string is stored unchanged, so the SQLite read path applies the same `from_str` rounding the DuckDB reader already applied and both sides see one value. **It stops being zero for a family whose R2 source is not a `DECIMAL` column** — i.e. Step 8's §3.2 D columns, which are `DOUBLE` today. Step 8 must use the `from_str_exact` path (`canonical_decimal_from_f64`) for those, not `canonical_decimal`; picking the lenient one would silently admit a value the column cannot represent. |
 | `qc_inspections.deviation` is a derived `REAL` driving a pass/fail verdict | ~~Out of scope; flagged in §3.2 E~~ **STORAGE DISPOSITION TAKEN 2026-08-02 (S457, Step 7 Part E): it stays `REAL`, and the "derived" part is what settles it rather than what worries it.** `qc::verdict` computes it as `actual - nominal` in `f64` (`verdict.rs:103`), so `25.03 - 25.0` is `0.030000000000000426` — scale 17. R2 refuses past scale 6, so the "exact" alternative would have **hard-failed the migration on an ordinary inspection row**. It crosses bit-identically and the gate proves it per row. **What remains open is the APP-layer question, and it is not a storage one:** a pass/fail verdict computed from `f64` subtraction against `f64` tolerances can flip on a representation artefact for a measurement sitting exactly on a band edge — the same shape as the `material_inventory` saga's sufficiency check in the row above, and it wants the same treatment. Its own PR: a change to `qc::verdict`'s arithmetic, its verdict tiers and its calibration tests, all reachable today on DuckDB and none of it engine-related. **Do not fold it into a migration commit** — mixed with a storage change it would be indistinguishable from migration collateral. |
 | **The QA/QC family crossed as its MIGRATOR HALF only (Step 7 Part E), so `apps/aberp/src/quality.rs` and `crates/aberp-qa/src` still run every one of their queries against DuckDB.** Same shape as Steps 5, 7B, 7C and 7D and recorded for the same reason: the STRICT DDL, the typed carry and the gate's arm are landed and green, and none of that makes the product read or write the SQLite copy. **Exposure today is ZERO** — no SQLite connection in the tree touches `ncrs`, `ncr_transitions`, `capas`, `qa_inspections`, `qc_inspection_plans` or `qc_inspections` outside the migrator and its test. ⚠ Three things a later session must not misread. (i) **This family has no money and no quantity at all** — its only numbers are `seq`, eight §3.2 E measurements and two booleans — so the Rust-side crossing owes no R1/R2 bind discipline; what it *does* owe is the `bool` bind on the two §3.2 H columns, because a `"true"` bound as `&str` would read back as `false`. (ii) **The M11 hazard has no site here**, measured: `LOWER(` and `LIKE` return zero hits against all six tables, so unlike partners this family's cutover owes no ASCII-fold fix. (iii) **`finite_measurement` guards the migrator's read path only**; the product's own write path into the eight `REAL` columns is unguarded, so the Rust-side crossing must decide whether a non-finite measurement can be *written* at all — today it can, on DuckDB, and nothing rejects it. | **The family's Rust-side crossing (the cutover), as its own commit** — the same sequencing M-1, M11/T-12, §3.4's inventory folds and Part D got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* |
+| **The dispatch/shipment family crossed as its MIGRATOR HALF only (Step 7 Part F), so `crates/aberp-dispatch/src` and `apps/aberp/src/part_marking.rs` still run every one of their queries against DuckDB.** Same shape as Steps 5, 7B, 7C, 7D and 7E and recorded for the same reason: the STRICT DDL, the typed carry and the gate's arm are landed and green, and none of that makes the product read or write the SQLite copy. **Exposure today is ZERO** — no SQLite connection in the tree touches `dispatches` or `wo_part_marks` outside the migrator and its test. ⚠ Three things a later session must not misread. (i) **This family has no money, no quantity, no float and no boolean** — its only number is `wo_part_marks.unit_index` (§3.2 F) — so the Rust-side crossing owes no R1/R2 bind discipline and no `finite_measurement`; what it *does* owe is nothing type-shaped at all, which is why the whole of the risk sits in the keying instead. (ii) **The M11 hazard has no site here**, measured: `LOWER(` and `LIKE` return zero hits against both tables, so unlike partners this family's cutover owes no ASCII-fold fix. (iii) **`unique_natural_keys` guards the migrator's read path only**; the product's own write path into `wo_part_marks` enforces the composite key with a Rust `COUNT(*)` inside the mark-parts transaction (`part_marking.rs:187`) and nothing in the DDL backs it, so the Rust-side crossing must decide whether that stays sufficient once the write goes through SQLite. | **The family's Rust-side crossing (the cutover), as its own commit** — the same sequencing M-1, M11/T-12, §3.4's inventory folds, Part D and Part E got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* |
+| **THE DISPATCH CUTOVER IS SEQUENCED BEHIND WORK-ORDERS' AND PARTNERS', because `dispatches` is JOINed to both — and this is a constraint on the ORDER of the Rust-side crossings that §7's family list does not carry.** Measured, not inferred: `crates/aberp-dispatch/src/repository.rs:249` reads `work_orders` inside `create_dispatch`'s transaction, `:726` and `:788` are `FROM work_orders wo … NOT EXISTS (SELECT 1 FROM dispatches d …)` (the dispatchable-WO list and its count), and `:283` reads `partners`. `part_marking.rs:504–505` additionally JOINs `wo_part_marks` to `dispatches`, which is why Part F crossed those two together in the first place. **Nothing is split today** — work-orders and partners crossed as migrator halves too, so all four statements still execute on one DuckDB connection — and that is exactly the point: the split becomes possible only at cutover, and a session that crossed dispatch's Rust half before work-orders' would produce a cross-engine JOIN that cannot be written at all. | **The cutover sequence, stated before the first family's Rust half moves.** Not a code change and nothing to fix here; recorded because §7's Step-7 line reads as a list of independent families and this pair of edges is the one place that is false. |
+| **`wo_part_marks` (Part F), `ncr_transitions` (Part E) and `invoice_line` (Step 5) all key the gate's per-row `BTreeMap` on a COMPOSITE that no DDL enforces — and only Part F's is guarded.** Part F added `migrate_dispatch::unique_natural_keys` because `wo_part_marks` has no `PRIMARY KEY`, no `UNIQUE` and no index of any kind, so a duplicate `(tenant_id, wo_id, unit_index)` is reachable from a real DuckDB source; it collapses two rows onto one map entry, and the row count, the `typeof` sweep and the per-row arm all stay green while one row is compared twice and the other never. **The other two are the same mechanism with a different amount of luck**: `ncr_transitions`'s `seq` is app-issued monotonically per NCR and `invoice_line`'s `ordinal` is app-issued per invoice, so a duplicate requires a *product* defect rather than only a missing constraint — but neither table has a `PRIMARY KEY` either, and the gate's blindness is identical in all three. ⚠ **Exposure is UNMEASURED, and stating that plainly is the honest form**: this session is DEV-only and does not touch `~/.aberp/**`, so no count of duplicate `(ncr_id, seq)` or `(invoice_id, ordinal)` rows on the real DEV tenant was taken. The argument above is about the *mechanism*, not about the data. | **Its own PR — deliberately NOT retrofitted here** (rule 3: this commit crosses one family and does not improve adjacent ones), and it is three lines plus a test per family, not a redesign: hoist `unique_natural_keys` to a shared helper and call it from `migrate_billing`'s and `migrate_quality`'s read sides. ⚠ **Do not fold it into a family commit** — mixed with a storage change it would be indistinguishable from migration collateral, which is the same argument the two app-layer rows above make. |
+| **`part_marking.rs` reads `unit_index` as `r.get::<_, i64>(?)?.max(0) as u32` at `:203` and `:455`, silently CLAMPING a negative ordinal to 0.** DuckDB's `INTEGER` is signed 32-bit, so a negative `unit_index` is storable; the clamp then maps it onto the same in-Rust identity as unit 0, which on a table whose natural key *is* `(tenant_id, wo_id, unit_index)` means two distinct physical units collapsing onto one traceability record. **Not a storage or migration defect** — Part F's carry is `i64` → `i64` and exact, the gate keys on the raw value, and both sides agree — which is precisely why it is recorded here rather than guarded in the migrator: refusing it at the migrator would be the migration acting as a validator for an app-layer clamp, and §6.3's own rule is that *a migration is not a repair tool*. **Exposure today is bounded, and this part IS measured**: `PartMark.unit_index` is a `u32` (`part_marking.rs:170`) bound as `m.unit_index as i64` (`:281`), so the product's own write path cannot mint a negative ordinal — reaching this needs a hand-edited row or a future adapter that writes the table directly. | **Its own PR, not this plan.** It is a change to `part_marking.rs`'s read path (and to whether the write path should reject a negative ordinal outright), reachable today on DuckDB and none of it engine-related. **Do not fold it into a migration commit.** |
 | ADR-0107 / the frozen baseline / its header disagree on the in-serve read-fork count (**14 / 13 / 9**) | Out of scope for the migration; a stale frozen baseline is the exact class PR #43 existed to prevent → its own PR |
 | `aberp-mes::ledger_writer::write_one` appends through a fresh in-serve connection while the write-fork gate reports ZERO | ADR-0107 §5 says close it **by hand now** — a forked *append* forks the ledger under **any** engine. Independent of this plan; should land before Step 5. |
 | The S392 NAV pre-flight is dead (0 `check_performed` in 225 mirror entries) | Orthogonal, engine-independent, and ADR-0107 §5 calls it the most under-weighted open item. Not this plan. |
