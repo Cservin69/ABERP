@@ -195,6 +195,10 @@ pub struct MigrateOutcome {
     /// symmetrically **per table**, because `bom_revisions` arrives with a later
     /// migration than the other three.
     pub work_orders: crate::migrate_work_orders::WorkOrdersCarry,
+    /// ADR-0108 Step 7 Part E — what the QA/QC family carried. All zeros when
+    /// the source has none of its six tables. Presence is held symmetrically
+    /// **per table**, because THREE migrations build the six.
+    pub quality: crate::migrate_quality::QualityCarry,
     /// SHA-256 of the DuckDB file, taken after the run. C-I says this must
     /// equal the digest taken before it (T-19 arm 2).
     pub duckdb_sha256_after: String,
@@ -237,6 +241,17 @@ pub fn run(args: &MigrateToSqliteArgs) -> Result<()> {
         "  work-orders/BOM family: {} work order(s), {} BOM line(s), {} routing op(s), \
          {} BOM revision(s)",
         w.work_orders, w.boms, w.routings, w.bom_revisions
+    );
+    let q = out.quality;
+    println!(
+        "  QA/QC family: {} NCR(s), {} transition(s), {} CAPA(s), {} QA inspection(s), \
+         {} QC plan(s), {} QC inspection(s)",
+        q.ncrs,
+        q.ncr_transitions,
+        q.capas,
+        q.qa_inspections,
+        q.qc_inspection_plans,
+        q.qc_inspections
     );
     println!(
         "  DuckDB SHA-256 after the run: {} (C-I: must equal the pre-migration manifest's)",
@@ -416,6 +431,14 @@ pub fn migrate_families(
     //     before that migration legitimately has three of the four.
     let work_orders = crate::migrate_work_orders::carry_work_orders(&src, &mut dst)?;
 
+    // --- ADR-0108 Step 7 Part E — the QA/QC family, same lock, same digest
+    //     window. Presence is per TABLE again, and here for the strongest
+    //     reason yet: THREE migrations build the six tables (`quality.rs`'s
+    //     batch for NCR/CAPA, V001 for `qa_inspections`, V002 for the two QC
+    //     tables), so a database predating S443 legitimately has four of the six
+    //     and one predating S439 has only `qa_inspections`.
+    let quality = crate::migrate_quality::carry_quality(&src, &mut dst)?;
+
     drop(dst);
     drop(src);
 
@@ -436,6 +459,7 @@ pub fn migrate_families(
         partners,
         products,
         work_orders,
+        quality,
         duckdb_sha256_after: after,
     })
 }
@@ -790,6 +814,9 @@ pub fn reconcile(duckdb_path: &Path, sqlite_path: &Path, tenant: &str) -> Result
         &mut r.checks,
         &mut r.hard_stops,
     )?;
+
+    // ---- ADR-0108 Step 7 Part E — the QA/QC family's arm ----
+    crate::migrate_quality::reconcile_quality(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
 
     Ok(r)
 }

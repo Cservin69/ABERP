@@ -577,6 +577,36 @@ below**); `work_orders.actual_machining_minutes`;
 > > columns (`quote_calibration.estimated_minutes` / `actual_minutes`) are
 > > `DOUBLE` as well. There is no fork to close.
 > >
+> > ✅ **THE EIGHT QC MEASUREMENT COLUMNS CROSSED AS `REAL`, UNCHANGED,
+> > 2026-08-02 (S457, Step 7 Part E) — note (b) above is followed, not
+> > re-litigated, and the flag stands.** `qc_inspection_plans.{nominal_value,
+> > upper_tol, lower_tol}` and `qc_inspections.{nominal_value, upper_tol,
+> > lower_tol, actual_value, deviation}` are `REAL` in a `STRICT` table and
+> > bit-identical per row. They did not follow S455's five for the same reason
+> > `actual_machining_minutes` did not: **no exact counterpart exists anywhere in
+> > the tree**, so there is no rule-7 fork to close — a dimensional measurement
+> > in `units` is stored in exactly one place in this product.
+> >
+> > **And `deviation` makes the argument concrete rather than analogous.** It is
+> > *derived by subtraction* — `qc::verdict` computes `actual - nominal` in `f64`
+> > (`crates/aberp-qa/src/qc/verdict.rs:103`) — so an ordinary pair like `25.03`
+> > and `25.0` yields `0.030000000000000426`, scale 17. R2 refuses past scale 6,
+> > so an R2 carry would have **hard-failed the whole migration on an ordinary
+> > inspection row**, not on a pathological one. The fixture carries exactly that
+> > value and the test asserts the scale.
+> >
+> > ⚠ **What the `REAL` call does NOT get for free, and Part E added it:**
+> > `DOUBLE` → `REAL` is bit-exact for every *finite* `f64`, but **SQLite has no
+> > `NaN`** — a bound `f64::NAN` is stored as `NULL` (measured by
+> > `sqlite_stores_a_bound_nan_as_null`; the infinities *do* round-trip). All
+> > eight columns are `NOT NULL`, so a `NaN` would have surfaced as an
+> > unattributable `NOT NULL constraint failed`, and on a *nullable* measurement
+> > column it would cross as a silent `NULL` that the gate's `IS NOT NULL`-scoped
+> > `typeof` sweep cannot see either. `migrate_quality::finite_measurement`
+> > refuses a non-finite measurement before the bind, naming table, column and
+> > row. **Any future §3.2 E column on a nullable float must use it** — that is
+> > the general lesson, and it is not specific to QC.
+> >
 > > **And the risk runs the other way for a measured duration.** R2 refuses
 > > anything above the canonical quantity scale of 6, so an R2 carry would
 > > **hard-fail the whole migration** on an ordinary row like `12.3456789` —
@@ -1812,6 +1842,95 @@ email/relay.
 > form, and it **rounds** past 28 significant digits rather than erroring. See
 > the §9 row.
 
+> **Step 7 Part E — the QA / QC family crossed, 2026-08-02 (S457).**
+> `apps/aberp/src/migrate_quality.rs` +
+> `apps/aberp/tests/adr0108_step7_quality_family.rs`, plugged into
+> `migrate_families` and `reconcile` beside the Step-5, Part-B, Part-C and
+> Part-D arms.
+>
+> **Same split, same constraint: the MIGRATOR HALF only.** `apps/aberp/src/quality.rs`
+> and `crates/aberp-qa/src` are untouched; every one of their queries still runs
+> against DuckDB. §9 carries the row.
+>
+> **Six tables, two owning modules, three construction paths, 84 columns** —
+> `ncrs` / `ncr_transitions` / `capas` (built by `aberp::quality::ensure_schema`),
+> `qa_inspections` (V001), `qc_inspection_plans` / `qc_inspections` (V002). The
+> table set was **grepped, not recalled**, per §3.2's own rule.
+>
+> **This family has NO money and NO quantity — §3.2's A, B, C, D and G
+> categories are all empty here**, and saying it plainly is worth more than a
+> hedge. Its only numbers are `ncr_transitions.seq` (§3.2 F), eight dimensional
+> measurements (§3.2 E) and two booleans (§3.2 H). R1 and R2 have nothing to
+> bite on, so the gate's arm is **per column over all 84** rather than
+> money-first: on an ISO-9001 record the payload is the record's completeness,
+> and "the important columns" would have been the wrong subset to pick. A unit
+> pin (`no_column_in_this_family_is_money_or_quantity`) reds if a later session
+> adds a cost or a quantity to an NCR or an inspection without deciding its
+> representation.
+>
+> **The eight floats stay `REAL`, which is §3.2 E's call followed, not a fresh
+> one** — and Part D's distinguishing test is what confirms it rather than
+> Part C's. Part C moved five `DOUBLE`s out of E because they were one half of a
+> *measured* rule-7 divergence; these eight have no exact counterpart anywhere in
+> the tree, so there is no fork to close. And the risk runs the other way more
+> sharply here than it did for `actual_machining_minutes`, because `deviation` is
+> **derived by subtraction**: `qc::verdict` computes `actual - nominal` in `f64`
+> (`verdict.rs:103`), so an ordinary pair like `25.03` and `25.0` yields
+> `0.030000000000000426`. R2 refuses anything past scale 6, so carrying these as
+> R2 would have **hard-failed the migration on an ordinary inspection row**. The
+> fixture's `qci-01` carries exactly that value and the test asserts its scale is
+> past 6, so the argument is pinned rather than narrated.
+>
+> ⚠ **The first booleans any family in this migration has carried.** §3.2 H's
+> `BOOLEAN` → `INTEGER` had never been exercised; `qc_inspection_plans.enabled`
+> and `qc_inspections.calibration_stale_at_event` exercise it now. Read and bound
+> as `bool` on both sides, `typeof` asserted `'integer'` — a `'text'` `"true"`
+> would read back as `false` and silently disable every enabled inspection plan.
+>
+> ⚠ **This family adds a refusal Part D did not have, and the reason is measured
+> rather than preferred: SQLite has no `NaN`.** A bound `f64::NAN` is stored as
+> `NULL` — pinned by `sqlite_stores_a_bound_nan_as_null`, which also measures
+> that the *infinities* do round-trip. All eight measurement columns are
+> `NOT NULL`, so without a refusal a `NaN` would surface as a bare
+> `NOT NULL constraint failed` naming neither row nor reason, and on any future
+> nullable measurement column it would cross as a **silent `NULL`**.
+> `migrate_quality::finite_measurement` therefore refuses a non-finite
+> measurement before the bind, naming the table, the column and the row — the
+> same shape `canonical_decimal` has for R2. The infinities are refused with it
+> as a *product* call, stated as such: an infinite dimensional measurement drives
+> a pass/fail verdict that can no longer mean anything.
+>
+> ⚠ **No M11-shaped hazard here, and that is measured too.** `LOWER(` and `LIKE`
+> both return **zero** hits against all six tables across `apps/aberp/src` and
+> `crates/aberp-qa/src`, so the ASCII-`LOWER()` fold partners must fix at its
+> cutover has no site in this family. Recorded so a later session does not
+> re-derive it — and so the absence is known rather than assumed.
+>
+> ⚠ **There is no `ensure_columns` ladder in this family**, measured the same
+> way: `ALTER TABLE` returns zero hits against all six tables. M8's
+> post-condition has nothing to exercise here — which is precisely *why* presence
+> is held **per table**: this family's schema evolved by adding **tables**, in
+> three separate migrations, so a database predating S443 legitimately has four
+> of the six and one predating S439 has only `qa_inspections`. A per-family
+> answer would read that as "present" and then hard-stop on a table the source
+> never had.
+>
+> **Ten pins.** The load-bearing one is
+> `a_single_changed_column_on_a_single_row_reds_the_gate`, run four times over
+> the four column classes: a measurement nudged by **one ULP** (no fold touches
+> these at all and `typeof` reads `'real'` either way), the boolean, an ordinary
+> `ncrs.description`, and the **composite-keyed** `ncr_transitions.note` with
+> `Σ seq` provably unchanged. The disjunction sweep is 4096 generated
+> measurements plus a 14-row adversarial table, requiring **both arms to fire**
+> (measured: 3850 carried, 260 refused) — and because a validator agreeing with
+> itself is not the property, a second pin pushes **192 generated doubles through
+> real DuckDB → SQLite storage** and compares all 960 values **bit for bit**.
+>
+> **No §3.4 fold is owed by this family and none is deferred.** §3.4's seven
+> arithmetic sites contain no QA/QC statement and §6.3's row says "row-by-row
+> carry". The T-8 pending-fold register is **unchanged by this commit**: nothing
+> joined it and nothing left it.
+
 **Step 8 — The quoting family, including the five `f64` money columns (§3.2 D).**
 - *Changes:* 17 + 15 + 10 + 7 + 6 = 55 DDL sites; `total_price_eur` ×2,
   `cost_per_kg_eur` ×2, and the two rate tunables `f64 → Decimal` at the Rust type;
@@ -1898,7 +2017,8 @@ it or an explicit "out of scope".
 | **§3.4's three cache-rebuild folds did NOT land with the products/inventory family, and §7's Step-7 line ("incl. §3.4's three cache-rebuild folds") is corrected to say so.** They are `SUM(qty_delta)` inside `aberp_inventory::repository::{record_movement, rebuild_stock_cache_for_tenant}` (the third §3.4 row, `bin/rebuild_stock_cache.rs`, carries no SQL of its own — it calls the second). Part C landed the **migrator half** — DDL, carry, gate — and changed no query: both statements still execute on a DuckDB `Connection`, where `DECIMAL` is a real decimal type and `SUM` does not coerce. **Exposure today is ZERO**, and the mutation that proves the fold matters — a `REAL`-coerced `SUM` writing a float `stock_qty` back into the products cache — is unreachable until the queries cross. | **The family's Rust-side crossing (the cutover), as its first commit** — the same sequencing M-1 and M11/T-12 got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* The T-8 **pending-fold register keeps both entries** and stays honest doing it: each still matches a live statement, so T8-3 (nothing new may join) and T8-4 (a folded site may not linger) are green because the sites are *there*, not because the gate is blind. ⚠ **Note for whoever writes it**: the fold is not "sum the same thing in Rust" — `record_movement`'s `SUM` runs **inside the movement-recording transaction** and its result is written straight back to `products.stock_qty`, so the fold must stay in that transaction and must not become a second round trip that could see a torn read. |
 | **The work-orders / BOM family crossed as its MIGRATOR HALF only (Step 7 Part D), so `crates/aberp-work-orders/src/repository.rs` still runs every one of its queries against DuckDB.** Same shape as Steps 5, 7B and 7C and recorded for the same reason: the STRICT DDL, the typed carry and the gate's arm are landed and green, and none of that makes the product read or write the SQLite copy. **Exposure today is ZERO** — no SQLite connection in the tree touches `work_orders`, `boms`, `routings` or `bom_revisions` outside the migrator and its test. ⚠ The specific thing a later session must not misread: `routings.est_cost_huf` is now **R2 `TEXT` in the SQLite schema and still `DECIMAL(18,2)` in DuckDB**, and `repository.rs:1544/1625/1954` already read it as `CAST(est_cost_huf AS VARCHAR)` → `Decimal`, so the Rust-side crossing needs no type change there — but it does need the R2 bind discipline (`Decimal`, never `f64`) on the **write** side, because `STRICT` will not enforce it (§3.1's corrected note). | **The family's Rust-side crossing (the cutover), as its own commit** — the same sequencing M-1, M11/T-12 and §3.4's inventory folds got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* |
 | **The migrator's two R2 validators differ in strictness, and the difference is now MEASURED rather than assumed.** `migrate_billing::canonical_decimal` (used by the invoice, work-orders and BOM families for a verbatim `DECIMAL` → `TEXT` carry) is built on `Decimal::from_str`, which **accepts exponent form** (`"1e6"`) and **rounds past 28 significant digits rather than erroring**. `migrate_products::canonical_decimal_from_f64` (used for the five rule-7 `DOUBLE`s) is built on `Decimal::from_str_exact`, which errors on both. Both behaviours are pinned in `adr0108_step7_work_orders_family::every_carried_decimal_either_round_trips_byte_identically_or_is_refused`'s adversarial table, with the measurement written beside each row. | **Nothing, today — and the condition under which that stops being true is the point of recording it.** Exposure is zero for every family that has crossed: the source is always a `DECIMAL(18,6)` or `DECIMAL(18,2)` column, which has 18 digits and cannot reach 28, and DuckDB's `CAST(… AS VARCHAR)` never emits exponent form. The lenient validator is also *correct* for a verbatim carry — the string is stored unchanged, so the SQLite read path applies the same `from_str` rounding the DuckDB reader already applied and both sides see one value. **It stops being zero for a family whose R2 source is not a `DECIMAL` column** — i.e. Step 8's §3.2 D columns, which are `DOUBLE` today. Step 8 must use the `from_str_exact` path (`canonical_decimal_from_f64`) for those, not `canonical_decimal`; picking the lenient one would silently admit a value the column cannot represent. |
-| `qc_inspections.deviation` is a derived `REAL` driving a pass/fail verdict | Out of scope; flagged in §3.2 E |
+| `qc_inspections.deviation` is a derived `REAL` driving a pass/fail verdict | ~~Out of scope; flagged in §3.2 E~~ **STORAGE DISPOSITION TAKEN 2026-08-02 (S457, Step 7 Part E): it stays `REAL`, and the "derived" part is what settles it rather than what worries it.** `qc::verdict` computes it as `actual - nominal` in `f64` (`verdict.rs:103`), so `25.03 - 25.0` is `0.030000000000000426` — scale 17. R2 refuses past scale 6, so the "exact" alternative would have **hard-failed the migration on an ordinary inspection row**. It crosses bit-identically and the gate proves it per row. **What remains open is the APP-layer question, and it is not a storage one:** a pass/fail verdict computed from `f64` subtraction against `f64` tolerances can flip on a representation artefact for a measurement sitting exactly on a band edge — the same shape as the `material_inventory` saga's sufficiency check in the row above, and it wants the same treatment. Its own PR: a change to `qc::verdict`'s arithmetic, its verdict tiers and its calibration tests, all reachable today on DuckDB and none of it engine-related. **Do not fold it into a migration commit** — mixed with a storage change it would be indistinguishable from migration collateral. |
+| **The QA/QC family crossed as its MIGRATOR HALF only (Step 7 Part E), so `apps/aberp/src/quality.rs` and `crates/aberp-qa/src` still run every one of their queries against DuckDB.** Same shape as Steps 5, 7B, 7C and 7D and recorded for the same reason: the STRICT DDL, the typed carry and the gate's arm are landed and green, and none of that makes the product read or write the SQLite copy. **Exposure today is ZERO** — no SQLite connection in the tree touches `ncrs`, `ncr_transitions`, `capas`, `qa_inspections`, `qc_inspection_plans` or `qc_inspections` outside the migrator and its test. ⚠ Three things a later session must not misread. (i) **This family has no money and no quantity at all** — its only numbers are `seq`, eight §3.2 E measurements and two booleans — so the Rust-side crossing owes no R1/R2 bind discipline; what it *does* owe is the `bool` bind on the two §3.2 H columns, because a `"true"` bound as `&str` would read back as `false`. (ii) **The M11 hazard has no site here**, measured: `LOWER(` and `LIKE` return zero hits against all six tables, so unlike partners this family's cutover owes no ASCII-fold fix. (iii) **`finite_measurement` guards the migrator's read path only**; the product's own write path into the eight `REAL` columns is unguarded, so the Rust-side crossing must decide whether a non-finite measurement can be *written* at all — today it can, on DuckDB, and nothing rejects it. | **The family's Rust-side crossing (the cutover), as its own commit** — the same sequencing M-1, M11/T-12, §3.4's inventory folds and Part D got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* |
 | ADR-0107 / the frozen baseline / its header disagree on the in-serve read-fork count (**14 / 13 / 9**) | Out of scope for the migration; a stale frozen baseline is the exact class PR #43 existed to prevent → its own PR |
 | `aberp-mes::ledger_writer::write_one` appends through a fresh in-serve connection while the write-fork gate reports ZERO | ADR-0107 §5 says close it **by hand now** — a forked *append* forks the ledger under **any** engine. Independent of this plan; should land before Step 5. |
 | The S392 NAV pre-flight is dead (0 `check_performed` in 225 mirror entries) | Orthogonal, engine-independent, and ADR-0107 §5 calls it the most under-weighted open item. Not this plan. |

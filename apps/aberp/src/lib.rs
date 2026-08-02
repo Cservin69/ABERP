@@ -106,6 +106,12 @@ pub mod migrate_partners;
 /// `stock_movements.qty_delta`.
 #[cfg(feature = "sqlite-engine")]
 pub mod migrate_products;
+/// ADR-0108 Step 7 Part E — the QA/QC family's STRICT schema, carry and gate
+/// arm. Six tables across two owning modules, **no money and no quantity**: its
+/// only numbers are one sequence integer (§3.2 F), eight dimensional
+/// measurements that stay `REAL` (§3.2 E) and two booleans (§3.2 H).
+#[cfg(feature = "sqlite-engine")]
+pub mod migrate_quality;
 /// ADR-0108 Step 4 — the migrator + the reconciliation gate. Behind the
 /// default-OFF `sqlite-engine` feature: this is the ONE binary that links both
 /// engines, because it reads DuckDB and writes SQLite.
