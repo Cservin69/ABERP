@@ -1738,7 +1738,16 @@ partners (+ **M11**, T-12 — *corrected: M11/T-12 belong to the family's
 Rust-side crossing, not to its migrator half; see §9*) → products/inventory (incl. §3.4's three cache-rebuild
 folds **and both low-stock predicate folds, `repository.rs:548–549` and `:585`,
 in one commit** — F1/Q2) → work orders/BOM → QA/QC → dispatch → purchasing →
-email/relay.
+email/relay → **approved-vendor list (`avl_vendors`)**.
+
+> ⚠ **CORRECTED 2026-08-02 (S461, Step 7 Part I): this list was missing
+> `avl_vendors`, and it had been missing it since the plan was written.** The
+> table is owned by a module no other family's boundary reaches, so every Part
+> A–H correctly excluded it and none adopted it — and a list that never contained
+> it read as complete at Part H, which is why Part H's closing sentence claimed
+> Step 7 was done when one table had crossed in **no Part at all**. §9's Part-G
+> row had said so in as many words since 2026-08-02. **A family absent from the
+> list is not a family that has crossed** (rule 11).
 - *Verified by:* per-family reconciliation + the family's existing round-trip tests
   + T-15 (customer-journey e2e) re-run after each.
 - *Rollback:* per family; each is its own PR.
@@ -2178,8 +2187,12 @@ email/relay.
 > than about a fold. **Nor is there an M11-shaped hazard**: `LOWER(` and `LIKE`
 > both return **zero** hits across `purchasing.rs`.
 >
-> **Step 7 Part H — the EMAIL / RELAY family crossed, 2026-08-02 (S460). This is
-> the last non-quoting family, so Step 7's migrator halves are complete.**
+> **Step 7 Part H — the EMAIL / RELAY family crossed, 2026-08-02 (S460).**
+>
+> ⚠ **This block originally read "This is the last non-quoting family, so Step
+> 7's migrator halves are complete." That was WRONG and is retracted (S461).**
+> `avl_vendors` had crossed in no Part, and §9's Part-G row said so. Step 7's
+> migrator halves complete at **Part I**, not here.
 > `apps/aberp/src/migrate_email.rs` +
 > `apps/aberp/tests/adr0108_step7_email_family.rs`, plugged into
 > `migrate_families` and `reconcile` beside the Step-5 and Part-B…G arms.
@@ -2282,6 +2295,77 @@ email/relay.
 > single transaction**, and the family's own access is **split across a fresh
 > opener and the shared `Handle`** today.
 
+> **Step 7 Part I — the APPROVED-VENDOR-LIST family crossed, 2026-08-02 (S461).
+> This is the last non-quoting family, and Step 7's migrator halves are now
+> complete.** `apps/aberp/src/migrate_avl.rs` +
+> `apps/aberp/tests/adr0108_step7_avl_family.rs`, plugged into `migrate_families`
+> and `reconcile` beside the Step-5 and Part-B…H arms.
+>
+> **Same split, same constraint: the MIGRATOR HALF only.**
+> `apps/aberp/src/avl_vendors.rs` is untouched; every one of its queries still
+> runs against DuckDB. §9 carries the row.
+>
+> **The family is ONE table with TWELVE columns and NOT ONE NUMBER in it.**
+> Measured: every column of `avl_vendors` is `VARCHAR` on DuckDB, and `DECIMAL`,
+> `NUMERIC`, `DOUBLE`, `REAL`, `FLOAT`, `BIGINT`, `INTEGER`, `BOOLEAN` and `BLOB`
+> all return **zero** hits against its DDL. So R1, R2, R3, `canonical_decimal`,
+> `canonical_decimal_from_f64`, `finite_measurement` and `fold_i64` have nothing
+> to guard here, and the gate has **no Σ arm** — not as a choice about which
+> columns to fold, but because there is nothing to fold. The per-row arm over all
+> twelve `TEXT` columns is therefore the *whole* of the value comparison.
+>
+> ⚠ **There is no vendor price, rating or score column, and `DpasRating` is not a
+> number.** It is the DPAS priority **vocabulary** (`DO`/`DX` + a program code),
+> parsed to a closed enum, and stored on **`partners`** as a `VARCHAR` — carried
+> by Part B, with `eccn`, `export_screening_status` and `export_screened_at`.
+> "Rating" is the one word in this family that would make a later session reach
+> for a float or an R2 money column; the family test pins the DDL against every
+> numeric type so that adding one is a red rather than an undeclared
+> representation choice.
+>
+> **The refusal is keyed on `tenant_id#id`, and the duplicate this family
+> legitimately produces is a different one.** `(tenant_id, partner_id)` is
+> deliberately NOT unique: `get_vendor_by_partner` (`avl_vendors.rs:347`) — the
+> lookup `purchasing.rs:605`'s `resolve_avl` makes — reads `ORDER BY created_at
+> DESC` and takes the first row, which is how a partner holds several AVL entries
+> over time with the newest winning. That is a property of the data model, so the
+> carry **preserves** it and the family test pins that the newest still wins
+> afterwards. Keying the guard on the partner would refuse to migrate a database
+> the product considers correct.
+>
+> ⚠ **The `PRIMARY KEY` is on the bare `id`, not on the composite the gate keys
+> on**, so — as in Part H — the product's own schema cannot produce the duplicate
+> the refusal exists for, and the family test reaches it by building the
+> repair-shaped source (the table hand-recreated without the key) rather than by
+> pretending the ordinary path can produce one.
+>
+> **No §3.4 fold is owed and none is deferred.** The module contains **no SQL
+> arithmetic at all** — `SUM`, `AVG`, `COUNT`, `+` and `*` return zero hits — and
+> the one place arithmetic could hide is the overdue re-screening scan, which
+> filters in **Rust** (`vendor_is_overdue`) over rows a plain `SELECT` returned.
+> The T-8 pending-fold register is **unchanged by this commit**. **Nor is there an
+> M11-shaped hazard**: `LOWER(` and `LIKE` return **zero** hits across the module,
+> because its closed vocabularies are parsed in Rust before any bind. `ALTER TABLE
+> avl_vendors` also returns zero hits, so there is no `ensure_columns` ladder and
+> M8's post-condition has nothing to exercise.
+>
+> ⚠ **This does NOT let purchasing cut over.** §9's Part-G row sequences that
+> behind the **Rust halves** of both this family and QA/QC, because `resolve_avl`
+> and `create_ncr` run on purchasing's own writer guard (rule 14's boundary shape
+> 2) and a migrator half never holds the product's guard. What this Part removes
+> is the "has crossed in NO Part" blocker, not the fusion.
+>
+> **One defect found and fixed in the test layer, worth naming because it is
+> copied.** The `declared_as` DDL helper that Parts D–H share matches
+> `l.split_whitespace().nth(1) == Some(ty)` — which reads a **nullable** column's
+> type as `TEXT,`, with the trailing comma, because a nullable column carries no
+> `NOT NULL` and its type token ends the line. Part H never saw it (it asked the
+> helper only about `NOT NULL` columns); Part I's DDL pin asks about all twelve
+> and went red. Fixed here by stripping the comma, and pinned directly by
+> `declared_as_sees_nullable_columns_too`. **A false RED in this direction, but
+> the same helper in a `!declared_as(…)` assertion is a false GREEN** — which is
+> the shape a later Part is likelier to write.
+
 **Step 8 — The quoting family, including the five `f64` money columns (§3.2 D).**
 - *Changes:* 17 + 15 + 10 + 7 + 6 = 55 DDL sites; `total_price_eur` ×2,
   `cost_per_kg_eur` ×2, and the two rate tunables `f64 → Decimal` at the Rust type;
@@ -2374,7 +2458,8 @@ it or an explicit "out of scope".
 | **THE DISPATCH CUTOVER IS SEQUENCED BEHIND WORK-ORDERS' AND PARTNERS', because `dispatches` is JOINed to both — and this is a constraint on the ORDER of the Rust-side crossings that §7's family list does not carry.** Measured, not inferred: `crates/aberp-dispatch/src/repository.rs:249` reads `work_orders` inside `create_dispatch`'s transaction, `:726` and `:788` are `FROM work_orders wo … NOT EXISTS (SELECT 1 FROM dispatches d …)` (the dispatchable-WO list and its count), and `:283` reads `partners`. `part_marking.rs:504–505` additionally JOINs `wo_part_marks` to `dispatches`, which is why Part F crossed those two together in the first place. **Nothing is split today** — work-orders and partners crossed as migrator halves too, so all four statements still execute on one DuckDB connection — and that is exactly the point: the split becomes possible only at cutover, and a session that crossed dispatch's Rust half before work-orders' would produce a cross-engine JOIN that cannot be written at all. | **The cutover sequence, stated before the first family's Rust half moves.** Not a code change and nothing to fix here; recorded because §7's Step-7 line reads as a list of independent families and this pair of edges is the one place that is false. |
 | **`wo_part_marks` (Part F), `ncr_transitions` (Part E) and `invoice_line` (Step 5) all key the gate's per-row `BTreeMap` on a COMPOSITE that no DDL enforces — and only Part F's is guarded.** Part F added `migrate_dispatch::unique_natural_keys` because `wo_part_marks` has no `PRIMARY KEY`, no `UNIQUE` and no index of any kind, so a duplicate `(tenant_id, wo_id, unit_index)` is reachable from a real DuckDB source; it collapses two rows onto one map entry, and the row count, the `typeof` sweep and the per-row arm all stay green while one row is compared twice and the other never. **The other two are the same mechanism with a different amount of luck**: `ncr_transitions`'s `seq` is app-issued monotonically per NCR and `invoice_line`'s `ordinal` is app-issued per invoice, so a duplicate requires a *product* defect rather than only a missing constraint — but neither table has a `PRIMARY KEY` either, and the gate's blindness is identical in all three. ⚠ **Exposure is UNMEASURED, and stating that plainly is the honest form**: this session is DEV-only and does not touch `~/.aberp/**`, so no count of duplicate `(ncr_id, seq)` or `(invoice_id, ordinal)` rows on the real DEV tenant was taken. The argument above is about the *mechanism*, not about the data. ⚠ **AMENDED 2026-08-02 (S459): "only Part F's is guarded" is now "Parts F and G are guarded".** Part G reused `migrate_dispatch::unique_natural_keys` verbatim on **all four** purchasing tables — none of which has a `PRIMARY KEY` either — so the guard already has two callers and the hoist below is a move, not a generalisation. `ncr_transitions` and `invoice_line` remain the two unguarded ones, and this row's disposition is unchanged. | **Its own PR — deliberately NOT retrofitted here** (rule 3: this commit crosses one family and does not improve adjacent ones), and it is three lines plus a test per family, not a redesign: hoist `unique_natural_keys` to a shared helper and call it from `migrate_billing`'s and `migrate_quality`'s read sides. ⚠ **Do not fold it into a family commit** — mixed with a storage change it would be indistinguishable from migration collateral, which is the same argument the two app-layer rows above make. |
 | **The purchasing family crossed as its MIGRATOR HALF only (Step 7 Part G), so `apps/aberp/src/purchasing.rs` still runs every one of its queries against DuckDB.** Same shape as Steps 5, 7B, 7C, 7D, 7E and 7F and recorded for the same reason: the STRICT DDL, the typed carry and the gate's arm are landed and green, and none of that makes the product read or write the SQLite copy. **Exposure today is ZERO** — no SQLite connection in the tree touches `purchase_orders`, `purchase_order_lines`, `purchase_order_receipts` or `po_number_state` outside the migrator and its test. ⚠ Three things a later session must not misread. (i) **This is the family that carries most of the tree's remaining money** — five §3.2 A columns — so unlike Parts E and F the Rust-side crossing DOES owe R1 bind discipline: `i64` minor units, never a float, on the write side, because `STRICT` will accept a bound `f64` into an `INTEGER` column when it is integral. (ii) **Its quantities are exact `i64` counts and must stay `INTEGER`**, not be "made consistent" with Part C's R2 `TEXT` quantities — the two are different physical things (see the census row below). (iii) **The M11 hazard has no site here**, measured: `LOWER(` and `LIKE` return zero hits across `purchasing.rs`. | **The family's Rust-side crossing (the cutover), as its own commit** — the same sequencing M-1, M11/T-12, §3.4's inventory folds and Parts D, E and F got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* |
-| **THE PURCHASING CUTOVER IS SEQUENCED BEHIND `avl_vendors`' AND QA/QC's — and `avl_vendors` HAS NOT CROSSED IN ANY PART.** Measured, not inferred, and the mechanism is different from the dispatch row above: `purchasing.rs` contains **zero JOINs**, so nothing here is fused by a statement. What fuses it is the **shared writer guard**. `create_po` calls `resolve_avl` → `avl_vendors::get_vendor_by_partner(&guard, …)` (`purchasing.rs:605`) and then opens the PO transaction on that same guard; `receive_delivery` calls `quality::create_ncr(&mut guard, …)` (`:1160`) between two purchasing transactions and stamps the returned `ncr_id` back onto `purchase_order_receipts` (`:1185`). A guard is one engine's connection, so the Rust-side crossing of purchasing cannot precede `avl_vendors`' — **a family no Part has crossed at all** — nor quality's, which crossed as a migrator half in Part E. Three more columns point out of the family (`vendor_partner_id` → `partners`, `product_id` → `products`, `ncr_id` → `ncrs`) and **none of them is a JOIN**; all three are resolved in Rust by the callers. **Nothing is split today**, because every one of those calls still executes on one DuckDB connection. | **The cutover sequence, and `avl_vendors` needs a Part of its own before purchasing's Rust half can move.** Not a code change and nothing to fix here; recorded because §7's Step-7 line reads as a list of independent families and, as with dispatch, this pair of edges is where that is false. ⚠ The narrower point worth keeping: **rule 14's fused boundary has two shapes, not one** — a JOIN (Part F) and a shared guard (Part G) — and the migrator half is blind to the second, because a migrator never holds the product's guard. |
+| **The AVL family crossed as its MIGRATOR HALF only (Step 7 Part I), so `apps/aberp/src/avl_vendors.rs` still runs every one of its queries against DuckDB.** Same shape as Steps 5 and 7B–7H and recorded for the same reason: the STRICT DDL, the typed carry and the gate's arm are landed and green, and none of that makes the product read or write the SQLite copy. **Exposure today is ZERO** — no SQLite connection in the tree touches `avl_vendors` outside the migrator and its test. ⚠ Four things a later session must not misread. (i) **This family has no number of any kind** — all twelve columns are `VARCHAR` on DuckDB — so the Rust-side crossing owes no R1/R2 bind discipline, no `finite_measurement` and no `bool` bind; it is the only crossed family of which that is true without qualification. (ii) **`DpasRating` is a vocabulary, not a rating figure**, and it lives on `partners` (Part B), not here; a vendor price, score or numeric rating added to this table would pull the whole of R1/R2/§3.4 onto a family currently exempt from all of it, and nothing but `no_column_in_this_family_is_a_number_or_a_blob` would say so. (iii) **`(tenant_id, partner_id)` is deliberately NOT unique** — `get_vendor_by_partner` resolves several entries by `ORDER BY created_at DESC` — so the cutover must keep that ordering total and must not "fix" the duplicate. (iv) **The M11 hazard has no site here**, measured: `LOWER(` and `LIKE` return zero hits across the module. | **The family's Rust-side crossing (the cutover), as its own commit** — the same sequencing M-1, M11/T-12, §3.4's inventory folds and Parts D–H got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* ⚠ **And purchasing's cutover is sequenced behind THIS one — see the row below.** |
+| **THE PURCHASING CUTOVER IS SEQUENCED BEHIND `avl_vendors`' AND QA/QC's — and `avl_vendors` HAS NOT CROSSED IN ANY PART.** ⚠ **PARTIALLY SUPERSEDED 2026-08-02 (S461): `avl_vendors` HAS now crossed, as Step 7 Part I — but only as a MIGRATOR HALF, so the sequencing constraint below is UNCHANGED.** What the Part removed is the "has crossed in no Part at all" blocker; what fuses purchasing to it is the **shared writer guard**, and a migrator half never holds the product's guard. Purchasing's Rust half still cannot precede the Rust halves of `avl_vendors` **and** quality. Read the original row unchanged: Measured, not inferred, and the mechanism is different from the dispatch row above: `purchasing.rs` contains **zero JOINs**, so nothing here is fused by a statement. What fuses it is the **shared writer guard**. `create_po` calls `resolve_avl` → `avl_vendors::get_vendor_by_partner(&guard, …)` (`purchasing.rs:605`) and then opens the PO transaction on that same guard; `receive_delivery` calls `quality::create_ncr(&mut guard, …)` (`:1160`) between two purchasing transactions and stamps the returned `ncr_id` back onto `purchase_order_receipts` (`:1185`). A guard is one engine's connection, so the Rust-side crossing of purchasing cannot precede `avl_vendors`' — **a family no Part has crossed at all** — nor quality's, which crossed as a migrator half in Part E. Three more columns point out of the family (`vendor_partner_id` → `partners`, `product_id` → `products`, `ncr_id` → `ncrs`) and **none of them is a JOIN**; all three are resolved in Rust by the callers. **Nothing is split today**, because every one of those calls still executes on one DuckDB connection. | **The cutover sequence, and `avl_vendors` needs a Part of its own before purchasing's Rust half can move.** Not a code change and nothing to fix here; recorded because §7's Step-7 line reads as a list of independent families and, as with dispatch, this pair of edges is where that is false. ⚠ The narrower point worth keeping: **rule 14's fused boundary has two shapes, not one** — a JOIN (Part F) and a shared guard (Part G) — and the migrator half is blind to the second, because a migrator never holds the product's guard. |
 | **§3.2 F's enumerated integer list was INCOMPLETE, and the gap was on the purchasing family: six columns crossed under a category that never named them.** `purchase_orders.vat_rate_pct`, `purchase_order_lines.seq` / `.quantity` / `.received_quantity`, `purchase_order_receipts.received_quantity` and `po_number_state.year` are all `BIGINT`/`INTEGER` on DuckDB and `i64`/`i32` in Rust, so §3.2 H's mechanical rename settles them and **no new decision was needed** — but §3.2's own rule is that a name absent from the census returns zero hits, and a session grepping it for `quantity` would have found only the R2 rows. **The disposition taken, and it is a rule-7 call rather than a default: they cross as `INTEGER`, not as R2 `TEXT`.** Part C's five quantities became `TEXT` because they were **`DOUBLE`s**; these are exact whole-unit counts, and rendering an `i64` as a decimal string would *introduce* a representation rather than preserve one — as well as breaking `purchasing.rs:1109`'s in-SQL `received_quantity + ?` at cutover. Two representations of "a quantity" now exist in the migrated tree on purpose, because two different physical things are being counted. ⚠ Also worth one line: `purchase_orders.vat_rate_pct` is a **whole percent** where billing stores `vat_rate_basis_points` — two representations of one concept (rule 7), exact integers on both engines either way, **not this commit's to reconcile**. | **§3.2 F carries the correction block, landed with Part G.** Nothing further is owed at the storage layer. The `vat_rate_pct`-vs-basis-points divergence is its own product question and does not belong in a migration commit. |
 | **`purchasing.rs:1109` — `UPDATE purchase_order_lines SET received_quantity = received_quantity + ?3` — is in-SQL arithmetic on a column this migration keeps as `INTEGER`, and the two engines DISAGREE on what an overflow does.** It is deliberately **not** a §3.4 site: §3.4's class is arithmetic over a column R2 turns into `TEXT`, and this column stays `INTEGER` on both sides, so the addition is exact and no fold is owed. What differs is the edge: DuckDB **raises** on `BIGINT` overflow, while SQLite silently converts an overflowing integer addition to `REAL` — a float landing in a `STRICT INTEGER` column's `UPDATE`, which is the one class T-8 exists for. **Exposure today is ZERO and bounded by the app rather than by the engine**: `receive_delivery` refuses `received_quantity > line.quantity - line.received_quantity` (`purchasing.rs:1047–1053`) and `create_po` refuses a non-positive quantity (`:641`), so the running sum cannot exceed a value already stored as `i64`. The exposure is that the bound is in Rust and nothing in the DDL backs it. | **The family's Rust-side crossing (the cutover), as a decision rather than a fix**: either keep the in-SQL increment and accept that its overflow guard is app-layer only, or read-modify-write the counter in Rust with a `checked_add` — the same shape §3.4 chose everywhere else. Recorded rather than changed here because touching a live `UPDATE` in a migrator-half commit would be exactly the migration collateral the rows above refuse. |
 | **`part_marking.rs` reads `unit_index` as `r.get::<_, i64>(?)?.max(0) as u32` at `:203` and `:455`, silently CLAMPING a negative ordinal to 0.** DuckDB's `INTEGER` is signed 32-bit, so a negative `unit_index` is storable; the clamp then maps it onto the same in-Rust identity as unit 0, which on a table whose natural key *is* `(tenant_id, wo_id, unit_index)` means two distinct physical units collapsing onto one traceability record. **Not a storage or migration defect** — Part F's carry is `i64` → `i64` and exact, the gate keys on the raw value, and both sides agree — which is precisely why it is recorded here rather than guarded in the migrator: refusing it at the migrator would be the migration acting as a validator for an app-layer clamp, and §6.3's own rule is that *a migration is not a repair tool*. **Exposure today is bounded, and this part IS measured**: `PartMark.unit_index` is a `u32` (`part_marking.rs:170`) bound as `m.unit_index as i64` (`:281`), so the product's own write path cannot mint a negative ordinal — reaching this needs a hand-edited row or a future adapter that writes the table directly. | **Its own PR, not this plan.** It is a change to `part_marking.rs`'s read path (and to whether the write path should reject a negative ordinal outright), reachable today on DuckDB and none of it engine-related. **Do not fold it into a migration commit.** |

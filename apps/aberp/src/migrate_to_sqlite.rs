@@ -215,6 +215,12 @@ pub struct MigrateOutcome {
     /// because the family **is** one table; the gate holds the two sides to it
     /// symmetrically.
     pub email: crate::migrate_email::EmailCarry,
+    /// ADR-0108 Step 7 Part I — what the approved-vendor-list family carried.
+    /// Zero when the source has no `avl_vendors` table, which is a legitimate
+    /// shape because the table is created lazily on first AVL use. Presence is
+    /// per family because the family **is** one table; the gate holds the two
+    /// sides to it symmetrically.
+    pub avl: crate::migrate_avl::AvlCarry,
     /// SHA-256 of the DuckDB file, taken after the run. C-I says this must
     /// equal the digest taken before it (T-19 arm 2).
     pub duckdb_sha256_after: String,
@@ -284,6 +290,7 @@ pub fn run(args: &MigrateToSqliteArgs) -> Result<()> {
         "  email/relay family: {} queued e-mail row(s)",
         out.email.outbound_email_queue
     );
+    println!("  AVL family: {} vendor(s)", out.avl.avl_vendors);
     println!(
         "  DuckDB SHA-256 after the run: {} (C-I: must equal the pre-migration manifest's)",
         out.duckdb_sha256_after
@@ -498,6 +505,17 @@ pub fn migrate_families(
     //     `~/.aberp/` — so what has to survive is the path, byte for byte.
     let email = crate::migrate_email::carry_email(&src, &mut dst)?;
 
+    // --- ADR-0108 Step 7 Part I — the approved-vendor-list family, same lock,
+    //     same digest window. ONE table (`avl_vendors`), created lazily on first
+    //     AVL use, so an absent table is a legitimate source shape rather than a
+    //     dropped carry arm. It is in no other family's boundary — `purchasing.rs`
+    //     has zero JOINs — which is exactly why Parts A–H each correctly
+    //     excluded it and none adopted it, and why it had crossed in NO Part
+    //     until now (§9). Carrying it does NOT cut purchasing over: that is
+    //     sequenced behind this family AND quality's Rust halves, because
+    //     `resolve_avl` and `create_ncr` run on purchasing's own writer guard.
+    let avl = crate::migrate_avl::carry_avl(&src, &mut dst)?;
+
     drop(dst);
     drop(src);
 
@@ -522,6 +540,7 @@ pub fn migrate_families(
         dispatch,
         purchasing,
         email,
+        avl,
         duckdb_sha256_after: after,
     })
 }
@@ -888,6 +907,9 @@ pub fn reconcile(duckdb_path: &Path, sqlite_path: &Path, tenant: &str) -> Result
 
     // ---- ADR-0108 Step 7 Part H — the email/relay family's arm ----
     crate::migrate_email::reconcile_email(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
+
+    // ---- ADR-0108 Step 7 Part I — the approved-vendor-list family's arm ----
+    crate::migrate_avl::reconcile_avl(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
 
     Ok(r)
 }

@@ -90,6 +90,13 @@ pub mod mes_boot;
 pub mod margin_profiles;
 pub mod mes_adapters_config;
 pub mod mes_manager;
+/// ADR-0108 Step 7 Part I — the approved-vendor-list family's STRICT DDL, its
+/// typed carry and the reconciliation gate's arm. **One table** (`avl_vendors`,
+/// 12 columns) and **not one number in it**: every column is `VARCHAR` on
+/// DuckDB, so R1, R2, R3 and the §3.4 fold rules all have nothing to guard here.
+/// Unblocks purchasing's cutover, which §9 sequences behind this family.
+#[cfg(feature = "sqlite-engine")]
+pub mod migrate_avl;
 /// ADR-0108 Step 5 — the invoice family's STRICT DDL, its typed carry, and the
 /// reconciliation gate's arm for it. Same feature gate as the Step-4 migrator
 /// it plugs into.
