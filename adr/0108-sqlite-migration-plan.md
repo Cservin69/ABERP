@@ -646,6 +646,32 @@ below**); `work_orders.actual_machining_minutes`;
 > Recorded in §9 as well, because the correction is to the census and not only
 > to one family's reading of it.
 
+> ⚠ **CORRECTED AGAIN 2026-08-02 (S460, Step 7 Part H): the email entry above
+> names a table that does not exist, and the family's second integer column is
+> not named at all.** The list says `email_relay_queue.byte_size`.
+> **`email_relay_queue` is the MODULE** (`apps/aberp/src/email_relay_queue.rs`);
+> the **table is `outbound_email_queue`**, and a `CREATE TABLE … email_relay_queue`
+> sweep returns **zero hits anywhere in the tree**. This is §3.2's own stated
+> failure mode firing for the second time in two Parts — *a name that does not
+> exist returns zero hits and reads as "already done"* — and it is worse here
+> than Part G's gap, because Part G's columns were merely unlisted while this one
+> is listed under a name that can never be found.
+>
+> The corrected pair, both `BIGINT`/`INTEGER` → `INTEGER`, both exact counts,
+> neither money:
+>
+> | Table.column | Today | Rust | SQLite (STRICT) |
+> |---|---|---|---|
+> | `outbound_email_queue.byte_size` | `BIGINT` | `u64` (bound `as i64`) | `INTEGER NOT NULL` |
+> | `outbound_email_queue.attempt_n` | `INTEGER` | `u32` (bound `as i64`) | `INTEGER NOT NULL` |
+>
+> `attempt_n` additionally **widens**: DuckDB's `INTEGER` is 32-bit and SQLite's
+> is 64-bit. Lossless in the carry direction and worth one line only because it
+> means the SQLite column will accept a retry count DuckDB could not have held —
+> the same widening `seq`, `year` and `vat_rate_pct` already took in Parts D and
+> G, and no family has raised a row for it. Recorded in §9 as well, because the
+> correction is to the census.
+
 **`vat_rate_basis_points INTEGER` is why VAT never touches a float *in storage*** —
 27% is `2700`, not `0.27`. The **storage** property is preserved verbatim, and
 F-6a's storage-side float-coercion class cannot reach the VAT rate. F-6a reaches
@@ -904,13 +930,32 @@ signature is shaped this way rather than taking `&[(String, String)]`.
 | `apps/aberp/src/restore_from_nav_outgoing.rs` | 4 | invoice | 5 |
 | `apps/aberp/src/invoice_draft.rs` | 2 | invoice | 5 |
 | `apps/aberp/src/serve.rs` | 1 | boot | 5 |
-| `apps/aberp/src/email_relay_queue.rs` | 1 | email | 7 |
+| `apps/aberp/src/email_relay_queue.rs` | ~~1~~ **0** (see below) | email | 7 |
 | `crates/aberp-inventory/migrations/V001__inventory.sql` | **4** | inventory | 7 |
 | `crates/aberp-work-orders/migrations/V002__calibration_link.sql` | **2** | work orders | 7 |
 | `crates/aberp-work-orders/migrations/V003__bom_revisions.sql` | **2** | work orders | 7 |
 | `crates/audit-ledger/src/storage/mod.rs:411` | 1 (already dynamic, const-driven) | ledger | 5 |
 | **src total** | **114** | | |
 | tests (`migration_pr73_old_schema.rs` ×3, `notes_migration.rs` ×2) | 5 | | with their family |
+
+> ⚠ **CORRECTED 2026-08-02 (S460, Step 7 Part H): `email_relay_queue.rs` has
+> ZERO executable `ADD COLUMN` sites, and the one counted here is a DOC
+> COMMENT.** Measured: the file's only occurrence of the phrase is `:20`, inside
+> the module docs, where it *names the `ADD COLUMN IF NOT EXISTS … DEFAULT`
+> gotcha from S271 / S273 / S279 as the reason the module does not use one*. A
+> tree-wide `ALTER TABLE` sweep against `outbound_email_queue` returns **zero**
+> hits. So the census counted a comment explaining an absence as an instance of
+> the thing it says is absent — which is why Part H builds no `ensure_columns`
+> ladder for this family and M8's post-condition has nothing to exercise here.
+>
+> **What this does NOT do is restate the 114.** The arithmetic follows — this
+> row's 1 was inside §1.2's 113 executable src sites, so the true figures would be
+> 112 executable + 1 const-driven = **113 src**, not 114 — but **only this row was
+> re-measured.** The other fourteen were not, and the same comment-vs-code
+> miscount is exactly as available to any of them. Asserting a new total on one
+> row's evidence would replace a measured-wrong number with a guessed one.
+> **Whoever re-runs the census tree-wide owns the total**; until then the headline
+> stands with this correction attached to it, and §9 carries the row.
 
 **The `.sql` files need a delivery decision** (they are `include_str!` +
 `execute_batch`, so they cannot call a Rust helper). Conservative call: **split
@@ -2132,6 +2177,110 @@ email/relay.
 > statement is in §9, and it is about SQLite's integer-overflow behaviour rather
 > than about a fold. **Nor is there an M11-shaped hazard**: `LOWER(` and `LIKE`
 > both return **zero** hits across `purchasing.rs`.
+>
+> **Step 7 Part H — the EMAIL / RELAY family crossed, 2026-08-02 (S460). This is
+> the last non-quoting family, so Step 7's migrator halves are complete.**
+> `apps/aberp/src/migrate_email.rs` +
+> `apps/aberp/tests/adr0108_step7_email_family.rs`, plugged into
+> `migrate_families` and `reconcile` beside the Step-5 and Part-B…G arms.
+>
+> **Same split, same constraint: the MIGRATOR HALF only.**
+> `apps/aberp/src/email_relay_queue.rs` is untouched; every one of its queries
+> still runs against DuckDB. **Nothing in the commit sends an e-mail.** §9 carries
+> the row.
+>
+> **ONE table, ONE owning module, 15 columns** — `outbound_email_queue`, built by
+> one `CREATE TABLE IF NOT EXISTS` at `email_relay_queue.rs:127–143`. The table
+> set was **grepped, not recalled**, and the grep settles three absences a session
+> would otherwise go looking for: there is **no outbox/notification/delivery-record
+> table** (the ADR-0009 outbox-poll daemon keeps *no persistent state at all* — the
+> storefront's `queued/ → claimed/ → sent/ | failed/` directory layout is the state
+> machine, and `SELECT`/`INSERT`/`UPDATE`/`CREATE TABLE` return **zero** hits
+> across all five sibling email modules), **no SMTP relay-state table** (keychain
+> credential, in-process rate limiter, drain position on the row), and **no
+> notes↔email linkage table** (`notes` is a column, not a table).
+>
+> ⚠ **§3.2 F named this family's one column under a table name that does not
+> exist**, and the second column not at all. §3.2 F now carries the correction and
+> §9 has the row — see the census-gap row, which is the **second** of its kind in
+> two Parts.
+>
+> **THERE IS NO BLOB IN THIS FAMILY, AND THAT IS THE DESIGN.**
+> `email_relay_queue.rs:24–31` states it: DuckDB `BLOB` columns degrade with large
+> binary data, so **attachments are files** under
+> `~/.aberp/<tenant>/email-relay-attachments/<row_id>/<n>_<safe_name>` and the row
+> holds a single `attachments_dir` **rel-path**. R3 therefore has nothing to bite
+> on, and the risk moves onto the path: an `attachments_dir` off by one byte is an
+> e-mail that sends **without** its attachment, and no row count, no `typeof`
+> class and no Σ fold can see it. The family test writes **real attachment bytes**
+> through the product's own `write_attachment` (including a zero-length file and
+> one containing all 256 byte values), carries the row, resolves the path **out of
+> the SQLite row**, asserts the file is byte-identical, and asserts the whole
+> attachment tree is **digest-identical across the migration** — the migrator must
+> read, write and stat none of it (C-II). That is the honest form of "carry the
+> attachments byte-exact" for a schema in which the bytes were never in the
+> database.
+>
+> ⚠ **`recipient_hash` is a hash and it stays `TEXT`.** It is `format!("{:x}",
+> Sha256…)` — a hex string (`email_relay.rs:82–92`) — consumed as a `String`
+> everywhere. Typing it `BLOB` by analogy with R3 would make every comparison of
+> it fail, because in SQLite `BLOB` and `TEXT` never compare equal. Same call §6.3
+> already took on `audit_ledger_anchors.chain_head_hash_at_anchor`, and the gate
+> asserts `typeof = 'text'` on every row.
+>
+> **What this family DOES have that no other did: six-figure-byte values.** The
+> `text/html` share of a relay message is "typically <100 KB"
+> (`email_relay_queue.rs:31`); the fixture carries a **~300 KB** multiline Unicode
+> `body_text` and a same-size `body_html`, compared **as bytes**, containing CRLF
+> and bare LF in one value, tabs, a non-breaking space, four scripts, a 4-byte
+> code point, quotes, a backslash and literal `%`/`_`. The drift pin flips **one
+> byte** inside it: no length change, no storage-class change, no Σ movement —
+> only the per-row byte comparison can see it. And because a hard stop that
+> interpolated two 300 KB bodies would make the gate's own report unreadable, the
+> email arm reports byte lengths and the **first differing offset** instead of the
+> value.
+>
+> **No money, no rate, no quantity, no decimal, no float, no boolean, no BLOB** —
+> the emptiest family yet. Its only numbers are `attempt_n` and `byte_size`, both
+> §3.2 F counts, and the fixture pins `byte_size` at `i64::MIN` and `i64::MAX`
+> (min before max, so the gate's `checked_add` Σ dips and returns).
+>
+> **The refusal is Part F's, reused for a third time — and the honest limit of it
+> is stated rather than glossed.** Unlike `wo_part_marks` and the four purchasing
+> tables, `outbound_email_queue` **does** carry a `PRIMARY KEY` on `id`, so the
+> product's own schema stops a duplicate and no source the product wrote can hold
+> one. `unique_natural_keys` is still called, on the DuckDB read side, for the
+> shape a `PRIMARY KEY` does not cover — a table hand-recreated by a repair, a
+> restore or a pre-S281 schema — and the family test **builds exactly that source**
+> rather than pretending the ordinary path can produce one. The test also
+> distinguishes the Rust refusal from SQLite's own constraint error, which would
+> name neither the source nor the key.
+>
+> **Presence is per family and per table at once**, because the family is one
+> table. `ALTER TABLE` returns **zero** hits against it, so there is no
+> `ensure_columns` ladder and M8's post-condition has nothing to exercise.
+>
+> ⚠ **S409's two `DROP INDEX IF EXISTS` statements are deliberately NOT ported.**
+> They remove the `state` and `submitter` secondary indexes that installs from
+> `PROD_v2.27.*` (≤ .61) carry, where DuckDB's ART maintenance on an `UPDATE`d
+> indexed column could fatal mid-`mark_sent` (observed in PROD 2026-06-14). A
+> SQLite database created by this migrator has never had either index, so porting
+> the drops would ship two statements that can never do anything (rule 12). The
+> **outcome** is preserved and pinned: the SQLite table has no secondary index.
+>
+> **No §3.4 fold is owed and none is deferred.** The module contains **no SQL
+> arithmetic at all** — `attempt_n + 1` is computed in Rust
+> (`email_relay_queue.rs:247`) and bound as a value. The T-8 pending-fold register
+> is **unchanged by this commit**. **Nor is there an M11-shaped hazard**, and that
+> is worth a sentence more here than elsewhere because the family's payload *is*
+> e-mail addresses: `LOWER(` and `LIKE` return **zero** hits across all six email
+> modules, because the recipient fold happens in **Rust**, in `hash_recipient_list`
+> (`email_relay.rs:85`, `to_ascii_lowercase()`), before anything is bound.
+>
+> ⚠ **Two sequencing constraints came out of this family and both are in §9**: the
+> refuse saga fuses `outbound_email_queue` to the **Step-8 quoting family inside a
+> single transaction**, and the family's own access is **split across a fresh
+> opener and the shared `Handle`** today.
 
 **Step 8 — The quoting family, including the five `f64` money columns (§3.2 D).**
 - *Changes:* 17 + 15 + 10 + 7 + 6 = 55 DDL sites; `total_price_eur` ×2,
@@ -2229,6 +2378,11 @@ it or an explicit "out of scope".
 | **§3.2 F's enumerated integer list was INCOMPLETE, and the gap was on the purchasing family: six columns crossed under a category that never named them.** `purchase_orders.vat_rate_pct`, `purchase_order_lines.seq` / `.quantity` / `.received_quantity`, `purchase_order_receipts.received_quantity` and `po_number_state.year` are all `BIGINT`/`INTEGER` on DuckDB and `i64`/`i32` in Rust, so §3.2 H's mechanical rename settles them and **no new decision was needed** — but §3.2's own rule is that a name absent from the census returns zero hits, and a session grepping it for `quantity` would have found only the R2 rows. **The disposition taken, and it is a rule-7 call rather than a default: they cross as `INTEGER`, not as R2 `TEXT`.** Part C's five quantities became `TEXT` because they were **`DOUBLE`s**; these are exact whole-unit counts, and rendering an `i64` as a decimal string would *introduce* a representation rather than preserve one — as well as breaking `purchasing.rs:1109`'s in-SQL `received_quantity + ?` at cutover. Two representations of "a quantity" now exist in the migrated tree on purpose, because two different physical things are being counted. ⚠ Also worth one line: `purchase_orders.vat_rate_pct` is a **whole percent** where billing stores `vat_rate_basis_points` — two representations of one concept (rule 7), exact integers on both engines either way, **not this commit's to reconcile**. | **§3.2 F carries the correction block, landed with Part G.** Nothing further is owed at the storage layer. The `vat_rate_pct`-vs-basis-points divergence is its own product question and does not belong in a migration commit. |
 | **`purchasing.rs:1109` — `UPDATE purchase_order_lines SET received_quantity = received_quantity + ?3` — is in-SQL arithmetic on a column this migration keeps as `INTEGER`, and the two engines DISAGREE on what an overflow does.** It is deliberately **not** a §3.4 site: §3.4's class is arithmetic over a column R2 turns into `TEXT`, and this column stays `INTEGER` on both sides, so the addition is exact and no fold is owed. What differs is the edge: DuckDB **raises** on `BIGINT` overflow, while SQLite silently converts an overflowing integer addition to `REAL` — a float landing in a `STRICT INTEGER` column's `UPDATE`, which is the one class T-8 exists for. **Exposure today is ZERO and bounded by the app rather than by the engine**: `receive_delivery` refuses `received_quantity > line.quantity - line.received_quantity` (`purchasing.rs:1047–1053`) and `create_po` refuses a non-positive quantity (`:641`), so the running sum cannot exceed a value already stored as `i64`. The exposure is that the bound is in Rust and nothing in the DDL backs it. | **The family's Rust-side crossing (the cutover), as a decision rather than a fix**: either keep the in-SQL increment and accept that its overflow guard is app-layer only, or read-modify-write the counter in Rust with a `checked_add` — the same shape §3.4 chose everywhere else. Recorded rather than changed here because touching a live `UPDATE` in a migrator-half commit would be exactly the migration collateral the rows above refuse. |
 | **`part_marking.rs` reads `unit_index` as `r.get::<_, i64>(?)?.max(0) as u32` at `:203` and `:455`, silently CLAMPING a negative ordinal to 0.** DuckDB's `INTEGER` is signed 32-bit, so a negative `unit_index` is storable; the clamp then maps it onto the same in-Rust identity as unit 0, which on a table whose natural key *is* `(tenant_id, wo_id, unit_index)` means two distinct physical units collapsing onto one traceability record. **Not a storage or migration defect** — Part F's carry is `i64` → `i64` and exact, the gate keys on the raw value, and both sides agree — which is precisely why it is recorded here rather than guarded in the migrator: refusing it at the migrator would be the migration acting as a validator for an app-layer clamp, and §6.3's own rule is that *a migration is not a repair tool*. **Exposure today is bounded, and this part IS measured**: `PartMark.unit_index` is a `u32` (`part_marking.rs:170`) bound as `m.unit_index as i64` (`:281`), so the product's own write path cannot mint a negative ordinal — reaching this needs a hand-edited row or a future adapter that writes the table directly. | **Its own PR, not this plan.** It is a change to `part_marking.rs`'s read path (and to whether the write path should reject a negative ordinal outright), reachable today on DuckDB and none of it engine-related. **Do not fold it into a migration commit.** |
+| **The email/relay family crossed as its MIGRATOR HALF only (Step 7 Part H), so `apps/aberp/src/email_relay_queue.rs` still runs every one of its queries against DuckDB.** Same shape as Steps 5 and 7B–7G and recorded for the same reason: the STRICT DDL, the typed carry and the gate's arm are landed and green, and none of that makes the product read or write the SQLite copy. **Exposure today is ZERO** — no SQLite connection in the tree touches `outbound_email_queue` outside the migrator and its test. ⚠ Four things a later session must not misread. (i) **This family has no money, no rate, no quantity, no decimal, no float, no boolean and no BLOB** — its only numbers are two §3.2 F counts — so the Rust-side crossing owes no R1/R2 bind discipline and no `finite_measurement`. (ii) **`recipient_hash` is `TEXT`, not R3 `BLOB`**: it is a hex string (`email_relay.rs:82–92`) and typing it `BLOB` on the write side at cutover would make every comparison of it fail silently, because in SQLite the two storage classes never compare equal. (iii) **The attachment bytes are NOT in the database** — they are files under `~/.aberp/<tenant>/email-relay-attachments/` and the row holds a rel-path, so what the cutover has to keep exact is a *string*, and a drifted one sends an e-mail without its attachment while every count, storage class and Σ stays green. (iv) **The M11 hazard has no site here**, measured: `LOWER(` and `LIKE` return zero hits across all six email modules, because the recipient fold happens in Rust before the bind. | **The family's Rust-side crossing (the cutover), as its own commit** — the same sequencing M-1, M11/T-12, §3.4's inventory folds and Parts D–G got, and §7's own rule is the authority: *a refusal whose test cannot be written yet is not landed yet.* ⚠ **And it cannot be the first cutover, nor an independent one — see the two rows below.** |
+| **THE EMAIL CUTOVER IS FUSED TO THE STEP-8 QUOTING FAMILY BY A SINGLE TRANSACTION, and this is the strongest rule-14 boundary any Part has found.** Measured, not inferred: `quote_refuse.rs::run_refuse_saga` opens **one** `conn.transaction()` (`:230`) and inside it writes **three families** — `log_table::mark_refused_in_tx` on `quote_intake_log` (**quoting, Step 8**, `:234`), `append_in_tx` on `audit_ledger` (**Step 4**, `:266`), and `email_relay_queue::insert_queued(&tx, …)` on `outbound_email_queue` (**this family**, `:290`) — then one `tx.commit()`. Part F's boundary was a **JOIN** (one statement, two tables) and Part G's was a **shared guard** (two transactions, one connection); this is **one transaction spanning three families**, and a transaction cannot span two engines at all. ⚠ **The sharper consequence, which §7's family list does not carry:** §3.2 D's own stop rule says that if Step 8 overruns, the correct fallback is to *leave the quoting family on DuckDB*. If that branch is taken, **the email family's Rust half cannot cross either** — it is not an independent tail-end family, it is downstream of the one family the plan explicitly reserves the right to abandon. **Nothing is split today**, because all three writes still execute on one DuckDB connection — which is exactly why the split only becomes possible, and only becomes wrong, at cutover. | **The cutover sequence, stated before the first family's Rust half moves** — and it belongs beside the dispatch and purchasing sequencing rows, which say the same thing about different edges. Not a code change and nothing to fix here. ⚠ The general lesson, now with three data points: **rule 14's fused boundary has THREE shapes — a JOIN (Part F), a shared guard (Part G), and a shared transaction (Part H)** — and the migrator half is blind to the last two, because a migrator never holds the product's guard and never joins its transaction. |
+| **THE EMAIL FAMILY'S OWN ACCESS IS ALREADY SPLIT BETWEEN A FRESH OPENER AND THE SHARED `Handle`, so its Rust-side crossing starts from a rule-13 violation rather than from a clean base.** Measured: the drain daemon reads and writes through `deps.db.write()` — the shared `Handle` (`email_relay_daemon.rs:141`) — while the route that *creates* the row, `POST /api/internal/send-email`, does `duckdb::Connection::open(&db_path)` on `spawn_blocking` (`serve.rs:28405`) and hands that fresh connection to `insert_queued`. Its two sibling readers (`handle_list_email_relay_queue`, `handle_get_email_relay_row`) are fresh openers too. **All three are already in the frozen baseline** — the two readers in GROUP A and `handle_relay_send_email` recorded as both a read-fork and a **write-fork** (`tools/adr0099_read_fork_structural_baseline.txt:51,52,65`) — so this is not a new finding, and R-5 is why it matters: the fresh connection's **close** checkpoints and truncates the `Handle`'s WAL, after which the daemon's later commits return `Ok` and are written nowhere. **Not fixed here** (rule 3: this commit crosses one family and does not improve adjacent ones), and the migrator half cannot fix it — a migrator holds neither the `Handle` nor the route. | **R-5's own PR for the containment, and then the family's Rust-side crossing for the rest.** Recorded against this family because the crossing is where it stops being a durability hazard and becomes an impossibility: rule 14 says a family's writers and readers cross together, and this family's writer and its daemon are on two different connection disciplines today. Whoever writes the cutover has to move `handle_relay_send_email` onto `state.db.write()` **first**, or accept a half-migrated family — which is the shape rule 14 exists to forbid. |
+| **§3.2 F's census gap fired a SECOND time, and this time under a table name that does not exist.** The list named `email_relay_queue.byte_size`; `email_relay_queue` is the **module**, the table is **`outbound_email_queue`**, and a `CREATE TABLE … email_relay_queue` sweep returns **zero hits anywhere in the tree**. The family's other integer, `attempt_n`, was not named at all. Both are exact counts and §3.2 H's mechanical `BIGINT`/`INTEGER` → `INTEGER` rename settles them, so **no new decision was needed** — but this is worse than Part G's gap, which merely omitted columns: a session grepping the census for the email family would have found an entry, gone looking for the table, found nothing, and had every reason to read the zero hits as "already done". That is §3.2's own stated failure mode, written into §3.2 itself, firing against §3.2. | **§3.2 F carries the correction block, landed with Part H.** Nothing further is owed at the storage layer. ⚠ The process point, now that it has happened twice in two Parts: **§3.2's "every table name has been re-grepped against the tree" claim (§3.2 A's note) was true of §3.2 A and is NOT true of §3.2 F.** A cheap gate — grep every table name in §3.2 against the tree's `CREATE TABLE` set — would have caught both, and it is worth exactly one shell script. Not written here (rule 3), and it is the natural companion to T-8's register. ⚠ **And a THIRD census error turned up in the same family, in a different section**: §4.2 credits `email_relay_queue.rs` with **1** `ADD COLUMN` site, and the file's only occurrence of the phrase is a **doc comment at `:20` explaining why the module does not use one**. §4.2 carries that correction. The arithmetic consequence — 112 executable + 1 const-driven = 113 src, not 114 — is stated there and **deliberately not propagated**, because only that one row of fifteen was re-measured and the same comment-vs-code miscount is available to any of the others. **The tree-wide re-count, and the total, belong to whoever runs it.** |
+| **`outbound_email_queue`'s two counts are CLAMPED on the product's read path, the same class as `part_marking.rs`'s `unit_index` clamp.** `decode_row` (`email_relay_queue.rs:488` and `:497`) reads both as `i64` and maps a negative to `0` — so a `byte_size` of `-1` and a `byte_size` of `0` are the same value to every consumer, and so are `attempt_n = -3` and a row that has never been attempted. On `attempt_n` that is the retry-cap counter: a negative would silently reset the budget. **Not a storage or migration defect** — the carry is `i64` → `i64` and exact, the gate keys and compares on the raw value, and both sides agree — which is precisely why it is recorded rather than guarded in the migrator: refusing it there would be the migration acting as a validator for an app-layer clamp, and §6.3's own rule is that *a migration is not a repair tool*. **Exposure today is bounded and this part IS measured**: `insert_queued` binds `byte_size as i64` from a `u64` and `0_i64` for `attempt_n`, and `claim_next_queued` binds `new_attempt as i64` from a `u32`, so the product's own write path cannot mint a negative — reaching it needs a hand-edited row, a `u64` above `i64::MAX`, or a future adapter writing the table directly. | **Its own PR, not this plan** — a change to `decode_row`'s read path and to whether the writer should reject out-of-range values outright, reachable today on DuckDB and none of it engine-related. **Do not fold it into a migration commit.** It is the same disposition, for the same reason, as the `part_marking.rs` clamp row above; if either is ever fixed, both should be. |
 | ADR-0107 / the frozen baseline / its header disagree on the in-serve read-fork count (**14 / 13 / 9**) | Out of scope for the migration; a stale frozen baseline is the exact class PR #43 existed to prevent → its own PR |
 | `aberp-mes::ledger_writer::write_one` appends through a fresh in-serve connection while the write-fork gate reports ZERO | ADR-0107 §5 says close it **by hand now** — a forked *append* forks the ledger under **any** engine. Independent of this plan; should land before Step 5. |
 | The S392 NAV pre-flight is dead (0 `check_performed` in 225 mirror entries) | Orthogonal, engine-independent, and ADR-0107 §5 calls it the most under-weighted open item. Not this plan. |

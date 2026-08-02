@@ -210,6 +210,11 @@ pub struct MigrateOutcome {
     /// carry rather than a legitimately partial source: one module builds all
     /// four in one batch, so a real database has four or none.
     pub purchasing: crate::migrate_purchasing::PurchasingCarry,
+    /// ADR-0108 Step 7 Part H — what the email/relay family carried. Zero when
+    /// the source has no `outbound_email_queue` table. Presence is per family
+    /// because the family **is** one table; the gate holds the two sides to it
+    /// symmetrically.
+    pub email: crate::migrate_email::EmailCarry,
     /// SHA-256 of the DuckDB file, taken after the run. C-I says this must
     /// equal the digest taken before it (T-19 arm 2).
     pub duckdb_sha256_after: String,
@@ -274,6 +279,10 @@ pub fn run(args: &MigrateToSqliteArgs) -> Result<()> {
         "  purchasing family: {} purchase order(s), {} PO line(s), {} receipt(s), {} PO number \
          bucket(s)",
         po.purchase_orders, po.purchase_order_lines, po.purchase_order_receipts, po.po_number_state
+    );
+    println!(
+        "  email/relay family: {} queued e-mail row(s)",
+        out.email.outbound_email_queue
     );
     println!(
         "  DuckDB SHA-256 after the run: {} (C-I: must equal the pre-migration manifest's)",
@@ -479,6 +488,16 @@ pub fn migrate_families(
     //     names exactly one purchasing table (rule 14's boundary, measured).
     let purchasing = crate::migrate_purchasing::carry_purchasing(&src, &mut dst)?;
 
+    // --- ADR-0108 Step 7 Part H — the email/relay family, same lock, same digest
+    //     window. ONE table (`outbound_email_queue`), so presence is per family
+    //     and per table at once. It is the last non-quoting family, and it is
+    //     the only one whose payload lives partly OUTSIDE the database:
+    //     attachments are files under `~/.aberp/<tenant>/email-relay-attachments/`
+    //     and the row carries a rel-path. The carry touches none of them — C-II
+    //     forbids this plan from reading, writing or stat-ing anything under
+    //     `~/.aberp/` — so what has to survive is the path, byte for byte.
+    let email = crate::migrate_email::carry_email(&src, &mut dst)?;
+
     drop(dst);
     drop(src);
 
@@ -502,6 +521,7 @@ pub fn migrate_families(
         quality,
         dispatch,
         purchasing,
+        email,
         duckdb_sha256_after: after,
     })
 }
@@ -865,6 +885,9 @@ pub fn reconcile(duckdb_path: &Path, sqlite_path: &Path, tenant: &str) -> Result
 
     // ---- ADR-0108 Step 7 Part G — the purchasing family's arm ----
     crate::migrate_purchasing::reconcile_purchasing(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
+
+    // ---- ADR-0108 Step 7 Part H — the email/relay family's arm ----
+    crate::migrate_email::reconcile_email(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
 
     Ok(r)
 }

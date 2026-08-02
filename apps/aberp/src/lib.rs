@@ -103,6 +103,13 @@ pub mod migrate_billing;
 /// no `PRIMARY KEY` for the gate's per-row arm to rely on.
 #[cfg(feature = "sqlite-engine")]
 pub mod migrate_dispatch;
+/// ADR-0108 Step 7 Part H — the email/relay family's STRICT DDL, its typed
+/// carry and the reconciliation gate's arm. **One table**
+/// (`outbound_email_queue`, 15 columns) and **no BLOB**: the attachment bytes
+/// live on the filesystem and the row holds a rel-path, so what the carry has to
+/// protect is the path and the potentially six-figure-byte message bodies.
+#[cfg(feature = "sqlite-engine")]
+pub mod migrate_email;
 /// ADR-0108 Step 7 Part B — the partners family's STRICT DDL, its typed carry,
 /// and the reconciliation gate's arm for it. Same feature gate as the Step-4
 /// migrator it plugs into.
