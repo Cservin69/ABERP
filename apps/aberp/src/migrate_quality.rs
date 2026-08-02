@@ -108,6 +108,7 @@ use anyhow::{bail, Result};
 use aberp_db::engine::{Connection as SqliteConn, ToSql};
 
 use crate::migrate_billing::fold_i64;
+use crate::migrate_dispatch::unique_natural_keys;
 
 // ---------------------------------------------------------------------------
 // The STRICT DDL
@@ -129,6 +130,25 @@ use crate::migrate_billing::fold_i64;
 /// surrogate id, no `CHECK`, no `DEFAULT`, no index (S341/S410 — scan and filter
 /// in Rust). ADR-0019 keeps uniqueness in Rust; adding a `PRIMARY KEY` here to
 /// make the migrator's life easier would be an invariant moving into the DDL.
+///
+/// ⚠ **And keeping uniqueness in Rust means the MIGRATOR has to keep it too —
+/// added 2026-08-02 (B2).** `ncrs` and `capas` have no `PRIMARY KEY`, no
+/// `UNIQUE` and no index **on either engine**, and the reconciliation arm keys
+/// its per-row `BTreeMap` on column 0 (`ncr_id` / `capa_id`). So a duplicate
+/// key in the DuckDB source carries as two rows, collapses onto one map entry,
+/// and the gate compares one row twice while never comparing the other — with
+/// the row count, the `typeof` sweep and the per-row arm all green. That is the
+/// exact shape Part F built
+/// [`unique_natural_keys`](crate::migrate_dispatch::unique_natural_keys) for,
+/// and it is now called on all three keyless tables in this family (`ncrs`,
+/// `capas`, `ncr_transitions`) before anything is written.
+///
+/// The other three (`qa_inspections`, `qc_inspection_plans`, `qc_inspections`)
+/// need no such call and that is measured, not assumed: each declares a
+/// single-column `PRIMARY KEY` below, the map is built from the **SQLite** side
+/// where that key holds, and the carry's plain `INSERT INTO` would abort on a
+/// duplicate rather than admit one. A guard there would be asserting a
+/// constraint the engine already enforces.
 const SQLITE_QUALITY_DDL: &str = "
 CREATE TABLE IF NOT EXISTS ncrs (
     ncr_id                 TEXT NOT NULL,
@@ -604,19 +624,28 @@ fn insert_sql(table: &str, cols: &[&str], extra: &[&str]) -> String {
 pub fn carry_quality(src: &duckdb::Connection, dst: &mut SqliteConn) -> Result<QualityCarry> {
     let ncrs = if present_duckdb(src, "ncrs")? {
         ensure_ncrs_table(dst)?;
-        read_text_table_duckdb(src, "ncrs", NCR_COLUMNS)?
+        let rows = read_text_table_duckdb(src, "ncrs", NCR_COLUMNS)?;
+        unique_natural_keys(&rows.iter().map(|r| key_of(r)).collect::<Vec<_>>(), "ncrs")?;
+        rows
     } else {
         Vec::new()
     };
     let transitions = if present_duckdb(src, "ncr_transitions")? {
         ensure_ncr_transitions_table(dst)?;
-        read_transitions_duckdb(src)?
+        let rows = read_transitions_duckdb(src)?;
+        unique_natural_keys(
+            &rows.iter().map(transition_key).collect::<Vec<_>>(),
+            "ncr_transitions",
+        )?;
+        rows
     } else {
         Vec::new()
     };
     let capas = if present_duckdb(src, "capas")? {
         ensure_capas_table(dst)?;
-        read_text_table_duckdb(src, "capas", CAPA_COLUMNS)?
+        let rows = read_text_table_duckdb(src, "capas", CAPA_COLUMNS)?;
+        unique_natural_keys(&rows.iter().map(|r| key_of(r)).collect::<Vec<_>>(), "capas")?;
+        rows
     } else {
         Vec::new()
     };

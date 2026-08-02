@@ -1379,3 +1379,82 @@ fn a_pre_s443_source_without_the_qc_tables_still_crosses() {
         );
     }
 }
+
+/// **B2 — the three keyless tables in this family must REFUSE a duplicate
+/// natural key, not reconcile it away.**
+///
+/// `ncrs`, `capas` and `ncr_transitions` have no `PRIMARY KEY`, no `UNIQUE` and
+/// no index **on either engine** (ADR-0019 keeps uniqueness in Rust), while the
+/// reconciliation arm keys its per-row `BTreeMap` on `ncr_id` / `capa_id` /
+/// `ncr_id#seq`. So a duplicate in the DuckDB source used to carry as two rows,
+/// collapse onto one map entry, and pass: the row count matched (both sides had
+/// the extra row), the `typeof` sweep matched, and the per-row arm compared one
+/// row twice while never comparing the other at all.
+///
+/// The assertion below is on the *refusal*, and the two `assert_eq!`s before it
+/// are what stop the test from passing vacuously: the plant really does add a
+/// row, and it really does leave the distinct-key count where it was — i.e.
+/// this is the collapse shape and not merely a bigger table.
+///
+/// It is the same guard, and the same call, Part F built for `wo_part_marks`
+/// and Part G reused for the four purchasing tables.
+#[test]
+fn a_duplicate_natural_key_in_a_keyless_quality_table_is_refused() {
+    for (table, plant, key_sql, named) in [
+        (
+            "ncrs",
+            "INSERT INTO ncrs SELECT * FROM ncrs WHERE ncr_id = 'ncr-01';",
+            "SELECT count(DISTINCT ncr_id) FROM ncrs",
+            "ncr-01",
+        ),
+        (
+            "capas",
+            "INSERT INTO capas SELECT * FROM capas WHERE capa_id = 'capa-01';",
+            "SELECT count(DISTINCT capa_id) FROM capas",
+            "capa-01",
+        ),
+        (
+            "ncr_transitions",
+            "INSERT INTO ncr_transitions SELECT * FROM ncr_transitions \
+             WHERE ncr_id = 'ncr-01' AND seq = 1;",
+            "SELECT count(*) FROM (SELECT DISTINCT ncr_id, seq FROM ncr_transitions)",
+            "ncr-01#1",
+        ),
+    ] {
+        let dir = scratch(&format!("dupkey-{table}"));
+        let db = seed(&dir);
+        let (rows_before, distinct_before) = {
+            let conn = duckdb::Connection::open(&db).unwrap();
+            let r: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |x| x.get(0))
+                .unwrap();
+            let d: i64 = conn.query_row(key_sql, [], |x| x.get(0)).unwrap();
+            conn.execute_batch(plant).unwrap();
+            let r2: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |x| x.get(0))
+                .unwrap();
+            let d2: i64 = conn.query_row(key_sql, [], |x| x.get(0)).unwrap();
+            conn.close().unwrap();
+            assert_eq!(r2, r + 1, "{table}: the plant must add exactly one row");
+            assert_eq!(
+                d2, d,
+                "{table}: the plant must NOT add a distinct key — that is the collapse shape"
+            );
+            (r2, d2)
+        };
+        assert_eq!(rows_before, distinct_before + 1);
+
+        let snap = run_snapshot(&db, TENANT, None).unwrap();
+        let lite = dir.join("aberp.sqlite");
+        let err = migrate_families(&db, &lite, TENANT, &snap, LedgerSource::Table)
+            .expect_err("a duplicate natural key on a keyless table must FAIL the carry");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(table), "must name the table: {msg}");
+        assert!(msg.contains(named), "must name the duplicated key: {msg}");
+        assert!(
+            msg.contains("no PRIMARY KEY"),
+            "must say WHY nothing stopped it, or the next reader adds a constraint to the DDL \
+             instead of keeping the invariant in Rust: {msg}"
+        );
+    }
+}

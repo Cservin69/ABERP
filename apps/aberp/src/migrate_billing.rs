@@ -68,6 +68,8 @@ use rust_decimal::Decimal;
 use aberp_db::engine::Connection as SqliteConn;
 use aberp_db::schema::{ensure_columns, EXACT_DECIMAL, MONEY_MINOR, TEXT};
 
+use crate::migrate_dispatch::unique_natural_keys;
+
 // ---------------------------------------------------------------------------
 // The STRICT DDL — base tables, then the six ladders
 // ---------------------------------------------------------------------------
@@ -276,6 +278,188 @@ pub struct InvoiceLineRow {
     pub vat_rate_kind: Option<String>,
 }
 
+/// Every carried `invoice` column, in the order [`InvoiceRow`]'s fields are
+/// read and written — the **one** list the SQLite read side and the per-column
+/// reconciliation both derive from.
+///
+/// B3, 2026-08-02. Before this, the gate compared 4 of the family's 29 columns
+/// and none of the ÁFA-bearing ones: `sequence_number`, `fiscal_year`,
+/// `series_id`, `customer_id`, `issue_date`, `currency`, `idempotency_key`, the
+/// five bank columns and `vat_rate_basis_points` / `vat_rate_kind` were carried
+/// and never value-compared. §6.3 said "money/decimal columns only"; every other
+/// Step-7 family compares every column, and this is the family the whole plan
+/// exists to protect. `every_carried_invoice_column_is_compared` pins the list
+/// against `pragma_table_info`, so a column added to the carry and not to the
+/// comparison reds rather than riding along unchecked.
+pub const INVOICE_COLUMNS: &[&str] = &[
+    "id",
+    "series_id",
+    "customer_id",
+    "issue_date",
+    "sequence_number",
+    "fiscal_year",
+    "idempotency_key",
+    "currency",
+    "exchange_rate",
+    "exchange_rate_source",
+    "exchange_rate_date",
+    "huf_equivalent_total",
+    "bank_account_id",
+    "bank_account_currency",
+    "bank_account_number",
+    "bank_account_bank_name",
+    "bank_account_swift_bic",
+    "invoice_note",
+    "payment_deadline",
+    "delivery_date",
+    "email_recipient_override",
+];
+
+/// Every carried `invoice_series` column, in [`SeriesRow`]'s tuple order.
+pub const SERIES_COLUMNS: &[&str] = &["id", "code", "reset_policy", "fiscal_year", "created_at"];
+
+/// Every carried `invoice_sequence_reservation` column, in [`ReservationRow`]'s
+/// tuple order.
+pub const RESERVATION_COLUMNS: &[&str] = &[
+    "id",
+    "series_id",
+    "fiscal_year",
+    "number",
+    "invoice_id",
+    "status",
+    "void_reason",
+    "reserved_at",
+    "used_at",
+    "voided_at",
+];
+
+/// Every carried `invoice_line` column, in [`InvoiceLineRow`]'s field order.
+pub const INVOICE_LINE_COLUMNS: &[&str] = &[
+    "invoice_id",
+    "ordinal",
+    "description",
+    "quantity",
+    "unit_price",
+    "vat_rate_basis_points",
+    "note",
+    "vat_rate_kind",
+];
+
+/// One row's columns as `(name, rendered)`, in `INVOICE_COLUMNS` order.
+///
+/// Rendered rather than compared field-by-field so the diff can *name* the
+/// column that drifted. `{:?}` throughout, so a `None` and a `Some("")` do not
+/// print the same.
+fn invoice_fields(r: &InvoiceRow) -> Vec<String> {
+    vec![
+        format!("{:?}", r.id),
+        format!("{:?}", r.series_id),
+        format!("{:?}", r.customer_id),
+        format!("{:?}", r.issue_date),
+        format!("{:?}", r.sequence_number),
+        format!("{:?}", r.fiscal_year),
+        format!("{:?}", r.idempotency_key),
+        format!("{:?}", r.currency),
+        format!("{:?}", r.exchange_rate),
+        format!("{:?}", r.exchange_rate_source),
+        format!("{:?}", r.exchange_rate_date),
+        format!("{:?}", r.huf_equivalent_total),
+        format!("{:?}", r.bank_account_id),
+        format!("{:?}", r.bank_account_currency),
+        format!("{:?}", r.bank_account_number),
+        format!("{:?}", r.bank_account_bank_name),
+        format!("{:?}", r.bank_account_swift_bic),
+        format!("{:?}", r.invoice_note),
+        format!("{:?}", r.payment_deadline),
+        format!("{:?}", r.delivery_date),
+        format!("{:?}", r.email_recipient_override),
+    ]
+}
+
+/// One `invoice_line` row's columns, in `INVOICE_LINE_COLUMNS` order.
+fn line_fields(r: &InvoiceLineRow) -> Vec<String> {
+    vec![
+        format!("{:?}", r.invoice_id),
+        format!("{:?}", r.ordinal),
+        format!("{:?}", r.description),
+        format!("{:?}", r.quantity),
+        format!("{:?}", r.unit_price),
+        format!("{:?}", r.vat_rate_basis_points),
+        format!("{:?}", r.note),
+        format!("{:?}", r.vat_rate_kind),
+    ]
+}
+
+/// One `invoice_series` row's columns, in `SERIES_COLUMNS` order.
+fn series_fields(r: &SeriesRow) -> Vec<String> {
+    vec![
+        format!("{:?}", r.0),
+        format!("{:?}", r.1),
+        format!("{:?}", r.2),
+        format!("{:?}", r.3),
+        format!("{:?}", r.4),
+    ]
+}
+
+/// One `invoice_sequence_reservation` row's columns, in `RESERVATION_COLUMNS`
+/// order.
+fn reservation_fields(r: &ReservationRow) -> Vec<String> {
+    vec![
+        format!("{:?}", r.0),
+        format!("{:?}", r.1),
+        format!("{:?}", r.2),
+        format!("{:?}", r.3),
+        format!("{:?}", r.4),
+        format!("{:?}", r.5),
+        format!("{:?}", r.6),
+        format!("{:?}", r.7),
+        format!("{:?}", r.8),
+        format!("{:?}", r.9),
+    ]
+}
+
+/// Why a drift in this particular column is worse than a drift in general.
+///
+/// Only the columns that reach the NAV filing get a sentence; the rest are
+/// reported plainly. A gate that shouts equally about everything is one nobody
+/// reads.
+fn why_it_matters(col: &str) -> &'static str {
+    match col {
+        "huf_equivalent_total" => " — this is the HUF figure on the NAV filing",
+        "vat_rate_basis_points" => " — this is the VAT rate the NAV filing carries",
+        "vat_rate_kind" => {
+            " — ADR-0103 Invariant V: the kind selects which <lineVatRate> choice element the \
+             line emits, so a drift here files an exempt line as taxable or the reverse"
+        }
+        "sequence_number" | "fiscal_year" | "series_id" => {
+            " — this is part of the számla number, which is filed with NAV and legally binding"
+        }
+        _ => "",
+    }
+}
+
+/// Name every column whose rendered value differs between the two sides.
+///
+/// The whole point of returning the **name** rather than a bool is that a
+/// failing gate has to say which of the 29 columns moved; "the rows differ" on
+/// a legally-binding record is a message that costs the next reader an hour.
+fn column_drifts<'a>(cols: &[&'a str], duck: &[String], lite: &[String]) -> Vec<(&'a str, String)> {
+    // A census and a field renderer that disagree would index past the end and
+    // panic with nothing to read. Name the two that disagree instead.
+    assert_eq!(
+        cols.len(),
+        duck.len(),
+        "the column census and its field renderer have diverged: {} names, {} rendered values",
+        cols.len(),
+        duck.len()
+    );
+    cols.iter()
+        .enumerate()
+        .filter(|(i, _)| duck[*i] != lite[*i])
+        .map(|(i, col)| (*col, format!("DuckDB {}, SQLite {}", duck[i], lite[i])))
+        .collect()
+}
+
 /// What the billing carry did. As with [`crate::migrate_to_sqlite`], these are
 /// **not** the numbers the gate compares (B4) — the gate re-derives every one
 /// of them from disk in a separate invocation.
@@ -328,6 +512,30 @@ pub fn carry_billing(src: &duckdb::Connection, dst: &mut SqliteConn) -> Result<B
     let reservations = read_reservations(src)?;
     let invoices = read_invoices(src)?;
     let lines = read_invoice_lines(src)?;
+    // B2, 2026-08-02 — and the measurement that came with it is worth more than
+    // the call. `invoice_line`'s identity is the composite (`invoice_id`,
+    // `ordinal`) and the reconciliation arm keys its per-row lookup on exactly
+    // that pair (`:806`), which is the same shape Part F built
+    // `unique_natural_keys` for. But unlike `wo_part_marks`, `ncrs`, `capas`
+    // and `ncr_transitions`, **BOTH engines declare it**: `PRIMARY KEY
+    // (invoice_id, ordinal)` in `SQLITE_BILLING_BASE_DDL` above and in
+    // `duckdb_store.rs:205`. A duplicate is therefore not reachable from a real
+    // DuckDB source at all, and this table was NOT one of the unguarded ones.
+    //
+    // The call stays for the reason Part F applies it to `dispatches`, whose
+    // `dsp_id` is likewise a real `PRIMARY KEY`: it costs one `BTreeSet` insert
+    // and it asserts the source's own key held. What it buys, if the impossible
+    // ever happens, is a refusal that names the invoice and the ordinal BEFORE
+    // anything is written, in place of an unattributable `UNIQUE constraint
+    // failed` from the middle of a carry transaction. One function, four uses —
+    // not two mechanisms.
+    unique_natural_keys(
+        &lines
+            .iter()
+            .map(|l| format!("{}#{}", l.invoice_id, l.ordinal))
+            .collect::<Vec<_>>(),
+        "invoice_line",
+    )?;
 
     let tx = aberp_db::engine::begin_immediate(dst)
         .map_err(|e| anyhow::anyhow!("begin the billing carry transaction: {e}"))?;
@@ -771,77 +979,78 @@ pub fn reconcile_billing(
         }
     }
 
-    // --- 3. per-row money / decimal equality, keyed by primary key ---
+    // --- 3. per-row equality over EVERY carried column, keyed by primary key ---
+    //
+    // B3, 2026-08-02. This used to compare four columns — `invoice.
+    // {exchange_rate, huf_equivalent_total}` and `invoice_line.{quantity,
+    // unit_price}` — out of the family's 29, and the ÁFA-bearing ones were not
+    // among them: `vat_rate_basis_points` and `vat_rate_kind` were carried and
+    // never value-compared, and neither were the three columns the számla
+    // number is made of. §6.3 said "money/decimal columns only"; every other
+    // Step-7 family compares every column, and this is the family the plan
+    // exists to protect. §6.3 now says so too.
+    //
+    // The three sequence tables got row COUNTS only, which is weaker still: a
+    // drifted `next_number` or a reservation whose `status` moved from `used`
+    // to `reserved` keeps the count exactly.
+    let duck_series = read_series(src)?;
+    reconcile_rows(
+        "invoice_series",
+        SERIES_COLUMNS,
+        &duck_series,
+        &read_sqlite_series(dst)?,
+        |r| r.0.clone(),
+        |r| r.0.clone(),
+        series_fields,
+        checks,
+        hard_stops,
+    );
+    // `invoice_sequence_state` is NOT reconciled here: it already has a per-row
+    // arm of its own at §6 below, keyed bucket-by-bucket, carrying the S444
+    // message about re-issuing a számla number. That arm is extended to its
+    // fourth column rather than duplicated here (rule 12).
+    let duck_res = read_reservations(src)?;
+    reconcile_rows(
+        "invoice_sequence_reservation",
+        RESERVATION_COLUMNS,
+        &duck_res,
+        &read_sqlite_reservations(dst)?,
+        |r| r.0.clone(),
+        |r| r.0.clone(),
+        reservation_fields,
+        checks,
+        hard_stops,
+    );
     let duck_invoices = read_invoices(src)?;
-    let lite_invoices = read_sqlite_invoice_money(dst)?;
-    let mut drift = 0usize;
-    for i in &duck_invoices {
-        match lite_invoices.get(&i.id) {
-            None => {
-                hard_stops.push(format!("invoice {} is missing on the SQLite side", i.id));
-                drift += 1;
-            }
-            Some((rate, huf)) => {
-                if rate != &i.exchange_rate {
-                    hard_stops.push(format!(
-                        "invoice {}: exchange_rate DuckDB {:?}, SQLite {:?}",
-                        i.id, i.exchange_rate, rate
-                    ));
-                    drift += 1;
-                }
-                if huf != &i.huf_equivalent_total {
-                    hard_stops.push(format!(
-                        "invoice {}: huf_equivalent_total DuckDB {:?}, SQLite {:?} — this is \
-                         the HUF figure on the NAV filing",
-                        i.id, i.huf_equivalent_total, huf
-                    ));
-                    drift += 1;
-                }
-            }
-        }
-    }
+    let lite_invoices = read_sqlite_invoices(dst)?;
+    reconcile_rows(
+        "invoice",
+        INVOICE_COLUMNS,
+        &duck_invoices,
+        &lite_invoices,
+        |r| r.id.clone(),
+        |r| r.id.clone(),
+        invoice_fields,
+        checks,
+        hard_stops,
+    );
     let duck_lines = read_invoice_lines(src)?;
-    let lite_lines = read_sqlite_line_money(dst)?;
-    for l in &duck_lines {
-        let key = (l.invoice_id.clone(), l.ordinal);
-        match lite_lines.get(&key) {
-            None => {
-                hard_stops.push(format!(
-                    "invoice_line {}#{} is missing on the SQLite side",
-                    l.invoice_id, l.ordinal
-                ));
-                drift += 1;
-            }
-            Some((qty, price)) => {
-                if qty != &l.quantity {
-                    hard_stops.push(format!(
-                        "invoice_line {}#{}: quantity DuckDB {:?}, SQLite {:?}",
-                        l.invoice_id, l.ordinal, l.quantity, qty
-                    ));
-                    drift += 1;
-                }
-                if *price != l.unit_price {
-                    hard_stops.push(format!(
-                        "invoice_line {}#{}: unit_price DuckDB {}, SQLite {}",
-                        l.invoice_id, l.ordinal, l.unit_price, price
-                    ));
-                    drift += 1;
-                }
-            }
-        }
-    }
-    if drift == 0 {
-        checks.push(format!(
-            "✓ every monetary value round-trips with ZERO drift ({} invoices × \
-             {{exchange_rate, huf_equivalent_total}}, {} lines × {{quantity, unit_price}})",
-            duck_invoices.len(),
-            duck_lines.len()
-        ));
-    }
+    let lite_lines = read_sqlite_lines(dst)?;
+    reconcile_rows(
+        "invoice_line",
+        INVOICE_LINE_COLUMNS,
+        &duck_lines,
+        &lite_lines,
+        |r| (r.invoice_id.clone(), r.ordinal),
+        |r| format!("{}#{}", r.invoice_id, r.ordinal),
+        line_fields,
+        checks,
+        hard_stops,
+    );
 
     // --- 4. exact sums, folded in RUST on both sides (never SQL SUM) ---
     let duck_unit_price = fold_i64(duck_lines.iter().map(|l| l.unit_price), "unit_price")?;
-    let lite_unit_price = fold_i64(lite_lines.values().map(|(_, p)| *p), "unit_price")?;
+    let lite_unit_price = fold_i64(lite_lines.values().map(|r| r.unit_price), "unit_price")?;
     if duck_unit_price == lite_unit_price {
         checks.push(format!(
             "✓ Σ invoice_line.unit_price = {duck_unit_price} (folded in Rust on both sides)"
@@ -856,7 +1065,9 @@ pub fn reconcile_billing(
         "huf_equivalent_total",
     )?;
     let lite_huf = fold_i64(
-        lite_invoices.values().filter_map(|(_, h)| *h),
+        lite_invoices
+            .values()
+            .filter_map(|r| r.huf_equivalent_total),
         "huf_equivalent_total",
     )?;
     if duck_huf == lite_huf {
@@ -869,7 +1080,7 @@ pub fn reconcile_billing(
         ));
     }
     let duck_qty = fold_decimal(duck_lines.iter().map(|l| l.quantity.as_str()))?;
-    let lite_qty = fold_decimal(lite_lines.values().map(|(q, _)| q.as_str()))?;
+    let lite_qty = fold_decimal(lite_lines.values().map(|r| r.quantity.as_str()))?;
     if duck_qty == lite_qty {
         checks.push(format!(
             "✓ Σ invoice_line.quantity = {duck_qty} (Decimal fold in Rust; SQL SUM over a \
@@ -915,22 +1126,35 @@ pub fn reconcile_billing(
 
     // --- 6. the sequence tables, bucket by bucket (the S444 surface) ---
     let duck_state = read_sequence_state(src)?;
-    let mut lite_state_stmt = dst.prepare(
-        "SELECT series_id, fiscal_year, next_number FROM invoice_sequence_state
-         ORDER BY series_id, fiscal_year ASC",
-    )?;
-    let lite_state: BTreeMap<(String, i32), i64> = lite_state_stmt
-        .query_map([], |r| Ok(((r.get(0)?, r.get(1)?), r.get::<_, i64>(2)?)))?
-        .collect::<std::result::Result<_, _>>()?;
+    // B3, 2026-08-02: `updated_at` joins the comparison. It was the one carried
+    // column of this table nothing checked, and the table has only four.
+    let lite_state = read_sqlite_sequence_state(dst)?;
     let mut bucket_drift = 0usize;
-    for (series_id, fiscal_year, next_number, _) in &duck_state {
+    for row in &duck_state {
+        let (series_id, fiscal_year, next_number, updated_at) = row;
         match lite_state.get(&(series_id.clone(), *fiscal_year)) {
-            Some(n) if n == next_number => {}
-            other => {
+            Some(got) if got == row => {}
+            Some(got) if &got.2 != next_number => {
                 hard_stops.push(format!(
                     "invoice_sequence_state[{series_id}, {fiscal_year}]: DuckDB next_number \
-                     {next_number}, SQLite {other:?} — the invoice-number allocator's stored \
-                     floor must cross exactly or the copy can re-issue a szamla number"
+                     {next_number}, SQLite {} — the invoice-number allocator's stored floor must \
+                     cross exactly or the copy can re-issue a szamla number",
+                    got.2
+                ));
+                bucket_drift += 1;
+            }
+            Some(got) => {
+                hard_stops.push(format!(
+                    "invoice_sequence_state[{series_id}, {fiscal_year}]: updated_at DuckDB \
+                     {updated_at:?}, SQLite {:?}",
+                    got.3
+                ));
+                bucket_drift += 1;
+            }
+            None => {
+                hard_stops.push(format!(
+                    "invoice_sequence_state[{series_id}, {fiscal_year}] is missing on the SQLite \
+                     side — the allocator's floor for that bucket did not cross at all"
                 ));
                 bucket_drift += 1;
             }
@@ -938,7 +1162,7 @@ pub fn reconcile_billing(
     }
     if bucket_drift == 0 {
         checks.push(format!(
-            "✓ invoice_sequence_state agrees bucket-by-bucket ({} bucket(s))",
+            "✓ invoice_sequence_state agrees bucket-by-bucket on every column ({} bucket(s))",
             duck_state.len()
         ));
     }
@@ -949,33 +1173,164 @@ pub fn reconcile_billing(
 /// The SQLite side's money columns for `invoice`, read through the ordinary
 /// typed path: `huf_equivalent_total` comes back as a bare `i64` — no cast, no
 /// string parse — which is the whole point of R1.
-fn read_sqlite_invoice_money(
-    conn: &SqliteConn,
-) -> Result<BTreeMap<String, (Option<String>, Option<i64>)>> {
-    let mut stmt =
-        conn.prepare("SELECT id, exchange_rate, huf_equivalent_total FROM invoice ORDER BY id")?;
+fn read_sqlite_invoices(conn: &SqliteConn) -> Result<BTreeMap<String, InvoiceRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM invoice ORDER BY id",
+        INVOICE_COLUMNS.join(", ")
+    ))?;
     let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            (r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?),
-        ))
+        Ok(InvoiceRow {
+            id: r.get(0)?,
+            series_id: r.get(1)?,
+            customer_id: r.get(2)?,
+            issue_date: r.get(3)?,
+            sequence_number: r.get(4)?,
+            fiscal_year: r.get(5)?,
+            idempotency_key: r.get(6)?,
+            currency: r.get(7)?,
+            exchange_rate: r.get(8)?,
+            exchange_rate_source: r.get(9)?,
+            exchange_rate_date: r.get(10)?,
+            huf_equivalent_total: r.get(11)?,
+            bank_account_id: r.get(12)?,
+            bank_account_currency: r.get(13)?,
+            bank_account_number: r.get(14)?,
+            bank_account_bank_name: r.get(15)?,
+            bank_account_swift_bic: r.get(16)?,
+            invoice_note: r.get(17)?,
+            payment_deadline: r.get(18)?,
+            delivery_date: r.get(19)?,
+            email_recipient_override: r.get(20)?,
+        })
     })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+    let v: Vec<InvoiceRow> = rows.collect::<std::result::Result<_, _>>()?;
+    Ok(v.into_iter().map(|r| (r.id.clone(), r)).collect())
 }
 
-/// The SQLite side's money columns for `invoice_line`.
-fn read_sqlite_line_money(conn: &SqliteConn) -> Result<BTreeMap<(String, i32), (String, i64)>> {
+/// The SQLite side's **whole** `invoice_line` row.
+fn read_sqlite_lines(conn: &SqliteConn) -> Result<BTreeMap<(String, i32), InvoiceLineRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM invoice_line ORDER BY invoice_id, ordinal",
+        INVOICE_LINE_COLUMNS.join(", ")
+    ))?;
+    let rows = stmt.query_map([], |r| {
+        Ok(InvoiceLineRow {
+            invoice_id: r.get(0)?,
+            ordinal: r.get(1)?,
+            description: r.get(2)?,
+            quantity: r.get(3)?,
+            unit_price: r.get(4)?,
+            vat_rate_basis_points: r.get(5)?,
+            note: r.get(6)?,
+            vat_rate_kind: r.get(7)?,
+        })
+    })?;
+    let v: Vec<InvoiceLineRow> = rows.collect::<std::result::Result<_, _>>()?;
+    Ok(v.into_iter()
+        .map(|r| ((r.invoice_id.clone(), r.ordinal), r))
+        .collect())
+}
+
+fn read_sqlite_series(conn: &SqliteConn) -> Result<BTreeMap<String, SeriesRow>> {
     let mut stmt = conn.prepare(
-        "SELECT invoice_id, ordinal, quantity, unit_price FROM invoice_line
-         ORDER BY invoice_id, ordinal",
+        "SELECT id, code, reset_policy, fiscal_year, created_at FROM invoice_series ORDER BY id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    })?;
+    let v: Vec<SeriesRow> = rows.collect::<std::result::Result<_, _>>()?;
+    Ok(v.into_iter().map(|r| (r.0.clone(), r)).collect())
+}
+
+fn read_sqlite_sequence_state(
+    conn: &SqliteConn,
+) -> Result<BTreeMap<(String, i32), SequenceStateRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT series_id, fiscal_year, next_number, updated_at FROM invoice_sequence_state
+         ORDER BY series_id, fiscal_year",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    let v: Vec<SequenceStateRow> = rows.collect::<std::result::Result<_, _>>()?;
+    Ok(v.into_iter().map(|r| ((r.0.clone(), r.1), r)).collect())
+}
+
+fn read_sqlite_reservations(conn: &SqliteConn) -> Result<BTreeMap<String, ReservationRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, series_id, fiscal_year, number, invoice_id, status, void_reason,
+                reserved_at, used_at, voided_at
+         FROM invoice_sequence_reservation ORDER BY id",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
-            (r.get::<_, String>(0)?, r.get::<_, i32>(1)?),
-            (r.get::<_, String>(2)?, r.get::<_, i64>(3)?),
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+            r.get(7)?,
+            r.get(8)?,
+            r.get(9)?,
         ))
     })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+    let v: Vec<ReservationRow> = rows.collect::<std::result::Result<_, _>>()?;
+    Ok(v.into_iter().map(|r| (r.0.clone(), r)).collect())
+}
+
+/// **The one per-row comparator this family uses, for all five tables.**
+///
+/// It walks a column census rather than a hand-written list of interesting
+/// columns, and it names the column that drifted — `{:?}`-rendered, so a `None`
+/// and a `Some("")` do not print the same. Both properties are the B3 finding:
+/// the old arm compared four hand-picked columns of 29, and the three sequence
+/// tables got row counts only, which cannot see a reservation whose `status`
+/// moved or an allocator floor that drifted.
+///
+/// Returns the drift count so a caller can fold several tables into one ✓.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_rows<K, R>(
+    noun: &str,
+    cols: &[&str],
+    duck: &[R],
+    lite: &BTreeMap<K, R>,
+    key: impl Fn(&R) -> K,
+    key_label: impl Fn(&R) -> String,
+    fields: impl Fn(&R) -> Vec<String>,
+    checks: &mut Vec<String>,
+    hard_stops: &mut Vec<String>,
+) where
+    K: Ord,
+{
+    let mut drift = 0usize;
+    for row in duck {
+        match lite.get(&key(row)) {
+            None => {
+                hard_stops.push(format!(
+                    "{noun} {} is missing on the SQLite side",
+                    key_label(row)
+                ));
+                drift += 1;
+            }
+            Some(got) => {
+                for (col, diff) in column_drifts(cols, &fields(row), &fields(got)) {
+                    hard_stops.push(format!(
+                        "{noun} {}: {col} {diff}{}",
+                        key_label(row),
+                        why_it_matters(col)
+                    ));
+                    drift += 1;
+                }
+            }
+        }
+    }
+    if drift == 0 {
+        checks.push(format!(
+            "✓ every {noun} column round-trips with ZERO drift ({} row(s) × {} columns)",
+            duck.len(),
+            cols.len()
+        ));
+    }
 }
 
 /// §3.4 — the fold that replaces SQL `SUM` on a money column. `checked_add`,

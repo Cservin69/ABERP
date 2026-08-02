@@ -681,11 +681,45 @@ mod tests {
     /// Is `col` declared with `ty` in the DDL? Matched on the line whose first
     /// token is the column name, so the pins below do not depend on the DDL's
     /// column alignment.
+    ///
+    /// ⚠ **The trailing comma is stripped, and that is load-bearing —
+    /// back-ported from `migrate_avl::declared_as` 2026-08-02 (R1).** A
+    /// **nullable** column carries no `NOT NULL`, so its type token is the last
+    /// on the line and reads as `TEXT,`; a bare `nth(1) == Some("TEXT")`
+    /// silently reports "not declared TEXT" for exactly the nullable columns in
+    /// this table. Today every caller here asks about a `NOT NULL` column, so
+    /// the trap is armed rather than firing — which is precisely why it is
+    /// disarmed now rather than when it goes off. In a positive assertion it is
+    /// a false RED; in the `!declared_as(…)` form a later Part is likelier to
+    /// write, it is a false GREEN.
     fn declared_as(col: &str, ty: &str) -> bool {
         SQLITE_OUTBOUND_EMAIL_QUEUE_DDL
             .lines()
             .filter(|l| l.split_whitespace().next() == Some(col))
-            .any(|l| l.split_whitespace().nth(1) == Some(ty))
+            .any(|l| l.split_whitespace().nth(1).map(|t| t.trim_end_matches(',')) == Some(ty))
+    }
+
+    /// [`declared_as`] sees a **nullable** column's type, not just a `NOT NULL`
+    /// one — the pin `migrate_avl` carries, back-ported with the fix (R1).
+    ///
+    /// Pinned directly because the bug it guards is invisible: the helper
+    /// returns `false` rather than erroring, so a suite that only ever asked it
+    /// about `NOT NULL` columns — which is exactly what this module's suite does
+    /// — stays green while the helper is blind to a third of the table.
+    #[test]
+    fn declared_as_sees_nullable_columns_too() {
+        for col in [
+            "cc_recipients_json",
+            "body_html",
+            "attachments_dir",
+            "last_error",
+            "sent_at",
+        ] {
+            assert!(declared_as(col, "TEXT"), "{col} is nullable TEXT");
+        }
+        // And it still discriminates rather than answering `true` to anything.
+        assert!(!declared_as("last_error", "INTEGER"));
+        assert!(!declared_as("nonexistent_column", "TEXT"));
     }
 
     /// The declared types this module uses are the vocabulary constants, spelled

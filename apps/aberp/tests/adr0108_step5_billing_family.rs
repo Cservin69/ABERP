@@ -567,3 +567,208 @@ fn a_ledger_only_source_reports_the_absence_rather_than_staying_silent() {
         r.checks
     );
 }
+
+/// **B2 — `invoice_line` is NOT one of the unguarded composite-key tables, and
+/// this pin is the measurement that retires the claim.**
+///
+/// The Parts B–H adversarial listed `invoice_line` beside `ncrs`, `capas` and
+/// `ncr_transitions` as keying the gate's per-row map on a composite "that no
+/// DDL enforces". Measured here instead of recalled: **both** engines declare
+/// `PRIMARY KEY (invoice_id, ordinal)` — SQLite in
+/// `migrate_billing::SQLITE_BILLING_BASE_DDL`, DuckDB in
+/// `duckdb_store.rs:205` — so a duplicate is not reachable from a real source,
+/// and the collapse the guard exists to stop cannot occur here.
+///
+/// What this test protects is that fact, not the guard: if a later session
+/// drops either declaration, the map-collapse hazard becomes real on the
+/// legally-binding family, and the `unique_natural_keys` call in
+/// `carry_billing` becomes the only thing between a duplicate line and a gate
+/// that compares one line twice and the other never. It goes red here first.
+#[test]
+fn invoice_lines_composite_key_is_enforced_by_both_engines() {
+    let dir = scratch("linekey");
+    let db = seed(&dir);
+
+    // DuckDB: the source engine refuses the duplicate outright.
+    {
+        let conn = duckdb::Connection::open(&db).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT count(*) FROM invoice_line", [], |r| r.get(0))
+            .unwrap();
+        assert!(before > 0, "the fixture must have lines to duplicate");
+        let e = conn
+            .execute_batch("INSERT INTO invoice_line SELECT * FROM invoice_line;")
+            .expect_err("DuckDB must refuse a duplicate (invoice_id, ordinal)");
+        let msg = format!("{e}");
+        assert!(
+            msg.to_lowercase().contains("constraint"),
+            "the refusal must be the PK, not something incidental: {msg}"
+        );
+        let after: i64 = conn
+            .query_row("SELECT count(*) FROM invoice_line", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, before, "the refused insert must add nothing");
+        conn.close().unwrap();
+    }
+
+    // SQLite: the carried schema declares the same composite key.
+    let snap = run_snapshot(&db, TENANT, None).unwrap();
+    let lite = dir.join("aberp.sqlite");
+    migrate_families(&db, &lite, TENANT, &snap, LedgerSource::Table).expect("migrate");
+    let conn = aberp_db::sqlite::open_hardened(&lite).unwrap();
+    let key: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('invoice_line') WHERE pk > 0 ORDER BY pk")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(
+        key,
+        vec!["invoice_id".to_string(), "ordinal".to_string()],
+        "the SQLite side must declare the composite key the gate keys its per-row map on"
+    );
+}
+
+/// **B3 — the per-row arm must cover EVERY carried column, and the census it
+/// walks must match the table.**
+///
+/// Before B3 the arm compared four columns of the family's 29 — `invoice.
+/// {exchange_rate, huf_equivalent_total}` and `invoice_line.{quantity,
+/// unit_price}` — and the ÁFA-bearing ones were not among them.
+/// `vat_rate_basis_points` and `vat_rate_kind` decide what the NAV filing
+/// carries and neither was value-compared; nor were the three columns the
+/// számla number is made of.
+///
+/// This pins the census against `pragma_table_info` on the carried SQLite
+/// tables, so a column added to the carry and forgotten by the comparison goes
+/// red here instead of riding along unchecked for a Part or two — which is
+/// exactly how these four became "the compared ones" in the first place.
+#[test]
+fn every_carried_invoice_column_is_compared() {
+    let dir = scratch("colcensus");
+    let db = seed(&dir);
+    let snap = run_snapshot(&db, TENANT, None).unwrap();
+    let lite = dir.join("aberp.sqlite");
+    migrate_families(&db, &lite, TENANT, &snap, LedgerSource::Table).expect("migrate");
+
+    let conn = aberp_db::sqlite::open_hardened(&lite).unwrap();
+    for (table, census) in [
+        ("invoice", aberp::migrate_billing::INVOICE_COLUMNS),
+        ("invoice_line", aberp::migrate_billing::INVOICE_LINE_COLUMNS),
+    ] {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+            ))
+            .unwrap();
+        let actual: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut a = actual.clone();
+        a.sort();
+        let mut c: Vec<String> = census.iter().map(|s| s.to_string()).collect();
+        c.sort();
+        assert_eq!(
+            a, c,
+            "{table}: the reconciliation census and the carried table have diverged. Every \
+             column that crosses must be value-compared — this is the legally-binding family, \
+             and a column carried but never compared is a column the gate reports PASS over."
+        );
+    }
+}
+
+/// And the arm has TEETH on the columns B3 added: a drift in an ÁFA-bearing
+/// column must hard-stop, not pass.
+///
+/// One mutation per column, each on its own copy, because one column's
+/// mutation reddening is not evidence that another's would — the §3.4 `:585`
+/// lesson, applied to the comparison instead of to the scanner.
+#[test]
+fn a_drift_in_a_previously_uncompared_column_reds_the_gate() {
+    for (table, col, mutate) in [
+        (
+            "invoice_line",
+            "vat_rate_basis_points",
+            "UPDATE invoice_line SET vat_rate_basis_points = 500",
+        ),
+        (
+            "invoice_line",
+            "vat_rate_kind",
+            "UPDATE invoice_line SET vat_rate_kind = 'AamExempt'",
+        ),
+        (
+            "invoice_line",
+            "description",
+            "UPDATE invoice_line SET description = 'tampered'",
+        ),
+        (
+            "invoice",
+            "customer_id",
+            "UPDATE invoice SET customer_id = 'tampered'",
+        ),
+        (
+            "invoice",
+            "sequence_number",
+            "UPDATE invoice SET sequence_number = sequence_number + 100",
+        ),
+        (
+            "invoice",
+            "idempotency_key",
+            "UPDATE invoice SET idempotency_key = id || '-tampered'",
+        ),
+        (
+            "invoice_sequence_reservation",
+            "status",
+            "UPDATE invoice_sequence_reservation SET status = 'voided'",
+        ),
+        (
+            "invoice_series",
+            "reset_policy",
+            "UPDATE invoice_series SET reset_policy = 'tampered'",
+        ),
+        (
+            "invoice_sequence_state",
+            "updated_at",
+            "UPDATE invoice_sequence_state SET updated_at = '1999-01-01T00:00:00Z'",
+        ),
+    ] {
+        let dir = scratch(&format!("drift-{table}-{col}"));
+        let db = seed(&dir);
+        let snap = run_snapshot(&db, TENANT, None).unwrap();
+        let lite = dir.join("aberp.sqlite");
+        migrate_families(&db, &lite, TENANT, &snap, LedgerSource::Table).expect("migrate");
+
+        // Clean first: the gate must be green before the mutation, or the
+        // red below proves nothing.
+        let clean = reconcile(&db, &lite, TENANT).expect("reconcile");
+        assert!(
+            clean.hard_stops.is_empty(),
+            "{table}.{col}: the gate must be green before the mutation: {:?}",
+            clean.hard_stops
+        );
+
+        // Mutate the SQLite COPY, which is what a drifted carry looks like from
+        // the gate's side. The DuckDB source is never written.
+        {
+            let conn = aberp_db::sqlite::open_hardened(&lite).unwrap();
+            let n = conn.execute(mutate, []).unwrap();
+            assert!(n > 0, "{table}.{col}: the mutation must touch a row");
+        }
+
+        let r = reconcile(&db, &lite, TENANT).expect("reconcile");
+        assert!(
+            r.hard_stops.iter().any(|h| h.contains(col)),
+            "{table}.{col}: a drift in a carried column must hard-stop and NAME the column. \
+             Before B3 this column was carried and never compared, so the gate reported PASS \
+             over it. Got: {:?}",
+            r.hard_stops
+        );
+    }
+}
