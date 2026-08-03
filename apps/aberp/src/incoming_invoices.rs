@@ -414,15 +414,12 @@ CREATE INDEX IF NOT EXISTS ap_invoice_tenant_issue_idx
 /// **This is DDL — a WRITE.** It may only ever be handed a connection that
 /// came from `Handle::write()` (a `WriteGuard` deref) or from the boot-phase
 /// opener in `serve::run`, **never** one from `Handle::read()`. Until
-/// 2026-07-31 the three read paths below called it defensively; under DuckDB
-/// that escaped the writer mutex quietly (a `read()` is a `try_clone` of the
-/// one instance, and the guard drops the instant the clone is taken), and
-/// under ADR-0108's `sqlite-engine` arm — where `read()` becomes a genuine
-/// second connection — it would have taken SQLite's write lock OUTSIDE the
-/// writer `Mutex`, falsifying §2.4's single-writer invariant and putting a
-/// 5-second `busy_timeout` on three pure-read routes.
+/// 2026-07-31 the three read paths below called it defensively, which escapes
+/// the writer mutex quietly (a `read()` is a `try_clone` of the one instance,
+/// and the guard drops the instant the clone is taken) — so "every write is
+/// serialized by one mutex" was already, silently, not quite true.
 /// Finding R-1, `docs/findings/read-fork-audit-sqlite-20260731.md`.
-/// Pinned by `apps/aberp/tests/adr0108_no_ddl_on_read_handle.rs`.
+/// Pinned by `apps/aberp/tests/no_ddl_on_read_handle.rs`.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(AP_INVOICE_SCHEMA_SQL)
         .context("ensure ap_invoice schema")
