@@ -58,6 +58,7 @@ pub use retention::{plan_retention, prune, RetentionPlan, RetentionPolicy};
 pub use store::{default_store_dir, find_snapshot, list_snapshots, SnapshotRecord};
 pub use take::{
     ensure_restore_allowed, restore_into, take_snapshot, validate_export, ValidationReport,
+    SECONDARY_INDEX_COUNT_SQL,
 };
 
 /// Typed error surface for the snapshot subsystem. Library crate → no
@@ -147,6 +148,17 @@ pub struct SnapshotMeta {
     pub audit_count: i64,
     /// Number of audit entries the hash chain re-verified end-to-end.
     pub chain_len: u64,
+    /// Number of non-constraint (`CREATE INDEX`) ART indexes in the re-imported
+    /// snapshot. `-1` for snapshots taken before this field existed, or when
+    /// the catalog was unreadable. Prod incident 2026-08-03.
+    #[serde(default = "secondary_index_count_unrecorded")]
+    pub secondary_index_count: i64,
     /// When `valid == false`, the human-readable reason.
     pub validation_error: Option<String>,
+}
+
+/// Sentinel for `meta.json` written before `secondary_index_count` existed:
+/// "not recorded", never "zero indexes".
+fn secondary_index_count_unrecorded() -> i64 {
+    -1
 }

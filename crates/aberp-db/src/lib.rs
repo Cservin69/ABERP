@@ -74,6 +74,10 @@ pub mod debounce;
 // The pure DB-path shape rule that the boot guard trio's third check calls.
 // Not reachable from `Handle`.
 pub mod engine_path;
+// Prod incident 2026-08-03 — boot-time rebuild of the non-constraint ART
+// indexes. Not reachable from `Handle`: serve boot calls it on the boot-phase
+// connection, BEFORE the Handle opens.
+pub mod index_integrity;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};

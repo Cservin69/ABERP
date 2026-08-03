@@ -1500,6 +1500,50 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     .context("reconcile audit-ledger mirror with DB at serve boot");
             }
         }
+
+        // Prod incident 2026-08-03 — rebuild the non-constraint ART indexes.
+        //
+        // "Mark AP invoice paid" fatally invalidated the live instance: the two
+        // `ap_invoice` secondary indexes were MISSING their entries for every
+        // row appended since a mid-July WAL tear, so the delete-half of the
+        // update's index maintenance found "0 out of 1" rows at COMMIT and
+        // DuckDB's revert path re-appended a key that was already there. The
+        // rows were fine; the ART was not. See
+        // `aberp_db::index_integrity` for the full measurement.
+        //
+        // There is no non-destructive DETECTOR for this class on DuckDB 1.5.3
+        // (a rolled-back probe never reaches `CommitDelete` and reports clean;
+        // a committed one invalidates the instance it was meant to protect), so
+        // this REPAIRS unconditionally instead of probing. ~40 ms for all 25
+        // indexes on the 25 MB prod DB, and it makes the poisoned state
+        // unreachable past boot — which also means no snapshot taken by this
+        // process can be taken from a source poisoned before boot.
+        //
+        // Placement: after the mirror reconcile/heal (so a healed DB is covered)
+        // and after every `ensure_schema` above (so the enumeration sees the
+        // full index set), on the SAME boot-phase connection — no new opener, so
+        // the ADR-0098 Handle census is unchanged. The shared Handle opens
+        // below, on an already-repaired file.
+        tracing::info!("boot step: rebuilding secondary ART indexes (2026-08-03 incident gate)");
+        let _rebuild_span = tracing::info_span!("serve.rebuild_secondary_indexes").entered();
+        match aberp_db::index_integrity::rebuild_secondary_indexes(&conn) {
+            Ok(rebuilt) => tracing::info!(
+                rebuilt = rebuilt.len(),
+                indexes = ?rebuilt,
+                "secondary ART indexes rebuilt at boot"
+            ),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "REFUSING to boot — could not rebuild the secondary ART indexes. Serving on \
+                     a DB whose indexes may disagree with its rows risks the 2026-08-03 class: \
+                     the first UPDATE/DELETE touching an indexed column invalidates the instance. \
+                     Restore from a verified snapshot before re-running."
+                );
+                return Err(anyhow::Error::new(e))
+                    .context("rebuild secondary ART indexes at serve boot");
+            }
+        }
     }
 
     // S433 — self-heal the tenant registry with the running tenant and,
