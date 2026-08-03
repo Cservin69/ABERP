@@ -517,6 +517,204 @@ fn the_quoting_family_crosses_with_zero_drift() {
 }
 
 // ---------------------------------------------------------------------------
+// M-1 — the pre-S418 NULL that used to abort the migration
+// ---------------------------------------------------------------------------
+
+/// **A `NULL` `machining_difficulty` on an operator-added grade crosses as 1.0
+/// — it does not abort the migration.**
+///
+/// The adversarial's M-1. The column is **nullable in the source**: on a
+/// pre-S418 DuckDB it arrives via `ALTER TABLE … ADD COLUMN IF NOT EXISTS
+/// machining_difficulty DOUBLE` with no `DEFAULT`, and
+/// `backfill_machining_difficulty` is **grade-filtered** to the seven-grade
+/// `MACHINING_DIFFICULTY_SEED` — so any grade the operator added themselves
+/// keeps `NULL` **permanently**. The backfill's own doc comment says so.
+///
+/// Before the fix the carry read the column as a bare `f64` and the whole
+/// migration died with `InvalidColumnType(4, "machining_difficulty", Null)` —
+/// at cutover, naming neither the tenant nor the row.
+///
+/// The coalesce value is the **product's**, not this migrator's:
+/// `row_to_material` (`quoting_materials.rs:952`) reads
+/// `row.get::<_, Option<f64>>(4)?.unwrap_or(1.0)`.
+///
+/// The fixture is built by hand because the current `ensure_schema` creates the
+/// column `NOT NULL DEFAULT 1.0` — a fresh table cannot reproduce the pre-S418
+/// shape, which is exactly why the defect survived the other 19 pins.
+#[test]
+fn a_null_machining_difficulty_crosses_as_the_product_default_not_an_abort() {
+    let dir = scratch("m1-null-difficulty");
+    let db = dir.join("aberp.duckdb");
+    {
+        let conn = duckdb::Connection::open(&db).unwrap();
+        // The pre-S418 shape: `machining_difficulty` NULLABLE, no DEFAULT.
+        conn.execute_batch(
+            "CREATE TABLE quoting_materials (
+                 grade                   VARCHAR NOT NULL PRIMARY KEY,
+                 tenant_id               VARCHAR NOT NULL,
+                 display_name            VARCHAR NOT NULL,
+                 density_g_cm3           DOUBLE  NOT NULL,
+                 cost_per_kg_eur         DOUBLE  NOT NULL,
+                 machining_difficulty    DOUBLE,
+                 carbide_life_multiplier DOUBLE  NOT NULL,
+                 stock_status            VARCHAR NOT NULL,
+                 lead_time_default_days  INTEGER NOT NULL,
+                 quote_multiplier        DOUBLE  NOT NULL,
+                 notes                   VARCHAR,
+                 updated_at              VARCHAR NOT NULL,
+                 updated_by_actor        VARCHAR NOT NULL,
+                 current_lot_id          VARCHAR,
+                 current_heat_id         VARCHAR,
+                 cert_url                VARCHAR,
+                 cert_attached_at        VARCHAR
+             );",
+        )
+        .unwrap();
+        // `TITANIUM-GR5-CUSTOM` is NOT in MACHINING_DIFFICULTY_SEED, so the
+        // grade-filtered backfill never touches it and the NULL is permanent.
+        conn.execute(
+            "INSERT INTO quoting_materials VALUES ('TITANIUM-GR5-CUSTOM', 'test', 'Ti Gr5', \
+             4.43, 55.5, NULL, 0.3, 'OnRequest', 30, 1.5, NULL, 't', 'operator', NULL, NULL, \
+             NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        // …and a seeded grade beside it, so the pin shows the coalesce applies
+        // to the NULL row ONLY and does not flatten a real tuned value.
+        conn.execute(
+            "INSERT INTO quoting_materials VALUES ('6061-T6', 'test', 'Al', 2.7, 12.5, 3.5, \
+             1.0, 'InStock', 7, 1.0, NULL, 't', 'operator', NULL, NULL, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.close().unwrap();
+    }
+    seed_ledger(&db);
+    let snap = run_snapshot(&db, TENANT, None).unwrap();
+    let lite = dir.join("aberp.sqlite");
+    let out = migrate_families(&db, &lite, TENANT, &snap, LedgerSource::Table)
+        .expect("a NULL machining_difficulty must CROSS, not abort the migration");
+    assert_eq!(out.quoting.quoting_materials, 2);
+
+    assert_eq!(
+        lite_f64(
+            &lite,
+            "SELECT machining_difficulty FROM quoting_materials \
+             WHERE grade = 'TITANIUM-GR5-CUSTOM'"
+        ),
+        1.0,
+        "a NULL must coalesce to the product's 1.0 reference"
+    );
+    assert_eq!(
+        lite_f64(
+            &lite,
+            "SELECT machining_difficulty FROM quoting_materials WHERE grade = '6061-T6'"
+        ),
+        3.5,
+        "a populated value must NOT be flattened to the default"
+    );
+    // It landed as a REAL, not as a NULL the NOT NULL column should have refused.
+    assert_eq!(
+        lite_i64(
+            &lite,
+            "SELECT count(*) FROM quoting_materials WHERE typeof(machining_difficulty) <> 'real'"
+        ),
+        0
+    );
+
+    // And the gate is green ON THIS TABLE: the DuckDB side coalesces through the
+    // same path, so the per-row arm compares 1.0 against 1.0 rather than
+    // reporting a drift it caused itself.
+    //
+    // Scoped to `quoting_materials` rather than asserting an empty hard-stop
+    // list, and the reason is worth recording: this fixture creates ONE table,
+    // but `ensure_quoting_schema` builds all eleven, so the other six carried
+    // tables exist on SQLite and not on DuckDB and the gate hard-stops on each —
+    // correctly, and in the safe direction. That is **R-2** (§9) with an
+    // observable consequence; it is a pre-existing property of the carry, not
+    // something M-1's fix introduced, and it is logged rather than fixed here.
+    let r = reconcile(&db, &lite, TENANT).expect("reconcile");
+    assert!(
+        !r.hard_stops.iter().any(|h| h.contains("quoting_materials")),
+        "the coalesced column must not read as a drift the gate caused itself: {:#?}",
+        r.hard_stops
+    );
+    assert!(
+        r.checks
+            .iter()
+            .any(|c| c.contains("every quoting_materials column round-trips with ZERO drift")),
+        "{:#?}",
+        r.checks
+    );
+}
+
+/// **A `NULL` on a `real` column with NO declared coalesce still REFUSES — and
+/// now names the column and the row.**
+///
+/// The other half of M-1's fix, and the half that keeps it from being a
+/// loosening. `carbide_life_multiplier` is `NOT NULL` in the source and is not
+/// in `null_real`, so a `NULL` there is a broken source, not a migration
+/// decision. Before the fix this was an unattributed `InvalidColumnType`; it is
+/// now an error that says which table, column and row.
+#[test]
+fn a_null_real_without_a_declared_coalesce_is_refused_and_names_the_row() {
+    let dir = scratch("m1-undeclared-null");
+    let db = dir.join("aberp.duckdb");
+    {
+        let conn = duckdb::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE quoting_materials (
+                 grade                   VARCHAR NOT NULL PRIMARY KEY,
+                 tenant_id               VARCHAR NOT NULL,
+                 display_name            VARCHAR NOT NULL,
+                 density_g_cm3           DOUBLE  NOT NULL,
+                 cost_per_kg_eur         DOUBLE  NOT NULL,
+                 machining_difficulty    DOUBLE,
+                 carbide_life_multiplier DOUBLE,
+                 stock_status            VARCHAR NOT NULL,
+                 lead_time_default_days  INTEGER NOT NULL,
+                 quote_multiplier        DOUBLE  NOT NULL,
+                 notes                   VARCHAR,
+                 updated_at              VARCHAR NOT NULL,
+                 updated_by_actor        VARCHAR NOT NULL,
+                 current_lot_id          VARCHAR,
+                 current_heat_id         VARCHAR,
+                 cert_url                VARCHAR,
+                 cert_attached_at        VARCHAR
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO quoting_materials VALUES ('6061-T6', 'test', 'Al', 2.7, 12.5, 1.0, \
+             NULL, 'InStock', 7, 1.0, NULL, 't', 'operator', NULL, NULL, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.close().unwrap();
+    }
+    seed_ledger(&db);
+    let snap = run_snapshot(&db, TENANT, None).unwrap();
+    let err = migrate_families(
+        &db,
+        &dir.join("aberp.sqlite"),
+        TENANT,
+        &snap,
+        LedgerSource::Table,
+    )
+    .expect_err("a NULL with no declared coalesce must refuse");
+    let err = format!("{err:#}");
+    assert!(err.contains("carbide_life_multiplier"), "{err}");
+    assert!(
+        err.contains("test#6061-T6"),
+        "the refusal must name the row: {err}"
+    );
+    assert!(
+        err.contains("no coalesce is declared"),
+        "the refusal must say what is missing, not just that a bind failed: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 2-5 — §3.2 D, the money
 // ---------------------------------------------------------------------------
 

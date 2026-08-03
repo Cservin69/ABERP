@@ -251,6 +251,17 @@ struct Spec {
     /// `TEXT` holding a canonical `rust_decimal` string — §3.2 D money on a
     /// float today.
     money: &'static [&'static str],
+    /// `real` columns that are **nullable in the SOURCE**, with the value the
+    /// product's own reader coalesces a `NULL` to.
+    ///
+    /// ⚠ **This is not a convenience and it is deliberately not a blanket.** A
+    /// `real` column absent from this list that arrives `NULL` is a **hard
+    /// error** naming the table, the column and the row — which is stricter
+    /// than what a bare `r.get::<_, f64>()` gave (an unattributed
+    /// `InvalidColumnType`), not looser. Only a column whose source contract
+    /// genuinely permits `NULL` may be listed, and the coalesce value must be
+    /// the one the product already uses, not a new choice made here.
+    null_real: &'static [(&'static str, f64)],
     /// The gate's key. Always tenant-scoped, unlike every one of these tables'
     /// own `PRIMARY KEY`.
     key: [&'static str; 2],
@@ -292,6 +303,15 @@ impl Spec {
     }
 }
 
+/// What a `NULL` `quoting_materials.machining_difficulty` coalesces to.
+///
+/// **1.0 is the 6061-T6 reference multiplier, and it is the product's number,
+/// not this migrator's.** `row_to_material` (`quoting_materials.rs:952`) reads
+/// the column as `row.get::<_, Option<f64>>(4)?.unwrap_or(1.0)`; the carry
+/// matches that contract rather than inventing a second answer to the same
+/// question (rule 7).
+const MACHINING_DIFFICULTY_DEFAULT: f64 = 1.0;
+
 const MARGIN_PROFILES: Spec = Spec {
     table: "margin_profiles",
     text: &[
@@ -308,6 +328,7 @@ const MARGIN_PROFILES: Spec = Spec {
     int: &[],
     flag: &["enabled"],
     money: &[],
+    null_real: &[],
     key: ["tenant_id", "id"],
 };
 
@@ -332,6 +353,7 @@ const QUOTING_MACHINES: Spec = Spec {
     int: &[],
     flag: &["enabled"],
     money: &[],
+    null_real: &[],
     key: ["tenant_id", "id"],
 };
 
@@ -360,6 +382,8 @@ const QUOTING_MATERIALS: Spec = Spec {
     int: &["lead_time_default_days"],
     flag: &[],
     money: &["cost_per_kg_eur"],
+    // ⚠ THE FAMILY'S ONLY NULL-SURVIVABLE FLOAT. See MACHINING_DIFFICULTY_NULL.
+    null_real: &[("machining_difficulty", MACHINING_DIFFICULTY_DEFAULT)],
     key: ["tenant_id", "grade"],
 };
 
@@ -383,6 +407,11 @@ const QUOTING_PARAMETERS: Spec = Spec {
     int: &["id", "setup_amortization_threshold"],
     flag: &[],
     money: &["machining_rate_eur_per_minute", "cad_cam_rate_eur_per_hour"],
+    // Empty, and MEASURED rather than assumed: `backfill_s418_parameters`
+    // (`quoting_tunables.rs`) is `UPDATE … WHERE <col> IS NULL` with **no row
+    // filter**, so every one of the seven S418 knobs — including both money
+    // knobs — is populated on every row of every migrated tenant.
+    null_real: &[],
     key: ["tenant_id", "id"],
 };
 
@@ -401,6 +430,7 @@ const QUOTING_COMPLEXITY_RULES: Spec = Spec {
     int: &["count_min", "count_max"],
     flag: &[],
     money: &[],
+    null_real: &[],
     key: ["tenant_id", "id"],
 };
 
@@ -417,6 +447,7 @@ const QUOTING_TOLERANCE_MULTIPLIERS: Spec = Spec {
     int: &[],
     flag: &[],
     money: &[],
+    null_real: &[],
     key: ["tenant_id", "tolerance_range"],
 };
 
@@ -435,6 +466,7 @@ const QUOTING_STOCK_ADJUSTMENTS: Spec = Spec {
     int: &[],
     flag: &[],
     money: &[],
+    null_real: &[],
     key: ["tenant_id", "id"],
 };
 
@@ -845,6 +877,21 @@ struct Row {
     money: Vec<f64>,
 }
 
+/// A source row **before** its nullable `real` columns are resolved (M-1).
+///
+/// Separate from [`Row`] rather than making `Row.real` an `Option<f64>` so that
+/// the resolution is a *step with a type change*: everything downstream of
+/// `read_duckdb` — the finite guard, the per-row comparison, the bind — holds a
+/// plain `f64` and cannot silently propagate a `None`.
+#[derive(Debug, Clone)]
+struct RawRow {
+    text: Vec<Option<String>>,
+    real: Vec<Option<f64>>,
+    int: Vec<Option<i64>>,
+    flag: Vec<bool>,
+    money: Vec<f64>,
+}
+
 /// What the quoting carry did. As everywhere else in this migrator these are
 /// **not** the numbers the gate compares (B4) — the gate re-derives every one of
 /// them from disk in a separate invocation.
@@ -1020,13 +1067,25 @@ pub fn carry_quoting(src: &duckdb::Connection, dst: &mut SqliteConn) -> Result<Q
 /// float — a key that cannot compare equal to itself is not a key — so the
 /// `real` and `money` buckets are a hard error rather than a fallthrough.
 fn key_of(spec: &Spec, row: &Row) -> Result<String> {
+    key_from(spec, &row.text, &row.int)
+}
+
+/// The same key, off a [`RawRow`] — needed because M-1's NULL resolution reports
+/// the row it refuses, so the key has to exist *before* the reals are resolved.
+/// Neither key bucket changes type between the two structs, so this is one
+/// implementation and not two.
+fn key_of_raw(spec: &Spec, row: &RawRow) -> Result<String> {
+    key_from(spec, &row.text, &row.int)
+}
+
+fn key_from(spec: &Spec, text: &[Option<String>], int: &[Option<i64>]) -> Result<String> {
     let mut parts = Vec::with_capacity(2);
     for want in spec.key {
         if let Some(i) = spec.text.iter().position(|c| *c == want) {
-            parts.push(row.text[i].clone().unwrap_or_default());
+            parts.push(text[i].clone().unwrap_or_default());
         } else if let Some(i) = spec.int.iter().position(|c| *c == want) {
             parts.push(
-                row.int[i]
+                int[i]
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "NULL".to_string()),
             );
@@ -1058,15 +1117,19 @@ fn read_duckdb(conn: &duckdb::Connection, spec: &Spec) -> Result<Vec<(Row, Vec<S
     let nm = spec.money.len();
 
     let mut stmt = conn.prepare(&spec.select_sql())?;
-    let raw: Vec<Row> = stmt
+    let raw: Vec<RawRow> = stmt
         .query_map([], |r| {
             let mut text = Vec::with_capacity(nt);
             for i in 0..nt {
                 text.push(r.get::<_, Option<String>>(i)?);
             }
+            // Read as Option and resolve BELOW rather than as a bare `f64`:
+            // a bare read turns a source NULL into an unattributed
+            // `InvalidColumnType`, which at cutover names neither the column
+            // nor the row (M-1).
             let mut real = Vec::with_capacity(nr);
             for i in 0..nr {
-                real.push(r.get::<_, f64>(nt + i)?);
+                real.push(r.get::<_, Option<f64>>(nt + i)?);
             }
             let mut int = Vec::with_capacity(ni);
             for i in 0..ni {
@@ -1080,7 +1143,7 @@ fn read_duckdb(conn: &duckdb::Connection, spec: &Spec) -> Result<Vec<(Row, Vec<S
             for i in 0..nm {
                 money.push(r.get::<_, f64>(nt + nr + ni + nf + i)?);
             }
-            Ok(Row {
+            Ok(RawRow {
                 text,
                 real,
                 int,
@@ -1092,25 +1155,69 @@ fn read_duckdb(conn: &duckdb::Connection, spec: &Spec) -> Result<Vec<(Row, Vec<S
 
     let mut keys = Vec::with_capacity(raw.len());
     let mut out = Vec::with_capacity(raw.len());
-    for row in raw {
-        let key = key_of(spec, &row)?;
+    for raw_row in raw {
+        let key = key_of_raw(spec, &raw_row)?;
+        // M-1: resolve every source NULL against the table's DECLARED coalesce
+        // set, or fail loud naming the column and the row.
+        let mut real = Vec::with_capacity(spec.real.len());
+        for (i, col) in spec.real.iter().enumerate() {
+            real.push(resolve_null_real(spec, col, raw_row.real[i], &key)?);
+        }
         // §3.2 E: a non-finite measurement is refused before the bind, because
         // SQLite has no NaN and would store it as NULL (Part E).
         for (i, col) in spec.real.iter().enumerate() {
-            finite_measurement(row.real[i], &key, spec.table, col)?;
+            finite_measurement(real[i], &key, spec.table, col)?;
         }
         // §3.2 D: refuse-never-round, exact round-trip or fail loud.
         let money = spec
             .money
             .iter()
-            .zip(&row.money)
+            .zip(&raw_row.money)
             .map(|(col, v)| canonical_decimal_from_f64(*v, &key, &format!("{}.{col}", spec.table)))
             .collect::<Result<Vec<_>>>()?;
         keys.push(key);
-        out.push((row, money));
+        out.push((
+            Row {
+                text: raw_row.text,
+                real,
+                int: raw_row.int,
+                flag: raw_row.flag,
+                money: raw_row.money,
+            },
+            money,
+        ));
     }
     unique_natural_keys(&keys, spec.table)?;
     Ok(out)
+}
+
+/// Resolve one source `real` value that may be `NULL`.
+///
+/// **M-1, and the shape is deliberately asymmetric.** A `NULL` on a column named
+/// in the table's [`Spec::null_real`] coalesces to the value the *product's own
+/// reader* uses; a `NULL` anywhere else is an `Err` that names the table, the
+/// column and the row.
+///
+/// The second half is the part worth keeping: before this existed the carry read
+/// every `real` as a bare `f64`, so a source `NULL` surfaced as
+/// `InvalidColumnType(4, "machining_difficulty", Null)` from deep inside
+/// `query_map` — an abort at cutover that names no row and no tenant. Coalescing
+/// one column did not require making the rest quieter, and it did not.
+fn resolve_null_real(spec: &Spec, col: &str, v: Option<f64>, key: &str) -> Result<f64> {
+    if let Some(v) = v {
+        return Ok(v);
+    }
+    match spec.null_real.iter().find(|(c, _)| *c == col) {
+        Some((_, default)) => Ok(*default),
+        None => bail!(
+            "{}.{col} is NULL on {key}, and no coalesce is declared for it. The target column is \
+             NOT NULL, so the carry cannot bind this row — and it will not invent a value. If \
+             this column is genuinely nullable in the source, add it to that table's \
+             `null_real` with the value the PRODUCT's own reader coalesces to, and pin it \
+             (ADR-0108 §3.2 E, CLAUDE.md rules 7 and 11)",
+            spec.table
+        ),
+    }
 }
 
 /// Read a carried table back from SQLite, converting each R2 money string to the
@@ -1880,6 +1987,7 @@ mod tests {
             int: &[],
             flag: &[],
             money: &[],
+            null_real: &[],
             key: ["tenant_id", "ratio"],
         };
         assert!(key_of(
