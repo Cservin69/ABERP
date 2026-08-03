@@ -1389,8 +1389,8 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // pre-write establishment of the ap_invoice schema. The three read paths
     // (`list_incoming` / `get_incoming` / `get_nav_xml_path`) used to repeat
     // it defensively on a `Handle::read()` connection — DDL on a reader, which
-    // becomes a second writer outside the writer mutex under ADR-0108's
-    // `sqlite-engine` arm. Those calls are gone; do not put them back.
+    // escapes the writer mutex. Those calls are gone; do not put them back.
+    // Pinned by `apps/aberp/tests/no_ddl_on_read_handle.rs`.
     {
         let _s = tracing::info_span!("serve.ensure_ap_invoice_schema").entered();
         let conn = Connection::open(&args.db).with_context(|| {
