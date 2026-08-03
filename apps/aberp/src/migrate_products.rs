@@ -454,7 +454,7 @@ pub fn canonical_decimal_from_f64(v: f64, key: &str, column: &str) -> Result<Str
 /// forwards again (B4): the gate parses what is actually on disk and converts
 /// it, so a carry that wrote the wrong string is caught by the comparison
 /// rather than reproduced by it.
-fn f64_from_canonical_decimal(raw: &str, key: &str, column: &str) -> Result<f64> {
+pub fn f64_from_canonical_decimal(raw: &str, key: &str, column: &str) -> Result<f64> {
     let d = Decimal::from_str_exact(raw).map_err(|e| {
         anyhow::anyhow!(
             "{column} on {key} is {raw:?} on the SQLite side, which is not a decimal ({e})"
