@@ -221,6 +221,15 @@ pub struct MigrateOutcome {
     /// per family because the family **is** one table; the gate holds the two
     /// sides to it symmetrically.
     pub avl: crate::migrate_avl::AvlCarry,
+    /// ADR-0108 **Step 8** — what the quoting family carried. All zeros when the
+    /// source has none of its eleven tables. Presence is per table, because
+    /// EIGHT modules build the eleven across a dozen sprints, so a subset is a
+    /// legitimate source shape.
+    ///
+    /// ⚠ `job_history_rows_dropped` is **not** a carry count: it is what §6.3
+    /// deliberately left behind, reported as a number so a drop policy and a
+    /// dropped carry arm cannot look alike.
+    pub quoting: crate::migrate_quoting::QuotingCarry,
     /// SHA-256 of the DuckDB file, taken after the run. C-I says this must
     /// equal the digest taken before it (T-19 arm 2).
     pub duckdb_sha256_after: String,
@@ -291,6 +300,23 @@ pub fn run(args: &MigrateToSqliteArgs) -> Result<()> {
         out.email.outbound_email_queue
     );
     println!("  AVL family: {} vendor(s)", out.avl.avl_vendors);
+    let qu = out.quoting;
+    println!(
+        "  quoting family: {} margin profile(s), {} machine(s), {} material(s), {} parameter \
+         row(s), {} complexity rule(s), {} tolerance multiplier(s), {} stock adjustment(s)",
+        qu.margin_profiles,
+        qu.quoting_machines,
+        qu.quoting_materials,
+        qu.quoting_parameters,
+        qu.quoting_complexity_rules,
+        qu.quoting_tolerance_multipliers,
+        qu.quoting_stock_adjustments
+    );
+    println!(
+        "    …and {} quoting job-history row(s) DELIBERATELY not carried (ADR-0108 §6.3: the \
+         schema crosses, the rows do not)",
+        qu.job_history_rows_dropped
+    );
     println!(
         "  DuckDB SHA-256 after the run: {} (C-I: must equal the pre-migration manifest's)",
         out.duckdb_sha256_after
@@ -516,6 +542,21 @@ pub fn migrate_families(
     //     `resolve_avl` and `create_ncr` run on purchasing's own writer guard.
     let avl = crate::migrate_avl::carry_avl(&src, &mut dst)?;
 
+    // --- ADR-0108 Step 8 — the quoting family, same lock, same digest window.
+    //     ELEVEN tables from EIGHT modules, and the only family in the plan
+    //     whose carry set is a strict subset of its schema set: §6.3 carries the
+    //     seven operator-configured tunables/materials/machines/margin tables
+    //     and drops the four job-history ones, whose schema still crosses so
+    //     §3.2 D's three remaining float-money columns have a landed `TEXT`
+    //     declaration. The gate holds the drop to "exists, empty, and declared
+    //     TEXT" rather than skipping it — a `typeof` sweep over zero rows is
+    //     vacuous, so the declaration is the only thing left to check.
+    //
+    //     This does NOT convert the five `f64` Rust types §7 schedules for this
+    //     step: that is the Rust half, it changes `quote_pricing_pipeline`'s
+    //     arithmetic, and it is what §3.2 D's stop rule is really about.
+    let quoting = crate::migrate_quoting::carry_quoting(&src, &mut dst)?;
+
     drop(dst);
     drop(src);
 
@@ -541,6 +582,7 @@ pub fn migrate_families(
         purchasing,
         email,
         avl,
+        quoting,
         duckdb_sha256_after: after,
     })
 }
@@ -910,6 +952,9 @@ pub fn reconcile(duckdb_path: &Path, sqlite_path: &Path, tenant: &str) -> Result
 
     // ---- ADR-0108 Step 7 Part I — the approved-vendor-list family's arm ----
     crate::migrate_avl::reconcile_avl(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
+
+    // ---- ADR-0108 Step 8 — the quoting family's arm ----
+    crate::migrate_quoting::reconcile_quoting(&src, &dst, &mut r.checks, &mut r.hard_stops)?;
 
     Ok(r)
 }

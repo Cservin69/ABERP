@@ -142,6 +142,13 @@ pub mod migrate_purchasing;
 /// measurements that stay `REAL` (§3.2 E) and two booleans (§3.2 H).
 #[cfg(feature = "sqlite-engine")]
 pub mod migrate_quality;
+/// ADR-0108 **Step 8** — the quoting family's STRICT schema, carry and gate arm.
+/// Eleven tables across eight owning modules; **seven carry rows and four are
+/// schema-only** (§6.3 drops quoting job history). It lands §3.2 D's six
+/// float-money column instances as R2 canonical-decimal `TEXT` — three proved
+/// per row, three declared without a row behind them — and never as `REAL`.
+#[cfg(feature = "sqlite-engine")]
+pub mod migrate_quoting;
 /// ADR-0108 Step 4 — the migrator + the reconciliation gate. Behind the
 /// default-OFF `sqlite-engine` feature: this is the ONE binary that links both
 /// engines, because it reads DuckDB and writes SQLite.

@@ -517,6 +517,43 @@ the correct fallback is to *stop* — leave the quoting family on DuckDB and kee
 the reversible window open — not to migrate it as `REAL`. That is the rule-11 call
 and it is written here so a later session cannot quietly take the easy branch.
 
+> ✅ **LANDED AS R2 2026-08-03 (S461, Step 8), migrator half. The stop rule was
+> not needed and was not softened.** All **six** column-instances are declared
+> `TEXT` in a `STRICT` table by `apps/aberp/src/migrate_quoting.rs` — the table
+> above lists five rows but `quoting_parameters` contributes two columns. Not one
+> is `REAL`, and `every_section_3_2_d_money_column_is_text_and_never_real` asserts
+> both halves (is-`TEXT` **and** is-not-`REAL`) so a column declared twice cannot
+> pass on the positive alone.
+>
+> ⚠ **But only THREE of the six are proved on real rows, and the reason is
+> §6.3's own drop policy.** `quoting_materials.cost_per_kg_eur` and
+> `quoting_parameters.{machining_rate_eur_per_minute, cad_cam_rate_eur_per_hour}`
+> cross with rows and get the full per-row round-trip arm. `quote_pricing_jobs`,
+> `quote_intake_log` and `quote_price_snapshots` are **job history**, §6.3 carries
+> none of it, so their money columns cross with a **declared type and no row
+> behind it**. Their guard is a `pragma_table_info` assertion, because a
+> `typeof()` sweep over zero rows passes **vacuously over a `REAL` declaration** —
+> that is the honest limit of what Step 8's migrator half proves, and it is stated
+> here rather than left for the adversarial to discover.
+>
+> **The carry uses `migrate_products::canonical_decimal_from_f64` verbatim**
+> (Part C's, one function now with five callers): shortest round-tripping
+> rendering → **`Decimal::from_str_exact`**, never the lenient `from_str` →
+> refuse non-finite → refuse scale > 6 → refuse unless it converts back to the
+> **identical** `f64`. Pinned by
+> `an_f64_money_value_that_cannot_cross_exactly_is_refused_not_rounded`, which
+> refuses `1.2345678` on a real quoting row **and** shows `1.234567` crossing, so
+> the limit is a boundary and not a blanket. §6.3's reason for dropping the job
+> history survives the existence of that converter: `total_price_eur` is the
+> **output of the f64 pricing pipeline** and an ordinary DEV row sits at scale
+> 15, so an R2 carry would hard-fail the migration on ordinary data and force
+> exactly the relax-or-round choice this section forbids.
+>
+> **What is NOT done: the Rust type change.** §7's "`f64 → Decimal` at the Rust
+> type" is the Rust half. `quote_pricing_pipeline`'s arithmetic and its
+> calibration tests are untouched, and that half is what the stop rule is really
+> about.
+
 #### E — non-money floats: `DOUBLE` → `REAL`, unchanged. Enumerated so the money census is provably complete.
 
 `margin_profiles.gross_margin_pct`, `min_margin_pct`; `quote_pricing_jobs.margin_override_pct`,
@@ -616,6 +653,30 @@ below**); `work_orders.actual_machining_minutes`;
 > > equal the `f64` DuckDB held, a `NaN` therefore hard-stopping), and the
 > > fixture's `wo-02` carries exactly the scale-7 duration the argument turns on.
 
+> ⚠ **CORRECTED 2026-08-03 (S461, Step 8): this enumeration contains a table
+> name that does not exist, a column that no longer exists, and four columns it
+> never named.** This is the **fourth consecutive** Part to find a census naming
+> error (G: `purchase_order_sequence`; H: `email_relay_queue`; I: the AVL family
+> had no entry at all), and §3.2 A's own note says why it matters — *a name that
+> does not exist returns zero hits and reads as "already done"*.
+>
+> | census says | measured |
+> |---|---|
+> | `quote_calibration.{estimated,actual}_minutes` | the table is **`quote_calibration_samples`** (`quote_calibration.rs:49`). `CREATE TABLE … quote_calibration (` returns **zero** hits anywhere in the tree. |
+> | `quoting_materials.machinability_index` | **the column is GONE.** S418 replaced it with `machining_difficulty` and dropped it (`quoting_materials.rs:131`). The census invites a later session to carry a column that does not exist. |
+> | `quoting_parameters.{scrap_factor, profit_margin_base, overhead_factor, min_margin, exotic_material_tax, setup_base_min, cad_cam_base_hours}` | correct, but **three more `DOUBLE` knobs are unnamed**: `mrr_rough_ref_cm3_per_min`, `t_finish_min_per_cm2`, `setup_5axis_min` — all three landed by the same S418 commit as two that *are* listed. |
+> | — | **`quoting_stock_adjustments.price_adjustment_pct` is in no section at all.** It is a **percentage, not money** — the same call this section makes for `margin_profiles.gross_margin_pct` — so it crosses as `REAL`. The classification is stated in `migrate_quoting.rs` rather than left to inference, because "price" in the name is exactly what would make a later session reach for R2. |
+>
+> ✅ **All 21 carried §3.2 E floats crossed as `REAL`, bit-exact, 2026-08-03
+> (S461).** Each goes through `migrate_quality::finite_measurement` — Part E's
+> "any future §3.2 E column on a nullable float must use it" applied rather than
+> re-derived, and run on the `NOT NULL` ones too because that is what makes the
+> claim measured. The family test carries a **scale-17** value
+> (`0.030000000000000426`) on `quoting_machines.buffer_pct` and
+> `margin_profiles.gross_margin_pct`: an R2 carry would have hard-failed the
+> whole migration on an ordinary tunable, which is Part E's argument, restated on
+> this family's own data.
+
 #### F — integers and identity: `BIGINT`/`INTEGER` → `INTEGER`, unchanged
 
 `invoice.sequence_number`, `invoice_sequence_state.next_number`,
@@ -672,6 +733,26 @@ below**); `work_orders.actual_machining_minutes`;
 > G, and no family has raised a row for it. Recorded in §9 as well, because the
 > correction is to the census.
 
+> ⚠ **CORRECTED A THIRD TIME 2026-08-03 (S461, Step 8): this list names not one
+> quoting integer, and the family has eleven.** Part G raised exactly this gap
+> for purchasing and the correction was applied to purchasing only — which is the
+> narrow-fix shape, not a fix of the census.
+>
+> On the **carried** tables: `quoting_materials.lead_time_default_days`,
+> `quoting_parameters.{id, setup_amortization_threshold}`,
+> `quoting_complexity_rules.{count_min, count_max}` (`count_max` **nullable** —
+> the family's only nullable integer, an open-ended top bucket). On the
+> **not-carried** ones: `quote_pricing_jobs.{quantity, attempt_n, lead_time_days,
+> lead_time_override_days}` and `quote_intake_log.quantity`.
+>
+> **None is R2**, for Part G's reason: Part C's five became `TEXT` because they
+> were *floats*; these are exact whole-unit counts (a lead time in days, a
+> feature count, a threshold), and rendering an `i64` as a decimal string would
+> **introduce** a representation rather than preserve one. §3.2 H's mechanical
+> `BIGINT`/`INTEGER` → `INTEGER` settles all eleven and no new decision was
+> needed. The `INTEGER`-declared ones additionally **widen** 32→64 bit, like
+> `attempt_n` did in Part H.
+
 **`vat_rate_basis_points INTEGER` is why VAT never touches a float *in storage*** —
 27% is `2700`, not `0.27`. The **storage** property is preserved verbatim, and
 F-6a's storage-side float-coercion class cannot reach the VAT rate. F-6a reaches
@@ -718,6 +799,7 @@ migrated row** — a `'text'` anywhere means the chain will not link.
 | `DOUBLE` | `REAL` | category E only |
 | `BOOLEAN` (5 sites) | `INTEGER` | `rusqlite` binds `bool` ↔ `INTEGER` 0/1 natively |
 | `DATE` (7 sites: `invoice.exchange_rate_date`, `payment_deadline`, `delivery_date`; `quote_intake_log.valid_until` ×2) | **`TEXT`** | already ISO-8601 `YYYY-MM-DD` on the wire, already read via `CAST(... AS VARCHAR)`. The `CAST` becomes a no-op and stays (harmless, and removing it is churn). |
+| `TIMESTAMP` (4 sites: `quote_intake_log.deal_issued_at`, `refresh_acked_at`, ×2 for the daemon-side and route-side ladders) | **`TEXT`** | ⚠ **ADDED 2026-08-03 (S461, Step 8) — this row did not exist, and `TIMESTAMP` is the one declared type in the tree that had no §3.2 H entry at all.** Declared at `log_table.rs:183,189` and mirrored in `quote_intake_query.rs:577,583`. Crosses as `TEXT` for the same reason `DATE` does; the app already writes and reads RFC-3339 strings, and this table's own module doc states "timestamps are stored as RFC3339 VARCHAR" for its other stamps — so `TEXT` is what removes the fork rather than what creates one. |
 | `DECIMAL(p,s)` | `TEXT` or `INTEGER` per §3.2 | `STRICT` **rejects** `DECIMAL` as a declared type — which is the point (PR #49 §6: it forces the decision rather than allowing deferral). |
 
 ### 3.3 How NAV XML and the invoice PDF consume it — no float, end to end
@@ -1298,7 +1380,7 @@ goes red**. A gate against B1 that has never been shown to catch B1 is not a gat
 | **partners / products / purchasing** | Row-by-row carry. | Operator-entered master data; cheap; needed for the customer-journey e2e. |
 | **inventory (`stock_movements`, cache cols)** | ~~Carry `stock_movements` (append-only ledger); **rebuild** the `products.stock_qty` cache from `SUM(qty_delta)` **in Rust** via the existing `rebuild-stock-cache` path.~~ **CORRECTED 2026-08-01 (S455): carry everything, including the cache columns, verbatim.** | ~~The cache is derived by definition, and rebuilding it exercises §3.4's Rust-side fold on real data.~~ **The rebuild would disarm the gate.** The reconciliation arm compares the two sides row-for-row; a migrator that re-derived `stock_qty` would make a DuckDB cache that had legitimately drifted — the exact condition ADR-0061 §3's `rebuild-stock-cache` recovery path exists for — show as a per-row difference, and the only way back to green would be to teach the gate the transformation, i.e. **to verify the extraction against itself (B4)**. It would also make the migration a repair tool, which §6.3's own mirror argument rules out three paragraphs above: *a migration is not a repair tool.* A cache that is wrong on DuckDB must cross as wrong and be repaired by the path that owns that repair. |
 | **work orders / BOM / QA / QC / dispatch** | Row-by-row carry. | Small; the customer-journey e2e traverses them. |
-| **quoting (`quote_pricing_jobs`, `quote_intake_log`, `quoting_*`, `supplier_prices`)** | **Drop and re-seed from the tunables defaults; do not carry job history.** | Step 8 changes five columns from `f64` to `Decimal` (§3.2 D). Carrying `f64` job history means writing a lossy `f64 → Decimal` converter for data that is DEV scratch. `[[feedback_dev_db_disposable]]` is exactly the licence to not build that. **The tunables/materials/machines rows ARE carried** (they are operator-configured, not scratch) — through the `Decimal` types, with a loud refusal on any value that does not round-trip. |
+| **quoting (`quote_pricing_jobs`, `quote_intake_log`, `quoting_*`, `supplier_prices`)** | **Drop and re-seed from the tunables defaults; do not carry job history.** | Step 8 changes five columns from `f64` to `Decimal` (§3.2 D). Carrying `f64` job history means writing a lossy `f64 → Decimal` converter for data that is DEV scratch. `[[feedback_dev_db_disposable]]` is exactly the licence to not build that. **The tunables/materials/machines rows ARE carried** (they are operator-configured, not scratch) — through the `Decimal` types, with a loud refusal on any value that does not round-trip.<br><br>✅ **EXECUTED 2026-08-03 (S461, Step 8), and this row's own table list was incomplete.** The family is **eleven** tables, not the four this row names, and §7's Step-8 line names five *files* covering only six of them — `margin_profiles`, `quoting_machines`, `quote_price_snapshots` and `quote_calibration_samples` are built by modules neither list mentions. **Seven carry rows** (`margin_profiles`, `quoting_machines`, `quoting_materials`, `quoting_parameters`, `quoting_complexity_rules`, `quoting_tolerance_multipliers`, `quoting_stock_adjustments`) and **four are schema-only** (`quote_pricing_jobs`, `quote_intake_log`, `quote_price_snapshots`, `quote_calibration_samples`).<br><br>⚠ **"Drop" means the ROWS, never the schema, and the distinction is load-bearing.** All eleven tables' `STRICT` DDL crosses, because that is where §3.2 D's three remaining money columns get their `TEXT` declaration; dropping the schema too would leave them undeclared and let the cutover make them `REAL`. And the drop is a **stated number**, not a silence: `QuotingCarry::job_history_rows_dropped` counts the DuckDB rows deliberately left behind and the gate prints them per table, because "0 rows on SQLite" and "N rows dropped on purpose" look identical from the SQLite side and only one of them is what this row authorised (rule 11). A row appearing in any of the four **reds** the gate.<br><br>**"Re-seed from the tunables defaults" was not needed and was not done.** This row's next sentence — *the tunables/materials/machines rows ARE carried* — is the more specific instruction and it is the one followed; a re-seed on top of a carry would have overwritten operator-tuned values with defaults. |
 | **`quote_pricing_jobs` CAD artefacts** | Not touched. | Filesystem, AES-GCM, keychain-keyed. The DB holds a path; the path is carried verbatim. |
 | **email outbox / relay queue** | Carry. | Small; the e2e sends an invoice email. |
 
@@ -2452,6 +2534,43 @@ email/relay → **approved-vendor list (`avl_vendors`)**.
   do not migrate it as `REAL` (§3.2 D).** The reversible window stays open; that is
   what it is for.
 
+> ✅ **MIGRATOR HALF LANDED 2026-08-03 (S461).** `apps/aberp/src/migrate_quoting.rs`
+> + `apps/aberp/tests/adr0108_step8_quoting_family.rs` (19 pins), wired into
+> `migrate_families` / `reconcile` beside Parts B–I. **The stop rule was not
+> needed and was not softened.**
+>
+> ⚠ **The five-file list above is not the family boundary, and reading it as one
+> would have left four tables uncrossed.** `crates/aberp-quote-intake/src/log_table.rs`,
+> `quote_intake_query.rs`, `quote_pricing_jobs.rs`, `quoting_tunables.rs` and
+> `quoting_materials.rs` account for **six** of the family's **eleven** tables. The
+> other five — `margin_profiles`, `quoting_machines`, `quote_price_snapshots`,
+> `quote_calibration_samples` and (via `quoting_tunables.rs`, but unnamed anywhere)
+> `quoting_stock_adjustments` — are built by modules this line does not mention.
+> **This is Part I's failure one level up**: there, a table no *family boundary*
+> named; here, four tables no *step description* named, in a list that reads as
+> complete. The eleven are enumerated in `migrate_quoting.rs`'s module docs,
+> grepped from `CREATE TABLE` rather than recalled.
+>
+> **What landed:** eleven `STRICT` DDLs; a typed row-by-row carry of the seven
+> operator-configured tables in **one `BEGIN IMMEDIATE`**; §3.2 D's six money
+> instances as R2 `TEXT` (three proved per row, three declared — see §3.2 D);
+> 21 §3.2 E floats as bit-exact `REAL` through `finite_measurement`; eleven
+> §3.2 F integers and four §3.2 H booleans as `INTEGER`; `unique_natural_keys`
+> on all seven carried tables, keyed on the **tenant-scoped composite** — which
+> on this family is not redundant with the source's `PRIMARY KEY`, because not
+> one of those PKs is tenant-scoped (§9).
+>
+> **The reconciliation arm compares the FULL column set per row** (B3), plus a
+> per-money-column Σ folded in Rust over exact decimals on both sides — never a
+> SQL `SUM`, which under R2 would coerce `TEXT` to `REAL` inside the gate that
+> exists to catch exactly that.
+>
+> **Still owed: the Rust half** — `f64 → Decimal` at the type level, the
+> `quote_pricing_pipeline` arithmetic and its calibration tests. Part H's finding
+> runs in this direction too: `quote_refuse.rs::run_refuse_saga` writes
+> `quote_intake_log`, `audit_ledger` and `outbound_email_queue` in **one**
+> transaction, so the email family's Rust half cannot cross unless this one does.
+
 **Step 9 — DEV soak + the report.** Run the DEV tenant on SQLite for a defined
 period with the DuckDB build one command away. Produce the measured comparison
 ADR-0107 §3.1 left as "unmeasured": bundle size delta, boot time, invoice-issue
@@ -2553,6 +2672,10 @@ it or an explicit "out of scope".
 | **B3 — THE INVOICE FAMILY'S PER-ROW ARM COMPARED 4 OF 29 COLUMNS, AND THE ÁFA-BEARING ONES WERE NOT AMONG THEM.** `migrate_billing`'s reconciliation compared `invoice.{exchange_rate, huf_equivalent_total}` and `invoice_line.{quantity, unit_price}` and nothing else. **Carried and never value-compared:** `vat_rate_basis_points` and `vat_rate_kind` — which between them decide what the NAV filing carries and, per ADR-0103 Invariant V, which `<lineVatRate>` choice element a line emits — plus `sequence_number` / `fiscal_year` / `series_id` (the three columns the számla number is made of), `customer_id`, `issue_date`, `currency`, `idempotency_key`, `description`, `note` and the five `bank_account_*` columns. `invoice_series` and `invoice_sequence_reservation` got **row counts only**, which cannot see a reservation whose `status` moved from used to voided. ⚠ **The scope was DOCUMENTED, which is what made it survive**: §6.3's bullet said "per-money-column", so the arm matched the plan and the plan was wrong — every other Step-7 family compares every column, and the exception was the one family the plan exists to protect. | ✅ **CLOSED 2026-08-02 (B3).** All five tables now go through **one** per-row comparator that walks a **column census** rather than a hand-picked list, and names the drifted column in the failure (a gate that says only "the rows differ" on a legally-binding record costs the next reader an hour). `invoice_sequence_state` was not duplicated — it already had a bucket-by-bucket arm carrying the S444 "can re-issue a számla number" message, and that arm gained its fourth column (`updated_at`) instead (rule 12). Σ folds are unchanged and are a **supplement** to the per-row arm, not a substitute. §6.3's bullet is rewritten to require full-column per-row for **every** family and to say plainly that its old "money/decimal only" wording is what shipped here. Two pins: `every_carried_invoice_column_is_compared` walks the census against `pragma_table_info`, so a column added to the carry and forgotten by the comparison reds instead of riding along — which is exactly how these four became "the compared ones"; and `a_drift_in_a_previously_uncompared_column_reds_the_gate` mutates **nine** columns across the four tables, one per copy, because one column's mutation reddening is not evidence for another's. |
 | **R1 — the `declared_as` tokenisation trap was still ARMED in `migrate_email`.** `migrate_email.rs:684`'s test helper matched a column's declared type with `l.split_whitespace().nth(1) == Some(ty)`. A **nullable** column carries no `NOT NULL`, so its type token is last on the line and reads as `TEXT,` — the helper then answers "not declared TEXT" for exactly the nullable columns. Part I found and fixed its own copy (`migrate_avl.rs:589`) and pinned it; the email copy was left. **No live false-green**: both of email's call sites ask about `NOT NULL` columns, so today the trap would be a false RED. It is the `!declared_as(…)` form — which a later Part is likelier to write — that turns it into a false GREEN. | ✅ **CLOSED 2026-08-02 (R1).** The `.trim_end_matches(',')` is back-ported verbatim from `migrate_avl`, and so is the pin: `declared_as_sees_nullable_columns_too` asks about five of the table's nullable columns and additionally asserts the helper still discriminates (a helper that answered `true` to everything would pass the first half). Disarmed **before** it fires rather than after, which is the whole reason it was worth a commit of its own scope. |
 | **R2 (doc-only) — the carry is TEN PER-FAMILY TRANSACTIONS ON ONE CONNECTION, not one global transaction, and §6.3 read as though it were atomic.** Each family opens its own `BEGIN IMMEDIATE` and commits it, so a refusal in family *n* leaves families *1..n-1* committed on the SQLite side. | ✅ **CORRECTED 2026-08-02, in §6.3, as wording rather than mechanism.** The plan now says **per-family transactional with a refusal guard** and states why that is safe: the DuckDB file is read-only and never written, the SQLite file is a fresh copy, and a failed run is **discarded whole** rather than resumed — so the unit of atomicity that matters is *the run*, enforced by discard, not by a transaction. What must not be inferred from the old wording is that a half-carried copy is impossible on disk: it is possible, it is the expected state after a refusal, and what makes it harmless is that nothing consults it. A single ten-family transaction was considered and rejected — it would hold one write transaction across the whole run for a property discard already provides. |
+| **S8-1 — EVERY QUOTING `PRIMARY KEY` IS UN-TENANT-SCOPED, so the product is single-tenant-shaped in the family that prices the work.** Measured 2026-08-03 (S461): `quoting_materials`'s PK is the bare `grade`, `quoting_tolerance_multipliers`'s the bare `tolerance_range`, `quoting_parameters`'s the bare `id`, and `margin_profiles` / `quoting_machines` / `quoting_complexity_rules` / `quoting_stock_adjustments` key on a bare surrogate `id` while every read in all seven modules filters `WHERE tenant_id = ?`. So two tenants **cannot** hold different tunables for the same grade or tolerance band — the second tenant's write is a PK violation, not an isolated row. This is a **pre-existing** modelling defect with nothing to do with the engine: it is identical on DuckDB today. | **Out of scope here (rule 3), and NOT closed by the crossing.** The migrator preserves each PK verbatim, because dropping one would remove an invariant the source has and widening one would add an invariant it does not. What Step 8 *does* add is a guard that does not depend on the PK: `unique_natural_keys` keys the gate on the **tenant-scoped composite** on all seven carried tables, so on this family the refusal is doing real work rather than restating the PK — a database in which two tenants share a grade (reachable by a repair, a restore or an older schema, not by the product) is refused rather than silently collapsed onto one `BTreeMap` entry with the row count and both sweeps still green. Pinned by `a_duplicate_tenant_scoped_key_is_refused`, which builds exactly that source. **Fixing the PKs is a product change to seven tables and their writers**, and it belongs to whoever makes quoting genuinely multi-tenant — not to a migrator half. |
+| **S8-2 — §3.2's CENSUS HAS NOW BEEN WRONG ABOUT NAMES IN FOUR CONSECUTIVE PARTS, and the per-Part correction is not fixing it.** G: `purchase_order_sequence` does not exist. H: `email_relay_queue` is a module, not a table. I: the AVL family had no census entry at all. Step 8: `quote_calibration` does not exist (`quote_calibration_samples` does), `quoting_materials.machinability_index` was dropped by S418 and is still listed, three S418 `DOUBLE` knobs are unlisted, `quoting_stock_adjustments.price_adjustment_pct` is in no section, eleven quoting integers are in no section, and `TIMESTAMP` had no §3.2 H row. **Each Part has corrected its own slice and left the shape intact** — which is B1's lesson (*a copy of a decision recorded elsewhere goes stale silently*) applied to the census instead of to the scanner. | **Recorded, not fixed here.** Every error above **is** corrected in §3.2 by this Part, so the census is accurate today. What is not built is the thing that would keep it accurate: **a gate that walks §3.2's table and column names against the tree and reds on a name that matches nothing** — the census equivalent of T-8's P14 probe, which exists precisely because a hand-maintained list cannot be trusted to stay true. It is a small awk gate over `CREATE TABLE` / `ADD COLUMN` and it would have caught all four Parts' errors on the day they were introduced. **Belongs to the adversarial review of Parts B–I and Step 8, which has not happened**, because that review is the first thing that reads the whole census as one artefact rather than one family at a time. |
+| **M-1 (Step 8 adversarial, PR #55) — `quoting_materials.machining_difficulty` IS NULLABLE IN THE SOURCE, and the carry read it as a bare `f64`.** On a **pre-S418** DuckDB the column arrives via `ALTER TABLE … ADD COLUMN IF NOT EXISTS machining_difficulty DOUBLE` — nullable, no `DEFAULT` — and `backfill_machining_difficulty` (`quoting_materials.rs:390-401`) is **grade-filtered** to the seven-grade `MACHINING_DIFFICULTY_SEED`, so **any operator-added grade keeps `NULL` permanently**. The backfill's own doc comment says exactly that. `migrate_quoting::read_duckdb` read the column non-`Option`, so on such a database `carry_quoting` died with `Err(InvalidColumnType(4, "machining_difficulty", Null))` — **the whole migration aborting at cutover, naming neither the tenant nor the row.** The fresh-table schema is `NOT NULL DEFAULT 1.0`, which is why none of the 19 original pins could reach it. | ✅ **CLOSED 2026-08-03 (S462), same branch.** The carry matches **the product's own contract** rather than inventing a second answer: `row_to_material` (`quoting_materials.rs:952`) reads `row.get::<_, Option<f64>>(4)?.unwrap_or(1.0)`, so the carry coalesces `NULL → 1.0` (the 6061-T6 reference) and the target keeps `NOT NULL DEFAULT 1.0`, which the coalesce guarantees is satisfiable. **Scoped to this one column, deliberately** — measured, not assumed: both `BOOLEAN`s are `NOT NULL` with no ladder, and `backfill_s418_parameters` (`quoting_tunables.rs`) is `UPDATE … WHERE <col> IS NULL` with **no row filter**, so all seven S418 knobs *including both money knobs* are populated on every row. ⚠ **The fix is a tightening, not a loosening**: every `real` is now read as `Option<f64>` and resolved against the table's declared `Spec::null_real` set, and a `NULL` on a column **not** in that set is a hard `Err` naming table, column and row — strictly better than the unattributed `InvalidColumnType` it replaces. Two pins: `a_null_machining_difficulty_crosses_as_the_product_default_not_an_abort` (built on a hand-rolled pre-S418 table, because the current `ensure_schema` cannot produce that shape) and `a_null_real_without_a_declared_coalesce_is_refused_and_names_the_row`. |
+| **R-1..R-5 (Step 8 adversarial, PR #55) — flagged, NOT blocking, NOT fixed here.** Logged one line each so the review's non-blocking findings survive the PR rather than living only in its thread. | **R-1** — multi-tenant quoting is impossible today and the crossing now **mirrors that to both engines**, which makes a pre-existing defect look sanctioned; see **S8-1** above, which is the same finding and carries the argument. **R-2** — `ensure_quoting_schema` is called under `if !present.is_empty()` in `carry_quoting`, which deviates from `migrate_avl` / `migrate_email`'s unconditional build; it is a second pattern for one job (rule 7). ⚠ **Sharpened 2026-08-03 while pinning M-1: it is not quite "harmless".** The guard is all-or-nothing across the family, so a source holding **one** quoting table gets **all eleven** built on SQLite, and the gate then hard-stops on the ten it did not carry — *"exists in SQLite but NOT in DuckDB"*. That is the **safe** direction (it refuses rather than passing), and a real DuckDB written by any current build has the whole family, so no real migration reaches it; but it means the guard buys nothing and costs a confusing verdict on a partial source. The M-1 pin scopes its gate assertion to `quoting_materials` for exactly this reason and says so inline. **The fix is to build per table, beside the per-table presence the carry already computes** — one line, but it belongs with whoever reconciles R-2 against the avl/email pattern, not to a MUST-FIX commit. **R-3** — `reconcile_job_history` hard-stops the (DuckDB-present, SQLite-absent) direction but **not** (DuckDB-absent, SQLite-present); the carried-table arm does stop both, so the two arms disagree. **R-4** — `canonical_decimal_from_f64`'s refusal messages are **inventory's** ("a stocked quantity", `QUANTITY_SCALE`, `stock_movements.qty_delta`), so a quoting money refusal reads as if it came from the wrong subsystem; the *behaviour* is correct and the column/row naming is accurate, only the prose is Part C's. **R-5** — `migrate_quoting`'s "every source `DEFAULT` is preserved" doc sentence is **overbroad**: the S418 *ladder* columns carry no `DEFAULT` on either engine (deliberately — the DuckDB DEFAULT-on-replay trap), so the sentence describes the base DDL only. **All five belong to the session that lands this branch or to the Rust half; none changes a stored value.** |
 | ADR-0107 §2 lists `db_writer_lock` as retirable; ADR-0107 §3 B-cost-1 says money is already integer; ADR-0107 §4.1 Phase 0 does not scope the DDL rewrites | Amended in Step 1's PR body per PR #49's own deferral ledger, plus §1.1 G-2's `.sql` correction which PR #49 also missed |
 
 ---
