@@ -1,201 +1,95 @@
-//! ADR-0108 Step 1 — the **engine ↔ DB-path agreement rule**, as a pure function.
+//! The **DB-path shape rule** for the boot guard trio, as a pure function.
 //!
-//! # What it defends (ADR-0108 C-I / C-II)
+//! `guard_tenant_matches_build` clears the tenant NAME; `guard_db_matches_tenant`
+//! clears the resolved PATH against the tenant. Neither says anything about the
+//! path being a well-formed DuckDB database path at all, and this module is that
+//! third check:
 //!
-//! The whole reversibility argument of the SQLite migration reduces to one
-//! property: **a `sqlite-engine` build never opens `aberp.duckdb`.** It opens
-//! `aberp.sqlite`, and the DuckDB file is therefore byte-unmodified for the
-//! entire reversible window. ADR-0108 §6.1 states that property; this module is
-//! the mechanism that makes it *checked* rather than hoped.
+//! * **Extension agreement.** The resolved DB path must end in `.duckdb`.
+//!   `extension()` is `None` for `:memory:` and for an extension-less path; both
+//!   are refusals, not exemptions.
+//! * **No URI-shaped path.** A name beginning with `file:` is refused, because a
+//!   URI-aware opener reads it as a scheme and opens the ABSOLUTE path that
+//!   follows, while `Path` reads the same string as a RELATIVE path — so the
+//!   guards and the opener would be talking about different files.
 //!
-//! Two arms, both here:
+//! **Pure.** No `cfg!`, no environment, no filesystem — the path is the only
+//! input, which is what makes every arm testable from one build. Comparison is
+//! lexical on the components given: the caller canonicalises first if it wants
+//! that, and a lexical check cannot be defeated by a path that does not exist
+//! yet.
 //!
-//! * **C-I — extension agreement.** A [`Engine::Sqlite`] binary whose resolved
-//!   DB path does not end in `.sqlite` is refused; a [`Engine::DuckDb`] binary
-//!   whose path does not end in `.duckdb` is refused.
-//! * **C-II — DEV-only.** A [`Engine::Sqlite`] binary whose resolved path lands
-//!   anywhere under the production root (`~/.aberp/`) is refused. The migration
-//!   is authorised for the DEV tenant only; nothing in ADR-0108 §7 may read,
-//!   write, or stat production data.
-//!
-//! # Why it is a pure function and not a `cfg!` block (ADR-0108 §7 Step 1, F6)
-//!
-//! As first drafted the refusal was "inert while no `sqlite-engine` feature
-//! exists" — which would leave the arm that actually carries C-I
-//! (*a SQLite binary refuses a non-`.sqlite` path*) **unbuildable, and therefore
-//! unpinned, across Steps 1 and 2** — including Step 2, the step that links
-//! `rusqlite` into the tree. Taking the engine as an *argument* instead of
-//! reading `cfg!` makes **both arms unit-testable and mutation-verifiable in
-//! Step 1 with no feature enabled at all**. Step 3 adds only the three-line
-//! `cfg!`-driven caller at the boot site.
-//!
-//! The generalised ordering rule ADR-0108 draws from this: **a refusal whose
-//! test cannot be written yet is not landed yet.**
-//!
-//! # Deliberately NOT wired into `serve` yet
-//!
-//! Step 1 lands the decision and its pins. There is no caller: with only one
-//! engine in the tree the DuckDB arm would start refusing the many legitimate
-//! non-`.duckdb` DB paths that tests and tooling use, which is scope this step
-//! does not own. Step 3 wires the boot cross-check when the second engine (and
-//! therefore the choice) actually exists.
+//! History: this began as the engine ↔ DB-path cross-check of the retired
+//! DuckDB→SQLite migration experiment (ADR-0108 C-I/C-II). The experiment is
+//! withdrawn and the tree is DuckDB-only again, so the engine-selector half is
+//! gone; the two refusals above were live in the default build and are kept
+//! exactly as they were. See `adr/0107` and `adr/0109` for why the engine did
+//! not prove swappable.
 
 use std::path::{Path, PathBuf};
 
-/// Which storage engine a binary was **built** with. ADR-0108 §2.2 D1: the
-/// selector is compile-time (`sqlite-engine` cargo feature, default OFF), so
-/// exactly one engine is linked into any given binary. This enum is the
-/// *value* form of that choice, so the decision below can be tested for both
-/// engines from one build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Engine {
-    /// The default build. Opens `*.duckdb`.
-    DuckDb,
-    /// The `sqlite-engine` build. Opens `*.sqlite`.
-    Sqlite,
-}
-
-impl Engine {
-    /// The file extension this engine's DB path must carry.
-    ///
-    /// This is the whole of C-I: the two engines use **two different files**,
-    /// which is where the reversibility comes from — not from the selector
-    /// (ADR-0108 §2.2, Q1).
-    pub fn required_extension(self) -> &'static str {
-        match self {
-            Engine::DuckDb => "duckdb",
-            Engine::Sqlite => "sqlite",
-        }
-    }
-}
-
-impl std::fmt::Display for Engine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Engine::DuckDb => f.write_str("duckdb"),
-            Engine::Sqlite => f.write_str("sqlite"),
-        }
-    }
-}
-
-/// Why a resolved DB path is not acceptable for the engine that was built.
+/// Why a resolved DB path is not acceptable.
 ///
-/// Every variant is a **refusal**, and the message names the engine, the path,
-/// and what was expected — CLAUDE.md rule 11: the caller must not be able to
-/// paper this over into a default.
+/// Every variant is a **refusal**, and the message names the path and what was
+/// expected — CLAUDE.md rule 11: the caller must not be able to paper this over
+/// into a default.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum EngineMismatch {
-    /// C-I. The path's extension does not match the linked engine.
+pub enum DbPathMismatch {
+    /// The path's extension is not `duckdb`.
     #[error(
-        "engine/DB-path mismatch: this is a `{engine}` build but the resolved DB path \
-         `{path}` does not end in `.{expected}` — a {engine} build must never open the \
-         other engine's file (ADR-0108 C-I)"
+        "DB-path mismatch: the resolved DB path `{path}` does not end in `.{expected}` — \
+         the transactional store is DuckDB and its file must be named as one"
     )]
     Extension {
-        /// The engine linked into this binary.
-        engine: Engine,
         /// The resolved DB path that was refused.
         path: PathBuf,
-        /// The extension the engine requires.
+        /// The extension required.
         expected: &'static str,
     },
 
-    /// **S449.** The path is URI-shaped, so the engine and every path-based
-    /// guard would disagree about which file it names.
+    /// The path is URI-shaped, so the opener and every path-based guard would
+    /// disagree about which file it names.
     #[error(
-        "URI-shaped DB path: `{path}` begins with a `file:` scheme. The bundled SQLite is \
-         compiled with `-DSQLITE_USE_URI` (libsqlite3-sys build.rs:140), so it parses such a \
-         name as a URI and opens the ABSOLUTE path inside it — while `Path` reads the same \
-         string as a RELATIVE path and every guard here, including the production-root check, \
-         clears it on that reading. Pass a plain filesystem path (ADR-0108 C-II)"
+        "URI-shaped DB path: `{path}` begins with a `file:` scheme. A URI-aware opener \
+         parses such a name as a URI and opens the ABSOLUTE path inside it — while `Path` \
+         reads the same string as a RELATIVE path and every guard here clears it on that \
+         reading. Pass a plain filesystem path"
     )]
     UriShapedPath {
         /// The URI-shaped path that was refused.
         path: PathBuf,
     },
-
-    /// C-II. A `sqlite-engine` build resolved a path under the production root.
-    #[error(
-        "DEV-only violation: this is a `sqlite` build but the resolved DB path `{path}` \
-         is under the production root `{prod_root}` — the ADR-0108 migration is \
-         authorised for the DEV tenant only (C-II)"
-    )]
-    SqliteUnderProdRoot {
-        /// The resolved DB path that was refused.
-        path: PathBuf,
-        /// The production root it landed under.
-        prod_root: PathBuf,
-    },
 }
 
-/// Does `path` agree with the `engine` this binary was built with?
-///
-/// **Pure.** No `cfg!`, no environment, no filesystem — every input is an
-/// argument, which is what makes both arms testable from a single default
-/// build (see the module docs, ADR-0108 F6).
-///
-/// `prod_root` is the production data root, normally `~/.aberp` — passed in
-/// rather than resolved here so this stays pure and so a test can point it at
-/// a scratch directory. `None` skips the C-II arm (the caller could not resolve
-/// a home directory); it does **not** weaken C-I.
-///
-/// Path comparison is **lexical on the components given**, deliberately: the
-/// caller resolves/canonicalises before calling if it wants that, and a purely
-/// lexical check cannot be defeated by a path that does not exist yet — which
-/// is the case for `aberp.sqlite` before the migrator has run.
-pub fn engine_path_agrees(
-    engine: Engine,
-    path: &Path,
-    prod_root: Option<&Path>,
-) -> Result<(), EngineMismatch> {
-    // S449 — the URI arm, FIRST, because it is the one that makes the two arms
-    // below unsound rather than merely incomplete. Both of them, and
-    // `premigration::ensure_dev_only`, decide from the string read as a
-    // `Path`. The bundled SQLite reads a leading `file:` as a URI scheme and
-    // opens the absolute path that follows, so for exactly these strings the
-    // guards and the opener are talking about different files —
-    // `file:/Users/x/.aberp/prod/aberp.sqlite` is a RELATIVE path to `Path`
-    // (first component `file:`), clears the production-root check, carries the
-    // extension `sqlite`, and opens production.
+/// The extension a DuckDB database path must carry.
+pub const REQUIRED_EXTENSION: &str = "duckdb";
+
+/// Is `path` a well-formed DuckDB database path?
+pub fn db_path_agrees(path: &Path) -> Result<(), DbPathMismatch> {
+    // The URI arm goes FIRST, because it is the one that makes the extension
+    // arm below unsound rather than merely incomplete: it decides from the
+    // string read as a `Path`, and for exactly these names the guard and the
+    // opener are talking about different files.
     //
     // Refused rather than normalised: rewriting a URI into the path it denotes
-    // would mean re-implementing SQLite's URI parser (query parameters, `%`
-    // escapes, `?vfs=`, authority) in a security guard, and being wrong there
-    // is the same failure with more code. Nothing in this tree passes a URI.
+    // would mean re-implementing a URI parser (query parameters, `%` escapes,
+    // authority) in a security guard, and being wrong there is the same failure
+    // with more code. Nothing in this tree passes a URI.
     if path
         .as_os_str()
         .to_str()
         .is_some_and(|s| s.starts_with("file:"))
     {
-        return Err(EngineMismatch::UriShapedPath {
+        return Err(DbPathMismatch::UriShapedPath {
             path: path.to_path_buf(),
         });
     }
 
-    // C-I — extension agreement. `extension()` is None for `:memory:` and for
-    // an extension-less path; both are refusals, not exemptions.
-    let expected = engine.required_extension();
-    let actual = path.extension().and_then(|e| e.to_str());
-    if actual != Some(expected) {
-        return Err(EngineMismatch::Extension {
-            engine,
+    if path.extension().and_then(|e| e.to_str()) != Some(REQUIRED_EXTENSION) {
+        return Err(DbPathMismatch::Extension {
             path: path.to_path_buf(),
-            expected,
+            expected: REQUIRED_EXTENSION,
         });
-    }
-
-    // C-II — DEV-only, and ONLY for the SQLite build. A DuckDB build under
-    // `~/.aberp/` is ordinary production operation; refusing it here would
-    // break every prod boot, which is the opposite of what this guard is for.
-    if engine == Engine::Sqlite {
-        if let Some(root) = prod_root {
-            if path.starts_with(root) {
-                return Err(EngineMismatch::SqliteUnderProdRoot {
-                    path: path.to_path_buf(),
-                    prod_root: root.to_path_buf(),
-                });
-            }
-        }
     }
 
     Ok(())
@@ -205,188 +99,57 @@ pub fn engine_path_agrees(
 mod tests {
     use super::*;
 
-    fn prod_root() -> PathBuf {
-        PathBuf::from("/Users/op/.aberp")
+    #[test]
+    fn a_duckdb_file_is_accepted() {
+        assert!(db_path_agrees(Path::new("/tmp/dev/aberp.duckdb")).is_ok());
     }
 
-    /// T-13 arm 1 — the arm the whole reversibility argument rests on
-    /// (ADR-0108 §6.1): a SQLite build must refuse the DuckDB file.
-    ///
-    /// This is the mutation-verified pin: delete the extension check in
-    /// [`engine_path_agrees`] and this test goes red.
     #[test]
-    fn sqlite_build_refuses_the_duckdb_file() {
-        let err = engine_path_agrees(
-            Engine::Sqlite,
-            Path::new("/dev/apps/aberp-ui/aberp.duckdb"),
-            Some(&prod_root()),
-        )
-        .expect_err("a sqlite build must never open the duckdb file");
-        assert!(
-            matches!(
-                err,
-                EngineMismatch::Extension {
-                    engine: Engine::Sqlite,
-                    ..
-                }
-            ),
-            "expected an extension refusal, got {err:?}"
-        );
-        // The message must name what to fix, not just that something is wrong.
-        let msg = err.to_string();
-        assert!(
-            msg.contains(".sqlite"),
-            "refusal must name the expected extension: {msg}"
-        );
-        assert!(
-            msg.contains("aberp.duckdb"),
-            "refusal must name the offending path: {msg}"
-        );
-    }
-
-    /// T-13 arm 2 — the other direction. A default (DuckDB) build must refuse
-    /// the SQLite file, so a mis-set `ABERP_DB` cannot point the DuckDB engine
-    /// at a file it would rewrite in its own format.
-    #[test]
-    fn duckdb_build_refuses_the_sqlite_file() {
-        let err = engine_path_agrees(
-            Engine::DuckDb,
-            Path::new("/dev/apps/aberp-ui/aberp.sqlite"),
-            Some(&prod_root()),
-        )
-        .expect_err("a duckdb build must never open the sqlite file");
+    fn a_non_duckdb_file_is_refused() {
         assert!(matches!(
-            err,
-            EngineMismatch::Extension {
-                engine: Engine::DuckDb,
-                expected: "duckdb",
-                ..
-            }
+            db_path_agrees(Path::new("/tmp/dev/aberp.sqlite")),
+            Err(DbPathMismatch::Extension { .. })
         ));
     }
 
-    /// T-13 arm 3 (C-II) — a SQLite build is refused anywhere under the
-    /// production root, even with the correct extension. The migration is
-    /// DEV-only; a `.sqlite` file under `~/.aberp/prod/` is exactly the
-    /// operator mistake this arm exists to stop.
+    /// A DuckDB path under the production root is ordinary production
+    /// operation. Refusing it here would break every prod boot, which is the
+    /// opposite of what this guard is for.
     #[test]
-    fn sqlite_build_refuses_a_path_under_the_production_root() {
-        let err = engine_path_agrees(
-            Engine::Sqlite,
-            Path::new("/Users/op/.aberp/prod/aberp.sqlite"),
-            Some(&prod_root()),
-        )
-        .expect_err("the ADR-0108 migration is DEV-only");
-        assert!(
-            matches!(err, EngineMismatch::SqliteUnderProdRoot { .. }),
-            "{err:?}"
-        );
+    fn a_duckdb_file_under_the_production_root_is_accepted() {
+        assert!(db_path_agrees(Path::new("/Users/x/.aberp/prod/aberp.duckdb")).is_ok());
     }
 
-    /// C-II must NOT fire for the DuckDB engine: production runs DuckDB under
-    /// `~/.aberp/` and always has. A guard that refuses that would take prod
-    /// down, which is why the arm is engine-scoped rather than path-only.
-    #[test]
-    fn duckdb_build_is_allowed_under_the_production_root() {
-        engine_path_agrees(
-            Engine::DuckDb,
-            Path::new("/Users/op/.aberp/prod/aberp.duckdb"),
-            Some(&prod_root()),
-        )
-        .expect("production DuckDB under ~/.aberp is ordinary operation");
-    }
-
-    /// The happy path both engines are actually built for (ADR-0108 §2.5).
-    #[test]
-    fn each_engine_accepts_its_own_dev_file() {
-        engine_path_agrees(
-            Engine::DuckDb,
-            Path::new("/dev/apps/aberp-ui/aberp.duckdb"),
-            Some(&prod_root()),
-        )
-        .expect("duckdb build on the duckdb dev file");
-        engine_path_agrees(
-            Engine::Sqlite,
-            Path::new("/dev/apps/aberp-ui/aberp.sqlite"),
-            Some(&prod_root()),
-        )
-        .expect("sqlite build on the sqlite dev file");
-    }
-
-    /// An extension-less path and `:memory:` are refusals, not exemptions —
-    /// "no extension" must not read as "any engine may open it".
     #[test]
     fn extensionless_and_in_memory_paths_are_refused() {
-        for p in ["/dev/apps/aberp-ui/aberp", ":memory:"] {
-            engine_path_agrees(Engine::Sqlite, Path::new(p), Some(&prod_root()))
-                .expect_err("an extension-less path must be refused, not waved through");
+        for p in [":memory:", "/tmp/dev/aberp", "/tmp/dev/"] {
+            assert!(
+                matches!(
+                    db_path_agrees(Path::new(p)),
+                    Err(DbPathMismatch::Extension { .. })
+                ),
+                "`{p}` must be refused: it names no DuckDB file"
+            );
         }
     }
 
-    /// `prod_root: None` (the caller could not resolve a home directory) skips
-    /// C-II but must NOT weaken C-I — a failure to resolve `~` is not a licence
-    /// to open the other engine's file.
-    #[test]
-    fn unresolvable_prod_root_does_not_weaken_the_extension_arm() {
-        engine_path_agrees(Engine::Sqlite, Path::new("/x/aberp.duckdb"), None)
-            .expect_err("C-I holds regardless of whether the prod root is known");
-    }
-
-    /// **S449 — the URI arm.** The bypass this closes was measured, not
-    /// theorised: with the bundled amalgamation (`-DSQLITE_USE_URI`),
-    /// `open_hardened("file:<abs>/target.sqlite")` creates `<abs>/target.sqlite`
-    /// while every guard here clears the string as a harmless relative path
-    /// with the right extension. Both engines are refused: the DuckDB arm
-    /// matters because `serve` runs this on the default build too.
-    ///
-    /// Mutation-verify: delete the `starts_with("file:")` block in
-    /// [`engine_path_agrees`] and both halves below go red.
     #[test]
     fn a_uri_shaped_path_is_refused_before_any_other_arm() {
-        for engine in [Engine::Sqlite, Engine::DuckDb] {
-            let ext = engine.required_extension();
-            // Correct extension, NOT under the prod root as `Path` reads it —
-            // so C-I and C-II both clear it. Only the URI arm can catch this.
-            let p = format!("file:/Users/op/.aberp/prod/aberp.{ext}");
-            let err = engine_path_agrees(engine, Path::new(&p), Some(&prod_root()))
-                .expect_err("a URI-shaped path must be refused");
-            assert!(
-                matches!(err, EngineMismatch::UriShapedPath { .. }),
-                "expected the URI refusal for {engine}, got {err:?}"
-            );
-            // The premise, asserted rather than assumed: without the URI arm
-            // this exact string passes both other arms.
-            assert!(
-                Path::new(&p).is_relative() && !Path::new(&p).starts_with(prod_root()),
-                "the whole point is that C-II cannot see this path: {p}"
-            );
-        }
+        // The premise, asserted rather than assumed: this name carries the
+        // required extension and would otherwise clear every arm, so the URI
+        // refusal is doing real work rather than duplicating the extension one.
+        let uri = Path::new("file:/Users/x/.aberp/prod/aberp.duckdb");
+        assert_eq!(uri.extension().and_then(|e| e.to_str()), Some("duckdb"));
+        assert!(matches!(
+            db_path_agrees(uri),
+            Err(DbPathMismatch::UriShapedPath { .. })
+        ));
     }
 
-    /// The URI arm must not swallow ordinary names that merely CONTAIN the
-    /// text. SQLite only parses a URI when the name *begins* with `file:`, so a
-    /// guard that refused more than that would reject legitimate paths and get
-    /// relaxed by the first person it inconveniences.
     #[test]
     fn a_path_that_merely_contains_file_colon_is_not_refused() {
-        engine_path_agrees(
-            Engine::Sqlite,
-            Path::new("/dev/apps/file:notauri/aberp.sqlite"),
-            Some(&prod_root()),
-        )
-        .expect("`file:` in a middle component is an ordinary directory name");
-    }
-
-    /// A sibling-named directory must not count as "under" the prod root:
-    /// `/Users/op/.aberp-scratch/` is not `/Users/op/.aberp/`. `Path::starts_with`
-    /// is component-wise (not a string prefix), and this pins that.
-    #[test]
-    fn prod_root_match_is_component_wise_not_a_string_prefix() {
-        engine_path_agrees(
-            Engine::Sqlite,
-            Path::new("/Users/op/.aberp-scratch/aberp.sqlite"),
-            Some(&prod_root()),
-        )
-        .expect("a sibling directory is not under the production root");
+        // The arm is anchored at the START of the string; a directory named
+        // `file:` further along is a legitimate (if odd) filesystem path.
+        assert!(db_path_agrees(Path::new("/tmp/file:x/aberp.duckdb")).is_ok());
     }
 }

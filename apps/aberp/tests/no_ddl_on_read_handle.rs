@@ -12,12 +12,10 @@
 //! is taken — so "every write is serialized by one mutex" was already, quietly,
 //! not quite true.
 //!
-//! Under ADR-0108's `sqlite-engine` arm it is a genuine second writer:
-//! `read()` becomes a real connection, `ensure_schema` takes SQLite's write
-//! lock OUTSIDE the writer `Mutex`, concurrently with the `Handle`'s writer.
-//! §2.4's single-writer invariant becomes false, and every AP-invoice list/get
-//! request contends for the write lock — waiting out `busy_timeout` (5 s) on a
-//! route that is a pure read today.
+//! That is enough on its own: "every write is serialized by one mutex" is the
+//! invariant the audit chain, the invoice-number allocator and the stock cache
+//! all rest on (CLAUDE.md rule 13), and a DDL statement that slips outside it
+//! is a hole in the invariant regardless of how visible its symptoms are.
 //!
 //! So this is a pin on the CLASS, not on the three lines: a scope-aware scan of
 //! every `.rs` file under `apps/`, `crates/` and `modules/` for a schema-
@@ -226,7 +224,7 @@ fn no_ddl_is_issued_on_a_handle_read_connection() {
         "DDL is being issued on a `Handle::read()` connection at {} site(s):\n{}\n\n\
          A `read()` connection may not run `CREATE`/`ALTER`/`DROP` or any \
          `ensure_schema`/`ensure_columns`. Under DuckDB this escapes the writer \
-         mutex; under ADR-0108's `sqlite-engine` arm it is a SECOND WRITER \
+         mutex, which is a hole in the single-writer invariant \
          outside that mutex, which falsifies §2.4's single-writer invariant and \
          puts a 5-second `busy_timeout` on a read route.\n\
          The fix is one of: hoist the schema establishment to the family's \

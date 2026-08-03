@@ -285,41 +285,22 @@ fn guard_db_matches_tenant(db: &std::path::Path, tenant: &str) {
     }
 }
 
-/// ADR-0108 C-I / C-II — the **engine ↔ DB-path** guard, third in the boot
-/// guard trio.
+/// The **DB-path shape** guard, third in the boot guard trio.
 ///
 /// [`guard_tenant_matches_build`] clears the tenant NAME;
 /// [`guard_db_matches_tenant`] clears the resolved PATH against the tenant.
-/// Neither knows which storage ENGINE this binary was compiled with, and that
-/// is the property the whole SQLite-migration reversibility argument rests on:
-///
-/// > A `sqlite-engine` build never opens `aberp.duckdb`. It opens
-/// > `aberp.sqlite`, so the DuckDB file is byte-unmodified for the entire
-/// > reversible window and rollback is "stop the SQLite binary, rebuild
-/// > default, start" (ADR-0108 §6.1).
-///
-/// This is the three-line caller ADR-0108 §7 Step 3 specifies. All the
-/// decision logic is the pure [`aberp_db::engine_path::engine_path_agrees`],
-/// which is why both arms could be unit- and mutation-tested back in Step 1
-/// with no feature enabled at all — the ordering rule being *a refusal whose
-/// test cannot be written yet is not landed yet*.
-///
-/// The `~/.aberp/` arm applies to the SQLite build **only**: production runs
-/// DuckDB under `~/.aberp/` and always has, so refusing that would take prod
-/// down. The migration is authorised for the DEV tenant only.
+/// Neither checks that the path names a well-formed DuckDB database at all:
+/// that it carries the `.duckdb` extension, and that it is not URI-shaped (a
+/// leading `file:`, which a URI-aware opener and `Path` read as two different
+/// files). All the decision logic is the pure
+/// [`aberp_db::engine_path::db_path_agrees`], which is why every arm is unit-
+/// and mutation-tested there rather than here.
 fn guard_engine_matches_db_path(db: &std::path::Path) {
-    let engine = if cfg!(feature = "sqlite-engine") {
-        aberp_db::engine_path::Engine::Sqlite
-    } else {
-        aberp_db::engine_path::Engine::DuckDb
-    };
-    let prod_root = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".aberp"));
-    if let Err(e) = aberp_db::engine_path::engine_path_agrees(engine, db, prod_root.as_deref()) {
+    if let Err(e) = aberp_db::engine_path::db_path_agrees(db) {
         eprintln!("❌ FATAL: {e}");
         eprintln!(
-            "   This binary was built with the `{engine}` storage engine. Point --db / \
-             ABERP_DB at a matching `.{}` file.",
-            engine.required_extension()
+            "   Point --db / ABERP_DB at a `.{}` file.",
+            aberp_db::engine_path::REQUIRED_EXTENSION
         );
         std::process::exit(1);
     }

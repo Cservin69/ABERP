@@ -71,18 +71,9 @@
 //!      snapshot primitive), so [`run_durable_checkpoint_locked`] is a stub.
 
 pub mod debounce;
-// ADR-0108 Step 1 — the SQLite-migration reversibility scaffolding. Neither
-// module is reachable from `Handle`; both are pure/one-shot capability the
-// migration tooling consumes. See their own module docs for why they live in
-// this crate (it is the sanctioned seam, excluded from the opener census).
-pub mod engine;
+// The pure DB-path shape rule that the boot guard trio's third check calls.
+// Not reachable from `Handle`.
 pub mod engine_path;
-pub mod readonly;
-pub mod schema;
-// ADR-0108 Step 2 — the SQLite open path + its security posture. Behind the
-// default-OFF `sqlite-engine` feature; nothing consumes it yet.
-#[cfg(feature = "sqlite-engine")]
-pub mod sqlite;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -119,25 +110,11 @@ pub enum DbError {
     #[error("duckdb: {0}")]
     Duck(#[from] duckdb::Error),
 
-    /// ADR-0108 Step 2 — underlying SQLite error (open / pragma / limit).
-    #[cfg(feature = "sqlite-engine")]
-    #[error("sqlite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
-
-    /// ADR-0108 Step 2 — a §5 mitigation could not be established at open
-    /// (version floor, file mode). Distinct from [`DbError::Sqlite`] because
-    /// this is *our* refusal, not the engine's: a database whose security
-    /// posture cannot be applied is not served (CLAUDE.md rule 11).
-    #[cfg(feature = "sqlite-engine")]
-    #[error("sqlite security posture: {0}")]
-    SqlitePosture(String),
-
-    /// ADR-0108 Step 3 (M8) — a schema operation could not be completed, or
-    /// completed but did not produce the columns it claimed to. Separate from
-    /// [`DbError::Duck`] / [`DbError::Sqlite`] because the post-condition
-    /// failure is OUR refusal on an engine that reported success: the whole
-    /// point of `ensure_columns` is that "the ALTER returned Ok" and "the
-    /// column is there" are different facts.
+    /// A schema operation could not be completed, or completed but did not
+    /// produce the columns it claimed to. Separate from [`DbError::Duck`]
+    /// because the post-condition failure is OUR refusal on an engine that
+    /// reported success: "the ALTER returned Ok" and "the column is there" are
+    /// different facts.
     #[error("schema: {0}")]
     Schema(String),
 }
@@ -360,35 +337,12 @@ impl Handle {
     /// (WAL-only) writes would be invisible to it; a `try_clone` of the shared
     /// instance is coherent.
     ///
-    /// # ADR-0108 R-3 — the SQLite arm KEEPS `lock_recovering()`. Binding.
-    ///
-    /// Under `sqlite-engine` there is no shared instance to `try_clone`, so the
-    /// final step becomes a real open. Steps 1–3 below are a **free choice**,
-    /// and this is the record of it (read-fork audit 2026-07-31, finding R-3 —
-    /// T-21 was unwritable until the choice existed):
-    ///
-    /// **The SQLite arm takes the writer mutex via [`Self::lock_recovering`],
-    /// exactly as the DuckDB arm does.** Consequences, all intended:
-    ///
-    /// * A nested `read()`-inside-`write()` resolves against the **Rust**
-    ///   `std::sync::Mutex` — it panics on the tripwire in debug and deadlocks
-    ///   on the mutex in release. It **never reaches SQLite**, so `busy_timeout`
-    ///   is never involved and cannot downgrade rule 13's loud self-deadlock
-    ///   into a silent 5-second hang. Same shape as today: not a regression.
-    /// * Poison recovery keeps parity across engines — a reader is not bricked
-    ///   by another holder's panic on one engine and recovered on the other.
-    /// * [`Self::assert_not_reentrant`] stays load-bearing rather than becoming
-    ///   decoration, and "single-writer" (§2.4) keeps its meaning.
-    ///
-    /// The rejected alternative — open a fresh SQLite connection without the
-    /// mutex, so reads do not queue behind the writer — makes the nested case
-    /// *legal*, deletes the tripwire's premise, and would require a loud abort
-    /// to be deliberately re-added. It also trades a deterministic, immediately
-    /// visible failure for a timing-dependent one. If a future session wants the
-    /// read concurrency, that is a reopening of R-3 with its own measurement,
-    /// not an implementation detail of Step 5.
-    ///
-    /// Pinned by `crates/aberp-db/tests/adr0108_t21_nested_read_in_write.rs`.
+    /// Taking the writer mutex here is deliberate, not incidental: it is what
+    /// makes a nested `read()`-inside-`write()` resolve against the **Rust**
+    /// `std::sync::Mutex` — panicking on the tripwire in debug and deadlocking
+    /// on the mutex in release — rather than becoming a timing-dependent
+    /// engine-level wait. It keeps [`Self::assert_not_reentrant`] load-bearing
+    /// rather than decoration, and keeps "single-writer" its literal meaning.
     pub fn read(&self) -> Result<Connection, DbError> {
         // Re-entrancy tripwire (ADR-0099 H3): `read()` locks the SAME writer mutex
         // to `try_clone`, so a read issued while this thread holds the write guard

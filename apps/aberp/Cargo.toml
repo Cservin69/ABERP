@@ -37,16 +37,6 @@ production = []
 # byte-behaviour-identical on loopback). `build_profile::IS_SAAS_BUILD`
 # is the single source of truth; later phases (2/4/6) fill the arms.
 saas = []
-# ADR-0108 §2.2 D1 — the storage-engine selector, default OFF. Pure
-# pass-through to `aberp-db`, which owns the actual `rusqlite` dependency and
-# the `engine` type seam. `serve`'s boot guard reads it via `cfg!` to decide
-# WHICH engine's DB-path rule to enforce (C-I/C-II).
-#
-# Note for the prod-cutover ADR: `--features production,sqlite-engine` would be
-# a NEW combination that has never been built, and `--features production`
-# already selects the LIVE NAV endpoint at compile time. It must be gated and
-# smoke-tested on its own — ADR-0108 §11 item 5.
-sqlite-engine = ["aberp-db/sqlite-engine"]
 
 [dependencies]
 # Workspace siblings — production deps. `aberp-audit-ledger` is included
