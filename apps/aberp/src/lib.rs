@@ -90,76 +90,6 @@ pub mod mes_boot;
 pub mod margin_profiles;
 pub mod mes_adapters_config;
 pub mod mes_manager;
-/// ADR-0108 Step 7 Part I — the approved-vendor-list family's STRICT DDL, its
-/// typed carry and the reconciliation gate's arm. **One table** (`avl_vendors`,
-/// 12 columns) and **not one number in it**: every column is `VARCHAR` on
-/// DuckDB, so R1, R2, R3 and the §3.4 fold rules all have nothing to guard here.
-/// Unblocks purchasing's cutover, which §9 sequences behind this family.
-#[cfg(feature = "sqlite-engine")]
-pub mod migrate_avl;
-/// ADR-0108 Step 5 — the invoice family's STRICT DDL, its typed carry, and the
-/// reconciliation gate's arm for it. Same feature gate as the Step-4 migrator
-/// it plugs into.
-#[cfg(feature = "sqlite-engine")]
-pub mod migrate_billing;
-/// ADR-0108 Step 7 Part F — the dispatch/shipment family's STRICT schema, carry
-/// and gate arm. Two tables across two owning modules, fused by the one SQL
-/// statement that joins them (`part_marking.rs:504`). **No money, no quantity
-/// and no float at all**: its only number is `wo_part_marks.unit_index` (§3.2
-/// F). Its one refusal is a duplicate natural key, because `wo_part_marks` has
-/// no `PRIMARY KEY` for the gate's per-row arm to rely on.
-#[cfg(feature = "sqlite-engine")]
-pub mod migrate_dispatch;
-/// ADR-0108 Step 7 Part H — the email/relay family's STRICT DDL, its typed
-/// carry and the reconciliation gate's arm. **One table**
-/// (`outbound_email_queue`, 15 columns) and **no BLOB**: the attachment bytes
-/// live on the filesystem and the row holds a rel-path, so what the carry has to
-/// protect is the path and the potentially six-figure-byte message bodies.
-#[cfg(feature = "sqlite-engine")]
-pub mod migrate_email;
-/// ADR-0108 Step 7 Part B — the partners family's STRICT DDL, its typed carry,
-/// and the reconciliation gate's arm for it. Same feature gate as the Step-4
-/// migrator it plugs into.
-#[cfg(feature = "sqlite-engine")]
-pub mod migrate_partners;
-/// ADR-0108 Step 7 Part C — the products/inventory family's STRICT schema,
-/// carry and gate arm, including the rule-7 resolution that brings the five
-/// `DOUBLE` quantity columns onto the same exact representation as
-/// `stock_movements.qty_delta`.
-#[cfg(feature = "sqlite-engine")]
-pub mod migrate_products;
-/// ADR-0108 Step 7 Part G — the purchasing / purchase-order family's STRICT
-/// schema, carry and gate arm. Four tables from one owning module, and the
-/// family that carries **most of the tree's remaining money**: five §3.2 A
-/// `BIGINT` → `INTEGER` minor-unit columns. Its quantities are exact `i64`
-/// counts (§3.2 F), not R2 decimals, and none of its four tables has a
-/// `PRIMARY KEY` for the gate's per-row arm to rely on.
-#[cfg(feature = "sqlite-engine")]
-pub mod migrate_purchasing;
-/// ADR-0108 Step 7 Part E — the QA/QC family's STRICT schema, carry and gate
-/// arm. Six tables across two owning modules, **no money and no quantity**: its
-/// only numbers are one sequence integer (§3.2 F), eight dimensional
-/// measurements that stay `REAL` (§3.2 E) and two booleans (§3.2 H).
-#[cfg(feature = "sqlite-engine")]
-pub mod migrate_quality;
-/// ADR-0108 **Step 8** — the quoting family's STRICT schema, carry and gate arm.
-/// Eleven tables across eight owning modules; **seven carry rows and four are
-/// schema-only** (§6.3 drops quoting job history). It lands §3.2 D's six
-/// float-money column instances as R2 canonical-decimal `TEXT` — three proved
-/// per row, three declared without a row behind them — and never as `REAL`.
-#[cfg(feature = "sqlite-engine")]
-pub mod migrate_quoting;
-/// ADR-0108 Step 4 — the migrator + the reconciliation gate. Behind the
-/// default-OFF `sqlite-engine` feature: this is the ONE binary that links both
-/// engines, because it reads DuckDB and writes SQLite.
-#[cfg(feature = "sqlite-engine")]
-pub mod migrate_to_sqlite;
-/// ADR-0108 Step 7 Part D — the work-orders/BOM family's STRICT schema, carry
-/// and gate arm. Carries the tree's one money column that is R2 rather than R1
-/// (`routings.est_cost_huf`, §3.2 B) and the family's one remaining float
-/// (`work_orders.actual_machining_minutes`, §3.2 E).
-#[cfg(feature = "sqlite-engine")]
-pub mod migrate_work_orders;
 pub mod mnb_rates_provider;
 pub mod nav_number_probe;
 pub mod nav_xml;
@@ -169,9 +99,6 @@ pub mod observe_receiver_confirmation;
 pub mod partners;
 pub mod poll_ack;
 pub mod poll_annulment_ack;
-/// ADR-0108 Step 1 — the pre-migration snapshot + manifest, and the verifier
-/// `run/rollback_to_duckdb.sh` calls to make the rollback *verified* (C-IV).
-pub mod premigration;
 pub mod print_invoice;
 pub mod products;
 pub mod purchasing;

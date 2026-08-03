@@ -25,22 +25,9 @@ publish.workspace = true
 # NOTE (build gate): `duckdb` pulls the bundled libduckdb 1.5.3 amalgamation.
 # The pure `debounce` module has ZERO external deps and unit-tests anywhere; the
 # duckdb-backed `Handle` + its `tests/handle_concurrency_e2e.rs` are CI/Mac-gated.
-[features]
-# ADR-0108 §2.2 D1 — the engine selector is COMPILE-TIME and default OFF.
-# Exactly one engine is linked into any given binary; reversibility comes from
-# the two engines using two different FILES (`aberp.duckdb` / `aberp.sqlite`),
-# not from the selector. A runtime toggle would need a trait layer over 449
-# `params!` sites, 120 `duckdb::Connection` signatures and 84 `Handle` call
-# sites, and would keep every family simultaneously reachable on two engines —
-# the half-migrated shape CLAUDE.md rule 14 forbids.
-sqlite-engine = ["dep:rusqlite"]
-
 [dependencies]
 aberp-audit-ledger = { path = "../audit-ledger" }
 duckdb = { workspace = true }
-# ADR-0108 Step 2 — optional, off by default. Nothing consumes it yet: Step 2
-# lands the dependency and `sqlite::open_hardened`'s security posture only.
-rusqlite = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
@@ -50,15 +37,6 @@ tracing = { workspace = true }
 # (unused here but matches the editions convention and is harmless).
 aberp-audit-ledger = { path = "../audit-ledger", features = ["test-support"] }
 duckdb = { workspace = true }
-# ADR-0108 Step 3 — `tests/adr0108_seam.rs` names `rusqlite` directly for the
-# two-connection arms (T-6's DEFERRED control, and the Q2 lexicographic
-# demonstration). Optional in `[dependencies]`; unconditional here so the test
-# file compiles whenever the `sqlite-engine` feature turns its arms on.
-rusqlite = { workspace = true }
-# Q2's demonstration compares a SQL `<` against a `Decimal` `<` on the SAME
-# values. Without a real decimal type the comparison would be against another
-# string compare, which proves nothing.
-rust_decimal = { workspace = true }
 
 # S449 — restored. PR #51 deleted this block while appending the two
 # dev-dependencies above, which made `aberp-db` the ONLY workspace member
