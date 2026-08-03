@@ -353,6 +353,128 @@ fn low_stock_products_surfaces_only_below_min() {
     assert_eq!(other, 0);
 }
 
+/// **ADR-0108 F1 / Q2 — the lexicographic break, pinned by the case that
+/// distinguishes the two implementations.**
+///
+/// Under the SQLite migration `stock_qty` / `min_stock` become R2 columns —
+/// `TEXT` holding a canonical decimal string — and a SQL `<` between them
+/// becomes **lexicographic**. `'9' < '10'` is FALSE as text and TRUE as a
+/// number, so a product at 9 against a minimum of 10 would be **silently not
+/// flagged**: no error, no warning, just a low-stock item missing from the
+/// operator's list and absent from the dashboard count.
+///
+/// The numbers here are chosen so that string ordering and numeric ordering
+/// **disagree on every one of them**, which is what makes this a pin rather
+/// than a coincidence:
+///
+/// | product | stock | min | numeric `<`? | lexicographic `<`? |
+/// |---|---|---|---|---|
+/// | `prd_lex_a` | 9 | 10 | **yes** | no (`'9' > '1'`) |
+/// | `prd_lex_b` | 100 | 20 | no | **yes** (`'1' < '2'`) |
+///
+/// So a lexicographic implementation returns exactly the WRONG one of the two.
+/// Ordering is pinned too: `prd_lex_a`'s deficit is −1, and a `TEXT - TEXT`
+/// subtraction would coerce to REAL rather than compare exactly.
+///
+/// Mutation-verify: put `AND COALESCE(stock_qty,0) < COALESCE(min_stock,0)`
+/// back into `low_stock_candidates`' SQL. On DuckDB it stays green (DECIMAL
+/// compares numerically) — which is precisely why this test exists *now*,
+/// before the columns become TEXT and the same SQL starts lying.
+#[test]
+fn low_stock_uses_numeric_not_lexicographic_comparison() {
+    let mut conn = setup_db();
+    insert_product(&conn, "prd_lex_a", "Nine vs ten", "10");
+    insert_product(&conn, "prd_lex_b", "Hundred vs twenty", "20");
+    let meta = meta();
+
+    record(
+        &mut conn,
+        &meta,
+        "prd_lex_a",
+        "9",
+        MovementReason::Receipt,
+        MovementRefKind::Manual,
+        None,
+        "i-lex-a",
+    )
+    .unwrap();
+    record(
+        &mut conn,
+        &meta,
+        "prd_lex_b",
+        "100",
+        MovementReason::Receipt,
+        MovementRefKind::Manual,
+        None,
+        "i-lex-b",
+    )
+    .unwrap();
+
+    let low = low_stock_products(&conn, TEST_TENANT).unwrap();
+    let names: Vec<&str> = low.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Nine vs ten"],
+        "9 < 10 numerically must be flagged and 100 < 20 must not; a lexicographic \
+         comparison returns exactly the other one"
+    );
+    assert_eq!(low[0].stock_qty, Decimal::from_str("9.000000").unwrap());
+    assert_eq!(low[0].min_stock, Decimal::from_str("10.000000").unwrap());
+
+    // The COUNT sibling carried its own copy of the predicate and would have
+    // been missed by a fix scoped to `low_stock_products` alone (F1's second
+    // instance). It must agree.
+    assert_eq!(
+        count_low_stock_products(&conn, TEST_TENANT).unwrap() as usize,
+        low.len(),
+        "the dashboard tile and the list it links to must not disagree"
+    );
+    assert_eq!(count_low_stock_products(&conn, TEST_TENANT).unwrap(), 1);
+}
+
+/// The deficit ordering, on values where a `TEXT - TEXT` subtraction would
+/// coerce to REAL. Sorted most-critical first, `name` as the tie-break — the
+/// contract the dashboard's click-through list renders against.
+#[test]
+fn low_stock_orders_by_exact_decimal_deficit_then_name() {
+    let mut conn = setup_db();
+    // deficits: a = -0.5, b = -12.25, c = -0.5 (ties with a, name breaks it)
+    insert_product(&conn, "prd_o_a", "Alpha", "10.5");
+    insert_product(&conn, "prd_o_b", "Bravo", "20.25");
+    insert_product(&conn, "prd_o_c", "Charlie", "3.5");
+    let meta = meta();
+    for (id, qty, idem) in [
+        ("prd_o_a", "10", "i-o-a"),
+        ("prd_o_b", "8", "i-o-b"),
+        ("prd_o_c", "3", "i-o-c"),
+    ] {
+        record(
+            &mut conn,
+            &meta,
+            id,
+            qty,
+            MovementReason::Receipt,
+            MovementRefKind::Manual,
+            None,
+            idem,
+        )
+        .unwrap();
+    }
+
+    let low = low_stock_products(&conn, TEST_TENANT).unwrap();
+    let names: Vec<&str> = low.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Bravo", "Alpha", "Charlie"],
+        "most-critical deficit first; equal deficits break on name"
+    );
+    // Exact, not near: -0.5 is representable in Decimal and not in binary float.
+    assert_eq!(
+        low[1].stock_qty - low[1].min_stock,
+        Decimal::from_str("-0.500000").unwrap()
+    );
+}
+
 #[test]
 fn count_low_stock_products_empty_tenant_is_zero() {
     let conn = setup_db();

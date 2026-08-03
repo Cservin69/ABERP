@@ -629,6 +629,167 @@ pub enum Command {
     /// corruption. `aberp serve` also takes these automatically every 4h.
     #[command(subcommand)]
     Snapshot(SnapshotCommand),
+
+    /// ADR-0108 Step 1 — take the **pre-migration snapshot** of a DEV tenant
+    /// DB before the SQLite migration exercise begins.
+    ///
+    /// Copies the DuckDB file, its `.wal`, the audit mirror and every
+    /// `.audit.log.*.bak` preservation file into a fresh
+    /// `.aberp-premigration-<ts>/`, all-or-none, and writes a `manifest.json`
+    /// recording their digests, every table's row count, the audit-chain head,
+    /// and the two tamper-evidence counts (non-NULL `event_sig`,
+    /// `audit_ledger_anchors`) that the reconciliation gate and
+    /// `run/rollback_to_duckdb.sh` both turn on.
+    ///
+    /// **DEV-only** (C-II): refuses any DB under `~/.aberp/`. Refuses while
+    /// another writer holds the tenant lock, and refuses on an unfolded WAL.
+    /// The DuckDB file is opened **read-only** and is byte-unmodified.
+    PremigrationSnapshot(PremigrationSnapshotArgs),
+
+    /// ADR-0108 Step 1 — re-derive every number in a pre-migration manifest
+    /// from a live DB and compare. This is what makes the rollback *verified*
+    /// (C-IV); `run/rollback_to_duckdb.sh` calls it after restoring.
+    ///
+    /// Exits non-zero on any mismatch, and treats a baseline with zero
+    /// signatures or zero anchors as a failure rather than a green equality
+    /// between two zeros (B1).
+    VerifyAgainstManifest(VerifyAgainstManifestArgs),
+
+    /// ADR-0108 §6.2 steps 4–5 — restore the DuckDB artefact set from a
+    /// pre-migration snapshot, **all or none**, digest-verified against the
+    /// manifest before anything moves. Called by
+    /// `run/rollback_to_duckdb.sh`; it is Rust rather than shell because the
+    /// WAL-pairing decision (B3) is the one place where being wrong corrupts
+    /// the database.
+    RollbackRestore(RollbackRestoreArgs),
+
+    /// ADR-0108 §6.2 step 5's precondition — does the on-disk DB still match
+    /// the digest the manifest recorded? Exit 0 = matches (C-I held, nothing to
+    /// restore); exit 2 = differs.
+    DbMatchesManifest(DbMatchesManifestArgs),
+
+    /// ADR-0108 Step 4 — carry `audit_ledger` + `audit_ledger_anchors` from a
+    /// **read-only** DuckDB into a fresh `aberp.sqlite`. The cheap abort point.
+    ///
+    /// Four preconditions, all refusals and none of which waits: the tenant's
+    /// whole-DB writer lock (rule 13 — a fresh opener reads Handle-WAL-resident
+    /// DuckDB stale), no unfolded `.wal` (a read-only open cannot replay one),
+    /// DEV-only paths (C-II), and a pre-migration snapshot that verifies.
+    ///
+    /// The `audit_ledger` TABLE is the source; the mirror is a cross-check arm
+    /// only (B1/Q7 — replaying the mirror strips every per-entry signature and
+    /// drops the anchors while leaving all four hash checks green).
+    #[cfg(feature = "sqlite-engine")]
+    MigrateToSqlite(MigrateToSqliteArgs),
+
+    /// ADR-0108 Step 4 — the reconciliation gate, as a **separate invocation**
+    /// run after the migrator has exited and released the lock (B4). It
+    /// re-opens both databases and re-queries through the ordinary read path:
+    /// **no number it compares was produced by the migrator.**
+    #[cfg(feature = "sqlite-engine")]
+    MigrateReconcile(MigrateReconcileArgs),
+}
+
+/// `aberp migrate-to-sqlite` (ADR-0108 Step 4).
+#[cfg(feature = "sqlite-engine")]
+#[derive(Debug, Parser)]
+pub struct MigrateToSqliteArgs {
+    /// The DEV DuckDB source. Opened READ-ONLY and byte-unmodified (C-I).
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// The SQLite target. Must not already exist.
+    #[arg(long, default_value = "./aberp.sqlite")]
+    pub to: PathBuf,
+
+    /// Tenant identifier — selects the whole-DB writer lock held for the run.
+    #[arg(long, default_value = "test")]
+    pub tenant: String,
+
+    /// The `.aberp-premigration-<ts>/` directory. Must verify before anything
+    /// is carried: there is no rollback target without it.
+    #[arg(long)]
+    pub from_snapshot: PathBuf,
+}
+
+/// `aberp migrate-reconcile` (ADR-0108 Step 4, §6.3).
+#[cfg(feature = "sqlite-engine")]
+#[derive(Debug, Parser)]
+pub struct MigrateReconcileArgs {
+    /// The DuckDB side, re-opened read-only and re-queried.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// The SQLite side the migrator produced.
+    #[arg(long, default_value = "./aberp.sqlite")]
+    pub sqlite: PathBuf,
+
+    /// Tenant identifier.
+    #[arg(long, default_value = "test")]
+    pub tenant: String,
+}
+
+/// `aberp rollback-restore` (ADR-0108 §6.2 steps 4–5).
+#[derive(Debug, Parser)]
+pub struct RollbackRestoreArgs {
+    /// The DB path to restore to.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// The `.aberp-premigration-<ts>/` directory to restore from.
+    #[arg(long)]
+    pub from: PathBuf,
+
+    /// Where a foreign-generation WAL (and the restore staging area) is kept.
+    /// Normally the run's `.aberp-rolledback-<ts>/`. Nothing here is ever
+    /// deleted — a deleted artefact cannot be post-mortemed.
+    #[arg(long)]
+    pub preserve_dir: PathBuf,
+}
+
+/// `aberp db-matches-manifest` (ADR-0108 §6.2 step 5).
+#[derive(Debug, Parser)]
+pub struct DbMatchesManifestArgs {
+    /// The DB path to digest.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// The `.aberp-premigration-<ts>/` directory holding the manifest.
+    #[arg(long)]
+    pub from: PathBuf,
+}
+
+/// `aberp premigration-snapshot` (ADR-0108 Step 1).
+#[derive(Debug, Parser)]
+pub struct PremigrationSnapshotArgs {
+    /// Path to the DEV tenant DuckDB to snapshot.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — selects the whole-DB writer lock this run holds.
+    #[arg(long, default_value = "test")]
+    pub tenant: String,
+
+    /// Override the snapshot directory. When unset, defaults to
+    /// `.aberp-premigration-<ts>/` beside the DB.
+    #[arg(long)]
+    pub out_dir: Option<PathBuf>,
+}
+
+/// `aberp verify-against-manifest` (ADR-0108 Step 1, §6.2 step 7).
+#[derive(Debug, Parser)]
+pub struct VerifyAgainstManifestArgs {
+    /// Path to the DB to verify (normally the just-restored DuckDB file).
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier. Must match the manifest's.
+    #[arg(long, default_value = "test")]
+    pub tenant: String,
+
+    /// Path to the `manifest.json` inside a `.aberp-premigration-<ts>/`.
+    #[arg(long)]
+    pub manifest: PathBuf,
 }
 
 /// `aberp snapshot <now|list|restore>` (S426 / ADR-0082).

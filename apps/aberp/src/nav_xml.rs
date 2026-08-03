@@ -3167,4 +3167,103 @@ mod tests {
             "must name the read failure: {msg}"
         );
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-0108 B2 / §3.3 N-2 — the one permitted `f64` on the emission
+    // path, bounded by measurement rather than by assertion.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// The four legal Hungarian ÁFA rates, in basis points (ADR-0101 §4).
+    const LEGAL_HU_RATES_BP: [u16; 4] = [0, 500, 1800, 2700];
+
+    /// The exact-`Decimal` rendering `write_vat_rate_choice` is scheduled to
+    /// become (ADR-0108 §3.3, Step 5's owed B2 conversion). Written here so
+    /// the two renderings can be compared over the whole domain BEFORE the
+    /// conversion lands, rather than discovering a moved byte after it.
+    fn vat_percentage_exact(bp: u16) -> String {
+        // Exactly the shape ADR-0108 §3.3 prescribes for the conversion:
+        // `Decimal::from(bp) / Decimal::from(10000)`, `{:.2}` via `round_dp(2)`.
+        format!(
+            "{:.2}",
+            (Decimal::from(bp) / Decimal::from(10_000)).round_dp(2)
+        )
+    }
+
+    /// **N-2's allowlist entry, measured over its entire domain.**
+    ///
+    /// `write_vat_rate_choice` renders `vat_rate_basis_points as f64 /
+    /// 10_000.0` with `{:.2}`. ADR-0108 §3.3 permits that single `f64`
+    /// *only* because the render is value-exact over the closed set of rates
+    /// the column can hold — but the column's Rust type is `u16`, so "the
+    /// closed set" is a claim about the *doors*, not about the type. This
+    /// test measures the whole `u16` domain and states exactly where the
+    /// `f64` and the exact `Decimal` renderings part company.
+    ///
+    /// The result, asserted rather than described: they agree everywhere
+    /// except on values that are an exact tie at the second decimal place
+    /// (`bp % 100 == 50`, e.g. `0.0050`), where the `f64`'s binary
+    /// approximation decides the tie and half-even decides it on the exact
+    /// value. **None of the four legal Hungarian rates is in that class**,
+    /// which is what makes N-2 sound — and which is the fact a session
+    /// landing the `f64 → Decimal` conversion needs, because it says the
+    /// conversion moves no filed byte for any rate the product can issue.
+    ///
+    /// Mutation-verify: change `LEGAL_HU_RATES_BP` to include `2750` and the
+    /// first assertion reds.
+    #[test]
+    fn the_permitted_f64_vat_rate_render_is_exact_except_on_second_decimal_ties() {
+        let renders_differ =
+            |bp: u16| format!("{:.2}", bp as f64 / 10_000.0) != vat_percentage_exact(bp);
+
+        for bp in LEGAL_HU_RATES_BP {
+            assert!(
+                !renders_differ(bp),
+                "N-2 permits the `f64` render ONLY because it is value-exact on the legal HU \
+                 rates; {bp} bp renders as {:?} via f64 and {:?} exactly",
+                format!("{:.2}", bp as f64 / 10_000.0),
+                vat_percentage_exact(bp)
+            );
+        }
+
+        let divergent: Vec<u16> = (0..=u16::MAX).filter(|bp| renders_differ(*bp)).collect();
+        assert!(
+            !divergent.is_empty(),
+            "the sweep must actually find the tie class — an empty result means the comparison \
+             is vacuous, not that the f64 is exact"
+        );
+        for bp in &divergent {
+            assert_eq!(
+                bp % 100,
+                50,
+                "the `f64` render may only diverge on an exact second-decimal tie; {bp} bp is a \
+                 divergence outside that class, which would mean N-2's allowlist entry is unsound \
+                 for reasons the ADR does not state"
+            );
+        }
+        // And the four legal rates are not merely absent from the divergent
+        // set by luck — none of them can be a tie.
+        for bp in LEGAL_HU_RATES_BP {
+            assert_ne!(bp % 100, 50, "{bp} bp would be a second-decimal tie");
+        }
+    }
+
+    /// The forward `f64` render and the exact inverse parse
+    /// ([`parse_vat_percentage_to_basis_points`], `Decimal::from_str_exact`)
+    /// are a rule-7 fork one hop apart — ADR-0108 §9 records it. This pins
+    /// that the fork is *currently harmless*: on every legal rate the round
+    /// trip returns the original basis points. A future widening of the rate
+    /// set that broke this would red here rather than at NAV.
+    #[test]
+    fn the_legal_hu_rates_round_trip_through_the_f64_render_and_the_exact_parse() {
+        for bp in LEGAL_HU_RATES_BP {
+            let rendered = format!("{:.2}", bp as f64 / 10_000.0);
+            let back = parse_vat_percentage_to_basis_points(&rendered).unwrap_or_else(|e| {
+                panic!("{bp} bp rendered as {rendered:?} must parse back: {e}")
+            });
+            assert_eq!(
+                back, bp,
+                "the write path ({rendered:?}) and the exact read path must agree on {bp} bp"
+            );
+        }
+    }
 }

@@ -244,6 +244,30 @@ keyring = "2"
 # Cargo.lock is the exact pin (this line is the floor per the header note).
 duckdb = { version = "1.10503", features = ["bundled"] }
 
+# ADR-0108 Step 2 (M10) — the SQLite engine, behind the `sqlite-engine` cargo
+# feature (default OFF; see ADR-0108 §2.2 D1). Nothing links it unless that
+# feature is on, so the default build is byte-for-byte what it was.
+#
+# `bundled` (M10): `libsqlite3-sys` compiles the amalgamation we ship rather
+# than linking whatever the host happens to have. On macOS that host copy is
+# Apple's, which is patched and versioned independently of upstream — a floor
+# check against it would be meaningless. Cargo.lock is the exact pin; this line
+# is the floor. `open_hardened` re-checks the linked library's version at
+# runtime (M10/M12: `IS NOT DISTINCT FROM` needs ≥ 3.39) so a lockfile edit
+# that drops below the floor fails loud instead of at the first query.
+#
+# `limits` (M3): exposes `sqlite3_limit`, which is how `SQLITE_LIMIT_ATTACHED`
+# is set to 0. Without this feature the limit cannot be set at all.
+#
+# DELIBERATELY ABSENT — `load_extension` (M2). Not enabling it means
+# `Connection::load_extension` and `load_extension_enable` **do not exist** for
+# this tree to call; that is a compile-time guarantee, strictly stronger than a
+# runtime check. `open_hardened` also clears the db-config flag at open, and
+# `tools/cut_gate_sqlite_posture.sh` greps for both the feature and the symbols.
+# Also deliberately absent: `hooks`, `vtab`, `functions`, `series` — PR #49 §8's
+# standing prohibition (RUSTSEC-2021-0128, CVE-2020-35866).
+rusqlite = { version = "0.40", features = ["bundled", "limits"] }
+
 # Date / time — ADR-0021 Part A, item 11 (closes F2).
 time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde", "serde-well-known"] }
 

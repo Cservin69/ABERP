@@ -19,6 +19,32 @@
 //! instead of stalling. Loud-fail on a genuine fs error (never silently skip the
 //! lock — a skipped whole-DB lock silently re-opens the two-writer corruption
 //! window).
+//!
+//! # ADR-0108 (M6) — re-scoped from "corruption guard" to **app-invariant guard**,
+//! # and NOT retirable
+//!
+//! ADR-0107 §2 lists this lock in its retirement table, on the reading that
+//! SQLite's own locking makes a cross-process advisory lock redundant. It is
+//! **not retired**, and PR #49 F-7b says so for a reason worth stating here
+//! rather than in a document nobody greps: SQLite permits a second writer.
+//! What this lock stops is not *file corruption* — it is two ABERP processes
+//! each believing it owns the tenant's invariants: the audit chain head, the
+//! invoice-number allocator, the stock cache. Those are **application**
+//! invariants; no storage engine enforces them.
+//!
+//! It also turns out to be a free safety property for the SQLite migration's
+//! reversible window, and ADR-0108 §1.1 G-7 measured it: [`lock_path_for`]
+//! keys the lock on `<parent-dir>/.aberp-db-writer.<tenant>.lock` — the
+//! **directory + tenant**, *not* the DB filename. So a DuckDB `serve` and a
+//! SQLite `serve` on tenant `test` in the same directory **already mutually
+//! exclude**, with no change at all. The two engines cannot both be live.
+//!
+//! Its third consumer is the migration tooling: `aberp premigration-snapshot`
+//! and `aberp verify-against-manifest` acquire it for their whole run
+//! (CLAUDE.md rule 13 — a fresh opener reads Handle-WAL-resident data STALE,
+//! so a snapshot taken while `serve` is live is a *short* snapshot), and
+//! ADR-0108 §7 Step 4 requires the migrator to do the same. They **refuse**;
+//! they never wait and never force.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -181,6 +207,61 @@ mod tests {
             .expect("tenant-b acquires independently");
         drop(a);
         drop(b);
+    }
+
+    /// **ADR-0108 T-7 / M6 / §1.1 G-7 — the cross-ENGINE refusal.**
+    ///
+    /// ADR-0107 §2 proposed retiring this lock. It is kept, and it turns out to
+    /// already carry a property the SQLite migration needs for free: because
+    /// [`lock_path_for`] keys on **directory + tenant** and NOT on the DB
+    /// filename, a DuckDB `serve` on `aberp.duckdb` and a SQLite `serve` on
+    /// `aberp.sqlite` — same directory, same tenant — **mutually exclude**.
+    /// The two engines cannot both be live during the reversible window.
+    ///
+    /// ADR-0108 §1.1 G-7 states this as measured fact; a fact nobody tests is a
+    /// fact that stops being true. Mutation-verify by keying `lock_path_for` on
+    /// the DB file stem instead of the directory: this test goes red and the
+    /// two engines silently become co-resident writers on one tenant.
+    #[test]
+    fn a_duckdb_writer_and_a_sqlite_writer_on_one_tenant_mutually_exclude() {
+        let duck = scratch_db("cross-engine");
+        // Same directory, same tenant, different engine file.
+        let sqlite = duck.with_file_name("aberp.sqlite");
+
+        assert_eq!(
+            lock_path_for(&duck, "test").unwrap(),
+            lock_path_for(&sqlite, "test").unwrap(),
+            "the lock must be keyed on dir+tenant, not on the DB filename — \
+             otherwise the two engines get two locks and neither excludes the other"
+        );
+
+        let duckdb_serve = try_acquire(&duck, "test")
+            .expect("acquire ok")
+            .expect("the DuckDB writer takes the lock");
+
+        // The SQLite build, booting on its own file in the same tenant dir.
+        match acquire_or_refuse(&sqlite, "test", "aberp serve (sqlite-engine)") {
+            Ok(_) => panic!(
+                "a sqlite-engine serve must be REFUSED while a duckdb serve holds the \
+                 tenant lock — ADR-0108's reversible window depends on it"
+            ),
+            Err(e) => assert!(
+                e.to_string().contains("single-writer"),
+                "refusal must explain the single-writer rule: {e}"
+            ),
+        }
+
+        // And the other direction, so this is a mutual exclusion and not a
+        // one-way precedence.
+        drop(duckdb_serve);
+        let sqlite_serve = try_acquire(&sqlite, "test")
+            .unwrap()
+            .expect("with the DuckDB writer gone the SQLite one acquires");
+        assert!(
+            try_acquire(&duck, "test").unwrap().is_none(),
+            "a duckdb serve must be refused while the sqlite one holds the lock"
+        );
+        drop(sqlite_serve);
     }
 
     /// Sanitisation keeps an exotic tenant string inside the parent dir.

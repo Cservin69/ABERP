@@ -410,6 +410,19 @@ CREATE INDEX IF NOT EXISTS ap_invoice_tenant_issue_idx
 /// Idempotent `CREATE TABLE IF NOT EXISTS` for the `ap_invoice` table.
 /// Called at serve boot per the same hot-path posture as
 /// `partners::ensure_schema` and `products::ensure_schema`.
+///
+/// **This is DDL — a WRITE.** It may only ever be handed a connection that
+/// came from `Handle::write()` (a `WriteGuard` deref) or from the boot-phase
+/// opener in `serve::run`, **never** one from `Handle::read()`. Until
+/// 2026-07-31 the three read paths below called it defensively; under DuckDB
+/// that escaped the writer mutex quietly (a `read()` is a `try_clone` of the
+/// one instance, and the guard drops the instant the clone is taken), and
+/// under ADR-0108's `sqlite-engine` arm — where `read()` becomes a genuine
+/// second connection — it would have taken SQLite's write lock OUTSIDE the
+/// writer `Mutex`, falsifying §2.4's single-writer invariant and putting a
+/// 5-second `busy_timeout` on three pure-read routes.
+/// Finding R-1, `docs/findings/read-fork-audit-sqlite-20260731.md`.
+/// Pinned by `apps/aberp/tests/adr0108_no_ddl_on_read_handle.rs`.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(AP_INVOICE_SCHEMA_SQL)
         .context("ensure ap_invoice schema")
@@ -768,7 +781,12 @@ pub fn list_incoming(
     let conn = db
         .read()
         .context("acquire shared reader for ap_invoice list")?;
-    ensure_schema(&conn).context("ensure ap_invoice schema (list)")?;
+    // R-1 (read-fork audit 2026-07-31): the defensive `ensure_schema(&conn)`
+    // that used to sit here ran DDL on a READ connection. The schema is
+    // established at serve boot (`serve::run`, "ensure ap_invoice schema at
+    // serve boot") and again on every write path in this module, so the
+    // defensive call bought nothing; what it cost was a writer outside the
+    // writer mutex. See `ensure_schema`'s doc-comment.
 
     let mut rows = Vec::new();
     match status_filter {
@@ -824,7 +842,7 @@ pub fn get_incoming(
     let conn = db
         .read()
         .context("acquire shared reader for ap_invoice get")?;
-    ensure_schema(&conn).context("ensure ap_invoice schema (get)")?;
+    // R-1 — no DDL on a read connection. See `ensure_schema`'s doc-comment.
     let mut stmt = conn.prepare(
         "SELECT id, supplier_tax_number, supplier_name, supplier_address,
                 nav_invoice_number, issue_date, delivery_date, payment_deadline,
@@ -856,7 +874,7 @@ pub fn get_nav_xml_path(
     let conn = db
         .read()
         .context("acquire shared reader for ap_invoice nav_xml_path read")?;
-    ensure_schema(&conn).context("ensure ap_invoice schema (nav_xml_path read)")?;
+    // R-1 — no DDL on a read connection. See `ensure_schema`'s doc-comment.
     let mut stmt = conn.prepare(
         "SELECT nav_xml_path FROM ap_invoice
           WHERE tenant_id = ? AND id = ? LIMIT 1",

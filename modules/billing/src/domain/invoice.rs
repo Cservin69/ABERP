@@ -64,13 +64,45 @@ pub struct LineItem {
     pub unit: Option<ProductUnit>,
 }
 
+/// Pre-tax line total: `round_half_even(unit_price × quantity)` in whole
+/// minor units. Returns `None` on overflow.
+///
+/// # Why this is a free function and not only a method
+///
+/// ADR-0108 M-2. The ÁFA report (`apps/aberp/src/reports.rs`) must produce
+/// the **same** number the NAV filing does, and the only way to make that a
+/// compile-time fact rather than a claim is for both to call the *same*
+/// function. The report reads `(unit_price, quantity, kind, basis_points)`
+/// off `invoice_line` rows without materialising a whole [`LineItem`], so
+/// the arithmetic lives here and [`LineItem::net_total`] delegates.
+/// Duplicating it — even faithfully — is the CLAUDE.md rule-7 fork that
+/// diverges on the first edit to either copy.
+pub fn line_net_total(unit_price: Huf, quantity: Decimal) -> Option<Huf> {
+    unit_price.checked_mul_decimal(quantity)
+}
+
+/// VAT amount for one line: `Percent` lines get `floor(net × bp / 10_000)`
+/// (integer division, so it **truncates toward zero**); every other kind gets
+/// exactly zero. Returns `None` on overflow.
+///
+/// The truncation is not incidental — it is what NAV is filed with, so a
+/// consumer that "improves" it to round-half-even stops matching the filing.
+/// See [`line_net_total`] for why this is a free function.
+pub fn line_vat_amount(net_total: Huf, kind: VatRateKind, basis_points: u16) -> Option<Huf> {
+    if !kind.is_percent() {
+        return Some(Huf::ZERO);
+    }
+    let vat = net_total.as_i64().checked_mul(basis_points as i64)?;
+    Some(Huf(vat / 10_000))
+}
+
 impl LineItem {
     /// Pre-tax line total: `round_half_even(unit_price × quantity)` in
     /// whole minor units. Returns `None` on overflow. S157 — quantity is
     /// `Decimal`, so the product is rounded back to integer minor units
     /// (a fractional forint/cent cannot exist on the wire).
     pub fn net_total(&self) -> Option<Huf> {
-        self.unit_price.checked_mul_decimal(self.quantity)
+        line_net_total(self.unit_price, self.quantity)
     }
 
     /// VAT amount for the line.
@@ -90,12 +122,11 @@ impl LineItem {
     /// bytes of ZERO correctly-issued invoices; it changes them only where a
     /// gate-bypassing door admitted a non-zero rate on such a line.
     pub fn vat_amount(&self) -> Option<Huf> {
-        if !self.vat_rate_kind.is_percent() {
-            return Some(Huf::ZERO);
-        }
-        let net = self.net_total()?.as_i64();
-        let vat = net.checked_mul(self.vat_rate_basis_points as i64)?;
-        Some(Huf(vat / 10_000))
+        line_vat_amount(
+            self.net_total()?,
+            self.vat_rate_kind,
+            self.vat_rate_basis_points,
+        )
     }
 
     /// Gross (net + VAT). Returns `None` on overflow.

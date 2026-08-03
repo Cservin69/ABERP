@@ -54,6 +54,21 @@ apps/aberp-ui/gen/
 /data/
 /tenants/
 /var/
+# ADR-0108 (B3) — the SQLite-migration artefacts. This repository is PUBLIC and
+# these files hold partner bank accounts, tax numbers and every invoice.
+# Measured, not assumed: before this block `aberp.sqlite`, its two WAL siblings,
+# and BOTH snapshot directories were untracked AND unignored. The snapshot
+# directories are the more dangerous half — each holds a byte copy of the entire
+# DuckDB database and its audit mirror. Pinned by
+# `run/tests/gitignore_migration_artefacts_test.sh`.
+# The two directory globs deliberately omit the trailing slash ADR-0108 §2.5
+# writes. With it, `.aberp-premigration-<ts>.partial` — the staging directory
+# the snapshot assembles in before its atomic promote — is a SIBLING name, not
+# a child, and would have stayed committable. T-17 caught that; the slashless
+# form covers the promoted directory and the staging one both.
+*.sqlite*
+.aberp-premigration-*
+.aberp-rolledback-*
 
 # --- Secrets (NEVER commit) ---------------------------------
 .env
