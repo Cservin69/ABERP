@@ -124,7 +124,10 @@ fn boot_rebuilds_the_indexes_after_the_heal_and_before_the_handle_opens() {
     };
 
     let reconcile = find_after("ensure_consistent_with_db(");
-    let rebuild = find_after("index_integrity::rebuild_secondary_indexes(");
+    // The AUDITED variant specifically — the plain one emits no durable
+    // `db.indexes_rebuilt` row, and with no detector for this class that row is
+    // the only evidence the repair ran (R2).
+    let rebuild = find_after("index_integrity::rebuild_secondary_indexes_audited(");
     let handle = find_after("open_tenant_handle(");
 
     assert!(

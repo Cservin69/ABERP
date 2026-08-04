@@ -771,6 +771,19 @@ pub enum EventKind {
     /// never swept into a per-invoice export bundle. F12 four-edit ritual fires.
     DbAutoRecovered,
 
+    /// Prod incident 2026-08-03 — serve boot rebuilt the non-constraint
+    /// (`CREATE INDEX`) ART indexes. The rebuild is UNCONDITIONAL because the
+    /// poisoned state it repairs (an ART missing entries for rows the table
+    /// still has) has NO non-destructive detector on DuckDB 1.5.3, so this
+    /// event is the only durable signal that the repair ran at all: recurrence
+    /// of the read-fork close-tear and boot-cost drift are observable only
+    /// here. Payload is `{"indexes_rebuilt":<u64>,"elapsed_ms":<u64>}`.
+    /// Deliberately NOT `db.auto_recovered` — that kind means "something went
+    /// wrong"; firing it every boot would mask real recoveries. `db.*` prefix —
+    /// a system/durability event, app-layer JSON only (never NAV XML), never
+    /// swept into a per-invoice export bundle. F12 four-edit ritual fires.
+    DbIndexesRebuilt,
+
     /// S220 / PR-217 — the buyer-backfill cycle completed one pass.
     /// The boot-time backfill walks restored_invoice rows with a
     /// NULL `customer_name` and tries to fetch buyer fields via NAV's
@@ -3172,6 +3185,7 @@ impl EventKind {
             EventKind::QuoteIntakePollCompleted => "system.quote_intake_poll_completed",
             EventKind::DaemonShutdownCompleted => "system.daemon_shutdown_completed",
             EventKind::DbAutoRecovered => "db.auto_recovered",
+            EventKind::DbIndexesRebuilt => "db.indexes_rebuilt",
             EventKind::RestoreBuyerBackfillCycleCompleted => {
                 "system.restore_buyer_backfill_cycle_completed"
             }
@@ -3392,6 +3406,7 @@ impl EventKind {
             "system.quote_intake_poll_completed" => Ok(EventKind::QuoteIntakePollCompleted),
             "system.daemon_shutdown_completed" => Ok(EventKind::DaemonShutdownCompleted),
             "db.auto_recovered" => Ok(EventKind::DbAutoRecovered),
+            "db.indexes_rebuilt" => Ok(EventKind::DbIndexesRebuilt),
             "system.restore_buyer_backfill_cycle_completed" => {
                 Ok(EventKind::RestoreBuyerBackfillCycleCompleted)
             }
@@ -3603,6 +3618,7 @@ impl EventKind {
         EventKind::QuoteIntakePollCompleted,
         EventKind::DaemonShutdownCompleted,
         EventKind::DbAutoRecovered,
+        EventKind::DbIndexesRebuilt,
         EventKind::RestoreBuyerBackfillCycleCompleted,
         EventKind::RestoreFromNavRun,
         EventKind::ExtNavPartnerManualLink,
@@ -3818,6 +3834,7 @@ mod tests {
             EventKind::QuoteIntakePollCompleted,
             EventKind::DaemonShutdownCompleted,
             EventKind::DbAutoRecovered,
+            EventKind::DbIndexesRebuilt,
             EventKind::RestoreBuyerBackfillCycleCompleted,
             EventKind::ExtNavPartnerManualLink,
             EventKind::RestoreFromNavRun,
@@ -4013,7 +4030,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            188,
+            189,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \

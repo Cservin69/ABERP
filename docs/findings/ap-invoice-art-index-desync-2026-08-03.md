@@ -108,8 +108,43 @@ Two DuckDB constraints the implementation obeys:
   inside an explicit `BEGIN`/`COMMIT` crashes DuckDB 1.5.x outright
   (*"Pure virtual function called!"*, measured);
 * a half-done rebuild leaves at most a *missing* index — a plan regression,
-  never a correctness one — and the next boot's `CREATE INDEX IF NOT EXISTS`
-  restores it.
+  never a correctness one.
+
+⚠ **R3 correction.** An earlier revision of this section claimed "the next
+boot's `CREATE INDEX IF NOT EXISTS` restores it". **That is false for two of the
+25 indexes.** Only tables whose `ensure_schema` is called inside `serve::run`
+get that guarantee. `partners::ensure_schema` is **not** in the boot path — it
+is called only on the demo DB (`serve.rs:632`) and from a route helper
+(`serve.rs:10296`) — so a durable `DROP` of `partners_tenant_deleted_idx` /
+`partners_tenant_display_idx` leaves them **absent until a partners route runs**.
+Still a plan regression, not a correctness one, but not self-healing at boot.
+
+### R2 — the repair is now audited
+
+The rebuild emits a durable `db.indexes_rebuilt` audit row
+(`{"indexes_rebuilt":N,"elapsed_ms":N}`) via
+`rebuild_secondary_indexes_audited`, then re-syncs the mirror. Because there is
+no detector (§3) and the repair is unconditional, this row is the **only**
+durable signal that it ran: recurrence of the close-tear and boot-cost drift are
+observable nowhere else. Deliberately a NEW `EventKind` and not
+`db.auto_recovered` — that kind means "something went wrong", and firing it on
+every boot would mask real recoveries. The append is best-effort (the repair has
+already landed) and logs at `error` on failure.
+
+### R1 — how long the poisoned window actually is
+
+The poison is **persistent per table**: once an ART is missing entries, it stays
+missing across restarts until something rebuilds it. This gate rebuilds at every
+boot, so the exposure window is "from whenever the tear happens until the next
+boot" — not "one request".
+
+⚠ That window is **not** closed for the rest of a serve session, and the
+generator is still live downstream of the gate: `apps/aberp/src/serve.rs:2389`
+is an in-serve `duckdb::Connection::open` (the cad-blob key-provision audit),
+which runs AFTER the repair and after the shared Handle opens. Its close carries
+DuckDB's default pragmas and can therefore fold/truncate the Handle's WAL —
+exactly the close-tear class that produced this incident. The repair makes the
+consequence self-healing on the next boot; it does not remove the generator.
 
 ## 5. Snapshot validation — what changed, and what it does not claim
 
@@ -117,6 +152,17 @@ Two DuckDB constraints the implementation obeys:
 snapshot, and `take_snapshot` compares it against the live source; a mismatch
 marks the snapshot invalid. Measured: source 25 == re-imported 25 on the
 incident DB, so the gate cannot false-positive on a healthy export.
+
+⚠ **The comparison must require BOTH counts to be real.** `-1` is the
+"catalog unreadable" sentinel, not a count. The first revision of this arm
+compared it like one, so an unreadable SOURCE catalog (`-1`) against a healthy
+re-imported `25` scored as a mismatch → `valid: false` → **`restore_into`
+refuses that snapshot → unrestorable**. Nothing else covered the source side:
+every `validate_export` arm only ever sees the re-imported copy. The verdict now
+lives in `index_inventory_verdict`, degrades an unreadable catalog to "not
+compared", and is pinned both ways (a real shortfall invalidates; a sentinel on
+either side never does). Both pins are mutation-verified: forcing the verdict to
+`None`, or dropping the sentinel guard, reds the suite.
 
 **Deliberate deviation, flagged.** The brief asked for the poisoned *source* to
 make its snapshot `valid: false`. That is not implemented, for two reasons:
@@ -143,6 +189,15 @@ theoretically reachable and is not covered — the next boot repairs it.
 * `crates/aberp-db/src/index_integrity.rs` unit tests — constraint ARTs are
   never listed or dropped; the rebuild is idempotent.
 * `crates/aberp-snapshot/tests/snapshot_tests.rs::snapshot_carries_and_records_the_secondary_index_inventory`.
+
+## 6b. Known residuals (adversarial review, 2026-08-04)
+
+| id | residual | status |
+|---|---|---|
+| **R5** | A standalone `CREATE UNIQUE INDEX` is ART-backed and just as poisonable, but `NOT is_unique` filters it out of the repair set — it would be silently unrepairable forever. | **Ratcheted.** `rebuild_secondary_indexes` counts standalone unique indexes BEFORE any drop and refuses loudly if there is one. Zero today; the first one added trips boot. Table-level `UNIQUE(...)` constraints are *not* standalone unique indexes and do not trip it (pinned both ways). |
+| **R6** | `DROP INDEX "<name>"` is unqualified, so an index in a non-`main` schema would fail to drop. | **Known, fail-safe.** Unreachable today — every ABERP object lives in `main`. A non-`main` index would make the DROP error out and REFUSE boot, i.e. it fails loud rather than silently skipping the repair. Widen to schema-qualified if a second schema is ever introduced. |
+| **R7** | The repair is bound to `serve` boot only. A CLI one-shot that writes the DB does not run it. | **Known, mitigated.** The whole-DB writer flock (ADR-0099 F-E) means a one-shot and `serve` cannot both hold the DB, and `aberp-ui` launches `serve` — so the normal desktop path always boots through the gate. A long-lived one-shot writer session remains uncovered until its next `serve` boot. |
+| **R8** | `clippy --features production --all-targets -D warnings` is red on `apps/aberp/tests/serve_tenant_feature_guard.rs:16`. | **No action — not a cut blocker.** Pre-existing on `main` (that file is byte-identical to `origin/main`), and CI's clippy step runs default features with no production arm, so it is not on the cut path. |
 
 ## 7. NOT closed by this change
 

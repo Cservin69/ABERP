@@ -1526,7 +1526,11 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // below, on an already-repaired file.
         tracing::info!("boot step: rebuilding secondary ART indexes (2026-08-03 incident gate)");
         let _rebuild_span = tracing::info_span!("serve.rebuild_secondary_indexes").entered();
-        match aberp_db::index_integrity::rebuild_secondary_indexes(&conn) {
+        match aberp_db::index_integrity::rebuild_secondary_indexes_audited(
+            &conn,
+            &tenant,
+            &mirror_path,
+        ) {
             Ok(rebuilt) => tracing::info!(
                 rebuilt = rebuilt.len(),
                 indexes = ?rebuilt,
