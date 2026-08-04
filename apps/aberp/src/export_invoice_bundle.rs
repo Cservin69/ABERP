@@ -676,6 +676,8 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // `db.`-scoped process-durability telemetry — never belongs in a
         // per-invoice export bundle.
         | EventKind::DbAutoRecovered
+        // Prod incident 2026-08-03 — boot index-rebuild telemetry; no NAV bytes.
+        | EventKind::DbIndexesRebuilt
         // S220 / PR-217 — buyer-backfill cycle completion event.
         // `system.`-scoped — recovery cadence telemetry against
         // `restored_invoice`, not a per-OUTGOING-invoice surface.
@@ -1087,7 +1089,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 188,
+        EventKind::ALL_KINDS_COUNT == 189,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

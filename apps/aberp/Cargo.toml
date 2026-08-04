@@ -284,6 +284,12 @@ aberp-snapshot = { path = "../../crates/aberp-snapshot" }
 duckdb = { workspace = true }
 time = { workspace = true }
 
+# Prod incident 2026-08-03 — `index_desync_incident_20260803.rs` unpacks the
+# zstd-compressed copy of the poisoned prod DB (`*.duckdb` is gitignored, and a
+# poisoned ART cannot be rebuilt from SQL, so it ships as bytes). `zstd` is
+# already a production dependency above; listing it here costs no build time.
+zstd = { workspace = true }
+
 # S161 — the NAV poll-daemon timer pins (`poll_ack.rs` two-phase
 # schedule tests) use tokio's `#[tokio::test(start_paused = true)]`
 # virtual clock so the 1/2/4/8/16/30/60 + 60s schedule is asserted

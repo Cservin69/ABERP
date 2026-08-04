@@ -20,7 +20,70 @@ pub struct ValidationReport {
     pub invoice_count: i64,
     pub audit_count: i64,
     pub chain_len: u64,
+    /// Number of non-constraint (`CREATE INDEX`) ART indexes present in the
+    /// RE-IMPORTED snapshot, or `-1` if unreadable. Compared against the live
+    /// source in [`take_snapshot`] — see [`SECONDARY_INDEX_COUNT_SQL`].
+    pub secondary_index_count: i64,
     pub error: Option<String>,
+}
+
+/// Count the non-constraint ART indexes of the connected database.
+///
+/// Prod incident 2026-08-03 — an `EXPORT`/`IMPORT` round-trip that silently
+/// dropped a `CREATE INDEX` would hand back a restored DB whose query plans
+/// quietly degrade, and it would do so with `valid: true`. Measured on the
+/// incident DB: source 25, re-imported 25 — the round-trip does carry them, so
+/// this gate cannot fire on a healthy export.
+///
+/// NOTE on what this does NOT do: it cannot see the incident's actual fault (an
+/// ART missing *entries* while the index object is present). `IMPORT DATABASE`
+/// rebuilds every index from the parquet, so the re-imported copy is healthy
+/// even when the source is poisoned — which is exactly why `snap-37` reported
+/// `valid: true`. That class is not detectable non-destructively on DuckDB
+/// 1.5.3 (see `aberp_db::index_integrity`); it is handled at serve boot, which
+/// repairs unconditionally before any snapshot of this process can be taken.
+pub const SECONDARY_INDEX_COUNT_SQL: &str =
+    "SELECT count(*) FROM duckdb_indexes() WHERE NOT is_primary AND NOT is_unique";
+
+/// Sentinel returned by [`secondary_index_count`] when the catalog could not be
+/// read. It is NOT a count — never compare it as one (see the both-real guard
+/// in [`take_snapshot`], and `secondary_index_count_unrecorded` in `lib.rs`,
+/// which uses the same value for "field absent from an older `meta.json`").
+pub const INDEX_COUNT_UNREADABLE: i64 = -1;
+
+fn secondary_index_count(conn: &Connection) -> i64 {
+    conn.query_row(SECONDARY_INDEX_COUNT_SQL, [], |r| r.get(0))
+        .unwrap_or(INDEX_COUNT_UNREADABLE)
+}
+
+/// Prod incident 2026-08-03 — `Some(reason)` iff the export demonstrably lost a
+/// `CREATE INDEX` relative to its live source. An export that loses one
+/// restores into a DB whose query plans the source assumed. Cannot fire on a
+/// healthy export (measured 25 == 25 on the incident DB).
+///
+/// # Both counts must be REAL — this is the load-bearing part
+///
+/// [`INDEX_COUNT_UNREADABLE`] means "could not read the catalog", NOT "zero
+/// indexes". An earlier revision compared the sentinel like a count, so an
+/// unreadable SOURCE catalog (`-1`) against a healthy re-imported `25` scored
+/// as a mismatch → `valid: false` → [`restore_into`] REFUSES that snapshot →
+/// unrestorable. Nothing else covers the source side: every
+/// [`validate_export`] arm only ever sees the re-imported copy, so the claim
+/// that "the existing arms already report it" was false.
+///
+/// A gate that can brick recovery is worse than the loss it guards against. An
+/// unreadable catalog therefore degrades to "not compared", never to "invalid".
+fn index_inventory_verdict(source: i64, reimported: i64) -> Option<String> {
+    if source == INDEX_COUNT_UNREADABLE || reimported == INDEX_COUNT_UNREADABLE {
+        return None;
+    }
+    if source == reimported {
+        return None;
+    }
+    Some(format!(
+        "export lost secondary indexes: source has {source}, \
+         the re-imported snapshot has {reimported}"
+    ))
 }
 
 /// Single-quote a path for embedding in a DuckDB SQL string, doubling any
@@ -65,6 +128,7 @@ pub fn validate_export(export_dir: &Path, tenant: &str) -> ValidationReport {
                 invoice_count: -1,
                 audit_count: -1,
                 chain_len: 0,
+                secondary_index_count: INDEX_COUNT_UNREADABLE,
                 error: Some(format!("invalid tenant id {tenant:?}")),
             }
         }
@@ -93,6 +157,10 @@ pub fn validate_export(export_dir: &Path, tenant: &str) -> ValidationReport {
             Err(e) => return fail(format!("audit_ledger unreadable in snapshot: {e}")),
         };
 
+    // Non-constraint ART index inventory of the RE-IMPORTED snapshot. Read
+    // before the connection is moved into the `Ledger` below.
+    let secondary_index_count = secondary_index_count(&conn);
+
     // Verify the hash chain on the imported connection WITHOUT re-opening a
     // file (S375). Binary hash is irrelevant to chain verification (which
     // checks prev/entry hashes against the tenant genesis), so a zero hash
@@ -104,6 +172,7 @@ pub fn validate_export(export_dir: &Path, tenant: &str) -> ValidationReport {
             invoice_count,
             audit_count,
             chain_len,
+            secondary_index_count,
             error: None,
         },
         Err(e) => ValidationReport {
@@ -111,6 +180,7 @@ pub fn validate_export(export_dir: &Path, tenant: &str) -> ValidationReport {
             invoice_count,
             audit_count,
             chain_len: 0,
+            secondary_index_count,
             error: Some(format!("hash-chain verification failed: {e}")),
         },
     }
@@ -122,6 +192,7 @@ fn fail(msg: String) -> ValidationReport {
         invoice_count: -1,
         audit_count: -1,
         chain_len: 0,
+        secondary_index_count: INDEX_COUNT_UNREADABLE,
         error: Some(msg),
     }
 }
@@ -214,19 +285,27 @@ pub fn take_snapshot(
         sql_quote(&partial_dir)
     ))?;
 
+    let source_secondary_indexes = secondary_index_count(conn);
     let report = validate_export(&partial_dir, tenant);
     let byte_size = dir_size(&partial_dir)?;
+
+    let (valid, validation_error) =
+        match index_inventory_verdict(source_secondary_indexes, report.secondary_index_count) {
+            Some(msg) if report.ok => (false, Some(msg)),
+            _ => (report.ok, report.error),
+        };
 
     let meta = SnapshotMeta {
         seq,
         created_at: now,
         source_db_sha256,
         byte_size,
-        valid: report.ok,
+        valid,
         invoice_count: report.invoice_count,
         audit_count: report.audit_count,
         chain_len: report.chain_len,
-        validation_error: report.error,
+        secondary_index_count: report.secondary_index_count,
+        validation_error,
     };
     write_meta(&partial_dir, &meta)?;
 
@@ -345,4 +424,77 @@ fn wal_sibling(db: &Path) -> PathBuf {
     let mut os = db.as_os_str().to_owned();
     os.push(".wal");
     PathBuf::from(os)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (a) A genuine, both-real shortfall IS a lost index and must invalidate.
+    /// Replacing the verdict body with `None` reds this.
+    #[test]
+    fn a_real_count_shortfall_invalidates_the_snapshot() {
+        let verdict = index_inventory_verdict(25, 24).expect("a real 25 vs 24 must invalidate");
+        assert!(
+            verdict.contains("source has 25") && verdict.contains("snapshot has 24"),
+            "the reason must name both counts: {verdict}"
+        );
+        // Direction-agnostic: an export that somehow gained one is equally a
+        // disagreement between the two catalogs.
+        assert!(index_inventory_verdict(24, 25).is_some());
+    }
+
+    /// Equal counts — the healthy path, and the only one prod ever takes.
+    #[test]
+    fn equal_counts_are_valid() {
+        assert_eq!(index_inventory_verdict(25, 25), None);
+        assert_eq!(index_inventory_verdict(0, 0), None);
+    }
+
+    /// (b) MUST-FIX — the `-1` sentinel on EITHER side must NOT flip validity.
+    ///
+    /// `-1` means "could not read the catalog", not "zero indexes". Comparing
+    /// it as a count made an unreadable SOURCE score as a mismatch →
+    /// `valid: false` → [`restore_into`] refuses → the snapshot is
+    /// unrestorable. Dropping the `INDEX_COUNT_UNREADABLE` guard reds this.
+    #[test]
+    fn the_unreadable_sentinel_never_invalidates_a_snapshot() {
+        assert_eq!(
+            index_inventory_verdict(INDEX_COUNT_UNREADABLE, 25),
+            None,
+            "an unreadable SOURCE catalog must degrade to 'not compared' — \
+             marking it invalid makes restore_into refuse the snapshot and \
+             bricks the recovery path"
+        );
+        assert_eq!(
+            index_inventory_verdict(25, INDEX_COUNT_UNREADABLE),
+            None,
+            "an unreadable RE-IMPORTED catalog must degrade to 'not compared' too"
+        );
+        assert_eq!(
+            index_inventory_verdict(INDEX_COUNT_UNREADABLE, INDEX_COUNT_UNREADABLE),
+            None
+        );
+        // And the sentinel is never confused with a genuine empty catalog.
+        assert_eq!(index_inventory_verdict(INDEX_COUNT_UNREADABLE, 0), None);
+        assert!(index_inventory_verdict(0, 25).is_some());
+    }
+
+    /// The verdict above is only worth anything if `take_snapshot` still calls
+    /// it. There is no way to induce a real inventory mismatch end-to-end
+    /// (measured: `EXPORT DATABASE` carries every `CREATE INDEX`, including
+    /// non-`main` schemas), so the wiring gets a structural pin — the same
+    /// technique `apps/aberp/tests/boot_order_*` uses for `serve::run`.
+    #[test]
+    fn take_snapshot_still_consults_the_inventory_verdict() {
+        const TAKE_RS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/take.rs"));
+        let body_start = TAKE_RS
+            .find("pub fn take_snapshot(")
+            .expect("locate take_snapshot");
+        assert!(
+            TAKE_RS[body_start..].contains("index_inventory_verdict("),
+            "take_snapshot must consult index_inventory_verdict — without the call the \
+             unit tests above pass while the gate does nothing"
+        );
+    }
 }

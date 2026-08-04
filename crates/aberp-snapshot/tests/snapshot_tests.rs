@@ -114,6 +114,7 @@ fn record(seq: u64, created_at: OffsetDateTime, valid: bool) -> SnapshotRecord {
             invoice_count: 1,
             audit_count: 1,
             chain_len: 1,
+            secondary_index_count: 0,
             validation_error: None,
         },
     }
@@ -151,6 +152,55 @@ fn take_snapshot_validates_and_round_trips() {
     let target = dir.path().join("restored").join("aberp.duckdb");
     restore_into(&rec.dir, &target, "prod").expect("restore ok");
     assert_eq!(read_invoice_ids(&target), vec![0, 1, 2]);
+}
+
+/// Prod incident 2026-08-03 — the snapshot must carry the source's
+/// non-constraint (`CREATE INDEX`) ART indexes, and must record how many it
+/// carried. An export that silently loses one restores into a DB whose query
+/// plans the source assumed; `take_snapshot` marks such a snapshot invalid.
+///
+/// This pins the healthy direction (source count == re-imported count == what
+/// the restored file actually has), so the gate is proven not to false-positive
+/// AND the loss it guards against would turn this red.
+#[test]
+fn snapshot_carries_and_records_the_secondary_index_inventory() {
+    let dir = ScopedTempDir::new("secondary-indexes");
+    let db = dir.path().join("aberp.duckdb");
+    seed_db(&db, "prod", 2, 2);
+    {
+        let conn = Connection::open(&db).expect("open to add secondary indexes");
+        conn.execute_batch(
+            "CREATE INDEX invoice_amount_idx ON invoice(amount);
+             CREATE INDEX invoice_note_idx ON invoice(note);",
+        )
+        .expect("create secondary indexes");
+    }
+
+    let store = dir.path().join("store");
+    let now = datetime!(2026-08-03 15:28:34 UTC);
+    let rec = take_snapshot(&snap_conn(&db), &db, &store, "prod", now).expect("snapshot ok");
+
+    assert!(
+        rec.meta.valid,
+        "healthy export must stay valid: {:?}",
+        rec.meta
+    );
+    assert_eq!(
+        rec.meta.secondary_index_count, 2,
+        "the snapshot must record the source's secondary-index inventory"
+    );
+
+    let target = dir.path().join("restored").join("aberp.duckdb");
+    restore_into(&rec.dir, &target, "prod").expect("restore ok");
+    let conn = Connection::open(&target).expect("reopen restored db");
+    let restored: i64 = conn
+        .query_row(aberp_snapshot::SECONDARY_INDEX_COUNT_SQL, [], |r| r.get(0))
+        .expect("count restored secondary indexes");
+    assert_eq!(
+        restored, 2,
+        "a restore must bring both secondary indexes back — losing one is the \
+         class the take_snapshot inventory gate refuses"
+    );
 }
 
 #[test]
