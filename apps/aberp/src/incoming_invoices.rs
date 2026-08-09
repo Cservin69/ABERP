@@ -1100,6 +1100,20 @@ pub fn change_status(
     .context("audit-ledger chain verification failed AFTER ap_invoice status change")?;
     drop(guard);
 
+    // ADR-0110 D3 — the durable-ack boundary. AP "mark paid" moves real money
+    // out, and unlike the AR side it DOES write a business row: the
+    // `ap_invoice.status` UPDATE. ADR-0110 §7.3 proved that row is
+    // unreconstructible from the audit payload (the natural key
+    // `supplier_tax_number` + `nav_invoice_number` is not in it, and AP sync
+    // re-ingests lost rows under FRESH ULIDs), so this UPDATE has no recovery
+    // path other than being durable in the first place. Guard drop fsync'd the
+    // mirror; this fsyncs the WAL that holds the UPDATE.
+    //
+    // Note the early return above (`from_parsed == to_status`) deliberately
+    // does NOT call this: it wrote nothing, so there is nothing to make durable.
+    db.durable_ack()
+        .context("ADR-0110 D3 durable-ack fsync after ap_invoice status-change commit")?;
+
     Ok(StatusChangeOutcome {
         id: ap_invoice_id.to_string(),
         from_status: from_parsed.as_str().to_string(),

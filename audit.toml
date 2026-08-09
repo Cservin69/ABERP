@@ -50,4 +50,5 @@ ignore = [
     "RUSTSEC-2026-0195",  # quick-xml quadratic-attr DoS — same envelope as -0194
     "RUSTSEC-2026-0185",  # quinn-proto QUIC DoS — http3 feature OFF; not in resolved graph (cargo-deny doesn't flag it), phantom Cargo.lock entry, never compiled
     "RUSTSEC-2026-0221",  # event-listener 5.4.1 — Linux-only path (keyring → secret-service → zbus); never compiled on the macOS target, phantom Cargo.lock entry
+    "RUSTSEC-2026-0235",  # rkyv 0.7.46 — optional rust_decimal feature we do not enable; `cargo tree -e normal | grep -c rkyv` == 0, phantom Cargo.lock entry. No in-semver fix (needs rkyv>=0.8.17; rust_decimal 1.x still on 0.7)
 ]

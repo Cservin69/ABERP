@@ -1189,6 +1189,25 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     .context("audit-ledger chain verification failed AFTER issuance")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
+    // ADR-0110 D3 — THE DURABLE-ACK BOUNDARY. Dropping the guard runs the
+    // lockstep `sync_mirror` (which fsyncs the mirror); `durable_ack` then
+    // fsyncs the main file + the WAL that actually holds these `invoice` /
+    // `invoice_line` rows. Only after BOTH does this function return, and
+    // returning is what makes the route answer the operator 200.
+    //
+    // The explicit `drop` is load-bearing, not tidiness: `durable_ack` takes no
+    // lock and must run after the mirror sync, and the guard would otherwise
+    // live to the end of the function. Ordering is mirror-then-DB so a crash
+    // between them leaves the mirror AHEAD, which `heal_from_mirror_ahead`
+    // covers; the inverse is the direction nothing covers (ADR-0110 §7.5).
+    //
+    // A failure here is propagated, never warned: the tx has committed, so the
+    // choice is "tell the operator it failed" vs "promise durability we did not
+    // achieve" (ADR-0110 R3 / §7.7, CLAUDE.md rule 11).
+    drop(guard);
+    db.durable_ack()
+        .context("ADR-0110 D3 durable-ack fsync after invoice issuance commit")?;
+
     tracing::info!(
         invoice_number = %invoice_number,
         entries_verified = verified,
