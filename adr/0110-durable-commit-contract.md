@@ -1,8 +1,10 @@
 # ADR-0110 — The durable-commit contract and business-state boot replay
 
-- **Status:** Proposed — **adversarially reviewed 2026-08-08.** Verdict: *sound after
-  changes*. The changes are listed in §11 and are folded into §5/§6/§7 below.
-- **Date:** 2026-08-08 (rev. 2, post-adversarial)
+- **Status:** **Partially implemented** — D3 landed 2026-08-09 (rev. 3). D1, D2,
+  D4, D5 and the payload widening remain proposed. Adversarially reviewed
+  2026-08-08; verdict *sound after changes*, listed in §11 and folded into
+  §5/§6/§7. Rev-3's corrections are in §12.
+- **Date:** 2026-08-09 (rev. 3, post-D3-implementation)
 - **Deciders:** Ervin
 - **Context repo:** `Cservin69/ABERP` (production line), at `380ba8a`
 - **Landing note:** this file is held at
@@ -15,8 +17,10 @@
   lane — H1/H2/H3, and the **H4 that was never built**), ADR-0030 + ADR-0008
   (audit mirror / hash chain), ADR-0082 (snapshot system), ADR-0107 (engine
   evaluation), ADR-0108 (SQLite DEV migration plan), ADR-0019 (storage strategy)
-- **Authorises:** nothing to be built. This document is a design decision only.
-  No runtime code, schema, or prod touch is authorised by it.
+- **Authorises:** nothing further to be built. Rev. 2 authorised nothing at all;
+  D3 was subsequently built and is recorded here as implemented (§5 D3, §12).
+  Nothing else in this document is authorised by it, and it authorises no
+  schema change and no prod touch — deployment is the operator's call.
 
 ---
 
@@ -414,9 +418,64 @@ business-state replay as the recovery path.**
   - **Emits one audited `DbAutoRecovered`-class row** naming exactly what it
     reconstructed and what it could not, so the operator can reconcile against NAV.
 
-- **D3 — Implement H4 (Option B) as the durability floor.** Replace the
-  `run_durable_checkpoint_locked` stub with the real validated build-aside +
-  `atomic_install` + marker, and default `checkpoint_enabled = true`.
+- **D3 — Make the ack durable. IMPLEMENTED 2026-08-09 — and NOT as H4.**
+  *(Corrected in rev. 3; see §12.1.)*
+
+  Rev. 2 wrote D3 as "implement H4": replace `run_durable_checkpoint_locked`
+  with a validated build-aside + `atomic_install` + marker and default
+  `checkpoint_enabled = true`. **That is not what shipped, and the difference
+  matters.**
+
+  What shipped is `aberp_db::Handle::durable_ack` — Option B, §4's other arm.
+  After a money-path commit it `fsync`s the main file, `<db>.wal`, and the
+  tenant directory. It **does not fold**. Five ack sites call it, each as
+  `drop(guard); db.durable_ack()?`, so the guard-drop mirror `fsync` always
+  precedes the DB `fsync`: `issue_invoice::issue_from_parsed`,
+  `issue_modification::modification_from_inputs`,
+  `issue_storno::storno_from_inputs`, `mark_invoice_paid::mark_paid`,
+  `incoming_invoices::change_status`.
+
+  **Why Option B over Option A (fold + fsync), which rev. 2 assumed:**
+  1. **A fold is not required for durability.** DuckDB replays `<db>.wal` on
+     open, so an `fsync`'d WAL is already a complete durable record of the
+     commit. Rev. 2's §5 D6b prose assumed the row could only become durable by
+     reaching the main file. It was wrong — measurably: the D6b byte-copy tier
+     boots a copy carrying only the WAL and gets the invoice back.
+  2. **Folding per ack reopens the hazard the pragmas exist to close.** Option A
+     rewrites the main file on every invoice. §2.3 measured six in-place folds
+     under sustained writes and §4 Option A already rejects that as the
+     `duckdb#23046` torn-metadata path. Doing it at *ack* frequency is Option A
+     with a worse duty cycle. Option B leaves the main file untouched on the
+     money path, so §7.8's snapshot-forks-chain interaction and the thirteen
+     boot openers are entirely unaffected — nothing about boot changes.
+  3. **Cost.** One `fsync` of a small append-only file against folding the whole
+     WAL and rewriting main-file metadata, on every money write, forever.
+  4. **It needs no new primitive.** `aberp_snapshot::live_durable_checkpoint`
+     still does not exist in this tree (§2.2). Option A would have had to build
+     it; Option B is `File::sync_all`, the same primitive `crash_safe.rs` and
+     the audit mirror already use — and the mirror is the store that lost
+     **nothing** on 2026-08-08, so the choice is evidenced rather than guessed.
+
+  **Measured cost (R6, §9's unmeasured ~24 ms estimate now replaced by a real
+  number).** 20 issuances, release build, this tree: **12.11 ms** per acked
+  issuance with `durable_ack`, **11.00 ms** without — **+1.11 ms**, about 4.6 %
+  of the ~24 ms/write baseline. Not operator-visible. Reproduce with
+  `durable_ack_latency_stays_inside_r6`.
+
+  **What D3 explicitly does NOT do, and the cost of that:**
+  - **H4 is still unbuilt.** `run_durable_checkpoint_locked` is still the
+    `tracing::error!` stub and `checkpoint_enabled` still defaults `false`.
+  - So the runtime WAL is now **durable but still unbounded**, and it is still
+    the boot fold that truncates it. **D4 therefore still depends on H4, not on
+    D3** — a boot that stops folding without H4 leaves the WAL growing without
+    limit. §6 Phase 3 is unchanged in that respect.
+  - Durability is **money-path only**, by choice: bounding the blast radius and
+    the latency. Every non-money write (quotes, inventory, MES, catalogue,
+    email outbox) is exactly as durable as it was, i.e. WAL-resident until the
+    next boot fold. §7.10's warning stands and now has a name: the next loss
+    will be in a family D3 does not cover, and **H4 is what covers them**.
+  - On macOS `sync_all` is `fsync(2)`, which does not force the *device's* write
+    cache; only `F_FULLFSYNC` does. Flagged, not fixed — see §12.4.
 
 - **D4 — Boot must stop folding blind.**
   1. Every boot-phase opener gets the same pragma posture as the Handle, via a
@@ -436,29 +495,103 @@ business-state replay as the recovery path.**
   3. Rebuild/restore gains an explicit, audited **mirror re-baselining** step,
      with the pre-restore mirror preserved byte-for-byte.
 
-- **D6 — Prove it, don't assert it. *(Spec corrected — §7.6.)*** A crash-injection
-  e2e in two tiers:
+- **D6 — Prove it, don't assert it. *(Spec corrected twice: §7.6, then §12.2.
+  BUILT and GREEN.)*** A crash-injection e2e, now in three tiers, all in
+  `apps/aberp/tests/adr0110_d6b_ondisk_durability.rs`:
   - **D6a — process-crash tier.** `SIGKILL` at the ack boundary, restart, assert
     the **`invoice` row** (not the ledger row) is present. Catches user-space
-    buffering. Must fail against `380ba8a`.
-  - **D6b — power-loss tier.** At the ack boundary, copy the on-disk byte state
-    (`aberp.duckdb`, `aberp.duckdb.wal`, `aberp.duckdb.audit.log`) into a fresh
-    tenant directory **and boot from that copy**, asserting the same row. This
-    isolates "what is on disk" from "what the live process holds", which SIGKILL
-    alone cannot do.
-  - Neither tier faithfully simulates power loss on macOS without root. **D6 must
-    therefore be labelled as testing process-crash durability, and R1's
-    machine-restart clause must not be claimed as proven by it.**
-  - **D6 must be wired into the cut-gate**, not left as a lone e2e (§7.9).
+    buffering. **Not built**, and rev. 3 does not intend to build it: §7.6
+    already establishes that a system with zero `fsync` passes it, so it can
+    only weaken the suite's apparent strength. The tier below strictly dominates
+    it.
+  - **D6b tier 1 — byte-copy tier. BUILT, and it PASSES against `380ba8a`,
+    contradicting rev. 2's expectation.** Rev. 2 wrote this as the power-loss
+    tier and expected it red. It is green, and was green *before any fix*:
+    DuckDB pushes WAL records out to `aberp.duckdb.wal` at commit, so a copy of
+    the tenant directory taken at the ack does carry the invoice and a fresh
+    instance replays it. **This tier cannot be the Phase-1 specification** — a
+    file copy reads through the OS page cache, so it measures "did the write
+    reach the file", never "did it reach stable storage". §7.6's argument
+    against `SIGKILL` applies to it verbatim. It is kept, un-ignored, as a
+    genuine regression pin on the WAL-at-commit property.
+  - **D6b tier 2 — the power-loss tier, and THE specification.** Reconstruct the
+    set of files that were actually `fsync`'d and boot from **only** those,
+    asserting the acked `invoice` **and** every `invoice_line`. Was RED against
+    `380ba8a` — that red was the spec — and is GREEN since D3.
+    - The durable set is **derived, never declared**: a file joins it only if
+      `Handle::fsynced_paths` (a journal appended to only on a *successful*
+      `sync_all`) says production code `fsync`'d it. Deleting the `fsync`
+      removes the WAL from the set and turns the tier red again, so the
+      derivation *is* the mutation proof rather than a comment claiming one.
+      Verified in both directions before landing: neutering `durable_ack`
+      re-reds it, and `fsync`ing the main file while skipping the WAL also
+      re-reds it — so the WAL specifically is load-bearing.
+    - Two members are unconditional and each warrant is a cited property of
+      other code: the mirror (`sync_mirror`'s `sync_all`, before every ack) and
+      the main file (folded and closed at provisioning — the modelling
+      concession that makes a red mean "the money write was lost" rather than
+      "the tenant was never on disk").
+    - Asserting `invoice_line` rows **alongside** the parent is what discharges
+      §7.5's per-physical-row requirement for this path. It cannot arise here
+      anyway — WAL replay is transaction-atomic, so a parent cannot survive
+      without its children — but the assertion pins it rather than assuming it.
+  - **D6b teeth control.** The same flow with an explicit `CHECKPOINT` + `fsync`
+    on a hard-coded set: Option A reached by the other primitive. It stays as
+    the independent control that tells a broken harness apart from a broken
+    write path.
+  - **Real-production-path tier.** `mark_invoice_paid::mark_paid` driven with
+    nothing modelled, through the same power-loss durable set. Issuance itself
+    stays modelled (the real route needs the OS keychain, an `MnbRatesProvider`
+    and a seller profile, so no unattended test can drive it); this closes the
+    "does production actually call it?" gap for one real ack.
+  - Neither tier faithfully simulates power loss on macOS without root. **D6 is
+    therefore labelled as testing process-crash durability plus a *derived*
+    power-loss model, and R1's machine-restart clause must not be claimed as
+    proven by it.** The harness cannot observe an `fsync`; it takes the write
+    path's word for it. Closing that needs fault injection below the
+    filesystem, which is not available here.
+  - **D6 is wired into the cut-gate** (§7.9), in two halves: the tests are
+    un-ignored so `cargo test --workspace --locked` blocks on them in `ci.yml`,
+    and `tools/cut_gate_durable_ack.sh` (ENFORCING in `cut-gate.yml`, with
+    negative probes) holds the money-path ack census closed in both directions.
+    The static half is the only cover for the three ack sites no unattended test
+    can reach — modification, storno, and the AP status change.
 
 ---
 
-## 6. Phased plan — **REORDERED**
+## 6. Phased plan — **REORDERED TWICE**
 
 The original draft ran Phase 1 = D1+D2+D6, Phase 2 = D4, Phase 3 = D3. The
 adversarial found that ordering unsafe on two counts: D4-before-D3 removes the
 only mechanism currently making prod durable (§2.3), and D2-before-D4 puts a large
-materialisation transaction on a 16 MB-autocheckpoint connection (§7.4).
+materialisation transaction on a 16 MB-autocheckpoint connection (§7.4). Rev. 2
+therefore ran D1+D6 → D3 → D4 → D2 → D5 → widening.
+
+**Rev. 3 corrects it again: Phase 1 is D3, not D1.** *(See §12.3.)*
+
+Rev. 2 put D1 first because it was "the cheapest correct answer available,
+because it is already happening" (§4 Option C) — the ack would gate on the
+mirror `fsync` that `WriteGuard::drop` already performs. The flaw is what the
+mirror can give back. §2.4 and §7.2 establish, in this same document, that the
+boot heal replays the mirror into `audit_ledger` **and nothing else**, and that
+`InvoiceDraftCreated` is deliberately a *pointer* payload — three NOT NULL
+columns (`customer_id`, `idempotency_key`, `series_id`) are not derivable, so a
+materialiser **cannot legally INSERT into `invoice` at all**.
+
+So gating the ack on the mirror would have made the ack honest about an event
+the system still could not turn back into an invoice. **The mirror cannot
+reconstruct an invoice row; only the row being durable can.** D1-first would
+have shipped a stronger *promise* on top of the same missing *data* — precisely
+the 2026-08-08 shape: a flawless ledger on frozen rows.
+
+D3 inverts that. It makes the row itself durable, so the ack is backed by the
+row rather than by a witness to it, and §7.7's remaining windows narrow without
+D1's failure-mode inversion (a 5xx on an already-committed transaction). D1
+becomes a **hardening step on top of a durable store**, not the durability
+mechanism — and correspondingly less urgent.
+
+Note this reordering does **not** disturb the adversarial's two findings: D3
+still precedes D4, and D2 still follows D4.
 
 ### Phase 0 — Forensic instrumentation *(desirable, no longer blocking)*
 
@@ -468,20 +601,28 @@ structured boot record. **No behaviour change.** Downgraded from prerequisite
 because §2.7 is now resolved; still worth having so the *next* incident is not
 diagnosed by inference.
 
-### Phase 1 — D1 + D6 *(the ack gate and its proof)*
+### Phase 1 — D6 + D3 *(the proof, then the durable ack)* — **DONE 2026-08-09**
 
-Ships first and alone. D1 is correct under every hypothesis, needs no schema
-change, no new write path, and closes the acknowledged-write window using a step
-that already runs. Order: **D6a/D6b red first — that red is the specification** —
-then D1, then D6 green, then D6 into the cut-gate.
+Order actually run, and the order to keep: **D6b red first — that red is the
+specification** — then D3, then D6b green, then D6 into the cut-gate.
 
-**This is the revised recommended Phase 1.** D2 has been removed from it.
+Shipped: `Handle::durable_ack` at five money-path acks (§5 D3); D6b tiers 1 and
+2 plus the teeth control and a real-production-path tier, all un-ignored;
+`tools/cut_gate_durable_ack.sh` ENFORCING in `cut-gate.yml` with negative
+probes. Measured cost +1.11 ms/issuance. **D1 has been removed from Phase 1**
+for the reason above; D2 was already removed by rev. 2.
 
-### Phase 2 — D3 (H4 for real)
+### Phase 2 — H4 for real *(was "D3"; D3 no longer means this)*
 
-The validated logical checkpoint, `checkpoint_enabled = true`. All primitives
-exist; this is assembly plus a crash-injection gate over the fold itself. Promoted
-ahead of D4 because D4 depends on it.
+The validated logical checkpoint — build-aside, validate, `atomic_install`,
+marker, `checkpoint_enabled = true`. All primitives exist bar
+`live_durable_checkpoint` itself; this is assembly plus a crash-injection gate
+over the fold. **Still ahead of D4, because D4 still depends on it** — D3 did
+not change that. Its remaining value after D3 is no longer *durability of the
+money path* but two things D3 does not give:
+  1. **bounding the runtime WAL**, which D3 leaves unbounded (§5 D3); and
+  2. **covering the families D3 deliberately excludes** — inventory, work
+     orders, the quote pipeline (§7.10).
 
 ### Phase 3 — D4 (boot stops folding blind)
 
@@ -493,6 +634,14 @@ one new cut-gate check + negative probes. **Must not precede Phase 2.**
 Now safe: the heal connection has a sane pragma posture (Phase 3) and the DB has a
 real checkpoint (Phase 2). Scope is the three kinds in §5, reconstructing into a
 quarantine table, per-table idempotency, satisfiability assertions under test.
+
+**Rev. 3: further demoted, and it should be re-justified before anyone builds
+it.** D2 exists to put back rows that were lost. D3 stops the money-path rows
+being lost, so the case for a second, divergent write path over those families
+(§7.1's proven Σ-per-bucket vs single-rounding HUF divergence, §7.2's three
+non-derivable NOT NULL columns) is now much weaker than it was on 2026-08-08.
+An operator-facing reconcile screen may well dominate it. Do not start Phase 4
+on rev. 2's motivation.
 
 ### Phase 5 — D5 (recovery-tool safety)
 
@@ -665,6 +814,15 @@ acked-but-not-durable. The windows that remain:
 
 ### 7.8 Does D3 (H4) interact badly with the 13 boot openers? — **yes, and the draft's ordering made it worse**
 
+> **Rev. 3 note.** Both interactions below are about a *fold*. D3 as shipped
+> does not fold (§12.1), so **neither applies to it**: `atomic_install` is never
+> called on the money path, the live file is never replaced, and the thirteen
+> boot openers see byte-for-byte what they saw before — the WAL still replays
+> and still folds at boot, exactly as at `380ba8a`. The snapshot path is
+> likewise untouched: `take_snapshot` reads through `Handle::read()` and D3 adds
+> no writer. This section stands **unchanged and still binding for H4**, which
+> is Phase 2 and still unbuilt.
+
 Two interactions:
 
 1. **Ordering (fatal as originally phased).** Boot folding is currently the only
@@ -689,6 +847,21 @@ a gate; a gate is a check that fails a cut.** If Phase 1 ships without wiring D6
 into the cut-gate, we repeat the exact mistake this document opens by naming. The
 D4.2 opener check is the second half of that gate.
 
+> **Rev. 3 — ANSWERED for D3.** Phase 1 did not ship without the gate. Two
+> halves, both enforcing:
+> 1. the D6b tiers are un-ignored, so `cargo test --workspace --locked` blocks
+>    on the power-loss spec in `ci.yml`; and
+> 2. `tools/cut_gate_durable_ack.sh` runs ENFORCING in `cut-gate.yml`, holding
+>    the money-path ack census closed in **both** directions — a deleted
+>    `durable_ack()` and an unregistered new one are equally red — with
+>    `cut_gate_durable_ack_probes.sh` proving it has teeth.
+>
+> The static half is not redundant with the tests: it is the **only** cover for
+> the three ack sites no unattended test can reach (modification, storno, AP
+> status change — they need NAV credentials, a NAV envelope, and an ingested AP
+> row respectively). D4.2's opener check is still unbuilt and is still the
+> remaining half of the *boot-side* gate.
+
 ### 7.10 The kind set is chosen from one incident
 
 Choosing scope from a single incident is how the previous hardening lane ended up
@@ -696,6 +869,13 @@ solving the wrong axis. The next loss will be in inventory movements, work order
 or the quote pipeline — families with no self-contained payload at all. Phase 2
 (D3/H4) is what actually covers them, which is a further argument for its
 promotion.
+
+> **Rev. 3 — this is the sharpest open risk, and D3 did not close it.** D3 is
+> money-path only by deliberate choice (blast radius, latency), so inventory
+> movements, work orders and the quote pipeline are **exactly as durable as they
+> were on 2026-08-08**: WAL-resident until a boot happens to fold. The families
+> named in this section are the ones D3 does not cover, and H4 — Phase 2, still
+> unbuilt — remains the thing that would cover them.
 
 ---
 
@@ -729,9 +909,23 @@ Until then: ADR-0107 and ADR-0108 stand exactly as written, unexecuted, DEV-scop
 - The audit mirror becomes load-bearing for the write path, not merely
   evidentiary. If the mirror file cannot be written, money-path writes fail. That
   is the intended trade (fail loud > lose silently) but it is a genuine new
-  coupling and should be stated in FOUNDATION.md.
+  coupling and should be stated in FOUNDATION.md. **Rev. 3: this is a
+  consequence of D1, which has not shipped.** D3 did not make the mirror
+  load-bearing — it made the *primary store* durable, which is the opposite
+  direction of coupling and is why §6 now runs D3 before D1.
 - Money-path write latency gains one `fsync` (~24 ms by analogy with the Editions
   MES measurement; **unmeasured on this tree — measure before accepting D1**).
+  **Rev. 3: measured for D3.** +1.11 ms per acked issuance (12.11 ms with,
+  11.00 ms without, 20 rounds, release build on the dev Mac). The ~24 ms
+  estimate was an order of magnitude high for this workload. R6 is satisfied
+  with room; the figure is not operator-visible.
+- **A money-path `fsync` failure is now a 5xx on an already-committed
+  transaction** (D3, five sites). This is §7.7's inverted failure mode arriving
+  a phase early: the operator is told "failed" about a write that did land in
+  the DB. It is the intended trade (R3 / rule 11: fail loud beats lose
+  silently), and it is strictly better than D1's version of the same inversion
+  because the row *is* durable — only our promise about it failed. The
+  reconciliation story §7.7 asks for is still undesigned.
 - Boot becomes slower and stricter. Every new refusal is a new way to be unable to
   start; R5 bounds that and Phase 5 is not optional.
 - The cut-gate grows a check whose predicate is *durability*, not *chain
@@ -775,3 +969,85 @@ Until then: ADR-0107 and ADR-0108 stand exactly as written, unexecuted, DEV-scop
    D4-before-D3 ordering would have made durability strictly worse (§7.8).
 9. Phase 0 downgraded from prerequisite to desirable.
 10. R7 added (no silently-wrong reconstructed rows).
+
+## 12. Changes made by rev. 3 (D3 implementation, 2026-08-09)
+
+Rev. 2 was a design document that authorised nothing. Rev. 3 records what
+building D3 proved, including the two places rev. 2 was wrong.
+
+### 12.1 D3 is Option B (`fsync` the WAL), not H4 (fold it) — §5 D3 rewritten
+
+Rev. 2's D3 read "Implement H4 (Option B)", conflating two different things: §4
+Option B is the *decision to make the ack durable*, H4 is *one mechanism* for
+it. Rev. 2 assumed the mechanism had to be the fold, on the unstated premise
+that a row is only durable once it reaches the main file.
+
+That premise is false, and the D6b byte-copy tier disproves it empirically:
+DuckDB writes WAL records at commit and replays them on open, so `fsync`ing
+`<db>.wal` makes the acked rows durable with no fold at all. Folding per ack
+would have reinstated the in-place `duckdb#23046` path §4 Option A rejects,
+rewritten the main file on every invoice, and required building
+`live_durable_checkpoint`, which does not exist in this tree.
+
+Consequences carried into §5 D3: **H4 remains unbuilt**, the runtime WAL is
+durable but **unbounded**, **D4 still depends on H4** rather than on D3, and
+durability is **money-path only** so §7.10's warning is unaddressed.
+
+### 12.2 §5 D6's tier spec was wrong about which tier is the spec — corrected
+
+Rev. 2 specified D6b as "copy the on-disk byte state and boot from that copy"
+and expected it RED. **It is GREEN, and was green before any fix** — a file copy
+reads through the OS page cache, so it can never distinguish "reached the file"
+from "reached stable storage". §7.6 had already made exactly this argument
+against `SIGKILL`; rev. 2 did not notice it applies verbatim to a byte copy.
+
+The real specification is the **power-loss tier**: boot from *only* the files
+that were actually `fsync`'d. That tier was RED at `380ba8a`, that red was the
+Phase-1 spec, and D3 turned it GREEN. §5 D6 now carries all three tiers with
+what each can and cannot prove, and the byte-copy tier is kept as a regression
+pin rather than promoted as evidence it cannot supply.
+
+D6a (`SIGKILL`) is recorded as **not built and not planned**: §7.6 already
+proves a zero-`fsync` system passes it, so it would add apparent rigour and no
+information.
+
+### 12.3 §6 Phase 1 is D3, not D1 — the mirror cannot reconstruct an invoice row
+
+Rev. 2 put D1 (gate the ack on the already-`fsync`'d mirror) first as "the
+cheapest correct answer, because it is already happening". But §2.4 and §7.2 of
+this same document establish that the mirror replays into `audit_ledger` only,
+and that `InvoiceDraftCreated` is a deliberate *pointer* payload with three
+non-derivable NOT NULL columns — so no amount of mirror durability puts an
+`invoice` row back.
+
+D1-first would therefore have shipped a stronger promise over the same missing
+data: the 2026-08-08 shape exactly, a flawless ledger on frozen rows. D3 makes
+the row itself durable, so the ack is backed by the row rather than by a witness
+to it. D1 survives as a hardening step on a durable store, materially less
+urgent. The adversarial's two ordering findings are undisturbed: D3 before D4,
+D2 after D4.
+
+### 12.4 Residuals — flagged, not fixed
+
+1. **`F_FULLFSYNC` on macOS.** `File::sync_all` is `fsync(2)`, which does not
+   force the device's own write cache; only `F_FULLFSYNC` does. §2.7 identifies
+   a hard power-off as the best fit for 2026-08-08, so this is a real gap and not
+   a pedantic one. Deliberately not closed here: `sync_all` is the primitive
+   `crash_safe.rs` and the audit mirror already use, and the mirror is the store
+   that lost **nothing** in the incident — so matching it is evidenced, whereas
+   introducing a second, platform-forked durability primitive on the same day as
+   the fix is not. Worth a measured follow-up (`F_FULLFSYNC` can cost tens of ms
+   where `fsync` costs one, so it must be measured against R6, not assumed).
+2. **The D6b harness cannot observe an `fsync`.** It derives the durable set
+   from `Handle::fsynced_paths`, i.e. it takes the write path's word that
+   `sync_all` succeeded. That is strictly better than rev. 2's hard-coded list
+   — delete the `fsync` and the file leaves the set — but it is not
+   fault injection below the filesystem, which is what would settle it. **R1's
+   machine-restart clause is still not proven.**
+3. **§7.7's reconciliation story is still undesigned**, and D3 has made one of
+   its cases live (see §9).
+4. **The DB-ahead-of-mirror direction remains uncovered** (§7.5). D3 narrows the
+   window — the DB `fsync` follows the mirror `fsync`, so a crash between them
+   leaves the mirror ahead, which `heal_from_mirror_ahead` handles — but a crash
+   between `commit` and the guard drop still leaves the DB ahead, and nothing
+   heals that.
