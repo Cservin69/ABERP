@@ -458,9 +458,15 @@ business-state replay as the recovery path.**
 
   **Measured cost (R6, §9's unmeasured ~24 ms estimate now replaced by a real
   number).** 20 issuances, release build, this tree: **12.11 ms** per acked
-  issuance with `durable_ack`, **11.00 ms** without — **+1.11 ms**, about 4.6 %
-  of the ~24 ms/write baseline. Not operator-visible. Reproduce with
-  `durable_ack_latency_stays_inside_r6`.
+  issuance with `durable_ack`, **11.00 ms** without — **≈1 ms marginal**. Not
+  operator-visible. Reproduce with `durable_ack_latency_stays_inside_r6`.
+
+  Read that figure as *marginal*, not as the cost of a device flush. Every ack
+  already pays one `F_FULLFSYNC`: `WriteGuard::drop` runs `sync_mirror`, which
+  `sync_all`s the mirror before `durable_ack` is ever called. D3's ~1 ms is
+  what a **second** flush costs on a device the same ack has just flushed — it
+  is not evidence that a full flush is cheap, and a workload that did not
+  already sync would pay more.
 
   **What D3 explicitly does NOT do, and the cost of that:**
   - **H4 is still unbuilt.** `run_durable_checkpoint_locked` is still the
@@ -474,8 +480,13 @@ business-state replay as the recovery path.**
     email outbox) is exactly as durable as it was, i.e. WAL-resident until the
     next boot fold. §7.10's warning stands and now has a name: the next loss
     will be in a family D3 does not cover, and **H4 is what covers them**.
-  - On macOS `sync_all` is `fsync(2)`, which does not force the *device's* write
-    cache; only `F_FULLFSYNC` does. Flagged, not fixed — see §12.4.
+  - **This IS power-loss durable on the internal disk** — stronger than rev. 3
+    first claimed. `File::sync_all` is not `fsync(2)` on macOS: the pinned
+    1.97.0 stdlib routes it to `fcntl(F_FULLFSYNC)`, a real device-cache flush
+    (verified in `std/src/fs.rs` → `sys/fs/unix.rs`,
+    `#[cfg(target_vendor = "apple")]`). The residual is one layer lower — the
+    drive must honour the flush, which Apple guarantees for the internal NVMe
+    and nobody guarantees for a third-party external enclosure. See §12.4.
 
 - **D4 — Boot must stop folding blind.**
   1. Every boot-phase opener gets the same pragma posture as the Handle, via a
@@ -609,7 +620,8 @@ specification** — then D3, then D6b green, then D6 into the cut-gate.
 Shipped: `Handle::durable_ack` at five money-path acks (§5 D3); D6b tiers 1 and
 2 plus the teeth control and a real-production-path tier, all un-ignored;
 `tools/cut_gate_durable_ack.sh` ENFORCING in `cut-gate.yml` with negative
-probes. Measured cost +1.11 ms/issuance. **D1 has been removed from Phase 1**
+probes. Measured cost ≈1 ms marginal per issuance. **D1 has been removed from
+Phase 1**
 for the reason above; D2 was already removed by rev. 2.
 
 ### Phase 2 — H4 for real *(was "D3"; D3 no longer means this)*
@@ -915,10 +927,12 @@ Until then: ADR-0107 and ADR-0108 stand exactly as written, unexecuted, DEV-scop
   direction of coupling and is why §6 now runs D3 before D1.
 - Money-path write latency gains one `fsync` (~24 ms by analogy with the Editions
   MES measurement; **unmeasured on this tree — measure before accepting D1**).
-  **Rev. 3: measured for D3.** +1.11 ms per acked issuance (12.11 ms with,
-  11.00 ms without, 20 rounds, release build on the dev Mac). The ~24 ms
-  estimate was an order of magnitude high for this workload. R6 is satisfied
-  with room; the figure is not operator-visible.
+  **Rev. 3: measured for D3.** ≈1 ms MARGINAL per acked issuance (12.11 ms
+  with, 11.00 ms without; 20 rounds, release build on the dev Mac). Marginal on
+  top of the `F_FULLFSYNC` the ack already pays inside `WriteGuard::drop`'s
+  `sync_mirror` — not the cost of a device flush from cold. The ~24 ms estimate
+  was an order of magnitude high for this workload. R6 is satisfied with room;
+  the figure is not operator-visible.
 - **A money-path `fsync` failure is now a 5xx on an already-committed
   transaction** (D3, five sites). This is §7.7's inverted failure mode arriving
   a phase early: the operator is told "failed" about a write that did land in
@@ -1029,16 +1043,30 @@ D2 after D4.
 
 ### 12.4 Residuals — flagged, not fixed
 
-1. **`F_FULLFSYNC` on macOS.** `File::sync_all` is `fsync(2)`, which does not
-   force the device's own write cache; only `F_FULLFSYNC` does. §2.7 identifies
-   a hard power-off as the best fit for 2026-08-08, so this is a real gap and not
-   a pedantic one. Deliberately not closed here: `sync_all` is the primitive
-   `crash_safe.rs` and the audit mirror already use, and the mirror is the store
-   that lost **nothing** in the incident — so matching it is evidenced, whereas
-   introducing a second, platform-forked durability primitive on the same day as
-   the fix is not. Worth a measured follow-up (`F_FULLFSYNC` can cost tens of ms
-   where `fsync` costs one, so it must be measured against R6, not assumed).
-2. **The D6b harness cannot observe an `fsync`.** It derives the durable set
+1. **`F_FULLFSYNC` on macOS — WITHDRAWN. This was wrong, in the conservative
+   direction.** Rev. 3 first listed as a residual that `File::sync_all` is
+   `fsync(2)` and therefore does not force the device's own write cache. It
+   does. On Apple targets the pinned 1.97.0 stdlib routes `sync_all` →
+   `inner.fsync()` → `fcntl(fd, F_FULLFSYNC)` (`std/src/fs.rs`,
+   `std/src/sys/fs/unix.rs` under `#[cfg(target_vendor = "apple")]`) — the
+   device-cache flush, not the weak one. The measured cost is consistent with
+   that and not with a plain `fsync`: a real flush on this APFS/NVMe is
+   milliseconds, which is exactly what the numbers show.
+
+   So D3 **is** power-loss durable on the internal disk, which is the failure
+   §2.7 identifies as the best fit for 2026-08-08 — the very hazard this
+   residual claimed was still open. Understating a durability guarantee is a
+   real defect: it invites someone to "fix" it by adding a second,
+   platform-forked primitive that is already there, and it misprices the risk
+   of every decision downstream.
+
+   **The residual that actually remains** is one layer lower: the guarantee
+   bottoms out at the drive honouring the flush. Apple guarantees that for the
+   internal NVMe. A third-party external enclosure may acknowledge
+   `F_FULLFSYNC` without flushing, so a tenant on external storage is outside
+   what D3 can promise. Nothing in software closes that.
+2. **The D6b harness cannot observe an `fsync`.** *(Narrowed — the worst case
+   is now covered. See §12.5.)* It derives the durable set
    from `Handle::fsynced_paths`, i.e. it takes the write path's word that
    `sync_all` succeeded. That is strictly better than rev. 2's hard-coded list
    — delete the `fsync` and the file leaves the set — but it is not
@@ -1051,3 +1079,75 @@ D2 after D4.
    leaves the mirror ahead, which `heal_from_mirror_ahead` handles — but a crash
    between `commit` and the guard drop still leaves the DB ahead, and nothing
    heals that.
+
+### 12.5 What the PR #59 adversarial pass changed (2026-08-09, verdict: merge-after-fixes)
+
+Three defects, one of them serious. All three are fixed on the PR branch.
+
+**F1 — deleting the `sync_all` was caught by nothing.** The durability evidence
+had a circular hole: [`power_loss_durable_set`] derives its set from
+`Handle::fsynced_paths`, and the journal is written by the same function that is
+supposed to do the syncing. Mutate `fsync_and_record` to journal the path
+**without** syncing it and the result is:
+
+| gate | verdict under the mutation |
+|---|---|
+| D6b tier 1 / tier 2 / teeth / real-mark-paid | **4/4 pass** |
+| `cut_gate_durable_ack.sh` | **PASSED** |
+| `clippy -D warnings`, `cargo fmt` | **clean** |
+
+— i.e. a total, silent revert to the 2026-08-08 loss with every gate green.
+Reproduced here before fixing, not taken on trust.
+
+Closed by `crates/aberp-db/tests/durable_ack_fault_injection.rs`: break the
+filesystem reach (delete the main DB file out from under an open `Handle`) and
+require `durable_ack` to return `Err`. Only code that really opens and syncs the
+path can notice, so the mutation goes RED — verified in both directions. This
+narrows residual §12.4.2: the harness still cannot *observe* an `fsync`, but the
+worst case it was blind to — a reach that never happens at all — is now covered.
+
+**F2 — the cut-gate counted a CALL, not a PROPAGATION.** Rewriting
+`db.durable_ack().context(..)?` as
+`if let Err(e) = db.durable_ack() { warn!(..) }` — the exact R3 / rule-11
+downgrade this document forbids by name — left CHECK D3-A and D3-B green,
+because the call is still there and still censused. Closed by **CHECK D3-C**,
+which requires a `?` terminator within three lines of every censused call site,
+with probes P7/P8 pinning that it fires on the swallowed site and *only* on it
+(1 swallowed / 4 propagate).
+
+**F3 — the `F_FULLFSYNC` residual was wrong, conservatively.** See §12.4.1: on
+macOS `sync_all` *is* the device flush. Six places asserted otherwise and are
+corrected. Understating a durability guarantee is a real defect, not a harmless
+excess of caution — it invites a "fix" that re-implements what is already there,
+and it misprices every downstream decision.
+
+**Not changed, deliberately:** the 5xx-on-an-already-committed-transaction
+behaviour (§9, §7.7). It is the intended R3 trade and it predates this branch.
+Its operational consequence is now written down — see §12.6 — because it is
+sharper than §7.7 implied.
+
+### 12.6 Operator note — retrying a failed issuance DOUBLE-ISSUES
+
+If a money-path ack fails **after** its transaction committed (a `durable_ack`
+error, or any other post-commit error), the operator sees a 5xx for a write that
+did land. What happens on a retry differs by path, and the difference matters:
+
+- **Issuance, modification, storno — NOT retry-safe.** Each mints a **fresh**
+  `IdempotencyKey` server-side per invocation (`build_command`
+  `issue_invoice.rs:1611`, `build_modification_command` `:1179`,
+  `build_storno_command` `:1524`); the wire body cannot supply one. So the retry
+  does not match the first attempt's key, `allocate_in_tx` returns `Fresh`
+  rather than `Replay`, and the retry **issues a second invoice and burns a
+  second NAV number**. The first one already exists.
+- **`mark_paid` — safe.** Its no-double-pay gate keys on `invoice_id` (an
+  `InvoicePaymentRecorded` lookup via `payment_record_for`), not on the
+  idempotency key, so the retry returns `AlreadyPaid`.
+- **`change_status` — safe.** `from_parsed == to_status` short-circuits to a
+  no-op before any write.
+
+This is pre-existing behaviour that D3 neither introduces nor worsens; D3 only
+adds one more (rare) way to reach the post-commit error branch. Recording it
+because the correct operator response to a failed issuance is **check whether
+the invoice exists before retrying**, and nothing in the UI says so today.
+Closing it properly means an operator-supplied or request-derived idempotency
+key on the issue routes — a separate change, out of D3's scope.

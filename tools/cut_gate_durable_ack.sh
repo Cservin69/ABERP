@@ -18,6 +18,13 @@
 # CHECK D3-A — every censused money-path ack file still calls `durable_ack()`.
 # CHECK D3-B — the call-site count across apps/*/src EQUALS the census count,
 #              so a new unregistered ack site is as red as a deleted one.
+# CHECK D3-C — every call site PROPAGATES the failure (`?`), rather than
+#              swallowing it. A/B only prove the call is present; they are
+#              blind to the one-line rewrite
+#                  if let Err(e) = db.durable_ack() { tracing::warn!(..) }
+#              which is the exact CLAUDE.md rule-11 / ADR-0110 R3 downgrade the
+#              ADR forbids by name, and which leaves the operator acked on a
+#              write nobody could make durable.
 #
 # ENFORCE_DURABLE_ACK=0 disables enforcement (used by the probe harness to
 # prove fail-closed). Exit 0 = gate green.
@@ -60,6 +67,16 @@ printf '    db.durable_ack()\n        .context("x")?;\n' > "$probe"
 printf '/// see [`Handle::durable_ack`] for why\n    // db.durable_ack()\n' > "$probe"
 [[ "$(ack_calls "$probe" | wc -l | tr -d ' ')" == "0" ]] \
   || { note "✗ FAIL: matcher counted a doc mention or commented-out call"; fail=1; }
+# D3-C's own liveness. Its dangerous failure direction is "everything reads
+# PROPAGATES" — silent green. A broken window/sed would do exactly that, so
+# pin the swallowing form as NOT propagating before trusting any ✓ below.
+propagates() { sed -n "1,4p" "$1" | sed 's://.*::' | grep -qE '\?[[:space:]]*;'; }
+printf 'db.durable_ack()\n    .context("x")?;\n' > "$probe"
+propagates "$probe" || { note "✗ FAIL: propagation check missed a real \`?\`"; fail=1; }
+printf 'if let Err(e) = db.durable_ack() {\n    warn!("x");\n}\n' > "$probe"
+propagates "$probe" && { note "✗ FAIL: propagation check called a swallowed error propagated"; fail=1; }
+printf 'db.durable_ack()\n    .context("x");  // no question mark\n' > "$probe"
+propagates "$probe" && { note "✗ FAIL: propagation check accepted a missing \`?\`"; fail=1; }
 if [[ "$fail" -ne 0 ]]; then echo; echo "CUT-GATE: ✗ FAILED (matcher liveness)"; exit 1; fi
 note "✓ matcher live"
 echo
@@ -106,6 +123,40 @@ if [[ "$actual" -ne "$expected" ]]; then
 else
   note "✓ $actual call site(s) across $expected censused file(s) — census closed"
 fi
+
+echo
+
+# ── CHECK D3-C — the failure must PROPAGATE, not be swallowed ────────────────
+# A/B are satisfied by a call that exists. They cannot see the difference
+# between `db.durable_ack().context(..)?` and
+# `if let Err(e) = db.durable_ack() { warn!(..) }` — and the second is the
+# 2026-08-08 posture with extra steps: the operator is acked, the write is not
+# durable, and the only trace is a log line nobody reads.
+#
+# The `?` may not be on the call line: the house style is
+#     db.durable_ack()
+#         .context("...")?;
+# so scan a small WINDOW forward from the call. The window is deliberately
+# tight — a `?` five lines later belongs to a different statement.
+echo "[CHECK D3-C] every durable_ack() call PROPAGATES its error (ENFORCED)"
+WINDOW=3
+for f in "${census_files[@]}"; do
+  [[ -f "$f" ]] || continue
+  while IFS= read -r rec; do
+    [[ -z "$rec" ]] && continue
+    ln="${rec%%:*}"
+    # Lines [ln, ln+WINDOW], comments stripped, looking for a `?` terminator.
+    if sed -n "${ln},$((ln + WINDOW))p" "$f" | sed 's://.*::' | grep -qE '\?[[:space:]]*;'; then
+      note "✓ $f:$ln — PROPAGATES"
+    else
+      flag "✗ SWALLOWED durable-ack failure at $f:$ln — no \`?\` within $WINDOW line(s)."
+      note "    ADR-0110 R3 / CLAUDE.md rule 11: a money-path write that could not be"
+      note "    made durable must FAIL the ack, not log and continue. Acking a write"
+      note "    nothing fsync'd is precisely the 2026-08-08 loss. Context:"
+      sed -n "${ln},$((ln + WINDOW))p" "$f" | sed 's/^/        /'
+    fi
+  done < <(ack_calls "$f")
+done
 
 echo
 if [[ "$fail" -ne 0 ]]; then echo "CUT-GATE: ✗ FAILED"; exit 1; fi

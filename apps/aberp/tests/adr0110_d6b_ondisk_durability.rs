@@ -86,9 +86,17 @@
 //!
 //! Even the power-loss tier is a *model*: it derives the durable set from
 //! audited facts about which code paths fsync, rather than cutting power to
-//! a real disk. macOS additionally makes `fsync(2)` a weaker promise than
-//! `F_FULLFSYNC`. **R1's machine-restart clause must not be claimed as
-//! proven by any tier here** (ADR-0110 §5 D6, §7.6).
+//! a real disk. **R1's machine-restart clause must not be claimed as proven
+//! by any tier here** (ADR-0110 §5 D6, §7.6).
+//!
+//! What the model rests on is, however, stronger than this file first claimed.
+//! `File::sync_all` is **not** `fsync(2)` on macOS: the pinned 1.97.0 stdlib
+//! routes it to `fcntl(F_FULLFSYNC)` (`sys/fs/unix.rs`,
+//! `#[cfg(target_vendor = "apple")]`), a real device-cache flush. So the
+//! `sync_all` these tiers credit is genuinely power-loss-grade, and the
+//! remaining caveat is one layer lower — the drive has to honour the flush,
+//! which Apple guarantees for the internal NVMe but nobody guarantees for a
+//! third-party external enclosure (ADR-0110 §12.4).
 //!
 //! # CI wiring (ADR-0110 §7.9)
 //!
@@ -444,9 +452,16 @@ fn copy_on_disk_bytes(from: &Path, to: &Path, only: Option<&[&str]>) -> Vec<(Str
 ///
 /// It takes the write path's word that `sync_all` reached stable storage. A
 /// harness that can only read the filesystem cannot tell a page-cache write
-/// from an `fsync`'d one — that needs fault injection below the FS, which is
-/// not available here. On macOS `fsync(2)` is weaker than `F_FULLFSYNC` on top
-/// of that. **R1's machine-restart clause is still not proven by this file.**
+/// from an `fsync`'d one — that needs fault injection below the FS. **R1's
+/// machine-restart clause is still not proven by this file.**
+///
+/// What the word is worth is not in doubt, though: on macOS `sync_all` is
+/// `fcntl(F_FULLFSYNC)`, a real device flush, not `fsync(2)`. And the word is
+/// no longer taken entirely on trust either —
+/// `crates/aberp-db/tests/durable_ack_fault_injection.rs` breaks the
+/// filesystem reach and requires `durable_ack` to notice, which is the one
+/// mutation this derivation cannot see: a `durable_ack` that journals a path
+/// without ever syncing it would keep every tier here green.
 fn power_loss_durable_set(handle: &aberp_db::Handle) -> Vec<String> {
     let mut set = vec![DB_FILE.to_string(), MIRROR_FILE.to_string()];
     for path in handle.fsynced_paths() {

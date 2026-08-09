@@ -8,7 +8,13 @@
 #   * a site that loses its `durable_ack()` call goes red (the regression that
 #     actually matters — a refactor silently un-durables invoicing);
 #   * a NEW `durable_ack()` call site that is not listed here goes red, so
-#     growth is a deliberate, reviewed edit of this file and not a drive-by.
+#     growth is a deliberate, reviewed edit of this file and not a drive-by;
+#   * a site that KEEPS the call but SWALLOWS its error goes red (CHECK D3-C).
+#     Added after the PR #59 adversarial found that rewriting
+#     `db.durable_ack().context(..)?` as
+#     `if let Err(e) = db.durable_ack() { warn!(..) }` — the exact ADR-0110 R3 /
+#     CLAUDE.md rule-11 downgrade — left the gate green. A present-but-ignored
+#     ack is the 2026-08-08 posture with a log line.
 #
 # Format: <path>\t<function>\t<what the operator was told>
 # Lines starting with '#' and blank lines are ignored.

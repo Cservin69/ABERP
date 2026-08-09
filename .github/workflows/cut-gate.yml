@@ -189,7 +189,10 @@ jobs:
         # proves the money path is durable today and runs in ci.yml; THIS keeps
         # it durable, by holding the census of money-path `Handle::durable_ack()`
         # acks closed in BOTH directions — a deleted call and an unregistered new
-        # one are equally red. It is the only cover for the three ack sites no
+        # one are equally red — and, since the PR #59 adversarial, by requiring
+        # each call to PROPAGATE its error (CHECK D3-C): a present-but-swallowed
+        # ack satisfied A and B while being the exact ADR-0110 R3 / rule-11
+        # downgrade the ADR forbids. It is the only cover for the three ack sites no
         # unattended test can reach (modification, storno, AP status change: they
         # need NAV credentials / a NAV envelope / an ingested AP row). Flag
         # explicit here as well as defaulted in the script so enforcement is

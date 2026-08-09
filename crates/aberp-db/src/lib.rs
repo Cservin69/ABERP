@@ -414,12 +414,24 @@ impl Handle {
     ///
     /// # Honest scope
     ///
-    /// `File::sync_all` is `fsync(2)`. On macOS that flushes to the device but
-    /// does **not** force the device's own write cache — only `F_FULLFSYNC`
-    /// does. This is the same primitive `crash_safe.rs::fsync_file` and the
-    /// audit mirror already use, and the mirror is the store that lost nothing
-    /// on 2026-08-08, so it is the tree's evidenced idiom rather than a guess.
-    /// `F_FULLFSYNC` is a deliberate, flagged residual (ADR-0110 §5 D3).
+    /// **On macOS this IS a device flush.** `File::sync_all` does not call
+    /// `fsync(2)` on Apple targets: the pinned 1.97.0 stdlib routes it to
+    /// `fcntl(fd, F_FULLFSYNC)` (`std/src/fs.rs` `sync_all` → `inner.fsync()` →
+    /// `sys/fs/unix.rs`, `#[cfg(target_vendor = "apple")] os_fsync`). So the
+    /// bytes are pushed past the drive's own write cache, not merely handed to
+    /// the OS — which is what makes an acked write survive a **power loss** and
+    /// not just a process kill.
+    ///
+    /// It is also the same primitive `crash_safe.rs::fsync_file` and the audit
+    /// mirror already use, and the mirror is the store that lost nothing on
+    /// 2026-08-08 — so the choice is the tree's evidenced idiom as well as the
+    /// strong one.
+    ///
+    /// The residual is one step further down: the guarantee bottoms out at the
+    /// **drive honouring the flush**. Apple guarantees that for the internal
+    /// NVMe; a third-party external enclosure may lie about it. A tenant on
+    /// external storage is therefore outside what this can promise (ADR-0110
+    /// §12.4).
     pub fn durable_ack(&self) -> Result<(), DbError> {
         // Main file first, then the WAL: the WAL is only meaningful on top of a
         // durable base. Both before the directory entry that names them.
