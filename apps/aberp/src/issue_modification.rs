@@ -574,6 +574,16 @@ pub fn modification_from_inputs(
     .context("audit-ledger chain verification failed AFTER modification issuance")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
+    // ADR-0110 D3 — the durable-ack boundary. Same shape and the same reasoning
+    // as `issue_invoice::issue_from_parsed`: guard drop fsyncs the mirror, then
+    // `durable_ack` fsyncs the WAL holding this modification's `invoice` +
+    // `invoice_line` rows, and only then does the operator get a success. A
+    // modification burns its own NAV invoice number, so losing it costs exactly
+    // what losing the original issuance costs.
+    drop(guard);
+    db.durable_ack()
+        .context("ADR-0110 D3 durable-ack fsync after modification issuance commit")?;
+
     // S174 — surface the SAME render that flowed to NAV on the
     // operator-visible summary (the render closure built it inside the tx
     // and returned it on `TxOutcome::modification_invoice_number`).

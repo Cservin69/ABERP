@@ -50,13 +50,32 @@
 //! shared instance *does* observe every committed row (one shared cache), and
 //! [`Handle::write`] serializes writes behind the writer mutex.
 //!
-//! # No new primitive
+//! # ADR-0110 D3 — the durable-ack boundary (the one primitive this crate owns)
 //!
-//! This crate invents **no** durability primitive. It reuses, verbatim,
-//! [`aberp_audit_ledger::sync_mirror`] / [`aberp_audit_ledger::LedgerMeta`]
-//! (and, in H4, the `aberp_snapshot` checkpoint primitives). It only *routes*
+//! The H3/H4 seam above left a hole that cost ~22 h of business rows on
+//! 2026-08-08: the pragmas that stop the WAL folding shipped, and the
+//! replacement checkpoint never did, so a committed money-write lived **only**
+//! in an `fsync`-less `<db>.wal` until the next boot happened to fold it.
+//!
+//! [`Handle::durable_ack`] closes that: after a money-path commit it `fsync`s
+//! the main file, the WAL, and the parent directory, so the acked rows are in
+//! the power-loss durable set. It does **not** fold — see its docs for why
+//! ADR-0110 Option B beats Option A here — so nothing about the boot openers,
+//! the snapshot path, or the mirror changes.
+//!
+//! That `fsync` is the ONLY durability primitive this crate owns. Everything
+//! else is reused verbatim: [`aberp_audit_ledger::sync_mirror`] /
+//! [`aberp_audit_ledger::LedgerMeta`] (and, if H4 is ever built, the
+//! `aberp_snapshot` checkpoint primitives). The crate still only *routes*
 //! access through one instance and *calls* those primitives at the post-commit
 //! point.
+//!
+//! **H4 is still unbuilt, and D3 does not build it.**
+//! [`Handle::run_durable_checkpoint_locked`] remains the stub below and
+//! [`HandleConfig::checkpoint_enabled`] still defaults `false`. The consequence
+//! to keep in view: the WAL is durable but still **unbounded** at runtime, and
+//! it is still the boot fold that truncates it. ADR-0110 D4 (boot stops folding
+//! blind) therefore still depends on H4, not on D3.
 //!
 //! # Prod adaptation vs. the editions source (`ABERP-Editions` 1e6097d)
 //!
@@ -121,6 +140,17 @@ pub enum DbError {
     /// different facts.
     #[error("schema: {0}")]
     Schema(String),
+
+    /// ADR-0110 D3 — a durable-ack `fsync` failed. Its own variant, not folded
+    /// into [`DbError::Duck`], because it is the ONE error whose meaning is
+    /// "the transaction committed but we cannot promise it survives a power
+    /// loss". A money-path caller must surface this rather than ack (R3 /
+    /// CLAUDE.md rule 11); it must never be downgraded to a `warn!`.
+    #[error("durable-ack fsync failed for {path}: {source}")]
+    DurableAck {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// Tunables for a [`Handle`]. [`HandleConfig::default`] is the ADR-0099 H3
@@ -205,7 +235,22 @@ pub struct Handle {
     /// debug/test re-entrancy tripwire to identify THIS Handle's writer mutex.
     id: u64,
     db_path: PathBuf,
+    /// `<db>.wal` — DuckDB's write-ahead log for [`Self::db_path`]. Precomputed
+    /// once because [`Self::durable_ack`] needs it on every money-path ack.
+    wal_path: PathBuf,
     mirror_path: PathBuf,
+    /// ADR-0110 D3 — the durability journal: every path this handle has
+    /// actually `fsync`'d, in first-sync order, deduped.
+    ///
+    /// Behind its **own** mutex, never the writer's: [`Self::durable_ack`] runs
+    /// AFTER the [`WriteGuard`] has dropped and deliberately does not take the
+    /// writer lock (see its docs), so recording must not reach for it either.
+    ///
+    /// This is not telemetry. It is the seam that lets the ADR-0110 D6b
+    /// power-loss spec DERIVE its durable set from what the write path really
+    /// did, instead of hard-coding a list that silently rots the moment this
+    /// file changes. See `apps/aberp/tests/adr0110_d6b_ondisk_durability.rs`.
+    synced: Mutex<Vec<PathBuf>>,
     /// Built **once** per process (S341 semantics): tenant + binary hash. The
     /// lockstep [`aberp_audit_ledger::sync_mirror`] needs it on every commit.
     meta: LedgerMeta,
@@ -274,7 +319,9 @@ impl Handle {
         Ok(Arc::new(Handle {
             id: NEXT_HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             db_path: db_path.to_path_buf(),
+            wal_path: wal_path_for(db_path),
             mirror_path,
+            synced: Mutex::new(Vec::new()),
             meta,
             tenant: tenant.as_str().to_string(),
             config,
@@ -300,6 +347,124 @@ impl Handle {
     /// The mirror (`<db>.audit.log`) path.
     pub fn mirror_path(&self) -> &Path {
         &self.mirror_path
+    }
+
+    /// **ADR-0110 D3 — the durable-ack boundary.** Force the just-committed
+    /// money-path write onto stable storage, so an acknowledged write survives
+    /// a power loss (ADR-0110 R1).
+    ///
+    /// # The defect this closes
+    ///
+    /// Before this existed, `grep -rn 'sync_all\|sync_data\|fsync'
+    /// crates/aberp-db/src/` returned **zero functional hits**. A committed
+    /// invoice lived only in an un-`fsync`'d `<db>.wal`; the main file advanced
+    /// only at the next boot's fold. On 2026-08-08 a force-restart kept the
+    /// `fsync`'d audit mirror and lost ~22 h of business rows — a flawless
+    /// ledger sitting on frozen rows (ADR-0110 §0, §2.2, §2.7 hypothesis H-A).
+    ///
+    /// # Why `fsync` the WAL rather than fold it (Option B, not Option A)
+    ///
+    /// ADR-0110 §4 Option B. DuckDB pushes its WAL records out to `<db>.wal` at
+    /// commit and **replays them on the next open**, so an `fsync`'d WAL is a
+    /// complete, self-describing durable record of the commit. Folding instead
+    /// (Option A / H4) would rewrite the main file on **every** invoice, which
+    /// (a) re-opens the in-place `duckdb#23046` torn-metadata path the F-A
+    /// pragmas exist to close, (b) costs the whole WAL per ack rather than one
+    /// small append-only flush, and (c) needs a `live_durable_checkpoint`
+    /// primitive that does not exist in this tree. Option B changes **nothing**
+    /// about what the boot openers see: the WAL still replays and still folds
+    /// at boot exactly as before.
+    ///
+    /// # What it `fsync`s, and why each one
+    ///
+    /// 1. **`<db>` (the main file)** — the WAL is replayed *against* the main
+    ///    file. If the last boot fold is still sitting in the page cache, a
+    ///    durable WAL replayed onto a half-written base is not a recovery. Free
+    ///    when clean, which at runtime it always is (nothing folds in place).
+    /// 2. **`<db>.wal`** — the file that actually holds the acked rows. Skipped
+    ///    (not an error) when absent: no WAL means the rows are already in the
+    ///    main file, and the contract holds either way.
+    /// 3. **The parent directory** — so a WAL *created* by this commit has a
+    ///    durable directory entry. Without it the whole file can vanish. Not
+    ///    recorded in the journal: a directory is not a durable-set member, it
+    ///    is what makes the members findable.
+    ///
+    /// The audit mirror is deliberately absent: [`WriteGuard::drop`] has
+    /// already `fsync`'d it via [`aberp_audit_ledger::sync_mirror`], which runs
+    /// before this is ever called.
+    ///
+    /// # Call it AFTER the guard drops
+    ///
+    /// This takes **no** lock. It does not need one — `fsync` flushes whatever
+    /// bytes are in the page cache and can never tear a file, and our own
+    /// commit's records were complete before `commit()` returned. Taking the
+    /// writer mutex would be actively wrong: money paths call this at the ack,
+    /// where a re-acquire trips the re-entrancy tripwire if the guard is still
+    /// alive, and needlessly serializes every other writer behind an `fsync`
+    /// otherwise. `drop(guard)` first, then call this.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::DurableAck`] if any `fsync` fails. **Propagate it — never
+    /// downgrade it to a `warn!`.** The business transaction has already
+    /// committed at this point, so the caller is choosing between "tell the
+    /// operator it failed when it may have landed" and "promise durability we
+    /// did not achieve". ADR-0110 R3 / CLAUDE.md rule 11 pick the first; the
+    /// inverted failure mode is named in ADR-0110 §7.7.
+    ///
+    /// # Honest scope
+    ///
+    /// `File::sync_all` is `fsync(2)`. On macOS that flushes to the device but
+    /// does **not** force the device's own write cache — only `F_FULLFSYNC`
+    /// does. This is the same primitive `crash_safe.rs::fsync_file` and the
+    /// audit mirror already use, and the mirror is the store that lost nothing
+    /// on 2026-08-08, so it is the tree's evidenced idiom rather than a guess.
+    /// `F_FULLFSYNC` is a deliberate, flagged residual (ADR-0110 §5 D3).
+    pub fn durable_ack(&self) -> Result<(), DbError> {
+        // Main file first, then the WAL: the WAL is only meaningful on top of a
+        // durable base. Both before the directory entry that names them.
+        self.fsync_and_record(&self.db_path.clone())?;
+        if self.wal_path.exists() {
+            self.fsync_and_record(&self.wal_path.clone())?;
+        }
+        if let Some(parent) = self.db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fsync_path(parent)?;
+        }
+        Ok(())
+    }
+
+    /// `fsync` `path` and record it in the durability journal. Recording only
+    /// happens on SUCCESS — the journal must mean "this is on stable storage",
+    /// never "we tried".
+    fn fsync_and_record(&self, path: &Path) -> Result<(), DbError> {
+        fsync_path(path)?;
+        // A poisoned journal mutex must not fail a write that IS now durable:
+        // the journal is evidence, not the contract. Recover in place.
+        let mut synced = match self.synced.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                self.synced.clear_poison();
+                poisoned.into_inner()
+            }
+        };
+        if !synced.iter().any(|p| p == path) {
+            synced.push(path.to_path_buf());
+        }
+        Ok(())
+    }
+
+    /// ADR-0110 D3 — the durability journal: every file this handle has
+    /// `fsync`'d via [`Self::durable_ack`], in first-sync order.
+    ///
+    /// Read by the ADR-0110 D6b power-loss spec to build its durable set out of
+    /// what the write path actually certified, so that deleting the `fsync`
+    /// deletes the file from the set and turns the spec red. Directories are
+    /// never listed (see [`Self::durable_ack`]).
+    pub fn fsynced_paths(&self) -> Vec<PathBuf> {
+        match self.synced.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     /// Acquire the **serialized writer** over the shared instance. The returned
@@ -612,6 +777,40 @@ impl Handle {
     }
 }
 
+/// `<db>.wal` — DuckDB's WAL sibling for `db_path`. The extension is
+/// **appended** to the whole file name (`aberp.duckdb` → `aberp.duckdb.wal`),
+/// not substituted, which `Path::set_extension` would get wrong.
+///
+/// Deliberately re-derived here rather than reused from
+/// `aberp_snapshot::crash_safe`: that helper is private, and `aberp-snapshot`
+/// is intentionally NOT a dependency of this crate (see the Cargo.toml note).
+/// One three-line path join does not justify inverting that.
+fn wal_path_for(db_path: &Path) -> PathBuf {
+    let mut name = db_path.as_os_str().to_os_string();
+    name.push(".wal");
+    PathBuf::from(name)
+}
+
+/// `fsync` a path's contents + metadata. Works for regular files and, on POSIX,
+/// for directories — opening read-only and `sync_all`-ing the fd is the
+/// canonical way to persist either (the same shape as
+/// `aberp_snapshot::crash_safe::fsync_file`).
+///
+/// Unlike that helper's directory arm, a failure here is **hard**. It is
+/// reached only from [`Handle::durable_ack`], where "we could not make the
+/// acked write durable" is precisely the fact that must not be swallowed
+/// (ADR-0110 R3).
+fn fsync_path(path: &Path) -> Result<(), DbError> {
+    let f = std::fs::File::open(path).map_err(|source| DbError::DurableAck {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    f.sync_all().map_err(|source| DbError::DurableAck {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 /// Open one runtime connection to the live tenant DB and apply the
 /// single-writer hardening pragmas.
 ///
@@ -628,7 +827,15 @@ impl Handle {
 /// file when the connection closes; `wal_autocheckpoint` raised to effectively
 /// infinite stops the in-place auto-fold DURING operation. Together they ensure
 /// the only checkpoint that ever touches the live file is the validated logical
-/// one (H4). An UNKNOWN pragma is NOT harmless — DuckDB errors HARD on an
+/// one (H4).
+///
+/// **ADR-0110 §2.2 correction.** That last sentence was true and load-bearing
+/// and H4 was never built, so for two releases "the only checkpoint" was *no
+/// checkpoint* and the live file simply never advanced at runtime. The pragmas
+/// stay — folding in place is still the `duckdb#23046` hazard — but durability
+/// no longer waits on H4: [`Handle::durable_ack`] `fsync`s the WAL at the money
+/// -path ack, so the acked rows are durable *without* a fold. An UNKNOWN pragma
+/// is NOT harmless — DuckDB errors HARD on an
 /// unrecognised pragma (duckdb#10127), so a future rename/typo makes
 /// `Handle::open` fail and `serve` refuse to boot (fail-hard: loud), not
 /// silently degrade. The spellings are confirmed VALID against libduckdb 1.5.3

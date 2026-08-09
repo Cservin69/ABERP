@@ -12,13 +12,32 @@
 //! ADR-0110 §5 D6 specifies two tiers. Measuring them produced a result the
 //! ADR did not anticipate, so this file carries three:
 //!
-//! | tier | models | verdict at `380ba8a` |
-//! |---|---|---|
-//! | D6a (`SIGKILL`, not built here) | user-space buffering | would pass — §7.6 |
-//! | [`d6b_live_byte_copy_at_ack_carries_the_acked_row`] | "what is on disk" vs "what the process holds" | **PASSES** |
-//! | [`acked_money_write_must_survive_the_power_loss_durable_set`] | power loss: only fsync'd bytes survive | **FAILS — the spec** |
+//! | tier | models | at `380ba8a` | with ADR-0110 D3 |
+//! |---|---|---|---|
+//! | D6a (`SIGKILL`, not built here) | user-space buffering | would pass — §7.6 | passes |
+//! | [`d6b_live_byte_copy_at_ack_carries_the_acked_row`] | "what is on disk" vs "what the process holds" | **PASSES** | passes |
+//! | [`acked_money_write_must_survive_the_power_loss_durable_set`] | power loss: only fsync'd bytes survive | **FAILED — the spec** | **PASSES** |
 //!
-//! ## Why the middle tier passes, and why that is not reassuring
+//! # What changed: ADR-0110 D3 (rev. 3)
+//!
+//! Tier 2 was RED when this file landed, and that red WAS the specification.
+//! `Handle::durable_ack` (`crates/aberp-db/src/lib.rs`) closes it: at every
+//! money-path ack the write path now `fsync`s the main file, `<db>.wal`, and
+//! the tenant directory. The acked rows are in `<db>.wal`, so the WAL is now a
+//! member of the power-loss durable set and the same assertions pass.
+//!
+//! **D3 took ADR-0110 Option B (fsync the WAL), not Option A (fold it).** The
+//! main file is never rewritten on the money path, so `main_file_advanced_at_ack`
+//! is still `false` at the ack — the RED spec's load-bearing premise survives
+//! the fix intact rather than being tuned away.
+//!
+//! Crucially, tier 2 does not hard-code the WAL into its durable set. It
+//! DERIVES the set from `Handle::fsynced_paths` (see [`power_loss_durable_set`]),
+//! so the WAL is a member if and only if production code really `fsync`'d it.
+//! Reverting the `fsync` drops it back out and tier 2 goes red again — the
+//! derivation is the mutation proof, not a comment claiming one.
+//!
+//! ## Why the byte-copy tier passes, and why that is not reassuring
 //!
 //! ADR-0110 §5 expected the byte-copy tier to be red. It is not. DuckDB
 //! pushes its WAL records out to `aberp.duckdb.wal` at commit, so a copy of
@@ -38,27 +57,30 @@
 //! * `<db>.audit.log` — **fsync'd per append batch** by `sync_mirror`
 //!   (`crates/audit-ledger/src/mirror.rs`, `file.sync_all()`). Survives.
 //! * `<db>` main file — advanced only by a checkpoint. The runtime one is
-//!   `run_durable_checkpoint_locked`, a `tracing::error!` stub that folds
-//!   NOTHING, and `HandleConfig::checkpoint_enabled` defaults to `false`
-//!   (`crates/aberp-db/src/lib.rs`). Never advances at ack.
-//! * `<db>.wal` — **nothing in `crates/aberp-db/src/` calls `sync_all`,
-//!   `sync_data` or `fsync`** (the one grep hit is the word inside a log
-//!   string). Never durable.
+//!   still `run_durable_checkpoint_locked`, a `tracing::error!` stub that
+//!   folds NOTHING, and `HandleConfig::checkpoint_enabled` still defaults to
+//!   `false`. **D3 did not build H4**; it made the ack durable without one.
+//! * `<db>.wal` — at `380ba8a`, **nothing in `crates/aberp-db/src/` called
+//!   `sync_all`, `sync_data` or `fsync`** (the one grep hit was the word
+//!   inside a log string), so the WAL was never durable and the acked rows
+//!   died with it. Since D3, `Handle::durable_ack` fsyncs it at every
+//!   money-path ack.
 //!
-//! So the post-power-loss durable set is *main file + mirror, without the
-//! WAL* — and that is precisely the state the 2026-08-08 recovery pass
-//! found: a clean prefix, a mirror holding every event, and the business
-//! rows gone. [`acked_money_write_must_survive_the_power_loss_durable_set`]
-//! reconstructs that set and demands the acked `invoice` + `invoice_line`
-//! rows from it.
+//! So the post-power-loss durable set was *main file + mirror, without the
+//! WAL* — precisely the state the 2026-08-08 recovery pass found: a clean
+//! prefix, a mirror holding every event, and the business rows gone.
+//! [`acked_money_write_must_survive_the_power_loss_durable_set`] reconstructs
+//! that set and demands the acked `invoice` + `invoice_line` rows from it.
 //!
-//! The model is **not** rigged to fail. It omits the WAL because nothing
-//! fsyncs it, and it asserts, as a load-bearing precondition, that the main
-//! file did not advance at ack. Land ADR-0110 D3 (a real H4: validated fold
-//! + `atomic_install` + fsync) and the fold puts the row in the main file,
-//! that precondition flips, and the same assertions pass on the same
-//! durable set. [`teeth_control_explicit_fold_and_fsync_at_ack_survives_power_loss`]
-//! demonstrates exactly that today, in the harness.
+//! The model is **not** rigged in either direction. It never hard-codes the
+//! WAL in or out: [`power_loss_durable_set`] derives membership from the
+//! `Handle`'s durability journal, which records a path only after a
+//! SUCCESSFUL `sync_all`. And it asserts, as a load-bearing precondition,
+//! that the main file did not advance at ack — a premise D3 preserves,
+//! because Option B does not fold.
+//! [`teeth_control_explicit_fold_and_fsync_at_ack_survives_power_loss`] is
+//! the independent control: it reaches the same durable outcome via the
+//! Option A primitive (explicit fold + fsync) on a hard-coded set.
 //!
 //! # Honest scope
 //!
@@ -70,17 +92,25 @@
 //!
 //! # CI wiring (ADR-0110 §7.9)
 //!
-//! All three are `#[ignore]`d for now: `ci.yml` runs a bare
-//! `cargo test --workspace --locked`, and this session is scoped to landing
-//! the RED spec, not to enabling a blocking gate. They are written to run
-//! unattended — hermetic `$TMPDIR` tenants, no network, no keychain, no
-//! `~/.aberp` touch, ~0.6 s total — so promoting them to the cut-gate once
-//! D1/D3 land is exactly: delete the `#[ignore]` lines. Run them with
+//! **All `#[ignore]`s are gone.** These run in the bare
+//! `cargo test --workspace --locked` that `ci.yml` already executes, and the
+//! standalone `cut-gate.yml` additionally runs `tools/cut_gate_durable_ack.sh`,
+//! which asserts every money-path ack still calls `Handle::durable_ack` —
+//! §7.9's point being that one test is not a gate. They are unattended by
+//! construction: hermetic `$TMPDIR` tenants, no network, no keychain, no
+//! `~/.aberp` touch, well under a second each. Run them directly with
 //!
 //! ```text
 //! cargo test --manifest-path apps/aberp/Cargo.toml \
-//!     --test adr0110_d6b_ondisk_durability -- --ignored --nocapture
+//!     --test adr0110_d6b_ondisk_durability -- --nocapture
 //! ```
+//!
+//! The latency measurement ADR-0110 §9 / R6 asks for is
+//! [`durable_ack_latency_stays_inside_r6`], kept `#[ignore]`d because it is a
+//! timing measurement and a wall-clock assertion in a shared CI runner is a
+//! flake generator. Its bound is R6's own ("a few tens of milliseconds is
+//! fine; a second is not"), not a tuned number. Run it with `-- --ignored
+//! --nocapture` to print the figures.
 
 use aberp_audit_ledger::{
     self as audit_ledger, Actor, BinaryHash, EventKind, LedgerMeta, TenantId,
@@ -184,6 +214,12 @@ struct Acked {
     /// the acked row. ADR-0110 §2.2 measured the same thing in production
     /// via `source_db_sha256` being identical across snapshots 52→57.
     main_file_advanced_at_ack: bool,
+    /// Wall-clock spent inside `Handle::durable_ack` for THIS write — i.e. the
+    /// ADR-0110 D3 delta, measured where it actually falls: over a WAL that
+    /// this commit just dirtied. Read by [`durable_ack_latency_stays_inside_r6`];
+    /// timing it anywhere else (a repeat `fsync` over already-clean bytes)
+    /// measures a no-op and flatters the result.
+    durable_ack_took: std::time::Duration,
 }
 
 fn fixture_args(series_id: SeriesId) -> AllocateArgs {
@@ -231,12 +267,30 @@ fn fixture_args(series_id: SeriesId) -> AllocateArgs {
 
 /// Issue ONE invoice through the production seam: the shared
 /// `aberp_db::Handle` writer, one transaction carrying the billing INSERTs
-/// **and** the audit appends (CLAUDE.md rule 15), commit, then guard-drop —
-/// whose post-commit hook is the lockstep `sync_mirror`.
+/// **and** the audit appends (CLAUDE.md rule 15), commit, guard-drop — whose
+/// post-commit hook is the lockstep `sync_mirror` — and then the ADR-0110 D3
+/// `durable_ack`.
 ///
 /// The returned [`Acked`] **is** the ack: in `serve.rs` the HTTP handler
-/// answers the operator 200 at exactly this point, with no checkpoint and
-/// no further durability step of any kind.
+/// answers the operator 200 at exactly this point.
+///
+/// # This models the write path; it does not call it
+///
+/// The real `issue_invoice::issue_from_parsed` needs NAV credentials from the
+/// OS keychain, an `MnbRatesProvider`, and a seller profile, so an unattended
+/// hermetic test cannot drive it (the same reason `issue_invoice_eur_offline.rs`
+/// pins helpers rather than the route). What is modelled here is the ORDER of
+/// the four steps, and each one is the real primitive: `Handle::write`,
+/// `allocate_in_tx` + `append_in_tx` in ONE tx, guard-drop's `sync_mirror`, and
+/// `Handle::durable_ack`.
+///
+/// The five production sites that run this exact sequence, each with the same
+/// `drop(guard); db.durable_ack()?` pair at its ack:
+/// `issue_invoice::issue_from_parsed`, `issue_modification::modification_from_inputs`,
+/// `issue_storno::storno_from_inputs`, `mark_invoice_paid::mark_paid`, and
+/// `incoming_invoices::change_status`. The fourth of those is driven for real,
+/// with no modelling at all, by
+/// [`real_money_path_mark_paid_survives_the_power_loss_durable_set`].
 fn issue_one_acked(handle: &aberp_db::Handle, series_id: SeriesId) -> Acked {
     let meta = ledger_meta();
     let idem = IdempotencyKey::new();
@@ -286,6 +340,16 @@ fn issue_one_acked(handle: &aberp_db::Handle, series_id: SeriesId) -> Acked {
         invoice
     };
 
+    // ADR-0110 D3 — the durable-ack boundary, exactly as the five production
+    // money paths run it: guard dropped (mirror fsync'd) FIRST, then the DB's
+    // own fsync. This call is what puts `<db>.wal` — the only place the acked
+    // `invoice` + `invoice_line` rows live — into the power-loss durable set.
+    let ack_started = std::time::Instant::now();
+    handle
+        .durable_ack()
+        .expect("ADR-0110 D3 durable-ack at the invoice-issuance ack");
+    let durable_ack_took = ack_started.elapsed();
+
     let main_after = std::fs::read(handle.db_path()).expect("read main file at ack");
     let mirror_entries = audit_ledger::read_mirror_entries(handle.mirror_path())
         .expect("read mirror at ack")
@@ -310,6 +374,7 @@ fn issue_one_acked(handle: &aberp_db::Handle, series_id: SeriesId) -> Acked {
             .collect(),
         mirror_entries,
         main_file_advanced_at_ack: main_before != main_after,
+        durable_ack_took,
     }
 }
 
@@ -341,6 +406,60 @@ fn copy_on_disk_bytes(from: &Path, to: &Path, only: Option<&[&str]>) -> Vec<(Str
     }
     manifest.sort();
     manifest
+}
+
+/// **The power-loss durable set at the ack instant — DERIVED, not declared.**
+///
+/// A power cut keeps only what was `fsync`'d. This builds that set from what
+/// the code actually did, so the model cannot quietly drift away from the tree.
+///
+/// Two members are unconditional, and both warrants are properties of code
+/// outside `aberp-db`:
+///
+/// * `<db>.audit.log` — `sync_mirror` `fsync`s it per append batch
+///   (`crates/audit-ledger/src/mirror.rs`, `file.sync_all()`), from inside
+///   `WriteGuard::drop`, i.e. before every ack. It is not the `Handle`'s own
+///   `fsync`, so the `Handle` cannot certify it; that citation is the warrant.
+/// * `<db>` — the modelling concession this file has always made. [`provision`]
+///   folded and closed the main file long before the money write, so the model
+///   treats the last-folded base as durable. Keeping it unconditional is what
+///   makes a red read "the MONEY WRITE was lost" rather than the far less
+///   useful "the tenant was never on disk at all". Since ADR-0110 D3 the write
+///   path `fsync`s it too, so the concession is now also earned — but nothing
+///   here leans on that.
+///
+/// **Every other file must be earned.** It joins the set only if
+/// [`aberp_db::Handle::fsynced_paths`] — the durability journal, appended to
+/// only on a SUCCESSFUL `sync_all` — says the production write path really
+/// `fsync`'d it.
+///
+/// That is what keeps tier 2 honest in both directions. At `380ba8a` nothing in
+/// `crates/aberp-db/src/` called `sync_all`, the journal is empty, the set is
+/// exactly the two constants, and tier 2 is RED — byte-for-byte the set the
+/// hard-coded RED spec used. With D3's `durable_ack` the WAL earns its place
+/// and tier 2 is GREEN. **Delete the `fsync` and the WAL falls straight back
+/// out of the set: the derivation IS the mutation test.**
+///
+/// # What this still cannot prove (unchanged from the RED spec's honest scope)
+///
+/// It takes the write path's word that `sync_all` reached stable storage. A
+/// harness that can only read the filesystem cannot tell a page-cache write
+/// from an `fsync`'d one — that needs fault injection below the FS, which is
+/// not available here. On macOS `fsync(2)` is weaker than `F_FULLFSYNC` on top
+/// of that. **R1's machine-restart clause is still not proven by this file.**
+fn power_loss_durable_set(handle: &aberp_db::Handle) -> Vec<String> {
+    let mut set = vec![DB_FILE.to_string(), MIRROR_FILE.to_string()];
+    for path in handle.fsynced_paths() {
+        let name = path
+            .file_name()
+            .expect("a journalled fsync path always names a file")
+            .to_string_lossy()
+            .into_owned();
+        if !set.contains(&name) {
+            set.push(name);
+        }
+    }
+    set
 }
 
 fn scalar_i64(conn: &Connection, sql: &str) -> i64 {
@@ -483,8 +602,6 @@ fn durability_violations(copy_db: &Path, acked: &Acked) -> Vec<String> {
 /// The `main_file_advanced_at_ack` assertion is the load-bearing part: it
 /// records that this tier passes *while nothing durable happened at all*.
 #[test]
-#[ignore = "ADR-0110 D6b tier 1: GREEN, but this session is scoped to landing the \
-            RED spec, not to enabling a blocking gate (§7.9). Un-ignore to promote."]
 fn d6b_live_byte_copy_at_ack_carries_the_acked_row() {
     let live = tenant_dir("tier1");
     let db = live.join(DB_FILE);
@@ -541,17 +658,16 @@ fn d6b_live_byte_copy_at_ack_carries_the_acked_row() {
 /// it is the same asymmetry `s444_torn_tail_number_reuse.rs` reproduces for
 /// the numbering invariant — here aimed at the business rows themselves.
 ///
-/// **Not rigged.** The WAL is omitted because nothing fsyncs it, and the
-/// `main_file_advanced_at_ack` assertion below pins that premise loudly. Land
-/// D3 (a real H4: validated fold + `atomic_install` + fsync at the ack
-/// boundary) and the fold puts the row into the main file, the premise
-/// flips, and these same assertions pass on the same durable set — which is
-/// what [`teeth_control_explicit_fold_and_fsync_at_ack_survives_power_loss`]
-/// shows today.
+/// **Not rigged.** The set is derived by [`power_loss_durable_set`], which adds
+/// a file only when the production write path certifies it `fsync`'d it. At
+/// `380ba8a` nothing did, the WAL was excluded, and this was RED — that red was
+/// the specification. ADR-0110 D3 (`Handle::durable_ack`) `fsync`s the WAL at
+/// the ack, the WAL earns its place in the set, and these same assertions pass.
+/// Revert the `fsync` and it goes red again by the same derivation.
+///
+/// **GREEN since ADR-0110 D3.** This is now a real, un-ignored test and a
+/// cut-gate arm (`tools/cut_gate_durable_ack.sh`, §7.9).
 #[test]
-#[ignore = "ADR-0110 D6b tier 2: RED against this tree BY DESIGN — the durable-commit \
-            contract is not built yet. This red IS the specification (§6 Phase 1). \
-            Un-ignore to promote to the cut-gate once it goes green."]
 fn acked_money_write_must_survive_the_power_loss_durable_set() {
     let live = tenant_dir("tier2");
     let db = live.join(DB_FILE);
@@ -561,19 +677,37 @@ fn acked_money_write_must_survive_the_power_loss_durable_set() {
     let handle = aberp_db::Handle::open_default(&db, tenant_id()).expect("shared Handle");
     let acked = issue_one_acked(&handle, series_id);
 
-    // The premise of the model, asserted rather than assumed: at the ack
-    // the write path did nothing that could have made the main file
-    // durable. If this ever fails, the durable set below is the wrong
-    // model and the test must be re-derived, not re-tuned.
+    // The premise of the model, asserted rather than assumed: the ack does not
+    // FOLD. ADR-0110 D3 took Option B (fsync the WAL) precisely so the main
+    // file is never rewritten on the money path, which keeps the
+    // `duckdb#23046` in-place-tearing surface closed and leaves the thirteen
+    // boot openers seeing exactly what they saw before. If this ever fails, the
+    // tree has started folding at commit and the whole durability analysis —
+    // not just this test — needs re-deriving.
     assert!(
         !acked.main_file_advanced_at_ack,
-        "ADR-0110 §2.2 premise broken: the main DB file ADVANCED at ack. The \
-         durable-set model in this test assumes the runtime checkpoint folds \
-         nothing; re-derive it before trusting the result."
+        "ADR-0110 §2.2 premise broken: the main DB file ADVANCED at ack, so this \
+         tree now folds at commit. Re-derive the analysis before re-tuning this."
+    );
+
+    // The acked row has to come from something the write path made durable, so
+    // the WAL must have EARNED its place in the set. Pinned separately from the
+    // survival assertion below because "the set is right" and "the row survived
+    // it" are different facts, and a set that silently lost its derivation
+    // would otherwise fail as a confusing baseline error.
+    let durable = power_loss_durable_set(&handle);
+    assert!(
+        durable.iter().any(|n| n == WAL_FILE),
+        "ADR-0110 D3 REGRESSION: at the ack of a money write the Handle's \
+         durability journal does not contain {WAL_FILE}, so nothing fsync'd the \
+         file the acked rows live in. Durable set derived: {durable:?}; journal: \
+         {:?}",
+        handle.fsynced_paths(),
     );
 
     let copy = tenant_dir("tier2-copy");
-    let manifest = copy_on_disk_bytes(&live, &copy, Some(&[DB_FILE, MIRROR_FILE]));
+    let only: Vec<&str> = durable.iter().map(String::as_str).collect();
+    let manifest = copy_on_disk_bytes(&live, &copy, Some(&only));
 
     let violations = durability_violations(&copy.join(DB_FILE), &acked);
     assert!(
@@ -598,12 +732,15 @@ fn acked_money_write_must_survive_the_power_loss_durable_set() {
 /// the durable set is bootable and complete, and the ONLY variable is
 /// whether the acked write was made durable.
 ///
-/// This is a test-harness prototype of ADR-0110 D3, **not** the production
-/// fix — `run_durable_checkpoint_locked` is still a stub and
-/// `checkpoint_enabled` still defaults to `false` in this tree.
+/// This is a harness prototype of ADR-0110 **Option A** (fold the WAL into the
+/// main file, then fsync) — the road not taken. D3 shipped Option B instead
+/// (fsync the WAL where it lies, no fold), so this stays as the independent
+/// control: it reaches the same durable outcome by the other primitive, on a
+/// hard-coded rather than derived set, and therefore keeps its power to tell a
+/// broken harness apart from a broken write path. `run_durable_checkpoint_locked`
+/// is still a stub and `checkpoint_enabled` still defaults `false`: D3 did not
+/// build H4.
 #[test]
-#[ignore = "ADR-0110 D6b tier 2 teeth: GREEN. Ignored alongside its siblings for \
-            this session (§7.9); un-ignore together with tier 2."]
 fn teeth_control_explicit_fold_and_fsync_at_ack_survives_power_loss() {
     let live = tenant_dir("teeth");
     let db = live.join(DB_FILE);
@@ -645,5 +782,141 @@ fn teeth_control_explicit_fold_and_fsync_at_ack_survives_power_loss() {
          is not measuring durability and the tier-2 red proves nothing.\n\n\
          Acked: {acked:#?}\n\nDurable set: {manifest:?}\n\n{}",
         violations.join("\n\n"),
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// The real production money path, driven with no modelling at all.
+// ──────────────────────────────────────────────────────────────────────
+
+/// **Tier 2 against production code rather than a model of it.**
+///
+/// The tier-2 test above reproduces the issuance sequence by hand, because the
+/// real `issue_invoice::issue_from_parsed` needs the OS keychain, an
+/// `MnbRatesProvider` and a seller profile, none of which an unattended test
+/// may have. That leaves one honest gap: a reader has to take on faith that
+/// production calls `Handle::durable_ack` at all.
+///
+/// `mark_invoice_paid::mark_paid` closes it. It is a real money-path ack — the
+/// operator is told "marked paid" — its only inputs are the shared `Handle`,
+/// the tenant and the payload, and it carries the identical
+/// `drop(guard); db.durable_ack()?` pair. So this drives the actual shipped
+/// function, cuts the power at its ack, and demands the payment back out of the
+/// durable set, with nothing modelled anywhere in the chain.
+///
+/// What it reads back is `audit_query::payment_record_for` **against the copied
+/// DB**, not against the mirror — deliberately. The mirror was always fsync'd,
+/// so a mirror-only check would pass at `380ba8a` and prove nothing. The DB's
+/// own `audit_ledger` table is also what `mark_paid`'s no-double-payment gate
+/// reads, so a payment durable only in the mirror silently re-opens exactly the
+/// double-payment window that gate exists to close.
+#[test]
+fn real_money_path_mark_paid_survives_the_power_loss_durable_set() {
+    let live = tenant_dir("markpaid");
+    let db = live.join(DB_FILE);
+    let series_id = SeriesId::new();
+    provision(&db, series_id);
+
+    let handle = aberp_db::Handle::open_default(&db, tenant_id()).expect("shared Handle");
+    let invoice_id = InvoiceId::new().to_prefixed_string();
+
+    // THE PRODUCTION FUNCTION. Not a re-implementation of it.
+    let outcome = aberp::mark_invoice_paid::mark_paid(
+        &handle,
+        tenant_id(),
+        TEST_BINARY_HASH,
+        "operator@test",
+        aberp::mark_invoice_paid::MarkPaidInput {
+            invoice_id: invoice_id.clone(),
+            paid_at: "2026-08-08".to_string(),
+            amount_minor: 3_480_653,
+            currency: "HUF".to_string(),
+            method: aberp::audit_payloads::PaymentMethod::BankTransfer,
+            reference: Some("D6B-REAL-PATH".to_string()),
+        },
+    )
+    .expect("mark_paid must succeed on a fresh invoice");
+    // `mark_paid` has returned: in `serve.rs` this is the 200. Cut the power.
+
+    let copy = tenant_dir("markpaid-copy");
+    let durable = power_loss_durable_set(&handle);
+    let only: Vec<&str> = durable.iter().map(String::as_str).collect();
+    let manifest = copy_on_disk_bytes(&live, &copy, Some(&only));
+
+    let conn = boot_shaped_open(&copy.join(DB_FILE));
+    let ledger = aberp_audit_ledger::Ledger::from_connection(conn, tenant_id(), TEST_BINARY_HASH);
+    let recovered = aberp::audit_query::payment_record_for(&ledger, &invoice_id)
+        .expect("read payment record back from the durable set");
+
+    assert_eq!(
+        recovered.as_ref().map(|p| p.amount_minor),
+        Some(outcome.payment.amount_minor),
+        "ADR-0110 R1 VIOLATED on the REAL mark-paid path — the operator was told \
+         invoice {invoice_id} was marked paid ({} minor units), and the \
+         power-loss durable set does not have it back: {recovered:?}.\n\n\
+         Durable set: {manifest:?}",
+        outcome.payment.amount_minor,
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// R6 — what the durable ack costs.
+// ──────────────────────────────────────────────────────────────────────
+
+/// **ADR-0110 R6 / §9 — measure the added latency; do not assume it.**
+///
+/// §9 estimated "~24 ms by analogy with the Editions MES measurement" and said,
+/// in bold, that it was unmeasured on this tree. This measures it: the same
+/// issuance twice over, once with the guard-drop mirror sync alone and once
+/// with the D3 `durable_ack` on top, and prints both.
+///
+/// The assertion is R6's own wording — "a few tens of milliseconds per write is
+/// fine; a second is not" — deliberately loose. A tight wall-clock bound in a
+/// shared CI runner is a flake generator, and a gate that cries wolf gets
+/// switched off. `#[ignore]`d for the same reason; run it with `--ignored
+/// --nocapture` to read the numbers.
+#[test]
+#[ignore = "timing measurement, not a behavioural pin — see the doc comment (R6)"]
+fn durable_ack_latency_stays_inside_r6() {
+    const ROUNDS: u32 = 20;
+
+    let live = tenant_dir("latency");
+    let db = live.join(DB_FILE);
+    let series_id = SeriesId::new();
+    provision(&db, series_id);
+    let handle = aberp_db::Handle::open_default(&db, tenant_id()).expect("shared Handle");
+
+    // Warm the tenant so the first-write costs (schema touch, mirror backfill,
+    // file creation) do not land inside either measurement.
+    issue_one_acked(&handle, series_id);
+
+    let mut with_ack = std::time::Duration::ZERO;
+    let mut ack_only = std::time::Duration::ZERO;
+    for _ in 0..ROUNDS {
+        let t0 = std::time::Instant::now();
+        // `Acked::durable_ack_took` times the `durable_ack` INSIDE this
+        // issuance, over the WAL bytes this commit just dirtied. Timing a
+        // second `durable_ack` afterwards instead would measure an fsync over
+        // already-clean bytes, i.e. roughly nothing, and overstate the fix.
+        let acked = issue_one_acked(&handle, series_id);
+        with_ack += t0.elapsed();
+        ack_only += acked.durable_ack_took;
+    }
+
+    let per_issue = with_ack / ROUNDS;
+    let per_ack = ack_only / ROUNDS;
+    println!(
+        "ADR-0110 R6 measurement over {ROUNDS} issuances on this machine:\n  \
+         full acked issuance (tx + mirror fsync + durable_ack): {per_issue:?}\n  \
+         durable_ack alone (the D3 delta):                      {per_ack:?}\n  \
+         issuance without it (derived):                         {:?}",
+        per_issue.saturating_sub(per_ack),
+    );
+
+    assert!(
+        per_issue < std::time::Duration::from_secs(1),
+        "ADR-0110 R6 VIOLATED: an acked issuance costs {per_issue:?}. R6 allows a \
+         few tens of milliseconds, not a second — the durable ack is now \
+         operator-visible latency."
     );
 }

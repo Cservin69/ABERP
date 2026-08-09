@@ -180,3 +180,31 @@ jobs:
         # direction: an unmutated tree and an unrelated non-NAV route must both
         # stay green, because a gate that cries wolf gets switched off.
         run: bash tools/cut_gate_nav_emit_door_probes.sh
+
+      - name: ADR-0110 D3 durable-ack gate (ENFORCING)
+        # THE eleventh gate, and the first whose predicate is DURABILITY rather
+        # than chain consistency (ADR-0110 §9). ADR-0110 §7.9 states the whole
+        # point: "One test is not a gate; a gate is a check that fails a cut."
+        # The D6b power-loss spec (apps/aberp/tests/adr0110_d6b_ondisk_durability.rs)
+        # proves the money path is durable today and runs in ci.yml; THIS keeps
+        # it durable, by holding the census of money-path `Handle::durable_ack()`
+        # acks closed in BOTH directions — a deleted call and an unregistered new
+        # one are equally red. It is the only cover for the three ack sites no
+        # unattended test can reach (modification, storno, AP status change: they
+        # need NAV credentials / a NAV envelope / an ingested AP row). Flag
+        # explicit here as well as defaulted in the script so enforcement is
+        # visible at the CI surface and cannot be silently weakened by a one-line
+        # script edit.
+        env:
+          ENFORCE_DURABLE_ACK: "1"
+        run: bash tools/cut_gate_durable_ack.sh
+
+      - name: Prove the durable-ack gate has teeth (negative probes)
+        # Plants each real regression shape — the call deleted, the call
+        # commented out "just for now", an unregistered new call site, a census
+        # entry dropped — and asserts RED. Pins the non-triggers too: the
+        # unmutated tree stays GREEN and a doc-comment mention of
+        # `Handle::durable_ack` is never counted as a call, because a gate that
+        # cries wolf gets switched off. Also asserts a de-gated run ANNOUNCES
+        # itself instead of looking indistinguishable from a clean tree.
+        run: bash tools/cut_gate_durable_ack_probes.sh
