@@ -423,9 +423,9 @@ impl Handle {
     pub fn durable_ack(&self) -> Result<(), DbError> {
         // Main file first, then the WAL: the WAL is only meaningful on top of a
         // durable base. Both before the directory entry that names them.
-        self.fsync_and_record(&self.db_path.clone())?;
+        self.fsync_and_record(&self.db_path)?;
         if self.wal_path.exists() {
-            self.fsync_and_record(&self.wal_path.clone())?;
+            self.fsync_and_record(&self.wal_path)?;
         }
         if let Some(parent) = self.db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fsync_path(parent)?;
