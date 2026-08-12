@@ -1501,3 +1501,57 @@ failure: *a detector whose granularity is coarser than the thing it detects*.
 Each was green while wrong. When a gate's unit of analysis is a function, a
 file, or a lexical scope, ask what it looks like one level down before believing
 it.
+
+### 13.5 The F3 fix's own cost, paid back (re-adversarial, non-blocking)
+
+F3 put six reader paths on `db.write()`. That was correct for R-1, but two of
+the six paid for it in a way the fix did not account for. Both are now narrowed.
+Neither weakens R-1: in both cases every DDL-reaching call still runs under the
+writer.
+
+**`prepare_rerender` held the process-wide writer across a PDF render and an
+fsync.** Widening it to "one writer for the whole body" swept in
+`aberp_quote_pdf::render` (pure CPU) and `crate::fs::write_atomic`, which calls
+`sync_all` — a real fsync. Measured ~14.5ms of guard hold, blocking a concurrent
+invoice-issue `db.write()` for ~13.2ms; and `poll_once` drains the queue
+*sequentially* through `process_one`, so an N-quote drain is N such windows
+back-to-back. On production storage it is worse than the microbenchmark says,
+because that fsync competes with `durable_ack`'s WAL fsync and the audit-mirror
+fsync for the same device — the money path's own durability, slowed by a PDF.
+
+The last DB use is `get_effective_lead_time_days`. The guard is now dropped
+immediately after it, so render and fsync run unlocked. Both DDL-reaching calls
+stay above the drop.
+
+**The pin had to be relaxed, not just the code.** The F3 test asserted
+`prepare_rerender` "must take `db.write()` for its whole body" — which would have
+made this fix red. That is a pin cementing an implementation instead of
+forbidding a defect. It now asserts the actual invariant: both DDL-reaching calls
+happen under the writer, no `read()` clone is held, and the explicit `drop`
+precedes the render/fsync tail. Mutation-verified in both directions — deleting
+the `drop` reds it (the throughput regression returns) and swapping `write()` for
+`read()` reds it (the R-1 defect returns).
+
+*General form, worth more than the instance:* a pin written as "the code looks
+like X" blocks the next legitimate improvement. Write it as "the defect cannot
+occur" and the fix passes while the regression still fails.
+
+**`resolve_recipient_email` took the writer on a tokio runtime worker.** It is
+the one F3 site called bare from an `async fn` — the other five already sit
+inside `spawn_blocking` — so it began taking the process-wide writer mutex on an
+async worker and holding it across a transaction plus two partner queries. On
+the auto-email-after-issue path, a contended writer parks that worker.
+
+Moved onto `spawn_blocking`, which required taking `(&Handle, &str tenant)`
+instead of `&AppState` so the call is movable. The alternative — narrowing the
+hold — was rejected on inspection rather than preference: the partner lookups
+*are* the DDL-reaching calls, so they must sit under the writer either way;
+narrowing would have shortened the block without removing blocking-from-async,
+while `spawn_blocking` removes it outright and matches what the other five sites
+already do. A panic in the blocking task now lands on the same
+"no recipient → audit the skip, banner the operator" branch a lookup error takes,
+so it can never be mistaken for a successful send.
+
+Also pinned: `partners::get_partner` and `find_partner_by_tax_number` were the
+one DDL premise asserted in prose but never tested, unlike their five siblings.
+They are in the half-1 pin now, mutation-verified.

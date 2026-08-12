@@ -417,14 +417,15 @@ fn prepare_rerender(
     // the shared Handle, so a fresh `Connection::open` read a folded SUBSET (a
     // just-priced quote could look artifact-less and be classified permanently
     // failed) and its CLOSE truncated the Handle's WAL under the daemon's OWN
-    // `write_audit`. The schema-ensure is a CREATE TABLE IF NOT EXISTS, so it
-    // takes the writer; the guard drops before the read below.
-    // ADR-0110 D8 / F3 — ONE writer for the whole fn, not a write-then-read pair.
-    // ADR-0108 R-1 forbids DDL on a `read()` clone, and this path reaches it
-    // twice: the explicit `ensure_schema` here, and `get_effective_lead_time_days`
-    // below, which ensure_schemas the connection it is handed. Splitting into
-    // write-for-DDL + read-for-queries would still leave the second one on a
-    // reader, so the whole body takes the writer.
+    // `write_audit`.
+    //
+    // ADR-0108 R-1 forbids DDL on a `read()` clone, and this path reaches DDL
+    // TWICE: the explicit `ensure_schema` just below, and
+    // `get_effective_lead_time_days` further down, which ensure_schemas the
+    // connection it is handed. A write-for-DDL + read-for-queries split would
+    // leave that second one on a reader, so the DB-touching PREFIX of this
+    // function runs under one writer — and the guard is dropped the moment the
+    // last query returns, before the render + fsync tail (see the `drop` below).
     let conn = db
         .write()
         .context("acquire shared writer for pdf re-render prepare (callees do DDL)")
@@ -493,6 +494,30 @@ fn prepare_rerender(
         .context("decode QuoteBreakdown for re-render")
         .map_err(PrepareError::Render)?;
 
+    // ADR-0110 D8 / F3 follow-up — the LAST database use in this function, and
+    // the second of the two DDL-reaching calls (it `ensure_schema`s the
+    // connection it is handed), so it must still be under the writer.
+    let lead_time_days =
+        crate::quote_pricing_jobs::get_effective_lead_time_days(&conn, quote_id, tenant_id)
+            .map_err(PrepareError::Db)?;
+
+    // …and the writer is released HERE, explicitly, before the expensive tail.
+    //
+    // The F3 fix widened this fn from "scoped write for the DDL, then read" to
+    // one writer for the whole body — which swept `aberp_quote_pdf::render`
+    // (pure CPU) and `crate::fs::write_atomic` (a real `sync_all` fsync,
+    // apps/aberp/src/fs.rs) under the PROCESS-WIDE writer mutex. Measured ~14.5ms
+    // of guard hold, blocking a concurrent invoice-issue `db.write()` for ~13.2ms
+    // — and `poll_once` drains the queue SEQUENTIALLY through `process_one`, so an
+    // N-quote drain is N of those windows back-to-back. On real-prod storage it is
+    // worse: this fsync competes with `durable_ack`'s WAL fsync and the
+    // audit-mirror fsync for the same device.
+    //
+    // Nothing below touches the database, so holding the writer across it bought
+    // nothing. Both DDL-reaching calls stay above this line, so ADR-0108 R-1 is
+    // preserved — the narrowing trades no correctness for the latency.
+    drop(conn);
+
     let inputs = QuoteInputs {
         quote_id,
         customer_email: &customer_email,
@@ -515,10 +540,8 @@ fn prepare_rerender(
         stock_alert: true,
         // S427 — effective lead-time (override ?? computed), same source
         // as `advance_render` so the re-render differs only by the band.
-        lead_time_days: crate::quote_pricing_jobs::get_effective_lead_time_days(
-            &conn, quote_id, tenant_id,
-        )
-        .map_err(PrepareError::Db)?,
+        // Resolved above, while the writer was still held.
+        lead_time_days,
     };
     let pdf_bytes = aberp_quote_pdf::render(&inputs)
         .map_err(|e| PrepareError::Render(anyhow!("render priced.pdf: {e}")))?;

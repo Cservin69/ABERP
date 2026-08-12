@@ -101,6 +101,19 @@ fn the_callees_on_these_reader_paths_really_do_issue_ddl() {
             "get_effective_lead_time_days",
             "pdf re-render prepare",
         ),
+        // The partners pair — the premise `resolve_recipient_email` is keyed on
+        // in half 2. These were the one premise asserted in prose but never
+        // pinned, unlike their five siblings.
+        (
+            "apps/aberp/src/partners.rs",
+            "get_partner",
+            "invoice-email recipient, rung 2 by partner id",
+        ),
+        (
+            "apps/aberp/src/partners.rs",
+            "find_partner_by_tax_number",
+            "invoice-email recipient, rung 2 legacy fallback",
+        ),
     ];
     for (file, callee, label) in cases {
         let body = fn_body(&read_src(file), callee);
@@ -158,15 +171,50 @@ fn d8_reader_paths_with_ddl_callees_take_the_writer_not_a_read_clone() {
         );
     }
 
-    // The daemon path, same rule, different file.
+    // The daemon path, same rule, different file — but a WEAKER assertion, and
+    // deliberately so.
+    //
+    // This originally read "must take `db.write()` for its whole body". That was
+    // over-strong and it cemented a throughput bug: holding the process-wide
+    // writer across `aberp_quote_pdf::render` (CPU) and `crate::fs::write_atomic`
+    // (an fsync) blocked concurrent invoice-issue writers for ~13ms per quote,
+    // N times over a sequential drain. The guard is now dropped right after the
+    // last query.
+    //
+    // So the invariant is NOT "the writer spans the function". It is: **both
+    // DDL-reaching calls happen under the writer, and neither happens on a read
+    // clone.** A pin must forbid the defect, not freeze one particular fix.
     let rerender = read_src("apps/aberp/src/quote_pdf_rerender_daemon.rs");
     let body = fn_body(&rerender, "prepare_rerender");
     assert!(
-        body.contains(".write()") && !body.contains(".read()"),
-        "ADR-0110 D8/F3 REGRESSION: `prepare_rerender` must take `db.write()` for its \
-         whole body — it ensure_schemas directly AND via \
-         `get_effective_lead_time_days`. A write-then-read split would put the second \
-         one back on a reader."
+        body.contains(".write()"),
+        "ADR-0110 D8/F3 REGRESSION: `prepare_rerender` must acquire `db.write()` — it \
+         ensure_schemas directly AND via `get_effective_lead_time_days`."
+    );
+    assert!(
+        !body.contains(".read()"),
+        "ADR-0110 D8/F3 REGRESSION: `prepare_rerender` must not hold a `read()` clone; \
+         a write-for-DDL + read-for-queries split puts `get_effective_lead_time_days` \
+         back on a reader."
+    );
+    // Ordering: both DDL-reaching calls must precede the guard release. This is
+    // what lets the guard be narrowed WITHOUT re-opening R-1.
+    let ensure_at = body
+        .find("ensure_schema")
+        .expect("prepare_rerender must still ensure the pricing-jobs schema");
+    let lead_time_at = body
+        .find("get_effective_lead_time_days")
+        .expect("prepare_rerender must still resolve the effective lead time");
+    let drop_at = body.find("drop(conn)").expect(
+        "ADR-0110 D8/F3: `prepare_rerender` should release the writer explicitly before \
+         its render + fsync tail. If the explicit `drop(conn)` is gone, the guard is \
+         being held to end-of-scope again — across a PDF render and an fsync.",
+    );
+    assert!(
+        ensure_at < drop_at && lead_time_at < drop_at,
+        "ADR-0110 D8/F3 REGRESSION: a DDL-reaching call in `prepare_rerender` now happens \
+         AFTER the writer is dropped. Both `ensure_schema` and \
+         `get_effective_lead_time_days` must run while the guard is held."
     );
 }
 

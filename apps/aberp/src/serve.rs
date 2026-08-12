@@ -21132,12 +21132,56 @@ pub async fn send_invoice_email_route(
     // that don't yet have a Partners row, and lets the operator override
     // the partner's default address for a single send without churning
     // the master record.
-    let recipient_lookup =
-        resolve_recipient_email(state, invoice_id, customer_partner_id, customer_tax_number)
-            .unwrap_or_else(|e| {
+    // ADR-0110 D8 / F3 follow-up — on `spawn_blocking`, not the async worker.
+    //
+    // F3 moved this resolver onto `db.write()` because both partner lookups
+    // `ensure_schema` the connection they are handed (ADR-0108 R-1). That was
+    // correct, but this is the ONE of the six F3 sites that is called bare from
+    // an `async fn` — the other five already sit inside `spawn_blocking` — so it
+    // began taking the process-wide writer mutex on a tokio runtime worker and
+    // holding it across a transaction plus two partner queries. A contended
+    // writer parks that worker.
+    //
+    // Narrowing the hold instead would not have helped: the partner queries ARE
+    // the DDL-reaching calls, so they must stay under the writer either way.
+    // Moving the whole resolver to the blocking pool is what actually removes
+    // blocking-from-async, and it matches what the other five sites already do.
+    let recipient_lookup = {
+        let db = state.db.clone();
+        let tenant = state.tenant.clone();
+        let invoice = invoice_id.to_string();
+        let partner = customer_partner_id.map(str::to_string);
+        let tax_number = customer_tax_number.to_string();
+        match tokio::task::spawn_blocking(move || {
+            resolve_recipient_email(
+                &db,
+                tenant.as_str(),
+                &invoice,
+                partner.as_deref(),
+                &tax_number,
+            )
+        })
+        .await
+        {
+            Ok(Ok(found)) => found,
+            Ok(Err(e)) => {
                 tracing::warn!(invoice_id = %invoice_id, error = %e, "resolve_recipient_email");
                 None
-            });
+            }
+            // A panic in the blocking task lands on the SAME "no recipient"
+            // branch a lookup error does — the send path then audits a
+            // MissingRecipient skip and banners the operator, which is the
+            // truthful outcome. It must never be mistaken for a successful send.
+            Err(join) => {
+                tracing::warn!(
+                    invoice_id = %invoice_id,
+                    error = %join,
+                    "resolve_recipient_email task panicked"
+                );
+                None
+            }
+        }
+    };
     let (recipient_email, recipient_display_name) = match recipient_lookup {
         Some((email, name)) if !email.trim().is_empty() => (email, name),
         _ => {
@@ -21418,8 +21462,12 @@ fn finalize_email_audit(
 /// `Err` for DuckDB / parse failures only. A missing override row
 /// (post-PR-203 invoice but column reads NULL — pre-PR-203 invoice OR
 /// operator left it blank) falls through to rung 2 normally.
+/// ADR-0110 D8 / F3 follow-up — takes the `Handle` + tenant rather than
+/// `&AppState` so the whole call can be moved into `spawn_blocking`. See the
+/// call site for why that matters.
 fn resolve_recipient_email(
-    state: &AppState,
+    db: &aberp_db::Handle,
+    tenant: &str,
     invoice_id: &str,
     partner_id: Option<&str>,
     customer_tax_number: &str,
@@ -21434,8 +21482,7 @@ fn resolve_recipient_email(
     // connection they are handed, so a `read()` clone here would issue DDL
     // outside the writer mutex. The guard is local to this fn and drops before
     // the caller's own Handle writes, so nothing is held across an await.
-    let mut conn = state
-        .db
+    let mut conn = db
         .write()
         .context("acquire shared writer for email-recipient resolution (callee does DDL)")?;
     // PR-203 / S203 — rung 1: per-invoice override.
@@ -21468,10 +21515,8 @@ fn resolve_recipient_email(
     // threads through input.json; fall back to the tax-number lookup
     // only for legacy / CLI invoices that never carried a partner_id.
     let p = match partner_id.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(id) => partners::get_partner(&conn, state.tenant.as_str(), id)?,
-        None => {
-            partners::find_partner_by_tax_number(&conn, state.tenant.as_str(), customer_tax_number)?
-        }
+        Some(id) => partners::get_partner(&conn, tenant, id)?,
+        None => partners::find_partner_by_tax_number(&conn, tenant, customer_tax_number)?,
     };
     let p = match p {
         Some(p) => p,
