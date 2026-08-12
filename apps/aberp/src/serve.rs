@@ -3566,6 +3566,14 @@ pub fn open_tenant_handle(
     db_path: &std::path::Path,
     tenant: TenantId,
 ) -> anyhow::Result<aberp_db::HandleArc> {
+    // ADR-0110 D7 / B2 — the boot re-derivation of a sticky durability alert is
+    // NOT wired here: `Handle::open` does it itself, as part of constructing
+    // the Handle. That is deliberate. Doing it at this call site would (a) be a
+    // step someone can forget on a new boot path, and (b) taint this fn under
+    // the CHECK N structural read-fork rule — a `let`-bound fresh opener that is
+    // then read through is exactly the shape that rule exists to catch, and it
+    // is right to catch it; the answer is not to allow-list the one function
+    // whose whole job is opening the shared Handle.
     aberp_db::Handle::open_default(db_path, tenant)
         .context("open the shared aberp-db Handle (ADR-0099 H3)")
 }
@@ -3798,6 +3806,12 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/health/acknowledge-first-prod-launch",
             post(handle_acknowledge_first_prod_launch),
+        )
+        .route(
+            // ADR-0110 D7 / B2 — the operator takes the durability banner down.
+            // Audits the acknowledgement first, then clears the flag.
+            "/health/acknowledge-durability-alert",
+            post(handle_acknowledge_durability_alert),
         )
         .route("/invoices", get(handle_list_invoices))
         .route("/invoices/issue", post(handle_issue_invoice))
@@ -6143,6 +6157,139 @@ async fn handle_health(State(state): State<AppState>) -> Response {
 #[derive(Serialize)]
 struct AcknowledgeFirstProdLaunchResponse {
     acknowledged_at: String,
+}
+
+/// ADR-0110 D7 / B2 — response shape for the durability-alert acknowledgement.
+#[derive(Serialize)]
+struct AcknowledgeDurabilityAlertResponse {
+    acknowledged_at: String,
+}
+
+/// `POST /health/acknowledge-durability-alert` — the operator acknowledges a
+/// durability-loss alert, taking the red banner down.
+///
+/// # Why this route has to exist (PR #61 adversarial, B2)
+///
+/// The banner is sticky by design and, since B2, is re-derived at every boot
+/// from the surviving audit mirror. Without an acknowledge route those two
+/// facts together would make it **permanent** — there would be no way to clear
+/// it short of deleting audit evidence, and an alarm that cannot be cleared
+/// gets routed around rather than acted on.
+///
+/// The inverse failure was worse and is the one B2 actually found: before this,
+/// the only thing that cleared the alert was the RESTART THE BANNER ASKS FOR.
+/// The operator was told to stop and recover, did so, and the act of doing it
+/// erased the warning. Keep-serving had degraded to keep-serving-and-forget.
+///
+/// So clearing is an ordinary attributable act: a hash-chained
+/// `DbDurabilityAlertAcknowledged` row goes down FIRST, and only then is the
+/// in-memory flag cleared. Order matters — if the append fails the request
+/// fails loudly and the banner stays up, which is the safe direction. Clearing
+/// first and failing to record would leave the operator with no banner and no
+/// trail, and the next boot would silently re-raise it with no explanation.
+async fn handle_acknowledge_durability_alert(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match acknowledge_durability_alert(&state, &operator_login) {
+        Ok(acknowledged_at) => {
+            Json(AcknowledgeDurabilityAlertResponse { acknowledged_at }).into_response()
+        }
+        Err(e) => internal_error("acknowledge_durability_alert", e),
+    }
+}
+
+/// Library core of [`handle_acknowledge_durability_alert`]: append the audit
+/// row, THEN clear the flag. Returns the RFC3339 stamp.
+fn acknowledge_durability_alert(state: &AppState, operator_login: &str) -> Result<String> {
+    use time::format_description::well_known::Rfc3339;
+
+    let acknowledged_at = time::OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .context("format durability-alert acknowledgement timestamp")?;
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute for durability acknowledgement")?;
+
+    // 1. AUDIT FIRST. A `?` here leaves the banner up, which is the safe
+    //    direction: an unrecorded clear is indistinguishable from amnesia, and
+    //    the next boot's mirror re-derivation would put the banner back with no
+    //    trace of who took it down or why.
+    record_durability_alert_ack_audit(
+        &state.db,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        &acknowledged_at,
+    )?;
+
+    // 2. Only now clear the in-memory flag. The durable half is already down,
+    //    so a restart from here keeps the banner down too — which is what makes
+    //    the button worth pressing.
+    state.db.clear_durability_alert();
+
+    tracing::warn!(
+        tenant = state.tenant.as_str(),
+        operator = operator_login,
+        at = %acknowledged_at,
+        "ADR-0110 D7: durability-loss alert ACKNOWLEDGED by the operator; banner cleared. The \
+         loss itself remains permanently recorded in the audit chain."
+    );
+    Ok(acknowledged_at)
+}
+
+/// Append a single `DbDurabilityAlertAcknowledged` entry through the shared
+/// Handle. Split out for the same reason
+/// [`record_first_prod_launch_audit`] is: the ledger-write half is testable
+/// against a scratch DuckDB without constructing an [`AppState`].
+fn record_durability_alert_ack_audit(
+    db: &aberp_db::Handle,
+    tenant: TenantId,
+    binary_hash: aberp_audit_ledger::BinaryHash,
+    operator_login: &str,
+    acknowledged_at: &str,
+) -> Result<()> {
+    // H3 (ADR-0099): the ONE shared Handle, never a fresh `Ledger::open`. The
+    // guard drop lockstep-syncs the mirror — load-bearing here rather than
+    // incidental, because the mirror is precisely what the next boot's
+    // re-derivation reads to decide whether the banner comes back.
+    let mut guard = db
+        .write()
+        .context("acquire shared writer to record the durability-alert acknowledgement")?;
+    let tx = guard
+        .transaction()
+        .context("begin durability-alert acknowledgement audit tx")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    // `operator_login` is the only non-fixed string, so it is JSON-escaped
+    // rather than interpolated raw (an operator login with a quote in it would
+    // otherwise produce an unparseable payload).
+    let payload = format!(
+        "{{\"acknowledged_at\":\"{}\",\"operator\":{}}}",
+        acknowledged_at,
+        serde_json::Value::String(operator_login.to_string()),
+    )
+    .into_bytes();
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        EventKind::DbDurabilityAlertAcknowledged,
+        payload,
+        actor,
+        None,
+    )
+    .context("append DbDurabilityAlertAcknowledged audit entry")?;
+    tx.commit()
+        .context("commit durability-alert acknowledgement audit")?;
+    Ok(())
 }
 
 /// `POST /health/acknowledge-first-prod-launch` — the operator's one-time

@@ -1,7 +1,8 @@
 # ADR-0110 — The durable-commit contract and business-state boot replay
 
 - **Status:** **Partially implemented** — D3 landed 2026-08-09 (rev. 3); D7 (the
-  WAL-truncation fence, added after incident 00012) landed 2026-08-12. D1, D2,
+  WAL-truncation fence, added after incident 00012) landed 2026-08-12 and ships
+  DISARMED pending the PR #3 opener sweep (D7.6). D1, D2,
   D4, D5 and the payload widening remain proposed. Adversarially reviewed
   2026-08-08; verdict *sound after changes*, listed in §11 and folded into
   §5/§6/§7. Rev-3's corrections are in §12.
@@ -570,8 +571,8 @@ business-state replay as the recovery path.**
     can reach — modification, storno, and the AP status change.
 
 - **D7 — The WAL-truncation fence (R1). *(Added 2026-08-12 after incident
-  00012. BUILT.)*** D3 made the acked bytes durable; it did not make the ack
-  HONEST. A foreign `Connection::open` on the tenant DB with DuckDB's DEFAULT
+  00012. BUILT, and SHIPPING DARK — see D7.6.)*** D3 made the acked bytes
+  durable; it did not make the ack HONEST. A foreign `Connection::open` on the tenant DB with DuckDB's DEFAULT
   pragmas — the ADR-0099 GROUP-A shape — folds and truncates the live Handle's
   WAL when it closes, and every subsequent Handle `commit()` returns `Ok` while
   reaching no file. D3's `durable_ack` could not see it **by construction**,
@@ -600,12 +601,26 @@ business-state replay as the recovery path.**
   4. **KEEP SERVING, not hard-stop** (Ervin, 2026-08-12). The breach latch is
      consumed as it is reported, so the app is not bricked and the next ack on
      a healthy tenant succeeds. What persists is a **sticky
-     `Handle::durability_alert`**, cleared only by an explicit
-     `clear_durability_alert`, plus a `db.durability_loss_detected` audit row
+     `Handle::durability_alert`** plus a `db.durability_loss_detected` audit row
      (its own `EventKind` — **not** `db.auto_recovered`, which means "we healed
      it"; nothing is healed here). The audit row rides the lockstep mirror
      sync, so the durable copy lands in the `fsync`'d mirror even when the DB
      copy does not.
+  4a. **Keep-serving must not degrade to keep-serving-and-FORGET** *(B2, PR #61
+     adversarial)*. As first built it did: the alert was process memory, the
+     `db.durability_loss_detected` row went into the very database whose WAL had
+     just been truncated, and so **the restart the banner tells the operator to
+     perform was the mute button**. Two changes close it. `Handle::open`
+     re-derives the alert at construction by scanning the surviving `fsync`'d
+     audit mirror — the alert is up exactly while the newest
+     `db.durability_loss_detected` out-ranks the newest
+     `db.durability_alert_acknowledged`. And `POST
+     /health/acknowledge-durability-alert` lets the operator clear it *without*
+     a restart, appending the hash-chained acknowledgement FIRST and only then
+     clearing the flag, so a failed append leaves the banner up. Clearing is now
+     an attributable act rather than an absence, and it is durable across
+     restarts. Re-derivation is deliberately **not** gated on D7.6's flag: a loss
+     recorded while the fence was armed must survive a boot where it is not.
   5. **The operator channel.** The alert is surfaced on `GET /health` as
      `durability_alert` (always present, explicitly `null` when quiet) and the
      SPA renders a full-width, high-contrast red banner above the topbar,
@@ -613,6 +628,20 @@ business-state replay as the recovery path.**
      off-palette — ADR-0017's ambient language is overridden for this one
      element, because the keep-serving decision above rests entirely on the
      operator seeing it.
+  6. **The fence SHIPS DISARMED** (`HandleConfig::wal_fence_enabled`, default
+     `false`) *(B1, PR #61 adversarial)*. Three foreign GROUP-A openers are
+     still live in-serve — `calibration_overview_request`,
+     `resolve_recipient_email`, `handle_quote_pipeline_status` — plus the
+     CLI-against-live openers, and each truncates the WAL on close. With the
+     fence armed *before* that sweep, opening the quote-calibration overview or
+     emailing an invoice arms a breach, and the next issuance or mark-paid then
+     fails its `durable_ack` — a failure that PROPAGATES, because the D3-C
+     cut-gate enforces exactly that. A committed invoice would report as failed
+     with its NAV handoff skipped. That is strictly worse than the silent bug
+     being detected, so the detection lands dark and the flag flips in a
+     one-line PR once **PR #3** has swept the openers. **The real loss-stopper
+     is the sweep; D7 is the belt-and-suspenders alarm that is safe to arm
+     after it.** Both flag states are pinned.
   - **Naming note.** This is D7, not D4: **D4 already means "boot must stop
     folding blind"** and remains unbuilt and H4-dependent. The two are
     unrelated — D4 is about the boot openers' pragma posture, D7 is about

@@ -30,6 +30,7 @@
 
   import { onDestroy, onMount } from "svelte";
   import {
+    acknowledgeDurabilityAlert,
     getBootStatus,
     health,
     retryBoot,
@@ -322,6 +323,19 @@
     // looks like it's updating in near-real-time during cold boot,
     // slow enough that we're not hammering Tauri with invokes.
     bootPollTimer = setInterval(() => void pollBoot(), 300);
+    // ADR-0110 D7 / N3 — start the /health probe NOW, not when boot reaches
+    // Ready. The durability banner is driven by `healthInfo`, so gating the
+    // probe on Ready silently gated the ALARM on Ready too: it could not render
+    // during loading, first-run setup, or a failed boot — exactly the states
+    // someone is in when they are poking at a box that is misbehaving, and
+    // exactly the states the banner's own comment claims it covers.
+    //
+    // Safe to start early: a probe against a still-booting backend just sets
+    // `healthState = "error"`, and every non-Ready `viewMode` renders its own
+    // fixed status chip rather than reading that. `pollBoot`'s
+    // `healthPollTimer === null` guard stops it starting a second timer.
+    void probe();
+    healthPollTimer = setInterval(() => void probe(), 10_000);
     unsubscribeRoute = subscribeRoute((r) => {
       route = r;
       // PR-223 / S227 — when a hash-change lands on the `invoices`
@@ -516,6 +530,15 @@
   // the only thing that can raise it and the only thing that can clear it.
   let durabilityAlert = $derived(durabilityAlertOf(healthInfo));
 
+  /** ADR-0110 D7 / B2 — POST the acknowledgement, then re-probe so the banner
+   * comes down because the BACKEND stopped reporting the alert, not because
+   * anything here decided to hide it. A rejected POST propagates to the banner,
+   * which shows the failure and stays up. */
+  async function onDurabilityAlertAcknowledged() {
+    await acknowledgeDurabilityAlert();
+    await probe();
+  }
+
   // PR-188 / session 188 — operator-supplied SPA wordmark. If
   // `static/aberp-logo.png` is present at build time, Vite serves it at
   // `/aberp-logo.png` and the `<img>` loads; if absent, `onerror` fires
@@ -536,7 +559,10 @@
        `viewMode === "ready"` like the status chip would hide it in exactly the
        states where someone is most likely to be poking at a sick box. -->
   {#if durabilityAlert}
-    <DurabilityAlertBanner alert={durabilityAlert} />
+    <DurabilityAlertBanner
+      alert={durabilityAlert}
+      onAcknowledge={onDurabilityAlertAcknowledged}
+    />
   {/if}
   <header class="topbar">
     <!-- PR-188 / session 188 — operator-supplied SPA wordmark. The

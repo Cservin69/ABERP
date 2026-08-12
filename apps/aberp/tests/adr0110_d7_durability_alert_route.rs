@@ -25,7 +25,7 @@ use std::sync::Arc;
 use aberp_audit_ledger::{
     append_in_tx, ensure_schema, Actor, BinaryHash, EventKind, LedgerMeta, TenantId,
 };
-use aberp_db::Handle;
+use aberp_db::{Handle, HandleConfig};
 use duckdb::Connection;
 use ulid::Ulid;
 
@@ -42,7 +42,22 @@ fn test_dir(label: &str) -> PathBuf {
 /// table without TLS or a keychain.
 fn demo_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new("demo".to_string()).expect("demo tenant id");
-    let db = serve::open_tenant_handle(&db_path, tenant.clone()).expect("open shared Handle");
+    // B1 ships the fence DISARMED, so these tests must arm it explicitly or
+    // they would pass vacuously (no fence, no alert, no banner to check). The
+    // boot re-derivation below is deliberately NOT gated on the flag — a
+    // historical loss recorded while the fence was armed must still resurface.
+    let db = Handle::open(
+        &db_path,
+        tenant.clone(),
+        HandleConfig {
+            wal_fence_enabled: true,
+            ..Default::default()
+        },
+    )
+    .expect("open shared Handle (fence ARMED)");
+    // No explicit `restore_durability_alert_from_mirror` here: `Handle::open`
+    // does it as part of construction, which is exactly the property
+    // `the_production_handle_constructor_re_derives_the_alert` pins.
     AppState {
         db,
         db_path: Arc::new(db_path),
@@ -299,6 +314,249 @@ async fn the_alert_survives_later_healthy_acks_and_repeated_polls() {
     assert!(
         body["durability_alert"].is_null(),
         "clear_durability_alert must be the one thing that retracts the banner"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── B2 — keep-serving must not degrade to keep-serving-and-FORGET ───────────
+
+/// **The restart the banner asks for must not be the mute button.**
+///
+/// The banner says *stop and recover*. Before B2, doing exactly that cleared
+/// it: the alert lived only in process memory, and the
+/// `db.durability_loss_detected` row had been written into the very database
+/// whose WAL was just truncated — so the DB copy is the copy most likely to be
+/// gone. The operator restarted, saw a clean screen, and carried on invoicing.
+///
+/// This drives the real sequence: fire the fence, then DROP the Handle and
+/// build a fresh one on the same tenant directory (a process restart, minus
+/// the process), and require the alert back.
+///
+/// Mutation-verified: delete the `handle.restore_durability_alert_from_mirror()`
+/// call from `serve::open_tenant_handle` and this goes RED while every other
+/// test in this file stays green.
+#[tokio::test]
+async fn a_restart_preserves_an_unacknowledged_durability_alert() {
+    let dir = test_dir("restart");
+    let db_path = dir.join("aberp.duckdb");
+    {
+        let c = Connection::open(&db_path).expect("seed open");
+        ensure_schema(&c).expect("seed schema");
+        c.execute_batch("CHECKPOINT;").expect("seed fold");
+    }
+
+    // ── Boot 1: the loss happens and is detected ──────────────────────────
+    {
+        let state = demo_state(db_path.clone());
+        commit_one(&state.db, "before");
+        state.db.durable_ack().expect("healthy ack");
+        foreign_open_and_close(&db_path);
+        commit_one(&state.db, "after");
+        let _ = state
+            .db
+            .durable_ack()
+            .expect_err("precondition: the fence must fire");
+        assert!(
+            state.db.durability_alert().is_some(),
+            "precondition: boot 1 must be showing the banner"
+        );
+        // The Handle drops here — the process is gone.
+    }
+
+    // ── Boot 2: a brand-new Handle on the same tenant ─────────────────────
+    let state = demo_state(db_path.clone());
+    let (status, body) = health_json(state.clone()).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        !body["durability_alert"].is_null(),
+        "ADR-0110 D7 / B2 REGRESSION: the durability alert did NOT survive a restart. The \
+         banner tells the operator to stop and recover — if the restart it asks for is also \
+         what silences it, keep-serving has degraded to keep-serving-and-FORGET, and the \
+         operator resumes invoicing on a tenant that may not be persisting. The alert must be \
+         re-derived at boot from the fsync'd audit mirror, which is the one copy a WAL \
+         truncation cannot take. Body: {body}"
+    );
+    let message = body["durability_alert"]["message"]
+        .as_str()
+        .expect("the re-derived alert carries a message");
+    assert!(
+        message.contains("Durability loss detected"),
+        "the re-derived alert must still read as an alarm; got {message:?}"
+    );
+    assert!(
+        message.contains("survived a restart"),
+        "the re-derived alert should say so — an operator who just restarted needs to know \
+         this is the SAME loss, not a new one; got {message:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The operator acknowledges: the banner comes down, the acknowledgement is
+/// recorded, and it is DURABLE — a further restart does not bring the banner
+/// back.
+///
+/// That last clause is what makes the button worth pressing. An acknowledgement
+/// that evaporated on restart would leave the operator with an alarm they can
+/// never actually clear, and an alarm that cannot be cleared is one people
+/// learn to route around.
+///
+/// Mutation-verified: make `acknowledge_durability_alert` clear the flag
+/// WITHOUT appending the audit row and the final restart assertion goes RED —
+/// the next boot re-derives the unacknowledged loss and the banner returns.
+#[tokio::test]
+async fn acknowledging_clears_the_banner_records_it_and_survives_a_restart() {
+    let dir = test_dir("ack");
+    let db_path = dir.join("aberp.duckdb");
+    {
+        let c = Connection::open(&db_path).expect("seed open");
+        ensure_schema(&c).expect("seed schema");
+        c.execute_batch("CHECKPOINT;").expect("seed fold");
+    }
+
+    let state = demo_state(db_path.clone());
+    commit_one(&state.db, "before");
+    state.db.durable_ack().expect("healthy ack");
+    foreign_open_and_close(&db_path);
+    commit_one(&state.db, "after");
+    let _ = state.db.durable_ack().expect_err("the fence fires");
+    assert!(
+        state.db.durability_alert().is_some(),
+        "precondition: banner up"
+    );
+
+    // ── Acknowledge over the REAL route ───────────────────────────────────
+    let app = serve::build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/health/acknowledge-durability-alert"))
+        .bearer_auth(state.session_token.as_str())
+        .send()
+        .await
+        .expect("POST the acknowledgement");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "the acknowledge route must answer 200 on a Ready tenant"
+    );
+    let ack: serde_json::Value = resp.json().await.expect("JSON");
+    assert!(
+        ack["acknowledged_at"]
+            .as_str()
+            .is_some_and(|s| s.contains('T')),
+        "the acknowledgement must report WHEN it happened (RFC3339); got {ack}"
+    );
+    server.abort();
+
+    // The banner is down...
+    let (_, body) = health_json(state.clone()).await;
+    assert!(
+        body["durability_alert"].is_null(),
+        "acknowledging must take the banner down; got {}",
+        body["durability_alert"]
+    );
+
+    // ...and it is RECORDED, in the mirror, where a truncation cannot reach it.
+    let mirror = aberp_audit_ledger::mirror_path_for(&db_path);
+    let entries = aberp_audit_ledger::read_mirror_entries(&mirror).expect("read mirror");
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.kind == "db.durability_alert_acknowledged"),
+        "B2 REGRESSION: the banner came down with NO durable record of who cleared it or when. \
+         Clearing a durability alert must be an attributable, hash-chained act — an unrecorded \
+         clear is indistinguishable from amnesia. Kinds present: {:?}",
+        entries.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.kind == "db.durability_loss_detected"),
+        "the LOSS itself must remain permanently recorded — acknowledging clears the banner, \
+         not the history"
+    );
+
+    // ...and the acknowledgement is DURABLE: restart, banner stays down.
+    drop(state);
+    let restarted = demo_state(db_path.clone());
+    let (_, body) = health_json(restarted).await;
+    assert!(
+        body["durability_alert"].is_null(),
+        "B2 REGRESSION: the banner came BACK after an acknowledged loss was restarted. The \
+         acknowledgement must out-rank the loss in the mirror, otherwise the operator has an \
+         alarm they can never clear — and an uncleavable alarm is one people learn to ignore. \
+         Body: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **`serve::open_tenant_handle` — the production constructor — must be the
+/// thing that re-derives.**
+///
+/// [`a_restart_preserves_an_unacknowledged_durability_alert`] proves the
+/// MECHANISM works, but it builds its Handle directly (it has to: B1 ships the
+/// fence disarmed and that test needs it armed), so it calls
+/// `restore_durability_alert_from_mirror` itself and cannot see whether serve
+/// ever does. Mutation-verified and caught exactly that: deleting the call from
+/// `open_tenant_handle` left it green. This closes the gap by going through the
+/// real constructor.
+///
+/// It also pins a second property worth stating out loud: **re-derivation is
+/// NOT gated on `wal_fence_enabled`.** A loss recorded while the fence was
+/// armed must still resurface on a boot where it is disarmed — otherwise
+/// turning the flag off would erase an outstanding alarm, which is a
+/// remarkably bad thing for a safety flag to do.
+#[tokio::test]
+async fn the_production_handle_constructor_re_derives_the_alert() {
+    let dir = test_dir("wiring");
+    let db_path = dir.join("aberp.duckdb");
+    {
+        let c = Connection::open(&db_path).expect("seed open");
+        ensure_schema(&c).expect("seed schema");
+        c.execute_batch("CHECKPOINT;").expect("seed fold");
+    }
+
+    // Produce a real, mirrored `db.durability_loss_detected` row by firing the
+    // fence on an ARMED Handle, then let that Handle go.
+    {
+        let armed = Handle::open(
+            &db_path,
+            TenantId::new("demo".to_string()).expect("tenant"),
+            HandleConfig {
+                wal_fence_enabled: true,
+                ..Default::default()
+            },
+        )
+        .expect("open armed Handle");
+        commit_one(&armed, "before");
+        armed.durable_ack().expect("healthy ack");
+        foreign_open_and_close(&db_path);
+        commit_one(&armed, "after");
+        let _ = armed
+            .durable_ack()
+            .expect_err("precondition: the fence fires");
+    }
+
+    // The production path, verbatim — `HandleConfig::default()`, fence DISARMED.
+    let handle =
+        serve::open_tenant_handle(&db_path, TenantId::new("demo".to_string()).expect("tenant"))
+            .expect("open the tenant Handle the way serve boot does");
+
+    assert!(
+        handle.durability_alert().is_some(),
+        "ADR-0110 D7 / B2 REGRESSION: `serve::open_tenant_handle` did not re-derive the \
+         outstanding durability alert from the audit mirror. Every serve boot path reaches the \
+         Handle through this function, so if the call is missing here the alert dies with the \
+         process no matter how well the mechanism itself works — and the restart the banner \
+         asks for silently clears it."
     );
 
     let _ = std::fs::remove_dir_all(&dir);

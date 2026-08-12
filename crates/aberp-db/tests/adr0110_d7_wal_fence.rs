@@ -117,8 +117,20 @@ fn seed(db: &Path) {
     conn.execute_batch("CHECKPOINT;").expect("seed fold");
 }
 
+/// A Handle with the D7 fence **ARMED**. Every fence test uses this, because
+/// `HandleConfig::default()` ships it DISARMED (B1) and always will until the
+/// GROUP-A opener sweep lands — see [`the_fence_ships_disarmed_by_default`] and
+/// [`with_the_fence_disarmed_the_group_a_shape_does_not_fail_the_ack`], which
+/// pin that other state.
 fn handle(db: &Path) -> std::sync::Arc<Handle> {
-    Handle::open_default(db, tenant()).expect("open shared Handle")
+    Handle::open(db, tenant(), armed_config()).expect("open shared Handle (fence ARMED)")
+}
+
+fn armed_config() -> HandleConfig {
+    HandleConfig {
+        wal_fence_enabled: true,
+        ..Default::default()
+    }
 }
 
 /// One committed audit row through the shared Handle — the shape every money
@@ -536,6 +548,171 @@ fn the_healthy_path_still_journals_what_it_synced() {
     assert!(
         synced.iter().any(|p| p == &wal_of(&db)),
         "the WAL must still be journalled on a tenant that has one; got {synced:?}"
+    );
+}
+
+// ── B1 — THE FENCE SHIPS DISARMED ───────────────────────────────────────────
+
+/// **The shipping default is OFF, and that is the whole point of B1.**
+///
+/// Three foreign GROUP-A openers are still live in-serve on this head
+/// (`calibration_overview_request`, `resolve_recipient_email`,
+/// `handle_quote_pipeline_status`). Each truncates this Handle's WAL on close.
+/// With the fence ARMED before those are swept, an operator opening the
+/// quote-calibration overview arms a breach, and the NEXT invoice issuance
+/// fails `durable_ack` — a failure that PROPAGATES via `?`, because the D3-C
+/// cut-gate enforces exactly that. A committed invoice would report as failed
+/// and skip its NAV handoff.
+///
+/// So this default is load-bearing safety, not a toggle someone should tidy
+/// away. Flip it only after the sweep.
+#[test]
+fn the_fence_ships_disarmed_by_default() {
+    assert!(
+        !HandleConfig::default().wal_fence_enabled,
+        "ADR-0110 D7 / B1 REGRESSION: the WAL fence must default DISARMED until the GROUP-A          opener sweep lands. Armed on this head it converts a silent durability bug into          routine LOUD money-path failures: calibration-overview / invoice-email /          pricing-jobs each truncate the WAL, and the next issue-invoice or mark-paid then          fails its durable_ack and propagates — a committed invoice reported as failed, NAV          handoff skipped. That is worse than the bug it detects."
+    );
+}
+
+/// The disarmed half of the RED-first pin: the exact GROUP-A shape that
+/// [`the_group_a_shape_must_fail_the_ack`] proves the armed fence catches must,
+/// with the fence off, behave exactly as it did before D7 — the ack succeeds.
+///
+/// Pinning BOTH states is the point. A flag whose off-state is untested is a
+/// flag nobody can trust to be off.
+#[test]
+fn with_the_fence_disarmed_the_group_a_shape_does_not_fail_the_ack() {
+    let tmp = Tmp::new("group-a-disarmed");
+    let db = tmp.db();
+    seed(&db);
+    // `open_default` — the production constructor, verbatim.
+    let h = Handle::open_default(&db, tenant()).expect("open shared Handle (fence DISARMED)");
+
+    commit_one(&h, "before");
+    assert!(wal_len(&db) > 0, "precondition: the commit is WAL-resident");
+    h.durable_ack().expect("healthy ack");
+
+    // The defect fires — and with the fence off, nothing notices. That is
+    // today's behaviour, deliberately preserved.
+    foreign_open_and_close(&db);
+    commit_one(&h, "after");
+
+    h.durable_ack().expect(
+        "B1 REGRESSION: with `wal_fence_enabled: false` the ack must behave exactly as it did          under D3 and SUCCEED. If this fails, the fence is armed on the default path and every          GROUP-A opener in serve becomes a money-path outage.",
+    );
+    assert!(
+        h.durability_alert().is_none(),
+        "B1 REGRESSION: a disarmed fence must raise no operator alert either — the banner would          be up on every box while the openers still ship"
+    );
+}
+
+/// A disarmed fence must not even LOOK. The guard drop is the hot path (every
+/// committed write in the process), so "off" has to mean no `stat` and no
+/// watermark mutex, not merely a suppressed verdict.
+#[test]
+fn a_disarmed_fence_never_touches_the_watermark() {
+    let tmp = Tmp::new("disarmed-quiet");
+    let db = tmp.db();
+    seed(&db);
+    let h = Handle::open_default(&db, tenant()).expect("open handle");
+
+    // Drive the shape that WOULD arm a breach, then prove none was latched:
+    // with the fence off, `durable_ack` never consults the watermark, so a
+    // latched-but-unreported breach would be a landmine waiting for the day
+    // someone flips the flag on a long-running process.
+    commit_one(&h, "one");
+    foreign_open_and_close(&db);
+    commit_one(&h, "two");
+    h.durable_ack().expect("disarmed ack succeeds");
+    assert!(
+        h.durability_alert().is_none(),
+        "a disarmed fence must leave no alert"
+    );
+}
+
+// ── N2 — "I could not look" is not "it is gone" ─────────────────────────────
+
+/// A `stat` that fails for a reason OTHER than ENOENT must resolve to
+/// "not checked", never to `WalVanished` — the most severe verdict the fence
+/// can reach.
+///
+/// The real-world shape is a NAS or removable mount hiccuping: ESTALE, EIO,
+/// ETIMEDOUT. Those are not reproducible in a unit test, so this uses the one
+/// non-ENOENT `stat` failure that IS deterministic — EACCES from an
+/// unsearchable parent directory. The code path is identical: `metadata()`
+/// returns an `Err` whose kind is not `NotFound`.
+///
+/// Mutation-verified: restore the original `std::fs::metadata(..).ok()` and
+/// this goes RED with a `WalTruncatedUnderWriter{ breach: WalVanished }` — a
+/// flaky mount reported as durability loss.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_wal_is_not_a_vanished_wal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = Tmp::new("unreadable");
+    let db = tmp.db();
+    seed(&db);
+    let h = handle(&db);
+    commit_one(&h, "before");
+    assert!(
+        wal_len(&db) > 0,
+        "precondition: a real WAL to lose sight of"
+    );
+    h.durable_ack().expect("healthy before the mount hiccup");
+
+    // Make the tenant directory unsearchable: `stat` on anything inside now
+    // fails EACCES rather than ENOENT.
+    let dir_perms = std::fs::metadata(&tmp.0)
+        .expect("stat tenant dir")
+        .permissions();
+    std::fs::set_permissions(&tmp.0, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod the tenant dir unsearchable");
+
+    let stat_now_fails = std::fs::metadata(wal_of(&db))
+        .err()
+        .filter(|e| e.kind() != std::io::ErrorKind::NotFound)
+        .is_some();
+
+    let outcome = h.durable_ack();
+
+    // Restore before asserting, so a failure does not also leave an
+    // undeletable temp dir behind.
+    std::fs::set_permissions(&tmp.0, dir_perms).expect("restore tenant dir permissions");
+
+    if !stat_now_fails {
+        // Running as root (CI containers sometimes do): permissions do not
+        // bite, so there is nothing to assert. Say so rather than passing
+        // vacuously.
+        eprintln!(
+            "SKIPPED an_unreadable_wal_is_not_a_vanished_wal: this process can stat through a              0o000 directory (running as root?), so the EACCES path was never reached."
+        );
+        return;
+    }
+
+    match outcome {
+        // The honest outcome: we could not reach the files, and the `fsync`
+        // says so in its own words.
+        Err(DbError::DurableAck { .. }) => {}
+        Err(DbError::WalTruncatedUnderWriter { breach, .. }) => panic!(
+            "N2 REGRESSION: an unreadable WAL (EACCES, not ENOENT) was reported as {breach:?}.              A NAS or removable mount that hiccups for one syscall would raise a DURABILITY              LOSS alarm and a sticky red banner on a tenant that never lost a byte.              'I could not look' must resolve to NOT CHECKED."
+        ),
+        other => panic!("expected DbError::DurableAck for an unreadable tenant dir, got {other:?}"),
+    }
+    assert!(
+        h.durability_alert().is_none(),
+        "N2 REGRESSION: an unreadable WAL raised the sticky durability banner"
+    );
+
+    // And the watermark survived intact: the next readable observation still
+    // compares against the last thing we actually saw, so a hiccup does not
+    // blind the fence afterwards.
+    commit_one(&h, "after");
+    h.durable_ack()
+        .expect("once the mount is back, acks are healthy again");
+    assert!(
+        h.durability_alert().is_none(),
+        "N2 REGRESSION: the observation after a stat hiccup fired the fence — the unreadable          observation must leave the watermark untouched, not reset it"
     );
 }
 

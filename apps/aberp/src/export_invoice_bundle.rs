@@ -681,6 +681,9 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // ADR-0110 D7 — the Handle's WAL fence fired; `db.`-scoped
         // process-durability telemetry, no NAV bytes.
         | EventKind::DbDurabilityLossDetected
+        // ADR-0110 D7 / B2 — the operator acknowledged a durability alert.
+        // `db.`-scoped consent record, no NAV bytes.
+        | EventKind::DbDurabilityAlertAcknowledged
         // S220 / PR-217 — buyer-backfill cycle completion event.
         // `system.`-scoped — recovery cadence telemetry against
         // `restored_invoice`, not a per-OUTGOING-invoice surface.
@@ -1092,7 +1095,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 190,
+        EventKind::ALL_KINDS_COUNT == 191,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

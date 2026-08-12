@@ -233,6 +233,9 @@ fn handle_background_paths_do_not_trip_while_serve_handle_registered() {
         min_checkpoint_interval: std::time::Duration::from_secs(3600),
         checkpoint_enabled: true,
         disable_implicit_close_checkpoint: true,
+        // ADR-0110 D7 / B1 — this test is about the checkpoint tripwire, not
+        // the WAL fence; leave the fence at its shipping default (disarmed).
+        wal_fence_enabled: false,
     };
     let handle = aberp_db::Handle::open(&db, tid(), cfg).expect("open handle");
     let _guard = register_serve_handle(&db);

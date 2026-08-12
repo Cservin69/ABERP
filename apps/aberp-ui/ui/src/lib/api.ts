@@ -496,6 +496,20 @@ export async function acknowledgeFirstProdLaunch(): Promise<AcknowledgeFirstProd
   return invoke<AcknowledgeFirstProdLaunchResponse>("acknowledge_first_prod_launch");
 }
 
+/** `POST /health/acknowledge-durability-alert` response. */
+export interface AcknowledgeDurabilityAlertResponse {
+  acknowledged_at: string;
+}
+
+/** ADR-0110 D7 — the operator acknowledges a durability-loss alert, taking the
+ * red banner down. The backend appends a permanent `DbDurabilityAlertAcknowledged`
+ * audit entry FIRST and only then clears the sticky flag, so a failed append
+ * leaves the banner UP. The acknowledgement is durable: it survives a restart,
+ * which is what stops the next boot re-raising the banner. */
+export async function acknowledgeDurabilityAlert(): Promise<AcknowledgeDurabilityAlertResponse> {
+  return invoke<AcknowledgeDurabilityAlertResponse>("acknowledge_durability_alert");
+}
+
 export async function listInvoices(): Promise<InvoiceListItem[]> {
   return invoke<InvoiceListItem[]>("list_invoices");
 }
