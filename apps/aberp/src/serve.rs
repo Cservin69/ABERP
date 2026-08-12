@@ -10565,10 +10565,23 @@ pub fn mark_paid_request(
     //    we read the billing row's stored gross (positive in practice;
     //    the negative arm is defence-in-depth against signed-storage
     //    drift) and let the pure verdict decide.
+    //
+    //    H3 (ADR-0099) / CHECK N — D2c, 2026-08-12. Both billing reads on
+    //    this route ran on their OWN `Connection::open(&state.db_path)`, a
+    //    second DuckDB instance co-resident with the shared Handle. Step 2's
+    //    `derive_state_for` and step 4's `mark_paid` were already Handle-
+    //    routed, so the route was a rule-14 family split in half. One shared
+    //    reader now serves both reads; it is dropped before step 4 dispatches
+    //    into the write path (never hold a read guard across a `write()`).
+    let billing_conn = state
+        .db
+        .read()
+        .context("acquire shared reader for the mark-paid route's billing reads")
+        .map_err(MarkPaidRouteError::Other)?;
     let total_gross = if derived.is_storno_self {
         None
     } else {
-        read_invoice_total_gross_minor(&state.db_path, invoice_id).map_err(|e| {
+        read_invoice_total_gross_minor(&billing_conn, invoice_id).map_err(|e| {
             MarkPaidRouteError::Other(anyhow!(
                 "read invoice total_gross for mark-paid eligibility gate: {e}"
             ))
@@ -10587,11 +10600,12 @@ pub fn mark_paid_request(
     //    currency). Read the invoice's currency from the billing
     //    store using the same scoped-read-tx posture as
     //    `read_base_currency`.
-    let invoice_currency = read_invoice_currency(&state.db_path, invoice_id).map_err(|e| {
+    let invoice_currency = read_invoice_currency(&billing_conn, invoice_id).map_err(|e| {
         MarkPaidRouteError::Other(anyhow!(
             "read invoice currency for mark-paid currency-match check: {e}"
         ))
     })?;
+    drop(billing_conn);
     if body.currency != invoice_currency {
         return Err(MarkPaidRouteError::CurrencyMismatch {
             invoice_currency: invoice_currency.iso_code().to_string(),
@@ -10640,13 +10654,22 @@ pub fn mark_paid_request(
 /// [`read_base_currency`] but does not require the invoice to be
 /// the base of a chain — works for any invoice id that exists in
 /// the billing table.
-fn read_invoice_currency(db_path: &Path, invoice_id: &str) -> Result<Currency> {
-    let mut conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for currency lookup",
-            db_path.display()
-        )
-    })?;
+///
+/// H3 (ADR-0099) / CHECK N — D2c, 2026-08-12. Takes the CALLER's shared-Handle
+/// connection, exactly as its already-migrated twin [`read_base_currency`]
+/// does. It used to `Connection::open(&state.db_path)` a second DuckDB
+/// instance, which does not replay the live writer's WAL — and worse, whose
+/// close FOLDS and truncates it (DuckDB DEFAULT pragmas, no
+/// `disable_checkpoint_on_shutdown`). Like D2b this read already failed
+/// LOUDLY on a stale row (`load_invoice_currency_metadata_in_tx` uses
+/// `query_row`), so the migration is for the Handle's WAL integrity and
+/// rule-14 coherence, not because the check itself could pass vacuously.
+fn read_invoice_currency(conn: &Connection, invoice_id: &str) -> Result<Currency> {
+    // `transaction()` needs `&mut`; a `try_clone` is the SAME instance (not a
+    // second OS open), so this stays coherent with the writer's WAL.
+    let mut conn = conn
+        .try_clone()
+        .context("try_clone the shared connection for the invoice-currency read")?;
     let tx = conn
         .transaction()
         .context("begin read transaction for invoice-currency lookup")?;
@@ -10665,13 +10688,20 @@ fn read_invoice_currency(db_path: &Path, invoice_id: &str) -> Result<Currency> {
 /// already excluded drafts by the time this runs). Reuses
 /// `billing::load_ready_invoice_by_id` so the gross read shares the
 /// list/detail read path's source of truth (CLAUDE.md rule 8).
-fn read_invoice_total_gross_minor(db_path: &Path, invoice_id: &str) -> Result<Option<i64>> {
-    let mut conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for total_gross lookup",
-            db_path.display()
-        )
-    })?;
+///
+/// H3 (ADR-0099) / CHECK N — D2c, 2026-08-12. Takes the CALLER's shared-Handle
+/// connection; it used to hold the D2a shape verbatim (fresh
+/// `Connection::open` + `billing::load_ready_invoice_by_id`). The `None` arm
+/// documented above stays exactly as it was — but note it is now `None` ONLY
+/// for a genuinely absent billing row, not also for a row the forked reader
+/// could not see: the list/detail path this reuses is Handle-routed, so both
+/// now read the same WAL-resident truth.
+fn read_invoice_total_gross_minor(conn: &Connection, invoice_id: &str) -> Result<Option<i64>> {
+    // `transaction()` needs `&mut`; a `try_clone` is the SAME instance (not a
+    // second OS open), so this stays coherent with the writer's WAL.
+    let mut conn = conn
+        .try_clone()
+        .context("try_clone the shared connection for the invoice total_gross read")?;
     let tx = conn
         .transaction()
         .context("begin read transaction for invoice total_gross lookup")?;

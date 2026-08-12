@@ -116,6 +116,22 @@
 # Census 91→89 openers, files 23→22 (both snapshot.rs and one take.rs opener
 # gone). Ratchet DOWN only — no additions, no content swaps. write-fork &
 # read-fork ENFORCE gates stay = 0.
+# ── 2026-08-12 D2c MARK-PAID BILLING READS — census RATCHETS DOWN 81→79 ──
+# The two openers D2 deferred (see the retraction above, and the D2c row of the
+# deferral ledger in docs/findings/modification-base-read-fork-2026-07-27.md) are
+# migrated onto the shared Handle. Delta, line by line — two removals, zero
+# additions (comm-verified):
+#   −2  apps/aberp/src/serve.rs 27→25, file stays on the census (25 remain)
+#       −1 …|read_invoice_currency:let mut conn = Connection::open(db_path).with_context(|| {
+#       −1 …|read_invoice_total_gross_minor:let mut conn = Connection::open(db_path).with_context(|| {
+# Both now take the caller's `state.db.read()` connection, one reader shared by
+# both reads and dropped before the route dispatches into `mark_paid`'s write.
+# This closes the LAST fresh-open member of the billing-reader family named in the
+# 2026-07-16 note above — read_base_currency, read_base_line_vat_kinds and these
+# two were that whole family, and all four are now Handle-routed. Both names are
+# now PINNED in adr0099_read_fork_scan.awk, so re-introducing either opener reds
+# CHECK N as well as this census; their lines are removed from
+# adr0099_read_fork_structural_baseline.txt (33→31) in this same change.
 apps/aberp/src/audit_dap_boot.rs|run_heartbeat_supervised:let mut ledger = Ledger::open(&db, tn, binary_hash)
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
@@ -163,8 +179,6 @@ apps/aberp/src/serve.rs|handle_get_email_relay_row:let conn = duckdb::Connection
 apps/aberp/src/serve.rs|handle_list_email_relay_queue:let conn = duckdb::Connection::open(&db_path).with_context(|| {
 apps/aberp/src/serve.rs|handle_quote_pipeline_status:let conn = duckdb::Connection::open(&db_path).context("open DB for daemon-pa
 apps/aberp/src/serve.rs|handle_relay_send_email:let conn = duckdb::Connection::open(&db_path).with_context(|| {
-apps/aberp/src/serve.rs|read_invoice_currency:let mut conn = Connection::open(db_path).with_context(|| {
-apps/aberp/src/serve.rs|read_invoice_total_gross_minor:let mut conn = Connection::open(db_path).with_context(|| {
 apps/aberp/src/serve.rs|record_upgrade_snapshot_mismatch_audit:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/serve.rs|resolve_recipient_email:let mut conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|run:duckdb::Connection::open(&cad_db_path).context(
