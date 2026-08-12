@@ -63,7 +63,6 @@
 //!     restored_invoice and ap_invoice are digest-only (no line items).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
 
 use aberp_audit_ledger::{BinaryHash, Entry, EventKind, Ledger, TenantId};
 use aberp_billing::domain::invoice::{line_net_total, line_vat_amount};
@@ -1414,41 +1413,59 @@ fn aging_bucket_for(today: Date, deadline: Date) -> AgingBucket {
 /// SQL aggregates against the prior periods (the audit-ledger walk is
 /// re-used).
 pub fn compute_financial_report(
-    db_path: &Path,
+    db: &aberp_db::Handle,
     tenant: TenantId,
     binary_hash: BinaryHash,
     req: ReportRequest,
 ) -> Result<FinancialReport> {
     let window = resolve_window(req.period)?;
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("open DuckDB at {} for financial report", db_path.display()))?;
 
+    // ADR-0110 D8 (GROUP-A sweep): this fn used to open FOUR independent DuckDB
+    // instances on the live tenant path — two `Connection::open`, one
+    // `DuckDbBillingStore::open`, one `Ledger::open` — each of which folds and
+    // TRUNCATES the serve Handle's WAL on close. Opening the Financial Report was
+    // therefore enough to make the next invoice-issue commit reach no file. All
+    // four now ride the ONE shared Handle.
+    //
     // Ensure relevant schemas exist (idempotent; mirrors how the existing
     // list endpoints lazily ensure schema on first read). Billing-side
     // schema is bootstrapped via the typed store so the `invoice` +
     // `invoice_line` tables exist on a fresh DB; the AP and restored
-    // mirrors carry their own idempotent CREATE.
-    let _ = crate::incoming_invoices::ensure_schema(&conn);
-    let _ = crate::restore_from_nav_outgoing::ensure_schema(&conn);
-    drop(conn);
+    // mirrors carry their own idempotent CREATE. These are CREATE TABLE IF NOT
+    // EXISTS statements, so they take the shared WRITER, in its own scope — the
+    // guard MUST drop before the `db.read()` below (a nested read under a held
+    // write guard self-deadlocks on the non-reentrant writer mutex).
     {
         use aberp_billing::ports::storage::BillingStore;
-        let mut store = aberp_billing::DuckDbBillingStore::open(db_path)
-            .context("open billing store for schema bootstrap")?;
+        let guard = db
+            .write()
+            .context("acquire shared writer for financial-report schema bootstrap")?;
+        let _ = crate::incoming_invoices::ensure_schema(&guard);
+        let _ = crate::restore_from_nav_outgoing::ensure_schema(&guard);
+        let mut store = aberp_billing::DuckDbBillingStore::from_connection(
+            guard
+                .try_clone()
+                .context("try_clone shared writer for billing schema bootstrap")?,
+        );
         store
             .ensure_schema()
             .context("ensure billing-side schema for financial report")?;
     }
-    let conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "re-open DuckDB at {} after billing-store schema bootstrap",
-            db_path.display()
-        )
-    })?;
+    let conn = db
+        .read()
+        .context("acquire shared reader for financial report")?;
 
     let tenant_str = tenant.as_str().to_string();
-    let ledger = Ledger::open(db_path, tenant.clone(), binary_hash)
-        .context("open audit ledger for financial report")?;
+    // The ledger walk rides its own try_clone of the SAME instance, so it sees the
+    // WAL-resident audit rows the in-serve writers have committed but not
+    // checkpointed — a fresh `Ledger::open` saw only the folded subset, which is
+    // exactly how a report could under-report issued invoices.
+    let ledger = Ledger::from_connection(
+        db.read()
+            .context("acquire shared reader for financial-report ledger walk")?,
+        tenant.clone(),
+        binary_hash,
+    );
     let walk = walk_ledger(&ledger, window)?;
 
     // Build a best-effort buyer-name map by reading side-store input.json

@@ -33,10 +33,24 @@
 #
 # Verdicts below are from the 2026-07-28 triage (call sites checked, not inferred).
 
-# ── GROUP A — LIVE IN-SERVE on the serve-held DB. GENUINE, OPEN, HIGHEST PRIORITY.
+# ── GROUP A — LIVE IN-SERVE on the serve-held DB. ***EMPTY as of 2026-08-12.*** ──
 # A second DuckDB instance co-resident with serve's Handle. Under H3 checkpointing
 # is disabled, so anything the Handle has written is WAL-resident and these read the
 # last-checkpointed SUBSET — the identical primitive behind #40/#41/#42/E1.
+#
+# ADR-0110 D8 swept the last eleven. GROUP A now contains ZERO entries: no in-serve
+# request route or in-serve daemon opens its own connection to the tenant DB.
+#
+# READ THIS BEFORE ARMING THE D7 FENCE. "GROUP A is empty" is a claim about THIS
+# list, and this list is what a STATIC scanner can see. Two known gaps survive it:
+#   1. GROUP B below — separate-process CLI one-shots. They cannot borrow serve's
+#      in-process Handle, and several run against a LIVE serve today. Their closes
+#      fold the same WAL. See adr/adr-0110-*.md §"D8 — the CLI-opener class (N7)".
+#   2. The factory split the scanner header already documents (an opener in one fn,
+#      the read in its caller) — the SERVE_HANDLE_LIVE runtime tripwire's job.
+# Arming the fence against a folded WAL that a CLI caused converts a silent bug into
+# a money-path outage just as surely as an in-serve opener would. D8 removes the
+# in-serve half of that precondition, not the whole of it.
 #
 # ── D2c CLOSED (2026-08-12) — the two mark-paid billing readers are MIGRATED ──
 # `read_invoice_currency` and `read_invoice_total_gross_minor` stood here as "the
@@ -46,12 +60,14 @@
 # exact-set rule) and both names are now PINNED in adr0099_read_fork_scan.awk —
 # re-introducing either opener reds CHECK N on the pinned rule, not just CHECK N1.
 # Baseline count 33 → 31.
-apps/aberp/src/serve.rs|resolve_recipient_email
-apps/aberp/src/serve.rs|calibration_overview_request
-apps/aberp/src/serve.rs|handle_quote_pipeline_status
-apps/aberp/src/serve.rs|handle_list_email_relay_queue
-apps/aberp/src/serve.rs|handle_get_email_relay_row
-apps/aberp/src/serve.rs|spawn_dap_audit_chain
+#
+# ── D8 STEP 1 (2026-08-12) — the three NAMED in-serve readers are MIGRATED ──
+# `calibration_overview_request`, `resolve_recipient_email` and
+# `handle_quote_pipeline_status` are the exact three the ADR-0110 D7 fence tests
+# name as "live GROUP-A openers on this head" — the reason `wal_fence_enabled`
+# ships DISARMED. All three now read `state.db.read()` (the owned try_clone that
+# holds no lock, so it moves into `spawn_blocking` unchanged), so their lines are
+# REMOVED here per the header's exact-set rule. Baseline count 31 → 28.
 # ── D1a (2026-07-28, pre-cut v2.33.2 adversarial) ──
 # `handle_relay_send_email` is `POST /api/internal/send-email` — a LIVE in-serve
 # route (deprecated, but it warns and serves rather than 410-ing). Inside its
@@ -63,14 +79,55 @@ apps/aberp/src/serve.rs|spawn_dap_audit_chain
 # queue` and `handle_get_email_relay_row`, both in GROUP A above — were already
 # frozen: a fused family (CLAUDE.md rule 14) split in half by a formatting accident.
 # Migrating it is product work on a live route; frozen here, not silenced.
-apps/aberp/src/serve.rs|handle_relay_send_email
-apps/aberp/src/reports.rs|compute_financial_report
-apps/aberp/src/quote_pdf_rerender_daemon.rs|prepare_rerender
-apps/aberp/src/audit_dap_boot.rs|run_heartbeat_supervised
+#
+# ── D8 STEP 2 (2026-08-12) — the relay-queue family is MIGRATED, WHOLE ──
+# The split D1a described is closed the only way rule 14 allows: all THREE at once.
+# `handle_relay_send_email` writes through `state.db.write()` (guard drop lockstep-
+# syncs the mirror) and both sibling readers read `state.db.read()`. Removed here:
+# `handle_relay_send_email`, `handle_list_email_relay_queue`,
+# `handle_get_email_relay_row`. Baseline count 28 → 25.
+# ── D8 STEP 3 (2026-08-12) — the Financial Report is MIGRATED ──
+# `reports::compute_financial_report` was the WORST single site in GROUP A: FOUR
+# independent instances on the live tenant path (two `Connection::open`, one
+# `DuckDbBillingStore::open`, one `Ledger::open`) — and only ONE of the four was
+# ever visible to this scanner. Opening the Financial Report, or the workshop
+# dashboard tile that reuses it, was on its own enough to fold the serve Handle's
+# WAL. It now takes `&aberp_db::Handle`: a scoped `write()` for the idempotent
+# schema bootstrap, then `read()` try_clones for the SQL aggregates and the
+# ledger walk. Baseline count 25 → 24.
+# ── D8 STEP 4 (2026-08-12) — the pdf-rerender daemon is WHOLLY on the Handle ──
+# `prepare_rerender` was the daemon's last fresh-open family: it read pricing-job
+# artifacts a co-resident in-serve writer had left WAL-resident, so it could see a
+# just-priced quote as artifact-less and classify it PERMANENTLY failed (no retry,
+# customer never gets the stock-alert PDF) — while its close truncated the WAL
+# under the daemon's own `write_audit`. Migrated; the `QuotePdfRerenderDaemonDeps.
+# db_path` field that existed solely to feed it is DELETED (rule 12), so the
+# half-migrated state that made this possible cannot be reconstructed by accident.
+# ── D8 STEP 5 (2026-08-12) — the DÁP/QES audit chain is MIGRATED, as a PAIR ──
+# `serve::spawn_dap_audit_chain` (the boot service-session open + crash recovery)
+# and `audit_dap_boot::run_heartbeat_supervised` (the anchor actor) are ONE family
+# and moved together. The heartbeat was the worst shape in the whole census: it
+# re-opened a foreign `Ledger` ON A TIMER for the life of the process, so on a
+# `dap_enabled` tenant the WAL was folded every `audit_anchor_heartbeat_seconds`
+# — the loss primitive re-armed on a schedule. Both now build the `Ledger` from a
+# `try_clone` of the shared WRITE guard (the anchors are appends), so the DÁP
+# chain is serialized with every other Handle writer. Baseline count 24 → 22.
 # `write_one` also APPENDS (write_mes_adapter_event) through its fresh connection,
 # so it is a WRITE-fork too — yet CHECK 10M reports ZERO, because its append-token
 # set does not know that helper name either. Same name-list failure, other gate.
-crates/aberp-mes/src/ledger_writer.rs|write_one
+#
+# ── D8 STEP 6 (2026-08-12) — the MES ledger writer is MIGRATED ──
+# One append per shop-floor scan, each through its own `Connection::open` — the
+# highest-FREQUENCY instance of the primitive in the tree. It now takes the shared
+# `db.write()` guard for the whole tx (`aberp-mes` gains an `aberp-db` dep for it),
+# and `MesBootDeps.db_path` / `LedgerWriterDeps.db_path` are DELETED, since each
+# existed only to feed this fork.
+#
+# The migration is self-proving: the writer's own end-to-end test polled the row
+# back through a fresh `Connection::open`. Once the write rode the Handle that
+# poller read ZERO forever (checkpointing is disabled under H3, so the row is
+# WAL-resident) — so the test HAD to move to `db.read()` in the same change, which
+# is rule 14 demonstrated rather than asserted.
 
 # ── GROUP B — SEPARATE-PROCESS CLI one-shots. Coherent, but NOT allow-listed.
 # The parent `run` of most of these IS already on the read-fork allow-list; these

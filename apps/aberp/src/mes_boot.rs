@@ -25,7 +25,7 @@
 //! NOT operator-exposed — neither here nor in the TOML. Only the
 //! operator-meaningful identity + endpoint fields persist.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
@@ -80,8 +80,10 @@ const DEFAULT_UR_RTDE_MODEL: &str = "UR";
 /// session info.
 #[derive(Debug, Clone)]
 pub struct MesBootDeps {
-    pub db_path: PathBuf,
-    /// ADR-0099 H3 — the shared DuckDB Handle; adapter audit appends route through it.
+    /// ADR-0099 H3 + ADR-0110 D8 — the shared DuckDB Handle, and now the ONLY DB
+    /// access MES boot hands out. The `db_path` field beside it existed solely to
+    /// feed `ledger_writer::write_one`'s fresh-open append; that fork is gone, so
+    /// the field is too (CLAUDE.md rule 12).
     pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,

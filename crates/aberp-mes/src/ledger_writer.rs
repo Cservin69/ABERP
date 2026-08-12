@@ -10,10 +10,12 @@
 //!
 //! ## Design
 //!
-//! One writer task per adapter. The task subscribes to the adapter
-//! once, opens a fresh DuckDB connection (per-write — matches the
-//! quote-intake / AP-sync posture; the connection is short-lived and
-//! the audit-ledger schema is idempotent via `ensure_schema`).
+//! One writer task per adapter. The task subscribes to the adapter once and
+//! appends each event through the SHARED `aberp_db::Handle` (ADR-0110 D8). It
+//! used to open a fresh DuckDB connection per write — the GROUP-A loss
+//! primitive: co-resident with serve's Handle, every close folded and truncated
+//! that Handle's WAL, so the next invoice commit returned Ok and reached no
+//! file. On a busy shop floor that fired once per scan.
 //!
 //! Cancellation races the broadcast receive via `tokio::select!`; a
 //! Tauri window close or a Ctrl-C in `run_prod.sh` exits the task
@@ -28,7 +30,6 @@
 //! dashboard surfaces the drop count) but otherwise continues — the
 //! adapter MUST stay running even if the ledger-writer falls behind.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::broadcast::error::RecvError;
@@ -43,11 +44,16 @@ use crate::audit::{write_mes_adapter_event, MesAdapterEventPayload};
 
 /// Dependencies the ledger-writer task needs to write into the audit
 /// ledger. Constructed by the boot code in `apps/aberp::serve` from
-/// the existing `recovery_state` (`db_path`, `tenant`, `binary_hash`)
+/// the existing `recovery_state` (`db`, `tenant`, `binary_hash`)
 /// + a fresh per-session [`LedgerWriterActor`].
 #[derive(Debug, Clone)]
 pub struct LedgerWriterDeps {
-    pub db_path: PathBuf,
+    /// ADR-0110 D8 (GROUP-A sweep): the ONE shared Handle, not a path. This
+    /// writer runs in-serve, one append per MES adapter event, and each fresh
+    /// `Connection::open` it used to make folded + truncated the live Handle's
+    /// WAL on close — so a busy shop floor re-armed the write-loss primitive
+    /// continuously.
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub actor: LedgerWriterActor,
@@ -131,7 +137,7 @@ async fn run_ledger_writer(
 }
 
 async fn write_one(deps: &LedgerWriterDeps, payload: &MesAdapterEventPayload, adapter_name: &str) {
-    let db_path = deps.db_path.clone();
+    let db = deps.db.clone();
     let tenant = deps.tenant.clone();
     let binary_hash = deps.binary_hash;
     let session_id = deps.actor.session_id.clone();
@@ -140,11 +146,15 @@ async fn write_one(deps: &LedgerWriterDeps, payload: &MesAdapterEventPayload, ad
     let adapter_name = adapter_name.to_string();
 
     let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let mut conn = duckdb::Connection::open(&db_path)
-            .map_err(|e| format!("open DB for MES audit append: {e}"))?;
-        aberp_audit_ledger::ensure_schema(&conn)
+        // ADR-0110 D8: the ONE shared writer. The guard's drop lockstep-syncs the
+        // mirror, and holding it for the whole tx keeps this append serialized
+        // with every other in-serve Handle writer.
+        let mut guard = db
+            .write()
+            .map_err(|e| format!("acquire shared writer for MES audit append: {e}"))?;
+        aberp_audit_ledger::ensure_schema(&guard)
             .map_err(|e| format!("ensure audit-ledger schema: {e}"))?;
-        let tx = conn
+        let tx = guard
             .transaction()
             .map_err(|e| format!("open MES audit tx: {e}"))?;
         let meta = LedgerMeta::new(tenant, binary_hash);
@@ -180,7 +190,6 @@ async fn write_one(deps: &LedgerWriterDeps, payload: &MesAdapterEventPayload, ad
 mod tests {
     use super::*;
 
-    use std::path::PathBuf;
     use std::time::Duration;
 
     use aberp_audit_ledger::{ensure_schema, BinaryHash, TenantId};
@@ -188,9 +197,19 @@ mod tests {
     use crate::adapters::barcode_scanner::{BarcodeScannerAdapter, BarcodeScannerConfig};
     use crate::events::CanonicalEvent;
 
-    fn deps_for_test(db_path: PathBuf) -> LedgerWriterDeps {
+    /// ADR-0110 D8 — the writer takes the shared Handle now, so the fixture opens
+    /// ONE and hands out `try_clone`s. The tests must read back through this SAME
+    /// Handle: H3 disables checkpointing, so the writer's committed rows stay
+    /// WAL-resident and a fresh `Connection::open` poller would see zero forever
+    /// (CLAUDE.md rule 13/14 — migrate a family's writers AND readers together).
+    fn handle_for_test(db_path: &std::path::Path) -> aberp_db::HandleArc {
+        aberp_db::Handle::open_default(db_path, TenantId::new("ten_test_mes_writer").expect("tid"))
+            .expect("open shared Handle for the MES ledger-writer test")
+    }
+
+    fn deps_for_test(db: aberp_db::HandleArc) -> LedgerWriterDeps {
         LedgerWriterDeps {
-            db_path,
+            db,
             tenant: TenantId::new("ten_test_mes_writer").expect("tenant id"),
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
             actor: LedgerWriterActor {
@@ -222,7 +241,8 @@ mod tests {
         let adapter: Arc<crate::NoopAdapter> =
             Arc::new(crate::NoopAdapter::new("test-noop-for-writer"));
         let adapter_for_writer: Arc<dyn Adapter> = adapter.clone();
-        let deps = deps_for_test(db_path.clone());
+        let db = handle_for_test(&db_path);
+        let deps = deps_for_test(db.clone());
         let cancel = CancellationToken::new();
         adapter.start().await.unwrap();
         let writer = spawn_ledger_writer(adapter_for_writer, deps, cancel.clone());
@@ -246,7 +266,8 @@ mod tests {
         let started = std::time::Instant::now();
         let mut row_count = 0u64;
         while started.elapsed() < Duration::from_secs(3) {
-            let conn = duckdb::Connection::open(&db_path).unwrap();
+            // Through the SAME Handle the writer uses — see `handle_for_test`.
+            let conn = db.read().expect("shared reader for the MES audit row");
             row_count = conn
                 .query_row(
                     "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'mes.adapter_event'",
@@ -299,7 +320,7 @@ mod tests {
         let adapter_for_writer: Arc<dyn Adapter> = adapter.clone();
         adapter.start().await.unwrap();
 
-        let deps = deps_for_test(db_path);
+        let deps = deps_for_test(handle_for_test(&db_path));
         let cancel = CancellationToken::new();
         let writer = spawn_ledger_writer(adapter_for_writer, deps, cancel.clone());
 

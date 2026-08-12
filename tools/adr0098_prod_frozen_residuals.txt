@@ -237,22 +237,31 @@
 # `mark_invoice_paid` — were already on the Handle (CLAUDE.md rule 14).
 # Both names are now PINNED in adr0099_read_fork_scan.awk; their lines are removed
 # from adr0099_read_fork_structural_baseline.txt (33→31) in this same change.
-1 apps/aberp/src/audit_dap_boot.rs
+# ── ADR-0110 D8 (2026-08-12) — GROUP-A opener sweep: 79 → 65, 20 → 16 files ──
+# Removals only (the fingerprint set in adr0098_prod_opener_fingerprints.txt is the
+# per-opener proof: `comm -13 frozen current` was EMPTY, i.e. zero additions).
+#   serve.rs                      25 → 18   (7 in-serve route/boot openers migrated)
+#   reports.rs                     4 → 0    (compute_financial_report held all four)
+#   audit_dap_boot.rs              1 → 0
+#   quote_pdf_rerender_daemon.rs   1 → 0
+#   aberp-mes/ledger_writer.rs     1 → 0
+#
+# The four files that reached ZERO are DELISTED rather than carried at `0`, and
+# that is the stronger posture: P1 reds on a "NEW unaccounted opener-bearing file",
+# so a single opener reappearing in reports.rs or the MES ledger writer now fails
+# the gate outright instead of being absorbed by a frozen headroom of 4.
 3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
 1 apps/aberp/src/export_invoice_bundle.rs
 4 apps/aberp/src/mark_abandoned.rs
 4 apps/aberp/src/observe_receiver_confirmation.rs
 3 apps/aberp/src/poll_annulment_ack.rs
-1 apps/aberp/src/quote_pdf_rerender_daemon.rs
 3 apps/aberp/src/recover_from_nav.rs
-4 apps/aberp/src/reports.rs
 4 apps/aberp/src/request_technical_annulment.rs
 8 apps/aberp/src/retry_submission.rs
-25 apps/aberp/src/serve.rs
+18 apps/aberp/src/serve.rs
 3 apps/aberp/src/submit_annulment.rs
 1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
-1 crates/aberp-mes/src/ledger_writer.rs
 2 crates/aberp-snapshot/src/crash_safe.rs
 1 crates/aberp-snapshot/src/take.rs
 3 crates/audit-ledger/src/storage/mod.rs

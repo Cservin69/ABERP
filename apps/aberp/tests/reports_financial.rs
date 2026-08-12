@@ -25,13 +25,34 @@
 
 use std::path::PathBuf;
 
-use aberp::reports::{self, compute_financial_report, DateBasis, PeriodKind, ReportRequest};
+use aberp::reports::{self, DateBasis, FinancialReport, PeriodKind, ReportRequest};
 use aberp_audit_ledger::{BinaryHash, TenantId};
 use duckdb::{params, Connection};
 use time::macros::date;
 use ulid::Ulid;
 
 const TEST_TENANT: &str = "reports_financial_test";
+
+/// ADR-0110 D8 (GROUP-A sweep) — [`reports::compute_financial_report`] takes the
+/// shared `aberp_db::Handle` now, not a path: in-serve it MUST NOT open its own
+/// DuckDB instance, whose close folds and truncates the live Handle's WAL.
+///
+/// These fixtures seed through plain `Connection::open` (they are single-process
+/// with no live serve Handle, so that is coherent — GROUP B, not GROUP A), so
+/// this adapter opens the Handle at call time, AFTER seeding. It exists to keep
+/// the ten call sites reading as report assertions rather than plumbing; the
+/// Handle it builds is the real production type, so the reports genuinely run
+/// through the shared-instance read path.
+fn compute_financial_report(
+    db_path: &std::path::Path,
+    tenant: TenantId,
+    binary_hash: BinaryHash,
+    req: ReportRequest,
+) -> anyhow::Result<FinancialReport> {
+    let db = aberp_db::Handle::open_default(db_path, tenant.clone())
+        .expect("open the shared Handle for the financial report");
+    reports::compute_financial_report(&db, tenant, binary_hash, req)
+}
 
 fn test_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir()

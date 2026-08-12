@@ -392,15 +392,20 @@ pub struct HandleConfig {
     ///
     /// # Why it ships OFF (PR #61 adversarial, B1)
     ///
-    /// Three foreign GROUP-A openers are still live in-serve on this head:
-    /// `serve::calibration_overview_request`, `resolve_recipient_email`, and
-    /// `handle_quote_pipeline_status`, plus the CLI-against-live openers. Each
-    /// of them truncates this Handle's WAL on close — that is the whole defect
-    /// D7 detects.
+    /// ADR-0110 D8 has since swept the IN-SERVE half: GROUP A in
+    /// `tools/adr0099_read_fork_structural_baseline.txt` is now EMPTY, so
+    /// `calibration_overview_request`, `resolve_recipient_email`,
+    /// `handle_quote_pipeline_status` and the eight others no longer open a
+    /// foreign connection. The fence nonetheless stays OFF, because the OTHER
+    /// half is untouched: the **CLI-against-live openers** (GROUP B —
+    /// `drain-submission-queue`, `drain-pending-retries`, `export-invoice-bundle`,
+    /// `recover-from-nav`, …) are separate OS processes that cannot borrow this
+    /// in-process Handle, and each still truncates this Handle's WAL on close.
+    /// That is the whole defect D7 detects, and one of its causes is still live.
     ///
-    /// So with the fence ON *before* those are swept, an operator who opens the
-    /// quote-calibration overview, emails an invoice, or opens Pricing Jobs
-    /// arms a breach; the NEXT invoice issuance or mark-paid then fails
+    /// So with the fence ON *before* those are fenced too, an operator who runs
+    /// any of those commands against a running serve arms a breach; the NEXT
+    /// invoice issuance or mark-paid then fails
     /// `durable_ack`, and that failure PROPAGATES via `?` (the D3-C cut-gate
     /// enforces exactly that propagation). The result is a failed invoice
     /// issuance for an invoice that actually committed, with the NAV handoff

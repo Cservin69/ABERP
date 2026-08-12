@@ -39,6 +39,13 @@ serde_json = { workspace = true }
 # per ADR-0060 §"Audit-ledger integration".
 aberp-audit-ledger = { path = "../audit-ledger" }
 
+# ADR-0110 D8 (GROUP-A sweep) — the ONE shared DuckDB Handle. The ledger
+# writer runs IN-SERVE, so its per-event append must ride the same instance
+# every other in-serve writer does; the fresh `Connection::open` it used
+# before folded and truncated the live Handle's WAL on every close, i.e.
+# once per MES adapter event.
+aberp-db = { path = "../aberp-db" }
+
 # DuckDB Transaction is the type signature of write_mes_adapter_event —
 # regular (not dev-only) dep because the audit-ledger writer surface
 # rides the caller's `&Transaction<'_>` per ADR-0008 §"Storage". Same

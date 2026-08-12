@@ -1283,3 +1283,119 @@ because the correct operator response to a failed issuance is **check whether
 the invoice exists before retrying**, and nothing in the UI says so today.
 Closing it properly means an operator-supplied or request-derived idempotency
 key on the issue routes — a separate change, out of D3's scope.
+
+## 13. D8 — the GROUP-A opener sweep, and the CLI-opener class it does NOT close (2026-08-12)
+
+D7 shipped the WAL-truncation fence **disarmed**, because arming it while a
+foreign opener still folds the WAL turns a silent durability bug into a routine
+money-path outage. D8 is the sweep that was supposed to make arming it safe. It
+closes **one of the two** opener classes, and this section exists so nobody
+reads "the sweep landed" as "the fence can be armed".
+
+### 13.1 What D8 closed — GROUP A is empty
+
+Every remaining in-serve GROUP-A opener now routes through the shared
+`aberp_db::Handle`. `tools/adr0099_read_fork_structural_baseline.txt` ratchets
+**31 → 20**, and the eleven removed are the whole of GROUP A: no in-serve
+request route and no in-serve daemon opens its own connection to the tenant DB.
+The remaining 20 are GROUP B (separate-process CLI) and GROUP C (not the
+serve-held path at all); see the file for the per-family record.
+
+Two findings from doing it are worth keeping:
+
+- **`reports::compute_financial_report` held four openers, and the census saw
+  one.** Two `Connection::open`, a `DuckDbBillingStore::open`, and a
+  `Ledger::open`. Opening the Financial Report — or the workshop dashboard tile
+  that reuses it for its one-day window — was on its own enough to fold the
+  WAL. A shape scanner keyed on `Connection::open` is structurally blind to a
+  typed store's constructor; the census undercounted for that reason, not
+  because anyone hid anything.
+- **The MES ledger writer proved rule 14 rather than asserting it.** Its
+  end-to-end test polled the appended row back through a fresh
+  `Connection::open`. The moment the write rode the Handle, that poller read
+  zero *forever* — checkpointing is disabled under H3, so the row is
+  WAL-resident and invisible to a second instance. The test could not stay as
+  it was; migrating writers without their readers is not a style preference.
+
+### 13.2 What D8 did NOT close — the CLI-against-live class (N7)
+
+A CLI one-shot is a **separate OS process**. It cannot borrow serve's
+in-process `Handle`, so the D8 fix does not apply to it and forcing it would be
+wrong. These were scoped instead, and the scoping produced a **better result
+than expected for most of them and one genuine hole**:
+
+**`aberp serve` holds the F-E whole-DB writer flock for its entire process
+lifetime** (`serve.rs:911`). Any CLI that acquires that flock is therefore
+*refused* while serve is up. Checked per command, and the ordering is what
+matters — the flock must be taken **before** the first DB open, or the
+open/close pair folds the WAL before the refusal is ever reached:
+
+| command | flock line | first DB open | verdict |
+|---|---|---|---|
+| `drain-submission-queue` | 121 | 161 | refused before any open — **safe** |
+| `drain-pending-retries` | 175 | 215 | refused before any open — **safe** |
+| `export-invoice-bundle` | 1233 | 1243 | refused before any open — **safe** |
+| `recover-from-nav` | 161 | 188 | refused before any open — **safe** |
+| `mark-abandoned` | 113 | 156 | refused before any open — **safe** |
+
+So for the four commands the PR #61 adversarial named, **run-against-a-live-
+serve is not a real operator path**: it is structurally refused, and refused
+early enough that the tenant DB file is never touched. No fix is owed, and none
+should be invented — adding a read-only pragma to a command that cannot run
+would be cargo-cult.
+
+**The residual is the openers that hold NO flock.** The ADR-0099 baseline
+already flags exactly two, and they are not equivalent:
+
+- **`print_invoice.rs|render_to_bytes` — not a fence hazard.** It opens
+  `aberp_db::Handle::open_default`, which issues `PRAGMA
+  disable_checkpoint_on_shutdown` + `wal_autocheckpoint='1TB'`
+  (`aberp-db/src/lib.rs::open_runtime_connection`). Its close therefore does
+  **not** fold the WAL. It remains a stale-*read* hazard (a second instance
+  does not replay the live writer's WAL — that is the E1 defect), but it cannot
+  sabotage the D7 fence. Serve itself does not reach it: the in-serve path uses
+  the connection-taking `render_to_bytes_on_conn`.
+- **`rebuild-stock-cache` — THE genuine hole, and it must be closed before the
+  fence is armed.** `crates/aberp-inventory/src/bin/rebuild_stock_cache.rs:61`
+  opens a bare `duckdb::Connection::open` with DEFAULT pragmas and holds no
+  flock, so its close folds and truncates a live serve's WAL. It is also a
+  *documented operator recovery path* — ADR-0061 §3 tells the operator to run
+  `cargo run -- rebuild-stock-cache` when the cache disagrees with
+  `SUM(qty_delta)` — i.e. precisely something an operator does *while the shop
+  is running*. With the fence armed, that recovery command would make the next
+  invoice issuance hard-fail.
+
+  It is *already* unsafe for a second reason the flock exists to prevent: it
+  **writes** `products.stock_qty` with no cross-process mutual exclusion
+  against serve.
+
+**Recommended fix (NOT implemented in D8 — deliberately deferred):** give it
+`db_writer_lock::acquire_or_refuse` before its first open, exactly as the
+twenty sibling mutating CLIs do. Three lines, twenty precedents, and it makes
+the command refuse rather than corrupt.
+
+It is deferred rather than done because it is **outside D8's goal** (D8 routes
+*in-serve* openers through the Handle) and because it is an operator-visible
+behaviour change: a recovery command that runs today would start refusing while
+serve is up. That is the *correct* behaviour, but an operator hitting it
+mid-incident deserves the change to arrive with its own review, release note,
+and a refusal message that tells them to stop serve first. Picking the
+conservative fork and flagging it, per the working agreement.
+
+The alternative — a read-only / no-checkpoint-on-close pragma — is **not**
+recommended here: the command is a writer, so read-only is wrong, and pragmas
+alone would leave the two-writer window open while fixing only the WAL symptom.
+
+### 13.3 Gate on arming the fence
+
+`wal_fence_enabled` stays `false`. The precondition is now precisely stateable:
+
+1. ✅ GROUP A empty — in-serve openers swept (D8).
+2. ❌ `rebuild-stock-cache` flock-fenced — **owed**, §13.2.
+3. ❌ An adversarial pass over D8 itself.
+
+Arming it before (2) reproduces exactly the failure mode D7's B1 test describes,
+with a different command as the trigger. The B1 tests and the `aberp-db` docs
+have been corrected to name the CLI class rather than the three now-migrated
+in-serve fns, so the disarmed default no longer cites a reason that has been
+fixed.

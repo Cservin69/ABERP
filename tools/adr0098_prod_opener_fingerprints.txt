@@ -132,7 +132,26 @@
 # now PINNED in adr0099_read_fork_scan.awk, so re-introducing either opener reds
 # CHECK N as well as this census; their lines are removed from
 # adr0099_read_fork_structural_baseline.txt (33→31) in this same change.
-apps/aberp/src/audit_dap_boot.rs|run_heartbeat_supervised:let mut ledger = Ledger::open(&db, tn, binary_hash)
+# ── ADR-0110 D8 (2026-08-12) — GROUP-A opener sweep: re-cut −14, REMOVALS ONLY ──
+# 79 → 65 openers. Verified `comm -13 frozen current` = EMPTY: not one fingerprint
+# was added, so nothing was smuggled in under cover of a large delta. The fourteen
+# removed are every remaining in-serve GROUP-A opener, now routed through the
+# shared `aberp_db::Handle` (see tools/adr0099_read_fork_structural_baseline.txt
+# for the per-family record and adr/0110-durable-commit-contract.md §13):
+#   serve.rs           calibration_overview_request, resolve_recipient_email,
+#                      handle_quote_pipeline_status, handle_relay_send_email,
+#                      handle_list_email_relay_queue, handle_get_email_relay_row,
+#                      spawn_dap_audit_chain                                  (7)
+#   reports.rs         compute_financial_report                              (4)
+#   quote_pdf_rerender_daemon.rs  prepare_rerender                           (1)
+#   audit_dap_boot.rs  run_heartbeat_supervised                              (1)
+#   aberp-mes ledger_writer.rs  write_one                                    (1)
+#
+# `compute_financial_report` alone accounts for FOUR of the fourteen — two
+# `Connection::open`, a `DuckDbBillingStore::open` and a `Ledger::open`. The
+# ADR-0099 read-fork census could see only one of them, which is why this
+# fingerprint set (which counts openers, not read-shapes) is the load-bearing
+# record for that fn and not a duplicate of the other file.
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
@@ -154,14 +173,9 @@ apps/aberp/src/observe_receiver_confirmation.rs|run:let mut conn = Connection::o
 apps/aberp/src/poll_annulment_ack.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
 apps/aberp/src/poll_annulment_ack.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
 apps/aberp/src/poll_annulment_ack.rs|run:let mut conn = Connection::open(&args.db)
-apps/aberp/src/quote_pdf_rerender_daemon.rs|prepare_rerender:let conn = Connection::open(db_path)
 apps/aberp/src/recover_from_nav.rs|resolve_recovery_precondition:let ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/recover_from_nav.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
 apps/aberp/src/recover_from_nav.rs|run:let mut conn = Connection::open(&args.db)
-apps/aberp/src/reports.rs|compute_financial_report:let conn = Connection::open(db_path)
-apps/aberp/src/reports.rs|compute_financial_report:let conn = Connection::open(db_path).with_context(|| {
-apps/aberp/src/reports.rs|compute_financial_report:let ledger = Ledger::open(db_path, tenant.clone(), binary_hash)
-apps/aberp/src/reports.rs|compute_financial_report:let mut store = aberp_billing::DuckDbBillingStore::open(db_path)
 apps/aberp/src/request_technical_annulment.rs|load_base_invoice_issue_year:let store = DuckDbBillingStore::open(db_path)
 apps/aberp/src/request_technical_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
 apps/aberp/src/request_technical_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
@@ -174,13 +188,7 @@ apps/aberp/src/retry_submission.rs|run:let ledger = Ledger::open(&args.db, tenan
 apps/aberp/src/retry_submission.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
 apps/aberp/src/retry_submission.rs|run:let ledger_tx1 = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
 apps/aberp/src/retry_submission.rs|run:let mut conn = Connection::open(&args.db)
-apps/aberp/src/serve.rs|calibration_overview_request:let conn = Connection::open(&*state.db_path)
-apps/aberp/src/serve.rs|handle_get_email_relay_row:let conn = duckdb::Connection::open(&db_path)
-apps/aberp/src/serve.rs|handle_list_email_relay_queue:let conn = duckdb::Connection::open(&db_path).with_context(|| {
-apps/aberp/src/serve.rs|handle_quote_pipeline_status:let conn = duckdb::Connection::open(&db_path).context("open DB for daemon-pa
-apps/aberp/src/serve.rs|handle_relay_send_email:let conn = duckdb::Connection::open(&db_path).with_context(|| {
 apps/aberp/src/serve.rs|record_upgrade_snapshot_mismatch_audit:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-apps/aberp/src/serve.rs|resolve_recipient_email:let mut conn = Connection::open(&*state.db_path)
 apps/aberp/src/serve.rs|run:duckdb::Connection::open(&cad_db_path).context(
 apps/aberp/src/serve.rs|run:duckdb::Connection::open(&count_db_path)
 apps/aberp/src/serve.rs|run:duckdb::Connection::open(&migrate_db_path)
@@ -198,12 +206,10 @@ apps/aberp/src/serve.rs|run:let mut conn = Connection::open(&args.db).with_conte
 apps/aberp/src/serve.rs|run:let mut conn = Connection::open(&args.db).with_context(|| {
 apps/aberp/src/serve.rs|run:let mut store = DuckDbBillingStore::open(creating)?;
 apps/aberp/src/serve.rs|seed_demo_sample_data:let conn = Connection::open(db)
-apps/aberp/src/serve.rs|spawn_dap_audit_chain:let mut ledger = aberp_audit_ledger::Ledger::open(&db_path, tenant.clone(), 
 apps/aberp/src/submit_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
 apps/aberp/src/submit_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
 apps/aberp/src/submit_annulment.rs|run:let mut conn = Connection::open(&args.db)
 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs|run:let mut conn = Connection::open(&db_path)
-crates/aberp-mes/src/ledger_writer.rs|write_one:let mut conn = duckdb::Connection::open(&db_path)
 crates/aberp-snapshot/src/crash_safe.rs|checkpoint_file:let conn = Connection::open(db)?;
 crates/aberp-snapshot/src/crash_safe.rs|probe_open:let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
 crates/aberp-snapshot/src/take.rs|restore_into:let conn = Connection::open(&staging)?;

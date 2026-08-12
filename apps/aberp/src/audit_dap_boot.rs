@@ -17,7 +17,6 @@
 //! network-free and unit-tested; the keychain load and the Tokio actor are
 //! thin shells around it.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use aes_gcm::aead::rand_core::RngCore;
@@ -117,7 +116,11 @@ pub fn open_service_session_and_recover(
 
 /// Dependencies for the heartbeat actor.
 pub struct HeartbeatDeps {
-    pub db_path: PathBuf,
+    /// ADR-0110 D8 (GROUP-A sweep): the ONE shared Handle, not a path. This actor
+    /// re-opened its own `Ledger` every cycle for the life of the process — a
+    /// foreign DuckDB instance whose CLOSE folded and truncated the serve
+    /// Handle's WAL on a timer, every `audit_anchor_heartbeat_seconds`.
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub actor: Actor,
@@ -140,7 +143,7 @@ pub async fn run_heartbeat_supervised(deps: HeartbeatDeps, cancel: CancellationT
         _ = tokio::time::sleep(Duration::from_secs(HEARTBEAT_BOOT_DELAY_SECS)) => {}
     }
     let HeartbeatDeps {
-        db_path,
+        db,
         tenant,
         binary_hash,
         actor,
@@ -151,15 +154,29 @@ pub async fn run_heartbeat_supervised(deps: HeartbeatDeps, cancel: CancellationT
         if cancel.is_cancelled() {
             return;
         }
-        let db = db_path.clone();
+        let db = db.clone();
         let tn = tenant.clone();
         let act = actor.clone();
         // Move the service ctx into the blocking task and ALWAYS return it
         // (even on error) so the loop keeps its signing key across cycles.
         let outcome = tokio::task::spawn_blocking(move || {
             let res = (|| -> Result<()> {
-                let mut ledger = Ledger::open(&db, tn, binary_hash)
-                    .map_err(|e| anyhow!("reopen ledger for heartbeat: {e}"))?;
+                // ADR-0110 D8: the anchor rides the ONE shared writer. The
+                // `Ledger` wraps a `try_clone` of the SAME instance the guard
+                // holds, so the append is serialized with every other Handle
+                // writer and the guard's drop lockstep-syncs the mirror.
+                let guard = db
+                    .write()
+                    .context("acquire shared writer for heartbeat anchor")?;
+                aberp_audit_ledger::ensure_schema(&guard)
+                    .context("ensure audit schema for heartbeat anchor")?;
+                let mut ledger = Ledger::from_connection(
+                    guard
+                        .try_clone()
+                        .context("try_clone shared writer for heartbeat ledger")?,
+                    tn,
+                    binary_hash,
+                );
                 let tsa = MockTimestampAuthority::new();
                 heartbeat(&mut ledger, &tsa, act, &service)
                     .map_err(|e| anyhow!("take heartbeat anchor: {e}"))?;

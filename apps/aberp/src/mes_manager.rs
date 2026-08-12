@@ -530,7 +530,7 @@ fn spawn_writer(
     cancel: &CancellationToken,
 ) -> JoinHandle<()> {
     let writer_deps = LedgerWriterDeps {
-        db_path: deps.db_path.clone(),
+        db: deps.db.clone(),
         tenant: deps.tenant.clone(),
         binary_hash: deps.binary_hash,
         actor: LedgerWriterActor {
@@ -585,7 +585,6 @@ mod tests {
                 TenantId::new("tenant-test").unwrap(),
             )
             .expect("test: open shared handle"),
-            db_path: dir.join("test.duckdb"),
             tenant: TenantId::new("tenant-test").unwrap(),
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
             operator_login: "op".to_string(),
