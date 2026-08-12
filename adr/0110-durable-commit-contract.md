@@ -621,6 +621,34 @@ business-state replay as the recovery path.**
      an attributable act rather than an absence, and it is durable across
      restarts. Re-derivation is deliberately **not** gated on D7.6's flag: a loss
      recorded while the fence was armed must survive a boot where it is not.
+  4b. **The acknowledgement is DB-authoritative** *(R2-B1, round-2
+     adversarial)*. B2 as first built read the mirror alone, which made the
+     Acknowledge button **inert in the one scenario it exists for**. A real
+     truncation regresses the DB head below the append-only mirror's, so
+     `sync_mirror` answers `MirrorDivergent` and appends nothing — and
+     `WriteGuard::drop` only `warn!`s, so the mirror is frozen *permanently*.
+     The ack still committed to the DB and still returned 200, so the operator
+     watched the banner drop; the next boot, reading the mirror alone, re-raised
+     it. Forever. Re-derivation now consults **both** stores for what each is
+     authoritative about — the mirror survives a truncation and holds the loss;
+     the DB is what still accepts writes afterwards and holds the ack — and
+     orders them by RFC3339 `time_wall`, because after the regression the two
+     stores' `seq` spaces overlap. A tie keeps the banner up.
+  4c. **A torn mirror tail must not blind the alarm** *(R2-B2)*. The
+     re-derivation reads through `read_mirror_under_tail_policy` (the boot
+     reconciler's reader), not the strict `read_mirror_entries`, which rejects
+     an unterminated final line — the commonest crash artifact there is, and
+     precisely the condition most likely to co-occur with a durability incident.
+  4d. **RESIDUAL, pinned not papered over.** A *second* loss occurring after the
+     mirror has already frozen leaves no durable trace: the mirror refuses it
+     and the DB is the store being truncated. The operator still sees the banner
+     for the whole session; what is lost is the record across a restart, and
+     only on an unrecovered tenant whose previous loss was acknowledged. This is
+     not D7's to fix — once the mirror is frozen there is no durable audit store
+     at all — and **D5** (`MirrorDivergent` becomes a loud, audited fault rather
+     than a `warn!`) is what makes it impossible. Pinned by
+     `known_residual_a_second_loss_after_the_mirror_froze_does_not_survive_a_restart`,
+     which is written to go RED when someone fixes it.
   5. **The operator channel.** The alert is surfaced on `GET /health` as
      `durability_alert` (always present, explicitly `null` when quiet) and the
      SPA renders a full-width, high-contrast red banner above the topbar,

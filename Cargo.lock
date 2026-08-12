@@ -132,6 +132,7 @@ dependencies = [
  "aberp-audit-ledger",
  "duckdb",
  "thiserror 1.0.69",
+ "time",
  "tracing",
 ]
 

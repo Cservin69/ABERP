@@ -30,6 +30,13 @@ aberp-audit-ledger = { path = "../audit-ledger" }
 duckdb = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# ADR-0110 D7 / R2-B1 — the durability-alert re-derivation orders a mirror row
+# against a DB row by their RFC3339 `time_wall`. `seq` cannot do it: a real WAL
+# truncation REGRESSES the DB head below the append-only mirror's, so the two
+# stores' sequence spaces overlap. And a lexicographic string compare cannot do
+# it either — `time`'s Rfc3339 emits variable-precision fractional seconds, so
+# "…:00.5Z" sorts ABOVE "…:00.5000001Z". Parse and compare properly.
+time = { workspace = true }
 
 [dev-dependencies]
 # Integration tests get their extern crates from dev-dependencies; the same

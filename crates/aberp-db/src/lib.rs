@@ -104,6 +104,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId};
 use duckdb::Connection;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use crate::debounce::CheckpointDebouncer;
 
@@ -326,6 +328,17 @@ struct WalMark {
     /// clears it — that is what keeps a fired fence from turning into a
     /// permanent write refusal.
     breach: Option<Breach>,
+}
+
+/// ADR-0110 D7 / R2-B1 — the newest `time_wall` of each durability audit kind
+/// within ONE store. Gathered separately from the mirror and from the DB,
+/// because after a real truncation the two disagree about which rows they have:
+/// the mirror keeps the loss and refuses everything after it, the DB may have
+/// lost the loss and is the only store still accepting the acknowledgement.
+#[derive(Debug, Default)]
+struct DurabilityAuditTimes {
+    loss: Option<OffsetDateTime>,
+    ack: Option<OffsetDateTime>,
 }
 
 /// What one `stat` of `<db>.wal` told us. The third arm is the point: N2 (PR
@@ -1072,8 +1085,8 @@ impl Handle {
         *slot = None;
     }
 
-    /// **ADR-0110 D7 / B2 — re-derive the sticky alert at boot from the
-    /// surviving audit mirror.**
+    /// **ADR-0110 D7 / B2 — re-derive the sticky alert at boot, from BOTH
+    /// durable stores.**
     ///
     /// # The defect this closes
     ///
@@ -1086,83 +1099,98 @@ impl Handle {
     /// "keep serving and forget", which is the failure mode the whole design
     /// exists to avoid.
     ///
-    /// # Why the MIRROR and not the DB
+    /// # Why BOTH stores, and not the mirror alone (R2-B1)
     ///
-    /// `WriteGuard::drop` runs the lockstep [`aberp_audit_ledger::sync_mirror`]
-    /// on the way out of the fence's own audit append, and the mirror is
-    /// `fsync`'d. It is the store that lost nothing on 2026-08-08. So the
-    /// mirror is where the evidence actually survives a truncation, and reading
-    /// the DB here would re-inherit the loss we are trying to report.
+    /// The first cut read the mirror only, on the sound reasoning that the
+    /// mirror is `fsync`'d and is the store that lost nothing on 2026-08-08.
+    /// That is right about the LOSS row and wrong about the ACKNOWLEDGEMENT,
+    /// and the gap made the Acknowledge button inert in the one scenario it
+    /// exists for:
+    ///
+    /// 1. A real truncation costs the DB its WAL-resident rows, so on the next
+    ///    boot the **DB head REGRESSES**. The mirror is append-only, so it
+    ///    keeps the higher seq.
+    /// 2. The mirror is now AHEAD of the DB, and
+    ///    [`aberp_audit_ledger::sync_mirror`] answers that with
+    ///    `MirrorDivergent` — it appends **nothing**.
+    /// 3. [`WriteGuard::drop`] only `warn!`s on a failed mirror sync. So the
+    ///    mirror is frozen **permanently**: every audit row written after the
+    ///    incident is refused, including the acknowledgement.
+    /// 4. The ack still commits to the DB and the route still returns 200, so
+    ///    the operator watches the banner drop and believes it is done — and
+    ///    the next boot, reading the mirror alone, re-raises it. Forever.
+    ///
+    /// So each store is consulted for what it is actually authoritative about:
+    /// the **mirror** survives a truncation and is where the loss lives; the
+    /// **DB** is what still accepts writes afterwards and is where the ack
+    /// lives. Reading both needs no new artifact and no new failure mode.
     ///
     /// # The rule
     ///
-    /// The alert is up exactly while the newest `db.durability_loss_detected`
-    /// out-ranks (by `seq`) the newest `db.durability_alert_acknowledged`. That
-    /// makes an acknowledgement durable too — restart after acknowledging and
-    /// the banner stays down, which is what makes the button worth pressing.
+    /// Raise the alert iff a `db.durability_loss_detected` exists in either
+    /// store AND no `db.durability_alert_acknowledged` in either store is
+    /// **strictly newer** than it.
+    ///
+    /// Ordering is by RFC3339 `time_wall`, not by `seq`. `seq` cannot do it:
+    /// after the regression above the two stores' sequence spaces overlap, so a
+    /// DB ack at seq 12 may post-date a mirror loss at seq 40. A lexicographic
+    /// string compare cannot do it either — `time`'s Rfc3339 emits
+    /// variable-precision fractional seconds, so `…:00.5Z` sorts ABOVE
+    /// `…:00.5000001Z`. Both stores format this field identically, so parsing
+    /// and comparing instants is exact.
+    ///
+    /// A TIE keeps the banner UP. An ack is always causally after the loss it
+    /// answers, so equal instants mean a clock too coarse to distinguish them —
+    /// and the safe reading of "I cannot tell" is that the loss stands.
     ///
     /// # Failure posture
     ///
     /// Best-effort and quiet: a missing mirror (a fresh tenant) is the normal
     /// case, and an unreadable one is logged, not fatal. This must never stop
-    /// `serve` booting — refusing to boot because we could not read a
-    /// *historical* alert would turn a durability warning into an outage.
+    /// `serve` booting — refusing to boot over a *historical* warning would
+    /// turn a durability alert into an outage.
+    ///
+    /// The mirror read goes through [`aberp_audit_ledger::read_mirror_under_tail_policy`]
+    /// (R2-B2), the same reader the boot reconciler uses, NOT the strict
+    /// [`aberp_audit_ledger::read_mirror_entries`]. The strict one rejects an
+    /// unterminated final line — the commonest crash artifact there is, and
+    /// precisely the condition most likely to co-occur with a durability
+    /// incident — which would have made a torn tail silently swallow the alarm.
+    /// The tail policy hands back the chain-reverified intact prefix instead.
     pub fn restore_durability_alert_from_mirror(&self) {
-        let entries = match aberp_audit_ledger::read_mirror_entries(&self.mirror_path) {
-            Ok(e) => e,
-            Err(e) => {
-                // A fresh tenant has no mirror yet; that is not news.
-                if !matches!(&e, aberp_audit_ledger::AppendError::MirrorIo(io)
-                    if io.kind() == std::io::ErrorKind::NotFound)
-                {
-                    tracing::warn!(
-                        error = %e,
-                        mirror = %self.mirror_path.display(),
-                        "aberp-db: ADR-0110 D7 — could not read the audit mirror to re-derive a \
-                         durability alert at boot; if one was raised before the restart the \
-                         banner will NOT come back. Boot continues."
-                    );
-                }
-                return;
-            }
-        };
+        let mirror_rows = self.mirror_audit_times();
+        let db_rows = self.db_audit_times();
 
-        let latest = |kind: EventKind| -> Option<&aberp_audit_ledger::MirrorEntry> {
-            entries
-                .iter()
-                .filter(|e| e.kind == kind.as_str())
-                .max_by_key(|e| e.seq)
+        // Newest of each kind across BOTH stores.
+        let newest = |a: Option<OffsetDateTime>, b: Option<OffsetDateTime>| match (a, b) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (x, y) => x.or(y),
         };
-        let loss = latest(EventKind::DbDurabilityLossDetected);
-        let ack = latest(EventKind::DbDurabilityAlertAcknowledged);
+        let loss = newest(mirror_rows.loss, db_rows.loss);
+        let ack = newest(mirror_rows.ack, db_rows.ack);
 
         let Some(loss) = loss else { return };
-        if ack.is_some_and(|a| a.seq >= loss.seq) {
+        // Strictly newer, so a tie keeps the banner up (see the docs).
+        if ack.is_some_and(|a| a > loss) {
             tracing::info!(
                 db = %self.db_path.display(),
-                loss_seq = loss.seq,
-                "aberp-db: ADR-0110 D7 — a past durability loss is recorded in the mirror but \
-                 has been ACKNOWLEDGED by the operator; the banner stays down"
+                "aberp-db: ADR-0110 D7 — a past durability loss is recorded, and an operator \
+                 acknowledgement post-dates it; the banner stays down"
             );
             return;
         }
 
-        // The breach code rides in the payload, but the payload is base64 in
-        // the mirror and decoding it here would drag in a decoder for one
-        // cosmetic field. The message below is honest without it, and the
-        // precise breach is in the audit row and the logs.
         let message = format!(
-            "Durability loss detected on the tenant database (audit seq {}, recorded {}). \
-             Recent writes may not have reached disk. Stop and recover. This alert survived a \
-             restart and stays up until it is acknowledged.",
-            loss.seq, loss.time_wall,
+            "Durability loss detected on the tenant database (recorded {}). Recent writes may \
+             not have reached disk. Stop and recover. This alert survived a restart and stays \
+             up until it is acknowledged.",
+            loss.format(&Rfc3339)
+                .unwrap_or_else(|_| "at an unreadable time".to_string()),
         );
         tracing::error!(
             db = %self.db_path.display(),
-            loss_seq = loss.seq,
-            recorded_at = %loss.time_wall,
             "aberp-db: ADR-0110 D7 — RE-RAISING an UNACKNOWLEDGED durability loss found in the \
-             audit mirror. A restart is not an acknowledgement."
+             durable audit record. A restart is not an acknowledgement."
         );
         let mut slot = match self.durability_alert.lock() {
             Ok(g) => g,
@@ -1172,13 +1200,112 @@ impl Handle {
             }
         };
         slot.get_or_insert(DurabilityAlert {
-            // Re-derived from the mirror, where the machine breach code is not
-            // cheaply readable. `WalVanished` is the shape the 00012 mechanism
-            // actually produces and the one the message describes.
+            // Re-derived: the machine breach code is not cheaply readable from
+            // either store (the mirror base64-encodes the payload). WalVanished
+            // is the shape the 00012 mechanism produces and the one the message
+            // describes.
             breach: WalBreach::WalVanished,
             message,
             detected_at: SystemTime::now(),
         });
+    }
+
+    /// Newest `time_wall` of each durability kind in the audit MIRROR.
+    ///
+    /// Tail-tolerant (R2-B2): a torn trailing line yields the intact prefix
+    /// rather than an error, because the alarm must survive the crash artifact
+    /// most likely to accompany the incident that raised it.
+    fn mirror_audit_times(&self) -> DurabilityAuditTimes {
+        use aberp_audit_ledger::MirrorTailPolicy;
+        let entries = match aberp_audit_ledger::read_mirror_under_tail_policy(&self.mirror_path) {
+            Ok(MirrorTailPolicy::Clean(e)) => e,
+            Ok(MirrorTailPolicy::TornTail { entries, .. }) => {
+                tracing::warn!(
+                    mirror = %self.mirror_path.display(),
+                    intact_entries = entries.len(),
+                    "aberp-db: ADR-0110 D7 — the audit mirror has a TORN TRAILING LINE; \
+                     re-deriving the durability alert from the chain-reverified intact prefix. \
+                     Not trimming here — that is the boot reconciler's job."
+                );
+                entries
+            }
+            Ok(MirrorTailPolicy::DeepCorrupt { reason }) => {
+                tracing::error!(
+                    reason = %reason,
+                    mirror = %self.mirror_path.display(),
+                    "aberp-db: ADR-0110 D7 — the audit mirror is DEEPLY corrupt, so it cannot be \
+                     consulted for a durability alert. The DB is still checked below."
+                );
+                Vec::new()
+            }
+            Err(e) => {
+                // A fresh tenant has no mirror yet; that is not news.
+                if !matches!(&e, aberp_audit_ledger::AppendError::MirrorIo(io)
+                    if io.kind() == std::io::ErrorKind::NotFound)
+                {
+                    tracing::warn!(
+                        error = %e,
+                        mirror = %self.mirror_path.display(),
+                        "aberp-db: ADR-0110 D7 — could not read the audit mirror to re-derive a \
+                         durability alert. The DB is still checked below."
+                    );
+                }
+                Vec::new()
+            }
+        };
+        let newest_of = |kind: EventKind| -> Option<OffsetDateTime> {
+            entries
+                .iter()
+                .filter(|e| e.kind == kind.as_str())
+                .filter_map(|e| OffsetDateTime::parse(&e.time_wall, &Rfc3339).ok())
+                .max()
+        };
+        DurabilityAuditTimes {
+            loss: newest_of(EventKind::DbDurabilityLossDetected),
+            ack: newest_of(EventKind::DbDurabilityAlertAcknowledged),
+        }
+    }
+
+    /// Newest `time_wall` of each durability kind in the live DB.
+    ///
+    /// This is the half that makes the Acknowledge button work after a real
+    /// loss: post-incident the mirror is frozen (`MirrorDivergent`), so the DB
+    /// is the only store still accepting the acknowledgement.
+    ///
+    /// Deliberately a narrow `MAX(time_wall) … WHERE kind = ?` rather than
+    /// [`aberp_audit_ledger::Ledger::entries`]: building a `Ledger` VERIFIES
+    /// the hash chain, and the tenant we are booting has just had rows
+    /// truncated out from under it — the one situation where a chain verify is
+    /// expected to fail. Re-deriving an alert must not depend on the chain
+    /// being intact, precisely because the alert means it may not be.
+    fn db_audit_times(&self) -> DurabilityAuditTimes {
+        let mut out = DurabilityAuditTimes::default();
+        let conn = match self.read() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    db = %self.db_path.display(),
+                    "aberp-db: ADR-0110 D7 — could not read the DB to re-derive a durability \
+                     alert; falling back to the audit mirror alone"
+                );
+                return out;
+            }
+        };
+        let newest_of = |kind: EventKind| -> Option<OffsetDateTime> {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT MAX(time_wall) FROM audit_ledger WHERE kind = ?",
+                    [kind.as_str()],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+            raw.and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
+        };
+        out.loss = newest_of(EventKind::DbDurabilityLossDetected);
+        out.ack = newest_of(EventKind::DbDurabilityAlertAcknowledged);
+        out
     }
 
     /// Record a fired fence three ways — log, sticky alert, audit row — and
@@ -1879,6 +2006,24 @@ impl Drop for WriteGuard<'_> {
 mod fence_tests {
     use super::*;
 
+    /// A seeded scratch tenant DB under `$TMPDIR`. Returns `(dir, db_path)`.
+    fn scratch_db(tag: &str) -> (std::path::PathBuf, PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "aberp-d7-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let db = dir.join("aberp.duckdb");
+        {
+            let c = Connection::open(&db).expect("seed open");
+            aberp_audit_ledger::ensure_schema(&c).expect("schema");
+        }
+        (dir, db)
+    }
+
     fn id(ino: u64) -> Option<FileId> {
         Some(FileId { dev: 1, ino })
     }
@@ -2030,6 +2175,92 @@ mod fence_tests {
             "the flag is single-shot: it must be consumed by the observation it excuses"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **R2-N1 — the disarmed fence must not even LOOK.**
+    ///
+    /// The integration test of the same name could only assert
+    /// `durability_alert().is_none()`, which holds whether or not the watermark
+    /// was sampled — un-gating `observe_durable_set` in `WriteGuard::drop` left
+    /// all thirteen fence tests green. It was vacuous exactly where it mattered.
+    ///
+    /// The risk it was meant to cover is a landmine for whoever flips the flag
+    /// on: with the fence disarmed `durable_ack` never calls `take_breach`, so a
+    /// breach latched by an un-gated sampler would sit in the watermark
+    /// indefinitely and fire on the first ack after the flag goes true — an
+    /// alarm about a truncation that happened days earlier, on a process that
+    /// has been running fine since.
+    ///
+    /// This is a crate-internal test so it can read the private watermark
+    /// directly, which is the only way to assert "nothing was sampled" rather
+    /// than "nothing surfaced".
+    #[test]
+    fn a_disarmed_fence_leaves_the_watermark_completely_untouched() {
+        let (dir, db) = scratch_db("disarmed-watermark");
+        let h = Handle::open_default(&db, TenantId::new("disarmed".to_string()).unwrap())
+            .expect("open disarmed handle");
+
+        // A committed write — the sampling site in `WriteGuard::drop`.
+        {
+            let g = h.write().expect("writer");
+            g.execute_batch(
+                "CREATE TABLE IF NOT EXISTS probe(x INTEGER); INSERT INTO probe VALUES (1);",
+            )
+            .expect("dirty the WAL");
+        }
+        h.durable_ack().expect("disarmed ack succeeds");
+
+        let mark = h.lock_watermark();
+        assert_eq!(
+            mark.wal_high_water, 0,
+            "R2-N1 REGRESSION: a DISARMED fence sampled the WAL high-water. Disarmed must mean \
+             the guard drop is bit-for-bit pre-D7 — no stat, no watermark mutex, nothing on the \
+             hot path of every committed write in the process."
+        );
+        assert!(
+            mark.wal_id.is_none() && mark.main_id.is_none(),
+            "R2-N1 REGRESSION: a DISARMED fence recorded file identities"
+        );
+        assert!(
+            mark.breach.is_none(),
+            "R2-N1 REGRESSION: a DISARMED fence LATCHED a breach. Nothing consumes that latch \
+             while the flag is false, so it would sit there and fire on the first ack after \
+             someone flips the flag on — an alarm about a truncation from days ago, on a \
+             process that has been healthy since."
+        );
+        drop(mark);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The armed counterpart, so the test above cannot pass because the
+    /// watermark is simply never populated by anything.
+    #[test]
+    fn an_armed_fence_does_populate_the_watermark() {
+        let (dir, db) = scratch_db("armed-watermark");
+        let h = Handle::open(
+            &db,
+            TenantId::new("armed".to_string()).unwrap(),
+            HandleConfig {
+                wal_fence_enabled: true,
+                ..Default::default()
+            },
+        )
+        .expect("open armed handle");
+        {
+            let g = h.write().expect("writer");
+            g.execute_batch(
+                "CREATE TABLE IF NOT EXISTS probe(x INTEGER); INSERT INTO probe VALUES (1);",
+            )
+            .expect("dirty the WAL");
+        }
+        let mark = h.lock_watermark();
+        assert!(
+            mark.wal_high_water > 0,
+            "an ARMED fence must sample the WAL at the guard drop — if it does not, the \
+             disarmed test above proves nothing"
+        );
+        drop(mark);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

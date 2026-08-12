@@ -334,8 +334,9 @@ async fn the_alert_survives_later_healthy_acks_and_repeated_polls() {
 /// the process), and require the alert back.
 ///
 /// Mutation-verified: delete the `handle.restore_durability_alert_from_mirror()`
-/// call from `serve::open_tenant_handle` and this goes RED while every other
-/// test in this file stays green.
+/// call from `Handle::open` — that is where it lives; `serve::open_tenant_handle`
+/// deliberately does NOT carry it (see the constructor's docs) — and this goes
+/// RED alongside `the_production_handle_constructor_re_derives_the_alert`.
 #[tokio::test]
 async fn a_restart_preserves_an_unacknowledged_durability_alert() {
     let dir = test_dir("restart");
@@ -490,33 +491,76 @@ async fn acknowledging_clears_the_banner_records_it_and_survives_a_restart() {
     assert!(
         body["durability_alert"].is_null(),
         "B2 REGRESSION: the banner came BACK after an acknowledged loss was restarted. The \
-         acknowledgement must out-rank the loss in the mirror, otherwise the operator has an \
-         alarm they can never clear — and an uncleavable alarm is one people learn to ignore. \
-         Body: {body}"
+         acknowledgement must out-rank the loss, otherwise the operator has an alarm they can \
+         never clear — and an unclearable alarm is one people learn to ignore. Body: {body}"
     );
+
+    // R2-N3 — the assertion above, alone, cannot tell "the acknowledgement was
+    // honoured" from "re-derivation is dead and never raises anything". Run the
+    // SAME code path against a tenant where the loss is UNacknowledged and
+    // require the opposite verdict. Now "down" is a decision, not a silence.
+    {
+        let other = test_dir("ack-control");
+        let other_db = other.join("aberp.duckdb");
+        {
+            let c = Connection::open(&other_db).expect("seed open");
+            ensure_schema(&c).expect("seed schema");
+            c.execute_batch("CHECKPOINT;").expect("seed fold");
+        }
+        {
+            let ctl = demo_state(other_db.clone());
+            commit_one(&ctl.db, "before");
+            ctl.db.durable_ack().expect("healthy ack");
+            foreign_open_and_close(&other_db);
+            commit_one(&ctl.db, "after");
+            let _ = ctl.db.durable_ack().expect_err("the fence fires");
+        }
+        let ctl = demo_state(other_db.clone());
+        let (_, body) = health_json(ctl).await;
+        assert!(
+            !body["durability_alert"].is_null(),
+            "R2-N3 REGRESSION: the identical re-derivation path raised NOTHING for a tenant \
+             whose loss was never acknowledged. That means the 'stays down' assertion above is \
+             vacuous — it was reading a dead code path, not an honoured acknowledgement. \
+             Body: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&other);
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **`serve::open_tenant_handle` — the production constructor — must be the
-/// thing that re-derives.**
+// ── R2-B1 — the acknowledgement must work in the ONE case it is for ─────────
+
+/// **A real loss FREEZES the mirror, and the acknowledgement was landing only
+/// there.**
 ///
-/// [`a_restart_preserves_an_unacknowledged_durability_alert`] proves the
-/// MECHANISM works, but it builds its Handle directly (it has to: B1 ships the
-/// fence disarmed and that test needs it armed), so it calls
-/// `restore_durability_alert_from_mirror` itself and cannot see whether serve
-/// ever does. Mutation-verified and caught exactly that: deleting the call from
-/// `open_tenant_handle` left it green. This closes the gap by going through the
-/// real constructor.
+/// [`acknowledging_clears_the_banner_records_it_and_survives_a_restart`] acks
+/// IN-PROCESS, before any restart, so the Handle's in-memory catalog still
+/// holds the post-fold seq and `sync_mirror` sees no divergence. That is not
+/// the scenario B2 exists for. B2's entire premise is that the banner survives
+/// a restart — which means the operator acknowledges AFTER restarting.
 ///
-/// It also pins a second property worth stating out loud: **re-derivation is
-/// NOT gated on `wal_fence_enabled`.** A loss recorded while the fence was
-/// armed must still resurface on a boot where it is disarmed — otherwise
-/// turning the flag off would erase an outstanding alarm, which is a
-/// remarkably bad thing for a safety flag to do.
+/// What happens then, and why the ack was inert:
+///
+/// 1. The truncation drops WAL-resident rows, so on the next boot the **DB head
+///    REGRESSES**. The mirror is append-only and `fsync`'d, so it keeps the
+///    higher seq.
+/// 2. The mirror is now AHEAD of the DB. `sync_mirror` (mirror.rs:653) returns
+///    `MirrorDivergent` and appends **nothing**.
+/// 3. `WriteGuard::drop` only `warn!`s on that. So the mirror is frozen **for
+///    good** — every audit row after the incident is refused, permanently.
+/// 4. `record_durability_alert_ack_audit` nevertheless commits to the DB and
+///    returns 200. The operator watches the banner drop and reasonably believes
+///    they have acknowledged it.
+/// 5. The next boot re-derives from the mirror alone, sees loss-with-no-ack,
+///    and re-raises. Forever. The button does nothing that lasts.
+///
+/// This drives exactly that: loss → RESTART → acknowledge over the real route →
+/// RESTART → the banner must stay down.
 #[tokio::test]
-async fn the_production_handle_constructor_re_derives_the_alert() {
-    let dir = test_dir("wiring");
+async fn after_a_real_loss_the_acknowledgement_survives_even_though_the_mirror_froze() {
+    let dir = test_dir("frozen-mirror-ack");
     let db_path = dir.join("aberp.duckdb");
     {
         let c = Connection::open(&db_path).expect("seed open");
@@ -524,39 +568,329 @@ async fn the_production_handle_constructor_re_derives_the_alert() {
         c.execute_batch("CHECKPOINT;").expect("seed fold");
     }
 
-    // Produce a real, mirrored `db.durability_loss_detected` row by firing the
-    // fence on an ARMED Handle, then let that Handle go.
+    // ── Boot 1: stage a REAL loss (WAL-resident rows truncated away) ──────
     {
-        let armed = Handle::open(
-            &db_path,
-            TenantId::new("demo".to_string()).expect("tenant"),
-            HandleConfig {
-                wal_fence_enabled: true,
-                ..Default::default()
-            },
-        )
-        .expect("open armed Handle");
-        commit_one(&armed, "before");
-        armed.durable_ack().expect("healthy ack");
+        let state = demo_state(db_path.clone());
+        commit_one(&state.db, "pre-loss-1");
+        state.db.durable_ack().expect("healthy ack");
+        // Several WAL-resident commits, so the truncation really does cost the
+        // DB rows the mirror already has.
+        for i in 0..3 {
+            commit_one(&state.db, &format!("wal-resident-{i}"));
+        }
         foreign_open_and_close(&db_path);
-        commit_one(&armed, "after");
-        let _ = armed
+        commit_one(&state.db, "post-truncation");
+        let _ = state
+            .db
             .durable_ack()
-            .expect_err("precondition: the fence fires");
+            .expect_err("precondition: the fence must fire");
+        assert!(
+            state.db.durability_alert().is_some(),
+            "precondition: boot 1 raised the banner"
+        );
     }
 
-    // The production path, verbatim — `HandleConfig::default()`, fence DISARMED.
-    let handle =
-        serve::open_tenant_handle(&db_path, TenantId::new("demo".to_string()).expect("tenant"))
-            .expect("open the tenant Handle the way serve boot does");
-
+    // ── Boot 2: the operator sees the banner and ACKNOWLEDGES ─────────────
+    let state = demo_state(db_path.clone());
     assert!(
-        handle.durability_alert().is_some(),
-        "ADR-0110 D7 / B2 REGRESSION: `serve::open_tenant_handle` did not re-derive the \
-         outstanding durability alert from the audit mirror. Every serve boot path reaches the \
-         Handle through this function, so if the call is missing here the alert dies with the \
-         process no matter how well the mechanism itself works — and the restart the banner \
-         asks for silently clears it."
+        state.db.durability_alert().is_some(),
+        "precondition: the alert survived the restart (B2)"
+    );
+
+    let app = serve::build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/health/acknowledge-durability-alert"))
+        .bearer_auth(state.session_token.as_str())
+        .send()
+        .await
+        .expect("POST the acknowledgement");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "the acknowledge route must succeed after a real loss too"
+    );
+    server.abort();
+
+    let (_, body) = health_json(state.clone()).await;
+    assert!(
+        body["durability_alert"].is_null(),
+        "the banner must come down in-process after acknowledging"
+    );
+    drop(state);
+
+    // ── Boot 3: it must STAY down ─────────────────────────────────────────
+    let restarted = demo_state(db_path.clone());
+    let (_, body) = health_json(restarted).await;
+    assert!(
+        body["durability_alert"].is_null(),
+        "ADR-0110 D7 / R2-B1 REGRESSION: the banner came BACK after the operator acknowledged \
+         a REAL loss. The truncation regressed the DB head below the append-only mirror's, so \
+         `sync_mirror` returns MirrorDivergent and appends NOTHING from then on — the mirror is \
+         frozen for good and the acknowledgement never reaches it. The route still committed to \
+         the DB and returned 200, so the operator watched the banner drop and believes they \
+         acknowledged it. Re-derivation must therefore also consult the DB, which is \
+         authoritative for anything written after the restart. Body: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A torn mirror tail must not silently swallow the alarm** (R2-B2).
+///
+/// `read_mirror_entries` is STRICT: a missing trailing newline, a JSON error or
+/// a seq gap makes it return `Err`, and the re-derivation's error arm logs and
+/// moves on — boot comes up clean, no banner.
+///
+/// An unterminated final line is the commonest crash artifact there is, and a
+/// durability incident is *precisely* the condition most likely to produce one.
+/// So the strict reader fails exactly when it is needed. The tree already owns
+/// the right primitive — `read_mirror_under_tail_policy`, which the boot
+/// reconciler uses — and it hands back the chain-reverified intact prefix.
+#[tokio::test]
+async fn a_torn_mirror_tail_does_not_lose_the_alarm() {
+    let dir = test_dir("torn-tail");
+    let db_path = dir.join("aberp.duckdb");
+    {
+        let c = Connection::open(&db_path).expect("seed open");
+        ensure_schema(&c).expect("seed schema");
+        c.execute_batch("CHECKPOINT;").expect("seed fold");
+    }
+
+    // Stage a loss so the mirror carries a `db.durability_loss_detected` row.
+    {
+        let state = demo_state(db_path.clone());
+        commit_one(&state.db, "before");
+        state.db.durable_ack().expect("healthy ack");
+        foreign_open_and_close(&db_path);
+        commit_one(&state.db, "after");
+        let _ = state.db.durable_ack().expect_err("the fence fires");
+    }
+
+    // Tear the tail: append an unterminated partial line, the shape a crash
+    // mid-append leaves behind.
+    let mirror = aberp_audit_ledger::mirror_path_for(&db_path);
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&mirror)
+            .expect("open mirror to tear it");
+        f.write_all(br#"{"id":"partial","seq":9999,"prev_hash":"de"#)
+            .expect("write a torn trailing line");
+    }
+    assert!(
+        aberp_audit_ledger::read_mirror_entries(&mirror).is_err(),
+        "precondition: the STRICT reader must reject this torn tail — otherwise this test is \
+         not exercising the condition it names"
+    );
+
+    // Boot onto the torn mirror.
+    let state = demo_state(db_path.clone());
+    let (_, body) = health_json(state).await;
+    assert!(
+        !body["durability_alert"].is_null(),
+        "ADR-0110 D7 / R2-B2 REGRESSION: a TORN MIRROR TAIL silently swallowed the durability \
+         alarm — boot came up clean with the banner absent. An unterminated final line is the \
+         commonest crash artifact, and a durability incident is exactly the condition most \
+         likely to co-occur with one, so the strict reader fails precisely when it matters. \
+         Use `read_mirror_under_tail_policy` (the boot reconciler's reader), which returns the \
+         chain-reverified intact prefix. Body: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── KNOWN RESIDUAL, pinned so it is surfaced rather than assumed away ───────
+
+/// **A SECOND loss, after the mirror has already frozen, leaves no durable
+/// trace — so it does not survive a restart.** This test PINS that limitation
+/// rather than claiming it is fixed (CLAUDE.md rule 11).
+///
+/// Found while sharpening
+/// [`acknowledging_clears_the_banner_records_it_and_survives_a_restart`] for
+/// R2-N3, by asking for something the system cannot currently deliver.
+///
+/// # Why it happens, and why it is not D7's to fix
+///
+/// After the first truncation the mirror is AHEAD of the DB, so `sync_mirror`
+/// returns `MirrorDivergent` and refuses every subsequent append — the mirror
+/// is frozen permanently. From that moment the DB is the only store still
+/// taking audit rows. R2-B1 uses exactly that to keep the ACKNOWLEDGEMENT
+/// durable, and it works, because nothing truncates the DB in between.
+///
+/// A second truncation is different: it destroys the DB rows, and the loss row
+/// it would produce is written *into the store being destroyed*. Neither store
+/// retains it. That is not a gap in the fence — it is the fence's own subject
+/// matter, one level down: **once the mirror is frozen there is no durable
+/// audit store left at all.**
+///
+/// The operator is not blind in the moment — the in-memory alert is up for the
+/// whole session and the banner is red. What is lost is the record ACROSS a
+/// restart, and only for a loss that happened after a previously-acknowledged
+/// one on an unrecovered tenant.
+///
+/// # The real fix is ADR-0110 D5, not more of D7
+///
+/// D5 makes `MirrorDivergent` "a loud, audited, operator-visible fault, not a
+/// `warn!`" and fails the write on it. With that, the mirror never silently
+/// freezes and this residual cannot arise. Bolting a third durable artifact
+/// onto D7 to paper over a frozen mirror would be inventing a store to work
+/// around a store we already refuse to fix — the wrong layer.
+///
+/// **If this test ever goes RED, that is good news**: something made the second
+/// loss durable. Update this doc and delete the pin; do not "fix" the test.
+#[tokio::test]
+async fn known_residual_a_second_loss_after_the_mirror_froze_does_not_survive_a_restart() {
+    let dir = test_dir("residual-second-loss");
+    let db_path = dir.join("aberp.duckdb");
+    {
+        let c = Connection::open(&db_path).expect("seed open");
+        ensure_schema(&c).expect("seed schema");
+        c.execute_batch("CHECKPOINT;").expect("seed fold");
+    }
+
+    // Loss #1, then acknowledge it, so the tenant reaches the state where the
+    // mirror is frozen and the banner is legitimately down.
+    {
+        let state = demo_state(db_path.clone());
+        commit_one(&state.db, "before");
+        state.db.durable_ack().expect("healthy ack");
+        foreign_open_and_close(&db_path);
+        commit_one(&state.db, "after");
+        let _ = state.db.durable_ack().expect_err("loss #1 fires");
+        state.db.clear_durability_alert();
+    }
+    {
+        let state = demo_state(db_path.clone());
+        let app = serve::build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/health/acknowledge-durability-alert"))
+            .bearer_auth(state.session_token.as_str())
+            .send()
+            .await
+            .expect("POST the acknowledgement");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        server.abort();
+    }
+
+    // Loss #2, on the unrecovered tenant.
+    {
+        let state = demo_state(db_path.clone());
+        assert!(
+            state.db.durability_alert().is_none(),
+            "precondition: loss #1 is acknowledged and quiet"
+        );
+        commit_one(&state.db, "post-ack");
+        state.db.durable_ack().expect("healthy ack");
+        foreign_open_and_close(&db_path);
+        commit_one(&state.db, "second-loss");
+        let _ = state.db.durable_ack().expect_err("loss #2 fires");
+        // IN THE MOMENT the operator does see it — this half is not degraded.
+        assert!(
+            state.db.durability_alert().is_some(),
+            "the second loss MUST raise the banner in-session; if this fails the fence itself \
+             is broken, not merely its durability"
+        );
+    }
+
+    // ...but it does not survive the restart. THE RESIDUAL.
+    let restarted = demo_state(db_path.clone());
+    let (_, body) = health_json(restarted).await;
+    assert!(
+        body["durability_alert"].is_null(),
+        "This test PINS A KNOWN RESIDUAL, and it just went RED — which is GOOD NEWS. A second \
+         durability loss, occurring after the audit mirror had already frozen, now DOES survive \
+         a restart. Something gave it a durable home (most likely ADR-0110 D5 landing, which \
+         stops the mirror freezing at all). Update this test's doc comment and DELETE the pin. \
+         Do not adjust the assertion to keep it green. Body: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **R2-N2 — a FAILED audit append must leave the banner UP.**
+///
+/// `acknowledge_durability_alert` records first and clears second, and that
+/// order is the whole safety property: an unrecorded clear is indistinguishable
+/// from amnesia, and the next boot would re-raise the banner with no trace of
+/// who took it down or why. Swapping to clear-first/audit-second left every
+/// other test green, so the ordering was asserted only by a comment.
+///
+/// The append is made to fail deterministically by dropping `audit_ledger` out
+/// from under it — a blunt instrument, but it exercises the exact branch
+/// (`record_durability_alert_ack_audit` returning `Err`, the `?` in the library
+/// core) that a real disk-full or chain-integrity failure would take.
+#[tokio::test]
+async fn a_failed_acknowledgement_audit_leaves_the_banner_up() {
+    let dir = test_dir("ack-audit-fails");
+    let db_path = dir.join("aberp.duckdb");
+    {
+        let c = Connection::open(&db_path).expect("seed open");
+        ensure_schema(&c).expect("seed schema");
+        c.execute_batch("CHECKPOINT;").expect("seed fold");
+    }
+    let state = demo_state(db_path.clone());
+    commit_one(&state.db, "before");
+    state.db.durable_ack().expect("healthy ack");
+    foreign_open_and_close(&db_path);
+    commit_one(&state.db, "after");
+    let _ = state.db.durable_ack().expect_err("the fence fires");
+    assert!(
+        state.db.durability_alert().is_some(),
+        "precondition: banner up"
+    );
+
+    // Break the audit append.
+    {
+        let guard = state.db.write().expect("writer");
+        guard
+            .execute_batch("DROP TABLE audit_ledger;")
+            .expect("drop the audit table so the ack's append must fail");
+    }
+
+    let app = serve::build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/health/acknowledge-durability-alert"))
+        .bearer_auth(state.session_token.as_str())
+        .send()
+        .await
+        .expect("POST the acknowledgement");
+    let status = resp.status();
+    server.abort();
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "an acknowledgement whose audit row could not be written must FAIL LOUDLY, not report \
+         success (ADR-0110 R3 / rule 11)"
+    );
+    assert!(
+        state.db.durability_alert().is_some(),
+        "R2-N2 REGRESSION: the banner came DOWN even though the acknowledgement could not be \
+         recorded. Audit-then-clear is the safety order: clearing first leaves the operator \
+         with no banner AND no trail, and the next boot re-raises it with nothing to explain \
+         why. A failed append must leave the alert standing."
     );
 
     let _ = std::fs::remove_dir_all(&dir);
