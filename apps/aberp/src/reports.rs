@@ -1440,6 +1440,17 @@ pub fn compute_financial_report(
         let guard = db
             .write()
             .context("acquire shared writer for financial-report schema bootstrap")?;
+        // ADR-0110 D8 / F2 — the audit schema, restored. `Ledger::open` used to
+        // `initialise` (⇒ `ensure_schema`) as a side effect of opening; the
+        // `Ledger::from_connection` that replaced it does NOT, so the D8 sweep
+        // silently dropped this bootstrap and the report errored with "Table
+        // audit_ledger does not exist" on a DB that had none (pre-sweep: an empty
+        // walk). Latent in-serve because boot ensures it first — but the comment
+        // below claimed a bootstrap that was no longer happening, and the three
+        // sibling migrations in the same change (DÁP boot, DÁP heartbeat, MES
+        // write_one) each kept theirs explicitly. Match them.
+        aberp_audit_ledger::ensure_schema(&guard)
+            .context("ensure audit-ledger schema for financial report")?;
         let _ = crate::incoming_invoices::ensure_schema(&guard);
         let _ = crate::restore_from_nav_outgoing::ensure_schema(&guard);
         let mut store = aberp_billing::DuckDbBillingStore::from_connection(

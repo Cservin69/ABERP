@@ -169,6 +169,44 @@ fn build_request(period: PeriodKind, today: time::Date) -> ReportRequest {
     }
 }
 
+/// **ADR-0110 D8 / F2 regression.** The report must bootstrap the audit schema
+/// itself, on a DB that has none.
+///
+/// `Ledger::open` used to `initialise` (⇒ `ensure_schema`) as a side effect of
+/// opening. The D8 sweep replaced it with `Ledger::from_connection`, which does
+/// NOT — so the bootstrap was silently dropped and the report started erroring
+/// with "Table audit_ledger does not exist" where it previously returned an
+/// empty walk.
+///
+/// Every other test in this file passed straight through that regression,
+/// because `ensure_all_schemas` pre-creates the audit table for them. This test
+/// deliberately does NOT call it: that omission is the whole point, and it is
+/// what gives the pin teeth. Mutation-verified — drop the
+/// `aberp_audit_ledger::ensure_schema` line from `compute_financial_report`'s
+/// bootstrap block and this goes RED while the other nine stay green.
+#[test]
+fn report_bootstraps_the_audit_schema_on_a_db_that_has_none() {
+    let db_path = fresh_db("no-audit-schema");
+    // NOTE: no `ensure_all_schemas(&db_path)` — deliberately.
+    let tenant = TenantId::new(TEST_TENANT.to_string()).unwrap();
+    let report = compute_financial_report(
+        &db_path,
+        tenant,
+        BinaryHash::from_bytes([0u8; 32]),
+        build_request(PeriodKind::Month(2026, 6), date!(2026 - 06 - 01)),
+    )
+    .expect(
+        "ADR-0110 D8/F2: the financial report must ensure the audit-ledger schema itself. \
+         `Ledger::from_connection` does not initialise, so without an explicit ensure_schema \
+         this fails with \"Table audit_ledger does not exist\".",
+    );
+
+    // And it must behave as it did pre-sweep: an empty ledger is an empty walk,
+    // not an error and not a fabricated figure.
+    assert_eq!(report.revenue.huf.gross_minor, 0);
+    assert_eq!(report.revenue.eur.gross_minor, 0);
+}
+
 #[test]
 fn empty_db_yields_zero_aggregates_with_deferred_notes() {
     let db_path = fresh_db("empty");

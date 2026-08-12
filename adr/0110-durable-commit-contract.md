@@ -1294,10 +1294,16 @@ reads "the sweep landed" as "the fence can be armed".
 
 ### 13.1 What D8 closed — GROUP A is empty
 
-Every remaining in-serve GROUP-A opener now routes through the shared
-`aberp_db::Handle`. `tools/adr0099_read_fork_structural_baseline.txt` ratchets
-**31 → 20**, and the eleven removed are the whole of GROUP A: no in-serve
-request route and no in-serve daemon opens its own connection to the tenant DB.
+> **Read §13.3 first.** The first cut of D8 claimed this and was wrong: three
+> post-Handle openers survived inside `serve::run`. They are migrated now and
+> the claim has been re-verified by independent grep, but the *reason* it was
+> wrong is the part worth carrying forward.
+
+Every in-serve GROUP-A opener — the eleven of the first pass plus the three the
+adversarial found — now routes through the shared `aberp_db::Handle`.
+`tools/adr0099_read_fork_structural_baseline.txt` ratchets **31 → 20** and the
+per-opener fingerprint census **79 → 62**: no in-serve request route and no
+in-serve daemon opens its own connection to the tenant DB.
 The remaining 20 are GROUP B (separate-process CLI) and GROUP C (not the
 serve-held path at all); see the file for the per-family record.
 
@@ -1386,16 +1392,112 @@ The alternative — a read-only / no-checkpoint-on-close pragma — is **not**
 recommended here: the command is a writer, so read-only is wrong, and pragmas
 alone would leave the two-writer window open while fixing only the WAL symptom.
 
-### 13.3 Gate on arming the fence
+### 13.3 Gate on arming the fence — **CORRECTED after the D8 adversarial**
 
-`wal_fence_enabled` stays `false`. The precondition is now precisely stateable:
+The first version of this section said "✅ GROUP A empty" with
+`rebuild-stock-cache` as the only owed item. **That was wrong**, and it was the
+most dangerous thing in the document, because it is the artifact someone would
+read before flipping the flag.
 
-1. ✅ GROUP A empty — in-serve openers swept (D8).
+Three foreign openers were still live inside `serve::run` *after* the shared
+Handle opens (~:1633): the cad-blob key-provision audit write (~:2390), the
+pricing-jobs index DDL (~:2432), and the pricing-jobs boot row count (~:2487).
+The last ran on **every boot**, after the Handle had already written. Measured
+against that shape with the fence armed: WAL 54107 → 0, and `durable_ack`
+returned `Err(WalTruncatedUnderWriter { WalVanished })`. So arming the fence on
+that head would have fired on the **first money-path `durable_ack` of every
+serve session** — not an edge case, the common path.
+
+They hid because the read-fork baseline collapses all of `serve::run` into one
+line and filed it under GROUP C with the justification *"provision_atomic, at
+boot, BEFORE the shared Handle is opened"*. That sentence is true of the first
+half of a function that spans the Handle open and continues for hundreds of
+lines past it. **A whole-function exemption granted on a property only part of
+the function has** — the same per-fn granularity blindness that hid three of
+`compute_financial_report`'s four openers. All three are now migrated onto
+`st.db`, and the baseline entry has been re-triaged into an explicit
+*line-region* exemption that names `open_tenant_handle` as the boundary and
+points at the per-opener fingerprint census as the authoritative detector.
+
+The corrected gate:
+
+1. ✅ GROUP A empty — **re-verified 2026-08-12 by independent tree-wide grep**,
+   not by the census alone. Every `Connection::open` / `Ledger::open` /
+   `DuckDbBillingStore::open` / `Handle::open_default` in `apps modules crates`
+   (minus `/tests/`) was enumerated and classified. The only in-serve openers
+   that remain are in `serve::run` at :1206–:1461 and
+   `record_upgrade_snapshot_mismatch_audit` (called at :1127) — all strictly
+   **before** `open_tenant_handle` at :1633 — plus the demo/new-tenant openers,
+   which target a different DB file. `ap_sync.rs:1417` and the ~70 other
+   `Handle::open_default` hits are inside `#[cfg(test)]` modules.
 2. ❌ `rebuild-stock-cache` flock-fenced — **owed**, §13.2.
-3. ❌ An adversarial pass over D8 itself.
+3. ❌ A re-run adversarial over the corrected D8.
 
 Arming it before (2) reproduces exactly the failure mode D7's B1 test describes,
 with a different command as the trigger. The B1 tests and the `aberp-db` docs
-have been corrected to name the CLI class rather than the three now-migrated
-in-serve fns, so the disarmed default no longer cites a reason that has been
-fixed.
+name the CLI class rather than the three now-migrated in-serve fns, so the
+disarmed default no longer cites a reason that has been fixed.
+
+**Method note, worth more than the fix.** Both D8 misses — the three
+`serve::run` openers and three of `compute_financial_report`'s four — were
+*per-function* views of a *per-opener* problem. Where a function-keyed artifact
+and an opener-keyed artifact disagree, the opener-keyed one wins; and "GROUP A
+is empty" is a claim that must be re-derived from the tree by grep, never read
+off a governance file that a previous change was supposed to have updated.
+
+### 13.4 D8's second miss — DDL one call-frame from a `read()` (adversarial F3)
+
+ADR-0108 R-1 forbids DDL on a `Handle::read()` connection: the try_clone is
+writable, but it is released from the writer mutex the instant it is taken, so
+DDL through it escapes the single-writer invariant the audit chain, the
+invoice-number allocator and the stock cache all rest on. It is pinned tree-wide
+by `apps/aberp/tests/no_ddl_on_read_handle.rs`.
+
+**The D8 sweep broke that rule at six sites, and the pin stayed green.** The
+pin's scan is scope-LOCAL — it flags `ensure_schema(&conn)` written beside the
+`let conn = …read()` binding. Every one of the six put the DDL one call-frame
+away:
+
+| migrated path | callee that issues the DDL |
+|---|---|
+| `calibration_overview_request` | `quote_calibration::calibration_overview` |
+| `handle_quote_pipeline_status` | `count_recent_daemon_panics` → **audit** `ensure_schema` |
+| `handle_list_email_relay_queue` | `email_relay_queue::list_rows` |
+| `handle_get_email_relay_row` | `email_relay_queue::read_row` |
+| `prepare_rerender` | `quote_pricing_jobs::get_effective_lead_time_days` |
+| `resolve_recipient_email` | `partners::get_partner` / `find_partner_by_tax_number` |
+
+The second row is the sharp one: the audit `ensure_schema` reaches
+`migrate_drop_unique_art_if_present`, which on a legacy table performs a `DROP` +
+`CREATE` + bulk re-`INSERT` of the entire `audit_ledger`. A whole-table rebuild
+issued from a mutex-free clone, concurrently with a real writer on the same
+instance, is not something anyone designed. It is unreachable today only because
+serve's boot migrates the audit schema before `open_tenant_handle` — a
+precondition, not a guard, and one nobody had written down.
+
+All six now take `db.write()` — R-1's own second remedy ("or take a
+`Handle::write()` for it"). The cost is that these routes serialize behind the
+writer mutex; they are low-frequency operator screens on a single-operator ERP,
+where `aberp-db` already documents write serialization as an accepted throughput
+ceiling. `compute_financial_report` deliberately stays on `read()`: its four
+SQL-aggregate callees issue no DDL (verified), so it scopes a brief `write()`
+for its bootstrap and reads the rest concurrently — and a test pins that
+asymmetry, so "put everything on `write()`" cannot become the rule by drift.
+
+**The alternative not taken**, and why: hoisting `ensure_schema` out of those
+six callees (the R-1 remedy applied to `incoming_invoices`) would preserve read
+concurrency, but those helpers have CLI callers that rely on the ensure, so it
+is a broader change than D8's scope and belongs in its own PR.
+
+`apps/aberp/tests/adr0110_d8_reader_schema_ddl.rs` pins the two halves R-1
+structurally cannot: that the callees really do issue DDL, and that these entry
+points really do take `write()`. Mutation-verified — flip one back to `read()`
+and it reds with the site named, while R-1 stays green.
+
+**The pattern across all three D8 misses.** F1 (per-function census entry hiding
+per-opener facts), F2 (a fixture that pre-created the schema hiding a dropped
+bootstrap), and F3 (a scope-local scan hiding a cross-frame call) are one
+failure: *a detector whose granularity is coarser than the thing it detects*.
+Each was green while wrong. When a gate's unit of analysis is a function, a
+file, or a lexical scope, ask what it looks like one level down before believing
+it.

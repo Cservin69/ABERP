@@ -152,6 +152,23 @@
 # ADR-0099 read-fork census could see only one of them, which is why this
 # fingerprint set (which counts openers, not read-shapes) is the load-bearing
 # record for that fn and not a duplicate of the other file.
+# ── ADR-0110 D8 / F1 (2026-08-12) — the three POST-Handle openers in `run()` ──
+# re-cut −3 (65 → 62), removals only, `comm -13 frozen current` EMPTY.
+# The D8 adversarial found these surviving inside `serve::run` AFTER the shared
+# Handle opens (~:1633), where the read-fork baseline's GROUP-C entry excused the
+# whole function as "boot, BEFORE the shared Handle is opened":
+#   run:duckdb::Connection::open(&cad_db_path)     cad-blob key provision AUDIT WRITE
+#   run:duckdb::Connection::open(&migrate_db_path) quote_pricing_jobs index DDL
+#   run:duckdb::Connection::open(&count_db_path)   boot row count — ran EVERY boot
+# The last one is the one that mattered: a post-Handle fold on every serve session,
+# so an armed fence would have fired WalVanished on the FIRST money-path
+# durable_ack of every session. All three now ride `st.db` (write guards — each
+# does DDL or an append; `count_jobs` calls `ensure_schema` internally).
+#
+# THIS FILE caught them and the read-fork baseline did not, because this set is
+# keyed per OPENER and that one is keyed per FUNCTION. Where the two disagree,
+# per-opener wins — the same granularity lesson as compute_financial_report,
+# where 3 of 4 openers were invisible to a per-fn view.
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|drive_one_retry:let mut conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/drain_pending_retries.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
@@ -189,9 +206,6 @@ apps/aberp/src/retry_submission.rs|run:let ledger = Ledger::open(&args.db, tenan
 apps/aberp/src/retry_submission.rs|run:let ledger_tx1 = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
 apps/aberp/src/retry_submission.rs|run:let mut conn = Connection::open(&args.db)
 apps/aberp/src/serve.rs|record_upgrade_snapshot_mismatch_audit:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-apps/aberp/src/serve.rs|run:duckdb::Connection::open(&cad_db_path).context(
-apps/aberp/src/serve.rs|run:duckdb::Connection::open(&count_db_path)
-apps/aberp/src/serve.rs|run:duckdb::Connection::open(&migrate_db_path)
 apps/aberp/src/serve.rs|run:let conn = Connection::open(&args.db).with_context(|| {
 apps/aberp/src/serve.rs|run:let conn = Connection::open(&args.db).with_context(|| {
 apps/aberp/src/serve.rs|run:let conn = Connection::open(&args.db).with_context(|| {

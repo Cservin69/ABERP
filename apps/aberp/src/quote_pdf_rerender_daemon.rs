@@ -419,18 +419,18 @@ fn prepare_rerender(
     // failed) and its CLOSE truncated the Handle's WAL under the daemon's OWN
     // `write_audit`. The schema-ensure is a CREATE TABLE IF NOT EXISTS, so it
     // takes the writer; the guard drops before the read below.
-    {
-        let guard = db
-            .write()
-            .context("acquire shared writer for pricing-jobs schema")
-            .map_err(PrepareError::Db)?;
-        crate::quote_pricing_jobs::ensure_schema(&guard)
-            .context("ensure quote_pricing_jobs schema")
-            .map_err(PrepareError::Db)?;
-    }
+    // ADR-0110 D8 / F3 — ONE writer for the whole fn, not a write-then-read pair.
+    // ADR-0108 R-1 forbids DDL on a `read()` clone, and this path reaches it
+    // twice: the explicit `ensure_schema` here, and `get_effective_lead_time_days`
+    // below, which ensure_schemas the connection it is handed. Splitting into
+    // write-for-DDL + read-for-queries would still leave the second one on a
+    // reader, so the whole body takes the writer.
     let conn = db
-        .read()
-        .context("acquire shared reader for pdf re-render prepare")
+        .write()
+        .context("acquire shared writer for pdf re-render prepare (callees do DDL)")
+        .map_err(PrepareError::Db)?;
+    crate::quote_pricing_jobs::ensure_schema(&conn)
+        .context("ensure quote_pricing_jobs schema")
         .map_err(PrepareError::Db)?;
 
     let loaded: Option<(

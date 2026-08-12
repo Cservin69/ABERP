@@ -172,8 +172,66 @@ apps/aberp/src/poll_ack.rs|run
 # or whether serve's Handle exists yet. These are the cases where that matters. The
 # discriminator they all have is runtime, not textual — which is exactly what the
 # SERVE_HANDLE_LIVE tripwire provides, and it stays silent on every one of them.
-# serve.rs|run — `provision_atomic`, at boot, BEFORE the shared Handle is opened.
+# ── serve.rs|run — RE-TRIAGED 2026-08-12 (ADR-0110 D8 / F1). READ THIS. ──
+# This line used to read: "`provision_atomic`, at boot, BEFORE the shared Handle is
+# opened." That justification was FALSE, and it hid three live openers.
+#
+# `run()` is not a boot phase. It is a ~2000-line function that SPANS the Handle
+# open (`open_tenant_handle`, ~:1633) and keeps going for hundreds of lines after
+# it. So "run is boot, therefore pre-Handle" is a category error: it exempted the
+# whole function on a property only its FIRST HALF has. Three post-Handle openers
+# lived in the second half behind that sentence —
+#   ~:2390 cad-blob key provision AUDIT WRITE
+#   ~:2432 quote_pricing_jobs secondary-index DDL
+#   ~:2487 quote_pricing_jobs boot row count — ran on EVERY boot
+# each folding the live Handle's WAL after the Handle had already written. With the
+# D7 fence armed, the third would have fired `WalVanished` on the FIRST money-path
+# `durable_ack` of every serve session. All three are MIGRATED onto `st.db`.
+#
+# THE INVARIANT THIS ENTRY NOW ENCODES — it is a LINE-REGION exemption, not a
+# function exemption. Exempt: openers in `run()` BEFORE `open_tenant_handle`
+# (currently ~:1206–:1461 — the billing/products/partners boot migrations and
+# `provision_atomic`, which genuinely precede the Handle's existence).
+# NOT exempt: ANY opener in `run()` after that call. There is no Handle-less window
+# there, so such an opener is a GROUP-A fork wearing a boot-shaped costume.
+#
+# WHY THIS ENTRY CANNOT BE THE DETECTOR, and what is:
+# this baseline is keyed per FUNCTION, so it physically cannot distinguish the two
+# halves of `run()` — the entry stays "live" as long as ANY opener remains in the
+# fn, which is why removing the three post-Handle ones did not even make it go
+# STALE. The per-OPENER fingerprint set (tools/adr0098_prod_opener_fingerprints.txt)
+# is the detector with the right granularity: it carried all three as distinct
+# `run:duckdb::Connection::open(&…)` lines and went RED when they were removed.
+# Where the two disagree about `serve.rs|run`, THE FINGERPRINT SET IS AUTHORITATIVE.
+# Same lesson as `compute_financial_report`, where a per-fn view saw 1 of 4 openers.
+#
+# HOW TO RE-VERIFY (reproducible; this is how "GROUP A is empty" was re-derived on
+# 2026-08-12 rather than read off a governance file):
+#
+#   h=$(grep -n 'let db_handle = open_tenant_handle' apps/aberp/src/serve.rs | cut -d: -f1)
+#   awk -f tools/adr0098_opener_scan.awk apps/aberp/src/serve.rs \
+#     | awk -F: -v h="$h" '$1+0 > h+0'
+#
+# ⚠ THE TRAP, and it WILL catch you: that check reports the DEFINITION line, and
+# the discriminator is the CALL SITE. `record_upgrade_snapshot_mismatch_audit` is
+# DEFINED at ~:6430 (far past the Handle open) but its only non-definition caller
+# is at ~:1127, which is pre-Handle — so it prints as a false positive. Conversely
+# a helper defined at the top of the file and called from a post-Handle boot arm
+# would print as a false NEGATIVE, which is the dangerous direction. Always resolve
+# the call site before judging. Both fns were checked this way, not by line order.
+#
+# So: before trusting this line again, diff the fingerprint set's `serve.rs|run:`
+# entries against the pre-`open_tenant_handle` region. Do not extend this exemption
+# to a new opener without checking which side of :1633 its CALLER is on.
 apps/aberp/src/serve.rs|run
+# NOTE (not a baseline entry — this scanner does not detect it, and an undetected
+# entry would red CHECK N1 as STALE): `serve.rs|record_upgrade_snapshot_mismatch_
+# audit` also opens a fresh `Ledger` on the tenant DB. It is a WRITE, so the
+# read-fork shape rule cannot see it; the fingerprint census carries it. Checked
+# during the F1 re-triage rather than inherited on trust: it is called from `run()`
+# at ~:1127, ~500 lines BEFORE `open_tenant_handle`, so it is in the genuinely
+# pre-Handle region and is exempt for the SAME reason — and on the same
+# line-region basis, not on the strength of the word "boot".
 # These three open a DIFFERENT tenant's DB file (the demo / newly-created tenant),
 # not `args.db`, so they are not co-resident with the serve Handle at all.
 apps/aberp/src/serve.rs|bootstrap_demo_tenant

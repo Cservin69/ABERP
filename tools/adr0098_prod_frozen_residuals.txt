@@ -250,6 +250,9 @@
 # that is the stronger posture: P1 reds on a "NEW unaccounted opener-bearing file",
 # so a single opener reappearing in reports.rs or the MES ledger writer now fails
 # the gate outright instead of being absorbed by a frozen headroom of 4.
+# ADR-0110 D8 / F1 (2026-08-12): serve.rs 18 → 15. The three post-Handle openers
+# inside `run()` (cad-blob provision audit, pricing-jobs index DDL, boot row
+# count) migrated onto the shared Handle. Total 65 → 62.
 3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
 1 apps/aberp/src/export_invoice_bundle.rs
@@ -259,7 +262,7 @@
 3 apps/aberp/src/recover_from_nav.rs
 4 apps/aberp/src/request_technical_annulment.rs
 8 apps/aberp/src/retry_submission.rs
-18 apps/aberp/src/serve.rs
+15 apps/aberp/src/serve.rs
 3 apps/aberp/src/submit_annulment.rs
 1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
 2 crates/aberp-snapshot/src/crash_safe.rs
