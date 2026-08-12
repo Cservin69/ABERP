@@ -219,6 +219,24 @@
 # as this census. Their named twins on the mark-paid route (read_invoice_currency,
 # read_invoice_total_gross_minor) are NOT migrated here and stay on the census —
 # recorded as D2c in docs/findings/modification-base-read-fork-2026-07-27.md.
+# ── 2026-08-12 D2c MARK-PAID BILLING READS — census RATCHETS DOWN 81→79 ──
+# The two openers the D2 note above deferred are migrated. Delta, line by line —
+# two removals, zero additions (comm-verified):
+#   −2  apps/aberp/src/serve.rs 27→25, file stays on the census (25 remain)
+#       −1 …|read_invoice_currency:let mut conn = Connection::open(db_path).with_context(|| {
+#       −1 …|read_invoice_total_gross_minor:let mut conn = Connection::open(db_path).with_context(|| {
+# Both now take the caller's `state.db.read()` connection. Why now, given D2 was
+# right that neither can mis-file the way D2a could: the hazard is not only what
+# these two READ, it is what their CLOSE does. They carried DuckDB's DEFAULT
+# pragmas — no `disable_checkpoint_on_shutdown`, unlike the shared Handle — so
+# every mark-paid call folded and TRUNCATED the live Handle's WAL underneath the
+# writer. That is the 00012 mechanism, and it sat on the money path. This closes
+# the last fresh-open member of the billing-reader family (read_base_currency,
+# read_base_line_vat_kinds and these two were the whole of it) and un-splits the
+# mark-paid route, whose other two DB touches — `derive_state_for` and
+# `mark_invoice_paid` — were already on the Handle (CLAUDE.md rule 14).
+# Both names are now PINNED in adr0099_read_fork_scan.awk; their lines are removed
+# from adr0099_read_fork_structural_baseline.txt (33→31) in this same change.
 1 apps/aberp/src/audit_dap_boot.rs
 3 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
@@ -231,7 +249,7 @@
 4 apps/aberp/src/reports.rs
 4 apps/aberp/src/request_technical_annulment.rs
 8 apps/aberp/src/retry_submission.rs
-27 apps/aberp/src/serve.rs
+25 apps/aberp/src/serve.rs
 3 apps/aberp/src/submit_annulment.rs
 1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs
 1 crates/aberp-mes/src/ledger_writer.rs

@@ -38,13 +38,14 @@
 # is disabled, so anything the Handle has written is WAL-resident and these read the
 # last-checkpointed SUBSET — the identical primitive behind #40/#41/#42/E1.
 #
-# `read_invoice_currency` is the twin of `read_base_currency`, which is PINNED and
-# already Handle-routed; `read_invoice_total_gross_minor` is the D2a shape verbatim
-# (fresh Connection::open + billing::load_ready_invoice_by_id). Both are called with
-# `&state.db_path` from serve.rs:10493 / 10512. Whatever argument migrated their
-# pinned siblings applies here unchanged; they were simply never named.
-apps/aberp/src/serve.rs|read_invoice_currency
-apps/aberp/src/serve.rs|read_invoice_total_gross_minor
+# ── D2c CLOSED (2026-08-12) — the two mark-paid billing readers are MIGRATED ──
+# `read_invoice_currency` and `read_invoice_total_gross_minor` stood here as "the
+# twin of `read_base_currency`, which is PINNED and already Handle-routed" and "the
+# D2a shape verbatim". Both now take the caller's `state.db.read()` connection, so
+# their lines are REMOVED from this baseline in the same change (per the header's
+# exact-set rule) and both names are now PINNED in adr0099_read_fork_scan.awk —
+# re-introducing either opener reds CHECK N on the pinned rule, not just CHECK N1.
+# Baseline count 33 → 31.
 apps/aberp/src/serve.rs|resolve_recipient_email
 apps/aberp/src/serve.rs|calibration_overview_request
 apps/aberp/src/serve.rs|handle_quote_pipeline_status

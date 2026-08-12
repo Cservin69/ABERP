@@ -138,7 +138,14 @@
 # KNOWN RESIDUAL, fail-CLOSED: a tuple-returning factory (`Ok((h, meta))`) is read as
 # an argument-list read and reports. That over-reports rather than under-reports, so
 # it costs a baseline triage, never a missed fork. Left as-is deliberately.
-BEGIN{ n_pin=split("read_base_line_vat_kinds,read_base_currency",P,",") }
+# D2c (2026-08-12): `read_invoice_currency` + `read_invoice_total_gross_minor`
+# JOIN the pin. They are the mark-paid route's twins of the two names D2 pinned,
+# migrated onto the shared Handle in the same change that adds them here — a pin
+# is only honest once the name holds no opener. Their close, not just their read,
+# was the hazard: they carried DuckDB's DEFAULT pragmas (no
+# disable_checkpoint_on_shutdown), so each mark-paid call folded and truncated the
+# live Handle's WAL. Pinning them means neither can come back under its own name.
+BEGIN{ n_pin=split("read_base_line_vat_kinds,read_base_currency,read_invoice_currency,read_invoice_total_gross_minor",P,",") }
 # Method calls that yield a DERIVATIVE of the forked handle rather than reading
 # through it — they extend the taint instead of tripping the rule.
 BEGIN{ split("transaction try_clone read write clone as_ref as_mut borrow borrow_mut lock unwrap expect ok context with_context",PR_," "); for(i_ in PR_) PROP[PR_[i_]]=1 }
