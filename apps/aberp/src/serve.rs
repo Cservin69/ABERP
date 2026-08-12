@@ -6055,6 +6055,53 @@ struct HealthResponse {
     /// `FirstProdLaunchModal` while this is true. Always `false` on
     /// dev/test builds.
     first_prod_launch_required: bool,
+    /// ADR-0110 D7 — `Some` once the shared Handle's WAL fence has fired, and
+    /// STICKY from then on: a foreign DuckDB opener folded and truncated the
+    /// live WAL, so writes acked since may not have reached disk.
+    ///
+    /// This is the operator's channel. Ervin's decision (2026-08-12) is that
+    /// the backend KEEPS SERVING on detection rather than hard-stopping, which
+    /// only works if the signal is impossible to miss — so the SPA turns this
+    /// into a full-width red banner that survives a reload (the state is here,
+    /// on the backend, not in the browser) and stays up until it is explicitly
+    /// cleared. `null` on a healthy tenant, which is every tenant until
+    /// something goes badly wrong. Deliberately emitted as an explicit `null`
+    /// rather than omitted: "this backend has the D7 fence and it is quiet" and
+    /// "this backend predates the fence" must not look identical on the wire to
+    /// a human or a script reading `/health`.
+    durability_alert: Option<DurabilityAlertView>,
+}
+
+/// ADR-0110 D7 — the wire shape of the sticky durability alert. Mirrors
+/// `aberp_db::DurabilityAlert`, with the instant rendered RFC3339 so the SPA
+/// can show the operator *when* the tenant started losing writes.
+#[derive(Serialize)]
+struct DurabilityAlertView {
+    /// Machine-stable breach code (`wal_vanished`, `wal_shrank`,
+    /// `wal_replaced`, `main_db_file_replaced`).
+    breach: &'static str,
+    /// The operator-facing sentence, rendered verbatim by the banner.
+    message: String,
+    /// RFC3339 UTC instant of the FIRST detection — not the latest, so the
+    /// banner answers "since when" rather than "as of a moment ago".
+    detected_at: String,
+}
+
+impl From<aberp_db::DurabilityAlert> for DurabilityAlertView {
+    fn from(a: aberp_db::DurabilityAlert) -> Self {
+        use time::format_description::well_known::Rfc3339;
+        let detected_at = time::OffsetDateTime::from(a.detected_at)
+            .format(&Rfc3339)
+            // A clock that will not format must not swallow the alarm: the
+            // banner's job is to be up, and an unknown timestamp is far better
+            // than no banner.
+            .unwrap_or_else(|_| "unknown".to_string());
+        Self {
+            breach: a.breach.code(),
+            message: a.message,
+            detected_at,
+        }
+    }
 }
 
 async fn handle_health(State(state): State<AppState>) -> Response {
@@ -6075,6 +6122,11 @@ async fn handle_health(State(state): State<AppState>) -> Response {
             first_prod_launch_required: crate::first_launch::first_prod_launch_required(
                 state.tenant.as_str(),
             ),
+            // ADR-0110 D7. Read straight off the shared Handle — the fence sets
+            // it there, so there is no second copy of the truth to drift and no
+            // new plumbing through `AppState`. The SPA polls /health every 10 s,
+            // which is also how the banner comes back after a reload.
+            durability_alert: state.db.durability_alert().map(DurabilityAlertView::from),
         })
         .into_response(),
         Err(e) => (

@@ -13,6 +13,8 @@ function health(overrides: Partial<HealthResponse>): HealthResponse {
     nav_xsd_version: "3.0",
     is_production_build: false,
     first_prod_launch_required: false,
+    // ADR-0110 D7 — healthy tenant. The field is always present on the wire.
+    durability_alert: null,
     ...overrides,
   };
 }

@@ -60,6 +60,11 @@
   } from "./lib/router";
   import FirstProdLaunchModal from "./routes/FirstProdLaunchModal.svelte";
   import { shouldShowFirstProdLaunchModal } from "./lib/first-prod-launch";
+  // ADR-0110 D7 — the durability-loss alarm. Its state is BACKEND-owned (see
+  // `lib/durability-alert.ts`), so it survives a reload and reads identically
+  // in every window.
+  import { durabilityAlertOf } from "./lib/durability-alert";
+  import DurabilityAlertBanner from "./lib/DurabilityAlertBanner.svelte";
   import InvoiceList from "./routes/InvoiceList.svelte";
   import IncomingInvoiceList from "./routes/IncomingInvoiceList.svelte";
   // S211 / PR-210 — Quotes operational tab (third tab under
@@ -505,6 +510,12 @@
   // false on dev/test builds (the backend reports false there).
   let firstProdLaunchRequired = $derived(shouldShowFirstProdLaunchModal(healthInfo));
 
+  // ADR-0110 D7 — the sticky durability-loss alert, straight off the /health
+  // poll (every 10 s, and once on every mount, which is how it comes back
+  // after a reload). Nothing here is derived from local state: the backend is
+  // the only thing that can raise it and the only thing that can clear it.
+  let durabilityAlert = $derived(durabilityAlertOf(healthInfo));
+
   // PR-188 / session 188 — operator-supplied SPA wordmark. If
   // `static/aberp-logo.png` is present at build time, Vite serves it at
   // `/aberp-logo.png` and the `<img>` loads; if absent, `onerror` fires
@@ -516,6 +527,17 @@
 </script>
 
 <div class="frame">
+  <!-- ADR-0110 D7 — the durability-loss alarm sits ABOVE the topbar and
+       OUTSIDE every `viewMode` branch, deliberately. When the backend has
+       caught a WAL truncation it keeps serving (Ervin, 2026-08-12), so this
+       banner is the operator's only signal — it must be visible while the app
+       is loading, while first-run setup is up, behind the
+       first-prod-launch modal, and on every route. Gating it on
+       `viewMode === "ready"` like the status chip would hide it in exactly the
+       states where someone is most likely to be poking at a sick box. -->
+  {#if durabilityAlert}
+    <DurabilityAlertBanner alert={durabilityAlert} />
+  {/if}
   <header class="topbar">
     <!-- PR-188 / session 188 — operator-supplied SPA wordmark. The
          `<h1>` is the screen-reader anchor either way; the visual is
