@@ -784,6 +784,53 @@ pub enum EventKind {
     /// swept into a per-invoice export bundle. F12 four-edit ritual fires.
     DbIndexesRebuilt,
 
+    /// ADR-0110 D7 — the shared `aberp_db::Handle`'s WAL fence FIRED: between
+    /// two of this Handle's own observations the live `<db>.wal` vanished,
+    /// shrank below the Handle's monotone high-water, or changed inode (or the
+    /// main DB file did). The only known producer of that shape is a foreign
+    /// `Connection::open` on the tenant DB carrying DuckDB's DEFAULT pragmas,
+    /// whose close FOLDS and TRUNCATES the live Handle's WAL — the 2026-08-08
+    /// mechanism. After it, `commit()` keeps returning `Ok` while the bytes
+    /// reach no file, and the D3 `durable_ack` could not see it because it
+    /// `fsync`s PATHS: a truncated-away WAL simply "does not exist", so the
+    /// existence check SKIPPED it, the main-file `fsync` succeeded and the ack
+    /// returned `Ok` — a false durability signal.
+    ///
+    /// Payload is `{"trigger","breach","wal_high_water","wal_observed",
+    /// "audit_head_seq"}` — fixed vocabulary plus `u64`s, nothing interpolated
+    /// from a path or an operator string.
+    ///
+    /// Deliberately **NOT** [`EventKind::DbAutoRecovered`], for the reason
+    /// [`EventKind::DbIndexesRebuilt`] gives one variant up: `db.auto_recovered`
+    /// means "something went wrong and we healed it". Nothing is healed here —
+    /// writes may already be lost and the operator must stop and recover. Fold
+    /// the two and a real recovery stops being distinguishable from a real loss.
+    ///
+    /// `db.*` prefix — a system/durability event, app-layer JSON only (never
+    /// NAV XML), never swept into a per-invoice export bundle. F12 four-edit
+    /// ritual fires.
+    DbDurabilityLossDetected,
+
+    /// ADR-0110 D7 / B2 — the operator ACKNOWLEDGED a durability-loss alert.
+    ///
+    /// [`EventKind::DbDurabilityLossDetected`] is sticky by design, and since
+    /// B2 that stickiness is re-derived at every boot by scanning the surviving
+    /// audit mirror. Without this kind the alert could then only ever be
+    /// silenced by deleting evidence — and worse, before B2 the restart the
+    /// banner ASKS FOR was itself the mute button. So the alert is up exactly
+    /// while the newest `db.durability_loss_detected` out-ranks the newest
+    /// `db.durability_alert_acknowledged`, and clearing it becomes an ordinary
+    /// hash-chained attributable act rather than an absence.
+    ///
+    /// Payload is `{"acknowledged_at":"<RFC3339>","operator":"<login>"}`; the
+    /// operator login is the only non-fixed string and is JSON-escaped at the
+    /// call site.
+    ///
+    /// `db.*` prefix — a system/durability event, app-layer JSON only (never
+    /// NAV XML), never swept into a per-invoice export bundle. F12 four-edit
+    /// ritual fires.
+    DbDurabilityAlertAcknowledged,
+
     /// S220 / PR-217 — the buyer-backfill cycle completed one pass.
     /// The boot-time backfill walks restored_invoice rows with a
     /// NULL `customer_name` and tries to fetch buyer fields via NAV's
@@ -3186,6 +3233,8 @@ impl EventKind {
             EventKind::DaemonShutdownCompleted => "system.daemon_shutdown_completed",
             EventKind::DbAutoRecovered => "db.auto_recovered",
             EventKind::DbIndexesRebuilt => "db.indexes_rebuilt",
+            EventKind::DbDurabilityLossDetected => "db.durability_loss_detected",
+            EventKind::DbDurabilityAlertAcknowledged => "db.durability_alert_acknowledged",
             EventKind::RestoreBuyerBackfillCycleCompleted => {
                 "system.restore_buyer_backfill_cycle_completed"
             }
@@ -3407,6 +3456,8 @@ impl EventKind {
             "system.daemon_shutdown_completed" => Ok(EventKind::DaemonShutdownCompleted),
             "db.auto_recovered" => Ok(EventKind::DbAutoRecovered),
             "db.indexes_rebuilt" => Ok(EventKind::DbIndexesRebuilt),
+            "db.durability_loss_detected" => Ok(EventKind::DbDurabilityLossDetected),
+            "db.durability_alert_acknowledged" => Ok(EventKind::DbDurabilityAlertAcknowledged),
             "system.restore_buyer_backfill_cycle_completed" => {
                 Ok(EventKind::RestoreBuyerBackfillCycleCompleted)
             }
@@ -3619,6 +3670,8 @@ impl EventKind {
         EventKind::DaemonShutdownCompleted,
         EventKind::DbAutoRecovered,
         EventKind::DbIndexesRebuilt,
+        EventKind::DbDurabilityLossDetected,
+        EventKind::DbDurabilityAlertAcknowledged,
         EventKind::RestoreBuyerBackfillCycleCompleted,
         EventKind::RestoreFromNavRun,
         EventKind::ExtNavPartnerManualLink,
@@ -3835,6 +3888,8 @@ mod tests {
             EventKind::DaemonShutdownCompleted,
             EventKind::DbAutoRecovered,
             EventKind::DbIndexesRebuilt,
+            EventKind::DbDurabilityLossDetected,
+            EventKind::DbDurabilityAlertAcknowledged,
             EventKind::RestoreBuyerBackfillCycleCompleted,
             EventKind::ExtNavPartnerManualLink,
             EventKind::RestoreFromNavRun,
@@ -4030,7 +4085,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            189,
+            191,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \

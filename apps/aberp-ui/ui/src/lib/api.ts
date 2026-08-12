@@ -455,6 +455,28 @@ export interface HealthResponse {
    * its main routes behind the `FirstProdLaunchModal`. Always `false` on
    * dev/test builds. */
   first_prod_launch_required: boolean;
+  /** ADR-0110 D7 — non-null once the backend's shared DB Handle has caught a
+   * WAL truncation under the writer: a foreign DuckDB opener folded and
+   * truncated the live write-ahead log, so writes acked since then may never
+   * have reached disk.
+   *
+   * STICKY on the backend until explicitly cleared, which is what lets the red
+   * banner survive a reload and show up identically in every window. `null` on
+   * a healthy tenant; `undefined` only from a backend older than D7. */
+  durability_alert: DurabilityAlert | null;
+}
+
+/** ADR-0110 D7 — mirrors `serve::DurabilityAlertView`. */
+export interface DurabilityAlert {
+  /** Machine-stable breach code: `wal_vanished` | `wal_shrank` |
+   * `wal_replaced` | `main_db_file_replaced`. */
+  breach: string;
+  /** Operator-facing sentence, rendered verbatim in the banner's detail
+   * line — it names the specific breach, which is what a recovery turns on. */
+  message: string;
+  /** RFC3339 UTC instant of the FIRST detection: the banner answers
+   * "since when", not "as of a moment ago". */
+  detected_at: string;
 }
 
 export async function health(): Promise<HealthResponse> {
@@ -472,6 +494,20 @@ export interface AcknowledgeFirstProdLaunchResponse {
  * `first_prod_launch_required: false`. */
 export async function acknowledgeFirstProdLaunch(): Promise<AcknowledgeFirstProdLaunchResponse> {
   return invoke<AcknowledgeFirstProdLaunchResponse>("acknowledge_first_prod_launch");
+}
+
+/** `POST /health/acknowledge-durability-alert` response. */
+export interface AcknowledgeDurabilityAlertResponse {
+  acknowledged_at: string;
+}
+
+/** ADR-0110 D7 — the operator acknowledges a durability-loss alert, taking the
+ * red banner down. The backend appends a permanent `DbDurabilityAlertAcknowledged`
+ * audit entry FIRST and only then clears the sticky flag, so a failed append
+ * leaves the banner UP. The acknowledgement is durable: it survives a restart,
+ * which is what stops the next boot re-raising the banner. */
+export async function acknowledgeDurabilityAlert(): Promise<AcknowledgeDurabilityAlertResponse> {
+  return invoke<AcknowledgeDurabilityAlertResponse>("acknowledge_durability_alert");
 }
 
 export async function listInvoices(): Promise<InvoiceListItem[]> {

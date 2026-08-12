@@ -74,7 +74,7 @@
 //! [`Handle::run_durable_checkpoint_locked`] remains the stub below and
 //! [`HandleConfig::checkpoint_enabled`] still defaults `false`. The consequence
 //! to keep in view: the WAL is durable but still **unbounded** at runtime, and
-//! it is still the boot fold that truncates it. ADR-0110 D4 (boot stops folding
+//! it is still the boot fold that truncates it. ADR-0110 D7 (boot stops folding
 //! blind) therefore still depends on H4, not on D3.
 //!
 //! # Prod adaptation vs. the editions source (`ABERP-Editions` 1e6097d)
@@ -104,6 +104,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId};
 use duckdb::Connection;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use crate::debounce::CheckpointDebouncer;
 
@@ -151,6 +153,213 @@ pub enum DbError {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    /// **ADR-0110 D7 — the WAL fence fired: this is DURABILITY LOSS, not a
+    /// failed `fsync`.**
+    ///
+    /// Between two of this [`Handle`]'s own observations the live `<db>.wal`
+    /// vanished, shrank below the Handle's monotone high-water, or changed
+    /// inode — or the main DB file changed inode. Nothing this Handle does can
+    /// produce that shape (its F-A pragmas exist precisely to stop it), so it
+    /// means a **foreign** DuckDB instance opened the tenant DB with DEFAULT
+    /// pragmas and, on close, FOLDED and TRUNCATED the WAL out from under the
+    /// writer. Past that point `commit()` keeps returning `Ok` while the bytes
+    /// reach no file.
+    ///
+    /// Distinct from [`DbError::DurableAck`] on purpose. That one means "the
+    /// `fsync` did not complete"; this one means "the `fsync` would have
+    /// completed and told you nothing" — D3's ack `fsync`s PATHS, and a WAL
+    /// truncated out of existence is simply absent, which the pre-D7 code
+    /// treated as a legitimate skip on the way to `Ok(())`. Same green light,
+    /// no bytes behind it.
+    ///
+    /// # Not a hard stop
+    ///
+    /// Raising this does **not** brick the Handle. The breach latch is
+    /// consumed when it is reported, so the next [`Handle::durable_ack`] is
+    /// evaluated on a fresh baseline and succeeds if the tenant is healthy
+    /// again: writes keep being served. What persists is the sticky
+    /// [`Handle::durability_alert`] the operator sees, plus the
+    /// `db.durability_loss_detected` audit row.
+    #[error(
+        "DURABILITY LOSS — {breach} on the live tenant DB at {db} \
+         (wal {wal}; expected {expected}, observed {observed}). A foreign DuckDB \
+         opener folded and truncated this Handle's WAL; commits since then may \
+         have returned Ok without reaching stable storage. STOP AND RECOVER."
+    )]
+    WalTruncatedUnderWriter {
+        breach: WalBreach,
+        db: PathBuf,
+        wal: PathBuf,
+        /// What the watermark said: a byte high-water for the two size
+        /// breaches, an inode number for the two identity breaches.
+        expected: u64,
+        /// What the filesystem said, in the same unit as `expected`.
+        observed: u64,
+    },
+}
+
+/// ADR-0110 D7 — which shape of WAL truncation the fence saw. A closed, fixed
+/// vocabulary: it is interpolated into the `db.durability_loss_detected` audit
+/// payload, so it must never carry an operator string or a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalBreach {
+    /// `<db>.wal` is GONE and this Handle had previously seen bytes in it.
+    /// This is the 00012 shape: the foreign close folded the WAL into the main
+    /// file and unlinked it. Pre-D7 this was the SKIP branch of
+    /// `if wal_path.exists()`.
+    WalVanished,
+    /// `<db>.wal` is present but SHORTER than this Handle's monotone
+    /// high-water. The WAL is append-only under the F-A pragmas, so the only
+    /// way it shrinks is a checkpoint we did not perform.
+    WalShrank,
+    /// `<db>.wal` is present and long enough, but it is a DIFFERENT inode. A
+    /// fold that truncated and recreated the file leaves exactly this trace,
+    /// and byte counts alone would miss it.
+    WalReplaced,
+    /// The main DB file changed inode under the running Handle — something
+    /// swapped the live file (a restore, or a fold-and-rename). Our open `fd`
+    /// still points at the old inode, so every subsequent commit is written to
+    /// a file no longer reachable by name.
+    MainReplaced,
+}
+
+impl WalBreach {
+    /// Stable machine code for the audit payload. `&'static str`, never
+    /// derived from anything an operator or a filesystem supplied.
+    pub fn code(self) -> &'static str {
+        match self {
+            WalBreach::WalVanished => "wal_vanished",
+            WalBreach::WalShrank => "wal_shrank",
+            WalBreach::WalReplaced => "wal_replaced",
+            WalBreach::MainReplaced => "main_db_file_replaced",
+        }
+    }
+}
+
+impl std::fmt::Display for WalBreach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            WalBreach::WalVanished => "the write-ahead log VANISHED",
+            WalBreach::WalShrank => "the write-ahead log SHRANK below our high-water",
+            WalBreach::WalReplaced => "the write-ahead log was REPLACED (inode changed)",
+            WalBreach::MainReplaced => "the main DB file was REPLACED (inode changed)",
+        };
+        f.write_str(s)
+    }
+}
+
+/// ADR-0110 D7 — the sticky operator-facing durability alert.
+///
+/// Set the first time the fence fires and kept until
+/// [`Handle::clear_durability_alert`] is called explicitly. Deliberately NOT
+/// cleared by a subsequent healthy ack: "it stopped happening" is not "it did
+/// not happen", and the rows that went missing do not come back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurabilityAlert {
+    /// What the fence saw, on the FIRST detection.
+    pub breach: WalBreach,
+    /// Operator-facing sentence. Rendered verbatim by the SPA banner.
+    pub message: String,
+    /// Wall-clock of the FIRST detection. Later breaches are logged and
+    /// audited but do not move this — the operator wants to know when the
+    /// tenant started losing writes, not when it last did.
+    pub detected_at: SystemTime,
+}
+
+/// ADR-0110 D7 — a file's `(dev, ino)` identity, as `stat`/`fstat` reports it.
+///
+/// `None` on non-unix (see [`file_id`]): every identity comparison degrades to
+/// "not checked" there rather than to a false positive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+/// The `(dev, ino)` of an already-`stat`ed file.
+///
+/// Unix-only by construction. On other targets there is no cheap stable inode
+/// notion, so this returns `None` and the fence falls back to the byte
+/// high-water alone — weaker, never wrong.
+fn file_id(md: &std::fs::Metadata) -> Option<FileId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(FileId {
+            dev: md.dev(),
+            ino: md.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        None
+    }
+}
+
+/// ADR-0110 D7 — what this [`Handle`] last saw of its own durable set.
+///
+/// Sampled at every [`WriteGuard::drop`] (so, under the writer lock, once per
+/// committed write) and again at every [`Handle::durable_ack`]. See
+/// [`Handle::observe_durable_set`] for why the byte counter is a MONOTONE
+/// high-water rather than a last-seen value — that is the whole race-tolerance
+/// argument.
+#[derive(Debug, Default)]
+struct WalMark {
+    /// Monotone high-water of `<db>.wal`'s length in bytes. Raised by every
+    /// observation, never lowered except by a fold we performed ourselves
+    /// (`folded_by_us`) or when a breach re-baselines. `0` means "this Handle
+    /// has never seen a non-empty WAL", which is also the boot state — and is
+    /// why the first ack after a boot fold cannot fire the fence.
+    wal_high_water: u64,
+    /// Identity of the `<db>.wal` we last saw. `None` until one exists.
+    wal_id: Option<FileId>,
+    /// Identity of the main DB file we last saw. `None` until first observed.
+    main_id: Option<FileId>,
+    /// Set by the Handle immediately before IT drops and reopens the shared
+    /// connection (today: post-poison recovery). Reopening replays the WAL and
+    /// may legitimately fold it, which is the ONLY sanctioned shrink. The next
+    /// observation consumes the flag and re-baselines instead of firing.
+    folded_by_us: bool,
+    /// A breach detected by an observation and not yet reported.
+    /// [`WriteGuard::drop`] cannot return an error, so a breach it finds is
+    /// latched here for the next [`Handle::durable_ack`] to take. Taking it
+    /// clears it — that is what keeps a fired fence from turning into a
+    /// permanent write refusal.
+    breach: Option<Breach>,
+}
+
+/// ADR-0110 D7 / R2-B1 — the newest `time_wall` of each durability audit kind
+/// within ONE store. Gathered separately from the mirror and from the DB,
+/// because after a real truncation the two disagree about which rows they have:
+/// the mirror keeps the loss and refuses everything after it, the DB may have
+/// lost the loss and is the only store still accepting the acknowledgement.
+#[derive(Debug, Default)]
+struct DurabilityAuditTimes {
+    loss: Option<OffsetDateTime>,
+    ack: Option<OffsetDateTime>,
+}
+
+/// What one `stat` of `<db>.wal` told us. The third arm is the point: N2 (PR
+/// #61 adversarial) — an `Err` that is not `NotFound` means "we could not
+/// look", which must never be collapsed into "it is gone".
+enum WalStat {
+    Present(std::fs::Metadata),
+    Absent,
+    Unreadable,
+}
+
+/// A latched breach plus the two numbers that justify it. Both are BYTES for
+/// [`WalBreach::WalVanished`] / [`WalBreach::WalShrank`] and INODE NUMBERS for
+/// [`WalBreach::WalReplaced`] / [`WalBreach::MainReplaced`] — the pair always
+/// reads "what the watermark said" vs "what the filesystem said", which is the
+/// only thing an operator or an audit reader needs from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Breach {
+    kind: WalBreach,
+    expected: u64,
+    observed: u64,
 }
 
 /// Tunables for a [`Handle`]. [`HandleConfig::default`] is the ADR-0099 H3
@@ -172,6 +381,36 @@ pub struct HandleConfig {
     /// never folds the WAL in place (the vulnerable in-place checkpoint). This
     /// is the F-A engine-adapter pragma; always `true` in production.
     pub disable_implicit_close_checkpoint: bool,
+    /// **ADR-0110 D7 — the WAL fence. DEFAULTS `false`, and must stay `false`
+    /// until the GROUP-A opener sweep lands.**
+    ///
+    /// When `true`, [`WriteGuard::drop`] samples the WAL watermark and
+    /// [`Handle::durable_ack`] refuses on a truncation
+    /// ([`DbError::WalTruncatedUnderWriter`]). When `false` — today's
+    /// production posture — neither happens and `durable_ack` behaves exactly
+    /// as it did under D3.
+    ///
+    /// # Why it ships OFF (PR #61 adversarial, B1)
+    ///
+    /// Three foreign GROUP-A openers are still live in-serve on this head:
+    /// `serve::calibration_overview_request`, `resolve_recipient_email`, and
+    /// `handle_quote_pipeline_status`, plus the CLI-against-live openers. Each
+    /// of them truncates this Handle's WAL on close — that is the whole defect
+    /// D7 detects.
+    ///
+    /// So with the fence ON *before* those are swept, an operator who opens the
+    /// quote-calibration overview, emails an invoice, or opens Pricing Jobs
+    /// arms a breach; the NEXT invoice issuance or mark-paid then fails
+    /// `durable_ack`, and that failure PROPAGATES via `?` (the D3-C cut-gate
+    /// enforces exactly that propagation). The result is a failed invoice
+    /// issuance for an invoice that actually committed, with the NAV handoff
+    /// skipped — a routine, loud, money-path failure on day one.
+    ///
+    /// That is strictly worse than the silent bug it detects, so the detection
+    /// lands DARK. The real loss-stopper is the opener sweep (PR #3); this
+    /// fence is the belt-and-suspenders alarm that is safe to arm afterwards.
+    /// Flipping this default to `true` is then a one-line PR.
+    pub wal_fence_enabled: bool,
 }
 
 impl Default for HandleConfig {
@@ -183,6 +422,10 @@ impl Default for HandleConfig {
             // DuckDB's own bounded auto-checkpoint safe in the interim.
             checkpoint_enabled: false,
             disable_implicit_close_checkpoint: true,
+            // ADR-0110 D7: the fence ships DARK. See the field docs — with the
+            // GROUP-A openers still live, an armed fence turns a silent bug
+            // into routine loud invoice-issuance failures. Flip after PR #3.
+            wal_fence_enabled: false,
         }
     }
 }
@@ -251,6 +494,21 @@ pub struct Handle {
     /// did, instead of hard-coding a list that silently rots the moment this
     /// file changes. See `apps/aberp/tests/adr0110_d6b_ondisk_durability.rs`.
     synced: Mutex<Vec<PathBuf>>,
+    /// ADR-0110 D7 — the WAL fence's watermark. Behind its **own** mutex for
+    /// the same reason [`Self::synced`] is: it is touched from
+    /// [`Self::durable_ack`], which runs after the [`WriteGuard`] has dropped
+    /// and deliberately takes no writer lock.
+    ///
+    /// That mutex is also load-bearing for correctness, not just for `&mut`:
+    /// [`Self::observe_durable_set`] `stat`s the files **while holding it**, so
+    /// observations are totally ordered and the monotone high-water can never
+    /// be raised by a concurrent writer *between* another thread's `stat` and
+    /// its comparison. See that method for the full race argument.
+    wal_watermark: Mutex<WalMark>,
+    /// ADR-0110 D7 — the sticky operator alert. `Some` from the first fence
+    /// fire until [`Self::clear_durability_alert`]; surfaced on `GET /health`
+    /// as `durability_alert` and rendered by the SPA's red banner.
+    durability_alert: Mutex<Option<DurabilityAlert>>,
     /// Built **once** per process (S341 semantics): tenant + binary hash. The
     /// lockstep [`aberp_audit_ledger::sync_mirror`] needs it on every commit.
     meta: LedgerMeta,
@@ -316,12 +574,19 @@ impl Handle {
         // Capture the coalescing window before `config` moves into the struct.
         let min_interval = config.min_checkpoint_interval;
 
-        Ok(Arc::new(Handle {
+        let handle = Arc::new(Handle {
             id: NEXT_HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             db_path: db_path.to_path_buf(),
             wal_path: wal_path_for(db_path),
             mirror_path,
             synced: Mutex::new(Vec::new()),
+            // ADR-0110 D7. Deliberately the DEFAULT (high-water 0, no
+            // identities, no breach) rather than a boot-time sample: at boot
+            // the WAL has just been replayed and folded by our own open, so
+            // there is no honest "before" to compare against. The first
+            // observation baselines; the fence can only fire on the SECOND.
+            wal_watermark: Mutex::new(WalMark::default()),
+            durability_alert: Mutex::new(None),
             meta,
             tenant: tenant.as_str().to_string(),
             config,
@@ -329,7 +594,23 @@ impl Handle {
                 conn: Some(conn),
                 debouncer: CheckpointDebouncer::new(min_interval),
             }),
-        }))
+        });
+        // ADR-0110 D7 / B2 — re-derive a sticky durability alert from the
+        // surviving audit mirror, as part of CONSTRUCTING the Handle.
+        //
+        // Here rather than at serve's call site for two reasons. It cannot be
+        // forgotten by a new boot path: every route to a live Handle goes
+        // through this constructor. And it keeps `serve::open_tenant_handle` a
+        // single tail expression — binding the fresh Handle to a local and then
+        // reading through it is precisely the shape the CHECK N structural
+        // read-fork rule flags, and that rule is right to flag it; the fix is
+        // not to allow-list the one function whose job is opening the Handle.
+        //
+        // Ungated by `wal_fence_enabled` on purpose: a loss recorded while the
+        // fence was armed must still resurface on a boot where it is disarmed.
+        // Turning a safety flag off must not erase an outstanding alarm.
+        handle.restore_durability_alert_from_mirror();
+        Ok(handle)
     }
 
     /// Production constructor: [`HandleConfig::default`] (H3 posture — checkpoint
@@ -403,14 +684,51 @@ impl Handle {
     /// alive, and needlessly serializes every other writer behind an `fsync`
     /// otherwise. `drop(guard)` first, then call this.
     ///
+    /// # ADR-0110 D7 — the fence in front of all of that
+    ///
+    /// Everything above assumes the files we are about to `fsync` are still
+    /// OUR files. On 2026-08-12 that assumption broke: a foreign
+    /// `Connection::open` on the tenant DB carrying DuckDB's DEFAULT pragmas
+    /// FOLDS and TRUNCATES the live Handle's WAL when it closes, and every
+    /// subsequent Handle commit then returns `Ok` while reaching no file.
+    ///
+    /// D3's ack was blind to it *by construction*, because it `fsync`s
+    /// **paths**: after the truncation `<db>.wal` is gone, so
+    /// `if wal_path.exists()` SKIPPED it, the main-file `fsync` succeeded, and
+    /// this returned `Ok(())`. A green light with nothing behind it — strictly
+    /// worse than no ack at all, because it is believed.
+    ///
+    /// So the ack now begins with [`Self::observe_durable_set`], and that
+    /// `exists()` test is no longer where the missing-WAL decision is made: a
+    /// WAL that is absent *after this Handle has seen bytes in it* is
+    /// [`WalBreach::WalVanished`], not a skip. The `fsync` calls themselves
+    /// additionally `fstat` the descriptor they opened and refuse to certify an
+    /// inode that is not the one the watermark recorded (the D3 "`fsync` the
+    /// wrong inode and report success" residual).
+    ///
+    /// **The fence presupposes the F-A pragmas** (`HandleConfig::
+    /// disable_implicit_close_checkpoint`, always `true` in this tree). They
+    /// are what make "our WAL only ever grows" true. A Handle configured
+    /// without them would let DuckDB fold legitimately, and the fence would be
+    /// reporting the engine's own bookkeeping as a loss.
+    ///
     /// # Errors
     ///
-    /// [`DbError::DurableAck`] if any `fsync` fails. **Propagate it — never
-    /// downgrade it to a `warn!`.** The business transaction has already
-    /// committed at this point, so the caller is choosing between "tell the
-    /// operator it failed when it may have landed" and "promise durability we
-    /// did not achieve". ADR-0110 R3 / CLAUDE.md rule 11 pick the first; the
-    /// inverted failure mode is named in ADR-0110 §7.7.
+    /// [`DbError::DurableAck`] if any `fsync` fails.
+    /// [`DbError::WalTruncatedUnderWriter`] if the fence fires — a strictly
+    /// worse fact, and the one that outranks everything else this method can
+    /// report. **Propagate both — never downgrade either to a `warn!`.** The
+    /// business transaction has already committed at this point, so the caller
+    /// is choosing between "tell the operator it failed when it may have
+    /// landed" and "promise durability we did not achieve". ADR-0110 R3 /
+    /// CLAUDE.md rule 11 pick the first; the inverted failure mode is named in
+    /// ADR-0110 §7.7.
+    ///
+    /// A fired fence is **not** a hard stop (Ervin, 2026-08-12): the latch is
+    /// consumed as it is reported, so the next ack starts from a fresh
+    /// baseline and the app keeps serving. What persists is the sticky
+    /// [`Self::durability_alert`] and the `db.durability_loss_detected` audit
+    /// row.
     ///
     /// # Honest scope
     ///
@@ -433,13 +751,56 @@ impl Handle {
     /// external storage is therefore outside what this can promise (ADR-0110
     /// §12.4).
     pub fn durable_ack(&self) -> Result<(), DbError> {
+        // ── ADR-0110 D7 — FENCE FIRST, when it is armed ──────────────────
+        // `wal_fence_enabled` defaults FALSE and must stay false until the
+        // GROUP-A opener sweep lands — see the field docs for why an armed
+        // fence on this head would turn a silent bug into routine loud invoice
+        // failures. With it off, everything below is the D3 body verbatim.
+        //
+        // One live observation at the ack itself, then take whatever breach is
+        // latched: this one's, or one a `WriteGuard::drop` found and could not
+        // return (a `Drop` has nowhere to put an error). Taking it CLEARS it,
+        // which is what keeps a fired fence from becoming a permanent write
+        // refusal.
+        let breach = if self.config.wal_fence_enabled {
+            self.observe_durable_set();
+            self.take_breach()
+        } else {
+            None
+        };
+
+        // Salvage anyway. Even on a breach the `fsync` is worth issuing: the
+        // foreign close FOLDS before it truncates, so rows may genuinely be in
+        // the main file now, just not on stable storage.
+        let fsync_outcome = self.fsync_durable_set();
+
+        // The breach OUTRANKS an `fsync` error. "Something we could not sync"
+        // is a smaller fact than "the file we were about to sync is not the
+        // one we wrote to".
+        match breach {
+            Some(b) => Err(self.raise_durability_alert(b)),
+            None => fsync_outcome,
+        }
+    }
+
+    /// `fsync` the durable set — main file, then WAL, then the parent
+    /// directory. Split out of [`Self::durable_ack`] only so the fence above it
+    /// reads as the first thing that happens.
+    fn fsync_durable_set(&self) -> Result<(), DbError> {
         // Main file first, then the WAL: the WAL is only meaningful on top of a
         // durable base. Both before the directory entry that names them.
         self.fsync_and_record(&self.db_path)?;
+        // Still an `exists()` test, but when the fence is armed it is no longer
+        // where the missing-WAL DECISION is made — `observe_durable_set` has
+        // already ruled on that. Here it means only "there is nothing to sync",
+        // which on a Handle that has never written a WAL byte is the plain
+        // truth.
         if self.wal_path.exists() {
             self.fsync_and_record(&self.wal_path)?;
         }
         if let Some(parent) = self.db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            // The directory is not a durable-set member, it is what makes the
+            // members findable.
             fsync_path(parent)?;
         }
         Ok(())
@@ -448,8 +809,36 @@ impl Handle {
     /// `fsync` `path` and record it in the durability journal. Recording only
     /// happens on SUCCESS — the journal must mean "this is on stable storage",
     /// never "we tried".
+    ///
+    /// # A2, and why there is no `fstat`-compare here (PR #61 adversarial)
+    ///
+    /// An earlier revision re-`fstat`ed the descriptor this opens and compared
+    /// it against the watermark, on the theory that opening BY PATH could
+    /// `fsync` an inode that is not the one we wrote to. That check was
+    /// **deleted**, for three reasons that all point the same way:
+    ///
+    /// * it was near-unreachable — [`Handle::observe_durable_set`] runs
+    ///   immediately before and RE-BASELINES the recorded inode, so by the time
+    ///   this ran the "expected" identity was already the swapped one;
+    /// * it was unpinned — no test could distinguish its presence from its
+    ///   absence, and its docstring claimed a mutation result that was false;
+    /// * it was redundant — an inode swap is caught one step earlier by
+    ///   `detect_breach` rule 4 ([`WalBreach::MainReplaced`]), which is what
+    ///   `swapping_the_inode_between_commit_and_ack_must_fail_the_ack`
+    ///   actually exercises.
+    ///
+    /// A check that cannot fire, cannot be tested, and duplicates a check that
+    /// can is not defence in depth; it is a second thing to maintain and a
+    /// false claim in the docs (CLAUDE.md rule 12).
     fn fsync_and_record(&self, path: &Path) -> Result<(), DbError> {
-        fsync_path(path)?;
+        let f = std::fs::File::open(path).map_err(|source| DbError::DurableAck {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        f.sync_all().map_err(|source| DbError::DurableAck {
+            path: path.to_path_buf(),
+            source,
+        })?;
         // A poisoned journal mutex must not fail a write that IS now durable:
         // the journal is evidence, not the contract. Recover in place.
         let mut synced = match self.synced.lock() {
@@ -477,6 +866,622 @@ impl Handle {
             Ok(g) => g.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    // ── ADR-0110 D7 — the WAL fence ──────────────────────────────────────
+
+    /// Take ONE ordered observation of this Handle's durable set (`<db>` and
+    /// `<db>.wal`) and fold it into the watermark, latching a breach if what
+    /// the filesystem says contradicts what we last saw.
+    ///
+    /// Called from exactly two places, and they are the same call: at every
+    /// [`WriteGuard::drop`] — right after the lockstep `sync_mirror`, so under
+    /// the writer lock, once per committed write — and at the top of
+    /// [`Self::durable_ack`]. Sampling at the drop is what makes the fence able
+    /// to see a truncation that happened BETWEEN two writes: the intervening
+    /// commit re-creates a small WAL, so by ack time a naive
+    /// stat-and-compare would find a perfectly self-consistent state and miss
+    /// the loss entirely. The high-water is what remembers.
+    ///
+    /// # Why the byte counter is a MONOTONE high-water (the race argument)
+    ///
+    /// The Handle serializes writers, but `durable_ack` deliberately takes no
+    /// writer lock, and daemons commit concurrently with a money path's ack. So
+    /// between our sample and our comparison the WAL can legitimately GROW. A
+    /// last-seen-length check would read that as drift; a high-water check
+    /// reads it as what it is. Growth is always fine; only a SHRINK is a fact
+    /// about the world that our own pragmas say cannot happen.
+    ///
+    /// Two more things make it race-tolerant rather than merely optimistic:
+    ///
+    /// 1. **The `stat` happens INSIDE the watermark mutex**, not before it.
+    ///    That closes the one race a high-water alone would not: thread A
+    ///    `stat`s 900 bytes, thread B's observation raises the water to 1000,
+    ///    thread A then compares 900 against 1000 and fires on a healthy
+    ///    tenant. Holding the lock across `stat`-compare-update totally orders
+    ///    observations, so the water a comparison sees is always one the
+    ///    comparison's own `stat` already includes.
+    ///
+    ///    Consequence worth being explicit about, since it is easy to claim
+    ///    otherwise: *given* that ordering, a last-seen length would already
+    ///    equal the high-water on a healthy tenant, so `max` is not what
+    ///    closes the race — the lock is. `max` states the invariant the
+    ///    `wal_high_water` field's name asserts, and keeps the comparison
+    ///    correct if a future observation path is ever added that does not
+    ///    hold the lock across its `stat`. Neither mutation (last-seen
+    ///    assignment; `stat` moved outside the lock with a 2 ms window) could
+    ///    be made to go red, and the test that covers this says so.
+    /// 2. **The only sanctioned shrink is one we performed**
+    ///    ([`WalMark::folded_by_us`], set around our own drop-and-reopen).
+    ///    Nothing else in this tree folds this WAL: the F-A pragmas disable
+    ///    both the close-checkpoint and the auto-checkpoint, `take.rs` snapshots
+    ///    a COPY (pinned by `snapshot_does_not_fold_the_handles_wal`), and H4's
+    ///    fold is still a stub.
+    ///
+    /// # What cannot fire it
+    ///
+    /// * **A boot fold.** A fresh Handle's watermark is the default — high-water
+    ///   `0`, no identities — so the first observation only baselines. The fence
+    ///   needs a "before" and a boot has none.
+    /// * **Booting onto a pre-existing WAL.** Same reason: whatever is there at
+    ///   the first observation becomes the baseline, however large.
+    /// * **Concurrent daemon writes.** Growth only; see above.
+    /// * **A legitimate reopen** (post-poison recovery). `folded_by_us`
+    ///   re-baselines and consumes itself.
+    /// * **A `stat` that fails for any reason other than ENOENT** — see N2
+    ///   below. "I could not look" is not "it is gone".
+    fn observe_durable_set(&self) {
+        let mut mark = self.lock_watermark();
+
+        // Inside the lock, deliberately — see the race argument above.
+        //
+        // N2 (PR #61 adversarial): ONLY `NotFound` may be read as "the WAL is
+        // absent". Any other `stat` error — ESTALE, EIO, ETIMEDOUT, the things
+        // a NAS or a removable mount produces when it hiccups — means we could
+        // not look, and must resolve to "not checked" rather than to
+        // `WalVanished`, which is the single most severe verdict this fence
+        // can reach. `.ok()` collapsed those two into the same `None` and so
+        // turned a flaky mount into a durability-loss alarm.
+        let wal_md = match std::fs::metadata(&self.wal_path) {
+            Ok(md) => WalStat::Present(md),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => WalStat::Absent,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    wal = %self.wal_path.display(),
+                    "aberp-db: ADR-0110 D7 — could not stat the WAL (not ENOENT); treating this \
+                     observation as NOT CHECKED rather than as a truncation. The watermark is \
+                     left untouched, so the next readable observation still compares against \
+                     the last thing we actually saw."
+                );
+                WalStat::Unreadable
+            }
+        };
+        // Same rule for the main file, and it already had the softer landing:
+        // an unreadable main file leaves `main_id` `None`, and `detect_breach`
+        // rule 4 requires `Some` on BOTH sides, so it resolves to "not
+        // checked" and the `fsync`'s own error reports the real problem.
+        let main_md = std::fs::metadata(&self.db_path).ok();
+
+        // An unreadable WAL must not move the watermark at all. Returning here
+        // rather than falling through is what makes "not checked" mean it:
+        // falling through would raise the high-water to 0 or clear `wal_id`,
+        // quietly destroying the baseline the next observation compares to.
+        let wal_md = match wal_md {
+            WalStat::Unreadable => return,
+            WalStat::Absent => None,
+            WalStat::Present(md) => Some(md),
+        };
+        let wal_len = wal_md.as_ref().map_or(0, |m| m.len());
+        let wal_id = wal_md.as_ref().and_then(file_id);
+        let main_id = main_md.as_ref().and_then(file_id);
+
+        // A fold WE performed is the one legitimate shrink. Consume the flag
+        // and re-baseline on whatever the reopen left behind.
+        if mark.folded_by_us {
+            mark.folded_by_us = false;
+            mark.wal_high_water = wal_len;
+            mark.wal_id = wal_id;
+            mark.main_id = main_id.or(mark.main_id);
+            return;
+        }
+
+        if let Some(kind) = detect_breach(&mark, wal_md.is_some(), wal_len, wal_id, main_id) {
+            let (expected, observed) = match kind {
+                WalBreach::WalVanished | WalBreach::WalShrank => (mark.wal_high_water, wal_len),
+                WalBreach::WalReplaced => (
+                    mark.wal_id.map_or(0, |f| f.ino),
+                    wal_id.map_or(0, |f| f.ino),
+                ),
+                WalBreach::MainReplaced => (
+                    mark.main_id.map_or(0, |f| f.ino),
+                    main_id.map_or(0, |f| f.ino),
+                ),
+            };
+            // Latch — a `Drop` cannot return, so `durable_ack` reports it. Keep
+            // the FIRST unreported breach: it names what actually went wrong,
+            // and the ones that follow are its echoes.
+            mark.breach.get_or_insert(Breach {
+                kind,
+                expected,
+                observed,
+            });
+            // RE-BASELINE onto the post-truncation reality. This is what makes
+            // "keep serving" true rather than aspirational: without it every
+            // later ack would re-detect the same historical shrink and every
+            // money path would 5xx forever, which is the sticky refusal Ervin
+            // explicitly ruled out.
+            mark.wal_high_water = wal_len;
+            mark.wal_id = wal_id;
+            mark.main_id = main_id.or(mark.main_id);
+            return;
+        }
+
+        // Healthy. Raise the water (never lower it) and refresh identities.
+        mark.wal_high_water = mark.wal_high_water.max(wal_len);
+        if wal_id.is_some() {
+            mark.wal_id = wal_id;
+        }
+        if main_id.is_some() {
+            mark.main_id = main_id;
+        }
+    }
+
+    /// Take the latched breach, clearing it. Taking is what stops one
+    /// truncation from failing every future ack (see [`Self::durable_ack`]).
+    fn take_breach(&self) -> Option<Breach> {
+        self.lock_watermark().breach.take()
+    }
+
+    /// Announce that THIS Handle is about to fold its own WAL (by dropping and
+    /// reopening the shared connection, which replays and may checkpoint it).
+    /// The next observation re-baselines instead of firing the fence.
+    fn note_self_fold(&self) {
+        self.lock_watermark().folded_by_us = true;
+    }
+
+    /// The watermark mutex, poison-recovered in place. A panic elsewhere must
+    /// not brick the fence — a fence that stops answering is a fence that
+    /// silently stops protecting.
+    fn lock_watermark(&self) -> MutexGuard<'_, WalMark> {
+        match self.wal_watermark.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                self.wal_watermark.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    /// The sticky durability alert, if the fence has ever fired.
+    ///
+    /// Surfaced on `GET /health` and rendered as the SPA's red banner. Survives
+    /// every subsequent healthy ack — only [`Self::clear_durability_alert`]
+    /// takes it down.
+    pub fn durability_alert(&self) -> Option<DurabilityAlert> {
+        match self.durability_alert.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Explicitly clear the sticky durability alert. The operator acknowledges
+    /// a durability loss; the code does not decide it stopped mattering.
+    ///
+    /// **Call this only alongside a durable `db.durability_alert_acknowledged`
+    /// audit row** (`serve::acknowledge_durability_alert` is the one production
+    /// caller). Clearing the in-memory flag on its own is not an
+    /// acknowledgement — it is amnesia, and the next boot's
+    /// [`Self::restore_durability_alert_from_mirror`] would correctly bring the
+    /// banner straight back.
+    pub fn clear_durability_alert(&self) {
+        let mut slot = match self.durability_alert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                self.durability_alert.clear_poison();
+                poisoned.into_inner()
+            }
+        };
+        *slot = None;
+    }
+
+    /// **ADR-0110 D7 / B2 — re-derive the sticky alert at boot, from BOTH
+    /// durable stores.**
+    ///
+    /// # The defect this closes
+    ///
+    /// The banner tells the operator to *stop and recover*. Before B2, the
+    /// restart it asks for was the **mute button**: the alert lived only in
+    /// this process's memory, so it died with the process, and the
+    /// `db.durability_loss_detected` row went with it — the fence writes that
+    /// row into the very database whose WAL was just truncated, so the DB copy
+    /// is exactly the copy most likely to be lost. "Keep serving" degraded to
+    /// "keep serving and forget", which is the failure mode the whole design
+    /// exists to avoid.
+    ///
+    /// # Why BOTH stores, and not the mirror alone (R2-B1)
+    ///
+    /// The first cut read the mirror only, on the sound reasoning that the
+    /// mirror is `fsync`'d and is the store that lost nothing on 2026-08-08.
+    /// That is right about the LOSS row and wrong about the ACKNOWLEDGEMENT,
+    /// and the gap made the Acknowledge button inert in the one scenario it
+    /// exists for:
+    ///
+    /// 1. A real truncation costs the DB its WAL-resident rows, so on the next
+    ///    boot the **DB head REGRESSES**. The mirror is append-only, so it
+    ///    keeps the higher seq.
+    /// 2. The mirror is now AHEAD of the DB, and
+    ///    [`aberp_audit_ledger::sync_mirror`] answers that with
+    ///    `MirrorDivergent` — it appends **nothing**.
+    /// 3. [`WriteGuard::drop`] only `warn!`s on a failed mirror sync, so the
+    ///    mirror stays frozen for the rest of the process: every audit row
+    ///    written after the incident is refused, including the
+    ///    acknowledgement. (R3-N2: within a process, not permanently. Serve's
+    ///    boot reconcile attempts a gated auto-heal that replays the DB up to
+    ///    the mirror head and un-freezes it — or refuses, in which case serve
+    ///    does not boot.)
+    /// 4. The ack still commits to the DB and the route still returns 200, so
+    ///    the operator watches the banner drop and believes it is done — and
+    ///    the next boot, reading the mirror alone, re-raises it. Forever.
+    ///
+    /// So each store is consulted for what it is actually authoritative about:
+    /// the **mirror** survives a truncation and is where the loss lives; the
+    /// **DB** is what still accepts writes afterwards and is where the ack
+    /// lives. Reading both needs no new artifact and no new failure mode.
+    ///
+    /// With the boot reconcile in the picture (R3-N2) the DB half is
+    /// **defence in depth** rather than the common path: after a healed boot
+    /// the mirror takes appends again and would carry the ack by itself. The
+    /// window the DB half still covers is real but narrow — a mid-process
+    /// `sync_mirror` divergence, and the span between an acknowledgement and
+    /// the next boot's reconcile. It is pinned directly by
+    /// `an_ack_that_reached_only_the_db_still_clears_a_loss_that_reached_only_the_mirror`.
+    ///
+    /// # The rule
+    ///
+    /// Raise the alert iff a `db.durability_loss_detected` exists in either
+    /// store AND no `db.durability_alert_acknowledged` in either store is
+    /// **strictly newer** than it.
+    ///
+    /// Ordering is by RFC3339 `time_wall`, not by `seq`. `seq` cannot do it:
+    /// after the regression above the two stores' sequence spaces overlap, so a
+    /// DB ack at seq 12 may post-date a mirror loss at seq 40. A lexicographic
+    /// string compare cannot do it either — `time`'s Rfc3339 emits
+    /// variable-precision fractional seconds, so `…:00.5Z` sorts ABOVE
+    /// `…:00.5000001Z`. Both stores format this field identically, so parsing
+    /// and comparing instants is exact.
+    ///
+    /// A TIE keeps the banner UP. An ack is always causally after the loss it
+    /// answers, so equal instants mean a clock too coarse to distinguish them —
+    /// and the safe reading of "I cannot tell" is that the loss stands.
+    ///
+    /// # Failure posture
+    ///
+    /// Best-effort and quiet: a missing mirror (a fresh tenant) is the normal
+    /// case, and an unreadable one is logged, not fatal. This must never stop
+    /// `serve` booting — refusing to boot over a *historical* warning would
+    /// turn a durability alert into an outage.
+    ///
+    /// The mirror read goes through [`aberp_audit_ledger::read_mirror_under_tail_policy`]
+    /// (R2-B2), the same reader the boot reconciler uses, NOT the strict
+    /// [`aberp_audit_ledger::read_mirror_entries`]. The strict one rejects an
+    /// unterminated final line — the commonest crash artifact there is, and
+    /// precisely the condition most likely to co-occur with a durability
+    /// incident — which would have made a torn tail silently swallow the alarm.
+    /// The tail policy hands back the chain-reverified intact prefix instead.
+    pub fn restore_durability_alert_from_mirror(&self) {
+        let mirror_rows = self.mirror_audit_times();
+        let db_rows = self.db_audit_times();
+
+        // Newest of each kind across BOTH stores.
+        let newest = |a: Option<OffsetDateTime>, b: Option<OffsetDateTime>| match (a, b) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (x, y) => x.or(y),
+        };
+        let loss = newest(mirror_rows.loss, db_rows.loss);
+        let ack = newest(mirror_rows.ack, db_rows.ack);
+
+        let Some(loss) = loss else { return };
+        // Strictly newer, so a tie keeps the banner up (see the docs).
+        if ack.is_some_and(|a| a > loss) {
+            tracing::info!(
+                db = %self.db_path.display(),
+                "aberp-db: ADR-0110 D7 — a past durability loss is recorded, and an operator \
+                 acknowledgement post-dates it; the banner stays down"
+            );
+            return;
+        }
+
+        let message = format!(
+            "Durability loss detected on the tenant database (recorded {}). Recent writes may \
+             not have reached disk. Stop and recover. This alert survived a restart and stays \
+             up until it is acknowledged.",
+            loss.format(&Rfc3339)
+                .unwrap_or_else(|_| "at an unreadable time".to_string()),
+        );
+        tracing::error!(
+            db = %self.db_path.display(),
+            "aberp-db: ADR-0110 D7 — RE-RAISING an UNACKNOWLEDGED durability loss found in the \
+             durable audit record. A restart is not an acknowledgement."
+        );
+        let mut slot = match self.durability_alert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                self.durability_alert.clear_poison();
+                poisoned.into_inner()
+            }
+        };
+        slot.get_or_insert(DurabilityAlert {
+            // Re-derived: the machine breach code is not cheaply readable from
+            // either store (the mirror base64-encodes the payload). WalVanished
+            // is the shape the 00012 mechanism produces and the one the message
+            // describes.
+            breach: WalBreach::WalVanished,
+            message,
+            detected_at: SystemTime::now(),
+        });
+    }
+
+    /// Newest `time_wall` of each durability kind in the audit MIRROR.
+    ///
+    /// Tail-tolerant (R2-B2): a torn trailing line yields the intact prefix
+    /// rather than an error, because the alarm must survive the crash artifact
+    /// most likely to accompany the incident that raised it.
+    fn mirror_audit_times(&self) -> DurabilityAuditTimes {
+        use aberp_audit_ledger::MirrorTailPolicy;
+        let entries = match aberp_audit_ledger::read_mirror_under_tail_policy(&self.mirror_path) {
+            Ok(MirrorTailPolicy::Clean(e)) => e,
+            Ok(MirrorTailPolicy::TornTail { entries, .. }) => {
+                tracing::warn!(
+                    mirror = %self.mirror_path.display(),
+                    intact_entries = entries.len(),
+                    "aberp-db: ADR-0110 D7 — the audit mirror has a TORN TRAILING LINE; \
+                     re-deriving the durability alert from the chain-reverified intact prefix. \
+                     Not trimming here — that is the boot reconciler's job."
+                );
+                entries
+            }
+            Ok(MirrorTailPolicy::DeepCorrupt { reason }) => {
+                tracing::error!(
+                    reason = %reason,
+                    mirror = %self.mirror_path.display(),
+                    "aberp-db: ADR-0110 D7 — the audit mirror is DEEPLY corrupt, so it cannot be \
+                     consulted for a durability alert. The DB is still checked below."
+                );
+                Vec::new()
+            }
+            Err(e) => {
+                // A fresh tenant has no mirror yet; that is not news.
+                if !matches!(&e, aberp_audit_ledger::AppendError::MirrorIo(io)
+                    if io.kind() == std::io::ErrorKind::NotFound)
+                {
+                    tracing::warn!(
+                        error = %e,
+                        mirror = %self.mirror_path.display(),
+                        "aberp-db: ADR-0110 D7 — could not read the audit mirror to re-derive a \
+                         durability alert. The DB is still checked below."
+                    );
+                }
+                Vec::new()
+            }
+        };
+        let newest_of = |kind: EventKind| -> Option<OffsetDateTime> {
+            entries
+                .iter()
+                .filter(|e| e.kind == kind.as_str())
+                .filter_map(|e| OffsetDateTime::parse(&e.time_wall, &Rfc3339).ok())
+                .max()
+        };
+        DurabilityAuditTimes {
+            loss: newest_of(EventKind::DbDurabilityLossDetected),
+            ack: newest_of(EventKind::DbDurabilityAlertAcknowledged),
+        }
+    }
+
+    /// Newest `time_wall` of each durability kind in the live DB.
+    ///
+    /// This is the half that makes the Acknowledge button work after a real
+    /// loss: post-incident the mirror is frozen (`MirrorDivergent`), so the DB
+    /// is the only store still accepting the acknowledgement.
+    ///
+    /// Deliberately a narrow per-kind `SELECT` rather than
+    /// [`aberp_audit_ledger::Ledger::entries`]: building a `Ledger` VERIFIES
+    /// the hash chain, and the tenant we are booting has just had rows
+    /// truncated out from under it — the one situation where a chain verify is
+    /// expected to fail. Re-deriving an alert must not depend on the chain
+    /// being intact, precisely because the alert means it may not be.
+    ///
+    /// # R3-N1 — SELECT the rows, PARSE each, then `.max()`. Never `SQL MAX`.
+    ///
+    /// `time_wall` is a **VARCHAR**, so `SELECT MAX(time_wall)` is a
+    /// LEXICOGRAPHIC max — exactly the comparison the `time` dependency and its
+    /// Cargo.toml note exist to avoid, reintroduced in SQL. `time`'s Rfc3339
+    /// trims trailing zeros, so the two orders disagree on ordinary
+    /// same-second stamps: `"…10:00:00Z"` sorts ABOVE `"…10:00:00.9Z"` because
+    /// `'Z'` (0x5A) > `'.'` (0x2E).
+    ///
+    /// It failed toward **banner down**, twice over. MAX could hand back an
+    /// older loss row and let an earlier acknowledgement out-rank it; and
+    /// because MAX collapses the column BEFORE anything is parsed, a single
+    /// malformed stamp that won the string compare was selected, failed to
+    /// parse, and took the entire DB-side loss verdict with it — good rows
+    /// included. Parsing first makes one bad row cost exactly that row.
+    fn db_audit_times(&self) -> DurabilityAuditTimes {
+        let mut out = DurabilityAuditTimes::default();
+        let conn = match self.read() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    db = %self.db_path.display(),
+                    "aberp-db: ADR-0110 D7 — could not read the DB to re-derive a durability \
+                     alert; falling back to the audit mirror alone"
+                );
+                return out;
+            }
+        };
+        let newest_of = |kind: EventKind| -> Option<OffsetDateTime> {
+            let mut stmt = conn
+                .prepare("SELECT time_wall FROM audit_ledger WHERE kind = ?")
+                .ok()?;
+            let rows = stmt
+                .query_map([kind.as_str()], |row| row.get::<_, String>(0))
+                .ok()?;
+            rows.filter_map(|r| r.ok())
+                // Parse EACH row and drop only the ones that will not parse —
+                // the same shape `mirror_audit_times` uses.
+                .filter_map(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
+                .max()
+        };
+        out.loss = newest_of(EventKind::DbDurabilityLossDetected);
+        out.ack = newest_of(EventKind::DbDurabilityAlertAcknowledged);
+        out
+    }
+
+    /// Record a fired fence three ways — log, sticky alert, audit row — and
+    /// return the error the money path will surface.
+    ///
+    /// Ervin's decision (2026-08-12): the app KEEPS SERVING. No sticky write
+    /// refusal, no process abort. This ack fails loudly because its own
+    /// durability is genuinely unknown; the persistence lives in the alert and
+    /// the audit row, not in a latch that poisons every later write.
+    fn raise_durability_alert(&self, breach: Breach) -> DbError {
+        tracing::error!(
+            db = %self.db_path.display(),
+            wal = %self.wal_path.display(),
+            breach = breach.kind.code(),
+            expected = breach.expected,
+            observed = breach.observed,
+            "aberp-db: ADR-0110 D7 DURABILITY LOSS DETECTED — {}. A foreign DuckDB opener \
+             folded and truncated this Handle's WAL; commits since then may have returned Ok \
+             without reaching stable storage. The app keeps serving; the operator alert is \
+             sticky until explicitly cleared.",
+            breach.kind
+        );
+
+        let message = format!(
+            "Durability loss detected on the tenant database: {}. \
+             Recent writes may not have reached disk. Stop and recover.",
+            breach.kind
+        );
+        {
+            let mut slot = match self.durability_alert.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    self.durability_alert.clear_poison();
+                    poisoned.into_inner()
+                }
+            };
+            // Keep the FIRST detection: the operator needs to know when the
+            // tenant started losing writes, not when it last did.
+            slot.get_or_insert(DurabilityAlert {
+                breach: breach.kind,
+                message,
+                detected_at: SystemTime::now(),
+            });
+        }
+
+        self.emit_durability_loss_audit(breach);
+
+        DbError::WalTruncatedUnderWriter {
+            breach: breach.kind,
+            db: self.db_path.clone(),
+            wal: self.wal_path.clone(),
+            expected: breach.expected,
+            observed: breach.observed,
+        }
+    }
+
+    /// Append the `db.durability_loss_detected` forensic row.
+    ///
+    /// Best-effort by contract, and the contract is honest about why: the DB we
+    /// are writing into is the one whose WAL just got truncated, so this row
+    /// may itself not survive. It is still worth writing, because
+    /// [`WriteGuard::drop`] runs the lockstep [`aberp_audit_ledger::sync_mirror`]
+    /// on the way out and the mirror IS `fsync`'d — the mirror is the store that
+    /// lost nothing on 2026-08-08. So the durable copy of "we detected a
+    /// durability loss" lands in the mirror even when the DB copy does not.
+    ///
+    /// Takes the writer lock, which [`Self::durable_ack`] otherwise never does.
+    /// That is safe here and only here: it runs on the breach path only, long
+    /// after the caller's guard has dropped (the D3 contract, gated by
+    /// `tools/cut_gate_durable_ack.sh`), so the healthy ack path is bit-for-bit
+    /// unchanged and the re-entrancy tripwire is not in play.
+    ///
+    /// Payload interpolations are a `&'static str` and three `u64`s — nothing
+    /// from a path or an operator — so the hand-formatted JSON cannot be
+    /// injected into, the same posture as [`Self::emit_poison_recovery_audit`].
+    fn emit_durability_loss_audit(&self, breach: Breach) {
+        let guard = match self.write() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    db = %self.db_path.display(),
+                    "aberp-db: durability-loss audit row SKIPPED (writer unavailable); the \
+                     detection itself was logged loudly and the sticky alert is set"
+                );
+                return;
+            }
+        };
+        let probe = match guard.try_clone() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    db = %self.db_path.display(),
+                    "aberp-db: durability-loss audit row SKIPPED (try_clone failed); the \
+                     detection itself was logged loudly and the sticky alert is set"
+                );
+                return;
+            }
+        };
+        let mut ledger = Ledger::from_connection(
+            probe,
+            self.meta.tenant_id().clone(),
+            BinaryHash::from_bytes([0u8; 32]),
+        );
+        // The head seq at the moment of detection — the forensic anchor for
+        // "which rows are in doubt". `recent(1)` is a single indexed read, not
+        // the genesis→head walk `verify_chain` does.
+        let head_seq = ledger
+            .recent(1)
+            .ok()
+            .and_then(|rows| rows.first().map(|e| e.seq.as_u64()))
+            .unwrap_or(0);
+        let payload = format!(
+            "{{\"trigger\":\"wal_truncated_under_writer\",\"breach\":\"{}\",\
+             \"wal_high_water\":{},\"wal_observed\":{},\"audit_head_seq\":{head_seq}}}",
+            breach.kind.code(),
+            breach.expected,
+            breach.observed,
+        )
+        .into_bytes();
+        let session_id = format!(
+            "aberp-db-durability-loss-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let actor = Actor::from_local_cli(session_id, "system:aberp-db");
+        match ledger.append(EventKind::DbDurabilityLossDetected, payload, actor, None) {
+            Ok(_) => tracing::error!(
+                db = %self.db_path.display(),
+                head_seq,
+                breach = breach.kind.code(),
+                "aberp-db: durability loss AUDITED (db.durability_loss_detected)"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                db = %self.db_path.display(),
+                "aberp-db: durability-loss audit-row append FAILED (non-fatal; the detection \
+                 was logged loudly and the sticky alert is set)"
+            ),
+        }
+        // Explicit: the guard's drop runs the lockstep mirror sync that gets
+        // this row onto fsync'd storage, which is the whole point of writing it.
+        drop(guard);
     }
 
     /// Acquire the **serialized writer** over the shared instance. The returned
@@ -659,6 +1664,13 @@ impl Handle {
         //     transaction / indeterminate. Drop and reopen FRESH on the same live
         //     inode so recovery starts clean. A failure to reopen IS a hard error
         //     (the DB genuinely will not open) and propagates via `?`.
+        //
+        //     ADR-0110 D7: dropping the last connection destroys the DuckDB
+        //     `Database`, and the reopen REPLAYS the WAL and may fold it. That
+        //     is the one shrink this Handle is allowed to cause, so declare it
+        //     — otherwise the fence would read our own recovery as the foreign
+        //     truncation it exists to catch, and nag on a box that is fine.
+        self.note_self_fold();
         inner.conn = None;
         self.ensure_open(inner)?;
 
@@ -778,6 +1790,11 @@ impl Handle {
     /// ever reached with `checkpoint_enabled == true` before H4 wires the real
     /// fold, that is a wiring bug: log LOUD and fold NOTHING, but keep the
     /// debouncer window consistent so we do not hot-loop.
+    ///
+    /// **H4 MUST call [`Self::note_self_fold`] before the quiesce.** The real
+    /// fold shrinks the WAL, and ADR-0110 D7's fence treats an undeclared
+    /// shrink as a foreign truncation. The stub does NOT call it, correctly:
+    /// it folds nothing, so there is nothing to declare.
     fn run_durable_checkpoint_locked(&self, inner: &mut Inner) {
         tracing::error!(
             db = %self.db_path.display(),
@@ -797,6 +1814,52 @@ impl Handle {
 /// `aberp_snapshot::crash_safe`: that helper is private, and `aberp-snapshot`
 /// is intentionally NOT a dependency of this crate (see the Cargo.toml note).
 /// One three-line path join does not justify inverting that.
+/// ADR-0110 D7 — the fence predicate, pulled out of
+/// [`Handle::observe_durable_set`] so the four rules read as four rules.
+///
+/// Ordered most-specific-first, and each arm is written so that "we have no
+/// prior knowledge" falls through to `None`. A fence that fires on ignorance
+/// would nag a healthy box, and an alarm that cries wolf is an alarm the
+/// operator learns to dismiss — which costs more than not having it.
+fn detect_breach(
+    mark: &WalMark,
+    wal_present: bool,
+    wal_len: u64,
+    wal_id: Option<FileId>,
+    main_id: Option<FileId>,
+) -> Option<WalBreach> {
+    // 1. The WAL is gone and we had seen bytes in it. THE 00012 SHAPE. Pre-D7
+    //    this was the `if wal_path.exists()` skip on the way to `Ok(())`.
+    //    Guarded on a non-zero high-water, so a Handle that has never written
+    //    a WAL byte (a boot, a read-only process) cannot trip on its absence.
+    if !wal_present && mark.wal_high_water > 0 {
+        return Some(WalBreach::WalVanished);
+    }
+    // 2. The WAL is present but SHORTER than we have already seen it. Under the
+    //    F-A pragmas the WAL is append-only, so this cannot happen to us.
+    if wal_present && wal_len < mark.wal_high_water {
+        return Some(WalBreach::WalShrank);
+    }
+    // 3. Same name, different inode: a truncate-and-recreate that byte counts
+    //    alone would sail straight past. Only checked when BOTH sides are
+    //    known — an unknown prior, or a non-unix target, means "not checked".
+    if let (Some(seen), Some(now)) = (mark.wal_id, wal_id) {
+        if seen != now {
+            return Some(WalBreach::WalReplaced);
+        }
+    }
+    // 4. The main file was swapped under the running Handle. Note the `Some`
+    //    on both sides again: a main file that is merely UNREADABLE is not an
+    //    identity change, and is left to the `fsync`'s own `ENOENT` so it keeps
+    //    reporting as the `DurableAck` error it has always been.
+    if let (Some(seen), Some(now)) = (mark.main_id, main_id) {
+        if seen != now {
+            return Some(WalBreach::MainReplaced);
+        }
+    }
+    None
+}
+
 fn wal_path_for(db_path: &Path) -> PathBuf {
     let mut name = db_path.as_os_str().to_os_string();
     name.push(".wal");
@@ -923,6 +1986,22 @@ impl Drop for WriteGuard<'_> {
             }
         }
 
+        // ADR-0110 D7 — SAMPLE THE WATERMARK. Here, and not in `durable_ack`
+        // alone, because this is the ordered point: writes are serialized
+        // behind the guard we are dropping, the transaction has committed, and
+        // the WAL bytes it produced are on the file. An ack-time sample by
+        // itself would be blind to a truncation that happened BETWEEN two
+        // writes — the intervening commit re-creates a small, self-consistent
+        // WAL and the loss reads as normal. The high-water this records is what
+        // remembers otherwise.
+        //
+        // Gated with the ack's own check (B1). With the fence disarmed — the
+        // shipping default — this guard drop is bit-for-bit what it was before
+        // D7: no `stat`, no watermark mutex, nothing added to the hot path.
+        if handle.config.wal_fence_enabled {
+            handle.observe_durable_set();
+        }
+
         // DEBOUNCED durable checkpoint (D2). Mark dirty, then fire only if the
         // coalescing window allows AND the checkpoint is enabled. H3: disabled,
         // so the branch never runs (the H4 seam — see
@@ -942,5 +2021,296 @@ impl Drop for WriteGuard<'_> {
         // never re-acquiring, so it is safe). Debug/test only.
         #[cfg(debug_assertions)]
         Handle::deregister_write_held(handle.id);
+    }
+}
+
+/// ADR-0110 D7 — deterministic unit pins for the fence PREDICATE.
+///
+/// The filesystem-level pins live in `tests/adr0110_d7_wal_fence.rs`, and they
+/// carry the acceptance argument. These cover what a wall-clock integration
+/// test cannot reach honestly: the exact table of watermark-vs-observed
+/// combinations, including the ones that must stay SILENT. A false positive is
+/// the failure mode that would make an operator learn to ignore the banner, so
+/// the silent cases are pinned one by one rather than sampled.
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+
+    /// A seeded scratch tenant DB under `$TMPDIR`. Returns `(dir, db_path)`.
+    fn scratch_db(tag: &str) -> (std::path::PathBuf, PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "aberp-d7-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let db = dir.join("aberp.duckdb");
+        {
+            let c = Connection::open(&db).expect("seed open");
+            aberp_audit_ledger::ensure_schema(&c).expect("schema");
+        }
+        (dir, db)
+    }
+
+    fn id(ino: u64) -> Option<FileId> {
+        Some(FileId { dev: 1, ino })
+    }
+
+    /// A watermark that has seen a 1000-byte WAL on inode 10 and a main file on
+    /// inode 20 — a Handle mid-flight on a healthy tenant.
+    fn mid_flight() -> WalMark {
+        WalMark {
+            wal_high_water: 1000,
+            wal_id: id(10),
+            main_id: id(20),
+            folded_by_us: false,
+            breach: None,
+        }
+    }
+
+    #[test]
+    fn a_fresh_watermark_cannot_fire_on_anything() {
+        // THE BOOT CASE, exhaustively: a Handle that has observed nothing has no
+        // "before", and a fence without a before must stay silent whatever it
+        // finds — a missing WAL, a huge WAL, any inode at all.
+        let fresh = WalMark::default();
+        assert_eq!(detect_breach(&fresh, false, 0, None, None), None);
+        assert_eq!(detect_breach(&fresh, true, 999_999, id(7), id(8)), None);
+        assert_eq!(detect_breach(&fresh, false, 0, None, id(8)), None);
+    }
+
+    #[test]
+    fn growth_is_never_a_breach() {
+        // The single most likely false positive: a concurrent daemon commit
+        // grows the WAL between a money path's sample and its ack.
+        let m = mid_flight();
+        assert_eq!(detect_breach(&m, true, 1000, id(10), id(20)), None);
+        assert_eq!(detect_breach(&m, true, 1001, id(10), id(20)), None);
+        assert_eq!(detect_breach(&m, true, u64::MAX, id(10), id(20)), None);
+    }
+
+    #[test]
+    fn the_four_breaches_are_each_detected_and_classified() {
+        let m = mid_flight();
+        // The 00012 shape: folded away entirely.
+        assert_eq!(
+            detect_breach(&m, false, 0, None, id(20)),
+            Some(WalBreach::WalVanished)
+        );
+        // Folded and re-created smaller.
+        assert_eq!(
+            detect_breach(&m, true, 999, id(10), id(20)),
+            Some(WalBreach::WalShrank)
+        );
+        // Truncated and re-created at the same size — bytes alone would miss it.
+        assert_eq!(
+            detect_breach(&m, true, 1000, id(11), id(20)),
+            Some(WalBreach::WalReplaced)
+        );
+        // The live file swapped under us.
+        assert_eq!(
+            detect_breach(&m, true, 1000, id(10), id(21)),
+            Some(WalBreach::MainReplaced)
+        );
+    }
+
+    #[test]
+    fn an_unknown_side_is_never_an_identity_breach() {
+        // "We cannot tell" must resolve to silence, not to an alarm. This is the
+        // non-unix path (`file_id` returns `None`) and the first-observation
+        // path, and it is why both identity rules test `Some` on BOTH sides.
+        let m = mid_flight();
+        assert_eq!(detect_breach(&m, true, 1000, None, None), None);
+        let no_prior = WalMark {
+            wal_id: None,
+            main_id: None,
+            ..mid_flight()
+        };
+        assert_eq!(detect_breach(&no_prior, true, 1000, id(99), id(99)), None);
+    }
+
+    #[test]
+    fn a_main_file_that_merely_vanished_is_left_to_the_fsync() {
+        // `durable_ack_fault_injection.rs` deletes the main DB file and requires
+        // `DbError::DurableAck` naming it. The fence must not intercept that and
+        // relabel it as a WAL truncation: "I could not open it" and "it is not
+        // the file I wrote to" are different facts and the operator acts on them
+        // differently.
+        let m = mid_flight();
+        assert_eq!(detect_breach(&m, true, 1000, id(10), None), None);
+    }
+
+    /// The `folded_by_us` escape hatch, end to end on a real Handle.
+    ///
+    /// Honest note on why this is a unit test and not an integration one: the
+    /// only production drop-and-reopen (post-poison recovery) does NOT in fact
+    /// fold on the pinned libduckdb 1.5.3 — measured 2026-08-12, the WAL GREW
+    /// 1270 → 2118 bytes across a recovery, because the F-A pragmas are on the
+    /// connection being closed and the reopen's replay does not truncate. So
+    /// `Handle::note_self_fold`'s call site there is INSURANCE against an engine
+    /// behaviour we do not control, not a line any integration test can turn
+    /// red. This pins the mechanism itself instead, so H4 — whose fold really
+    /// will shrink the WAL — can rely on it.
+    #[test]
+    fn a_declared_self_fold_re_baselines_instead_of_firing() {
+        let dir = std::env::temp_dir().join(format!(
+            "aberp-d7-selffold-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let db = dir.join("aberp.duckdb");
+        {
+            let c = Connection::open(&db).expect("seed");
+            aberp_audit_ledger::ensure_schema(&c).expect("schema");
+        }
+        let h = Handle::open_default(&db, TenantId::new("selffold".to_string()).unwrap())
+            .expect("open handle");
+
+        // Pretend we have seen a big WAL, then shrink it to nothing.
+        {
+            let mut mark = h.lock_watermark();
+            mark.wal_high_water = 4096;
+            mark.wal_id = Some(FileId { dev: 1, ino: 1 });
+        }
+        // Undeclared: that is a breach.
+        h.observe_durable_set();
+        assert!(
+            h.take_breach().is_some(),
+            "an undeclared shrink from 4096 bytes to nothing MUST latch a breach"
+        );
+
+        // Declared: same shrink, no breach, and the water re-baselines.
+        {
+            let mut mark = h.lock_watermark();
+            mark.wal_high_water = 4096;
+            mark.wal_id = Some(FileId { dev: 1, ino: 1 });
+        }
+        h.note_self_fold();
+        h.observe_durable_set();
+        assert!(
+            h.take_breach().is_none(),
+            "a fold this Handle DECLARED is the one legitimate shrink and must not fire"
+        );
+        assert_eq!(
+            h.lock_watermark().wal_high_water,
+            0,
+            "a declared fold must RE-BASELINE the high-water, not leave a stale one behind that \
+             fires on the very next observation"
+        );
+        assert!(
+            !h.lock_watermark().folded_by_us,
+            "the flag is single-shot: it must be consumed by the observation it excuses"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **R2-N1 — the disarmed fence must not even LOOK.**
+    ///
+    /// The integration test of the same name could only assert
+    /// `durability_alert().is_none()`, which holds whether or not the watermark
+    /// was sampled — un-gating `observe_durable_set` in `WriteGuard::drop` left
+    /// all thirteen fence tests green. It was vacuous exactly where it mattered.
+    ///
+    /// The risk it was meant to cover is a landmine for whoever flips the flag
+    /// on: with the fence disarmed `durable_ack` never calls `take_breach`, so a
+    /// breach latched by an un-gated sampler would sit in the watermark
+    /// indefinitely and fire on the first ack after the flag goes true — an
+    /// alarm about a truncation that happened days earlier, on a process that
+    /// has been running fine since.
+    ///
+    /// This is a crate-internal test so it can read the private watermark
+    /// directly, which is the only way to assert "nothing was sampled" rather
+    /// than "nothing surfaced".
+    #[test]
+    fn a_disarmed_fence_leaves_the_watermark_completely_untouched() {
+        let (dir, db) = scratch_db("disarmed-watermark");
+        let h = Handle::open_default(&db, TenantId::new("disarmed".to_string()).unwrap())
+            .expect("open disarmed handle");
+
+        // A committed write — the sampling site in `WriteGuard::drop`.
+        {
+            let g = h.write().expect("writer");
+            g.execute_batch(
+                "CREATE TABLE IF NOT EXISTS probe(x INTEGER); INSERT INTO probe VALUES (1);",
+            )
+            .expect("dirty the WAL");
+        }
+        h.durable_ack().expect("disarmed ack succeeds");
+
+        let mark = h.lock_watermark();
+        assert_eq!(
+            mark.wal_high_water, 0,
+            "R2-N1 REGRESSION: a DISARMED fence sampled the WAL high-water. Disarmed must mean \
+             the guard drop is bit-for-bit pre-D7 — no stat, no watermark mutex, nothing on the \
+             hot path of every committed write in the process."
+        );
+        assert!(
+            mark.wal_id.is_none() && mark.main_id.is_none(),
+            "R2-N1 REGRESSION: a DISARMED fence recorded file identities"
+        );
+        assert!(
+            mark.breach.is_none(),
+            "R2-N1 REGRESSION: a DISARMED fence LATCHED a breach. Nothing consumes that latch \
+             while the flag is false, so it would sit there and fire on the first ack after \
+             someone flips the flag on — an alarm about a truncation from days ago, on a \
+             process that has been healthy since."
+        );
+        drop(mark);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The armed counterpart, so the test above cannot pass because the
+    /// watermark is simply never populated by anything.
+    #[test]
+    fn an_armed_fence_does_populate_the_watermark() {
+        let (dir, db) = scratch_db("armed-watermark");
+        let h = Handle::open(
+            &db,
+            TenantId::new("armed".to_string()).unwrap(),
+            HandleConfig {
+                wal_fence_enabled: true,
+                ..Default::default()
+            },
+        )
+        .expect("open armed handle");
+        {
+            let g = h.write().expect("writer");
+            g.execute_batch(
+                "CREATE TABLE IF NOT EXISTS probe(x INTEGER); INSERT INTO probe VALUES (1);",
+            )
+            .expect("dirty the WAL");
+        }
+        let mark = h.lock_watermark();
+        assert!(
+            mark.wal_high_water > 0,
+            "an ARMED fence must sample the WAL at the guard drop — if it does not, the \
+             disarmed test above proves nothing"
+        );
+        drop(mark);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Taking a breach CLEARS it. This is the "keep serving, do not degrade to
+    /// forget" hinge: leave it latched and every later ack re-reports the same
+    /// historical truncation, which is the sticky write refusal that was
+    /// explicitly ruled out; clear it without recording and the loss is
+    /// forgotten. The alert and the audit row are what carry it forward.
+    #[test]
+    fn taking_a_breach_clears_the_latch() {
+        let m = WalMark {
+            breach: Some(Breach {
+                kind: WalBreach::WalVanished,
+                expected: 1000,
+                observed: 0,
+            }),
+            ..mid_flight()
+        };
+        let mut m = m;
+        assert!(m.breach.take().is_some());
+        assert!(m.breach.take().is_none(), "the latch is single-shot");
     }
 }

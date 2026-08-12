@@ -798,6 +798,14 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // Prod incident 2026-08-03 — boot index-rebuild telemetry
         // (`{"indexes_rebuilt":N,"elapsed_ms":N}`). App-layer JSON, no NAV bytes.
         | EventKind::DbIndexesRebuilt
+        // ADR-0110 D7 — the Handle's WAL fence fired
+        // (`db.durability_loss_detected`). `db.`-scoped; the payload is fence
+        // telemetry (breach code + the watermark/observed byte counts + the
+        // audit head seq), never NAV bytes.
+        | EventKind::DbDurabilityLossDetected
+        // ADR-0110 D7 / B2 — the operator acknowledged a durability alert.
+        // `db.`-scoped consent record, no NAV bytes.
+        | EventKind::DbDurabilityAlertAcknowledged
         // S220 / PR-217 — buyer-backfill cycle event. `system.`-scoped;
         // the payload carries cycle counters, not NAV bytes (the
         // per-row NAV bytes ride the row's NULL→filled customer_name
@@ -1224,7 +1232,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 189,
+        EventKind::ALL_KINDS_COUNT == 191,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

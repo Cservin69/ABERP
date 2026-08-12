@@ -34,6 +34,17 @@ pub async fn acknowledge_first_prod_launch(state: State<'_, AppState>) -> Result
     forward_post(&state, "/health/acknowledge-first-prod-launch", Value::Null).await
 }
 
+/// ADR-0110 D7 / B2 — `POST /health/acknowledge-durability-alert`. The red
+/// durability banner's Acknowledge button POSTs here. No body — the backend
+/// appends the permanent, hash-chained `DbDurabilityAlertAcknowledged` audit
+/// entry FIRST and only then clears the sticky flag, so the banner staying up
+/// is the failure mode of a failed append (the safe direction). Returns
+/// `{ acknowledged_at }`.
+#[tauri::command]
+pub async fn acknowledge_durability_alert(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_post(&state, "/health/acknowledge-durability-alert", Value::Null).await
+}
+
 /// `GET /invoices` — authenticated; returns the list shape derived
 /// per ADR-0009 §2.
 #[tauri::command]

@@ -1,6 +1,8 @@
 # ADR-0110 — The durable-commit contract and business-state boot replay
 
-- **Status:** **Partially implemented** — D3 landed 2026-08-09 (rev. 3). D1, D2,
+- **Status:** **Partially implemented** — D3 landed 2026-08-09 (rev. 3); D7 (the
+  WAL-truncation fence, added after incident 00012) landed 2026-08-12 and ships
+  DISARMED pending the PR #3 opener sweep (D7.6). D1, D2,
   D4, D5 and the payload widening remain proposed. Adversarially reviewed
   2026-08-08; verdict *sound after changes*, listed in §11 and folded into
   §5/§6/§7. Rev-3's corrections are in §12.
@@ -567,6 +569,136 @@ business-state replay as the recovery path.**
     negative probes) holds the money-path ack census closed in both directions.
     The static half is the only cover for the three ack sites no unattended test
     can reach — modification, storno, and the AP status change.
+
+- **D7 — The WAL-truncation fence (R1). *(Added 2026-08-12 after incident
+  00012. BUILT, and SHIPPING DARK — see D7.6.)*** D3 made the acked bytes
+  durable; it did not make the ack HONEST. A foreign `Connection::open` on the tenant DB with DuckDB's DEFAULT
+  pragmas — the ADR-0099 GROUP-A shape — folds and truncates the live Handle's
+  WAL when it closes, and every subsequent Handle `commit()` returns `Ok` while
+  reaching no file. D3's `durable_ack` could not see it **by construction**,
+  because it `fsync`s PATHS: after the truncation `<db>.wal` is absent, so
+  `if wal_path.exists()` SKIPPED it, the main-file `fsync` succeeded, and the
+  ack returned `Ok(())`. A green durability light with nothing behind it, and
+  every D3 gate green through it.
+  1. **A watermark on the `Handle`** (`WalMark`), sampled under the writer lock
+     at every `WriteGuard::drop` — right after the lockstep `sync_mirror`, so
+     the sample is ordered against every other write. It carries a **monotone**
+     byte high-water for `<db>.wal`, the `(dev,ino)` of the WAL and of the main
+     file, and a single-shot `folded_by_us` escape hatch for a fold the Handle
+     performs itself. Sampling at the drop and not only at the ack is what lets
+     it see a truncation that happened BETWEEN two writes: the intervening
+     commit re-creates a small, self-consistent WAL that an ack-time
+     stat-and-compare would read as healthy.
+  2. **A fence at the top of `durable_ack`.** WAL gone below a non-zero
+     high-water, WAL shorter than the high-water, WAL inode changed, or main
+     file inode changed → `DbError::WalTruncatedUnderWriter`. Line 439's
+     `if wal_path.exists()` is no longer where the missing-WAL decision is
+     made.
+  3. **The by-path `fsync` residual (A2) closed.** `fsync_and_record` now
+     `fstat`s the descriptor it opened and refuses to certify an inode the
+     watermark does not recognise — the "`fsync` the wrong inode and report
+     success" hole D3 left.
+  4. **KEEP SERVING, not hard-stop** (Ervin, 2026-08-12). The breach latch is
+     consumed as it is reported, so the app is not bricked and the next ack on
+     a healthy tenant succeeds. What persists is a **sticky
+     `Handle::durability_alert`** plus a `db.durability_loss_detected` audit row
+     (its own `EventKind` — **not** `db.auto_recovered`, which means "we healed
+     it"; nothing is healed here). The audit row rides the lockstep mirror
+     sync, so the durable copy lands in the `fsync`'d mirror even when the DB
+     copy does not.
+  4a. **Keep-serving must not degrade to keep-serving-and-FORGET** *(B2, PR #61
+     adversarial)*. As first built it did: the alert was process memory, the
+     `db.durability_loss_detected` row went into the very database whose WAL had
+     just been truncated, and so **the restart the banner tells the operator to
+     perform was the mute button**. Two changes close it. `Handle::open`
+     re-derives the alert at construction by scanning the surviving `fsync`'d
+     audit mirror — the alert is up exactly while the newest
+     `db.durability_loss_detected` out-ranks the newest
+     `db.durability_alert_acknowledged`. And `POST
+     /health/acknowledge-durability-alert` lets the operator clear it *without*
+     a restart, appending the hash-chained acknowledgement FIRST and only then
+     clearing the flag, so a failed append leaves the banner up. Clearing is now
+     an attributable act rather than an absence, and it is durable across
+     restarts. Re-derivation is deliberately **not** gated on D7.6's flag: a loss
+     recorded while the fence was armed must survive a boot where it is not.
+  4b. **The acknowledgement is DB-authoritative** *(R2-B1, round-2
+     adversarial)*. B2 as first built read the mirror alone, which made the
+     Acknowledge button **inert in the one scenario it exists for**. A real
+     truncation regresses the DB head below the append-only mirror's, so
+     `sync_mirror` answers `MirrorDivergent` and appends nothing — and
+     `WriteGuard::drop` only `warn!`s, so the mirror is frozen *permanently*.
+     The ack still committed to the DB and still returned 200, so the operator
+     watched the banner drop; the next boot, reading the mirror alone, re-raised
+     it. Forever. Re-derivation now consults **both** stores for what each is
+     authoritative about — the mirror survives a truncation and holds the loss;
+     the DB is what still accepts writes afterwards and holds the ack — and
+     orders them by RFC3339 `time_wall`, because after the regression the two
+     stores' `seq` spaces overlap. A tie keeps the banner up.
+  4c. **A torn mirror tail must not blind the alarm** *(R2-B2)*. The
+     re-derivation reads through `read_mirror_under_tail_policy` (the boot
+     reconciler's reader), not the strict `read_mirror_entries`, which rejects
+     an unterminated final line — the commonest crash artifact there is, and
+     precisely the condition most likely to co-occur with a durability incident.
+  4d. **Residual — CORRECTED, and much narrower than rev-1 of this bullet
+     claimed** *(R3-N2, round-3 adversarial)*. The first write-up said a second
+     loss after a frozen mirror leaves no durable trace, and pinned a test to
+     that effect. Both were wrong, because they assumed the mirror stays frozen.
+     It does not: serve's boot mirror-reconcile
+     (`ensure_consistent_with_db`, run BEFORE the Handle opens) attempts a
+     **gated auto-heal** on every boot and, on success, replays the DB up to the
+     mirror head — which brings the DB level again and **un-freezes**
+     `sync_mirror`. So the acknowledgement and every later loss row do reach the
+     mirror, and a second loss DOES re-raise across a restart. That is now
+     pinned positively by
+     `a_second_loss_after_an_acknowledged_one_re_raises_across_a_restart`; the
+     old test passed only because its harness skipped the reconcile, i.e. it
+     pinned a state production never reaches.
+     What genuinely remains is the window inside a **single process that never
+     restarts between the two incidents** — and there the in-session banner is
+     up the whole time, so the operator is not blind. **D5**
+     (`MirrorDivergent` becomes a loud audited fault rather than a `warn!`) is
+     still right on its own merits; it should not be re-prioritised on the
+     strength of this residual, which is what the previous over-broad wording
+     would have caused.
+  4e. **"Keep serving" does not extend to the NEXT boot** *(R3-N3)*. The
+     keep-serving decision (D7.4) governs the running process. Boot is governed
+     by the pre-existing H1 preserve-and-refuse posture instead: if the gated
+     auto-heal REFUSES — the chain fails the in-tx full genesis→head re-verify,
+     as opposed to merely being short — `ensure_consistent_with_db` returns
+     `MirrorAheadOfDb`, the ahead mirror is preserved to a side file, and
+     **`serve` exits non-zero and does not boot**. Stated here because a D7
+     reader arrives expecting "the app keeps running" and that promise stops at
+     the process boundary: a tenant whose audit chain no longer verifies is
+     refused, loudly, rather than served.
+  5. **The operator channel.** The alert is surfaced on `GET /health` as
+     `durability_alert` (always present, explicitly `null` when quiet) and the
+     SPA renders a full-width, high-contrast red banner above the topbar,
+     outside every `viewMode` branch, with no dismiss control. Deliberately
+     off-palette — ADR-0017's ambient language is overridden for this one
+     element, because the keep-serving decision above rests entirely on the
+     operator seeing it.
+  6. **The fence SHIPS DISARMED** (`HandleConfig::wal_fence_enabled`, default
+     `false`) *(B1, PR #61 adversarial)*. Three foreign GROUP-A openers are
+     still live in-serve — `calibration_overview_request`,
+     `resolve_recipient_email`, `handle_quote_pipeline_status` — plus the
+     CLI-against-live openers, and each truncates the WAL on close. With the
+     fence armed *before* that sweep, opening the quote-calibration overview or
+     emailing an invoice arms a breach, and the next issuance or mark-paid then
+     fails its `durable_ack` — a failure that PROPAGATES, because the D3-C
+     cut-gate enforces exactly that. A committed invoice would report as failed
+     with its NAV handoff skipped. That is strictly worse than the silent bug
+     being detected, so the detection lands dark and the flag flips in a
+     one-line PR once **PR #3** has swept the openers. **The real loss-stopper
+     is the sweep; D7 is the belt-and-suspenders alarm that is safe to arm
+     after it.** Both flag states are pinned.
+  - **Naming note.** This is D7, not D4: **D4 already means "boot must stop
+    folding blind"** and remains unbuilt and H4-dependent. The two are
+    unrelated — D4 is about the boot openers' pragma posture, D7 is about
+    detecting a runtime truncation after the fact.
+  - **Not a coverage claim.** The fence detects a truncation that has ALREADY
+    happened; it does not prevent one. The prevention work is the GROUP-A
+    opener sweep (`calibration_overview_request`, `resolve_recipient_email`,
+    `handle_quote_pipeline_status` are still open) and D4.
 
 ---
 
