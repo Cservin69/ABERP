@@ -1113,9 +1113,13 @@ impl Handle {
     /// 2. The mirror is now AHEAD of the DB, and
     ///    [`aberp_audit_ledger::sync_mirror`] answers that with
     ///    `MirrorDivergent` — it appends **nothing**.
-    /// 3. [`WriteGuard::drop`] only `warn!`s on a failed mirror sync. So the
-    ///    mirror is frozen **permanently**: every audit row written after the
-    ///    incident is refused, including the acknowledgement.
+    /// 3. [`WriteGuard::drop`] only `warn!`s on a failed mirror sync, so the
+    ///    mirror stays frozen for the rest of the process: every audit row
+    ///    written after the incident is refused, including the
+    ///    acknowledgement. (R3-N2: within a process, not permanently. Serve's
+    ///    boot reconcile attempts a gated auto-heal that replays the DB up to
+    ///    the mirror head and un-freezes it — or refuses, in which case serve
+    ///    does not boot.)
     /// 4. The ack still commits to the DB and the route still returns 200, so
     ///    the operator watches the banner drop and believes it is done — and
     ///    the next boot, reading the mirror alone, re-raises it. Forever.
@@ -1124,6 +1128,14 @@ impl Handle {
     /// the **mirror** survives a truncation and is where the loss lives; the
     /// **DB** is what still accepts writes afterwards and is where the ack
     /// lives. Reading both needs no new artifact and no new failure mode.
+    ///
+    /// With the boot reconcile in the picture (R3-N2) the DB half is
+    /// **defence in depth** rather than the common path: after a healed boot
+    /// the mirror takes appends again and would carry the ack by itself. The
+    /// window the DB half still covers is real but narrow — a mid-process
+    /// `sync_mirror` divergence, and the span between an acknowledgement and
+    /// the next boot's reconcile. It is pinned directly by
+    /// `an_ack_that_reached_only_the_db_still_clears_a_loss_that_reached_only_the_mirror`.
     ///
     /// # The rule
     ///
@@ -1272,12 +1284,28 @@ impl Handle {
     /// loss: post-incident the mirror is frozen (`MirrorDivergent`), so the DB
     /// is the only store still accepting the acknowledgement.
     ///
-    /// Deliberately a narrow `MAX(time_wall) … WHERE kind = ?` rather than
+    /// Deliberately a narrow per-kind `SELECT` rather than
     /// [`aberp_audit_ledger::Ledger::entries`]: building a `Ledger` VERIFIES
     /// the hash chain, and the tenant we are booting has just had rows
     /// truncated out from under it — the one situation where a chain verify is
     /// expected to fail. Re-deriving an alert must not depend on the chain
     /// being intact, precisely because the alert means it may not be.
+    ///
+    /// # R3-N1 — SELECT the rows, PARSE each, then `.max()`. Never `SQL MAX`.
+    ///
+    /// `time_wall` is a **VARCHAR**, so `SELECT MAX(time_wall)` is a
+    /// LEXICOGRAPHIC max — exactly the comparison the `time` dependency and its
+    /// Cargo.toml note exist to avoid, reintroduced in SQL. `time`'s Rfc3339
+    /// trims trailing zeros, so the two orders disagree on ordinary
+    /// same-second stamps: `"…10:00:00Z"` sorts ABOVE `"…10:00:00.9Z"` because
+    /// `'Z'` (0x5A) > `'.'` (0x2E).
+    ///
+    /// It failed toward **banner down**, twice over. MAX could hand back an
+    /// older loss row and let an earlier acknowledgement out-rank it; and
+    /// because MAX collapses the column BEFORE anything is parsed, a single
+    /// malformed stamp that won the string compare was selected, failed to
+    /// parse, and took the entire DB-side loss verdict with it — good rows
+    /// included. Parsing first makes one bad row cost exactly that row.
     fn db_audit_times(&self) -> DurabilityAuditTimes {
         let mut out = DurabilityAuditTimes::default();
         let conn = match self.read() {
@@ -1293,15 +1321,17 @@ impl Handle {
             }
         };
         let newest_of = |kind: EventKind| -> Option<OffsetDateTime> {
-            let raw: Option<String> = conn
-                .query_row(
-                    "SELECT MAX(time_wall) FROM audit_ledger WHERE kind = ?",
-                    [kind.as_str()],
-                    |row| row.get(0),
-                )
-                .ok()
-                .flatten();
-            raw.and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
+            let mut stmt = conn
+                .prepare("SELECT time_wall FROM audit_ledger WHERE kind = ?")
+                .ok()?;
+            let rows = stmt
+                .query_map([kind.as_str()], |row| row.get::<_, String>(0))
+                .ok()?;
+            rows.filter_map(|r| r.ok())
+                // Parse EACH row and drop only the ones that will not parse —
+                // the same shape `mirror_audit_times` uses.
+                .filter_map(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
+                .max()
         };
         out.loss = newest_of(EventKind::DbDurabilityLossDetected);
         out.ack = newest_of(EventKind::DbDurabilityAlertAcknowledged);

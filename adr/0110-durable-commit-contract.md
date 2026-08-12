@@ -639,16 +639,37 @@ business-state replay as the recovery path.**
      reconciler's reader), not the strict `read_mirror_entries`, which rejects
      an unterminated final line — the commonest crash artifact there is, and
      precisely the condition most likely to co-occur with a durability incident.
-  4d. **RESIDUAL, pinned not papered over.** A *second* loss occurring after the
-     mirror has already frozen leaves no durable trace: the mirror refuses it
-     and the DB is the store being truncated. The operator still sees the banner
-     for the whole session; what is lost is the record across a restart, and
-     only on an unrecovered tenant whose previous loss was acknowledged. This is
-     not D7's to fix — once the mirror is frozen there is no durable audit store
-     at all — and **D5** (`MirrorDivergent` becomes a loud, audited fault rather
-     than a `warn!`) is what makes it impossible. Pinned by
-     `known_residual_a_second_loss_after_the_mirror_froze_does_not_survive_a_restart`,
-     which is written to go RED when someone fixes it.
+  4d. **Residual — CORRECTED, and much narrower than rev-1 of this bullet
+     claimed** *(R3-N2, round-3 adversarial)*. The first write-up said a second
+     loss after a frozen mirror leaves no durable trace, and pinned a test to
+     that effect. Both were wrong, because they assumed the mirror stays frozen.
+     It does not: serve's boot mirror-reconcile
+     (`ensure_consistent_with_db`, run BEFORE the Handle opens) attempts a
+     **gated auto-heal** on every boot and, on success, replays the DB up to the
+     mirror head — which brings the DB level again and **un-freezes**
+     `sync_mirror`. So the acknowledgement and every later loss row do reach the
+     mirror, and a second loss DOES re-raise across a restart. That is now
+     pinned positively by
+     `a_second_loss_after_an_acknowledged_one_re_raises_across_a_restart`; the
+     old test passed only because its harness skipped the reconcile, i.e. it
+     pinned a state production never reaches.
+     What genuinely remains is the window inside a **single process that never
+     restarts between the two incidents** — and there the in-session banner is
+     up the whole time, so the operator is not blind. **D5**
+     (`MirrorDivergent` becomes a loud audited fault rather than a `warn!`) is
+     still right on its own merits; it should not be re-prioritised on the
+     strength of this residual, which is what the previous over-broad wording
+     would have caused.
+  4e. **"Keep serving" does not extend to the NEXT boot** *(R3-N3)*. The
+     keep-serving decision (D7.4) governs the running process. Boot is governed
+     by the pre-existing H1 preserve-and-refuse posture instead: if the gated
+     auto-heal REFUSES — the chain fails the in-tx full genesis→head re-verify,
+     as opposed to merely being short — `ensure_consistent_with_db` returns
+     `MirrorAheadOfDb`, the ahead mirror is preserved to a side file, and
+     **`serve` exits non-zero and does not boot**. Stated here because a D7
+     reader arrives expecting "the app keeps running" and that promise stops at
+     the process boundary: a tenant whose audit chain no longer verifies is
+     refused, loudly, rather than served.
   5. **The operator channel.** The alert is surfaced on `GET /health` as
      `durability_alert` (always present, explicitly `null` when quiet) and the
      SPA renders a full-width, high-contrast red banner above the topbar,

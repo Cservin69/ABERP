@@ -735,3 +735,214 @@ fn the_fence_is_pinned_to_the_production_posture() {
          WAL-resident and therefore what makes a foreign fold destructive"
     );
 }
+
+// ── R3-N1 — the DB side must PARSE then max, never SQL-MAX a VARCHAR ────────
+//
+// `time_wall` is a VARCHAR column. `SELECT MAX(time_wall)` is therefore a
+// LEXICOGRAPHIC max — precisely the comparison the `time` dependency and its
+// Cargo.toml note exist to avoid. `time`'s Rfc3339 trims trailing zeros, so on
+// same-second stamps the two orders disagree often, not rarely.
+//
+// Both proofs below drive `Handle::restore_durability_alert_from_mirror`
+// through hand-written audit rows, which is the only way to control the exact
+// stamps. They observe the outcome through the public
+// `Handle::durability_alert`.
+
+use aberp_audit_ledger::mirror_path_for;
+
+/// Write one audit row DIRECTLY, with an exact `time_wall`, bypassing
+/// `append_in_tx` (which would stamp `now`). Chain fields are not exercised by
+/// the re-derivation — it reads `kind` and `time_wall` only — so they are
+/// filled with fixed placeholders rather than a real chain.
+fn insert_audit_row(db: &Path, kind: &str, time_wall: &str, seq: u64) {
+    let conn = Connection::open(db).expect("open to insert an audit row");
+    conn.execute(
+        "INSERT INTO audit_ledger \
+         (id, seq, prev_hash, time_wall, time_mono, actor, binary_hash, tenant_id, kind, \
+          payload, idempotency_key, entry_hash, session_id, session_pubkey, event_sig) \
+         VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL)",
+        duckdb::params![
+            format!("id-{seq}"),
+            seq as i64,
+            vec![0u8; 32],
+            time_wall,
+            "{\"kind\":\"local_cli\",\"session_id\":\"t\",\"user_id\":\"t\"}",
+            vec![0u8; 32],
+            TENANT,
+            kind,
+            b"{}".to_vec(),
+            vec![0u8; 32],
+        ],
+    )
+    .expect("insert the audit row");
+}
+
+/// A tenant seeded with the audit schema and NO mirror, so the re-derivation's
+/// verdict comes from the DB half alone.
+fn db_only_tenant(tag: &str) -> (Tmp, PathBuf) {
+    let tmp = Tmp::new(tag);
+    let db = tmp.db();
+    seed(&db);
+    let mirror = mirror_path_for(&db);
+    let _ = std::fs::remove_file(&mirror);
+    (tmp, db)
+}
+
+fn alert_after_reopen(db: &Path) -> bool {
+    // `Handle::open` runs the re-derivation as part of construction.
+    let h = Handle::open_default(db, tenant()).expect("reopen");
+    h.durability_alert().is_some()
+}
+
+/// **The fail-toward-DOWN case.** A loss at `10:00:00.9Z` and an ack at
+/// `10:00:00.5Z` — the ack is EARLIER, so the banner must stay UP.
+///
+/// Under `SELECT MAX(time_wall)` the loss row loses to a bare-second sibling:
+/// `"10:00:00Z"` sorts ABOVE `"10:00:00.9Z"` because `'Z'` (0x5A) > `'.'`
+/// (0x2E). MAX therefore returns the wrong row for the loss, the ack at `.5Z`
+/// out-ranks it, and the banner drops on a tenant that never acknowledged
+/// anything.
+#[test]
+fn max_time_wall_is_a_lexicographic_compare_on_a_varchar() {
+    let (_tmp, db) = db_only_tenant("lex-max");
+    // Two loss rows in the same second. The NEWEST is `.9Z`; the bare-second
+    // one is older but sorts higher as a string.
+    insert_audit_row(
+        &db,
+        "db.durability_loss_detected",
+        "2026-08-12T10:00:00Z",
+        1,
+    );
+    insert_audit_row(
+        &db,
+        "db.durability_loss_detected",
+        "2026-08-12T10:00:00.9Z",
+        2,
+    );
+    // The operator acknowledged BEFORE the newest loss — so it does not cover it.
+    insert_audit_row(
+        &db,
+        "db.durability_alert_acknowledged",
+        "2026-08-12T10:00:00.5Z",
+        3,
+    );
+
+    assert!(
+        alert_after_reopen(&db),
+        "R3-N1 REGRESSION: the banner is DOWN. The newest loss is at .9Z and the only \
+         acknowledgement is at .5Z — EARLIER — so it cannot cover it. This is `SELECT \
+         MAX(time_wall)` doing a LEXICOGRAPHIC compare on a VARCHAR: \"10:00:00Z\" sorts ABOVE \
+         \"10:00:00.9Z\" ('Z' 0x5A > '.' 0x2E), so MAX hands back the OLDER loss and the ack \
+         out-ranks it. That is the exact comparison the `time` dependency was added to avoid, \
+         and it fails toward BANNER DOWN. Parse the rows and `.max()` on OffsetDateTime, the \
+         way `mirror_audit_times` already does."
+    );
+}
+
+/// **The malformed-stamp case.** One unparseable `time_wall` must cost us that
+/// ROW, not the whole DB-side verdict.
+///
+/// `SELECT MAX(...)` collapses the column to a single value BEFORE any parsing,
+/// so if the lexicographic winner happens to be malformed the parse drops it —
+/// and takes every good row with it. Here a perfectly good loss row sits right
+/// beside it and the banner still goes down.
+#[test]
+fn a_malformed_time_wall_on_the_loss_row_fails_toward_banner_down() {
+    let (_tmp, db) = db_only_tenant("malformed-max");
+    insert_audit_row(
+        &db,
+        "db.durability_loss_detected",
+        "2026-08-12T10:00:00Z",
+        1,
+    );
+    // Malformed, and lexicographically the highest ('~' 0x7E tops every digit).
+    insert_audit_row(&db, "db.durability_loss_detected", "~not-a-timestamp", 2);
+
+    assert!(
+        alert_after_reopen(&db),
+        "R3-N1 REGRESSION: the banner is DOWN even though a well-formed, unacknowledged \
+         `db.durability_loss_detected` row is present. `SELECT MAX(time_wall)` collapses the \
+         column BEFORE anything is parsed, so a single malformed stamp that wins the \
+         lexicographic compare is selected, fails to parse, and takes the entire DB-side loss \
+         verdict with it. One bad row must cost that ROW only. Select the rows, parse each, and \
+         `.max()` the ones that parsed."
+    );
+}
+
+/// **R2-B1's both-store rule, pinned directly** — mirror holds the loss, DB
+/// holds the acknowledgement, and the banner must be DOWN.
+///
+/// This exists because R3-N2 showed the route-level test that used to cover it
+/// had gone vacuous. That test staged a "permanently frozen mirror", which
+/// serve never actually reaches: the boot reconcile
+/// (`ensure_consistent_with_db`) attempts a gated auto-heal on EVERY boot and,
+/// on success, replays the DB up to the mirror head — un-freezing `sync_mirror`
+/// so the acknowledgement reaches the mirror after all. With the real boot
+/// order in the path, deleting the DB half no longer turned it red.
+///
+/// So the DB half is **defence in depth**, not the common path, and this pins
+/// it as exactly that: the split-stores state is constructed directly rather
+/// than by pretending production sits in it. The window it covers is real but
+/// narrow — a mid-process `sync_mirror` divergence, or any moment between the
+/// acknowledgement and the next boot's reconcile, where the DB is the only
+/// store holding the ack.
+///
+/// Mutation-verified: replace `self.db_audit_times()` with
+/// `DurabilityAuditTimes::default()` and this goes RED.
+#[test]
+fn an_ack_that_reached_only_the_db_still_clears_a_loss_that_reached_only_the_mirror() {
+    let tmp = Tmp::new("split-stores");
+    let db = tmp.db();
+    seed(&db);
+
+    // Fire the fence for real, so the loss row lands in BOTH stores.
+    {
+        let h = handle(&db);
+        commit_one(&h, "before");
+        h.durable_ack().expect("healthy ack");
+        foreign_open_and_close(&db);
+        commit_one(&h, "after");
+        let _ = h.durable_ack().expect_err("the fence fires");
+    }
+    let mirror = mirror_path_for(&db);
+    let mirrored = aberp_audit_ledger::read_mirror_entries(&mirror).expect("read mirror");
+    let loss = mirrored
+        .iter()
+        .find(|e| e.kind == "db.durability_loss_detected")
+        .expect("precondition: the loss row reached the mirror");
+    let loss_time = loss.time_wall.clone();
+
+    // Now split the stores: delete the loss from the DB (what a truncation
+    // does) and write the acknowledgement to the DB ONLY (what happens while
+    // the mirror is refusing appends). The mirror is left untouched.
+    {
+        let conn = Connection::open(&db).expect("open to split the stores");
+        conn.execute(
+            "DELETE FROM audit_ledger WHERE kind = 'db.durability_loss_detected'",
+            [],
+        )
+        .expect("drop the loss row from the DB");
+    }
+    // An acknowledgement strictly AFTER the loss.
+    let ack_time = {
+        let t: String = loss_time.clone();
+        // Same instant plus a second, formatted the way the ledger formats.
+        let parsed =
+            time::OffsetDateTime::parse(&t, &time::format_description::well_known::Rfc3339)
+                .expect("the mirror's time_wall parses");
+        (parsed + time::Duration::seconds(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("format")
+    };
+    insert_audit_row(&db, "db.durability_alert_acknowledged", &ack_time, 9_000);
+
+    let h = Handle::open_default(&db, tenant()).expect("reopen");
+    assert!(
+        h.durability_alert().is_none(),
+        "R2-B1 REGRESSION: the loss is in the MIRROR only and the acknowledgement is in the DB \
+         only, and the banner is still up. Re-derivation must consult BOTH stores for what each \
+         is authoritative about — the mirror survives a truncation and holds the loss, the DB \
+         is what still accepts writes while the mirror is refusing appends and holds the ack. \
+         Reading the mirror alone makes the Acknowledge button inert in exactly that window."
+    );
+}

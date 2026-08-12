@@ -42,6 +42,30 @@ fn test_dir(label: &str) -> PathBuf {
 /// table without TLS or a keychain.
 fn demo_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new("demo".to_string()).expect("demo tenant id");
+    // R3-N2 — mirror serve's REAL boot order: reconcile the audit mirror with
+    // the DB (serve.rs, `boot step: reconciling audit-ledger mirror with DB`)
+    // BEFORE opening the shared Handle. Omitting it made these tests run
+    // against a state production never reaches: a mirror-ahead condition that
+    // stays frozen forever. In serve, `ensure_consistent_with_db` attempts the
+    // gated auto-heal on every boot, which replays the DB up to the mirror head
+    // and so UNFREEZES `sync_mirror`; when the heal refuses, serve does not
+    // boot at all. Either way the "permanently frozen mirror" this file used to
+    // assume is not a production state.
+    {
+        let conn = Connection::open(&db_path).expect("open for the boot mirror reconcile");
+        aberp_audit_ledger::ensure_schema(&conn).expect("ensure schema at boot");
+        match aberp_audit_ledger::ensure_consistent_with_db(
+            &conn,
+            &aberp_audit_ledger::mirror_path_for(&db_path),
+        ) {
+            Ok(_) => {}
+            // Serve REFUSES to boot on these. The tests here are about what the
+            // banner does on a tenant that DOES boot, so surface and continue —
+            // a test that silently swallowed a refusal would be claiming to
+            // exercise a boot that never happens.
+            Err(e) => eprintln!("boot mirror reconcile surfaced (serve would refuse here): {e}"),
+        }
+    }
     // B1 ships the fence DISARMED, so these tests must arm it explicitly or
     // they would pass vacuously (no fence, no alert, no banner to check). The
     // boot re-derivation below is deliberately NOT gated on the flag — a
@@ -548,8 +572,12 @@ async fn acknowledging_clears_the_banner_records_it_and_survives_a_restart() {
 ///    higher seq.
 /// 2. The mirror is now AHEAD of the DB. `sync_mirror` (mirror.rs:653) returns
 ///    `MirrorDivergent` and appends **nothing**.
-/// 3. `WriteGuard::drop` only `warn!`s on that. So the mirror is frozen **for
-///    good** — every audit row after the incident is refused, permanently.
+/// 3. `WriteGuard::drop` only `warn!`s on that, so the mirror stays frozen for
+///    the rest of the process — every audit row after the incident is refused.
+///    (R3-N2: "for good" was too strong. Serve's boot mirror-reconcile attempts
+///    a gated auto-heal on the NEXT boot, which replays the DB up to the mirror
+///    head and un-freezes it. The freeze is real within a process, not
+///    permanent across restarts.)
 /// 4. `record_durability_alert_ack_audit` nevertheless commits to the DB and
 ///    returns 200. The operator watches the banner drop and reasonably believes
 ///    they have acknowledged it.
@@ -557,7 +585,16 @@ async fn acknowledging_clears_the_banner_records_it_and_survives_a_restart() {
 ///    and re-raises. Forever. The button does nothing that lasts.
 ///
 /// This drives exactly that: loss → RESTART → acknowledge over the real route →
-/// RESTART → the banner must stay down.
+/// RESTART → the banner must stay down, through the same boot order serve uses
+/// (reconcile, then open the Handle).
+///
+/// R3-N2 note on what this test is now worth: with the boot reconcile in the
+/// path it no longer isolates the DB half — the heal un-freezes the mirror, so
+/// the acknowledgement reaches it too, and deleting `db_audit_times` leaves this
+/// green. It earns its place as the END-TO-END pin (real loss, real route, two
+/// real restarts). The both-store rule itself is pinned directly by
+/// `an_ack_that_reached_only_the_db_still_clears_a_loss_that_reached_only_the_mirror`
+/// in `crates/aberp-db/tests/adr0110_d7_wal_fence.rs`.
 #[tokio::test]
 async fn after_a_real_loss_the_acknowledgement_survives_even_though_the_mirror_froze() {
     let dir = test_dir("frozen-mirror-ack");
@@ -707,48 +744,36 @@ async fn a_torn_mirror_tail_does_not_lose_the_alarm() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ── KNOWN RESIDUAL, pinned so it is surfaced rather than assumed away ───────
+// ── R3-N2 — the boot reconcile is part of the story ────────────────────────
 
-/// **A SECOND loss, after the mirror has already frozen, leaves no durable
-/// trace — so it does not survive a restart.** This test PINS that limitation
-/// rather than claiming it is fixed (CLAUDE.md rule 11).
+/// **A SECOND loss, after an earlier one was acknowledged, DOES re-raise across
+/// a restart.**
 ///
-/// Found while sharpening
-/// [`acknowledging_clears_the_banner_records_it_and_survives_a_restart`] for
-/// R2-N3, by asking for something the system cannot currently deliver.
+/// This replaces a test that claimed the opposite. That one asserted a second
+/// loss left no durable trace, and it passed — but only because this file's
+/// `demo_state` skipped serve's boot mirror-reconcile, so it pinned a state
+/// production never reaches.
 ///
-/// # Why it happens, and why it is not D7's to fix
+/// What the reconcile changes: after a real truncation the mirror is ahead of
+/// the DB, and `ensure_consistent_with_db` attempts a **gated auto-heal** on
+/// every boot. On success it replays the DB up to the mirror head, which brings
+/// the DB back level and **un-freezes `sync_mirror`** — so the acknowledgement
+/// and every later loss row reach the mirror after all. The "permanently frozen
+/// mirror" the old test staged is not a production steady state: either the
+/// heal runs, or the heal refuses and serve does not boot at all (see the
+/// ADR-0110 D7 note on refuse-to-boot).
 ///
-/// After the first truncation the mirror is AHEAD of the DB, so `sync_mirror`
-/// returns `MirrorDivergent` and refuses every subsequent append — the mirror
-/// is frozen permanently. From that moment the DB is the only store still
-/// taking audit rows. R2-B1 uses exactly that to keep the ACKNOWLEDGEMENT
-/// durable, and it works, because nothing truncates the DB in between.
+/// So the real residual is much narrower than it was written up as, and it is
+/// recorded that way in ADR-0110 D7.4d: it needs a process that never restarts
+/// between the two incidents, and in that process the in-session banner is up
+/// the whole time. That is not a gap worth re-prioritising D5 over — D5 is
+/// still right, on its own merits.
 ///
-/// A second truncation is different: it destroys the DB rows, and the loss row
-/// it would produce is written *into the store being destroyed*. Neither store
-/// retains it. That is not a gap in the fence — it is the fence's own subject
-/// matter, one level down: **once the mirror is frozen there is no durable
-/// audit store left at all.**
-///
-/// The operator is not blind in the moment — the in-memory alert is up for the
-/// whole session and the banner is red. What is lost is the record ACROSS a
-/// restart, and only for a loss that happened after a previously-acknowledged
-/// one on an unrecovered tenant.
-///
-/// # The real fix is ADR-0110 D5, not more of D7
-///
-/// D5 makes `MirrorDivergent` "a loud, audited, operator-visible fault, not a
-/// `warn!`" and fails the write on it. With that, the mirror never silently
-/// freezes and this residual cannot arise. Bolting a third durable artifact
-/// onto D7 to paper over a frozen mirror would be inventing a store to work
-/// around a store we already refuse to fix — the wrong layer.
-///
-/// **If this test ever goes RED, that is good news**: something made the second
-/// loss durable. Update this doc and delete the pin; do not "fix" the test.
+/// Mutation-verified: remove the reconcile block from `demo_state` and this
+/// goes RED, which is exactly how the old test was passing.
 #[tokio::test]
-async fn known_residual_a_second_loss_after_the_mirror_froze_does_not_survive_a_restart() {
-    let dir = test_dir("residual-second-loss");
+async fn a_second_loss_after_an_acknowledged_one_re_raises_across_a_restart() {
+    let dir = test_dir("second-loss-re-raises");
     let db_path = dir.join("aberp.duckdb");
     {
         let c = Connection::open(&db_path).expect("seed open");
@@ -756,8 +781,7 @@ async fn known_residual_a_second_loss_after_the_mirror_froze_does_not_survive_a_
         c.execute_batch("CHECKPOINT;").expect("seed fold");
     }
 
-    // Loss #1, then acknowledge it, so the tenant reaches the state where the
-    // mirror is frozen and the banner is legitimately down.
+    // Loss #1.
     {
         let state = demo_state(db_path.clone());
         commit_one(&state.db, "before");
@@ -765,10 +789,15 @@ async fn known_residual_a_second_loss_after_the_mirror_froze_does_not_survive_a_
         foreign_open_and_close(&db_path);
         commit_one(&state.db, "after");
         let _ = state.db.durable_ack().expect_err("loss #1 fires");
-        state.db.clear_durability_alert();
     }
+
+    // Restart, then acknowledge it over the real route.
     {
         let state = demo_state(db_path.clone());
+        assert!(
+            state.db.durability_alert().is_some(),
+            "precondition: loss #1 survived the restart"
+        );
         let app = serve::build_router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -787,7 +816,7 @@ async fn known_residual_a_second_loss_after_the_mirror_froze_does_not_survive_a_
         server.abort();
     }
 
-    // Loss #2, on the unrecovered tenant.
+    // Loss #2, on the still-unrecovered tenant.
     {
         let state = demo_state(db_path.clone());
         assert!(
@@ -799,24 +828,23 @@ async fn known_residual_a_second_loss_after_the_mirror_froze_does_not_survive_a_
         foreign_open_and_close(&db_path);
         commit_one(&state.db, "second-loss");
         let _ = state.db.durable_ack().expect_err("loss #2 fires");
-        // IN THE MOMENT the operator does see it — this half is not degraded.
         assert!(
             state.db.durability_alert().is_some(),
-            "the second loss MUST raise the banner in-session; if this fails the fence itself \
-             is broken, not merely its durability"
+            "loss #2 must raise the banner in-session"
         );
     }
 
-    // ...but it does not survive the restart. THE RESIDUAL.
+    // ...and it must STILL be up after the restart.
     let restarted = demo_state(db_path.clone());
     let (_, body) = health_json(restarted).await;
     assert!(
-        body["durability_alert"].is_null(),
-        "This test PINS A KNOWN RESIDUAL, and it just went RED — which is GOOD NEWS. A second \
-         durability loss, occurring after the audit mirror had already frozen, now DOES survive \
-         a restart. Something gave it a durable home (most likely ADR-0110 D5 landing, which \
-         stops the mirror freezing at all). Update this test's doc comment and DELETE the pin. \
-         Do not adjust the assertion to keep it green. Body: {body}"
+        !body["durability_alert"].is_null(),
+        "R3-N2 REGRESSION: a SECOND durability loss, occurring after the operator acknowledged \
+         the first, did not survive a restart. An acknowledgement clears the loss it answered, \
+         not all future ones — and the boot mirror-reconcile heals the mirror-ahead state on \
+         every boot, so `sync_mirror` is working again and loss #2's audit row does reach the \
+         mirror. If this is red, either the reconcile is no longer in the boot path or an ack \
+         is being read as covering losses that post-date it. Body: {body}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
