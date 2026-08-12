@@ -118,8 +118,8 @@ fn seed(db: &Path) {
 }
 
 /// A Handle with the D7 fence **ARMED**. Every fence test uses this, because
-/// `HandleConfig::default()` ships it DISARMED (B1) and always will until the
-/// GROUP-A opener sweep lands — see [`the_fence_ships_disarmed_by_default`] and
+/// `HandleConfig::default()` ships it DISARMED (B1) and will until the CLI-against-
+/// live opener class is fenced (ADR-0110 D8 closed the in-serve one) — see [`the_fence_ships_disarmed_by_default`] and
 /// [`with_the_fence_disarmed_the_group_a_shape_does_not_fail_the_ack`], which
 /// pin that other state.
 fn handle(db: &Path) -> std::sync::Arc<Handle> {
@@ -158,9 +158,11 @@ fn commit_one(h: &Handle, label: &str) {
 
 /// **The defect primitive.** A foreign DuckDB instance on the same path,
 /// opened and closed with DEFAULT pragmas. Its close folds and truncates the
-/// live Handle's WAL. This is `serve::read_invoice_total_gross_minor` before
-/// PR #1, and `calibration_overview_request` / `resolve_recipient_email` /
-/// `handle_quote_pipeline_status` today.
+/// live Handle's WAL. This was `serve::read_invoice_total_gross_minor` before
+/// PR #1 and `calibration_overview_request` / `resolve_recipient_email` /
+/// `handle_quote_pipeline_status` before ADR-0110 D8 — all now Handle-routed.
+/// It remains the shape of every CLI-against-live opener (GROUP B), which is a
+/// separate OS process and so cannot be migrated the same way.
 fn foreign_open_and_close(db: &Path) {
     let c = Connection::open(db).expect("foreign open");
     c.execute_batch("SELECT 1;").expect("foreign read");
@@ -555,22 +557,25 @@ fn the_healthy_path_still_journals_what_it_synced() {
 
 /// **The shipping default is OFF, and that is the whole point of B1.**
 ///
-/// Three foreign GROUP-A openers are still live in-serve on this head
-/// (`calibration_overview_request`, `resolve_recipient_email`,
-/// `handle_quote_pipeline_status`). Each truncates this Handle's WAL on close.
-/// With the fence ARMED before those are swept, an operator opening the
-/// quote-calibration overview arms a breach, and the NEXT invoice issuance
-/// fails `durable_ack` — a failure that PROPAGATES via `?`, because the D3-C
-/// cut-gate enforces exactly that. A committed invoice would report as failed
-/// and skip its NAV handoff.
+/// ADR-0110 D8 swept the in-serve GROUP-A openers (that baseline group is now
+/// empty), but the CLI-against-live class is NOT swept: `drain-submission-queue`,
+/// `drain-pending-retries`, `export-invoice-bundle`, `recover-from-nav` and their
+/// siblings are separate OS processes, so they cannot borrow serve's in-process
+/// Handle, and each still truncates this Handle's WAL on close.
+///
+/// With the fence ARMED before those are fenced, an operator draining the
+/// submission queue against a running serve arms a breach, and the NEXT invoice
+/// issuance fails `durable_ack` — a failure that PROPAGATES via `?`, because the
+/// D3-C cut-gate enforces exactly that. A committed invoice would report as
+/// failed and skip its NAV handoff.
 ///
 /// So this default is load-bearing safety, not a toggle someone should tidy
-/// away. Flip it only after the sweep.
+/// away. Flip it only once the CLI class is fenced too.
 #[test]
 fn the_fence_ships_disarmed_by_default() {
     assert!(
         !HandleConfig::default().wal_fence_enabled,
-        "ADR-0110 D7 / B1 REGRESSION: the WAL fence must default DISARMED until the GROUP-A          opener sweep lands. Armed on this head it converts a silent durability bug into          routine LOUD money-path failures: calibration-overview / invoice-email /          pricing-jobs each truncate the WAL, and the next issue-invoice or mark-paid then          fails its durable_ack and propagates — a committed invoice reported as failed, NAV          handoff skipped. That is worse than the bug it detects."
+        "ADR-0110 D7 / B1 REGRESSION: the WAL fence must default DISARMED until BOTH opener          classes are closed. ADR-0110 D8 closed the in-serve one (GROUP A is empty), but the          CLI-against-live class is still open: drain-submission-queue / drain-pending-retries          / export-invoice-bundle / recover-from-nav are separate processes that still fold          this WAL on close. Armed on this head it converts a silent durability bug into          routine LOUD money-path failures — the next issue-invoice or mark-paid after any          such command fails its durable_ack and propagates: a committed invoice reported as          failed, NAV handoff skipped. That is worse than the bug it detects."
     );
 }
 
@@ -598,11 +603,11 @@ fn with_the_fence_disarmed_the_group_a_shape_does_not_fail_the_ack() {
     commit_one(&h, "after");
 
     h.durable_ack().expect(
-        "B1 REGRESSION: with `wal_fence_enabled: false` the ack must behave exactly as it did          under D3 and SUCCEED. If this fails, the fence is armed on the default path and every          GROUP-A opener in serve becomes a money-path outage.",
+        "B1 REGRESSION: with `wal_fence_enabled: false` the ack must behave exactly as it did          under D3 and SUCCEED. If this fails, the fence is armed on the default path and every          CLI-against-live opener becomes a money-path outage.",
     );
     assert!(
         h.durability_alert().is_none(),
-        "B1 REGRESSION: a disarmed fence must raise no operator alert either — the banner would          be up on every box while the openers still ship"
+        "B1 REGRESSION: a disarmed fence must raise no operator alert either — the banner would          be up on every box while the CLI openers still ship"
     );
 }
 

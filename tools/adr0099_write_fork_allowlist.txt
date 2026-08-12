@@ -43,6 +43,9 @@ apps/aberp/src/serve.rs:record_upgrade_snapshot_mismatch_audit
 # `Ledger::open`, but every one is READ-ONLY (entries / verify_chain /
 # walk_ledger / stuck_precondition / find_invoice_draft, never an append):
 #   print_invoice.rs:render_to_bytes            reports.rs:compute_financial_report
+#     ^^ ADR-0110 D8 (2026-08-12): `compute_financial_report` no longer calls
+#        `Ledger::open` at all — it reads the shared Handle via
+#        `Ledger::from_connection(db.read())`. Seven of the eight remain accurate.
 #   export_invoice_bundle.rs:run                mark_abandoned.rs:resolve_stuck_or_loud_fail
 #   recover_from_nav.rs:resolve_recovery_precondition
 #   retry_submission.rs:resolve_stuck_or_loud_fail
@@ -53,6 +56,34 @@ apps/aberp/src/serve.rs:record_upgrade_snapshot_mismatch_audit
 # doing so would fill the write gate with false positives and duplicate that
 # gate. Probes W11/W11b/W11c pin that boundary.
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ── RESOLVED 2026-08-12 (ADR-0110 D8). READ THIS BEFORE THE NOTE BELOW. ──
+# The entire section that follows is HISTORY. Its central claim — "a full
+# migration needs the Ledger-over-WriteGuard adapter that does not yet exist" —
+# is no longer true, and its "NEXT:" step is DONE.
+#
+# The adapter exists and is `Ledger::from_connection(guard.try_clone()?)` over a
+# `db.write()` guard. Both DÁP sites now use it:
+#   serve.rs:spawn_dap_audit_chain            — shared writer, guard-scoped
+#   audit_dap_boot.rs:run_heartbeat_supervised — shared writer, per tick
+# So neither opens a fresh `Ledger` and neither appends outside the shared
+# `aberp_db::Handle`. The borrow-escape residual this section enumerates is
+# CLOSED — not by teaching the scanner a cross-file call graph, but by removing
+# the thing it could not see.
+#
+# TWO THINGS DELIBERATELY DID NOT CHANGE:
+#   1. Still NO allow-list entry. One would have been inert before (the scanner
+#      never flagged these) and is unnecessary now (there is nothing to flag).
+#      The fork-zero-ENFORCED state holds on the code, not on a blessing.
+#   2. The PRODUCTION-build refusal STAYS. Its second reason is still live:
+#      `NetlockTsa::timestamp` is `todo!()`, so a prod DÁP path would panic on
+#      its first real anchor. Only the write-fork half of its justification was
+#      retired; the serve.rs refusal text was corrected to say exactly that.
+#      Do NOT "drop the prod guard" as the old NEXT: line invites — that line was
+#      written when the fork was the blocker, and the TSA is now the blocker.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# ── HISTORICAL (pre-2026-08-12) ───────────────────────────────────────────────
 # ── ADR-0099 H3 — DÁP/QES: TRACKED RESIDUAL, secured-by-guard, NOT allow-listed ──
 # The DÁP audit-chain boot + heartbeat are latent audit-ledger write-forks:
 #   apps/aberp/src/serve.rs:spawn_dap_audit_chain        (fresh Ledger::open, boot)
@@ -73,6 +104,8 @@ apps/aberp/src/serve.rs:record_upgrade_snapshot_mismatch_audit
 # This note
 # exists so the ENFORCE flip does not silently miss the scanner-blind residual.
 # NEXT: build the WriteGuard adapter, route DÁP onto the Handle, drop the prod guard.
+# ^^ SUPERSEDED — see the RESOLVED banner above. The adapter is built and DÁP is on
+# the Handle; the prod guard is NOT dropped, because NetlockTsa is still todo!().
 #
 # Addendum 4 re-check (2026-07-19): STILL BLIND, and the reason is now precise.
 # These two are a DIFFERENT escape shape from the snapshot one just fixed — not a

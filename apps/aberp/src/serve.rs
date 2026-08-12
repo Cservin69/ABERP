@@ -2379,21 +2379,27 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                             // CAD blobs in the clear.
                             let cad_blob_ctx_result = {
                                 let cad_tenant = st.tenant.as_str().to_string();
-                                let cad_db_path = (*st.db_path).clone();
+                                // ADR-0110 D8 / F1 — this runs INSIDE `run()` but LONG AFTER the
+                                // shared Handle opened (`open_tenant_handle`, ~:1633), so the
+                                // GROUP-C "boot, before the Handle exists" exemption does NOT
+                                // cover it. It is a post-Handle in-serve audit WRITE: on the
+                                // fresh connection it used, the close folded and truncated the
+                                // live Handle's WAL. On the shared writer instead.
+                                let cad_db = st.db.clone();
                                 let cad_login = pipeline_operator_login.clone();
                                 tokio::task::spawn_blocking(
                                     move || -> Result<crate::cad_blob::CadBlobCtx> {
                                         let (key, prov) =
                                             crate::cad_blob::load_or_provision_key(&cad_tenant)?;
                                         if prov == crate::cad_blob::KeyProvision::Minted {
-                                            let mut conn =
-                                                duckdb::Connection::open(&cad_db_path).context(
-                                                    "open DB for cad-blob-key provision audit",
-                                                )?;
-                                            aberp_audit_ledger::ensure_schema(&conn)
+                                            let mut guard = cad_db.write().context(
+                                                "acquire shared writer for cad-blob-key provision \
+                                                 audit",
+                                            )?;
+                                            aberp_audit_ledger::ensure_schema(&guard)
                                                 .context("ensure audit schema for cad-blob key")?;
                                             crate::cad_blob::emit_key_provisioned(
-                                                &mut conn,
+                                                &mut guard,
                                                 &cad_tenant,
                                                 binary_hash,
                                                 &cad_login,
@@ -2425,14 +2431,17 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                     // row fires only on `true`, giving a
                                     // forensic walker one-shot evidence
                                     // that this install was migrated.
-                                    let migrate_db_path = (*st.db_path).clone();
+                                    // ADR-0110 D8 / F1 — post-Handle boot DDL (DROP INDEX +
+                                    // ensure_schema). Takes the shared WRITER; the fresh
+                                    // connection it used folded the live Handle's WAL on close.
+                                    let migrate_db = st.db.clone();
                                     let migrate_res = tokio::task::spawn_blocking(
                                         move || -> Result<bool> {
-                                            let conn =
-                                                duckdb::Connection::open(&migrate_db_path)
-                                                    .context("open DB for index migration")?;
+                                            let guard = migrate_db
+                                                .write()
+                                                .context("shared writer for index migration")?;
                                             crate::quote_pricing_jobs::migrate_secondary_index_with_report(
-                                                &conn,
+                                                &guard,
                                             )
                                         },
                                     )
@@ -2479,15 +2488,22 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                     // mortem of PROD_v2.27.2: a pre-
                                     // existing row was racing the daemon
                                     // into a DuckDB FATAL.
-                                    let count_db_path = (*st.db_path).clone();
+                                    // ADR-0110 D8 / F1 — THE per-boot WAL fold. This ran on EVERY
+                                    // boot, after the Handle had already written, so its close
+                                    // truncated the live WAL every serve session: with the fence
+                                    // armed it would fire `WalVanished` on the FIRST money-path
+                                    // `durable_ack` of every session. `count_jobs` also calls
+                                    // `ensure_schema` internally, so it takes the WRITER rather
+                                    // than a read try_clone — DDL does not belong on a reader.
+                                    let count_db = st.db.clone();
                                     let count_tenant = st.tenant.as_str().to_string();
                                     let count_res =
                                         tokio::task::spawn_blocking(move || -> Result<u64> {
-                                            let conn =
-                                                duckdb::Connection::open(&count_db_path)
-                                                    .context("open DB for boot row count")?;
+                                            let guard = count_db
+                                                .write()
+                                                .context("shared writer for boot row count")?;
                                             crate::quote_pricing_jobs::count_jobs(
-                                                &conn,
+                                                &guard,
                                                 &count_tenant,
                                             )
                                         })
@@ -2587,7 +2603,6 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 .wait()
                 .context("await background binary hash for MES adapter boot")?;
             let mes_deps = crate::mes_boot::MesBootDeps {
-                db_path: (*recovery_state.db_path).clone(),
                 db: recovery_state.db.clone(),
                 tenant: recovery_state.tenant.clone(),
                 binary_hash,
@@ -2876,7 +2891,6 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 ),
             }
             let rr_deps = crate::quote_pdf_rerender_daemon::QuotePdfRerenderDaemonDeps {
-                db_path: (*recovery_state.db_path).clone(),
                 db: recovery_state.db.clone(),
                 tenant: recovery_state.tenant.clone(),
                 binary_hash: rr_binary_hash,
@@ -2951,19 +2965,20 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         match crate::tenant_registry::tenant_dap_config(recovery_state.tenant.as_str()) {
             Ok((true, heartbeat_secs)) => {
                 // ADR-0099 H3 — DÁP is a TRACKED RESIDUAL, not production-ready.
-                // Its boot open (`spawn_dap_audit_chain`) and its heartbeat
-                // (`audit_dap_boot::run_heartbeat_supervised`) each do a fresh
-                // `Ledger::open` and APPEND from a *different* fn
-                // (`open_service_session_and_recover` / `heartbeat`), so the per-fn
-                // write-fork scanner is structurally BLIND to them: they never enter
-                // the write-fork worklist yet they ride OUTSIDE the shared
-                // `aberp_db::Handle` — a scanner-blind audit-ledger fork armed the
-                // moment a tenant sets `dap_enabled`. Migrating them needs the
-                // Ledger-over-WriteGuard adapter that does not yet exist (Editions never
-                // built it). Until then, a PRODUCTION build REFUSES TO START rather than
-                // arm the latent fork (fail loud — CLAUDE.md rule 11), so the
-                // fork-zero-ENFORCED acceptance state holds without an allow-list
-                // blessing. Note the precision: this is a RUNTIME `if` on the
+                //
+                // ADR-0110 D8 (2026-08-12) — ONE OF THE TWO ORIGINAL REASONS IS FIXED.
+                // This used to read: the boot open (`spawn_dap_audit_chain`) and the
+                // heartbeat (`run_heartbeat_supervised`) each do a fresh `Ledger::open`
+                // and append OUTSIDE the shared Handle, and migrating them "needs the
+                // Ledger-over-WriteGuard adapter that does not yet exist". That adapter
+                // now EXISTS and is in use: `Ledger::from_connection(guard.try_clone())`
+                // over a `state.db.write()` guard. Both paths ride the shared Handle,
+                // so the scanner-blind write-fork is GONE.
+                //
+                // The refusal STAYS, on the reason that is still true: `NetlockTsa::
+                // timestamp` is `todo!()`, so a production DÁP path would panic on its
+                // first real anchor. Fail loud (rule 11) rather than start something
+                // that cannot function. Note the precision: this is a RUNTIME `if` on the
                 // `IS_PRODUCTION_BUILD` const, not a `cfg` — the DÁP code is still
                 // compiled into the prod binary, the branch is merely NOT TAKEN. Do not
                 // read it as "unreachable"; the guard's strength is that it is the one
@@ -2975,10 +2990,11 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     return Err(anyhow!(
                         "tenant '{}' has dap_enabled=true, but this is a PRODUCTION build: the \
                          DÁP/QES timestamp-anchored audit chain is a tracked ADR-0099 residual, \
-                         NOT production-ready — its boot + heartbeat open a fresh ledger and append \
-                         OUTSIDE the shared aberp_db::Handle (a scanner-blind write-fork not yet \
-                         migrated), and NetlockTsa is unimplemented. Refusing to start. Unset \
-                         dap_enabled for this tenant, or run a non-production build.",
+                         NOT production-ready — NetlockTsa (the real timestamp authority) is \
+                         unimplemented, so the first anchor would panic. Refusing to start. Unset \
+                         dap_enabled for this tenant, or run a non-production build. (The other \
+                         historical reason — boot + heartbeat appending outside the shared \
+                         aberp_db::Handle — was FIXED by ADR-0110 D8; both now ride the Handle.)",
                         recovery_state.tenant.as_str()
                     ));
                 }
@@ -11407,8 +11423,25 @@ async fn handle_get_calibration(headers: HeaderMap, State(state): State<AppState
 pub fn calibration_overview_request(
     state: &AppState,
 ) -> anyhow::Result<crate::quote_calibration::CalibrationOverview> {
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0110 D8 (GROUP-A sweep): go through the ONE shared Handle, never a
+    // fresh `Connection::open`. A second co-resident instance reads the last-
+    // CHECKPOINTED subset (H3 disables checkpointing, so Handle-committed
+    // rows are WAL-resident and invisible to it) and — the loss primitive —
+    // its CLOSE folds and TRUNCATES the live Handle's WAL, after which every
+    // subsequent Handle commit returns Ok but reaches no file.
+    //
+    // ADR-0110 D8 / F3 — the WRITER, and the reason is ADR-0108 R-1
+    // ("no DDL on a `Handle::read()` connection", pinned tree-wide by
+    // apps/aberp/tests/no_ddl_on_read_handle.rs). `calibration_overview` calls
+    // `ensure_schema` on the connection it is handed. A `read()` try_clone is
+    // writable but is released from the writer mutex the instant it is taken, so
+    // DDL through it escapes the single-writer invariant (CLAUDE.md rule 13).
+    // R-1's scan is scope-LOCAL — it sees `ensure_schema(&conn)` beside the
+    // binding, not one call-frame away — so this breach was invisible to it.
+    let conn = state
+        .db
+        .write()
+        .context("acquire shared writer for calibration overview (callee does DDL)")?;
     crate::quote_calibration::calibration_overview(&conn, state.tenant.as_str())
 }
 
@@ -13191,7 +13224,6 @@ fn mes_deps_for_request(state: &AppState) -> Result<crate::mes_boot::MesBootDeps
         .wait()
         .context("await binary hash for adapter mutation")?;
     Ok(crate::mes_boot::MesBootDeps {
-        db_path: (*state.db_path).clone(),
         db: state.db.clone(),
         tenant: state.tenant.clone(),
         binary_hash,
@@ -18776,7 +18808,9 @@ async fn handle_financial_report(
             return internal_error("financial_report:binary_hash", e);
         }
     };
-    let db_path = state.db_path.clone();
+    // ADR-0110 D8 (GROUP-A sweep): the report rides the shared Handle now, so the
+    // blocking task takes the `HandleArc`, not the path.
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let top_n = q.top_n.unwrap_or(TOP_N_DEFAULT).clamp(1, TOP_N_MAX);
     let req = reports::ReportRequest {
@@ -18786,7 +18820,7 @@ async fn handle_financial_report(
         top_n,
     };
     let result = tokio::task::spawn_blocking(move || {
-        reports::compute_financial_report(&db_path, tenant, binary_hash, req)
+        reports::compute_financial_report(&db, tenant, binary_hash, req)
     })
     .await;
     match result {
@@ -19323,8 +19357,10 @@ fn compute_workshop_dashboard(
 
     // Today's invoice headline rides on `reports::compute_financial_report`
     // with a 1-day Custom window — one source of truth for revenue
-    // grouping. `compute_financial_report` opens its own Connection; the
-    // brief one-day window keeps it cheap.
+    // grouping. ADR-0110 D8 — it now rides the SAME shared Handle this fn is
+    // already reading through (`conn` above is an owned try_clone holding no
+    // lock, so the brief writer the report takes for its schema bootstrap does
+    // not self-deadlock); the one-day window keeps it cheap.
     let req = reports::ReportRequest {
         period: reports::PeriodKind::Custom {
             from: today,
@@ -19337,7 +19373,7 @@ fn compute_workshop_dashboard(
         top_n: TOP_N_DEFAULT,
     };
     let today_report =
-        reports::compute_financial_report(&state.db_path, state.tenant.clone(), binary_hash, req)
+        reports::compute_financial_report(&state.db, state.tenant.clone(), binary_hash, req)
             .context("compute today's financial snapshot for dashboard tile")?;
 
     // S246 / PR-239 — per-tile row lists. Each helper reads a small
@@ -21096,12 +21132,56 @@ pub async fn send_invoice_email_route(
     // that don't yet have a Partners row, and lets the operator override
     // the partner's default address for a single send without churning
     // the master record.
-    let recipient_lookup =
-        resolve_recipient_email(state, invoice_id, customer_partner_id, customer_tax_number)
-            .unwrap_or_else(|e| {
+    // ADR-0110 D8 / F3 follow-up — on `spawn_blocking`, not the async worker.
+    //
+    // F3 moved this resolver onto `db.write()` because both partner lookups
+    // `ensure_schema` the connection they are handed (ADR-0108 R-1). That was
+    // correct, but this is the ONE of the six F3 sites that is called bare from
+    // an `async fn` — the other five already sit inside `spawn_blocking` — so it
+    // began taking the process-wide writer mutex on a tokio runtime worker and
+    // holding it across a transaction plus two partner queries. A contended
+    // writer parks that worker.
+    //
+    // Narrowing the hold instead would not have helped: the partner queries ARE
+    // the DDL-reaching calls, so they must stay under the writer either way.
+    // Moving the whole resolver to the blocking pool is what actually removes
+    // blocking-from-async, and it matches what the other five sites already do.
+    let recipient_lookup = {
+        let db = state.db.clone();
+        let tenant = state.tenant.clone();
+        let invoice = invoice_id.to_string();
+        let partner = customer_partner_id.map(str::to_string);
+        let tax_number = customer_tax_number.to_string();
+        match tokio::task::spawn_blocking(move || {
+            resolve_recipient_email(
+                &db,
+                tenant.as_str(),
+                &invoice,
+                partner.as_deref(),
+                &tax_number,
+            )
+        })
+        .await
+        {
+            Ok(Ok(found)) => found,
+            Ok(Err(e)) => {
                 tracing::warn!(invoice_id = %invoice_id, error = %e, "resolve_recipient_email");
                 None
-            });
+            }
+            // A panic in the blocking task lands on the SAME "no recipient"
+            // branch a lookup error does — the send path then audits a
+            // MissingRecipient skip and banners the operator, which is the
+            // truthful outcome. It must never be mistaken for a successful send.
+            Err(join) => {
+                tracing::warn!(
+                    invoice_id = %invoice_id,
+                    error = %join,
+                    "resolve_recipient_email task panicked"
+                );
+                None
+            }
+        }
+    };
     let (recipient_email, recipient_display_name) = match recipient_lookup {
         Some((email, name)) if !email.trim().is_empty() => (email, name),
         _ => {
@@ -21382,14 +21462,29 @@ fn finalize_email_audit(
 /// `Err` for DuckDB / parse failures only. A missing override row
 /// (post-PR-203 invoice but column reads NULL — pre-PR-203 invoice OR
 /// operator left it blank) falls through to rung 2 normally.
+/// ADR-0110 D8 / F3 follow-up — takes the `Handle` + tenant rather than
+/// `&AppState` so the whole call can be moved into `spawn_blocking`. See the
+/// call site for why that matters.
 fn resolve_recipient_email(
-    state: &AppState,
+    db: &aberp_db::Handle,
+    tenant: &str,
     invoice_id: &str,
     partner_id: Option<&str>,
     customer_tax_number: &str,
 ) -> Result<Option<(String, Option<String>)>> {
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // ADR-0110 D8 (GROUP-A sweep): the shared Handle's coherent try_clone.
+    // Both rungs matter here — the override column is written by the issue /
+    // modification routes on the Handle, so a fresh `Connection::open` would
+    // read a stale pre-override view AND close-fold the Handle's WAL on the
+    // way out of the send path.
+    // ADR-0110 D8 / F3 — the WRITER (ADR-0108 R-1). Rung 2's `partners::
+    // get_partner` / `find_partner_by_tax_number` both `ensure_schema` on the
+    // connection they are handed, so a `read()` clone here would issue DDL
+    // outside the writer mutex. The guard is local to this fn and drops before
+    // the caller's own Handle writes, so nothing is held across an await.
+    let mut conn = db
+        .write()
+        .context("acquire shared writer for email-recipient resolution (callee does DDL)")?;
     // PR-203 / S203 — rung 1: per-invoice override.
     let override_value = {
         let tx = conn
@@ -21420,10 +21515,8 @@ fn resolve_recipient_email(
     // threads through input.json; fall back to the tax-number lookup
     // only for legacy / CLI invoices that never carried a partner_id.
     let p = match partner_id.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(id) => partners::get_partner(&conn, state.tenant.as_str(), id)?,
-        None => {
-            partners::find_partner_by_tax_number(&conn, state.tenant.as_str(), customer_tax_number)?
-        }
+        Some(id) => partners::get_partner(&conn, tenant, id)?,
+        None => partners::find_partner_by_tax_number(&conn, tenant, customer_tax_number)?,
     };
     let p = match p {
         Some(p) => p,
@@ -23626,9 +23719,22 @@ async fn handle_quote_pipeline_status(
     // ledger. Best-effort: if the ledger walk errors, the status response
     // still returns the existing Python-resolver snapshot — partial-truth
     // beats a 500 for an operator-facing health endpoint.
-    let db_path = (*state.db_path).clone();
+    // ADR-0110 D8 (GROUP-A sweep): the panic rows this counts are appended by
+    // in-serve daemons on the shared Handle, so they are WAL-resident — a fresh
+    // `Connection::open` would under-count them AND close-fold the Handle's WAL.
+    // `db.read()` hands out an OWNED try_clone holding no lock, so it moves into
+    // the blocking task cleanly.
+    let db = state.db.clone();
     let panic_telemetry = tokio::task::spawn_blocking(move || -> Result<DaemonPanicTelemetry> {
-        let conn = duckdb::Connection::open(&db_path).context("open DB for daemon-panic count")?;
+        // ADR-0110 D8 / F3 — the WRITER (ADR-0108 R-1). This is the sharpest of
+        // the six: `count_recent_daemon_panics` calls the AUDIT `ensure_schema`,
+        // which on a legacy table reaches `migrate_drop_unique_art_if_present` —
+        // a DROP + CREATE + bulk re-INSERT of the whole `audit_ledger`. Issuing
+        // that from a mutex-free read clone, concurrently with a real writer on
+        // the same instance, is not a thing any reader may do.
+        let conn = db
+            .write()
+            .context("acquire shared writer for daemon-panic count (callee does DDL)")?;
         count_recent_daemon_panics(&conn, 10)
     })
     .await
@@ -27813,26 +27919,41 @@ fn spawn_dap_audit_chain(
         .wait()
         .map_err(|e| anyhow!("binary hash unavailable for DÁP audit boot: {e}"))?;
     let tenant = recovery_state.tenant.clone();
-    let db_path = (*recovery_state.db_path).clone();
 
     let service_key = crate::audit_dap_boot::load_or_provision_service_key(tenant.as_str())?;
     let actor = Actor::from_local_cli(Ulid::new().to_string(), "system:audit-service");
 
     // Open the service session BEFORE serving (ADR-0088: no daemon precedes
-    // its session open) on a short-lived ledger handle, then drop it.
-    let mut ledger = aberp_audit_ledger::Ledger::open(&db_path, tenant.clone(), binary_hash)
-        .map_err(|e| anyhow!("open ledger for DÁP service session: {e}"))?;
-    let tsa = aberp_audit_ledger::session::tsa::MockTimestampAuthority::new();
-    let service = crate::audit_dap_boot::open_service_session_and_recover(
-        &mut ledger,
-        &tsa,
-        actor.clone(),
-        service_key,
-    )?;
-    drop(ledger);
+    // its session open). ADR-0110 D8 (GROUP-A sweep): on the ONE shared writer,
+    // not a short-lived `Ledger::open` — this runs AFTER `state.db` exists, so
+    // that handle's close folded the live Handle's WAL at every boot, and the
+    // crash-recovery appends it makes were themselves at risk. The guard scope
+    // ends before `run()` continues, so nothing is held across serving.
+    let service = {
+        let guard = recovery_state
+            .db
+            .write()
+            .context("acquire shared writer for DÁP service session")?;
+        aberp_audit_ledger::ensure_schema(&guard)
+            .context("ensure audit schema for DÁP service session")?;
+        let mut ledger = aberp_audit_ledger::Ledger::from_connection(
+            guard
+                .try_clone()
+                .context("try_clone shared writer for DÁP service-session ledger")?,
+            tenant.clone(),
+            binary_hash,
+        );
+        let tsa = aberp_audit_ledger::session::tsa::MockTimestampAuthority::new();
+        crate::audit_dap_boot::open_service_session_and_recover(
+            &mut ledger,
+            &tsa,
+            actor.clone(),
+            service_key,
+        )?
+    };
 
     let deps = crate::audit_dap_boot::HeartbeatDeps {
-        db_path,
+        db: recovery_state.db.clone(),
         tenant,
         binary_hash,
         actor,
@@ -28650,7 +28771,6 @@ async fn handle_relay_send_email(
         })
     };
 
-    let db_path = (*state.db_path).clone();
     let row_id_for_blocking = row_id.clone();
     let to_json_for_blocking = to_json.clone();
     let cc_json_for_blocking = cc_json.clone();
@@ -28660,15 +28780,16 @@ async fn handle_relay_send_email(
     let attachments_rel_dir_for_blocking = attachments_rel_dir.clone();
     let recipient_hash_for_blocking = validated.recipient_hash.clone();
     let byte_size = validated.byte_size;
+    // ADR-0110 D8 (GROUP-A sweep): the relay-queue family rides the ONE shared
+    // Handle — this WRITER and its two sibling readers (`handle_list_email_relay_
+    // queue` / `handle_get_email_relay_row`) migrate together, per CLAUDE.md rule
+    // 14: a half-migrated family (Handle write, fresh-open read) tears and fails
+    // open. The guard's drop lockstep-syncs the mirror.
+    let db = state.db.clone();
     let insert_res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let conn = duckdb::Connection::open(&db_path).with_context(|| {
-            format!(
-                "open DuckDB at {} for relay queue insert",
-                db_path.display()
-            )
-        })?;
+        let guard = db.write().context("shared writer for relay queue insert")?;
         email_relay_queue::insert_queued(
-            &conn,
+            &guard,
             &row_id_for_blocking,
             RELAY_SUBMITTER_STOREFRONT,
             &to_json_for_blocking,
@@ -28772,11 +28893,18 @@ async fn handle_list_email_relay_queue(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100)
         .min(500);
-    let db_path = (*state.db_path).clone();
+    // ADR-0110 D8 (GROUP-A sweep) — the READ half of the relay-queue family.
+    // `handle_relay_send_email` and the relay daemon both write these rows on the
+    // shared Handle, so they are WAL-resident: a fresh `Connection::open` here
+    // showed the operator a stale, folded subset of their own queue.
+    let db = state.db.clone();
     let rows_res = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<_>> {
-        let conn = duckdb::Connection::open(&db_path).with_context(|| {
-            format!("open DuckDB at {} for relay queue list", db_path.display())
-        })?;
+        // ADR-0110 D8 / F3 — the WRITER (ADR-0108 R-1): `list_rows` calls
+        // `ensure_schema` on the connection it is handed, one call-frame away
+        // from R-1's scope-local scan.
+        let conn = db
+            .write()
+            .context("shared writer for relay queue list (callee does DDL)")?;
         email_relay_queue::list_rows(&conn, state_filter, limit)
     })
     .await;
@@ -28826,10 +28954,13 @@ async fn handle_get_email_relay_row(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    let db_path = (*state.db_path).clone();
+    // ADR-0110 D8 (GROUP-A sweep) — the single-row READ half of the same family.
+    let db = state.db.clone();
     let row_res = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let conn = duckdb::Connection::open(&db_path)
-            .with_context(|| format!("open DuckDB at {} for relay queue row", db_path.display()))?;
+        // ADR-0110 D8 / F3 — the WRITER (ADR-0108 R-1): `read_row` ensure_schemas.
+        let conn = db
+            .write()
+            .context("shared writer for relay queue row (callee does DDL)")?;
         email_relay_queue::read_row(&conn, &id)
     })
     .await;

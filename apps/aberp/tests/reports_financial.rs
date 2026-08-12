@@ -25,13 +25,34 @@
 
 use std::path::PathBuf;
 
-use aberp::reports::{self, compute_financial_report, DateBasis, PeriodKind, ReportRequest};
+use aberp::reports::{self, DateBasis, FinancialReport, PeriodKind, ReportRequest};
 use aberp_audit_ledger::{BinaryHash, TenantId};
 use duckdb::{params, Connection};
 use time::macros::date;
 use ulid::Ulid;
 
 const TEST_TENANT: &str = "reports_financial_test";
+
+/// ADR-0110 D8 (GROUP-A sweep) — [`reports::compute_financial_report`] takes the
+/// shared `aberp_db::Handle` now, not a path: in-serve it MUST NOT open its own
+/// DuckDB instance, whose close folds and truncates the live Handle's WAL.
+///
+/// These fixtures seed through plain `Connection::open` (they are single-process
+/// with no live serve Handle, so that is coherent — GROUP B, not GROUP A), so
+/// this adapter opens the Handle at call time, AFTER seeding. It exists to keep
+/// the ten call sites reading as report assertions rather than plumbing; the
+/// Handle it builds is the real production type, so the reports genuinely run
+/// through the shared-instance read path.
+fn compute_financial_report(
+    db_path: &std::path::Path,
+    tenant: TenantId,
+    binary_hash: BinaryHash,
+    req: ReportRequest,
+) -> anyhow::Result<FinancialReport> {
+    let db = aberp_db::Handle::open_default(db_path, tenant.clone())
+        .expect("open the shared Handle for the financial report");
+    reports::compute_financial_report(&db, tenant, binary_hash, req)
+}
 
 fn test_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir()
@@ -146,6 +167,44 @@ fn build_request(period: PeriodKind, today: time::Date) -> ReportRequest {
         today,
         top_n: 10,
     }
+}
+
+/// **ADR-0110 D8 / F2 regression.** The report must bootstrap the audit schema
+/// itself, on a DB that has none.
+///
+/// `Ledger::open` used to `initialise` (⇒ `ensure_schema`) as a side effect of
+/// opening. The D8 sweep replaced it with `Ledger::from_connection`, which does
+/// NOT — so the bootstrap was silently dropped and the report started erroring
+/// with "Table audit_ledger does not exist" where it previously returned an
+/// empty walk.
+///
+/// Every other test in this file passed straight through that regression,
+/// because `ensure_all_schemas` pre-creates the audit table for them. This test
+/// deliberately does NOT call it: that omission is the whole point, and it is
+/// what gives the pin teeth. Mutation-verified — drop the
+/// `aberp_audit_ledger::ensure_schema` line from `compute_financial_report`'s
+/// bootstrap block and this goes RED while the other nine stay green.
+#[test]
+fn report_bootstraps_the_audit_schema_on_a_db_that_has_none() {
+    let db_path = fresh_db("no-audit-schema");
+    // NOTE: no `ensure_all_schemas(&db_path)` — deliberately.
+    let tenant = TenantId::new(TEST_TENANT.to_string()).unwrap();
+    let report = compute_financial_report(
+        &db_path,
+        tenant,
+        BinaryHash::from_bytes([0u8; 32]),
+        build_request(PeriodKind::Month(2026, 6), date!(2026 - 06 - 01)),
+    )
+    .expect(
+        "ADR-0110 D8/F2: the financial report must ensure the audit-ledger schema itself. \
+         `Ledger::from_connection` does not initialise, so without an explicit ensure_schema \
+         this fails with \"Table audit_ledger does not exist\".",
+    );
+
+    // And it must behave as it did pre-sweep: an empty ledger is an empty walk,
+    // not an error and not a fabricated figure.
+    assert_eq!(report.revenue.huf.gross_minor, 0);
+    assert_eq!(report.revenue.eur.gross_minor, 0);
 }
 
 #[test]

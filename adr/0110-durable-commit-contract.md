@@ -1283,3 +1283,275 @@ because the correct operator response to a failed issuance is **check whether
 the invoice exists before retrying**, and nothing in the UI says so today.
 Closing it properly means an operator-supplied or request-derived idempotency
 key on the issue routes — a separate change, out of D3's scope.
+
+## 13. D8 — the GROUP-A opener sweep, and the CLI-opener class it does NOT close (2026-08-12)
+
+D7 shipped the WAL-truncation fence **disarmed**, because arming it while a
+foreign opener still folds the WAL turns a silent durability bug into a routine
+money-path outage. D8 is the sweep that was supposed to make arming it safe. It
+closes **one of the two** opener classes, and this section exists so nobody
+reads "the sweep landed" as "the fence can be armed".
+
+### 13.1 What D8 closed — GROUP A is empty
+
+> **Read §13.3 first.** The first cut of D8 claimed this and was wrong: three
+> post-Handle openers survived inside `serve::run`. They are migrated now and
+> the claim has been re-verified by independent grep, but the *reason* it was
+> wrong is the part worth carrying forward.
+
+Every in-serve GROUP-A opener — the eleven of the first pass plus the three the
+adversarial found — now routes through the shared `aberp_db::Handle`.
+`tools/adr0099_read_fork_structural_baseline.txt` ratchets **31 → 20** and the
+per-opener fingerprint census **79 → 62**: no in-serve request route and no
+in-serve daemon opens its own connection to the tenant DB.
+The remaining 20 are GROUP B (separate-process CLI) and GROUP C (not the
+serve-held path at all); see the file for the per-family record.
+
+Two findings from doing it are worth keeping:
+
+- **`reports::compute_financial_report` held four openers, and the census saw
+  one.** Two `Connection::open`, a `DuckDbBillingStore::open`, and a
+  `Ledger::open`. Opening the Financial Report — or the workshop dashboard tile
+  that reuses it for its one-day window — was on its own enough to fold the
+  WAL. A shape scanner keyed on `Connection::open` is structurally blind to a
+  typed store's constructor; the census undercounted for that reason, not
+  because anyone hid anything.
+- **The MES ledger writer proved rule 14 rather than asserting it.** Its
+  end-to-end test polled the appended row back through a fresh
+  `Connection::open`. The moment the write rode the Handle, that poller read
+  zero *forever* — checkpointing is disabled under H3, so the row is
+  WAL-resident and invisible to a second instance. The test could not stay as
+  it was; migrating writers without their readers is not a style preference.
+
+### 13.2 What D8 did NOT close — the CLI-against-live class (N7)
+
+A CLI one-shot is a **separate OS process**. It cannot borrow serve's
+in-process `Handle`, so the D8 fix does not apply to it and forcing it would be
+wrong. These were scoped instead, and the scoping produced a **better result
+than expected for most of them and one genuine hole**:
+
+**`aberp serve` holds the F-E whole-DB writer flock for its entire process
+lifetime** (`serve.rs:911`). Any CLI that acquires that flock is therefore
+*refused* while serve is up. Checked per command, and the ordering is what
+matters — the flock must be taken **before** the first DB open, or the
+open/close pair folds the WAL before the refusal is ever reached:
+
+| command | flock line | first DB open | verdict |
+|---|---|---|---|
+| `drain-submission-queue` | 121 | 161 | refused before any open — **safe** |
+| `drain-pending-retries` | 175 | 215 | refused before any open — **safe** |
+| `export-invoice-bundle` | 1233 | 1243 | refused before any open — **safe** |
+| `recover-from-nav` | 161 | 188 | refused before any open — **safe** |
+| `mark-abandoned` | 113 | 156 | refused before any open — **safe** |
+
+So for the four commands the PR #61 adversarial named, **run-against-a-live-
+serve is not a real operator path**: it is structurally refused, and refused
+early enough that the tenant DB file is never touched. No fix is owed, and none
+should be invented — adding a read-only pragma to a command that cannot run
+would be cargo-cult.
+
+**The residual is the openers that hold NO flock.** The ADR-0099 baseline
+already flags exactly two, and they are not equivalent:
+
+- **`print_invoice.rs|render_to_bytes` — not a fence hazard.** It opens
+  `aberp_db::Handle::open_default`, which issues `PRAGMA
+  disable_checkpoint_on_shutdown` + `wal_autocheckpoint='1TB'`
+  (`aberp-db/src/lib.rs::open_runtime_connection`). Its close therefore does
+  **not** fold the WAL. It remains a stale-*read* hazard (a second instance
+  does not replay the live writer's WAL — that is the E1 defect), but it cannot
+  sabotage the D7 fence. Serve itself does not reach it: the in-serve path uses
+  the connection-taking `render_to_bytes_on_conn`.
+- **`rebuild-stock-cache` — THE genuine hole, and it must be closed before the
+  fence is armed.** `crates/aberp-inventory/src/bin/rebuild_stock_cache.rs:61`
+  opens a bare `duckdb::Connection::open` with DEFAULT pragmas and holds no
+  flock, so its close folds and truncates a live serve's WAL. It is also a
+  *documented operator recovery path* — ADR-0061 §3 tells the operator to run
+  `cargo run -- rebuild-stock-cache` when the cache disagrees with
+  `SUM(qty_delta)` — i.e. precisely something an operator does *while the shop
+  is running*. With the fence armed, that recovery command would make the next
+  invoice issuance hard-fail.
+
+  It is *already* unsafe for a second reason the flock exists to prevent: it
+  **writes** `products.stock_qty` with no cross-process mutual exclusion
+  against serve.
+
+**Recommended fix (NOT implemented in D8 — deliberately deferred):** give it
+`db_writer_lock::acquire_or_refuse` before its first open, exactly as the
+twenty sibling mutating CLIs do. Three lines, twenty precedents, and it makes
+the command refuse rather than corrupt.
+
+It is deferred rather than done because it is **outside D8's goal** (D8 routes
+*in-serve* openers through the Handle) and because it is an operator-visible
+behaviour change: a recovery command that runs today would start refusing while
+serve is up. That is the *correct* behaviour, but an operator hitting it
+mid-incident deserves the change to arrive with its own review, release note,
+and a refusal message that tells them to stop serve first. Picking the
+conservative fork and flagging it, per the working agreement.
+
+The alternative — a read-only / no-checkpoint-on-close pragma — is **not**
+recommended here: the command is a writer, so read-only is wrong, and pragmas
+alone would leave the two-writer window open while fixing only the WAL symptom.
+
+### 13.3 Gate on arming the fence — **CORRECTED after the D8 adversarial**
+
+The first version of this section said "✅ GROUP A empty" with
+`rebuild-stock-cache` as the only owed item. **That was wrong**, and it was the
+most dangerous thing in the document, because it is the artifact someone would
+read before flipping the flag.
+
+Three foreign openers were still live inside `serve::run` *after* the shared
+Handle opens (~:1633): the cad-blob key-provision audit write (~:2390), the
+pricing-jobs index DDL (~:2432), and the pricing-jobs boot row count (~:2487).
+The last ran on **every boot**, after the Handle had already written. Measured
+against that shape with the fence armed: WAL 54107 → 0, and `durable_ack`
+returned `Err(WalTruncatedUnderWriter { WalVanished })`. So arming the fence on
+that head would have fired on the **first money-path `durable_ack` of every
+serve session** — not an edge case, the common path.
+
+They hid because the read-fork baseline collapses all of `serve::run` into one
+line and filed it under GROUP C with the justification *"provision_atomic, at
+boot, BEFORE the shared Handle is opened"*. That sentence is true of the first
+half of a function that spans the Handle open and continues for hundreds of
+lines past it. **A whole-function exemption granted on a property only part of
+the function has** — the same per-fn granularity blindness that hid three of
+`compute_financial_report`'s four openers. All three are now migrated onto
+`st.db`, and the baseline entry has been re-triaged into an explicit
+*line-region* exemption that names `open_tenant_handle` as the boundary and
+points at the per-opener fingerprint census as the authoritative detector.
+
+The corrected gate:
+
+1. ✅ GROUP A empty — **re-verified 2026-08-12 by independent tree-wide grep**,
+   not by the census alone. Every `Connection::open` / `Ledger::open` /
+   `DuckDbBillingStore::open` / `Handle::open_default` in `apps modules crates`
+   (minus `/tests/`) was enumerated and classified. The only in-serve openers
+   that remain are in `serve::run` at :1206–:1461 and
+   `record_upgrade_snapshot_mismatch_audit` (called at :1127) — all strictly
+   **before** `open_tenant_handle` at :1633 — plus the demo/new-tenant openers,
+   which target a different DB file. `ap_sync.rs:1417` and the ~70 other
+   `Handle::open_default` hits are inside `#[cfg(test)]` modules.
+2. ❌ `rebuild-stock-cache` flock-fenced — **owed**, §13.2.
+3. ❌ A re-run adversarial over the corrected D8.
+
+Arming it before (2) reproduces exactly the failure mode D7's B1 test describes,
+with a different command as the trigger. The B1 tests and the `aberp-db` docs
+name the CLI class rather than the three now-migrated in-serve fns, so the
+disarmed default no longer cites a reason that has been fixed.
+
+**Method note, worth more than the fix.** Both D8 misses — the three
+`serve::run` openers and three of `compute_financial_report`'s four — were
+*per-function* views of a *per-opener* problem. Where a function-keyed artifact
+and an opener-keyed artifact disagree, the opener-keyed one wins; and "GROUP A
+is empty" is a claim that must be re-derived from the tree by grep, never read
+off a governance file that a previous change was supposed to have updated.
+
+### 13.4 D8's second miss — DDL one call-frame from a `read()` (adversarial F3)
+
+ADR-0108 R-1 forbids DDL on a `Handle::read()` connection: the try_clone is
+writable, but it is released from the writer mutex the instant it is taken, so
+DDL through it escapes the single-writer invariant the audit chain, the
+invoice-number allocator and the stock cache all rest on. It is pinned tree-wide
+by `apps/aberp/tests/no_ddl_on_read_handle.rs`.
+
+**The D8 sweep broke that rule at six sites, and the pin stayed green.** The
+pin's scan is scope-LOCAL — it flags `ensure_schema(&conn)` written beside the
+`let conn = …read()` binding. Every one of the six put the DDL one call-frame
+away:
+
+| migrated path | callee that issues the DDL |
+|---|---|
+| `calibration_overview_request` | `quote_calibration::calibration_overview` |
+| `handle_quote_pipeline_status` | `count_recent_daemon_panics` → **audit** `ensure_schema` |
+| `handle_list_email_relay_queue` | `email_relay_queue::list_rows` |
+| `handle_get_email_relay_row` | `email_relay_queue::read_row` |
+| `prepare_rerender` | `quote_pricing_jobs::get_effective_lead_time_days` |
+| `resolve_recipient_email` | `partners::get_partner` / `find_partner_by_tax_number` |
+
+The second row is the sharp one: the audit `ensure_schema` reaches
+`migrate_drop_unique_art_if_present`, which on a legacy table performs a `DROP` +
+`CREATE` + bulk re-`INSERT` of the entire `audit_ledger`. A whole-table rebuild
+issued from a mutex-free clone, concurrently with a real writer on the same
+instance, is not something anyone designed. It is unreachable today only because
+serve's boot migrates the audit schema before `open_tenant_handle` — a
+precondition, not a guard, and one nobody had written down.
+
+All six now take `db.write()` — R-1's own second remedy ("or take a
+`Handle::write()` for it"). The cost is that these routes serialize behind the
+writer mutex; they are low-frequency operator screens on a single-operator ERP,
+where `aberp-db` already documents write serialization as an accepted throughput
+ceiling. `compute_financial_report` deliberately stays on `read()`: its four
+SQL-aggregate callees issue no DDL (verified), so it scopes a brief `write()`
+for its bootstrap and reads the rest concurrently — and a test pins that
+asymmetry, so "put everything on `write()`" cannot become the rule by drift.
+
+**The alternative not taken**, and why: hoisting `ensure_schema` out of those
+six callees (the R-1 remedy applied to `incoming_invoices`) would preserve read
+concurrency, but those helpers have CLI callers that rely on the ensure, so it
+is a broader change than D8's scope and belongs in its own PR.
+
+`apps/aberp/tests/adr0110_d8_reader_schema_ddl.rs` pins the two halves R-1
+structurally cannot: that the callees really do issue DDL, and that these entry
+points really do take `write()`. Mutation-verified — flip one back to `read()`
+and it reds with the site named, while R-1 stays green.
+
+**The pattern across all three D8 misses.** F1 (per-function census entry hiding
+per-opener facts), F2 (a fixture that pre-created the schema hiding a dropped
+bootstrap), and F3 (a scope-local scan hiding a cross-frame call) are one
+failure: *a detector whose granularity is coarser than the thing it detects*.
+Each was green while wrong. When a gate's unit of analysis is a function, a
+file, or a lexical scope, ask what it looks like one level down before believing
+it.
+
+### 13.5 The F3 fix's own cost, paid back (re-adversarial, non-blocking)
+
+F3 put six reader paths on `db.write()`. That was correct for R-1, but two of
+the six paid for it in a way the fix did not account for. Both are now narrowed.
+Neither weakens R-1: in both cases every DDL-reaching call still runs under the
+writer.
+
+**`prepare_rerender` held the process-wide writer across a PDF render and an
+fsync.** Widening it to "one writer for the whole body" swept in
+`aberp_quote_pdf::render` (pure CPU) and `crate::fs::write_atomic`, which calls
+`sync_all` — a real fsync. Measured ~14.5ms of guard hold, blocking a concurrent
+invoice-issue `db.write()` for ~13.2ms; and `poll_once` drains the queue
+*sequentially* through `process_one`, so an N-quote drain is N such windows
+back-to-back. On production storage it is worse than the microbenchmark says,
+because that fsync competes with `durable_ack`'s WAL fsync and the audit-mirror
+fsync for the same device — the money path's own durability, slowed by a PDF.
+
+The last DB use is `get_effective_lead_time_days`. The guard is now dropped
+immediately after it, so render and fsync run unlocked. Both DDL-reaching calls
+stay above the drop.
+
+**The pin had to be relaxed, not just the code.** The F3 test asserted
+`prepare_rerender` "must take `db.write()` for its whole body" — which would have
+made this fix red. That is a pin cementing an implementation instead of
+forbidding a defect. It now asserts the actual invariant: both DDL-reaching calls
+happen under the writer, no `read()` clone is held, and the explicit `drop`
+precedes the render/fsync tail. Mutation-verified in both directions — deleting
+the `drop` reds it (the throughput regression returns) and swapping `write()` for
+`read()` reds it (the R-1 defect returns).
+
+*General form, worth more than the instance:* a pin written as "the code looks
+like X" blocks the next legitimate improvement. Write it as "the defect cannot
+occur" and the fix passes while the regression still fails.
+
+**`resolve_recipient_email` took the writer on a tokio runtime worker.** It is
+the one F3 site called bare from an `async fn` — the other five already sit
+inside `spawn_blocking` — so it began taking the process-wide writer mutex on an
+async worker and holding it across a transaction plus two partner queries. On
+the auto-email-after-issue path, a contended writer parks that worker.
+
+Moved onto `spawn_blocking`, which required taking `(&Handle, &str tenant)`
+instead of `&AppState` so the call is movable. The alternative — narrowing the
+hold — was rejected on inspection rather than preference: the partner lookups
+*are* the DDL-reaching calls, so they must sit under the writer either way;
+narrowing would have shortened the block without removing blocking-from-async,
+while `spawn_blocking` removes it outright and matches what the other five sites
+already do. A panic in the blocking task now lands on the same
+"no recipient → audit the skip, banner the operator" branch a lookup error takes,
+so it can never be mistaken for a successful send.
+
+Also pinned: `partners::get_partner` and `find_partner_by_tax_number` were the
+one DDL premise asserted in prose but never tested, unlike their five siblings.
+They are in the half-1 pin now, mutation-verified.
