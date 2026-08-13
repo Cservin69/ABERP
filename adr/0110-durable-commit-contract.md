@@ -1947,6 +1947,27 @@ not, which is what
 the DB exactly two rows behind at the first freeze, the boot that used to be
 refused now heals, and the tenant is usable again.
 
+**A pre-existing reconciler window the alarm can walk an operator into (R5-N3;
+not a D5 defect and not fixed here).** `ensure_consistent_with_db`'s
+**equal-length arm** compares head `entry_hash`es and refuses when they differ.
+After a lag-N freeze, a process that goes on to commit exactly N more writes
+brings the DB head level with the mirror's — different content at the same seq —
+and the next boot lands in that arm and REFUSES. The round-5 adversarial
+demonstrated this with a control carrying no D5, no marker and no Handle: it is
+a property of the reconciler, which D5 neither causes nor prevents. (D5's first
+cut only made it *deterministic* at lag 2 by adding its own row; that is gone
+with route (a).)
+
+It is recorded here anyway, because **D5's banner is what tells the operator to
+restart now**, so the alarm is exactly what can walk them into the window. Two
+consequences, both operational: the current remedy is restore-from-snapshot
+(the ahead/corrupt mirror is preserved to a side file first, so nothing is
+lost), and a follow-up ticket is opened against the reconciler's equal-length
+arm to distinguish "the DB has different content at this seq because it lost
+rows and then wrote new ones" from "the chains genuinely forked". Not attempted
+in this PR: changing the reconciler's refuse arms is its own change with its own
+adversarial pass, and refusing a boot is the safe direction to be wrong in.
+
 ### 15.6 Scope held narrow; no new opener; no deadlock
 
 Only `MirrorDivergent` raises. `MirrorIo` and `MirrorCorrupt` keep the pre-D5
@@ -2001,6 +2022,9 @@ alert — and goes RED when the raise is wrapped in
 | `a_mirror_advanced_by_someone_else_must_not_raise` | weaken the regression test to `now <= prev` |
 | `the_freeze_is_recorded_once_per_episode` | delete the `freeze_reported` gate (4 records instead of 1) |
 | `the_alarm_fires_with_the_wal_fence_disarmed` | gate the raise on `wal_fence_enabled` |
+| `a_torn_marker_record_counts_as_a_loss` (R5-N1) | restore the reader's skip-and-`warn!` arm |
+| `a_torn_marker_record_is_still_acknowledgeable` (R5-N1) | stamp torn records at `now_utc`; or drop the terminate-a-torn-record step in `append_line` |
+| `an_unreadable_marker_keeps_the_banner_up_and_refuses_to_clear` (R5-N2) | clear the flag despite a failed `record_ack` |
 
 **Three of these were vacuous when first written, and the mutations are what
 found that** — worth recording, because the same shape recurs:
@@ -2017,3 +2041,66 @@ found that** — worth recording, because the same shape recurs:
 
 In all three the fix was to make the test's state faithful, not to weaken the
 assertion — and in all three the un-faithful version would have shipped green.
+
+### 15.9 Round-5 — the marker's own failure direction
+
+The round-5 adversarial cleared D5 (B1 dead at all lag depths, B2 unreachable,
+pins non-vacuous) and named two places where the marker module's CODE and its
+stated failure posture disagreed. On fresh durability code those have to agree,
+so both were closed before merge.
+
+**R5-N1 — a torn record could fail toward banner-DOWN.** A record goes down with
+one `write_all`, but a crash can still cut it, and of the 75 truncation points
+on a loss record six leave the *event field* incomplete (`v`, `v1`, `v1<TAB>`,
+`v1<TAB>l`, `v1<TAB>lo`, `v1<TAB>los`). Those landed in the reader's
+skip-and-`warn!` arm, so a torn FIRST record left the banner DOWN — damage to
+the file silencing the alarm, the precise inverse of what the module documents.
+The rule is now: **a line counts as an acknowledgement only if it parses
+completely as one; every other non-empty line counts as a loss.** That covers
+all six, plus a torn `ack` (an interrupted acknowledgement is not an
+acknowledgement) and any future format this build cannot read. Blank lines are
+still skipped, so a healthy tenant that has only ever touched the file wears no
+banner.
+
+Deliberately wider than "v1-prefixed records raise": one of the six shapes is
+`v`, which is not `v1`-prefixed, and a record from a format this build cannot
+read is better understood as "something happened here" than as nothing. Both
+degrade to banner-up-and-clearable, which is the safe corner.
+
+**R5-N2 — an unreadable marker is banner-UP but NOT clearable.** The docstring
+promised everything raised here stays acknowledgeable. True for damaged
+CONTENT; false for a broken FILE, where nothing can be read (so no ack is ever
+seen) and the same fault blocks the write (so `clear_durability_alert` returns
+`Err`). **Disposition: correct the documentation, not the behaviour.** The only
+way to make that case clearable is to clear the flag when the durable half could
+not be written — which is exactly the amnesia D7.4b closed. So both docstrings
+now split the two classes explicitly and say that an unreadable or unwritable
+marker keeps the banner up until the filesystem fault is fixed; it is an
+operator-attention fault on a path beside the tenant DB, logged at ERROR with
+the path on every attempt, and fixing it makes the alert immediately
+acknowledgeable again.
+
+**Two real defects the new pins found on their first run**, both in the marker
+module and both fixed here:
+
+- **An infinite loop on a persistently unreadable file.** The reader `continue`d
+  after a line-level read error, but the errors that reach that arm are
+  properties of the file, not the line (a directory occupying the marker path
+  returns `EISDIR` on every read) — so it spun forever, hanging any boot that
+  met it. It now counts the loss and `break`s; nothing past an unreadable point
+  is trustworthy anyway.
+- **An append onto a torn record SPLICED the two.** A torn record has no
+  trailing newline, so appending the acknowledgement straight onto it produced
+  one line that parsed as neither — swallowing the ack and making the banner
+  genuinely permanent. That is the failure the UNIX_EPOCH stamp exists to
+  prevent, reintroduced one layer down. `append_line` now terminates a torn
+  record first; the torn record is preserved on its own line and still counts as
+  a loss.
+
+Three pins, each mutation-verified: `a_torn_marker_record_counts_as_a_loss`
+(restore the skip arm), `a_torn_marker_record_is_still_acknowledgeable` (stamp
+torn records at `now_utc`, or drop the terminate-a-torn-record step), and
+`an_unreadable_marker_keeps_the_banner_up_and_refuses_to_clear` (clear the flag
+despite a failed `record_ack`). The infinite loop is verified by construction —
+reverting `break` to `continue` hangs that pin rather than reddening it, which
+is how it was found.

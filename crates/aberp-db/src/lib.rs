@@ -1232,6 +1232,19 @@ impl Handle {
     /// which is the safe direction: clearing memory while the durable half
     /// stayed raised is precisely the "operator watched the banner drop and it
     /// came back next boot" defect D7.4b fixed.
+    ///
+    /// # When the marker file itself is broken (R5-N2)
+    ///
+    /// If the marker cannot be written — permissions, a full or read-only
+    /// volume, something else occupying the path — this returns `Err` on every
+    /// attempt and **the banner cannot be cleared until that is fixed**. That
+    /// is deliberate and it is not a bug to route around: the alternative is
+    /// clearing a real durability loss with no durable record that anyone
+    /// acknowledged it, which is the amnesia D7.4b closed. The failure is an
+    /// operator-attention filesystem fault on a path beside the tenant DB,
+    /// logged at ERROR with the path on every attempt; fixing it makes the
+    /// alert immediately acknowledgeable again. See
+    /// [`crate::durability_marker::read`] for the same split on the read side.
     pub fn clear_durability_alert(&self) -> Result<(), DbError> {
         durability_marker::record_ack(&self.marker_path, OffsetDateTime::now_utc()).map_err(
             |e| {

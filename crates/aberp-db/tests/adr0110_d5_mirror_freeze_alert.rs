@@ -785,3 +785,176 @@ fn the_alarm_fires_with_the_wal_fence_disarmed() {
          production, where the flag is false"
     );
 }
+
+// ── THE MARKER'S OWN FAILURE DIRECTION (round-5) ────────────────────────────
+
+/// Write raw bytes as the whole marker file, standing in for whatever a crash
+/// or a foreign hand left there.
+fn overwrite_marker(h: &Handle, body: &str) {
+    std::fs::write(h.durability_marker_path(), body).expect("write the marker");
+}
+
+/// **R5-N1 — a TORN record must fail toward the banner UP.**
+///
+/// A record goes down with one `write_all`, but a crash can still cut it. Of
+/// the 75 truncation points on a real loss record, six leave the *event field*
+/// incomplete — `v`, `v1`, `v1\t`, `v1\tl`, `v1\tlo`, `v1\tlos`. The first cut
+/// of the reader skipped those with a `warn!`, so a torn FIRST record left the
+/// banner DOWN: the exact opposite of the posture the module documents, and a
+/// way for damage to silence the alarm rather than raise it.
+///
+/// The rule now is that a line counts as an acknowledgement only if it parses
+/// completely as one, and every other non-empty line counts as a loss. All six
+/// shapes are checked one by one rather than sampled, because "we fixed the
+/// class" is the claim, and a class is not a sample. A torn `ack` is in here
+/// too: an acknowledgement whose write was interrupted is not one.
+///
+/// The other direction is the last case: a genuinely BLANK marker must stay
+/// quiet, or every healthy tenant that ever touched the file wears a banner.
+///
+/// Mutation-verified: restore the `_ => tracing::warn!(...)` skip arm and every
+/// torn case below goes RED while the blank case stays green.
+#[test]
+fn a_torn_marker_record_counts_as_a_loss() {
+    let tmp = Tmp::new("torn-marker");
+    let db = tmp.db();
+    seed(&db);
+
+    // The six truncation points that cut the event field, plus a torn ack, plus
+    // a record from a format this build cannot read.
+    for torn in [
+        "v",
+        "v1",
+        "v1\t",
+        "v1\tl",
+        "v1\tlo",
+        "v1\tlos",
+        "v1\tack",
+        "v1\tack\t",
+        "v2\tloss\t2026-08-13T10:00:00Z\tsomething\tnew\t7",
+    ] {
+        let h = handle(&db);
+        overwrite_marker(&h, torn);
+        drop(h);
+
+        assert!(
+            handle(&db).durability_alert().is_some(),
+            "a torn or unreadable marker record ({torn:?}) left the banner DOWN. Damaging this \
+             file must never be a way to silence the alarm — anything that is not a complete \
+             acknowledgement has to count as a loss."
+        );
+    }
+
+    // ...and the other direction, which is what stops this being a rule that
+    // just says "always raise".
+    let h = handle(&db);
+    overwrite_marker(&h, "\n   \n\n");
+    drop(h);
+    assert!(
+        handle(&db).durability_alert().is_none(),
+        "a blank marker is not an incident; raising here would put a banner on every tenant \
+         that ever touched the file"
+    );
+}
+
+/// A torn record raises the banner, and the operator can still take it down.
+///
+/// This is the half that keeps R5-N1's fix from creating the failure it is
+/// meant to avoid. The torn record is counted at UNIX_EPOCH precisely so a real
+/// acknowledgement out-ranks it — an alarm that cannot be cleared is one an
+/// operator routes around, and then it is worse than nothing on the day it is
+/// right.
+///
+/// It found a real defect on its first run, which is the reason it is written
+/// as a round-trip through the acknowledge path rather than as an assertion
+/// about UNIX_EPOCH. A torn record does not end in a newline, so appending the
+/// acknowledgement onto it SPLICED the two into one line that parsed as
+/// neither: the ack was swallowed and the banner became genuinely permanent —
+/// the failure the UNIX_EPOCH stamp exists to prevent, reintroduced one layer
+/// down in `append_line`. Terminating a torn record before appending is the
+/// fix.
+///
+/// Mutation-verified twice: stamp the torn record at `OffsetDateTime::now_utc()`
+/// instead of UNIX_EPOCH in `durability_marker::read` (the acknowledgement can
+/// no longer out-rank it), or drop the terminate-a-torn-record step from
+/// `append_line` (the acknowledgement is spliced away). Either goes RED.
+#[test]
+fn a_torn_marker_record_is_still_acknowledgeable() {
+    let tmp = Tmp::new("torn-ackable");
+    let db = tmp.db();
+    seed(&db);
+
+    let h = handle(&db);
+    overwrite_marker(&h, "v1\tlos");
+    drop(h);
+
+    let h = handle(&db);
+    assert!(
+        h.durability_alert().is_some(),
+        "precondition: the torn record raised the banner"
+    );
+    h.clear_durability_alert()
+        .expect("a readable, writable marker must always be acknowledgeable");
+    drop(h);
+
+    assert!(
+        handle(&db).durability_alert().is_none(),
+        "the acknowledgement must out-rank a torn record across a restart, or the banner is \
+         permanent and the operator learns to work around it"
+    );
+}
+
+/// **R5-N2 — a marker that cannot be read or written keeps the banner up, and
+/// says so.**
+///
+/// The docstring used to promise that everything raised here stays
+/// acknowledgeable. For damaged CONTENT that is true (the test above). For a
+/// broken FILE it was not: nothing can be read, so no acknowledgement is ever
+/// seen, and the same fault blocks the write, so `clear_durability_alert`
+/// returns `Err` and the banner is stuck until the filesystem is fixed.
+///
+/// The disposition is to say that plainly rather than to soften the behaviour.
+/// The alternative — clearing the flag when the durable half could not be
+/// written — is exactly the amnesia D7.4b closed: the operator would watch the
+/// banner drop, and the next boot would raise it again with no record that
+/// anyone acknowledged anything. So this pins BOTH halves: the banner is up,
+/// and the acknowledge attempt FAILS rather than silently succeeding.
+///
+/// A directory at the marker path stands in for the whole class (permission
+/// denied, EIO, a read-only volume): every member reaches these same two arms,
+/// and this one reproduces deterministically without depending on the test
+/// process's privileges.
+///
+/// Mutation-verified: make `clear_durability_alert` ignore the `record_ack`
+/// error and clear anyway, and the second half goes RED.
+#[test]
+fn an_unreadable_marker_keeps_the_banner_up_and_refuses_to_clear() {
+    let tmp = Tmp::new("unreadable-marker");
+    let db = tmp.db();
+    seed(&db);
+
+    let marker = handle(&db).durability_marker_path().to_path_buf();
+    std::fs::create_dir(&marker).expect("occupy the marker path");
+
+    let h = handle(&db);
+    assert!(
+        h.durability_alert().is_some(),
+        "a marker that exists but cannot be read must raise: an unreadable alarm must not be a \
+         silent one"
+    );
+    let err = h.clear_durability_alert().expect_err(
+        "acknowledging must FAIL while the durable half cannot be written — clearing the flag \
+         anyway is the amnesia D7.4b closed",
+    );
+    assert!(
+        h.durability_alert().is_some(),
+        "and the banner must still be up after the failed clear"
+    );
+    assert!(
+        err.to_string().contains("durability-alert marker"),
+        "the error must name the marker so the operator knows which filesystem fault to fix, \
+         got: {err}"
+    );
+
+    std::fs::remove_dir(&marker).expect("clean up");
+}
