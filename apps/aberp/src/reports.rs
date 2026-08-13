@@ -530,7 +530,24 @@ struct ReportTrace {
     has_submission_response: bool,
     has_marked_abandoned: bool,
     last_ack_status: Option<String>,
-    is_storno_base: bool,
+    /// This invoice is the base of a storno that ACTUALLY LANDED — its
+    /// storno child classifies as [`CountedKind::Counted`], i.e. the
+    /// reversal is in the aggregates and the pair nets to zero.
+    ///
+    /// NOT "a storno was issued against it". `InvoiceStornoIssued` is
+    /// appended in the same transaction as the storno DRAFT, before the
+    /// storno is submitted to NAV (`issue_storno.rs:1195-1213`), so the
+    /// chain link alone says only that a cancellation was *attempted*. If
+    /// that storno was ABORTED at NAV or never submitted, it never
+    /// negates anything and the base is still a live, unpaid, legally
+    /// outstanding invoice. This flag is therefore resolved AFTER the
+    /// ledger walk, once the child's own ack is known — see
+    /// [`resolve_landed_stornos`].
+    ///
+    /// Same rule the NAV chain allocator applies: only chain members
+    /// whose own submission reached terminal SAVED count
+    /// (`issue_storno::saved_chain_member_ids_in_tx`, S381/F4).
+    has_landed_storno: bool,
     is_amended_base: bool,
     is_storno_self: bool,
     payment_paid_at: Option<String>,
@@ -598,6 +615,11 @@ fn walk_ledger(ledger: &Ledger, period_window: DateWindow) -> Result<LedgerWalk>
         .entries()
         .context("read audit ledger entries for financial report")?;
     let mut walk = LedgerWalk::default();
+    // (base_invoice_id, storno_invoice_id) for every storno chain link.
+    // Collected during the walk but RESOLVED after it: whether a storno
+    // landed depends on the child's own ack, which may be appended by a
+    // later entry than the chain link itself.
+    let mut storno_links: Vec<(String, String)> = Vec::new();
     for entry in &entries {
         if let Some(id) = extract_invoice_id_local(entry) {
             walk.traces.entry(id.clone()).or_default().merge(entry, &id);
@@ -608,10 +630,8 @@ fn walk_ledger(ledger: &Ledger, period_window: DateWindow) -> Result<LedgerWalk>
                     .entry(link.child_invoice_id.clone())
                     .or_default()
                     .is_storno_self = true;
-                walk.traces
-                    .entry(link.base_invoice_id.clone())
-                    .or_default()
-                    .is_storno_base = true;
+                walk.traces.entry(link.base_invoice_id.clone()).or_default();
+                storno_links.push((link.base_invoice_id, link.child_invoice_id));
                 if entry_in_window(entry, period_window) {
                     walk.storno_links_in_period = walk.storno_links_in_period.saturating_add(1);
                 }
@@ -627,7 +647,50 @@ fn walk_ledger(ledger: &Ledger, period_window: DateWindow) -> Result<LedgerWalk>
             }
         }
     }
+    resolve_landed_stornos(&mut walk.traces, &storno_links);
     Ok(walk)
+}
+
+/// Second pass over the storno chain links: flag a base as
+/// [`ReportTrace::has_landed_storno`] only if its storno child actually
+/// took effect.
+///
+/// Split from the walk because it cannot be decided during it. The
+/// `InvoiceStornoIssued` link is appended with the storno DRAFT, in the
+/// same transaction, BEFORE the storno is submitted
+/// (`issue_storno.rs:1195-1213`); the child's ack — the thing that says
+/// whether the cancellation happened — arrives in a later entry. Setting
+/// the flag at link time meant "a cancellation was attempted", which is
+/// not the same claim.
+///
+/// "Landed" is [`CountedKind::Counted`] — deliberately the SAME condition
+/// under which [`aggregate_outgoing`] adds the child's −amount to revenue.
+/// That coupling is the invariant: revenue and receivables must agree
+/// about whether a storno took effect. A NAV-ABORTed or never-submitted
+/// storno classifies as `Rejected` / `PendingDraft`, revenue keeps the
+/// base's +amount, and so must receivables — the base is still owed.
+///
+/// This is the report-side reading of the rule the NAV chain allocator
+/// already applies via `issue_storno::saved_chain_member_ids_in_tx`
+/// (S381/F4): a storno that never reached terminal SAVED never registered.
+fn resolve_landed_stornos(
+    traces: &mut HashMap<String, ReportTrace>,
+    storno_links: &[(String, String)],
+) {
+    let landed_bases: Vec<String> = storno_links
+        .iter()
+        .filter(|(_, child)| {
+            traces
+                .get(child)
+                .is_some_and(|t| matches!(t.classify(), CountedKind::Counted { .. }))
+        })
+        .map(|(base, _)| base.clone())
+        .collect();
+    for base in landed_bases {
+        if let Some(t) = traces.get_mut(&base) {
+            t.has_landed_storno = true;
+        }
+    }
 }
 
 impl ReportTrace {
@@ -1287,8 +1350,8 @@ fn aggregate_outgoing(
         vat_target.gross_minor = vat_target.gross_minor.saturating_add(*vat);
         vat_target.vat_minor = vat_target.vat_minor.saturating_add(*vat);
         vat_target.count = vat_target.count.saturating_add(1);
-        // Receivables: counted-but-not-paid. BOTH halves of a storno pair
-        // are excluded — the storno-self row (the −amount credit note, which
+        // Receivables: counted-but-not-paid. BOTH halves of a LANDED
+        // storno pair are excluded — the storno-self row (the −amount credit note, which
         // is self-resolving: the negation IS the payment) AND the cancelled
         // base it reverses. A voided invoice is not *partially* receivable,
         // it is not receivable: nobody owes it. Excluding only the
@@ -1300,9 +1363,20 @@ fn aggregate_outgoing(
         // the chain link: netting would still count the pair as 2 open
         // receivables and would depend on both halves landing in the same
         // window.
+        //
+        // LANDED is load-bearing, and it is why the flag is resolved after
+        // the walk rather than at the chain link (see
+        // `resolve_landed_stornos`). A storno that was ABORTED at NAV or
+        // never submitted cancels nothing: the base is still owed, revenue
+        // still carries its +amount, and dropping it from AR would silently
+        // erase a real receivable — an under-count nobody can see on the
+        // tile, unlike the over-count that got us here (rule 11). This
+        // predicate tracks revenue exactly: the pair nets to zero in revenue
+        // iff the child classifies as `Counted`, and AR excludes both halves
+        // iff the same.
         let trace = traces.get(id).cloned().unwrap_or_default();
         let paid = trace.payment_paid_at.is_some();
-        if !paid && !*is_storno_self && !trace.is_storno_base {
+        if !paid && !*is_storno_self && !trace.has_landed_storno {
             let ar_target = match currency.as_str() {
                 "EUR" => &mut agg.receivables.eur,
                 _ => &mut agg.receivables.huf,
@@ -1918,6 +1992,8 @@ pub fn today_local() -> Date {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aberp_audit_ledger::Actor;
+    use aberp_billing::IdempotencyKey;
     use time::Duration;
 
     #[test]
@@ -2195,10 +2271,39 @@ mod tests {
         Date::from_calendar_date(y, m, day).unwrap()
     }
 
+    /// Build the trace map the way [`walk_ledger`] does — per-invoice traces
+    /// plus the POST-walk storno resolution. Tests go through
+    /// [`resolve_landed_stornos`] rather than hand-setting
+    /// `has_landed_storno`, so a regression in the resolution itself cannot
+    /// hide behind a hand-built flag.
+    fn resolved_traces(
+        traces: Vec<(&str, ReportTrace)>,
+        storno_links: &[(&str, &str)],
+    ) -> HashMap<String, ReportTrace> {
+        let mut map: HashMap<String, ReportTrace> = traces
+            .into_iter()
+            .map(|(id, t)| (id.to_string(), t))
+            .collect();
+        let links: Vec<(String, String)> = storno_links
+            .iter()
+            .map(|(b, c)| ((*b).to_string(), (*c).to_string()))
+            .collect();
+        resolve_landed_stornos(&mut map, &links);
+        map
+    }
+
+    /// A storno child that reached NAV and was SAVED — the reversal landed.
+    fn landed_storno_child() -> ReportTrace {
+        ReportTrace {
+            is_storno_self: true,
+            ..saved_trace()
+        }
+    }
+
     /// **The AR storno-leak fixture** (the live-prod #3/#4 pair).
     ///
-    /// A storno pair is two equal-and-opposite rows: the cancelled ORIGINAL
-    /// (`is_storno_base`, +431,80 €) and the credit note that reverses it
+    /// A LANDED storno pair is two equal-and-opposite rows: the cancelled
+    /// ORIGINAL (+431,80 €) and the credit note that reverses it
     /// (`is_storno_self`, −431,80 €). The receivables predicate excluded only
     /// the counterpart, so the −amount was dropped while the cancelled
     /// original's +amount stayed in AR: the pair could not net, and prod
@@ -2211,29 +2316,24 @@ mod tests {
     /// unpaid, same currency — must survive: the exclusion is storno-specific,
     /// not a paid-status or date-basis side effect.
     ///
-    /// Mutation check: drop `&& !trace.is_storno_base` from the predicate and
-    /// AR goes to 993 140 / count 2, the `Current` aging bucket gains 43 180,
-    /// and the cash-flow tiles gain 43 180 — four independent reds.
+    /// Mutation check: drop `&& !trace.has_landed_storno` from the predicate
+    /// and AR goes to 993 140 / count 2, the `Current` aging bucket gains
+    /// 43 180, and the cash-flow tiles gain 43 180 — four independent reds.
     #[test]
-    fn cancelled_storno_base_is_excluded_from_receivables_aging_and_cashflow() {
+    fn landed_storno_base_is_excluded_from_receivables_aging_and_cashflow() {
         let today = d(2026, Month::August, 13);
-        let traces: HashMap<String, ReportTrace> = HashMap::from([
-            (
-                "inv3".into(),
-                ReportTrace {
-                    is_storno_base: true,
-                    ..saved_trace()
-                },
-            ),
-            (
-                "inv4".into(),
-                ReportTrace {
-                    is_storno_self: true,
-                    ..saved_trace()
-                },
-            ),
-            ("inv9".into(), saved_trace()),
-        ]);
+        let traces = resolved_traces(
+            vec![
+                ("inv3", saved_trace()),
+                ("inv4", landed_storno_child()),
+                ("inv9", saved_trace()),
+            ],
+            &[("inv3", "inv4")],
+        );
+        assert!(
+            traces["inv3"].has_landed_storno,
+            "a SAVED storno child means the reversal landed"
+        );
         let groups = vec![
             // The cancelled original and its credit note — both unpaid, both
             // with a FUTURE deadline, so pre-fix the leak also reached the
@@ -2266,10 +2366,172 @@ mod tests {
         assert_eq!(agg.cashflow_forward.next_30.eur_minor, 0);
         assert_eq!(agg.cashflow_forward.next_60.eur_minor, 0);
         assert_eq!(agg.cashflow_forward.next_90.eur_minor, 0);
-        // Revenue is untouched by this fix and still nets the pair to zero —
-        // the two halves really are equal-and-opposite, which is what makes
-        // exclude-both (rather than netting via the chain link) correct.
+        // Revenue nets the landed pair to zero — the two halves really are
+        // equal-and-opposite, which is what makes exclude-both (rather than
+        // netting via the chain link) correct. AR must agree with revenue.
         assert_eq!(agg.revenue.eur.gross_minor, 949_960);
+    }
+
+    /// **The over-exclusion pin.** `InvoiceStornoIssued` is appended with the
+    /// storno DRAFT, in the same transaction, BEFORE the storno is submitted
+    /// (`issue_storno.rs:1195-1213`) — so "a storno was issued against this
+    /// invoice" does NOT mean the cancellation took effect. If the storno was
+    /// ABORTED at NAV, or never submitted, it reverses nothing and the base
+    /// is still a live, unpaid, legally outstanding receivable.
+    ///
+    /// Excluding such a base is the mirror-image defect of the leak above and
+    /// strictly worse to operate with: an over-count is visible on the tile
+    /// (that is how the leak was caught), an under-count silently erases a
+    /// receivable that then never gets chased (rule 11).
+    ///
+    /// Coherence is the invariant under test: revenue keeps the base's
+    /// +amount for a storno that did not land, so receivables must keep it
+    /// too. Both bases here must appear in AR, in the right aging bucket,
+    /// in the past-deadline count, and in the cash-flow projection.
+    ///
+    /// Mutation check: flag the base at chain-link time again (the
+    /// issuance-time `is_storno_base`) and AR drops to 0 / count 0 while
+    /// revenue still reports 63 180 — the incoherence is the tell.
+    #[test]
+    fn aborted_or_unsubmitted_storno_leaves_the_base_receivable_standing() {
+        let today = d(2026, Month::August, 13);
+        let traces = resolved_traces(
+            vec![
+                ("base_past", saved_trace()),
+                // Storno submitted, NAV said ABORTED → classifies Rejected.
+                (
+                    "storno_past",
+                    ReportTrace {
+                        is_storno_self: true,
+                        last_ack_status: Some("ABORTED".into()),
+                        ..Default::default()
+                    },
+                ),
+                ("base_future", saved_trace()),
+                // Storno drafted but never submitted → classifies
+                // PendingDraft. No ack ever arrives.
+                (
+                    "storno_future",
+                    ReportTrace {
+                        is_storno_self: true,
+                        has_draft: true,
+                        ..Default::default()
+                    },
+                ),
+            ],
+            &[
+                ("base_past", "storno_past"),
+                ("base_future", "storno_future"),
+            ],
+        );
+        assert!(
+            !traces["base_past"].has_landed_storno,
+            "a NAV-ABORTed storno never registered — the base is not cancelled"
+        );
+        assert!(
+            !traces["base_future"].has_landed_storno,
+            "an unsubmitted storno cancels nothing"
+        );
+
+        let groups = vec![
+            group("base_past", "EUR", 43_180, Some("2026-07-14")),
+            group("storno_past", "EUR", 43_180, Some("2026-07-14")),
+            group("base_future", "EUR", 20_000, Some("2026-08-23")),
+            group("storno_future", "EUR", 20_000, Some("2026-08-23")),
+        ];
+        let agg = aggregate_outgoing(groups, &traces, today, &HashMap::new());
+
+        assert_eq!(
+            agg.receivables.eur.gross_minor, 63_180,
+            "both bases are still owed in full; 0 means the fix erased live receivables"
+        );
+        assert_eq!(agg.receivables.eur.count, 2);
+        // The tiles nested under the same predicate follow AR.
+        assert_eq!(agg.receivables_aging.days_1_30.gross_minor, 43_180);
+        assert_eq!(agg.receivables_aging.current.gross_minor, 20_000);
+        assert_eq!(agg.outstanding_past_deadline_count, 1);
+        assert_eq!(agg.cashflow_forward.next_30.eur_minor, 20_000);
+        assert_eq!(agg.cashflow_forward.next_60.eur_minor, 20_000);
+        assert_eq!(agg.cashflow_forward.next_90.eur_minor, 20_000);
+        // Coherence with revenue: neither storno classifies as Counted, so
+        // revenue carries both bases and nothing else. AR reports the same
+        // figure. If these two ever disagree, one of them is lying.
+        assert_eq!(agg.revenue.eur.gross_minor, 63_180);
+        assert_eq!(agg.revenue.eur.gross_minor, agg.receivables.eur.gross_minor);
+    }
+
+    /// The resolution must survive the ledger's ORDERING: the chain link is
+    /// appended before the storno is submitted, so the child's ack is a
+    /// strictly later entry. Anything that decides "did this land?" during
+    /// the walk reads the child's trace before it exists.
+    ///
+    /// Driven through a real in-memory `Ledger` so the entry ordering, the
+    /// typed payload decode and the post-walk resolution are all exercised.
+    #[test]
+    fn walk_ledger_flags_a_base_only_when_its_storno_landed() {
+        let tenant = TenantId::new("t1".to_string()).unwrap();
+        let mut ledger = Ledger::open_in_memory(tenant, BinaryHash::from_bytes([0u8; 32])).unwrap();
+        let actor = Actor::from_local_cli("sess".to_string(), "test-user");
+
+        let link = |ledger: &mut Ledger, base: &str, storno: &str, index: u32| {
+            let payload = audit_payloads::InvoiceStornoIssuedPayload::new(
+                storno,
+                100 + u64::from(index),
+                "rsv",
+                IdempotencyKey::new(),
+                base,
+                1,
+                index,
+            );
+            ledger
+                .append(
+                    EventKind::InvoiceStornoIssued,
+                    payload.to_bytes(),
+                    actor.clone(),
+                    None,
+                )
+                .unwrap();
+        };
+        let ack = |ledger: &mut Ledger, invoice: &str, status: &str| {
+            let payload = audit_payloads::InvoiceAckStatusPayload::new(
+                invoice,
+                "tx",
+                status,
+                b"<a/>".to_vec(),
+            );
+            ledger
+                .append(
+                    EventKind::InvoiceAckStatus,
+                    payload.to_bytes(),
+                    actor.clone(),
+                    None,
+                )
+                .unwrap();
+        };
+
+        // Both chain links land in the ledger BEFORE either ack — the real
+        // ordering, and the one that breaks a mid-walk decision.
+        link(&mut ledger, "base_saved", "storno_saved", 1);
+        link(&mut ledger, "base_aborted", "storno_aborted", 1);
+        ack(&mut ledger, "storno_saved", "SAVED");
+        ack(&mut ledger, "storno_aborted", "ABORTED");
+
+        let walk = walk_ledger(&ledger, DateWindow::unbounded()).unwrap();
+
+        assert!(
+            walk.traces["base_saved"].has_landed_storno,
+            "SAVED storno child → the base really is cancelled"
+        );
+        assert!(
+            !walk.traces["base_aborted"].has_landed_storno,
+            "ABORTED storno child → the base is still outstanding"
+        );
+        // Both children are storno-self regardless of outcome; that flag IS
+        // an issuance-time fact and stays one.
+        assert!(walk.traces["storno_saved"].is_storno_self);
+        assert!(walk.traces["storno_aborted"].is_storno_self);
+        // Hygiene counts chain links, not landings — unchanged by this fix.
+        assert_eq!(walk.storno_links_in_period, 2);
     }
 
     /// A *paid* invoice is out of AR for the ordinary reason, and a plain
