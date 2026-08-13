@@ -30,6 +30,14 @@
 //! mirror), running `cargo run -p aberp-inventory --bin rebuild-stock-cache -- --tenant <id> --db <path>`
 //! re-derives every product's `stock_qty` from `SUM(qty_delta)` in
 //! one transaction.
+//!
+//! ADR-0110 D9: that binary takes the ADR-0099 F-E whole-DB writer flock
+//! (`aberp_db::db_writer_lock::acquire_or_refuse`) before it opens the tenant
+//! DB, so it REFUSES while `aberp serve` holds the tenant — stop serve first.
+//! It opens with DuckDB DEFAULT pragmas, so without the flock its exit would
+//! checkpoint and TRUNCATE the live serve Handle's WAL. This library half takes
+//! no such lock and needs none: it works on a caller-owned `Transaction`, which
+//! is what keeps it callable from inside a `Handle` write guard.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]

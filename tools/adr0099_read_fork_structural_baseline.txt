@@ -142,12 +142,34 @@ apps/aberp/src/mark_abandoned.rs|resolve_stuck_or_loud_fail
 apps/aberp/src/recover_from_nav.rs|resolve_recovery_precondition
 apps/aberp/src/request_technical_annulment.rs|load_base_invoice_issue_year
 apps/aberp/src/observe_receiver_confirmation.rs|load_base_nav_invoice_number
-# ⚠ These two hold NO flock (`acquire_or_refuse` / `try_acquire` absent from both
-# files), so the premise that makes a CLI one-shot's fresh read coherent — mutual
-# exclusion against serve — is NOT established for them. They must NOT be moved to
-# the allow-list as-is; either fence them or migrate them.
-apps/aberp/src/print_invoice.rs|render_to_bytes
+# ⚠ These two held NO flock, so the premise that makes a CLI one-shot's fresh read
+# coherent — mutual exclusion against serve — was not established for either. ONE
+# of the two is now closed; read both notes before touching the allow-list.
+#
+# ── D9 (2026-08-13) — `rebuild-stock-cache` is FLOCK-FENCED ──
+# It was the last opener in the tree that could fold a LIVE serve's WAL: a bare
+# `duckdb::Connection::open` with DEFAULT pragmas, no flock, in a binary ADR-0061
+# §3 tells operators to run *while the shop is running*. Its close checkpointed
+# and truncated the WAL out from under serve's Handle. It now takes
+# `aberp_db::db_writer_lock::acquire_or_refuse` BEFORE its first open, exactly as
+# the twenty sibling mutating CLIs do, so it refuses against a live serve.
+# (The flock module MOVED to `aberp-db` in the same change — a binary outside
+# `apps/aberp` cannot reach `apps/aberp`, and a second copy of the lock-path
+# derivation would be no lock at all. `apps/aberp/src/db_writer_lock.rs` is now a
+# re-export; `is_flock_fenced`'s grep is unaffected — it keys on the call token,
+# which is present in the fenced file.)
+# The line STAYS here: fencing EARNS the exemption, it does not grant it. Moving
+# it to the allow-list is the deliberate follow-up this header already reserves.
 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs|run
+# ── STILL UNFENCED, and knowingly so — `print_invoice|render_to_bytes` ──
+# Re-triaged 2026-08-13 (ADR-0110 §13.2): it is NOT a fold hazard, which is why it
+# is not on the D7 arming gate. It opens `aberp_db::Handle::open_default`, which
+# issues `disable_checkpoint_on_shutdown` + `wal_autocheckpoint='1TB'`, so its
+# close cannot fold a live WAL. What remains is a stale-READ hazard: a second
+# instance does not replay the live writer's WAL (the E1 defect), so a
+# just-issued invoice can render as absent — loud, not silent. It must NOT be
+# moved to the allow-list as-is; either fence it or migrate it.
+apps/aberp/src/print_invoice.rs|render_to_bytes
 # ── D1a (2026-07-28) — the four DUAL-CONTEXT fns, finally visible ──
 # The read-fork ALLOW-LIST header has named these four for months as the fns that are
 # deliberately NOT exempted ("they DO run in-serve, so the CLI context does not exempt

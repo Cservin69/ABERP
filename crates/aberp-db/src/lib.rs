@@ -90,6 +90,12 @@
 //!      snapshot primitive), so [`run_durable_checkpoint_locked`] is a stub.
 
 pub mod debounce;
+// ADR-0099 F-E — the CROSS-process counterpart of this crate's in-process
+// single writer. Lives here, not in `apps/aberp`, because DB-mutating one-shots
+// outside that package (`aberp-inventory`'s `rebuild-stock-cache`) must take the
+// same lock, and two copies of the path derivation would be no lock at all.
+// Not reachable from `Handle` — the caller acquires it BEFORE any DB open.
+pub mod db_writer_lock;
 // The pure DB-path shape rule that the boot guard trio's third check calls.
 // Not reachable from `Handle`.
 pub mod engine_path;
@@ -381,8 +387,8 @@ pub struct HandleConfig {
     /// never folds the WAL in place (the vulnerable in-place checkpoint). This
     /// is the F-A engine-adapter pragma; always `true` in production.
     pub disable_implicit_close_checkpoint: bool,
-    /// **ADR-0110 D7 — the WAL fence. DEFAULTS `false`, and must stay `false`
-    /// until the GROUP-A opener sweep lands.**
+    /// **ADR-0110 D7 — the WAL fence. Still DEFAULTS `false` on this head. As
+    /// of D9 the arming PRECONDITION is met; the flip itself is a separate PR.**
     ///
     /// When `true`, [`WriteGuard::drop`] samples the WAL watermark and
     /// [`Handle::durable_ack`] refuses on a truncation
@@ -390,31 +396,45 @@ pub struct HandleConfig {
     /// production posture — neither happens and `durable_ack` behaves exactly
     /// as it did under D3.
     ///
-    /// # Why it ships OFF (PR #61 adversarial, B1)
+    /// # Why it shipped OFF (PR #61 adversarial, B1)
     ///
-    /// ADR-0110 D8 has since swept the IN-SERVE half: GROUP A in
-    /// `tools/adr0099_read_fork_structural_baseline.txt` is now EMPTY, so
-    /// `calibration_overview_request`, `resolve_recipient_email`,
-    /// `handle_quote_pipeline_status` and the eight others no longer open a
-    /// foreign connection. The fence nonetheless stays OFF, because the OTHER
-    /// half is untouched: the **CLI-against-live openers** (GROUP B —
-    /// `drain-submission-queue`, `drain-pending-retries`, `export-invoice-bundle`,
-    /// `recover-from-nav`, …) are separate OS processes that cannot borrow this
-    /// in-process Handle, and each still truncates this Handle's WAL on close.
-    /// That is the whole defect D7 detects, and one of its causes is still live.
-    ///
-    /// So with the fence ON *before* those are fenced too, an operator who runs
-    /// any of those commands against a running serve arms a breach; the NEXT
-    /// invoice issuance or mark-paid then fails
+    /// Arming the fence while ANY opener can still fold this Handle's WAL turns
+    /// a silent durability bug into a routine money-path outage: the breach is
+    /// armed by the fold, the NEXT invoice issuance or mark-paid fails
     /// `durable_ack`, and that failure PROPAGATES via `?` (the D3-C cut-gate
-    /// enforces exactly that propagation). The result is a failed invoice
-    /// issuance for an invoice that actually committed, with the NAV handoff
-    /// skipped — a routine, loud, money-path failure on day one.
+    /// enforces exactly that propagation) — a committed invoice reported as
+    /// failed, NAV handoff skipped. Strictly worse than the bug it detects, so
+    /// the detection landed DARK while its two causes were closed in turn.
     ///
-    /// That is strictly worse than the silent bug it detects, so the detection
-    /// lands DARK. The real loss-stopper is the opener sweep (PR #3); this
-    /// fence is the belt-and-suspenders alarm that is safe to arm afterwards.
-    /// Flipping this default to `true` is then a one-line PR.
+    /// # Both causes are now closed (D8, then D9)
+    ///
+    /// 1. **In-serve openers — closed by D8.** GROUP A in
+    ///    `tools/adr0099_read_fork_structural_baseline.txt` is EMPTY: no
+    ///    in-serve request route or daemon opens a foreign connection to the
+    ///    tenant DB.
+    /// 2. **CLI-against-live openers (GROUP B) — closed by D9.** These are
+    ///    separate OS processes that cannot borrow this in-process Handle, so
+    ///    the fix is not migration but MUTUAL EXCLUSION: every DB-mutating
+    ///    one-shot takes the F-E whole-DB writer flock
+    ///    ([`crate::db_writer_lock::acquire_or_refuse`]) before it opens the DB,
+    ///    and therefore REFUSES against a live serve rather than folding its
+    ///    WAL. `drain-submission-queue`, `drain-pending-retries`,
+    ///    `export-invoice-bundle`, `recover-from-nav` and `mark-abandoned`
+    ///    already did; `rebuild-stock-cache` — a *documented* ADR-0061 §3
+    ///    recovery path, i.e. the one an operator runs while the shop is live —
+    ///    was the last that did not. D9 fenced it.
+    ///
+    /// `print_invoice::render_to_bytes` still holds no flock and is knowingly
+    /// NOT on this gate: it opens via [`Handle::open_default`], whose
+    /// `disable_checkpoint_on_shutdown` pragma means its close cannot fold a
+    /// WAL. It is a stale-*read* debt (ADR-0110 §13.2), not a fold hazard.
+    ///
+    /// # What is still owed before the flip
+    ///
+    /// Only the re-run adversarial over the corrected D8+D9 head (ADR-0110
+    /// §13.3 item 3). The flag change itself is one line, and deliberately not
+    /// bundled with the fix that unblocked it — a fence that arms in the same
+    /// commit as its precondition gives the adversarial nothing to check.
     pub wal_fence_enabled: bool,
 }
 

@@ -28,6 +28,11 @@ publish.workspace = true
 [dependencies]
 aberp-audit-ledger = { path = "../audit-ledger" }
 duckdb = { workspace = true }
+# ADR-0099 F-E — the whole-DB writer flock's advisory-lock primitive (flock on
+# Linux/macOS, LockFileEx on Windows). The same crate the audit-ledger mirror
+# writer locks with; `db_writer_lock` moved down from `apps/aberp` (ADR-0110 D9)
+# and brought its dep with it.
+fs2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # ADR-0110 D7 / R2-B1 — the durability-alert re-derivation orders a mirror row

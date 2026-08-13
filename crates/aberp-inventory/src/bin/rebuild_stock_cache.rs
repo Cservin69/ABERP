@@ -58,6 +58,27 @@ fn parse_args() -> Result<(String, PathBuf)> {
 
 fn run() -> Result<u64> {
     let (tenant, db_path) = parse_args()?;
+
+    // ADR-0099 F-E / ADR-0110 D9 — take the whole-DB writer flock BEFORE the
+    // DB is opened, and hold it for the rest of the command.
+    //
+    // This binary is a DOCUMENTED recovery path (ADR-0061 §3: "the recovery is
+    // `cargo run -- rebuild-stock-cache`"), which means an operator runs it on a
+    // live shop — with `aberp serve` up, holding the tenant's `aberp_db::Handle`
+    // and its WAL. The `Connection::open` below carries DuckDB's DEFAULT
+    // pragmas, so its CLOSE checkpoints and TRUNCATES that WAL out from under
+    // the live writer: every commit serve made since the last checkpoint is
+    // gone, while `commit()` keeps returning Ok. That is the exact write-loss
+    // primitive ADR-0110 D7's fence exists to detect, and this was the last
+    // opener in the tree that could still arm it against a live serve.
+    //
+    // Named binding, not `let _ =`: `_guard` lives to the end of `run`, whereas
+    // `let _` would drop the guard immediately and release the lock before the
+    // first read. Declared BEFORE `conn` so the drop order is conn-then-guard —
+    // the DB is closed while this process still owns the tenant.
+    let _guard =
+        aberp_db::db_writer_lock::acquire_or_refuse(&db_path, &tenant, "rebuild-stock-cache")?;
+
     let mut conn = Connection::open(&db_path)
         .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
 

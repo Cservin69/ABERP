@@ -1361,8 +1361,9 @@ already flags exactly two, and they are not equivalent:
   does not replay the live writer's WAL — that is the E1 defect), but it cannot
   sabotage the D7 fence. Serve itself does not reach it: the in-serve path uses
   the connection-taking `render_to_bytes_on_conn`.
-- **`rebuild-stock-cache` — THE genuine hole, and it must be closed before the
-  fence is armed.** `crates/aberp-inventory/src/bin/rebuild_stock_cache.rs:61`
+- **`rebuild-stock-cache` — THE genuine hole. CLOSED by D9 (2026-08-13); §14
+  records what was built and answers the deferral below on its own terms.**
+  As diagnosed here: `crates/aberp-inventory/src/bin/rebuild_stock_cache.rs:61`
   opens a bare `duckdb::Connection::open` with DEFAULT pragmas and holds no
   flock, so its close folds and truncates a live serve's WAL. It is also a
   *documented operator recovery path* — ADR-0061 §3 tells the operator to run
@@ -1430,13 +1431,17 @@ The corrected gate:
    **before** `open_tenant_handle` at :1633 — plus the demo/new-tenant openers,
    which target a different DB file. `ap_sync.rs:1417` and the ~70 other
    `Handle::open_default` hits are inside `#[cfg(test)]` modules.
-2. ❌ `rebuild-stock-cache` flock-fenced — **owed**, §13.2.
-3. ❌ A re-run adversarial over the corrected D8.
+2. ✅ `rebuild-stock-cache` flock-fenced — **done 2026-08-13 (D9, §14)**. It
+   was the LAST opener in the tree that could fold a live serve's WAL, so with
+   it fenced the GROUP-B live-fold hazard is closed and this gate's substantive
+   items are both green.
+3. ❌ A re-run adversarial over the corrected D8 **+ D9**.
 
-Arming it before (2) reproduces exactly the failure mode D7's B1 test describes,
-with a different command as the trigger. The B1 tests and the `aberp-db` docs
-name the CLI class rather than the three now-migrated in-serve fns, so the
-disarmed default no longer cites a reason that has been fixed.
+Arming it before (2) would have reproduced exactly the failure mode D7's B1 test
+describes, with a different command as the trigger. With (2) done, the flag flip
+is a **separate PR** and is deliberately not bundled with the fix that unblocked
+it: a fence armed in the same commit as its own precondition leaves (3) nothing
+to check. The B1 test now pins that ORDER rather than an open hazard.
 
 **Method note, worth more than the fix.** Both D8 misses — the three
 `serve::run` openers and three of `compute_financial_report`'s four — were
@@ -1555,3 +1560,113 @@ so it can never be mistaken for a successful send.
 Also pinned: `partners::get_partner` and `find_partner_by_tax_number` were the
 one DDL premise asserted in prose but never tested, unlike their five siblings.
 They are in the half-1 pin now, mutation-verified.
+
+## 14. D9 — the last CLI-against-live opener is fenced (2026-08-13)
+
+§13.2 named `rebuild-stock-cache` as the one genuine remaining hole and
+deliberately deferred it. This is that deferral, paid.
+
+### 14.1 What was wrong
+
+`crates/aberp-inventory/src/bin/rebuild_stock_cache.rs` opened the tenant DB
+with a bare `duckdb::Connection::open` — DuckDB DEFAULT pragmas — and held no
+flock. A default-pragma close checkpoints and TRUNCATES the WAL. Run against a
+live `aberp serve`, its exit folded away every commit serve had made since the
+last checkpoint while `commit()` kept returning `Ok`: the D7 write-loss
+primitive, verbatim.
+
+What made it the acute one is not the code, it is the documentation. ADR-0061 §3
+tells the operator, in those words, that when `products.stock_qty` disagrees with
+`SUM(qty_delta)` the recovery is to run this binary. So the tree shipped a
+documented instruction to run a WAL-folding process against a running shop, at
+exactly the moment an operator is already dealing with an inconsistency.
+
+It was also, independently, a second unsynchronised WRITER of `products.stock_qty`.
+
+### 14.2 The fix — the flock, and only the flock
+
+`aberp_db::db_writer_lock::acquire_or_refuse(&db_path, &tenant,
+"rebuild-stock-cache")` before the first open, bound to a named `_guard` that
+lives to the end of `run` and is declared *before* `conn` so the drop order is
+conn-then-guard (the DB closes while this process still owns the tenant). This
+is the same call, in the same position, as the twenty sibling mutating CLIs —
+§13.2's own recommendation, unmodified.
+
+**The pragma alternative was considered and NOT taken**, per §13.2's reasoning
+and re-verified here. Switching the opener to `Handle::open_default` (the
+`disable_checkpoint_on_shutdown` path, what `print_invoice::render_to_bytes`
+uses) would work mechanically — `WriteGuard` derefs to `&mut Connection`, so
+`rebuild_stock_cache_for_tenant` runs unchanged — but it fixes the *symptom* and
+leaves the *cause*: two processes writing one tenant's stock cache with no mutual
+exclusion, which is the app-invariant class ADR-0108 M6 says this flock exists
+for. It would also make a recovery tool acquire a Handle's full runtime
+machinery to do a single-transaction repair. The flock refuses; that is the
+correct outcome, and it is one call. Defence-in-depth on the pragma is a legible
+follow-up, not a substitute, and it is worth strictly less now that the command
+cannot run against a live serve at all.
+
+**Operator-visible behaviour change, as §13.2 promised it would be:**
+`rebuild-stock-cache` now REFUSES while `aberp serve` is running, with the F-E
+message that names the single-writer rule and tells the operator to stop the
+other writer and retry. Previously it ran and silently ate serve's unflushed
+commits. Release note owed.
+
+### 14.3 Where the flock lives now, and why it moved
+
+`db_writer_lock` shipped in `apps/aberp/src/db_writer_lock.rs` while every caller
+was an `aberp` subcommand. `rebuild-stock-cache` is not: it is a binary of
+`crates/aberp-inventory`, which cannot depend on `apps/aberp`.
+
+The fork was one shared module versus a second copy of `lock_path_for`, and a
+second copy is much the worse hazard: two derivations that drift by one
+character produce two lock files, and two lock files are no lock at all,
+silently — with nothing red anywhere. So the module moved down to `aberp-db`,
+the crate that already owns "one writer per tenant DB", and
+`apps/aberp/src/db_writer_lock.rs` became a re-export. Every existing
+`crate::db_writer_lock::…` call site, `aberp::db_writer_lock::…` test, and
+doc/ADR reference to that path is unchanged. One API change: the fallible
+surface returns a typed `DbWriterLockError` instead of `anyhow::Error`
+(`aberp-db` is a library crate, ADR-0021 Part A) — `?` into an `anyhow::Result`
+is identical at every call site, and the refusal `Display` body, including the
+`single-writer` substring the F-E refusal tests match on, is carried over
+verbatim.
+
+`tools/cut_gate_read_fork.sh`'s `is_flock_fenced()` greps the *call token*
+(`acquire_or_refuse|try_acquire`), not the module path, so the move is invisible
+to it and the fenced binary now satisfies it.
+
+### 14.4 The pin
+
+`crates/aberp-inventory/tests/rebuild_stock_cache_flock.rs` drives the REAL
+binary as a separate OS process (the flock is a cross-process primitive; an
+in-process call could not prove it) against a DB whose cache is deliberately
+drifted from its ledger. One corruption, two runs: **locked** → non-zero exit,
+stderr cites the single-writer rule, cache untouched; **free** → exit 0, cache
+re-derived to `SUM(qty_delta)`.
+
+Mutation-verified in both directions. Removing the `acquire_or_refuse` makes the
+locked arm exit 0 and rewrite the cache — red, and that run is also the empirical
+proof that nothing else was stopping it (DuckDB's own file locking does not
+refuse the second opener). The free arm is what stops the refusal assertions from
+passing on a merely broken binary.
+
+### 14.5 What this closes, and what it does not
+
+Closed: the GROUP-B **live-fold** hazard. Every DB-mutating CLI one-shot now
+takes the flock before opening, so none can fold a live serve's WAL — the last
+precondition on ADR-0110 §13.3's arming gate.
+
+Not closed, and knowingly out of scope:
+
+- **`print_invoice::render_to_bytes` still holds no flock.** It is not a fold
+  hazard (§13.2: it opens `Handle::open_default`, so its close cannot fold), and
+  so it is not on the arming gate. It remains a stale-*read* debt — a second
+  instance does not replay the live writer's WAL, so a just-issued invoice can
+  render as absent. Loud, not silent. Recorded in the read-fork baseline with
+  that triage; closing it is either a flock or a migration, in its own change.
+- **`wal_fence_enabled` is NOT flipped here.** Separate PR, deliberately: a fence
+  armed in the same commit as its own precondition leaves §13.3 item 3's re-run
+  adversarial nothing to check.
+- **Moving `rebuild_stock_cache.rs|run` to the read-fork allow-list.** Fencing
+  EARNS that move; it does not perform it. The baseline header reserves it as a
+  deliberate follow-up and it stays one.
