@@ -4,7 +4,9 @@
   WAL-truncation fence, added after incident 00012) landed 2026-08-12 and ships
   DISARMED pending the PR #3 opener sweep (D7.6); D8/D9 closed that sweep's two
   halves (§13, §14); **D5.1 landed 2026-08-13 (§15)** — a frozen audit mirror is
-  now a raised, audited, operator-visible durability fault. D1, D2,
+  now a raised, operator-visible durability fault, recorded in a NON-CHAINED
+  marker rather than the ledger (route (a): a machine-spawned diagnostic must
+  never consume a ledger seq). D1, D2,
   D4, D5.2/D5.3 and the payload widening remain proposed. Adversarially reviewed
   2026-08-08; verdict *sound after changes*, listed in §11 and folded into
   §5/§6/§7. Rev-3's corrections are in §12.
@@ -506,12 +508,15 @@ business-state replay as the recovery path.**
   D5.2 and D5.3 remain proposed.)***
   1. `MirrorDivergent` from `sync_mirror` becomes a loud, audited,
      operator-visible fault, not a `warn!`. **BUILT** — it raises the D7 alert
-     surface (sticky alert → `GET /health durability_alert` → red banner) plus a
-     `db.durability_loss_detected` row. It does **not** fail the write: the
-     write has already committed by the time `WriteGuard::drop` runs, and the
-     keep-serving decision (D7.4) governs here too. "Under D1 it fails the
-     write" describes a D1 that does not exist; §15.2 records why raising is the
-     whole of it.
+     surface (sticky alert → `GET /health durability_alert` → red banner) and
+     records the episode in the **non-chained `<db>.durability-alert` marker**
+     (route (a), Ervin 2026-08-13). It does **not** append to the ledger: the
+     freeze is detected exactly when the DB head has regressed below the
+     mirror's, so an append there forks the two chains and REFUSES the next boot
+     (D5-B1, §15.2). It does **not** fail the write either: the write has
+     already committed by the time `WriteGuard::drop` runs, and the keep-serving
+     decision (D7.4) governs here too. "Under D1 it fails the write" describes a
+     D1 that does not exist.
   2. `snapshot now` refuses to append `SnapshotCreated` when the mirror head does
      not agree with the DB head.
   3. Rebuild/restore gains an explicit, audited **mirror re-baselining** step,
@@ -671,10 +676,11 @@ business-state replay as the recovery path.**
      would have caused.
      **CLOSED 2026-08-13 by D5.1 (§15).** The residual was "the freeze itself is
      invisible until a restart". It is now visible when it happens: the drop
-     that hits `MirrorDivergent` raises the same sticky alert and writes the
-     same `db.durability_loss_detected` kind, so the single-process window has
-     the banner up *from the freeze*, not merely from whatever raised the first
-     alarm. What remains is not a residual but a stated property — see §15.4.
+     that hits `MirrorDivergent` raises the same sticky alert and records the
+     episode in the non-chained `<db>.durability-alert` marker, so the
+     single-process window has the banner up *from the freeze*, not merely from
+     whatever raised the first alarm. What remains is not a residual but a
+     stated property — see §15.5.
   4e. **"Keep serving" does not extend to the NEXT boot** *(R3-N3)*. The
      keep-serving decision (D7.4) governs the running process. Boot is governed
      by the pre-existing H1 preserve-and-refuse posture instead: if the gated
@@ -690,8 +696,10 @@ business-state replay as the recovery path.**
      and then as a refused boot rather than as an alert. D5.1 puts the alert up
      in the running process at the moment the mirror refuses. The refuse-to-boot
      posture itself is unchanged and remains correct — D5 raises the alarm, it
-     does not make a forked chain servable. §15.4 states what a D5 detection
-     implies for the *next* boot.
+     does not make a forked chain servable. What D5.1 additionally guarantees is
+     that the alarm never *causes* that refusal: its diagnostic consumes no
+     ledger seq, so a tenant whose chains have not forked still heals and boots
+     (D5-B1, §15.2/§15.5).
   5. **The operator channel.** The alert is surfaced on `GET /health` as
      `durability_alert` (always present, explicitly `null` when quiet) and the
      SPA renders a full-width, high-contrast red banner above the topbar,
@@ -1761,149 +1769,251 @@ mirror *"will reconcile on the next write or at the pre-snapshot fsync"*, which
 for this shape is false. The next write re-derives the same divergence and
 refuses again. The mirror was FROZEN for the rest of the process, and the mirror
 is the `fsync`'d store. From that moment every audit row — a business event, a
-D7 acknowledgement, a second `db.durability_loss_detected` — reached the DB
-alone, i.e. the store that had just been shown to lose rows. Nothing surfaced
-it. That is the mechanism named in D7.4b and left standing by D7.4d/D7.4e, and
-it is why the PR #61 round-3 adversarial promoted D5 from optional to
-load-bearing for the D7 alarm.
+D7 acknowledgement, a second durability diagnostic — reached the DB alone, i.e.
+the store that had just been shown to lose rows. Nothing surfaced it. That is
+the mechanism named in D7.4b and left standing by D7.4d/D7.4e, and it is why the
+PR #61 round-3 adversarial promoted D5 from optional to load-bearing.
 
-### 15.2 What shipped
+### 15.2 Route (a) — the diagnostic goes to a NON-CHAINED marker
 
-One arm in `WriteGuard::drop`. On `MirrorDivergent` — and only when the
-discriminator in §15.3 holds — `Handle::raise_mirror_freeze_alert` runs:
+**Ervin, 2026-08-13.** The first cut of D5 recorded the freeze by appending a
+`db.durability_loss_detected` row to the hash-chained `audit_ledger`. That was
+wrong, and wrong in a way that could brick the tenant (**D5-B1**):
 
-1. a `tracing::error!` naming the divergence and its `reason`;
-2. the **same sticky `Handle::durability_alert`** D7 built, with a new
-   `WalBreach::AuditMirrorFrozen` code — so `GET /health durability_alert`, the
-   full-width red banner, and `POST /health/acknowledge-durability-alert` all
-   work with no change to any of them (the banner renders `message` verbatim and
-   does not branch on the code);
-3. a **`db.durability_loss_detected`** row with
-   `{"trigger":"audit_mirror_sync_refused","breach":"audit_mirror_frozen",
-   "mirror_head_seq":N,"audit_head_seq":M}`.
+The freeze is detected exactly when the DB head has regressed below the
+mirror's. An append there consumes the next DB `seq` — one the mirror already
+holds a *different* entry for. The chains fork at that seq. The next boot's
+gated auto-heal proves benignness by matching the DB head's `entry_hash` against
+the mirror's at the same seq; forked ⇒ refused ⇒ `ensure_consistent_with_db`
+answers `MirrorAheadOfDb` ⇒ `serve` exits non-zero and does not boot. **The
+alarm that says "stop and recover" was what stopped the operator recovering.**
 
-**It raises; it does not refuse.** The write committed before `drop` ran — there
-is nothing left to fail — and the keep-serving decision (D7.4) governs. §5 D5's
-"under D1 it fails the write" describes a D1 that does not exist and is not what
-was built.
+The rule this establishes, and the reason it is not a patch: **a machine-spawned
+durability diagnostic is not a business event and must never consume a ledger
+seq.** The ledger is for operator and workflow events. An alarm about the
+ledger's own substrate cannot live inside it.
 
-**Kind reused, not forked.** A sibling `EventKind` was considered and rejected:
-the boot re-derivation (`restore_durability_alert_from_mirror`, D7.4a/D7.4b)
-keys on `db.durability_loss_detected` in **both** stores, so reusing it makes a
-D5-raised fault survive a restart with no new code — the mirror is frozen, the
-row reaches the DB alone, and the DB half of the re-derivation is exactly the
-half D7 R2-B1 added for that case. A new kind would have had to be taught to
-both halves plus the `EventKind` four-edit ritual, and a kind that is *not*
-taught fails silently in the one direction that matters. The operator
-instruction is identical either way — stop and recover — and the payload's
-`trigger` keeps the two apart for forensics. The one cost is that
-`WalBreach` now carries a member that is not a WAL shape; the type is renamed by
-nothing, because it is a merged public type and its `/health` wire vocabulary,
-and its doc now says what it actually discriminates.
+**The marker** (`crates/aberp-db/src/durability_marker.rs`) is
+`<db>.durability-alert`: append-only, `fsync`'d, chained to nothing, one record
+per line — a `v1` version tag, then `loss` (instant, trigger, breach code, a
+`u64` detail) or `ack` (instant), tab-separated.
 
-**Ungated by `wal_fence_enabled`.** The D7.6 flag exists because the *fence*
-fails `durable_ack`, and a false positive there is a money-path outage. D5
-refuses nothing, so it carries none of that risk — the same reasoning that left
-the boot re-derivation ungated (D7.4a). Gating it would also make it dead code
-in production, where the flag is `false`. Pinned by
-`the_alarm_is_not_gated_on_the_disarmed_wal_fence`, which asserts the tests run
-in the disarmed posture.
+Design notes worth keeping:
 
-### 15.3 The benign-vs-live discriminator, and why it is not "any divergence"
+- **A file, not a table.** A table would live in the database whose WAL was just
+  truncated — the store most likely to lose the row (D7's own note). A file next
+  to the DB is `fsync`'d on its own terms, is readable at `Handle::open` without
+  a DB read, survives a boot that refuses, and needs no DDL (so it stays clear of
+  the D8-F3 "DDL one call-frame from a `read()`" hazard). It also means the D5
+  path performs almost no database access, which is most of §15.6.
+- **Tab-separated, not JSON.** Every field is a `&'static str` from a closed
+  vocabulary, an instant this crate formatted, or a `u64`. No free-form string
+  ever reaches the file — no path, no operator login, no formatted error — so
+  there is nothing to escape, and JSON would buy only a parser (this crate has
+  no `serde` dependency to spend on one). The `&'static str` is in the function
+  signature, not the convention, so the property cannot erode.
+- **Append on ack, never delete.** Acknowledging appends `ack`; the loss line
+  stays. Taking a banner down must not erase the record of what raised it. The
+  *attributable* act remains the hash-chained `db.durability_alert_acknowledged`
+  row the route writes — an operator event, which belongs on the chain.
+- **Failure direction.** An unreadable file, or a `loss` line that will not
+  parse, counts as an unacknowledged loss at `UNIX_EPOCH`: the banner goes UP
+  (corrupting a line must not be a way to silence the alarm) but stays
+  acknowledgeable (a later `ack` out-ranks it). An alarm that cannot be cleared
+  is one an operator routes around.
+- **No lock.** `O_APPEND` makes each small write atomic, the same argument
+  `sync_mirror` makes for the mirror. Cross-process the ADR-0099 F-E flock
+  already excludes other writers; in-process the loss append runs under the
+  writer mutex.
 
-A mirror that is AHEAD at boot is **normal**. It is what an unclean stop leaves:
-the mirror is `fsync`'d, the DB's WAL tail is not. `serve` heals it on every boot
-via `ensure_consistent_with_db`, which runs **before** `open_tenant_handle` —
-ordering already pinned by `index_desync_incident_20260803.rs`. An alarm that
-fired on that would be up after half the crashes this system exists to survive,
-and a banner in that state is one the operator learns to skip.
+Everything the operator sees is unchanged: the same sticky
+`Handle::durability_alert`, the same `GET /health durability_alert`, the same
+red banner, the same acknowledge route, the same survives-a-restart property —
+now re-derived from the marker.
 
-Two things keep it quiet:
+**It raises; it does not refuse.** The write committed before `drop` ran, so the
+keep-serving decision (D7.4) governs. §5 D5's "under D1 it fails the write"
+describes a D1 that does not exist.
 
-1. **Structural, in `serve`.** The alarm lives in `WriteGuard::drop`, which
-   cannot run before a `Handle` exists, which cannot exist before the reconcile
-   has returned `Ok`. A boot-time mirror-ahead is therefore either healed (no
-   divergence remains for any drop to see) or the boot is refused (D7.4e). There
-   is no third state in which a `serve` drop meets an inherited divergence.
-2. **Explicit, for every other opener.** A CLI one-shot opens a `Handle` with no
-   reconcile of its own, so it *can* meet one. The raise is gated on
-   `Inner::mirror_lockstep_seen` — set by a **successful** lockstep
-   `sync_mirror` on this Handle. The alarm therefore means "the two stores
-   agreed while I was the one writing, and now they do not". Diverging from a
-   state this Handle never observed is an *inherited* condition: the boot
-   reconciler's business, still logged loudly on every write, but not this
-   process claiming to have detected a new loss.
+**Ungated by `wal_fence_enabled`.** That flag exists because the *fence* fails
+`durable_ack`, and a false positive there is a money-path outage. D5 refuses
+nothing, so it carries none of that risk — the same reasoning that left the boot
+re-derivation ungated (D7.4a) — and gating it would make it dead code in
+production, where the flag is `false`.
 
-That gate costs no coverage on the truncation path it exists for. A divergence
-requires the DB to lose rows the mirror has; immediately after a boot the WAL has
-just been replayed and folded, so the rows a truncation can cost are the ones
-*this* Handle wrote — each of which already ran a successful `sync_mirror` at its
-own drop. Lockstep is seen before there is anything to lose.
+### 15.3 D7 coherence — D7 stays on-chain, and the reader consults both
 
-A second flag, `Inner::mirror_freeze_reported`, makes the raise one-shot. The
-divergence is continuous, not repeated; without it a busy tenant buries its own
-ledger under `db.durability_loss_detected` rows, each one a write into the only
-store still accepting writes. Both flags live in `Inner` — i.e. under the writer
-mutex the dropping guard already holds — so there is no second lock to order.
+By the same principle, D7's fence writes the same machine-spawned
+`db.durability_loss_detected` into the ledger and ideally would move too. **It
+does not, this PR.** The conservative path, and why:
 
-### 15.4 What a D5 detection implies for the next boot (replaces the D7.4d residual)
+- **Backward compatibility is a requirement, not a preference.** A prod tenant
+  recovered from incident 00012 may already hold a `db.durability_loss_detected`
+  row. The boot re-derivation must keep reading that kind from both ledger
+  stores whichever way D7 goes, so the reader work is identical under either
+  option — it is only the *writer* that is in question.
+- **Routing D7's writer would rewrite merged, adversarially-cleared pins.**
+  `an_ack_that_reached_only_the_db_still_clears_a_loss_that_reached_only_the_mirror`
+  (the R2-B1 pin) fires the fence for real and requires the loss row to reach the
+  MIRROR; `adr0110_d7_durability_alert_route.rs` asserts the same. Those tests
+  encode the both-stores property that survived two adversarial rounds. Moving
+  the writer means rewriting them, which is exactly the blast radius this PR
+  should not take on while the acute defect is D5's.
+- **D7's write path is dormant.** The fence ships DISARMED (D7.6), so on this
+  head it never runs.
 
-D7.4d recorded that the boot reconcile un-freezes a frozen mirror, so the
-residual was only "the operator is blind *within* the process". D5 closes that:
-the banner is up from the freeze itself.
+So: **boot re-derivation now reads THREE sources** — the marker, the mirror, and
+the DB — and raises iff a loss in any of them is not strictly out-ranked by an
+acknowledgement in any of them. Additive, no reader retired, no merged pin
+touched.
 
-The remaining honest statement is about the boot, and it is a property, not a
-gap. By the time D5 fires, the DB has already appended at least one entry at a
-seq the mirror holds a *different* entry for — the business write whose drop
-detected the divergence. The two chains have forked. So the next boot's gated
-auto-heal will usually **refuse** (the boundary/full-genesis re-verify is what
-it is for), the ahead mirror is preserved, and `serve` exits non-zero rather than
-serving a tenant whose audit chain no longer verifies. That is D7.4e's posture,
-unchanged and correct: D5 raises the alarm, it does not make a forked chain
-servable. The alert still survives the restart either way — the loss row is in
-the DB and `Handle::open` re-derives from both stores — which is what
-`the_alert_survives_a_restart` pins.
+**The residual this leaves, stated plainly.** D7's on-chain append carries the
+*same* B1 exposure: if the fence were armed and fired on a truncation, its
+ledger row would consume the seq that forks the chains. It cannot bite today
+(disarmed), and D5 now fires first on that same drop and records off-chain — but
+**routing D7's diagnostic to the marker is a precondition for arming the fence**,
+not an optional tidy-up. D7.6 already makes the flip its own PR with its own
+review; this is now on that PR's list.
 
-### 15.5 Scope held deliberately narrow
+### 15.4 The discriminators — two, and both are needed
+
+A mirror that is AHEAD is not by itself a durability loss. Two ways it happens
+benignly, and the alarm must be silent for both.
+
+**(1) Benign at boot.** The mirror is `fsync`'d and the DB's WAL tail is not, so
+any unclean stop leaves the mirror ahead. `serve` heals it on every boot via
+`ensure_consistent_with_db`, which runs **before** `open_tenant_handle` —
+ordering already pinned by `index_desync_incident_20260803.rs`. In `serve` this
+is structural: a `WriteGuard` cannot exist before the reconcile returned `Ok`, so
+a boot-time mirror-ahead is either healed (nothing left to see) or the boot is
+refused (D7.4e). For openers with no reconcile of their own (a CLI one-shot on a
+tenant awaiting recovery), the explicit gate is `Inner::last_synced_head` being
+`None` — this Handle never saw the two stores agree, so the divergence is
+INHERITED, not witnessed.
+
+**(2) D5-B2 — a co-resident CLI advancing the mirror.** The NAV resubmission
+family writes audit rows and syncs the mirror in its own process. A different
+DuckDB instance does not replay another process's WAL, so from `serve`'s Handle
+the mirror is suddenly ahead — pixel-identical to a truncation freeze. A
+permanent "stop and recover" banner after sanctioned maintenance is the round-1
+alarm-the-operator-dismisses failure.
+
+The discriminator is that **our own head did not move**. A truncation costs this
+Handle rows it had already mirrored; somebody else's append does not. So the
+raise requires the DB's audit head to have fallen strictly BELOW
+`last_synced_head` (the head the last successful `sync_mirror` returned). One
+indexed `MAX(seq)`, on the divergence path only — never on the healthy write
+path. That also sharpens what the alarm *means*: not "the mirror moved" but "we
+lost rows we had already mirrored", which is the only thing a durability banner
+should claim.
+
+**B2 is closed on two independent grounds**, and it is worth recording both
+because they fail differently. Structurally, D9 already excludes it: `serve`
+holds the F-E whole-DB writer flock for its entire process lifetime and every
+DB-mutating one-shot acquires it before opening the DB, so a co-resident CLI
+mirror-writer REFUSES to run. The head-regression gate is the belt to that
+braces — it holds even if a future writer slips the flock, which is the same
+posture D7 itself takes ("the fence must keep catching if a future opener slips
+the fencing"). Option (c) — stopping CLIs advancing serve's mirror — is not
+needed and was not undertaken.
+
+**Not covered, deliberately:** a `MirrorDivergent` from the *hash-mismatch* arm
+with our head unmoved (a fork or tamper at equal seq). That is an integrity
+fault, not a durability loss, and the boot reconciler already refuses on it
+(arm (c)). It is logged loudly and does not raise the durability banner.
+
+A second flag, `Inner::mirror_freeze_reported`, makes the raise one-shot: the
+divergence is continuous, and without it every subsequent guard drop appends
+another episode. Both flags live in `Inner` — under the writer mutex the
+dropping guard already holds — so there is no second lock to order.
+
+### 15.5 What a D5 detection implies for the next boot
+
+D7.4d recorded that the boot reconcile un-freezes a frozen mirror, so its
+residual was "the operator is blind *within* the process". D5 closes that: the
+banner is up from the freeze itself.
+
+What remains is a property, not a gap. By the time D5 fires, the DB has already
+appended at least one entry at a seq the mirror holds a different entry for —
+the business write whose drop detected the divergence. The chains have forked.
+So the next boot's gated auto-heal may refuse, the ahead mirror is preserved, and
+`serve` exits non-zero rather than serving a tenant whose audit chain no longer
+verifies. That is D7.4e's posture, unchanged and correct.
+
+The distinction B1 turns on is *whose* fork it is. The business write's fork is
+the incident. D5's own diagnostic must not ADD one — and with the marker it does
+not, which is what
+`the_d5_b1_scenario_must_boot_cleanly_with_the_db_two_rows_behind` pins: with
+the DB exactly two rows behind at the first freeze, the boot that used to be
+refused now heals, and the tenant is usable again.
+
+### 15.6 Scope held narrow; no new opener; no deadlock
 
 Only `MirrorDivergent` raises. `MirrorIo` and `MirrorCorrupt` keep the pre-D5
-`warn!`, because for those the old message is true or the boot reconciler owns
-the repair (a torn trailing line is trimmed there), and widening the alarm
-widens its false-positive surface — the one thing §15.3 exists to protect.
-`sync_mirror`'s other call sites are untouched: this is the lockstep drop path
-only. D5.2 (`snapshot now` refusing on a disagreeing head) and D5.3 (audited
-mirror re-baselining on rebuild/restore) remain proposed.
+`warn!` — for those the old message is true, or the boot reconciler owns the
+repair (a torn tail is trimmed there) — and widening the alarm widens the
+false-positive surface §15.4 exists to protect. `sync_mirror`'s other call sites
+are untouched. D5.2 (`snapshot now` refusing on a disagreeing head) and D5.3
+(audited mirror re-baselining) remain proposed.
 
-### 15.6 No new opener, no new deadlock
+Since route (a) the D5 path touches the database only to read one indexed
+`MAX(seq)`; recording the episode is one `OpenOptions::append` on a sidecar file
+and one `sync_all`. No `Connection::open` (the ADR-0098 census, the ADR-0099
+read/write fork scanners and the D9 flock shape are all untouched — GROUP A
+stays empty), no `try_clone`, no transaction, no `AUDIT_APPEND_LOCK`. The head
+read takes the `&Connection` the guard is already holding, never `Handle::read`,
+which locks the same writer mutex the dropping guard holds (a self-deadlock; in
+debug the re-entrancy tripwire panics first, since deregistration is the last
+thing `drop` does).
 
-The audit row goes down on the connection the dropping guard already holds
-(`try_clone` of the shared instance — not a second OS open), so the ADR-0098
-opener census, the ADR-0099 read/write-fork scanners and the D9 flock shape are
-all untouched: GROUP A stays empty. It must not reach for `Handle::write` /
-`Handle::read` — the writer mutex is held by the very guard whose `drop` is
-running, and in debug the re-entrancy tripwire panics before the deadlock,
-because deregistration is the last thing `drop` does. The lock order taken —
-writer mutex, then the ledger's `AUDIT_APPEND_LOCK` — is the one
-`emit_durability_loss_audit` has taken since D7, and nothing in the tree takes
-those two in the other order (`AUDIT_APPEND_LOCK` is held only inside
-`Ledger::append`/`append_signed`, which touch their own connection and never the
-Handle).
+### 15.7 N2 and N3
 
-### 15.7 The pins
+**N2 — the restored breach was a guess.** Before the marker there was nothing to
+read the detected code from (the mirror base64-encodes the payload), so
+re-derivation hard-coded `wal_vanished`; after a restart every D5 mirror freeze
+came back on `/health` and in the banner claiming the WAL had vanished, losing
+the one distinction a recovery turns on. The marker stores the real code, so when
+the marker holds the newest loss its breach is used. The ledger-sourced path
+keeps the old default, which is still the best available answer for those rows
+and is right for the fence rows that dominate them.
+
+**N3 — the third vacuous pin.** `the_alarm_is_not_gated_on_the_disarmed_wal_fence`
+asserted only that `HandleConfig::default().wal_fence_enabled == false`. That is
+a statement about `HandleConfig`, not about D5: it stayed green with D5 fully
+gated on the flag. Replaced by `the_alarm_fires_with_the_wal_fence_disarmed`,
+which runs the freeze against an explicitly disarmed config and requires the
+alert — and goes RED when the raise is wrapped in
+`if handle.config.wal_fence_enabled`.
+
+### 15.8 The pins
 
 `crates/aberp-db/tests/adr0110_d5_mirror_freeze_alert.rs`, all against
 `HandleConfig::default()` (fence disarmed), each mutation-verified:
 
 | Pin | Mutation that reds it |
 | --- | --- |
-| `a_live_process_mirror_divergence_raises_the_alert_and_audits_it` | restore the unconditional `warn!` |
-| `the_alert_survives_a_restart` | skip the `append_durability_loss_row` call (in-memory alert only) |
+| `a_live_process_mirror_divergence_raises_the_alert_and_records_the_marker` | disable the raise arm |
+| `the_d5_b1_scenario_must_boot_cleanly_with_the_db_two_rows_behind` | put the ledger append back — `MirrorAheadOfDb`, boot refused |
+| `the_alert_survives_a_restart_with_the_breach_it_was_detected_as` | skip `record_loss`; or hard-code `WalVanished` in restore (reds the breach half alone) |
+| `an_acknowledgement_keeps_the_banner_down_across_a_restart` | skip `record_ack` in `clear_durability_alert` |
 | `a_boot_reconcile_that_heals_a_mirror_ahead_leaves_the_alarm_quiet` | delete the `boot_reconcile` call |
-| `a_divergence_this_handle_never_saw_agree_must_not_raise` | delete the `lockstep_seen` gate |
-| `the_freeze_is_audited_once_per_episode` | delete the `freeze_reported` gate (4 rows instead of 1) |
+| `a_divergence_this_handle_never_saw_agree_must_not_raise` | treat `last_synced_head.is_none()` as a loss |
+| `a_mirror_advanced_by_someone_else_must_not_raise` | weaken the regression test to `now <= prev` |
+| `the_freeze_is_recorded_once_per_episode` | delete the `freeze_reported` gate (4 records instead of 1) |
+| `the_alarm_fires_with_the_wal_fence_disarmed` | gate the raise on `wal_fence_enabled` |
 
-The benign pin asserts the mirror and DB are back in **lockstep** after the
-heal, not merely that the alarm is silent. Without that it passed for the wrong
-reason — a Handle that never reached lockstep is quiet either way — and deleting
-the reconcile left it green. That was caught by running the mutation, which is
-the argument for running them.
+**Three of these were vacuous when first written, and the mutations are what
+found that** — worth recording, because the same shape recurs:
+
+- the benign-boot pin passed for the wrong reason (a Handle that never reached
+  lockstep is quiet either way), so deleting the reconcile left it green. It now
+  also asserts the two stores are back in LOCKSTEP after the heal;
+- the B2 pin committed a row after the foreign mirror append, which moved our own
+  head and stopped the discriminator being what held the alarm back. It now drops
+  a guard *without* writing, which is the state the case actually occurs in;
+- the once-per-episode pin did the same thing, so the latch was never reached and
+  removing it stayed green. It now uses guard drops that leave the head where the
+  freeze left it.
+
+In all three the fix was to make the test's state faithful, not to weaken the
+assertion — and in all three the un-faithful version would have shipped green.

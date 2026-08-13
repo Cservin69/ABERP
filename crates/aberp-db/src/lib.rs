@@ -96,6 +96,12 @@ pub mod debounce;
 // same lock, and two copies of the path derivation would be no lock at all.
 // Not reachable from `Handle` — the caller acquires it BEFORE any DB open.
 pub mod db_writer_lock;
+// ADR-0110 D5 — the NON-CHAINED durability-alert marker (`<db>.durability-alert`).
+// A machine-spawned durability diagnostic must never consume a ledger seq: the
+// freeze is detected exactly when the DB head has regressed below the mirror's,
+// so an append there forks the two chains and REFUSES the next boot (D5-B1).
+// Private: the Handle owns every read and write of it.
+mod durability_marker;
 // The pure DB-path shape rule that the boot guard trio's third check calls.
 // Not reachable from `Handle`.
 pub mod engine_path;
@@ -156,6 +162,19 @@ pub enum DbError {
     /// CLAUDE.md rule 11); it must never be downgraded to a `warn!`.
     #[error("durable-ack fsync failed for {path}: {source}")]
     DurableAck {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// ADR-0110 D5 — a write to the NON-CHAINED durability-alert marker failed.
+    ///
+    /// Its own variant because it has one caller and one meaning: the operator
+    /// pressed Acknowledge and the DURABLE half of taking the banner down did
+    /// not land. [`Handle::clear_durability_alert`] returns this instead of
+    /// clearing, so the route fails loudly with the banner still up. Clearing
+    /// memory over a failed durable clear is the amnesia D7.4b closed.
+    #[error("durability-alert marker write failed for {path}: {source}")]
+    DurabilityMarker {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -260,6 +279,22 @@ impl WalBreach {
             WalBreach::WalReplaced => "wal_replaced",
             WalBreach::MainReplaced => "main_db_file_replaced",
             WalBreach::AuditMirrorFrozen => "audit_mirror_frozen",
+        }
+    }
+
+    /// Inverse of [`Self::code`] — used by the D5 marker reader so a restart
+    /// re-raises with the breach that was actually detected instead of a
+    /// hard-coded guess (ADR-0110 D5 / N2). `None` for a code this build does
+    /// not know, which a newer format could produce; the caller decides what an
+    /// unknown shape means rather than being handed a wrong one.
+    pub(crate) fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "wal_vanished" => Some(WalBreach::WalVanished),
+            "wal_shrank" => Some(WalBreach::WalShrank),
+            "wal_replaced" => Some(WalBreach::WalReplaced),
+            "main_db_file_replaced" => Some(WalBreach::MainReplaced),
+            "audit_mirror_frozen" => Some(WalBreach::AuditMirrorFrozen),
+            _ => None,
         }
     }
 }
@@ -489,23 +524,31 @@ struct Inner {
     conn: Option<Connection>,
     /// D2 cadence coordinator (pure; see [`debounce`]).
     debouncer: CheckpointDebouncer,
-    /// **ADR-0110 D5 — the benign-vs-live discriminator.** `true` once a
-    /// lockstep [`aberp_audit_ledger::sync_mirror`] at [`WriteGuard::drop`] has
-    /// SUCCEEDED on this Handle: the mirror and the DB agreed while THIS
-    /// process was the one writing.
+    /// **ADR-0110 D5 — the benign-vs-live discriminator.** The audit head seq
+    /// the last SUCCESSFUL lockstep [`aberp_audit_ledger::sync_mirror`] saw
+    /// (its return value is the mirror head after the append, which is the DB's
+    /// max seq at that instant). `None` until one has succeeded on this Handle.
     ///
-    /// A `MirrorDivergent` is only a live-process durability fault if that
-    /// already held. Diverging from a state we never saw agree means the tenant
-    /// arrived diverged — the boot reconciler's business, and in `serve`
-    /// unreachable (`ensure_consistent_with_db` runs before
-    /// `open_tenant_handle` and either heals it or refuses the boot). Raising
-    /// there would put the banner up on a state a boot resolves, which is the
-    /// one failure mode that makes an operator stop reading banners.
+    /// Two questions are answered by this one number, and both have to hold
+    /// before a `MirrorDivergent` is a durability fault:
+    ///
+    /// 1. **`None` ⇒ never in lockstep.** Diverging from a state this Handle
+    ///    never saw agree means the tenant ARRIVED diverged — the boot
+    ///    reconciler's business, and in `serve` unreachable
+    ///    (`ensure_consistent_with_db` runs before `open_tenant_handle` and
+    ///    either heals it or refuses the boot). Raising there would put the
+    ///    banner up on a state a boot resolves.
+    /// 2. **`Some(n)` and the DB head is still ≥ `n` ⇒ we lost nothing**
+    ///    (D5-B2). A mirror that is ahead because somebody ELSE appended to it
+    ///    is not our durability failing; a mirror that is ahead because OUR
+    ///    database head fell back below what we had already mirrored is. Only
+    ///    the second is a loss, and only the second raises. See
+    ///    [`WriteGuard::drop`] for why that distinction is the whole of B2.
     ///
     /// Lives in `Inner`, not behind its own lock, precisely because it is only
     /// ever touched from `WriteGuard::drop` — i.e. under the writer mutex this
     /// very guard holds. No second lock to order, no atomic to reason about.
-    mirror_lockstep_seen: bool,
+    last_synced_head: Option<u64>,
     /// **ADR-0110 D5** — one-shot latch: the mirror freeze has been raised and
     /// audited once for this Handle. The divergence is CONTINUOUS (it does not
     /// resolve without a boot reconcile), so without this every subsequent
@@ -555,6 +598,10 @@ pub struct Handle {
     /// once because [`Self::durable_ack`] needs it on every money-path ack.
     wal_path: PathBuf,
     mirror_path: PathBuf,
+    /// ADR-0110 D5 — `<db>.durability-alert`, the NON-CHAINED marker that
+    /// carries a durability-loss episode across a restart. Precomputed here for
+    /// the same reason [`Self::wal_path`] is: the one derivation, in one place.
+    marker_path: PathBuf,
     /// ADR-0110 D3 — the durability journal: every path this handle has
     /// actually `fsync`'d, in first-sync order, deduped.
     ///
@@ -651,6 +698,7 @@ impl Handle {
             id: NEXT_HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             db_path: db_path.to_path_buf(),
             wal_path: wal_path_for(db_path),
+            marker_path: durability_marker::marker_path_for(db_path),
             mirror_path,
             synced: Mutex::new(Vec::new()),
             // ADR-0110 D7. Deliberately the DEFAULT (high-water 0, no
@@ -669,7 +717,7 @@ impl Handle {
                 // ADR-0110 D5. A fresh Handle has seen nothing, so its first
                 // drop can only BASELINE — the mirror-freeze alarm, like the
                 // D7 fence, can fire on the second observation at the earliest.
-                mirror_lockstep_seen: false,
+                last_synced_head: None,
                 mirror_freeze_reported: false,
             }),
         });
@@ -687,7 +735,7 @@ impl Handle {
         // Ungated by `wal_fence_enabled` on purpose: a loss recorded while the
         // fence was armed must still resurface on a boot where it is disarmed.
         // Turning a safety flag off must not erase an outstanding alarm.
-        handle.restore_durability_alert_from_mirror();
+        handle.restore_durability_alert();
         Ok(handle)
     }
 
@@ -706,6 +754,16 @@ impl Handle {
     /// The mirror (`<db>.audit.log`) path.
     pub fn mirror_path(&self) -> &Path {
         &self.mirror_path
+    }
+
+    /// ADR-0110 D5 — the durability-alert marker (`<db>.durability-alert`).
+    ///
+    /// Exposed so callers that need to reason about the tenant's on-disk
+    /// artifacts (the D5 pins; anything enumerating what a recovery must
+    /// preserve) name it through the one derivation instead of rebuilding the
+    /// path — a second copy of that rule would eventually be a second store.
+    pub fn durability_marker_path(&self) -> &Path {
+        &self.marker_path
     }
 
     /// **ADR-0110 D3 — the durable-ack boundary.** Force the just-committed
@@ -1160,9 +1218,36 @@ impl Handle {
     /// audit row** (`serve::acknowledge_durability_alert` is the one production
     /// caller). Clearing the in-memory flag on its own is not an
     /// acknowledgement — it is amnesia, and the next boot's
-    /// [`Self::restore_durability_alert_from_mirror`] would correctly bring the
-    /// banner straight back.
-    pub fn clear_durability_alert(&self) {
+    /// [`Self::restore_durability_alert`] would correctly bring the banner
+    /// straight back.
+    ///
+    /// # ADR-0110 D5 — the durable half now includes the marker
+    ///
+    /// The ledger ack row alone no longer takes the banner down, because a D5
+    /// episode never reached the ledger: it lives in
+    /// [`crate::durability_marker`]. So this appends the marker's own `ack`
+    /// record FIRST and clears the in-memory flag only if that succeeded —
+    /// the same ordering, and the same reason, as the route's audit-row-first
+    /// rule. A failed marker write returns `Err` with the banner still UP,
+    /// which is the safe direction: clearing memory while the durable half
+    /// stayed raised is precisely the "operator watched the banner drop and it
+    /// came back next boot" defect D7.4b fixed.
+    pub fn clear_durability_alert(&self) -> Result<(), DbError> {
+        durability_marker::record_ack(&self.marker_path, OffsetDateTime::now_utc()).map_err(
+            |e| {
+                tracing::error!(
+                    error = %e,
+                    marker = %self.marker_path.display(),
+                    "aberp-db: ADR-0110 D5 — could NOT record the acknowledgement in the \
+                     durability-alert marker; leaving the banner UP rather than clearing a \
+                     flag whose durable half is still raised"
+                );
+                DbError::DurabilityMarker {
+                    path: self.marker_path.clone(),
+                    source: e,
+                }
+            },
+        )?;
         let mut slot = match self.durability_alert.lock() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -1171,6 +1256,7 @@ impl Handle {
             }
         };
         *slot = None;
+        Ok(())
     }
 
     /// **ADR-0110 D7 / B2 — re-derive the sticky alert at boot, from BOTH
@@ -1225,10 +1311,24 @@ impl Handle {
     /// the next boot's reconcile. It is pinned directly by
     /// `an_ack_that_reached_only_the_db_still_clears_a_loss_that_reached_only_the_mirror`.
     ///
+    /// # ADR-0110 D5 — and a THIRD source, which is now the live one
+    ///
+    /// D5 (route (a), Ervin 2026-08-13) records a mirror freeze in the
+    /// non-chained [`crate::durability_marker`] instead of the ledger, because
+    /// an append at that moment forks the two chains and refuses the next boot
+    /// (D5-B1). So the marker is read here too, and it is the source that
+    /// carries every D5 episode.
+    ///
+    /// The two ledger halves are KEPT, not replaced. They are what re-raise a
+    /// `db.durability_loss_detected` row that a real ledger already holds —
+    /// D7's fence still writes one, and a prod tenant recovered from incident
+    /// 00012 may carry one. Dropping the ledger reader to "clean up" would
+    /// silently retire those rows.
+    ///
     /// # The rule
     ///
-    /// Raise the alert iff a `db.durability_loss_detected` exists in either
-    /// store AND no `db.durability_alert_acknowledged` in either store is
+    /// Raise the alert iff a loss exists in ANY of the three sources — the
+    /// marker, the mirror, or the DB — AND no acknowledgement in any of them is
     /// **strictly newer** than it.
     ///
     /// Ordering is by RFC3339 `time_wall`, not by `seq`. `seq` cannot do it:
@@ -1257,17 +1357,19 @@ impl Handle {
     /// precisely the condition most likely to co-occur with a durability
     /// incident — which would have made a torn tail silently swallow the alarm.
     /// The tail policy hands back the chain-reverified intact prefix instead.
-    pub fn restore_durability_alert_from_mirror(&self) {
+    pub fn restore_durability_alert(&self) {
         let mirror_rows = self.mirror_audit_times();
         let db_rows = self.db_audit_times();
+        let marker = durability_marker::read(&self.marker_path);
 
-        // Newest of each kind across BOTH stores.
+        // Newest of each kind across ALL THREE sources.
         let newest = |a: Option<OffsetDateTime>, b: Option<OffsetDateTime>| match (a, b) {
             (Some(x), Some(y)) => Some(x.max(y)),
             (x, y) => x.or(y),
         };
-        let loss = newest(mirror_rows.loss, db_rows.loss);
-        let ack = newest(mirror_rows.ack, db_rows.ack);
+        let marker_loss = marker.loss.map(|(at, _)| at);
+        let loss = newest(newest(mirror_rows.loss, db_rows.loss), marker_loss);
+        let ack = newest(newest(mirror_rows.ack, db_rows.ack), marker.ack);
 
         let Some(loss) = loss else { return };
         // Strictly newer, so a tie keeps the banner up (see the docs).
@@ -1280,25 +1382,65 @@ impl Handle {
             return;
         }
 
+        // ADR-0110 D5 / N2 — report the breach that was actually DETECTED.
+        //
+        // Before the marker there was nothing to read it from: the machine code
+        // is not cheaply recoverable from either ledger store (the mirror
+        // base64-encodes the payload), so this hard-coded `WalVanished` — the
+        // shape the 00012 mechanism produces and the one the generic message
+        // describes. That was a guess, and after a restart it turned every D5
+        // mirror-freeze into a reported WAL truncation on `/health` and in the
+        // banner, losing the one distinction a recovery actually turns on.
+        //
+        // The marker stores the real code, so when the marker holds the newest
+        // loss, its breach is used. The ledger-sourced path keeps the old
+        // default, because for those rows the guess is still the best available
+        // answer — and it is right for the fence rows that dominate them.
+        let breach = match marker.loss {
+            Some((at, Some(code))) if at == loss => code,
+            _ => WalBreach::WalVanished,
+        };
         let message = format!(
-            "Durability loss detected on the tenant database (recorded {}). Recent writes may \
-             not have reached disk. Stop and recover. This alert survived a restart and stays \
-             up until it is acknowledged.",
+            "Durability loss detected on the tenant database (recorded {}): {breach}. Stop and \
+             recover. This alert survived a restart and stays up until it is acknowledged.",
             loss.format(&Rfc3339)
                 .unwrap_or_else(|_| "at an unreadable time".to_string()),
         );
         tracing::error!(
             db = %self.db_path.display(),
-            "aberp-db: ADR-0110 D7 — RE-RAISING an UNACKNOWLEDGED durability loss found in the \
-             durable audit record. A restart is not an acknowledgement."
+            breach = breach.code(),
+            "aberp-db: ADR-0110 D7/D5 — RE-RAISING an UNACKNOWLEDGED durability loss found in \
+             the durable record. A restart is not an acknowledgement."
         );
-        // Re-derived: the machine breach code is not cheaply readable from
-        // either store (the mirror base64-encodes the payload). WalVanished is
-        // the shape the 00012 mechanism produces and the one the message
-        // describes. A D5 mirror-freeze row re-raises under the same code —
-        // the operator instruction is identical and the payload keeps the
-        // distinction for forensics.
-        self.set_sticky_alert(WalBreach::WalVanished, message);
+        self.set_sticky_alert(breach, message);
+    }
+
+    /// The DB's audit head seq, read on an ALREADY-HELD connection.
+    ///
+    /// One indexed aggregate, and it is only ever called on the D5 divergence
+    /// path — never on the healthy write path, which stays bit-for-bit what it
+    /// was. Takes `&Connection` rather than reaching for [`Self::read`],
+    /// because its caller is inside [`WriteGuard::drop`] and `read()` locks the
+    /// same writer mutex that guard is holding (a self-deadlock; in debug the
+    /// re-entrancy tripwire panics first).
+    ///
+    /// `None` on any query failure. The caller treats that as "cannot tell",
+    /// not as "regressed" — see the `MirrorDivergent` arm.
+    fn audit_head_seq(&self, conn: &Connection) -> Option<u64> {
+        match conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM audit_ledger", [], |r| {
+            r.get::<_, i64>(0)
+        }) {
+            Ok(v) => Some(v as u64),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    db = %self.db_path.display(),
+                    "aberp-db: ADR-0110 D5 — could not read the audit head to decide whether \
+                     this divergence cost us rows; not raising on a question we could not put"
+                );
+                None
+            }
+        }
     }
 
     /// Set the sticky operator alert, keeping any alert already up.
@@ -1493,18 +1635,28 @@ impl Handle {
     /// acknowledgement, a *second* durability loss) exists in the DB alone,
     /// and the DB is the store that has just been shown to lose rows.
     ///
-    /// # Why the same alert surface rather than a new one
+    /// # Why the alert goes to the MARKER and never to the ledger (D5-B1)
     ///
-    /// The operator's instruction is identical to D7's — stop and recover —
-    /// and reusing [`Self::set_sticky_alert`] + `db.durability_loss_detected`
-    /// inherits, unchanged and untested-by-implication, the whole D7 channel:
-    /// `GET /health durability_alert`, the red banner, the acknowledge route,
-    /// and — the load-bearing one — the boot re-derivation in
-    /// [`Self::restore_durability_alert_from_mirror`], which is what makes this
-    /// alert survive a restart. A sibling `EventKind` would have had to be
-    /// taught to both halves of that re-derivation to get the same property,
-    /// and a kind that is *not* taught silently does not survive a boot. The
-    /// payload's `trigger` keeps the two apart for forensics.
+    /// The first cut appended a `db.durability_loss_detected` row here. That
+    /// could BRICK the tenant, and it is the whole reason this method now
+    /// touches no SQL at all.
+    ///
+    /// The freeze is detected exactly when the DB head has regressed below the
+    /// append-only mirror's. An append at that moment consumes the next DB
+    /// `seq` — one the mirror already holds a *different* entry for. The chains
+    /// fork there, and the next boot's gated auto-heal proves benignness by
+    /// matching the DB head's `entry_hash` against the mirror's at the same
+    /// seq. Forked ⇒ refused ⇒ `serve` exits non-zero. The diagnostic that says
+    /// "stop and recover" would have been what stopped the operator recovering.
+    ///
+    /// Ervin's rule (2026-08-13): a machine-spawned durability diagnostic is
+    /// not a business event and must never consume a ledger seq. It goes to
+    /// [`crate::durability_marker`], which is append-only, `fsync`'d, chained to
+    /// nothing, and writable while the mirror is frozen — the whole point.
+    /// Everything the operator sees is unchanged: the same sticky alert, the
+    /// same `GET /health durability_alert`, the same red banner, the same
+    /// acknowledge route, and the same survives-a-restart property, now
+    /// re-derived from the marker by [`Self::restore_durability_alert`].
     ///
     /// # Not gated on `wal_fence_enabled`
     ///
@@ -1518,48 +1670,56 @@ impl Handle {
     ///
     /// # No new opener, no deadlock
     ///
-    /// The audit row goes down on `conn` — the shared Handle connection this
-    /// guard is holding — so there is no second `Connection::open` and the
-    /// GROUP-A census is unchanged. It must NOT reach for [`Self::write`] /
-    /// [`Self::read`]: the writer mutex is held by the very guard whose `drop`
-    /// is running, and both would self-deadlock (in debug the re-entrancy
-    /// tripwire panics first, because deregistration is the last thing `drop`
-    /// does). The lock order taken here — writer mutex, then the ledger's
-    /// `AUDIT_APPEND_LOCK` — is the one [`Self::emit_durability_loss_audit`]
-    /// already takes, and nothing anywhere takes those two in the other order.
-    fn raise_mirror_freeze_alert(&self, conn: &Connection, mirror_head_seq: u64, reason: &str) {
+    /// Since D5-B1 this path performs no database access whatsoever: one
+    /// `OpenOptions::append` on a sidecar file, one `sync_all`. No
+    /// `Connection::open` (the GROUP-A census is unchanged), no `try_clone`, no
+    /// transaction, and no `AUDIT_APPEND_LOCK`. It must still never reach for
+    /// [`Self::write`] / [`Self::read`] — the writer mutex is held by the very
+    /// guard whose `drop` is running, and both would self-deadlock (in debug
+    /// the re-entrancy tripwire panics first, because deregistration is the
+    /// last thing `drop` does) — and now there is nothing on this path that
+    /// could be tempted to.
+    fn raise_mirror_freeze_alert(&self, mirror_head_seq: u64, db_head_seq: u64, reason: &str) {
         tracing::error!(
             db = %self.db_path.display(),
             mirror = %self.mirror_path.display(),
             mirror_head_seq,
+            db_head_seq,
             reason,
             "aberp-db: ADR-0110 D5 DURABILITY LOSS DETECTED — the audit mirror REFUSED the \
-             lockstep append (MirrorDivergent) after previously being in lockstep with this \
-             Handle. The mirror is now FROZEN: audit rows written from here on reach the DB \
-             only, never fsync'd storage. The app keeps serving; the operator alert is sticky \
-             until explicitly acknowledged."
+             lockstep append (MirrorDivergent) and this Handle's own DB head has REGRESSED \
+             below what it had already mirrored. The mirror is now FROZEN: audit rows written \
+             from here on reach the DB only, never fsync'd storage. The app keeps serving; the \
+             operator alert is sticky until explicitly acknowledged."
         );
 
         self.set_sticky_alert(
             WalBreach::AuditMirrorFrozen,
             format!(
-                "Durability loss detected on the tenant database: {} (audit seq \
-                 {mirror_head_seq}). Stop and recover.",
+                "Durability loss detected on the tenant database: {} (the database head fell \
+                 from audit seq {mirror_head_seq} to {db_head_seq}). Stop and recover.",
                 WalBreach::AuditMirrorFrozen
             ),
         );
 
-        // Fixed vocabulary plus one `u64`. `reason` is a formatted sentence and
-        // stays in the log line above — the payload keeps the same
-        // nothing-interpolated posture as D7's.
-        self.append_durability_loss_row(
-            conn,
+        // Best-effort, and loud when it fails: the in-memory alert is already
+        // up, so a failed marker write costs the restart-survival half, not the
+        // banner in front of the operator right now.
+        if let Err(e) = durability_marker::record_loss(
+            &self.marker_path,
+            OffsetDateTime::now_utc(),
             "audit_mirror_sync_refused",
-            &format!(
-                "\"breach\":\"{}\",\"mirror_head_seq\":{mirror_head_seq}",
-                WalBreach::AuditMirrorFrozen.code()
-            ),
-        );
+            WalBreach::AuditMirrorFrozen,
+            mirror_head_seq,
+        ) {
+            tracing::error!(
+                error = %e,
+                marker = %self.marker_path.display(),
+                "aberp-db: ADR-0110 D5 — could NOT record the durability-alert marker. The \
+                 detection was logged loudly and the sticky alert is set, but this alert will \
+                 not survive a restart."
+            );
+        }
     }
 
     /// Append the `db.durability_loss_detected` forensic row.
@@ -1594,45 +1754,7 @@ impl Handle {
                 return;
             }
         };
-        self.append_durability_loss_row(
-            &guard,
-            "wal_truncated_under_writer",
-            &format!(
-                "\"breach\":\"{}\",\"wal_high_water\":{},\"wal_observed\":{}",
-                breach.kind.code(),
-                breach.expected,
-                breach.observed,
-            ),
-        );
-        // Explicit: the guard's drop runs the lockstep mirror sync that gets
-        // this row onto fsync'd storage, which is the whole point of writing it.
-        drop(guard);
-    }
-
-    /// Append one `db.durability_loss_detected` row on an ALREADY-HELD
-    /// connection. The shared body of the two detectors: D7's fence
-    /// ([`Self::emit_durability_loss_audit`], which passes its own write guard)
-    /// and D5's mirror freeze ([`Self::raise_mirror_freeze_alert`], which
-    /// passes the connection out of the guard being dropped).
-    ///
-    /// Takes `&Connection` and never [`Self::write`]: the D5 caller is inside
-    /// `WriteGuard::drop` and re-acquiring the writer mutex there is a
-    /// self-deadlock. `try_clone` is a clone of the SAME instance, not a second
-    /// OS open — the ADR-0098/0099 opener census is unchanged by this call.
-    ///
-    /// `extra` is spliced between `trigger` and `audit_head_seq` and must
-    /// carry FIXED-VOCABULARY fields only — `&'static str` codes and integers,
-    /// nothing from a path, an operator, or a formatted error. The payload is
-    /// hand-formatted JSON, so that rule is what keeps it un-injectable (same
-    /// posture as [`Self::emit_poison_recovery_audit`]).
-    ///
-    /// Best-effort by contract, and honest about why: on the D7 path the DB
-    /// being written to is the one whose WAL was just truncated, and on the D5
-    /// path the mirror is already refusing appends, so this row may reach only
-    /// one store — or neither. It is still worth writing; every failure arm
-    /// below logs loudly and the sticky alert is already up regardless.
-    fn append_durability_loss_row(&self, conn: &Connection, trigger: &'static str, extra: &str) {
-        let probe = match conn.try_clone() {
+        let probe = match guard.try_clone() {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(
@@ -1657,9 +1779,14 @@ impl Handle {
             .ok()
             .and_then(|rows| rows.first().map(|e| e.seq.as_u64()))
             .unwrap_or(0);
-        let payload =
-            format!("{{\"trigger\":\"{trigger}\",{extra},\"audit_head_seq\":{head_seq}}}")
-                .into_bytes();
+        let payload = format!(
+            "{{\"trigger\":\"wal_truncated_under_writer\",\"breach\":\"{}\",\
+             \"wal_high_water\":{},\"wal_observed\":{},\"audit_head_seq\":{head_seq}}}",
+            breach.kind.code(),
+            breach.expected,
+            breach.observed,
+        )
+        .into_bytes();
         let session_id = format!(
             "aberp-db-durability-loss-{}",
             SystemTime::now()
@@ -1672,17 +1799,19 @@ impl Handle {
             Ok(_) => tracing::error!(
                 db = %self.db_path.display(),
                 head_seq,
-                trigger,
+                breach = breach.kind.code(),
                 "aberp-db: durability loss AUDITED (db.durability_loss_detected)"
             ),
             Err(e) => tracing::error!(
                 error = %e,
                 db = %self.db_path.display(),
-                trigger,
                 "aberp-db: durability-loss audit-row append FAILED (non-fatal; the detection \
                  was logged loudly and the sticky alert is set)"
             ),
         }
+        // Explicit: the guard's drop runs the lockstep mirror sync that gets
+        // this row onto fsync'd storage, which is the whole point of writing it.
+        drop(guard);
     }
 
     /// Acquire the **serialized writer** over the shared instance. The returned
@@ -2177,17 +2306,19 @@ impl Drop for WriteGuard<'_> {
         // sees exactly what the just-finished txn committed.
         //
         // ADR-0110 D5 — the outcome is CLASSIFIED, not just logged. Read the
-        // two flags out of `Inner` first: the arm below needs `&Connection` out
-        // of the same struct, and the writes-back happen once the borrow ends.
-        let lockstep_seen = self.inner.mirror_lockstep_seen;
+        // two pieces of state out of `Inner` first: the arms below need
+        // `&Connection` out of the same struct, and the writes-back happen once
+        // that borrow ends.
+        let last_synced_head = self.inner.last_synced_head;
         let freeze_reported = self.inner.mirror_freeze_reported;
-        let mut now_lockstep = false;
+        let mut new_synced_head = None;
         let mut now_reported = false;
         if let Some(conn) = self.inner.conn.as_ref() {
             match aberp_audit_ledger::sync_mirror(conn, &handle.meta, &handle.mirror_path) {
                 // The mirror took the append: the two stores agree, under our
-                // own writing. This is the fact D5's discrimination rests on.
-                Ok(_) => now_lockstep = true,
+                // own writing, at this head. Both halves of D5's discrimination
+                // rest on that number.
+                Ok(head) => new_synced_head = Some(head),
                 // ADR-0110 D5 — THE APPEND-REFUSED CASE. `MirrorDivergent` is
                 // not a transient I/O hiccup that "reconciles on the next
                 // write": `sync_mirror` re-derives the same divergence every
@@ -2199,32 +2330,51 @@ impl Drop for WriteGuard<'_> {
                 // silently-degraded durability posture indistinguishable from a
                 // healthy one.
                 //
-                // Gated on `lockstep_seen`, NOT on `wal_fence_enabled`: see
-                // `raise_mirror_freeze_alert`.
-                Err(aberp_audit_ledger::AppendError::MirrorDivergent { seq, reason })
-                    if lockstep_seen && !freeze_reported =>
-                {
-                    handle.raise_mirror_freeze_alert(conn, seq, &reason);
-                    now_reported = true;
-                }
-                // A divergence we are deliberately NOT raising: either this
-                // Handle never saw the two stores agree (an INHERITED state —
-                // see `Inner::mirror_lockstep_seen`) or the episode is already
-                // reported and the alert is already up. It still gets its own
-                // line, because the generic message below would be a LIE here:
-                // this will not reconcile on the next write.
-                Err(e @ aberp_audit_ledger::AppendError::MirrorDivergent { .. }) => {
-                    tracing::warn!(
-                        error = %e,
-                        mirror = %handle.mirror_path.display(),
-                        mirror_lockstep_seen = lockstep_seen,
-                        mirror_freeze_already_reported = freeze_reported,
-                        "aberp-db: ADR-0110 D5 — the audit mirror is REFUSING appends and will \
-                         keep refusing until a boot reconcile heals it (or refuses the boot). \
-                         Not raising the durability alert from here: see the two flags above — \
-                         an inherited divergence belongs to the boot reconciler, and an already- \
-                         reported one is on the banner."
-                    );
+                // Two gates, and NEITHER is `wal_fence_enabled` (see
+                // `raise_mirror_freeze_alert`):
+                //
+                // * `last_synced_head` must be `Some` — we saw the two stores
+                //   agree before they stopped agreeing;
+                // * the DB head must have FALLEN BELOW it. That is D5-B2. A
+                //   co-resident CLI mirror-writer (the NAV resubmission family)
+                //   advances the mirror without our instance seeing its rows,
+                //   which looks exactly like a truncation from here — except
+                //   that OUR head has not moved. A truncation costs us rows we
+                //   had already mirrored; sanctioned maintenance does not. Only
+                //   the first is a durability loss, and a banner that could not
+                //   tell them apart would be up after routine maintenance,
+                //   which is the alarm-the-operator-dismisses failure.
+                Err(aberp_audit_ledger::AppendError::MirrorDivergent { seq, reason }) => {
+                    // ONE head read, on the divergence path only — never on the
+                    // healthy write path. `None` means we could not ask, and we
+                    // do not raise on a question we could not put: a regression
+                    // we cannot demonstrate is not one we should alarm on.
+                    let db_head = handle.audit_head_seq(conn);
+                    let regressed = matches!((last_synced_head, db_head), (Some(prev), Some(now)) if now < prev);
+                    if regressed && !freeze_reported {
+                        handle.raise_mirror_freeze_alert(seq, db_head.unwrap_or(0), &reason);
+                        now_reported = true;
+                    } else {
+                        // A divergence we deliberately do NOT raise. It still
+                        // gets its own line, because the generic message below
+                        // would be a LIE here: this will not reconcile on the
+                        // next write.
+                        tracing::warn!(
+                            mirror = %handle.mirror_path.display(),
+                            mirror_head_seq = seq,
+                            db_head_seq = db_head,
+                            last_synced_head,
+                            mirror_freeze_already_reported = freeze_reported,
+                            reason,
+                            "aberp-db: ADR-0110 D5 — the audit mirror is REFUSING appends and \
+                             will keep refusing until a boot reconcile heals it (or refuses the \
+                             boot). NOT raising the durability alert: this Handle's own audit \
+                             head has not fallen below what it had already mirrored, so nothing \
+                             OF OURS was lost — the mirror was advanced by something else, or \
+                             the tenant arrived diverged, or the episode is already on the \
+                             banner."
+                        );
+                    }
                 }
                 Err(e) => {
                     // `MirrorIo` / `MirrorCorrupt` keep the pre-D5 posture: for
@@ -2241,7 +2391,9 @@ impl Drop for WriteGuard<'_> {
                 }
             }
         }
-        self.inner.mirror_lockstep_seen = lockstep_seen || now_lockstep;
+        if let Some(head) = new_synced_head {
+            self.inner.last_synced_head = Some(head);
+        }
         self.inner.mirror_freeze_reported = freeze_reported || now_reported;
 
         // ADR-0110 D7 — SAMPLE THE WATERMARK. Here, and not in `durable_ack`
