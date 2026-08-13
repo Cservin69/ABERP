@@ -140,6 +140,14 @@ rebuild, idempotent. If a future operator panic surfaces "stock_qty
 disagrees with SUM(qty_delta)", the recovery is `cargo run -- rebuild-stock-cache` and the cache catches up. The ledger never needs
 correcting.
 
+> **Operator note (ADR-0110 D9, 2026-08-13).** `rebuild-stock-cache` now takes
+> the ADR-0099 F-E whole-DB writer flock before it opens the tenant DB, so it
+> **REFUSES while `aberp serve` is running** and says so. Stop serve, run the
+> rebuild, start serve. Previously it ran anyway — and because it opened with
+> DuckDB default pragmas, its exit checkpointed and truncated serve's WAL,
+> silently discarding every commit serve had made since the last checkpoint. The
+> refusal is the tool declining to trade a stale cache for lost invoices.
+
 ### 4. Audit-ledger integration
 
 One new `EventKind` variant: `StockMovementRecorded` (storage string

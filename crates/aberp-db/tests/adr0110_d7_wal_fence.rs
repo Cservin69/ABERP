@@ -161,8 +161,12 @@ fn commit_one(h: &Handle, label: &str) {
 /// live Handle's WAL. This was `serve::read_invoice_total_gross_minor` before
 /// PR #1 and `calibration_overview_request` / `resolve_recipient_email` /
 /// `handle_quote_pipeline_status` before ADR-0110 D8 — all now Handle-routed.
-/// It remains the shape of every CLI-against-live opener (GROUP B), which is a
-/// separate OS process and so cannot be migrated the same way.
+/// It remains the shape of every CLI one-shot (GROUP B), which is a separate OS
+/// process and so cannot be migrated the same way — as of ADR-0110 D9 those are
+/// instead FENCED: each takes the F-E whole-DB writer flock before opening, so
+/// this shape can no longer occur *against a live serve*. The shape itself stays
+/// exactly as written here, because that is what the fence must keep catching if
+/// a future opener slips the fencing.
 fn foreign_open_and_close(db: &Path) {
     let c = Connection::open(db).expect("foreign open");
     c.execute_batch("SELECT 1;").expect("foreign read");
@@ -555,27 +559,35 @@ fn the_healthy_path_still_journals_what_it_synced() {
 
 // ── B1 — THE FENCE SHIPS DISARMED ───────────────────────────────────────────
 
-/// **The shipping default is OFF, and that is the whole point of B1.**
+/// **The shipping default is OFF — and as of D9 that is a SEQUENCING pin, not a
+/// hazard pin.**
 ///
-/// ADR-0110 D8 swept the in-serve GROUP-A openers (that baseline group is now
-/// empty), but the CLI-against-live class is NOT swept: `drain-submission-queue`,
-/// `drain-pending-retries`, `export-invoice-bundle`, `recover-from-nav` and their
-/// siblings are separate OS processes, so they cannot borrow serve's in-process
-/// Handle, and each still truncates this Handle's WAL on close.
+/// Both opener classes are now closed. D8 swept the in-serve one (GROUP A in the
+/// read-fork baseline is empty). D9 closed the CLI-against-live one the only way
+/// a separate OS process can be closed — mutual exclusion, not migration: every
+/// DB-mutating one-shot takes the F-E whole-DB writer flock before it opens the
+/// tenant DB, so it REFUSES against a live serve instead of folding its WAL.
+/// `rebuild-stock-cache` was the last one that did not, and it was the acute one:
+/// ADR-0061 §3 documents it as the recovery command to run when the stock cache
+/// disagrees with its ledger — i.e. the one an operator runs *while the shop is
+/// live*. It is fenced and pinned by
+/// `aberp-inventory/tests/rebuild_stock_cache_flock.rs`.
 ///
-/// With the fence ARMED before those are fenced, an operator draining the
-/// submission queue against a running serve arms a breach, and the NEXT invoice
-/// issuance fails `durable_ack` — a failure that PROPAGATES via `?`, because the
-/// D3-C cut-gate enforces exactly that. A committed invoice would report as
-/// failed and skip its NAV handoff.
+/// What this test therefore holds is the ORDER: the flip is its own PR, so the
+/// re-run adversarial (ADR-0110 §13.3 item 3) has a head to check where the
+/// precondition landed and the flag did not. A fence armed in the same commit as
+/// its own precondition gives an adversarial nothing to disagree with.
 ///
-/// So this default is load-bearing safety, not a toggle someone should tidy
-/// away. Flip it only once the CLI class is fenced too.
+/// The cost of getting the order wrong has not changed, and is why this stays a
+/// test rather than a comment: armed over any surviving fold, the next
+/// issue-invoice or mark-paid fails `durable_ack`, and that failure PROPAGATES
+/// via `?` (the D3-C cut-gate enforces exactly that) — a committed invoice
+/// reported as failed, NAV handoff skipped.
 #[test]
 fn the_fence_ships_disarmed_by_default() {
     assert!(
         !HandleConfig::default().wal_fence_enabled,
-        "ADR-0110 D7 / B1 REGRESSION: the WAL fence must default DISARMED until BOTH opener          classes are closed. ADR-0110 D8 closed the in-serve one (GROUP A is empty), but the          CLI-against-live class is still open: drain-submission-queue / drain-pending-retries          / export-invoice-bundle / recover-from-nav are separate processes that still fold          this WAL on close. Armed on this head it converts a silent durability bug into          routine LOUD money-path failures — the next issue-invoice or mark-paid after any          such command fails its durable_ack and propagates: a committed invoice reported as          failed, NAV handoff skipped. That is worse than the bug it detects."
+        "ADR-0110 D7 / B1 REGRESSION: the WAL fence must default DISARMED on this head. Both          opener classes are now closed — D8 emptied GROUP A, D9 flock-fenced the last          CLI-against-live opener (rebuild-stock-cache) — so the remaining owed item is the          re-run adversarial over the corrected head, NOT another fix. Arming it here would          bundle the flip with its own precondition and leave that adversarial nothing to          check. If a fold DOES survive, an armed fence converts a silent durability bug          into routine LOUD money-path failures: the next issue-invoice or mark-paid fails          its durable_ack and propagates — a committed invoice reported as failed, NAV          handoff skipped."
     );
 }
 

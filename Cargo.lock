@@ -131,6 +131,7 @@ version = "0.0.0"
 dependencies = [
  "aberp-audit-ledger",
  "duckdb",
+ "fs2",
  "thiserror 1.0.69",
  "time",
  "tracing",
@@ -171,6 +172,7 @@ name = "aberp-inventory"
 version = "0.0.0"
 dependencies = [
  "aberp-audit-ledger",
+ "aberp-db",
  "anyhow",
  "duckdb",
  "rust_decimal",

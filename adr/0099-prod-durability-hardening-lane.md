@@ -574,7 +574,12 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   head mid-export. FIXED this wave (it now `acquire_or_refuse`s before opening the
   ledger) + pinned by `run_refuses_while_the_whole_db_writer_lock_is_held`.
 - **THE FLOCK (F-E) IS BUILT, WIRED, AND PROVEN — the premise IS kept.**
-  `apps/aberp/src/db_writer_lock.rs` (fs2 `try_lock_exclusive`, consistent with
+  `crates/aberp-db/src/db_writer_lock.rs` — MOVED there from
+  `apps/aberp/src/db_writer_lock.rs` by ADR-0110 D9, which left a re-export at the
+  old path, so every reference in this document still resolves; it moved because
+  `aberp-inventory`'s `rebuild-stock-cache` binary needs the SAME lock and cannot
+  depend on `apps/aberp`, and a second copy of the path derivation would be no
+  lock at all — (fs2 `try_lock_exclusive`, consistent with
   `mirror.rs`'s `fs2::FileExt`; NO `remove_file` — the marker persists by design,
   like `submission_lock.rs`), acquired by `serve` at boot (`serve.rs`) and by every
   CLI mutator before it opens the DB. Three PERMANENT process-level tests cover the
@@ -802,9 +807,11 @@ the separate-boot-opener fork repro + shared-Handle coherence pair, and
   `debounce` module + the checkpoint-disabled e2e suite + poison-recovery (Bug 5)
   + F-C/F-A pre-fixes.
 - `EventKind::DbAutoRecovered` (full F12 ritual).
-- F-E: the cross-process whole-DB single-writer flock (`db_writer_lock.rs`) +
-  serve boot acquisition + the cross-process refusal e2e, **and** all 14
-  DB-mutating CLI one-shots now `acquire_or_refuse` the whole-DB writer lock
+- F-E: the cross-process whole-DB single-writer flock (`db_writer_lock.rs`, in
+  `aberp-db` since ADR-0110 D9) + serve boot acquisition + the cross-process
+  refusal e2e, **and** all 14 DB-mutating CLI one-shots — plus
+  `aberp-inventory`'s `rebuild-stock-cache` recovery binary, fenced by ADR-0110
+  D9 — now `acquire_or_refuse` the whole-DB writer lock
   before opening the tenant DB (COMPLETE — closes the CLI-vs-serve two-writer
   class that forced a hand-stop of prod on 2026-07-09).
 - The zero-residual write-fork gate machinery (scanner + allow-list + the

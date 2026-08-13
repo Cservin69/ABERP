@@ -25,6 +25,15 @@ path = "src/bin/rebuild_stock_cache.rs"
 # INSERT + the products cache UPDATE.
 aberp-audit-ledger = { path = "../audit-ledger" }
 
+# ADR-0099 F-E / ADR-0110 D9 — for the `rebuild-stock-cache` BINARY only, which
+# takes the cross-process whole-DB writer flock before it opens the tenant DB
+# (it is a documented recovery path an operator runs while serve is live, and
+# its close would otherwise fold serve's WAL). The LIBRARY half of this crate
+# deliberately does NOT touch aberp-db: it operates on a caller-owned
+# Transaction, which is what keeps it callable from inside a Handle write guard
+# (CLAUDE.md rule 13).
+aberp-db = { path = "../aberp-db" }
+
 # DuckDB Transaction is the type signature of record_movement; same
 # posture as aberp-mes and aberp-quote-intake.
 duckdb = { workspace = true }
