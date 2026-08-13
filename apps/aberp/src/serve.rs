@@ -6108,7 +6108,8 @@ struct HealthResponse {
 #[derive(Serialize)]
 struct DurabilityAlertView {
     /// Machine-stable breach code (`wal_vanished`, `wal_shrank`,
-    /// `wal_replaced`, `main_db_file_replaced`).
+    /// `wal_replaced`, `main_db_file_replaced`, and — ADR-0110 D5 —
+    /// `audit_mirror_frozen`).
     breach: &'static str,
     /// The operator-facing sentence, rendered verbatim by the banner.
     message: String,
