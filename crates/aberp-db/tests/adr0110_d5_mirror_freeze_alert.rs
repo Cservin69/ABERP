@@ -116,16 +116,22 @@ fn seed(db: &Path) {
     conn.execute_batch("CHECKPOINT;").expect("seed fold");
 }
 
-/// A Handle in the **production posture**: `HandleConfig::default()`, which
-/// ships the D7 WAL fence DISARMED.
+/// A Handle in the **production posture**: `HandleConfig::default()` — which as
+/// of ADR-0110 D7.6 (2026-08-13) ships the D7 WAL fence **ARMED**.
 ///
-/// Every test here uses it, and that is the point rather than a convenience:
-/// D5 raises an alarm and refuses no write, so unlike the fence it carries no
-/// money-path-outage risk and is deliberately NOT gated on
-/// `wal_fence_enabled`. Gating it would make it dead code in production, where
-/// the flag is `false`. [`the_alarm_fires_with_the_wal_fence_disarmed`] pins
-/// that against an explicitly disarmed config rather than leaning on this
-/// default.
+/// Every test here uses it, and that is the point rather than a convenience: D5
+/// raises an alarm and refuses no write, so unlike the fence it carries no
+/// money-path-outage risk and is deliberately NOT gated on `wal_fence_enabled`.
+/// These pins therefore have to hold whatever that flag says, and they did not
+/// need a single change when it flipped — which is the property, not a
+/// coincidence. [`the_alarm_fires_in_both_wal_fence_states`] asserts it on both
+/// branches explicitly instead of leaning on whatever the default happens to be.
+///
+/// Note what the flip DOES add here: with the fence armed, every `WriteGuard`
+/// drop in this file now also samples the WAL watermark. That the freeze pins
+/// below are unaffected by it is itself worth having under test — a mirror
+/// freeze and a WAL truncation are separate detectors that must not bleed into
+/// each other.
 fn handle(db: &Path) -> std::sync::Arc<Handle> {
     Handle::open(db, tenant(), HandleConfig::default()).expect("open shared Handle")
 }
@@ -741,49 +747,66 @@ fn the_freeze_is_recorded_once_per_episode() {
     );
 }
 
-/// **The alarm fires with the D7 WAL fence DISARMED — the production posture.**
+/// **The alarm fires in BOTH `wal_fence_enabled` states — D5 is ungated.**
 ///
-/// D7.6 ships `wal_fence_enabled = false` because the FENCE fails `durable_ack`
-/// and a false positive there is a money-path outage. D5 raises an alarm and
-/// refuses nothing, so it is ungated — the same reasoning that left the D7 boot
-/// re-derivation ungated (D7.4a). Gating it would make it dead code in
-/// production.
+/// The FENCE (D7) fails `durable_ack`, and a false positive there is a
+/// money-path outage; that is the only reason the flag exists. D5 raises an
+/// alarm and refuses nothing, so it is ungated — the same reasoning that left
+/// the D7 boot re-derivation ungated (D7.4a).
 ///
 /// This test used to assert only that the flag DEFAULTS to false, which is a
 /// statement about `HandleConfig`, not about D5 (N3). It stayed green with D5
-/// fully gated on the flag — a pin that cannot fail. It now runs the freeze
-/// against an EXPLICITLY disarmed config and requires the alert.
+/// fully gated on the flag — a pin that cannot fail. It then ran the freeze
+/// against an explicitly DISARMED config.
+///
+/// **D7.6 (2026-08-13) sharpened it again, for the reason N3 existed in the
+/// first place.** A residual `assert!(!HandleConfig::default().wal_fence_enabled)`
+/// had stayed behind — a second statement about the DEFAULT hiding inside a test
+/// about the FLAG — and arming the fence turned it red without D5 changing at
+/// all. Re-pointing it at the new default would only re-arm the same landmine
+/// for the next flip, so the pin now drives the freeze under BOTH configs.
+/// "Ungated" is a claim about both branches; it is now asserted on both, and no
+/// future flag flip can make it vacuous or red.
 ///
 /// Mutation-verified: wrap the `MirrorDivergent` raise in
-/// `if handle.config.wal_fence_enabled` and this goes RED, together with the
-/// other raise pins (which use `HandleConfig::default()` and so are disarmed
-/// too — this one says so out loud instead of relying on the default).
+/// `if handle.config.wal_fence_enabled` and the DISARMED iteration goes RED
+/// while the armed one stays green — exactly the asymmetry that mutation
+/// introduces; invert the gate to `!wal_fence_enabled` and the ARMED iteration
+/// goes red instead.
 #[test]
-fn the_alarm_fires_with_the_wal_fence_disarmed() {
-    let disarmed = HandleConfig {
-        wal_fence_enabled: false,
-        ..Default::default()
-    };
-    assert!(
-        !HandleConfig::default().wal_fence_enabled,
-        "and the disarmed config IS the shipping default"
-    );
+fn the_alarm_fires_in_both_wal_fence_states() {
+    for armed in [false, true] {
+        let cfg = HandleConfig {
+            wal_fence_enabled: armed,
+            ..Default::default()
+        };
+        let tmp = Tmp::new(if armed {
+            "ungated-armed"
+        } else {
+            "ungated-disarmed"
+        });
+        let db = tmp.db();
+        seed(&db);
+        let h = Handle::open(&db, tenant(), cfg).expect("open with the fence set explicitly");
 
-    let tmp = Tmp::new("ungated");
-    let db = tmp.db();
-    seed(&db);
-    let h = Handle::open(&db, tenant(), disarmed).expect("open with the fence explicitly OFF");
+        commit_one(&h, "one");
+        commit_one(&h, "two");
+        regress_db_head_through_handle(&h, 1);
 
-    commit_one(&h, "one");
-    commit_one(&h, "two");
-    regress_db_head_through_handle(&h, 1);
-
-    assert!(
-        h.durability_alert().is_some(),
-        "D5 must fire with the WAL fence disarmed: it refuses no write, so it carries none of \
-         the risk that flag exists to hold back — and gating it would make it dead code in \
-         production, where the flag is false"
-    );
+        assert!(
+            h.durability_alert().is_some(),
+            "D5 must fire with the WAL fence {} — it refuses no write, so it carries none of \
+             the risk that flag exists to hold back, and gating it either way would make it \
+             dead code in one of the two postures this tree ships",
+            if armed { "ARMED" } else { "DISARMED" }
+        );
+        assert_eq!(
+            h.durability_alert().map(|a| a.breach),
+            Some(WalBreach::AuditMirrorFrozen),
+            "and it must stay D5's OWN breach code in both states: arming the fence must not \
+             reclassify a mirror freeze as a WAL truncation"
+        );
+    }
 }
 
 // ── THE MARKER'S OWN FAILURE DIRECTION (round-5) ────────────────────────────

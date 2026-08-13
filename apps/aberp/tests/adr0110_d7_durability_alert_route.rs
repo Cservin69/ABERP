@@ -506,12 +506,39 @@ async fn acknowledging_clears_the_banner_records_it_and_survives_a_restart() {
          clear is indistinguishable from amnesia. Kinds present: {:?}",
         entries.iter().map(|e| &e.kind).collect::<Vec<_>>()
     );
+    // ...and the LOSS itself remains permanently recorded too — but in the
+    // MARKER, not the chain (ADR-0110 §15.3, D7.6). The two halves land in
+    // different stores on purpose: the acknowledgement is an OPERATOR act and
+    // belongs on the hash chain, while the detection is machine-spawned and must
+    // never consume a ledger seq — on a truncation that append forks the chains
+    // and refuses the next boot. Acknowledging APPENDS `ack`; it never deletes
+    // the loss line, because taking a banner down must not erase the record of
+    // what raised it.
+    let marker = std::fs::read_to_string(state.db.durability_marker_path())
+        .expect("the durability-alert marker must exist after a fired fence");
+    let marker_lines: Vec<&str> = marker.lines().collect();
     assert!(
-        entries
+        marker_lines
+            .iter()
+            .any(|l| l.starts_with("v1\tloss\t") && l.contains("\twal_truncated_under_writer\t")),
+        "the LOSS itself must remain permanently recorded — acknowledging clears the banner, \
+         not the history. Marker: {marker_lines:?}"
+    );
+    assert!(
+        marker_lines.iter().any(|l| l.starts_with("v1\tack\t")),
+        "and the acknowledgement must be recorded in the marker too, which is what makes the \
+         banner stay down across the restart below. Marker: {marker_lines:?}"
+    );
+    assert!(
+        !entries
             .iter()
             .any(|e| e.kind == "db.durability_loss_detected"),
-        "the LOSS itself must remain permanently recorded — acknowledging clears the banner, \
-         not the history"
+        "D5-B1 APPLIED TO D7 (ADR-0110 §15.3): the fence's diagnostic reached the hash-chained \
+         ledger. A truncation regresses the DB head below the mirror's, so that append lands at \
+         a seq the mirror holds a different entry for — the chains fork and the next boot is \
+         REFUSED. That is the precondition for arming the fence, and it is armed. Kinds \
+         present: {:?}",
+        entries.iter().map(|e| &e.kind).collect::<Vec<_>>()
     );
 
     // ...and the acknowledgement is DURABLE: restart, banner stays down.

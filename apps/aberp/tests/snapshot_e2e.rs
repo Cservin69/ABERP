@@ -253,6 +253,17 @@ fn ledger_seqs(db: &HandleArc) -> Vec<u64> {
 /// pin — DuckDB shares one instance per path per process, so an in-process
 /// fresh `Connection::open` still reads the WAL and the counts come out
 /// identical either way (verified by mutation). The FOLD is what differs.
+///
+/// # ADR-0110 D7.6 (2026-08-13) — and now the fence has a say
+///
+/// `handle()` is `Handle::open_default`, so as of D7.6 this runs with the WAL
+/// fence ARMED. A snapshot that folded the WAL no longer merely tears the
+/// mirror: it arms a breach, and the next money-path `durable_ack` REFUSES —
+/// a committed invoice reported as failed with its NAV handoff skipped. So the
+/// `durable_ack` below is a second, independent statement of the same
+/// invariant, on the surface the operator actually feels. It is also this
+/// suite's half of the "no false positive on a healthy armed box" set: taking
+/// a snapshot is a routine operation, and it must stay silent.
 #[test]
 fn snapshot_does_not_fold_the_handles_wal() {
     let dir = ScopedTempDir::new("walfold");
@@ -283,6 +294,20 @@ fn snapshot_does_not_fold_the_handles_wal() {
         "CHECKPOINT TEAR — taking a snapshot folded the Handle's WAL ({wal_before} -> {wal_after} \
          bytes). A snapshot must never checkpoint the live DB underneath the shared Handle; \
          that is what put the audit mirror ahead of the DB (seq 8060 > 8058)."
+    );
+
+    // ADR-0110 D7.6: and the ARMED fence must agree. Same invariant, stated on
+    // the surface the operator feels.
+    h.durable_ack().expect(
+        "ADR-0110 D7.6: taking a snapshot fired the ARMED WAL fence. With the fence armed a \
+         snapshot that folds the Handle's WAL is no longer only a mirror tear — the next \
+         invoice issuance or mark-paid fails its durable_ack and that failure PROPAGATES, so a \
+         committed invoice reports as failed with its NAV handoff skipped.",
+    );
+    assert!(
+        h.durability_alert().is_none(),
+        "and no red banner: taking a snapshot is routine, and an alarm the operator sees after \
+         routine work is one they learn to dismiss"
     );
 }
 
