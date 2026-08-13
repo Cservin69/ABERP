@@ -164,6 +164,16 @@ fn rebuild_stock_cache_refuses_while_the_whole_db_writer_lock_is_held() {
             "the refusal must cite the single-writer rule so the operator knows to stop \
              serve rather than retry blindly: {stderr}"
         );
+        // A contended lock is not a mistyped argument. The refusal used to exit
+        // through `print_usage_and_exit`, so the operator read "another writer is
+        // running" and then an argument synopsis — which reads as "…and your flags
+        // are wrong". Mid-incident that costs them a detour re-reading a command
+        // line they typed correctly. No synopsis on this path.
+        assert!(
+            !stderr.contains("Re-derives products.stock_qty"),
+            "a contended-lock refusal must NOT dump the argument usage — the operator's \
+             command was correct, the tenant is merely busy: {stderr}"
+        );
         assert_eq!(
             cached_qty(&db),
             CORRUPT_QTY,

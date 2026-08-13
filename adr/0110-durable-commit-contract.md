@@ -1670,3 +1670,55 @@ Not closed, and knowingly out of scope:
 - **Moving `rebuild_stock_cache.rs|run` to the read-fork allow-list.** Fencing
   EARNS that move; it does not perform it. The baseline header reserves it as a
   deliberate follow-up and it stays one.
+
+### 14.6 The shape pin, and the refusal's exit path (post-adversarial, 2026-08-13)
+
+The adversarial on the D9 head cleared the fix and named one non-blocking gap.
+Both items below are that gap, closed.
+
+**The flock's SHAPE was checked by nothing.** `cut_gate_read_fork.sh`'s
+`is_flock_fenced()` is a file-level `grep -qE 'acquire_or_refuse|try_acquire'`.
+It answers "does this file mention the flock", which is not the invariant. Two
+one-character mutations keep that grep AND the D9 runtime refusal test green
+while silently disabling the fence:
+
+- `let _guard = …` → `let _ = …`. `let _` binds nothing: the guard is a
+  temporary that drops at the end of the *statement*, so the command runs its
+  whole open/read/UPDATE/close **unlocked**. A contended run still refuses, so
+  the refusal test cannot see it — the mutation only shows up in the
+  uncontended window it silently re-opens.
+- Moving the acquire BELOW the opener. Acquire-before-open is what every "the
+  flock makes this coherent" row in §13.2 rests on, and for a default-pragma
+  opener the fold is armed by that open's eventual close regardless of what the
+  lock says afterwards. Four lines down, invisible to every gate in the tree.
+
+`apps/aberp/tests/adr0110_d9_flock_shape.rs` pins both, in the source-shape
+style of `adr0110_d8_reader_schema_ddl.rs`. It is **discovery-based, not
+census-based**: it finds every production call site of
+`db_writer_lock::{acquire_or_refuse, try_acquire}` under the
+`cut_gate_read_fork.sh` scope and checks all of them — 19 sites across 18 files
+at D9 — so it retroactively hardens the eighteen files that were already
+flocked, not only the one that prompted it. A census would have pinned
+`rebuild-stock-cache` and left the rest exactly as unchecked as before.
+
+Two details worth keeping. It matches the **qualified** `db_writer_lock::` path,
+which is what keeps `submission_lock::try_acquire` (a different lock,
+deliberately taken per-row *inside* a loop) and `email_relay`'s rate-limiter
+`try_acquire` out of the scan — a line `is_flock_fenced()`'s bare grep does not
+draw. And it asserts a floor on the number of sites found, because a
+discovery test that silently matches nothing is a green test that checks
+nothing — the exact failure mode it exists to prevent elsewhere.
+
+Mutation-verified both ways, each isolating its own invariant: `let _guard` →
+`let _` reds only the binding test; moving the acquire below the
+`Connection::open` reds only the ordering test.
+
+**The refusal exited through the usage dump.** A contended lock printed the
+single-writer message and then the argument synopsis, so a legitimate "another
+writer is running, stop it and retry" read as "…and you got the flags wrong".
+Mid-incident that costs the operator a detour re-reading a command line they
+typed correctly. The contended case now exits with a plain one-line stderr
+message and `ExitCode::FAILURE`, no synopsis; the `single-writer` substring the
+F-E refusal tests match on is untouched, and the arg-parse path still dumps
+usage, which is exactly right there. Pinned in the D9 refusal test (asserting
+the synopsis is ABSENT), and mutation-verified by restoring the old arm.

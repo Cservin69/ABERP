@@ -19,6 +19,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use aberp_db::db_writer_lock::DbWriterLockError;
 use anyhow::{Context, Result};
 use duckdb::Connection;
 
@@ -100,6 +101,25 @@ fn main() -> ExitCode {
                 touched
             );
             ExitCode::SUCCESS
+        }
+        // ADR-0110 D9 — a CONTENDED writer lock is a legitimate refusal, not a
+        // mistyped argument. Routing it through `print_usage_and_exit` told the
+        // operator "another writer is running" and then dumped the argument
+        // synopsis underneath it, which reads as "…and you got the flags wrong".
+        // Mid-incident that is the difference between "stop serve and retry" and
+        // "re-read the usage line I already typed correctly". Plain message, no
+        // synopsis. `{e}` (Display) rather than `{e:?}`: the refusal is one
+        // sentence and already says everything, including the `single-writer`
+        // rule. The arg-parse path below is untouched — a usage dump is exactly
+        // right there.
+        Err(e)
+            if matches!(
+                e.downcast_ref::<DbWriterLockError>(),
+                Some(DbWriterLockError::Contended { .. })
+            ) =>
+        {
+            eprintln!("rebuild-stock-cache: {e}");
+            ExitCode::FAILURE
         }
         Err(e) => {
             eprintln!("rebuild-stock-cache: error: {e:?}");
