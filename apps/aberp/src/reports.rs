@@ -811,6 +811,9 @@ struct OutgoingLineGroup {
     /// `invoice.issue_date`, unconditionally — NOT the date-basis column.
     /// Its one consumer is the DSO sample, which is defined as
     /// `paid_at − issue_date`; see [`aggregate_outgoing`].
+    ///
+    /// Always the bare `YYYY-MM-DD` head: the projection truncates it, because
+    /// the stored column is RFC3339 VARCHAR and the consumer parses date-only.
     issue_date: String,
     payment_deadline: Option<String>,
     vat_rate_basis_points: i32,
@@ -888,6 +891,19 @@ fn query_outgoing_groups(
     // this statement. The projected date is `i.issue_date` unconditionally:
     // its only consumer is the DSO sample, which is anchored on the issue
     // date by definition, regardless of the basis the operator is viewing.
+    //
+    // It is projected as `SUBSTR(CAST(… AS VARCHAR), 1, 10)`, NOT raw. In
+    // production `invoice.issue_date` is `VARCHAR NOT NULL` holding RFC3339
+    // (`draft.issue_date.format(&Rfc3339)` in the billing store), e.g.
+    // `2026-06-15T12:00:00Z` — but the consumer, `parse_iso_date`, accepts
+    // `[year]-[month]-[day]` and nothing else. Feeding it the raw column made
+    // every DSO sample fail the parse guard and drop silently: the panel
+    // rendered `— (n=0)` on all real data. The `SUBSTR` truncates to the date
+    // head, which is correct for RFC3339 and a no-op for a date-only VARCHAR;
+    // the `CAST` additionally keeps `row.get::<String>` from raising
+    // `InvalidColumnType` on a legacy DATE-typed column — that error would
+    // fail the WHOLE financial report, not just DSO. Same shape as the
+    // `payment_deadline` projection below.
     let _ = basis;
     let (where_clause, has_from, has_to) = build_date_where(window);
     // ADR-0108 §3.4 site 1 / T-8: NO arithmetic in SQL. The statement projects
@@ -898,7 +914,7 @@ fn query_outgoing_groups(
     let sql = format!(
         "SELECT i.id,
                 COALESCE(i.currency, 'HUF') AS currency,
-                i.issue_date AS issue_date,
+                SUBSTR(CAST(i.issue_date AS VARCHAR), 1, 10) AS issue_date,
                 CAST(i.payment_deadline AS VARCHAR) AS payment_deadline,
                 il.vat_rate_basis_points,
                 il.vat_rate_kind,
@@ -2599,9 +2615,18 @@ mod tests {
     /// prepayment is −12, the ordinary invoice is 20 (not 24), and only the
     /// no-delivery-date row agrees under both.
     ///
-    /// Mutation check: project the date-basis column again instead of
-    /// `i.issue_date` and the prepayment sample goes to −12,0 — red on both
-    /// the value and the `>= 0.0` assertion.
+    /// The seed uses the PRODUCTION `issue_date` format — RFC3339 VARCHAR —
+    /// so the pin also covers the anchor's tolerance of it. The first cut of
+    /// this fixture seeded date-only, which the write path never produces;
+    /// it passed green while the shipped anchor fed the raw RFC3339 column to
+    /// a date-only `parse_iso_date` and dropped EVERY sample (`n=0` on all
+    /// real data).
+    ///
+    /// Mutation checks, both verified red:
+    /// - project the date-basis column again instead of `i.issue_date` → the
+    ///   prepayment sample goes to −12,0, red on the value and on `>= 0.0`;
+    /// - drop the `SUBSTR(CAST(…))` truncation back to a raw `i.issue_date`
+    ///   → samples is `[]`, red on the value assertion (this is the bug).
     #[test]
     fn dso_is_anchored_on_issue_date_so_prepayments_are_not_negative() {
         let conn = Connection::open_in_memory().expect("in-memory duckdb");
@@ -2620,15 +2645,21 @@ mod tests {
                  quantity DECIMAL(18,6),
                  unit_price INTEGER
              );
-             INSERT INTO invoice VALUES
+             -- `issue_date` is seeded in the PRODUCTION write format: the
+               -- billing store declares it `VARCHAR NOT NULL` and writes
+               -- `draft.issue_date.format(&Rfc3339)` (see
+               -- `modules/billing/src/adapters/duckdb_store.rs`). A date-only
+               -- seed here is unfaithful to that write path and lets an
+               -- anchor that cannot tolerate RFC3339 pass green.
+               INSERT INTO invoice VALUES
                -- Prepayment: paid 07-08, i.e. after issue but 12 days BEFORE
                -- fulfillment. Issue-anchored DSO = +7.
-               ('prepaid', 'HUF', '2026-07-01', DATE '2026-07-20', DATE '2026-07-31'),
+               ('prepaid', 'HUF', '2026-07-01T09:00:00Z', DATE '2026-07-20', DATE '2026-07-31'),
                -- Ordinary: issue 07-01, fulfilled 07-05, paid 07-25.
                -- Issue-anchored = 24; fulfillment-anchored would be 20.
-               ('ordinary', 'HUF', '2026-07-01', DATE '2026-07-05', DATE '2026-07-31'),
+               ('ordinary', 'HUF', '2026-07-01T09:00:00Z', DATE '2026-07-05', DATE '2026-07-31'),
                -- No delivery_date: both anchors coincide at issue → +7.
-               ('nodelivery', 'HUF', '2026-07-01', NULL, DATE '2026-07-31');
+               ('nodelivery', 'HUF', '2026-07-01T09:00:00Z', NULL, DATE '2026-07-31');
              INSERT INTO invoice_line VALUES
                ('prepaid',    0, 'Percent', 1.0, 100000),
                ('ordinary',   0, 'Percent', 1.0, 100000),
@@ -2667,5 +2698,79 @@ mod tests {
             "a prepayment is paid before fulfillment but never before issue — DSO cannot go negative"
         );
         assert_eq!(mean(&samples).unwrap(), 38.0 / 3.0);
+    }
+
+    /// The DSO anchor's OTHER two input shapes. A legacy install may still
+    /// hold `issue_date` as a real DATE column rather than the RFC3339
+    /// VARCHAR the current billing store writes; without the `CAST`, the
+    /// `row.get::<String>` in [`row_to_outgoing`] raises `InvalidColumnType`
+    /// and errors the WHOLE financial report — not merely the DSO panel.
+    /// A date-only VARCHAR (hand-seeded / imported rows) must keep working
+    /// too, i.e. the `SUBSTR` truncation is a no-op there.
+    ///
+    /// Driven on the UNBOUNDED window (the operator's `All` period) for a
+    /// substantive reason: with bounds, `build_date_where` emits
+    /// `COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date)`, which a
+    /// DATE-typed `issue_date` cannot bind at all ("Cannot mix values of type
+    /// VARCHAR and DATE in COALESCE"). That pre-existing limit of the SHARED
+    /// window predicate is out of this fix's scope; `All` is the path on
+    /// which a legacy DATE column actually reaches this projection, and it is
+    /// exactly there that the `CAST` earns its keep.
+    ///
+    /// Mutation check: drop the `CAST` and the DATE half is red with an
+    /// `Err` out of `query_outgoing_groups`; drop the whole projection
+    /// wrapper and the RFC3339 pin above goes to `n=0`.
+    #[test]
+    fn dso_anchor_tolerates_legacy_date_column_and_date_only_varchar() {
+        for (label, issue_col_ddl, issue_value) in [
+            ("legacy DATE column", "issue_date DATE", "DATE '2026-07-01'"),
+            ("date-only VARCHAR", "issue_date VARCHAR", "'2026-07-01'"),
+        ] {
+            let conn = Connection::open_in_memory().expect("in-memory duckdb");
+            conn.execute_batch(&format!(
+                "CREATE TABLE invoice (
+                     id VARCHAR,
+                     currency VARCHAR,
+                     {issue_col_ddl},
+                     delivery_date DATE,
+                     payment_deadline DATE
+                 );
+                 CREATE TABLE invoice_line (
+                     invoice_id VARCHAR,
+                     vat_rate_basis_points INTEGER,
+                     vat_rate_kind VARCHAR,
+                     quantity DECIMAL(18,6),
+                     unit_price INTEGER
+                 );
+                 INSERT INTO invoice VALUES
+                   ('ordinary', 'HUF', {issue_value}, NULL, DATE '2026-07-31');
+                 INSERT INTO invoice_line VALUES
+                   ('ordinary', 0, 'Percent', 1.0, 100000);"
+            ))
+            .expect("seed invoice + invoice_line rows");
+
+            let groups =
+                query_outgoing_groups(&conn, DateWindow::unbounded(), DateBasis::Teljesites)
+                    .unwrap_or_else(|e| {
+                        panic!("{label}: the outgoing query must not error: {e:#}")
+                    });
+            assert_eq!(groups.len(), 1, "{label}: the invoice is in the All window");
+
+            let traces: HashMap<String, ReportTrace> = HashMap::from([(
+                "ordinary".to_string(),
+                ReportTrace {
+                    payment_paid_at: Some("2026-07-25".into()),
+                    payment_amount_minor: Some(100_000),
+                    ..saved_trace()
+                },
+            )]);
+            let agg =
+                aggregate_outgoing(groups, &traces, d(2026, Month::August, 13), &HashMap::new());
+            assert_eq!(
+                agg.dso_huf_samples,
+                vec![24.0],
+                "{label}: 07-01→07-25 is a real 24-day sample, not a silently dropped one"
+            );
+        }
     }
 }
