@@ -332,8 +332,14 @@ async fn the_alert_survives_later_healthy_acks_and_repeated_polls() {
         );
     }
 
-    // ...and an explicit clear is what takes it down.
-    state.db.clear_durability_alert();
+    // ...and an explicit clear is what takes it down. ADR-0110 D5: that clear
+    // records the acknowledgement in the non-chained durability-alert marker
+    // first, so it is fallible — a failed durable clear must leave the banner
+    // up rather than silently drop it.
+    state
+        .db
+        .clear_durability_alert()
+        .expect("the acknowledgement must record");
     let (_, body) = health_json(state).await;
     assert!(
         body["durability_alert"].is_null(),

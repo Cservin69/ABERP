@@ -6108,7 +6108,8 @@ struct HealthResponse {
 #[derive(Serialize)]
 struct DurabilityAlertView {
     /// Machine-stable breach code (`wal_vanished`, `wal_shrank`,
-    /// `wal_replaced`, `main_db_file_replaced`).
+    /// `wal_replaced`, `main_db_file_replaced`, and — ADR-0110 D5 —
+    /// `audit_mirror_frozen`).
     breach: &'static str,
     /// The operator-facing sentence, rendered verbatim by the banner.
     message: String,
@@ -6247,17 +6248,26 @@ fn acknowledge_durability_alert(state: &AppState, operator_login: &str) -> Resul
         &acknowledged_at,
     )?;
 
-    // 2. Only now clear the in-memory flag. The durable half is already down,
-    //    so a restart from here keeps the banner down too — which is what makes
-    //    the button worth pressing.
-    state.db.clear_durability_alert();
+    // 2. Only now clear the flag. ADR-0110 D5: `clear_durability_alert` first
+    //    appends the acknowledgement to the NON-CHAINED durability-alert marker
+    //    — the store a D5 mirror-freeze episode lives in, since it never
+    //    reaches the ledger — and clears the in-memory flag only if that
+    //    landed. A `?` here therefore keeps the banner UP on a failed durable
+    //    clear, the same safe direction step 1 takes.
+    state
+        .db
+        .clear_durability_alert()
+        .context("clear the durability alert (marker acknowledgement)")?;
 
     tracing::warn!(
         tenant = state.tenant.as_str(),
         operator = operator_login,
         at = %acknowledged_at,
         "ADR-0110 D7: durability-loss alert ACKNOWLEDGED by the operator; banner cleared. The \
-         loss itself remains permanently recorded in the audit chain."
+         acknowledgement is permanently recorded in the audit chain, and the loss itself \
+         remains recorded where it was detected — the chain for a D7 fence firing, the \
+         non-chained durability-alert marker for a D5 mirror freeze. Acknowledging takes the \
+         banner down; it erases nothing."
     );
     Ok(acknowledged_at)
 }

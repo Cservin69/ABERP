@@ -469,7 +469,9 @@ export interface HealthResponse {
 /** ADR-0110 D7 — mirrors `serve::DurabilityAlertView`. */
 export interface DurabilityAlert {
   /** Machine-stable breach code: `wal_vanished` | `wal_shrank` |
-   * `wal_replaced` | `main_db_file_replaced`. */
+   * `wal_replaced` | `main_db_file_replaced` | `audit_mirror_frozen`
+   * (ADR-0110 D5). The banner does not branch on it — it renders `message`
+   * verbatim — so a new code needs no SPA change. */
   breach: string;
   /** Operator-facing sentence, rendered verbatim in the banner's detail
    * line — it names the specific breach, which is what a recovery turns on. */

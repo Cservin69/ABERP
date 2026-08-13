@@ -276,7 +276,11 @@ fn the_group_a_shape_must_fail_the_ack() {
         "the durability alert must be sticky until explicitly cleared — a healthy ack must not \
          silently take the operator's banner down"
     );
-    h.clear_durability_alert();
+    // ADR-0110 D5: clearing now records the acknowledgement in the non-chained
+    // durability-alert marker FIRST and only then clears the flag, so it is
+    // fallible — and a failure has to leave the banner up.
+    h.clear_durability_alert()
+        .expect("the acknowledgement must record");
     assert!(
         h.durability_alert().is_none(),
         "clear_durability_alert is the one thing that takes it down"
