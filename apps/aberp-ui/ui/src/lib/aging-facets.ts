@@ -21,7 +21,12 @@
 // sorting); what moved is only the part that has to agree, row for row,
 // with a figure the backend already computed.
 
-import { agingBucketFor, hasNoRecordedDeadline, type AgingBucket } from "./aging";
+import {
+  agingBucketFor,
+  canonicalDeadlineIso,
+  hasNoRecordedDeadline,
+  type AgingBucket,
+} from "./aging";
 import type { IncomingInvoice, InvoiceListItem } from "./api";
 
 /** The three outgoing states the dashboard's receivables aging counts —
@@ -97,9 +102,27 @@ export function incomingPastDeadlineMatches(
   todayIso: string,
 ): boolean {
   if (inv.local_status !== "Outstanding") return false;
-  const deadline = inv.payment_deadline;
-  if (hasNoRecordedDeadline(deadline)) return false;
-  // Non-null and canonical once the predicate above passes, so the
-  // lexicographic ISO compare the list has always used is sound.
-  return (deadline as string) < todayIso;
+  // Both sides go through the classifier before the compare. The compare
+  // itself is still lexicographic — sound on two canonical `YYYY-MM-DD`
+  // strings — but it is now comparing the classifier's OUTPUT, not the
+  // raw column.
+  //
+  // It used to read `(deadline as string) < todayIso` off the stored
+  // value, under a comment claiming the predicate above had made it
+  // canonical. It had not: `hasNoRecordedDeadline` trims before it
+  // matches, so `" 2026-12-30"` passes as a readable deadline and then
+  // sorts before every real date on the leading space — a payable due in
+  // December reported as past due in August. Normalising is also what
+  // pads a year below 1000 to four digits, so `"0026-06-15"` sorts
+  // before today instead of after it.
+  const deadline = canonicalDeadlineIso(inv.payment_deadline);
+  if (deadline === null) return false; // no recorded deadline
+  // `todayIso` is canonical by construction (`todayIsoLocal`), but it
+  // arrives here as a plain string parameter; normalising it too means a
+  // caller cannot produce a verdict from a today the backend would have
+  // rejected. Unreadable today → no row is past deadline, which is the
+  // conservative direction.
+  const today = canonicalDeadlineIso(todayIso);
+  if (today === null) return false;
+  return deadline < today;
 }

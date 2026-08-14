@@ -108,8 +108,36 @@ export function hasNoRecordedDeadline(deadlineIso: string | null | undefined): b
 }
 
 /** Canonical `YYYY-MM-DD` shape. Anchored at both ends — a bare
- * `Date.parse` would accept far more than the backend does. */
+ * `Date.parse` would accept far more than the backend does, and the
+ * anchoring is also what rejects the signed year (`+2026-06-15`) that
+ * `time::Date::parse` used to accept on the Rust side. */
 const CANONICAL_DEADLINE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/** ASCII whitespace, and ONLY ASCII whitespace, at either end.
+ *
+ * `String.prototype.trim` is not usable here: it strips
+ * `WhiteSpace` ∪ `LineTerminator`, and Rust's `str::trim` strips Unicode
+ * `White_Space`. Those two sets differ, and every difference was a
+ * classifier split with the backend:
+ *
+ *   U+FEFF  ZWNBSP  JS stripped it, Rust kept it   → SPA dated, report undated
+ *   U+0085  NEL     Rust stripped it, JS kept it   → report dated, SPA undated
+ *   U+000B  VT      JS strips it, Rust's `is_ascii_whitespace` does not
+ *   U+00A0  NBSP    both stripped it — agreeing, but by luck
+ *
+ * A split is an invoice one side counts as outstanding and the other
+ * excludes as a settled legacy import. ASCII whitespace is the set both
+ * languages can state exactly, so both sides trim these five characters
+ * and nothing else; every exotic form is undated on both.
+ *
+ * Mirrors `iso_date::trim_ascii_whitespace` (Rust). Note the deliberate
+ * absence of `\v` (U+000B): Rust's `char::is_ascii_whitespace` excludes
+ * it, so we must too. */
+const ASCII_WS = /^[\t\n\f\r ]+|[\t\n\f\r ]+$/g;
+
+function asciiTrim(s: string): string {
+  return s.replace(ASCII_WS, "");
+}
 
 /** Parse a recorded payment deadline, or `null` when there isn't one.
  *
@@ -134,15 +162,35 @@ const CANONICAL_DEADLINE = /^(\d{4})-(\d{2})-(\d{2})$/;
  *                      date head), and rejected here deliberately rather
  *                      than by accident.
  *
- * So: trim, require the canonical shape, then confirm the date did not
- * roll over. Whitespace tolerance matches Rust's `str::trim`; the
- * round-trip check is what `time::Date::parse` does for free. */
+ * Two later divergences, found by adversarial review of the fix above
+ * and closed here:
+ *
+ *   a FEFF-padded date  `String.prototype.trim` strips U+FEFF and
+ *                       Rust's `str::trim` does not — so the SPA called
+ *                       a row dated that the report had excluded as
+ *                       settled. A NEL-padded (U+0085) date was the same
+ *                       split the other way round, and U+00A0 was a
+ *                       coincidence rather than an agreement. Both sides
+ *                       now trim ASCII whitespace only — see `asciiTrim`.
+ *   `"0001-01-01"`      a perfectly ordinary `time::Date` on the Rust
+ *                       side, but `Date.UTC(1, 0, 1)` means 1901, so the
+ *                       round-trip check below rejected a date the
+ *                       backend accepts. `Date.UTC` remaps years 0–99
+ *                       into 1900–1999; `setUTCFullYear` undoes it.
+ *
+ * So: ASCII-trim, require the canonical shape, correct the two-digit-year
+ * remap, then confirm the date did not roll over. The round-trip check is
+ * what `time::Date::parse` does for free. */
 export function parseRecordedDeadline(deadlineIso: string | null | undefined): Date | null {
   if (deadlineIso == null) return null;
-  const m = CANONICAL_DEADLINE.exec(deadlineIso.trim());
+  const m = CANONICAL_DEADLINE.exec(asciiTrim(deadlineIso));
   if (m === null) return null;
   const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
   const parsed = new Date(Date.UTC(y, mo - 1, d));
+  // `Date.UTC(26, 5, 15)` is 1926, not year 26 — the legacy two-digit
+  // shorthand. Undo it before the round-trip check, or every year below
+  // 100 reads as unreadable here and as an ordinary date in Rust.
+  if (y < 100) parsed.setUTCFullYear(y);
   // `Date.UTC(2026, 1, 30)` happily yields 2026-03-02. Comparing the
   // components back is the only way to tell a real date from a rolled
   // one, and it is exactly the check the backend parser applies.
@@ -154,6 +202,31 @@ export function parseRecordedDeadline(deadlineIso: string | null | undefined): D
     return null;
   }
   return parsed;
+}
+
+/** The canonical `YYYY-MM-DD` rendering of a recorded deadline, or
+ * `null` when there isn't one — [`parseRecordedDeadline`]'s verdict,
+ * back as a string that is safe to compare lexicographically.
+ *
+ * Callers that need to ask "is this deadline before that one?" must go
+ * through here rather than comparing the stored strings. The stored
+ * string is untrusted input: `" 2026-12-30"` is a readable deadline
+ * whose leading space sorts it before every real date, so a raw
+ * `deadline < todayIso` reports a FUTURE payable as past due. The year
+ * is padded to four digits for the same reason — a value the parser
+ * accepts must not depend on its rendered width to sort correctly.
+ *
+ * (`String.padStart` on `parsed.getUTCFullYear()` rather than
+ * `toISOString().slice(0, 10)`: the latter is correct today but silently
+ * switches to the expanded `±YYYYYY` form outside 0000–9999, which is
+ * exactly the class of surprise this function exists to remove.) */
+export function canonicalDeadlineIso(deadlineIso: string | null | undefined): string | null {
+  const parsed = parseRecordedDeadline(deadlineIso);
+  if (parsed === null) return null;
+  const y = String(parsed.getUTCFullYear()).padStart(4, "0");
+  const mo = String(parsed.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(parsed.getUTCDate()).padStart(2, "0");
+  return `${y}-${mo}-${d}`;
 }
 
 /** Classify a payment deadline into its aging bucket relative to `today`.
