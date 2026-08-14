@@ -82,6 +82,56 @@ describe("StatisticsPage ledger-integrity banner", () => {
   });
 });
 
+// The aging panels had the SAME silent drop on a different code path: an
+// outstanding invoice whose `payment_deadline` was missing or unreadable
+// fell out of every bucket while still counting toward the receivables /
+// payables total, so the buckets summed to less than the headline above
+// them. The backend now ages it as 90+ and reports
+// `aging_undated_invoices`. The bucket is therefore an IMPUTATION, and the
+// operator has to be told — otherwise the fix just launders a guess into
+// a number that looks measured.
+
+/** The undated-aging disclosure block only — same slicing rule as above. */
+const undated = (() => {
+  const start = page.indexOf("{#if r.ledger_diagnostics.aging_undated_invoices > 0}");
+  expect(start, "the undated-aging disclosure's {#if} guard must exist").toBeGreaterThan(-1);
+  const end = page.indexOf("</div>", start);
+  expect(end, "the undated-aging disclosure must close its element").toBeGreaterThan(start);
+  return page.slice(start, end);
+})();
+
+describe("StatisticsPage undated-aging disclosure", () => {
+  it("says the invoices ARE counted — only their age is a guess", () => {
+    // The failure mode to avoid in BOTH directions: reading as "figures
+    // are missing" (they are not — that is what the fix restored), or
+    // saying nothing and letting an imputed 90+ read as measured.
+    expect(undated).toMatch(/counted in full/i);
+    expect(undated).toMatch(/90\+/);
+  });
+
+  it("names the invoices, and discloses the id cap", () => {
+    expect(undated).toContain("r.ledger_diagnostics.aging_undated_invoice_ids");
+    expect(undated).toContain(
+      "r.ledger_diagnostics.aging_undated_invoices > r.ledger_diagnostics.aging_undated_invoice_ids.length",
+    );
+  });
+
+  it("fires ONLY on a non-zero count, and cannot be dismissed", () => {
+    expect(page).toContain("{#if r.ledger_diagnostics.aging_undated_invoices > 0}");
+    expect(undated).not.toMatch(/<button/i);
+    expect(undated).not.toMatch(/dismiss|onclick/i);
+  });
+
+  it("sits ABOVE the figures it qualifies", () => {
+    const at = page.indexOf("{#if r.ledger_diagnostics.aging_undated_invoices > 0}");
+    const cardsAt = page.indexOf('<section class="stats__cards"');
+    const agingAt = page.indexOf('<section class="stats__aging-grid"');
+    expect(agingAt).toBeGreaterThan(-1);
+    expect(at).toBeLessThan(cardsAt);
+    expect(at).toBeLessThan(agingAt);
+  });
+});
+
 describe("FinancialReport wire shape", () => {
   it("carries ledger_diagnostics as a required field", () => {
     // Optional (`?:`) would let the banner's guard silently short-circuit on
@@ -90,5 +140,10 @@ describe("FinancialReport wire shape", () => {
     expect(api).toMatch(/ledger_diagnostics:\s*LedgerDiagnostics;/);
     expect(api).toMatch(/unparseable_entries:\s*number;/);
     expect(api).toMatch(/unparseable_entry_ids:\s*string\[\];/);
+  });
+
+  it("carries the undated-aging counters as required fields too", () => {
+    expect(api).toMatch(/aging_undated_invoices:\s*number;/);
+    expect(api).toMatch(/aging_undated_invoice_ids:\s*string\[\];/);
   });
 });

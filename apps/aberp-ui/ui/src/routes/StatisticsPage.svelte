@@ -333,6 +333,35 @@
       </div>
     {/if}
 
+    <!-- Undated-aging disclosure. Separate from the banner above on
+         purpose: nothing is MISSING here — every one of these invoices is
+         in the receivables/payables total AND in an aging bucket, which is
+         what the backend fix restored. What it needs to say is narrower:
+         the 90+ bucket they landed in is an imputation, because their
+         deadline could not be read. Kept above the numbers for the same
+         reason as the banner, and it disappears on clean data. -->
+    {#if r.ledger_diagnostics.aging_undated_invoices > 0}
+      <div class="stats__integrity stats__integrity--soft" role="status">
+        <strong>
+          {r.ledger_diagnostics.aging_undated_invoices} outstanding
+          {r.ledger_diagnostics.aging_undated_invoices === 1 ? "invoice has" : "invoices have"}
+          no readable payment deadline — aged as 90+.
+        </strong>
+        <p>
+          Az összegekben teljes értéken benne vannak; csak a korosításuk becslés. /
+          They are counted in full; only their AGE is a guess — shown in the most-overdue
+          bucket because an unreadable deadline cannot be assumed current. Invoice
+          {r.ledger_diagnostics.aging_undated_invoice_ids.length === 1 ? "id" : "ids"}:
+          <span class="stats__integrity-ids"
+            >{r.ledger_diagnostics.aging_undated_invoice_ids.join(", ")}</span
+          >{#if r.ledger_diagnostics.aging_undated_invoices > r.ledger_diagnostics.aging_undated_invoice_ids.length}
+            … (+{r.ledger_diagnostics.aging_undated_invoices -
+              r.ledger_diagnostics.aging_undated_invoice_ids.length} more; see the server log)
+          {/if}
+        </p>
+      </div>
+    {/if}
+
     <!-- Row 1: revenue / expenses / gross profit / VAT-to-pay -->
     <section class="stats__cards" aria-label="Headline figures">
       <article class="stats__card">
@@ -1100,6 +1129,14 @@
   }
   .stats__integrity strong {
     color: var(--color-signal-negative);
+  }
+  /* Undated-aging disclosure — warning chrome, not negative: the figures
+   * are complete, one column of them is an estimate. */
+  .stats__integrity--soft {
+    border-color: var(--color-signal-warning);
+  }
+  .stats__integrity--soft strong {
+    color: var(--color-signal-warning);
   }
   .stats__integrity-ids {
     font-family: var(--type-family-mono);

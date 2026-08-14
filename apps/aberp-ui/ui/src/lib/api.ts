@@ -4906,6 +4906,12 @@ export interface FinancialReport {
 export interface LedgerDiagnostics {
   unparseable_entries: number;
   unparseable_entry_ids: string[];
+  /** Outstanding invoices (AR or AP) whose `payment_deadline` was missing
+   * or unreadable. They ARE in the receivables / payables totals and in
+   * the `days_90_plus` aging bucket — the count says their age is an
+   * imputation, not that a figure is missing. */
+  aging_undated_invoices: number;
+  aging_undated_invoice_ids: string[];
 }
 
 /** Fetch the financial-statistics snapshot for the given period +
