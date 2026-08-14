@@ -86,19 +86,27 @@ describe("StatisticsPage ledger-integrity banner", () => {
 // outstanding invoice whose `payment_deadline` was missing or unreadable
 // fell out of every bucket while still counting toward the receivables /
 // payables total, so the buckets summed to less than the headline above
-// them. The backend now ages it as 90+ and counts it. The bucket is
-// therefore an IMPUTATION and must not read as a measurement.
+// them. Those rows are legacy NAV imports, settled under the prior
+// system, and are now EXCLUDED from outstanding on both sides of the
+// equation — no total, no bucket, no hygiene counter. The sum closes
+// because both sides lost the same row.
 //
-// It is disclosed QUIETLY, and that is a considered choice rather than an
-// oversight: `ap_sync` records no payment deadline at all for NAV-synced
-// payables, so on a real book this condition is permanent and universal.
-// A page-level alert would be lit on every single load and a rendered id
-// list would be a permanent wall of ids — both teach the operator to
-// ignore the page, which is how the ledger-integrity banner ABOVE (a rare
-// and genuinely alarming signal) loses its meaning too. So: a per-side
-// count, inline under the panel it qualifies, in the same muted
-// `stats__detail` chrome as the existing "counts are exact" footnote. The
-// ids stay on the wire for support.
+// An exclusion is exactly the kind of thing that has to stay visible: the
+// figures are complete only if the ruling behind it is true of every row
+// it swept up, and `ap_sync` writes no deadline on ONGOING payable syncs
+// too. The LOUD channel for that is the aggregate `tracing::warn!` in the
+// report, which carries the excluded amount.
+//
+// On the dashboard it is disclosed QUIETLY, and that is a considered
+// choice rather than an oversight: `ap_sync` records no payment deadline
+// at all for NAV-synced payables, so on a real book this condition is
+// permanent and universal. A page-level alert would be lit on every
+// single load and a rendered id list would be a permanent wall of ids —
+// both teach the operator to ignore the page, which is how the
+// ledger-integrity banner ABOVE (a rare and genuinely alarming signal)
+// loses its meaning too. So: a per-side count, inline under the panel it
+// qualifies, in the same muted `stats__detail` chrome as the existing
+// "counts are exact" footnote. The ids stay on the wire for support.
 
 /** The aging-panel snippet — the footnote's home. Sliced to the snippet
  * body so a page-level block elsewhere cannot satisfy these by accident. */
@@ -110,51 +118,64 @@ const agingSnippet = (() => {
   return page.slice(start, end);
 })();
 
-describe("StatisticsPage undated-aging footnote", () => {
+describe("StatisticsPage settled-undated footnote", () => {
   it("discloses the count inline, in the panel it qualifies", () => {
-    // Saying nothing is the failure this pin blocks: an imputed 90+ that
-    // reads as measured is the original defect wearing a nicer hat.
-    expect(agingSnippet).toContain("undatedCount");
-    expect(agingSnippet).toMatch(/\{#if undatedCount > 0\}/);
+    // Saying nothing is the failure this pin blocks: rows silently gone
+    // from a total is the original defect wearing a nicer hat.
+    expect(agingSnippet).toContain("settledUndatedCount");
+    expect(agingSnippet).toMatch(/\{#if settledUndatedCount > 0\}/);
     expect(agingSnippet).toMatch(/no recorded due date/i);
-    expect(agingSnippet).toMatch(/90\+/);
+  });
+
+  it("says the rows are EXCLUDED and SETTLED, not bucketed", () => {
+    // The wording carries the whole meaning. PR #68's footnote said
+    // "Includes N … aged to 90+" — a breakdown OF the total. These rows
+    // are not in the total, and a footnote that still reads "of which"
+    // would tell the operator the opposite of what the figures do.
+    // `\s+` not a literal space: the formatter wraps this line, and a pin
+    // that reds on a reflow is a pin nobody keeps.
+    expect(agingSnippet).toMatch(/excluded\s+from outstanding/i);
+    expect(agingSnippet).toMatch(/settled/i);
+    expect(agingSnippet, "the 90+ imputation is gone — the footnote must not still claim it")
+      .not.toMatch(/90\+/);
+    expect(agingSnippet).not.toMatch(/\bIncludes\b/);
   });
 
   it("is fed the PER-SIDE counts, not the combined total", () => {
     // The combined figure under both panels would double-report it: a
-    // payables-only problem would show up as receivables trouble too.
-    expect(page).toContain("r.ledger_diagnostics.aging_undated_receivables");
-    expect(page).toContain("r.ledger_diagnostics.aging_undated_payables");
+    // payables-only exclusion would show up as receivables trouble too.
+    expect(page).toContain("r.ledger_diagnostics.aging_settled_undated_receivables");
+    expect(page).toContain("r.ledger_diagnostics.aging_settled_undated_payables");
   });
 
   it("stays quiet: no alert role, no alarm chrome, no dismiss control", () => {
-    // The distinction this pin holds against drift back to a banner: the
-    // figures are COMPLETE, one column of them is an estimate. Escalating
-    // that to role="alert" next to the real integrity banner devalues
-    // both.
+    // The distinction this pin holds against drift back to a banner: on a
+    // legacy book this condition is universal and permanent, so an alarm
+    // here is lit on every load and devalues the real integrity banner
+    // beside it. The loud channel is the backend's aggregate warn!.
     expect(agingSnippet).not.toMatch(/role="(alert|status)"/);
     expect(agingSnippet).not.toContain("stats__integrity");
     expect(agingSnippet).not.toMatch(/dismiss/i);
   });
 
   it("renders NO id list anywhere on the dashboard", () => {
-    // The whole point of the quiet form. `aging_undated_invoice_ids` is
-    // machine-readable diagnostics; rendering it puts 50 ids permanently
-    // on Ervin's screen.
-    expect(page).not.toContain("aging_undated_invoice_ids");
+    // The whole point of the quiet form.
+    // `aging_settled_undated_invoice_ids` is machine-readable
+    // diagnostics; rendering it puts 50 ids permanently on Ervin's
+    // screen.
+    expect(page).not.toContain("aging_settled_undated_invoice_ids");
   });
 
   it("drives no page-level block of its own", () => {
-    // The undated counters must reach the operator ONLY as snippet
-    // arguments feeding the inline footnote. A `{#if ... > 0}` block at
-    // page level is the drift back to the alarm form this replaced —
-    // whatever chrome it wears.
-    expect(page).not.toMatch(/\{#if r\.ledger_diagnostics\.aging_undated/);
-    for (const m of page.matchAll(/r\.ledger_diagnostics\.aging_undated_\w+/g)) {
+    // The counters must reach the operator ONLY as snippet arguments
+    // feeding the inline footnote. A `{#if ... > 0}` block at page level
+    // is the drift to the alarm form this deliberately is not — whatever
+    // chrome it wears.
+    expect(page).not.toMatch(/\{#if r\.ledger_diagnostics\.aging_settled_undated/);
+    for (const m of page.matchAll(/r\.ledger_diagnostics\.aging_settled_undated\w*/g)) {
       const line = page.slice(page.lastIndexOf("\n", m.index) + 1, page.indexOf("\n", m.index));
-      expect(line.trim(), "undated counts belong in the agingPanel call, nowhere else").toMatch(
-        /^r\.ledger_diagnostics\.aging_undated_(receivables|payables),$/,
-      );
+      expect(line.trim(), "settled-undated counts belong in the agingPanel call, nowhere else")
+        .toMatch(/^r\.ledger_diagnostics\.aging_settled_undated_(receivables|payables),$/);
     }
   });
 });
@@ -169,16 +190,18 @@ describe("FinancialReport wire shape", () => {
     expect(api).toMatch(/unparseable_entry_ids:\s*string\[\];/);
   });
 
-  it("carries the undated-aging counters as required fields too", () => {
-    expect(api).toMatch(/aging_undated_invoices:\s*number;/);
-    expect(api).toMatch(/aging_undated_receivables:\s*number;/);
-    expect(api).toMatch(/aging_undated_payables:\s*number;/);
+  it("carries the settled-undated counters as required fields too", () => {
+    expect(api).toMatch(/aging_settled_undated:\s*number;/);
+    expect(api).toMatch(/aging_settled_undated_receivables:\s*number;/);
+    expect(api).toMatch(/aging_settled_undated_payables:\s*number;/);
   });
 
   it("keeps the id list on the WIRE even though the page does not render it", () => {
     // Unrendered is not unreported. Dropping the field would take away
-    // support's only way to find the offending invoices, since the log is
-    // the debug-level per-invoice line.
-    expect(api).toMatch(/aging_undated_invoice_ids:\s*string\[\];/);
+    // support's only way to find the excluded invoices, since the
+    // per-invoice log line is at debug level — and these rows are gone
+    // from the figures entirely, so there is nothing else to find them
+    // by.
+    expect(api).toMatch(/aging_settled_undated_invoice_ids:\s*string\[\];/);
   });
 });

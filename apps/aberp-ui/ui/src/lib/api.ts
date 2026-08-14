@@ -4906,19 +4906,21 @@ export interface FinancialReport {
 export interface LedgerDiagnostics {
   unparseable_entries: number;
   unparseable_entry_ids: string[];
-  /** Outstanding invoices (AR or AP) whose `payment_deadline` was missing
-   * or unreadable. They ARE in the receivables / payables totals and in
-   * the `days_90_plus` aging bucket — the count says their age is an
-   * imputation, not that a figure is missing. */
-  aging_undated_invoices: number;
+  /** Otherwise-outstanding invoices (AR or AP) with NO recorded
+   * `payment_deadline` — missing, or a value that will not parse. They
+   * are legacy NAV imports, settled under the prior system, and are
+   * therefore in NO receivables/payables total, NO aging bucket and NO
+   * past-deadline counter. The count is the size of that exclusion: not a
+   * missing figure, but a deliberate omission that has to stay visible. */
+  aging_settled_undated: number;
   /** Machine-readable only. The dashboard does NOT render this list:
    * NAV-synced payables have no deadline at all, so on a real book it
    * would be a permanent wall of ids. Kept for support/debugging. */
-  aging_undated_invoice_ids: string[];
-  /** Per-side split of `aging_undated_invoices`, so each aging panel can
-   * footnote its own imputed rows without double-reporting the total. */
-  aging_undated_receivables: number;
-  aging_undated_payables: number;
+  aging_settled_undated_invoice_ids: string[];
+  /** Per-side split of `aging_settled_undated`, so each aging panel can
+   * footnote its own excluded rows without double-reporting the total. */
+  aging_settled_undated_receivables: number;
+  aging_settled_undated_payables: number;
 }
 
 /** Fetch the financial-statistics snapshot for the given period +

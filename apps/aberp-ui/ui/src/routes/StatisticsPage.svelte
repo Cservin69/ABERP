@@ -532,7 +532,7 @@
       title: string,
       panel: AgingPanel,
       tab: "outgoing" | "incoming",
-      undatedCount: number,
+      settledUndatedCount: number,
     )}
       <section class="stats__aging" aria-label={title}>
         <h3>{title}</h3>
@@ -564,24 +564,31 @@
           {/each}
         </ul>
         <p class="stats__detail">* counts are exact; amounts sum HUF + EUR.</p>
-        <!-- Undated rows are aged into 90+ by imputation rather than
-             dropped (that is what makes the buckets sum to the total
-             above). Deliberately a QUIET inline footnote, not a page-level
-             alert, and deliberately count-only: NAV-synced payables carry
-             no deadline at all, so an alarm block would be lit on every
-             load and a rendered id list would be a permanent wall of ids —
-             cry-wolf either way. The ids stay on the wire in
+        <!-- Rows with no recorded due date are legacy NAV imports, taken
+             as settled, and are EXCLUDED from the total above and from
+             every bucket alike — which is what keeps the buckets summing
+             to the headline. Not "of which": these rows are not in the
+             figures at all, so the wording must not read as a breakdown
+             of them.
+             Deliberately a QUIET inline footnote, not a page-level alert,
+             and deliberately count-only: NAV-synced payables carry no
+             deadline at all, so an alarm block would be lit on every load
+             and a rendered id list would be a permanent wall of ids —
+             cry-wolf either way, and that is how the genuine integrity
+             banner above loses its meaning too. The loud channel for this
+             is the aggregate `tracing::warn!` in the report, which
+             carries the excluded amount; the ids stay on the wire in
              `ledger_diagnostics` for support, just unrendered.
              Presentation is reversible: if Ervin would rather see this as
-             a per-side alert, a threshold-suppressed list, or its own
-             explicit "undated" aging bucket, only this block and its pins
-             need to change — the backend counts already support all
-             three. -->
-        {#if undatedCount > 0}
+             a per-side alert or a threshold-suppressed list, only this
+             block and its pins need to change — the backend counts
+             already support both. -->
+        {#if settledUndatedCount > 0}
           <p class="stats__detail">
-            Ebből {undatedCount} számlán nincs rögzített fizetési határidő — 90+ alá sorolva. /
-            Includes {undatedCount}
-            {undatedCount === 1 ? "invoice" : "invoices"} with no recorded due date, aged to 90+.
+            {settledUndatedCount} rendezett számla rögzített fizetési határidő nélkül — kizárva a
+            kintlévőségből. / {settledUndatedCount} settled
+            {settledUndatedCount === 1 ? "invoice" : "invoices"} with no recorded due date, excluded
+            from outstanding.
           </p>
         {/if}
       </section>
@@ -591,13 +598,13 @@
         "Receivables aging / Vevőkövetelés korosítás",
         r.receivables_aging,
         "outgoing",
-        r.ledger_diagnostics.aging_undated_receivables,
+        r.ledger_diagnostics.aging_settled_undated_receivables,
       )}
       {@render agingPanel(
         "Payables aging / Szállítói tartozás korosítás",
         r.payables_aging,
         "incoming",
-        r.ledger_diagnostics.aging_undated_payables,
+        r.ledger_diagnostics.aging_settled_undated_payables,
       )}
     </section>
 

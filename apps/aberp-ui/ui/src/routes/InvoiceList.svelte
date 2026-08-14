@@ -107,12 +107,8 @@
   import { parseInvoicesUrl } from "../lib/hygiene-clickthrough";
   // S262 / PR-251 — receivables-aging bucket deep-link from the Finance
   // dashboard's AR-aging card.
-  import {
-    agingBucketFor,
-    AGING_LABELS,
-    todayIsoLocal,
-    type AgingBucket,
-  } from "../lib/aging";
+  import { AGING_LABELS, todayIsoLocal, type AgingBucket } from "../lib/aging";
+  import { outgoingAgingMatches } from "../lib/aging-facets";
   import InvoiceDetail from "./InvoiceDetail.svelte";
   import ModificationInvoice from "./ModificationInvoice.svelte";
   // S220 / PR-217 — operator-paced partner picker for ExtNav rows.
@@ -168,30 +164,13 @@
   // navigation, cleared via the dismissable banner or a fresh mount.
   let agingFacet = $state<AgingBucket | null>(null);
 
-  /** Receivable-eligible aging predicate for an outgoing row. Mirrors the
-   * backend `reports::aggregate_outgoing` receivables-aging gate: a
-   * NAV-accepted ("counted") invoice that is unpaid and is not a storno
-   * child, classified by `payment_deadline` into the clicked bucket.
-   * The "counted" set is approximated by the three revenue-recognized
-   * states {Submitted, Recovered, Finalized}; storno/amended BASE rows
-   * (a rarer edge) are excluded, so the list count can diverge slightly
-   * from the dashboard bucket count in those cases — the same
-   * best-effort posture S227 documented for the storno-chain row. */
+  /** Receivable-eligible aging predicate for an outgoing row.
+   *
+   * The rule itself lives in `aging-facets.ts` so the pins can CALL it on
+   * real rows: pinned as source text it looked correct while a flipped
+   * verdict (`return true` where the exclusion belongs) stayed green. */
   function agingMatches(row: InvoiceListItem): boolean {
-    if (agingFacet === null) return true;
-    if (row.payment !== null) return false; // paid → not a receivable
-    if (row.is_storno) return false; // storno child
-    if (
-      row.state !== "Submitted" &&
-      row.state !== "Recovered" &&
-      row.state !== "Finalized"
-    ) {
-      return false;
-    }
-    // No early-out on a null deadline: the dashboard's `receivables_aging`
-    // ages such a row as `d90_plus` rather than dropping it, so this list
-    // must too or the click-through count disagrees with the tile.
-    return agingBucketFor(todayIsoLocal(), row.payment_deadline) === agingFacet;
+    return outgoingAgingMatches(row, agingFacet, todayIsoLocal());
   }
 
   // PR-94 / session-114 — sortable-columns state. `key === null` keeps
