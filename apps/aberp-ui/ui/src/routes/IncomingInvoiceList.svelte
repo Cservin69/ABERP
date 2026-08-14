@@ -43,12 +43,11 @@
   import { parseInvoicesUrl } from "../lib/hygiene-clickthrough";
   // S262 / PR-251 — payables-aging bucket deep-link from the Finance
   // dashboard's AP-aging card.
+  import { AGING_LABELS, type AgingBucket } from "../lib/aging";
   import {
-    agingBucketFor,
-    hasNoRecordedDeadline,
-    AGING_LABELS,
-    type AgingBucket,
-  } from "../lib/aging";
+    incomingAgingMatches,
+    incomingPastDeadlineMatches,
+  } from "../lib/aging-facets";
   import { formatTotal, formatInvoiceDate } from "../lib/format";
   import {
     actionsForStatus,
@@ -233,33 +232,17 @@
     // `past_deadline` is in the closed-vocab. Mirrors the dashboard's
     // `payable_past_deadline_count`: unpaid (local_status ===
     // Outstanding) AND payment_deadline strictly before today.
+    // PR-223 / S227 hygiene gate + S262 / PR-251 payables-aging gate.
+    // Both rules live in `aging-facets.ts` so the pins can CALL them on
+    // real rows — as source text they read correctly while a flipped
+    // verdict stayed green. Both exclude rows with no recorded deadline,
+    // through one shared predicate.
     const hygiene = filter.hygiene ?? null;
-    if (hygiene === "past_deadline") {
-      if (inv.local_status !== "Outstanding") return false;
-      // Rows with no recorded deadline are settled legacy imports and are
-      // out of outstanding everywhere — this counter never had them, and
-      // now the payables total does not either. Routed through the SHARED
-      // predicate rather than a local `=== null`, which is the shape that
-      // silently keeps the unparseable half.
-      if (hasNoRecordedDeadline(inv.payment_deadline)) return false;
-      if (inv.payment_deadline! >= todayIso()) return false;
+    if (hygiene === "past_deadline" && !incomingPastDeadlineMatches(inv, todayIso())) {
+      return false;
     }
-    // S262 / PR-251 — payables-aging bucket gate. Mirrors the dashboard's
-    // `payables_aging` panel: Outstanding rows only, classified by
-    // `payment_deadline` vs today into the same buckets the backend
-    // `reports::aging_bucket_for` computes.
-    if (agingFacet !== null) {
-      if (inv.local_status !== "Outstanding") return false;
-      // Same exclusion as the hygiene branch above, from the same
-      // predicate: the dashboard's `payables_aging` drops deadline-less
-      // rows from the total and from every bucket, so keeping them here
-      // would make this list over-count the tile that linked to it.
-      // Load-bearing on this side — `ap_sync` records no deadline at all
-      // for NAV-synced payables, so on a legacy book this is most of it.
-      if (hasNoRecordedDeadline(inv.payment_deadline)) return false;
-      if (agingBucketFor(todayIso(), inv.payment_deadline) !== agingFacet) {
-        return false;
-      }
+    if (!incomingAgingMatches(inv, agingFacet, todayIso())) {
+      return false;
     }
     const needle = filter.needle.trim().toLowerCase();
     if (needle === "") return true;

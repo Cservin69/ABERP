@@ -71,6 +71,56 @@ describe("agingBucketFor — boundaries mirror reports::aging_bucket_for", () =>
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────
+// CLASSIFIER PARITY with the backend.
+//
+// `hasNoRecordedDeadline` and `reports::parse_iso_date` decide which
+// invoices are outstanding AT ALL, on two sides of the wire. A shape they
+// disagree about is a row one of them counts and the other excludes —
+// tile says 3, list shows 2, or worse, a receivable that is in the total
+// but in no drill-down.
+//
+// This table is duplicated verbatim in the Rust pin
+// `deadline_classifier_parity_with_the_spa` (reports.rs). Both must
+// change together; that is the point of writing it out twice.
+//
+// The naive `Date.parse(`${d}T00:00:00Z`)` this replaced disagreed on
+// three of these. None was reachable — the writers store canonical
+// `YYYY-MM-DD` and the SQL projections now truncate to the date head —
+// but "unreachable" was doing a lot of unguarded work.
+// ─────────────────────────────────────────────────────────────────────
+const PARITY: ReadonlyArray<[string, boolean]> = [
+  ["2026-06-30", true], // canonical
+  [" 2026-06-30 ", true], // Rust `str::trim`; Date.parse said NaN
+  ["\t2026-06-30\n", true], // tabs/newlines trim the same way
+  ["2026-02-30", false], // impossible; JS rolled it to 2026-03-02
+  ["2026-13-45", false], // out of range both ways
+  ["2026-6-3", false], // unpadded — not the canonical shape
+  ["2026-06-30T00:00:00Z", false], // RFC3339 is not a deadline shape
+  ["30/06/2026", false], // swapped format
+  ["not-a-date", false],
+  ["", false],
+];
+
+describe("deadline classifier parity with reports::parse_iso_date", () => {
+  for (const [input, isDated] of PARITY) {
+    it(`${JSON.stringify(input)} → ${isDated ? "dated" : "undated"}`, () => {
+      expect(hasNoRecordedDeadline(input)).toBe(!isDated);
+    });
+  }
+
+  it("a rolled-over date never reaches a bucket", () => {
+    // The sharpest of the three: JS turns 2026-02-30 into 2026-03-02, so
+    // the old code bucketed a receivable from a date that does not
+    // exist — and disagreed with a backend that had excluded it.
+    expect(agingBucketFor(TODAY, "2026-02-30")).toBeNull();
+  });
+
+  it("trimmed whitespace buckets identically to the trimmed value", () => {
+    expect(agingBucketFor(TODAY, " 2026-05-31 ")).toBe(agingBucketFor(TODAY, "2026-05-31"));
+  });
+});
+
 describe("hasNoRecordedDeadline — the one predicate both facets share", () => {
   // Exported so the aging facet and the hygiene facet cannot drift on
   // this point one edit at a time. `payment_deadline === null` in a

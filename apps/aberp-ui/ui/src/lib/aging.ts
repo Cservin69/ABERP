@@ -77,16 +77,14 @@ export function bucketAmount(panel: AgingPanel, bucket: AgingBucket): AmountAggr
   return panel[panelField(bucket)];
 }
 
-/** Whole calendar days between two ISO `YYYY-MM-DD` dates (`a − b`).
- * Both are anchored at UTC midnight so the difference is an exact integer
- * day count (no DST drift) — matching the backend's `time::Date`
- * `whole_days()`. Returns `null` if either string is unparseable. */
-function dayDiff(aIso: string, bIso: string): number | null {
-  const a = Date.parse(`${aIso}T00:00:00Z`);
-  const b = Date.parse(`${bIso}T00:00:00Z`);
-  if (Number.isNaN(a) || Number.isNaN(b)) return null;
-  return Math.round((a - b) / 86_400_000);
-}
+// The former `dayDiff` helper lived here and did its own
+// `Date.parse(`${iso}T00:00:00Z`)`. It is gone deliberately rather than
+// left unused: a SECOND, laxer date parser sitting next to the canonical
+// one is how the two classifiers drifted apart in the first place. Day
+// arithmetic now happens on the `Date` objects `parseRecordedDeadline`
+// returns — still anchored at UTC midnight, so the difference is an exact
+// integer day count with no DST drift, matching the backend's
+// `time::Date` `whole_days()`.
 
 /** True when a row has NO recorded payment deadline — the field is
  * `null`/`undefined`, or holds a string that will not parse as a date.
@@ -106,7 +104,56 @@ function dayDiff(aIso: string, bIso: string): number | null {
  * time; `payment_deadline === null` in a component is the shape that
  * misses the unparseable half. */
 export function hasNoRecordedDeadline(deadlineIso: string | null | undefined): boolean {
-  return deadlineIso == null || Number.isNaN(Date.parse(`${deadlineIso}T00:00:00Z`));
+  return parseRecordedDeadline(deadlineIso) === null;
+}
+
+/** Canonical `YYYY-MM-DD` shape. Anchored at both ends — a bare
+ * `Date.parse` would accept far more than the backend does. */
+const CANONICAL_DEADLINE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/** Parse a recorded payment deadline, or `null` when there isn't one.
+ *
+ * MIRRORS `reports::parse_iso_date` EXACTLY, and the parity is pinned in
+ * both languages over one shared vocabulary (`aging.test.ts` here,
+ * `deadline_classifier_parity_with_the_spa` there). The two classifiers
+ * decide which invoices are outstanding at all, so a shape they disagree
+ * about is a row the tile counts and the list does not, or vice versa.
+ *
+ * The naive form — `Date.parse(`${d}T00:00:00Z`)` — disagreed on three
+ * shapes, none of them reachable today but none of them guarded either:
+ *
+ *   `" 2026-06-30 "`   Rust trims and accepts; `Date.parse` returned NaN,
+ *                      so the SPA called a dated invoice undated.
+ *   `"2026-02-30"`     Rust rejects an impossible calendar date; JS
+ *                      SILENTLY ROLLS OVER to 2026-03-02, so the SPA
+ *                      called an undated invoice dated — and bucketed it
+ *                      from a date that does not exist.
+ *   `"2026-06-30T…Z"`  both reject, but for the wrong reason: the
+ *                      interpolation produced a double suffix. Guarded at
+ *                      source now (the SQL projections truncate to the
+ *                      date head), and rejected here deliberately rather
+ *                      than by accident.
+ *
+ * So: trim, require the canonical shape, then confirm the date did not
+ * roll over. Whitespace tolerance matches Rust's `str::trim`; the
+ * round-trip check is what `time::Date::parse` does for free. */
+export function parseRecordedDeadline(deadlineIso: string | null | undefined): Date | null {
+  if (deadlineIso == null) return null;
+  const m = CANONICAL_DEADLINE.exec(deadlineIso.trim());
+  if (m === null) return null;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const parsed = new Date(Date.UTC(y, mo - 1, d));
+  // `Date.UTC(2026, 1, 30)` happily yields 2026-03-02. Comparing the
+  // components back is the only way to tell a real date from a rolled
+  // one, and it is exactly the check the backend parser applies.
+  if (
+    parsed.getUTCFullYear() !== y ||
+    parsed.getUTCMonth() !== mo - 1 ||
+    parsed.getUTCDate() !== d
+  ) {
+    return null;
+  }
+  return parsed;
 }
 
 /** Classify a payment deadline into its aging bucket relative to `today`.
@@ -124,9 +171,15 @@ export function agingBucketFor(
   todayIso: string,
   deadlineIso: string | null | undefined,
 ): AgingBucket | null {
-  if (hasNoRecordedDeadline(deadlineIso)) return null;
-  const overdue = dayDiff(todayIso, deadlineIso as string);
-  if (overdue === null) return null;
+  const deadline = parseRecordedDeadline(deadlineIso);
+  if (deadline === null) return null;
+  // `todayIso` goes through the SAME parser, so a caller cannot get a
+  // bucket out of a deadline the backend would have rejected by pairing
+  // it with a today the backend would have rejected too. Unreachable in
+  // practice — `todayIsoLocal()` is canonical by construction.
+  const today = parseRecordedDeadline(todayIso);
+  if (today === null) return null;
+  const overdue = Math.round((today.getTime() - deadline.getTime()) / 86_400_000);
   if (overdue <= 0) return "current";
   if (overdue <= 30) return "d1_30";
   if (overdue <= 60) return "d31_60";

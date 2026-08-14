@@ -1089,8 +1089,19 @@ fn query_outgoing_groups(
     // head, which is correct for RFC3339 and a no-op for a date-only VARCHAR;
     // the `CAST` additionally keeps `row.get::<String>` from raising
     // `InvalidColumnType` on a legacy DATE-typed column — that error would
-    // fail the WHOLE financial report, not just DSO. Same shape as the
-    // `payment_deadline` projection below.
+    // fail the WHOLE financial report, not just DSO.
+    //
+    // `payment_deadline` is projected the SAME way, and the comment used to
+    // claim it already was while it in fact carried a bare `CAST` with no
+    // `SUBSTR`. It is currently `DATE` and renders date-only, so the two
+    // agreed by luck rather than by construction. The asymmetry was a live
+    // trap under this branch's semantics: widen that column to a timestamp
+    // (or let any writer store an RFC3339 string, which is exactly what
+    // happened to `issue_date`) and `parse_iso_date` would reject EVERY AR
+    // deadline — which no longer means "drop from the buckets" but "treat
+    // as settled and remove from Receivables entirely". The whole
+    // receivables book would silently go to zero behind a footnote. The
+    // truncation is a no-op today and removes the trap.
     let _ = basis;
     let (where_clause, has_from, has_to) = build_date_where(window);
     // ADR-0108 §3.4 site 1 / T-8: NO arithmetic in SQL. The statement projects
@@ -1102,7 +1113,7 @@ fn query_outgoing_groups(
         "SELECT i.id,
                 COALESCE(i.currency, 'HUF') AS currency,
                 SUBSTR(CAST(i.issue_date AS VARCHAR), 1, 10) AS issue_date,
-                CAST(i.payment_deadline AS VARCHAR) AS payment_deadline,
+                SUBSTR(CAST(i.payment_deadline AS VARCHAR), 1, 10) AS payment_deadline,
                 il.vat_rate_basis_points,
                 il.vat_rate_kind,
                 CAST(il.quantity AS VARCHAR) AS quantity,
@@ -1316,8 +1327,17 @@ fn query_ap_rows(
         clauses.push(format!("{date_col} <= ?"));
         binds.push(date_str(to));
     }
+    // `payment_deadline` gets the same `SUBSTR(CAST(… AS VARCHAR), 1, 10)`
+    // treatment as the outgoing projection, and for a sharper reason: this
+    // is the side where undated rows are the DOMINANT population, so a
+    // column that ever renders wider than a bare date would move the whole
+    // payables book into "settled, excluded" in one step. It was the only
+    // one of the three date projections with no `CAST` at all, which also
+    // left `row.get::<Option<String>>` free to raise `InvalidColumnType`
+    // and fail the entire financial report on a type change.
     let sql = format!(
-        "SELECT a.id, a.supplier_name, a.payment_deadline,
+        "SELECT a.id, a.supplier_name,
+                SUBSTR(CAST(a.payment_deadline AS VARCHAR), 1, 10) AS payment_deadline,
                 a.total_net_minor, a.total_vat_minor, a.total_gross_minor, a.currency,
                 a.local_status
            FROM ap_invoice a
@@ -1793,11 +1813,37 @@ impl SettledUndated {
 /// both sides rather than by imputing a bucket.
 ///
 /// **Why deadline-less means settled.** These are legacy invoices
-/// imported from NAV — issued, and paid, under the prior system, which
-/// recorded no payment deadline for them. The operator's ruling is that
-/// they are all settled. `issue_invoice` validates the deadline on every
-/// AR invoice this system issues, so a current-system receivable is
-/// always dated and only legacy AR can reach the `None` arm.
+/// issued, and paid, under the prior system, which recorded no payment
+/// deadline for them. The operator's ruling is that they are all settled.
+///
+/// On the AR side that ruling is backed by a MIGRATION TIMELINE, not by
+/// input validation — the distinction matters, because validation would
+/// only constrain what callers may send, and it is the timeline that
+/// constrains what the column can hold:
+///
+///   * `MIGRATE_PR_84_SQL` (billing `duckdb_store.rs`) added
+///     `payment_deadline DATE` to `invoice` with **no backfill** — by
+///     design, since pre-PR-84 rows had no operator-chosen date to
+///     recover. Every row already in the table got NULL.
+///   * Post-PR-84 the column cannot become NULL again:
+///     `DraftInvoice::payment_deadline` is a non-`Option` `time::Date`,
+///     `issue_invoice` defaults a missing input to the issue date rather
+///     than passing nothing through, and the store always formats and
+///     binds a canonical `YYYY-MM-DD`.
+///   * The migration landed 2026-05-27; the earliest shipped release is
+///     PROD_v1.4.1 (2026-05-31). No release predates it.
+///
+/// So a NULL AR deadline can only be a row written before that
+/// migration — genuinely pre-PR-84, genuinely legacy. It is NOT the case
+/// that `issue_invoice`'s validation makes this arm unreachable for
+/// current-system AR: that check only rejects a malformed deadline a
+/// caller *supplied*, and rejecting bad input says nothing about rows
+/// that were never given the column at all.
+///
+/// The consequence is real and was reproduced adversarially: an UNPAID
+/// pre-PR-84 receivable leaves the Receivables total silently. That is
+/// the operator's ruling working as intended, not a bug — but it is why
+/// the count below is not optional.
 ///
 /// **The residual, and why the tally is not optional.** AP is not
 /// symmetric: `ap_sync::digest_to_ingestion_input` writes
@@ -2179,10 +2225,11 @@ pub fn compute_financial_report(
     //
     // Every row named here was DROPPED from the outstanding figures on
     // the strength of a rule — "no recorded deadline means a settled
-    // legacy NAV import" — that this code cannot verify per row. On AR
-    // the rule is safe by construction: `issue_invoice` validates the
-    // deadline, so a current-system receivable is always dated. On AP it
-    // is not: `ap_sync` writes `payment_deadline: None` on every
+    // legacy import" — that this code cannot verify per row. On AR the
+    // rule is bounded by the PR-84 migration timeline: the column was
+    // added without backfill and cannot go NULL again, so a NULL there
+    // is necessarily a pre-PR-84 row (see `aging_placement`). On AP it
+    // is not bounded at all: `ap_sync` writes `payment_deadline: None` on every
     // NAV-synced payable (ap_sync.rs:971) and that sync is ONGOING, so a
     // genuinely unpaid deadline-less payable arriving tomorrow would be
     // excluded by exactly this rule and would simply not appear in
@@ -3364,6 +3411,57 @@ mod tests {
     //      unpaid payable disappears.
     // ──────────────────────────────────────────────────────────────────
 
+    /// **CLASSIFIER PARITY with the SPA.** `parse_iso_date` and the
+    /// SPA's `hasNoRecordedDeadline` (`aging.ts`) decide which invoices
+    /// are outstanding AT ALL, on two sides of the wire. A shape they
+    /// disagree about is a row one of them counts and the other excludes
+    /// — the tile reads 3 and the drill-down shows 2, or a receivable
+    /// sits in the total under no bucket anyone can click to.
+    ///
+    /// This table is duplicated verbatim in `aging.test.ts`
+    /// (`deadline classifier parity with reports::parse_iso_date`). Both
+    /// must move together; writing it out twice is the point.
+    ///
+    /// The SPA used to classify with
+    /// ``Date.parse(`${d}T00:00:00Z`)``, which disagreed here on three
+    /// rows: it rejected the whitespace-padded forms this trims and
+    /// accepts, and it SILENTLY ROLLED `2026-02-30` over to 2026-03-02 —
+    /// bucketing a receivable from a date that does not exist while this
+    /// side had excluded it. None was reachable (writers store canonical
+    /// `YYYY-MM-DD`, and the SQL projections now truncate to the date
+    /// head), but nothing guarded it either.
+    ///
+    /// NOTE for anyone loosening `parse_iso_date`: it is shared with the
+    /// DSO and window paths. If one of those needs RFC3339 tolerance,
+    /// SPLIT the function rather than widening it — this pin reds on
+    /// purpose, because widening it silently changes which invoices are
+    /// receivable. (The DSO path already gets its tolerance the right
+    /// way: `SUBSTR(…, 1, 10)` in the projection, not a laxer parser.)
+    #[test]
+    fn deadline_classifier_parity_with_the_spa() {
+        // (input, is_dated)
+        let vocabulary: [(&str, bool); 10] = [
+            ("2026-06-30", true),            // canonical
+            (" 2026-06-30 ", true),          // `str::trim`; JS said NaN
+            ("\t2026-06-30\n", true),        // tabs/newlines trim alike
+            ("2026-02-30", false),           // impossible; JS rolled it over
+            ("2026-13-45", false),           // out of range both ways
+            ("2026-6-3", false),             // unpadded — not canonical
+            ("2026-06-30T00:00:00Z", false), // RFC3339 is not a deadline
+            ("30/06/2026", false),           // swapped format
+            ("not-a-date", false),
+            ("", false),
+        ];
+        for (input, is_dated) in vocabulary {
+            assert_eq!(
+                parse_iso_date(input).is_ok(),
+                is_dated,
+                "classifier parity for {input:?} — the SPA's `aging.test.ts` \
+                 table must say the same thing"
+            );
+        }
+    }
+
     /// Sum an aging panel's five buckets — the figure that must equal the
     /// receivables / payables headline the panel sits under.
     fn aging_totals(panel: &AgingPanel) -> (i64, i64, i64, u64) {
@@ -3472,9 +3570,15 @@ mod tests {
     }
 
     /// The `None` half: a receivable with NO deadline at all. This is the
-    /// legacy-import shape the operator's ruling is actually about —
-    /// `issue_invoice` validates the deadline on every AR invoice THIS
-    /// system issues, so an undated receivable came from the prior one.
+    /// legacy shape the operator's ruling is actually about — the PR-84
+    /// migration added `payment_deadline` without backfilling it and the
+    /// column cannot go NULL again, so an undated receivable is a
+    /// pre-PR-84 row. See `aging_placement` for why that timeline, and
+    /// NOT `issue_invoice`'s input validation, is what bounds this.
+    ///
+    /// Note what this pin accepts: the invoice is UNPAID and still leaves
+    /// Receivables. That is the ruling, applied — and the reason the
+    /// exclusion has to stay countable.
     #[test]
     fn receivable_with_no_deadline_at_all_is_excluded_as_settled() {
         let today = d(2026, Month::August, 13);

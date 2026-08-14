@@ -1,128 +1,211 @@
 import { describe, expect, it } from "vitest";
-// Vite's `?raw` — the component sources as strings. Same posture as
-// `statistics-integrity-banner.test.ts`: this package mounts no
-// components, so the contract is pinned by reading the source. Honest
-// scope — these cannot prove the lists RENDER the right rows; they catch
-// the one regression with a plausible motive, named per-test below.
+import {
+  incomingAgingMatches,
+  incomingPastDeadlineMatches,
+  outgoingAgingMatches,
+} from "./aging-facets";
+import { AGING_BUCKETS, type AgingBucket } from "./aging";
+import type { IncomingInvoice, InvoiceListItem } from "./api";
+// Vite's `?raw` — the component sources as strings. Used ONLY for the
+// delegation checks at the bottom, which are the one thing a behaviour
+// test cannot see: that the components actually call these predicates
+// rather than keeping a private copy.
 import outgoing from "../routes/InvoiceList.svelte?raw";
 import incoming from "../routes/IncomingInvoiceList.svelte?raw";
 
 // ─────────────────────────────────────────────────────────────────────
 // An otherwise-outstanding invoice with NO recorded `payment_deadline`
-// (missing, or a value that will not parse) is a legacy NAV import taken
-// as SETTLED: `reports::aging_placement` drops it from the receivables /
+// (missing, or a value that will not parse) is a legacy import taken as
+// SETTLED: `reports::aging_placement` drops it from the receivables /
 // payables total, from every aging bucket, and from the past-deadline
 // hygiene counters together. Each of those tiles is CLICKABLE — it deep
 // links into one of these two lists, which re-run the classification
-// client-side.
+// client-side. So BOTH facets must exclude those rows, or the operator
+// clicks a tile reading 0 and lands on a list of legacy invoices.
 //
-// So BOTH facets must exclude those rows, or the operator clicks a tile
-// reading 0 and lands on a list of legacy invoices. That is the same
-// tile↔list incoherence the previous pins guarded, pointing the other
-// way: PR #68 imputed the rows into `d90_plus` and required the aging
-// facet to KEEP them, and the two facets deliberately disagreed. Under
-// the settled ruling they must agree — and a half-applied revert, where
-// one list re-adds the rows and the other does not, is the failure this
-// file is aimed at.
+// THESE PINS ASSERT BEHAVIOUR, NOT SOURCE TEXT. The previous cut checked
+// the component sources with `?raw` + regex, which caught a deleted
+// exclusion but NOT a flipped verdict: turning
 //
-// The exclusion is expressed through `hasNoRecordedDeadline` in both
-// places rather than a local `payment_deadline === null`, because the
-// local form silently keeps the UNPARSEABLE half — an exclusion that
-// covers only two of the three shapes reads as correct right up until a
-// malformed date appears.
+//     if (bucket === null) return false;   →   return true;
+//
+// keeps every grepped token, inverts the meaning into "matches every
+// bucket", and left the whole suite green. That is why the rules moved
+// into `aging-facets.ts` — so the tests can call them and check which
+// rows come back.
 // ─────────────────────────────────────────────────────────────────────
 
-/** The shared predicate, in either call shape. */
-const SHARED_EXCLUSION = /hasNoRecordedDeadline\(/;
+const TODAY = "2026-06-30";
 
-/** A hand-rolled null check standing in for it. Deliberately broad, so
- * the pin is not sidestepped by `== null`, a falsy check, or an early
- * `!deadline` guard — each of which handles `null` and misses `"junk"`. */
-const LOCAL_NULL_ONLY_CHECK = /payment_deadline\s*(===?|!==?)\s*null|!\w+\.payment_deadline/;
+/** Every shape of "no recorded deadline" the backend excludes:
+ * missing, empty, unparseable, and — since the two classifiers were
+ * unified — an impossible calendar date that JS would otherwise roll
+ * over into a real one. */
+const UNDATED: ReadonlyArray<string | null> = [
+  null,
+  "",
+  "not-a-date",
+  "30/06/2026",
+  "2026-13-45",
+  "2026-02-30",
+];
 
-/** Slice `source` from `startMarker` to the first line that closes at
- * `indent` spaces, so a block's own nested closers do not end it. */
-function block(source: string, startMarker: string, indent: number): string {
-  const start = source.indexOf(startMarker);
-  expect(start, `expected to find \`${startMarker}\``).toBeGreaterThan(-1);
-  const closer = `\n${" ".repeat(indent)}}`;
-  const end = source.indexOf(closer, start);
-  expect(end, `expected \`${startMarker}\` to close`).toBeGreaterThan(start);
-  return source.slice(start, end);
+function arRow(payment_deadline: string | null): InvoiceListItem {
+  // Only the fields the predicate reads are meaningful; the rest are
+  // filled to satisfy the wire type. Cast is confined to this builder.
+  return {
+    invoice_id: "inv_1",
+    state: "Submitted",
+    is_storno: false,
+    payment: null,
+    payment_deadline,
+  } as unknown as InvoiceListItem;
 }
 
-const outgoingAging = block(
-  outgoing,
-  "function agingMatches(row: InvoiceListItem): boolean {",
-  2,
-);
-const incomingAging = block(incoming, "if (agingFacet !== null) {", 4);
-const incomingHygiene = block(incoming, 'if (hygiene === "past_deadline") {', 4);
+function apRow(
+  payment_deadline: string | null,
+  local_status = "Outstanding",
+): IncomingInvoice {
+  return {
+    id: "ap_1",
+    payment_deadline,
+    local_status,
+  } as unknown as IncomingInvoice;
+}
 
-describe("aging click-through stays in lockstep with the dashboard panels", () => {
-  it("outgoing list classifies through the shared helper, not its own copy", () => {
-    // A local re-implementation of the bucket boundaries is the other way
-    // these drift; `aging.ts` exists to be the single source.
-    expect(outgoingAging).toContain("agingBucketFor(");
+describe("outgoing aging facet — deadline-less rows are excluded from EVERY bucket", () => {
+  for (const deadline of UNDATED) {
+    it(`${JSON.stringify(deadline)} matches no bucket`, () => {
+      // The verdict-flip mutation (`return true` where the exclusion
+      // belongs) reds here: the row would match all five facets.
+      const matched = AGING_BUCKETS.filter((b) =>
+        outgoingAgingMatches(arRow(deadline), b, TODAY),
+      );
+      expect(matched, "a settled legacy invoice belongs under no aging bucket").toEqual([]);
+    });
+  }
+
+  it("a dated receivable still lands in exactly ONE bucket", () => {
+    // The other direction: an exclusion that widened to swallow healthy
+    // rows would empty the drill-down while every tile still showed
+    // counts. Exactly one, so a `return true` flip fails here too.
+    const matched = AGING_BUCKETS.filter((b) =>
+      outgoingAgingMatches(arRow("2026-05-31"), b, TODAY),
+    );
+    expect(matched).toEqual<AgingBucket[]>(["d1_30"]);
   });
 
-  it("outgoing list EXCLUDES rows with no recorded deadline", () => {
-    // The revert this pin exists for: dropping the exclusion puts settled
-    // legacy invoices back into a bucket drill-down whose tile counts
-    // none of them.
-    expect(outgoingAging).toMatch(/bucket === null/);
+  it("a dated but PAID receivable is out regardless of bucket", () => {
+    const paid = { ...arRow("2026-05-31"), payment: {} } as unknown as InvoiceListItem;
+    expect(AGING_BUCKETS.filter((b) => outgoingAgingMatches(paid, b, TODAY))).toEqual([]);
   });
 
-  it("incoming list classifies through the shared helper, not its own copy", () => {
-    expect(incomingAging).toContain("agingBucketFor(");
+  it("no facet clicked means no aging filtering at all", () => {
+    // The undated row must still be listable when the operator is just
+    // browsing — the exclusion is about the DRILL-DOWN, not the list.
+    expect(outgoingAgingMatches(arRow(null), null, TODAY)).toBe(true);
+  });
+});
+
+describe("incoming aging facet — deadline-less rows are excluded from EVERY bucket", () => {
+  for (const deadline of UNDATED) {
+    it(`${JSON.stringify(deadline)} matches no bucket`, () => {
+      // Load-bearing on this side: `ap_sync` records no deadline for
+      // NAV-synced payables, so on a legacy book this is most of the
+      // book. A flipped verdict would fill this drill-down against
+      // tiles that are all zero.
+      const matched = AGING_BUCKETS.filter((b) =>
+        incomingAgingMatches(apRow(deadline), b, TODAY),
+      );
+      expect(matched).toEqual([]);
+    });
+  }
+
+  it("a dated outstanding payable still lands in exactly ONE bucket", () => {
+    const matched = AGING_BUCKETS.filter((b) =>
+      incomingAgingMatches(apRow("2026-04-15"), b, TODAY),
+    );
+    expect(matched).toEqual<AgingBucket[]>(["d61_90"]);
   });
 
-  it("incoming list EXCLUDES rows with no recorded deadline", () => {
-    // Load-bearing on this side: `ap_sync` records no deadline at all for
-    // NAV-synced payables, so on a legacy book keeping them would fill
-    // the payables aging drill-down against tiles that are all zero.
-    expect(incomingAging).toMatch(SHARED_EXCLUSION);
+  it("a non-Outstanding row is out regardless of bucket", () => {
+    const settled = apRow("2026-04-15", "Paid");
+    expect(AGING_BUCKETS.filter((b) => incomingAgingMatches(settled, b, TODAY))).toEqual([]);
+  });
+
+  it("no facet clicked means no aging filtering at all", () => {
+    expect(incomingAgingMatches(apRow(null), null, TODAY)).toBe(true);
   });
 });
 
 describe("the past-deadline HYGIENE facet keeps excluding undated rows", () => {
   // Unchanged in effect, and it was already correct — but it must not be
   // "corrected" the other way now that the aging facet agrees with it.
-  // `payable_past_deadline_count` is a LATENESS ASSERTION and nothing
-  // supports one for an invoice with no deadline; the settled ruling adds
-  // a second independent reason (a settled invoice is not late). Both
-  // point the same way.
-  it("still short-circuits on a row with no recorded deadline", () => {
-    expect(incomingHygiene).toMatch(SHARED_EXCLUSION);
+  // Two independent reasons point the same way: a settled invoice is not
+  // late, and an unreadable deadline is unknown lateness.
+  for (const deadline of UNDATED) {
+    it(`${JSON.stringify(deadline)} is not past deadline`, () => {
+      expect(incomingPastDeadlineMatches(apRow(deadline), TODAY)).toBe(false);
+    });
+  }
+
+  it("a deadline strictly before today IS past deadline", () => {
+    expect(incomingPastDeadlineMatches(apRow("2026-06-29"), TODAY)).toBe(true);
   });
 
-  it("still requires a deadline strictly in the past", () => {
-    expect(incomingHygiene).toContain("todayIso()");
+  it("a deadline of today or later is NOT past deadline", () => {
+    expect(incomingPastDeadlineMatches(apRow(TODAY), TODAY)).toBe(false);
+    expect(incomingPastDeadlineMatches(apRow("2026-07-01"), TODAY)).toBe(false);
+  });
+
+  it("a non-Outstanding row is never past deadline", () => {
+    expect(incomingPastDeadlineMatches(apRow("2026-06-29", "Paid"), TODAY)).toBe(false);
   });
 });
 
-describe("both facets exclude via the SHARED predicate", () => {
-  it("neither hand-rolls a null-only check that would miss unparseable dates", () => {
-    // The half-fix with the most plausible motive: `=== null` reads as
-    // obviously right, passes every test written with `null` in mind, and
-    // silently keeps `"30/06/2026"` in a list whose tile excluded it.
-    for (const [name, source] of [
-      ["outgoing aging", outgoingAging],
-      ["incoming aging", incomingAging],
-      ["incoming hygiene", incomingHygiene],
-    ] as const) {
-      expect(LOCAL_NULL_ONLY_CHECK.test(source), `${name} must not hand-roll a null check`).toBe(
+describe("the two incoming facets agree about which rows are deadline-less", () => {
+  // Under PR #68 these deliberately DISAGREED and a pin held them apart.
+  // They now have to match, so a change to one that is not made to the
+  // other is caught here rather than by Ervin clicking a tile.
+  it("every undated row is excluded by BOTH", () => {
+    for (const deadline of UNDATED) {
+      const inAnyBucket = AGING_BUCKETS.some((b) =>
+        incomingAgingMatches(apRow(deadline), b, TODAY),
+      );
+      expect(inAnyBucket, `aging facet / ${deadline}`).toBe(false);
+      expect(incomingPastDeadlineMatches(apRow(deadline), TODAY), `hygiene / ${deadline}`).toBe(
         false,
       );
     }
   });
+});
 
-  it("the two incoming facets agree about deadline-less rows", () => {
-    // Under PR #68 these two blocks deliberately DISAGREED and a pin held
-    // them apart. They now have to match, so a change to one that is not
-    // made to the other is caught here rather than by Ervin clicking a
-    // tile.
-    expect(SHARED_EXCLUSION.test(incomingHygiene)).toBe(true);
-    expect(SHARED_EXCLUSION.test(incomingAging)).toBe(true);
+describe("the components delegate to these predicates", () => {
+  // The one contract a behaviour test cannot observe from here: this
+  // package mounts no components, so nothing else would notice a
+  // component quietly reinstating a private copy of the rule and
+  // drifting from the module the pins above exercise.
+  it("outgoing list calls the shared outgoing predicate", () => {
+    expect(outgoing).toContain("outgoingAgingMatches(");
+  });
+
+  it("incoming list calls both shared incoming predicates", () => {
+    expect(incoming).toContain("incomingAgingMatches(");
+    expect(incoming).toContain("incomingPastDeadlineMatches(");
+  });
+
+  it("neither component classifies deadlines on its own any more", () => {
+    // A local `agingBucketFor` call or a hand-rolled `payment_deadline
+    // === null` in a component is the drift back to two sources of
+    // truth — and the `=== null` form is the one that silently keeps the
+    // unparseable half.
+    for (const [name, source] of [
+      ["InvoiceList", outgoing],
+      ["IncomingInvoiceList", incoming],
+    ] as const) {
+      expect(source, `${name} must not classify deadlines itself`).not.toMatch(
+        /agingBucketFor\(|payment_deadline\s*(===?|!==?)\s*null/,
+      );
+    }
   });
 });
