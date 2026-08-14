@@ -168,7 +168,60 @@ pub struct FinancialReport {
     pub deltas: PeriodDeltas,
     pub annual_running: AnnualRunningPanel,
     pub deferred_notes: Vec<String>,
+    /// Integrity signal for THIS run of the aggregator — see
+    /// [`LedgerDiagnostics`]. Non-zero means the figures above are
+    /// possibly incomplete.
+    #[serde(default)]
+    pub ledger_diagnostics: LedgerDiagnostics,
 }
+
+/// Per-run integrity diagnostic for the audit-ledger walk
+/// ([`walk_ledger`]).
+///
+/// The walk decodes every audit entry's JSON payload to derive per-invoice
+/// state (ack status, payment, storno chain links). Before this fix, a
+/// payload that failed to decode was dropped on the floor: the `if let
+/// Ok(..)` / `.ok()?` arms in [`ReportTrace::merge`],
+/// [`extract_chain_link_local`] and [`extract_invoice_id_local`] each fell
+/// through to "nothing happened". A malformed `InvoicePaymentRecorded`
+/// payload therefore made an invoice look UNPAID (inflating receivables,
+/// dropping its DSO sample, and possibly counting it past-deadline); a
+/// malformed `InvoiceAckStatus` payload could demote a SAVED invoice to
+/// `PendingDraft` and take it out of revenue + VAT-collected entirely; a
+/// malformed storno chain link left the base uncancelled. All of it
+/// silently — the operator saw a clean number that was simply wrong.
+///
+/// The conservative posture (CLAUDE.md rule 12 — fail loud) is NOT to
+/// abort the whole dashboard on one bad row: a single corrupt entry must
+/// not blank the operator's entire financial screen, and every valid row's
+/// arithmetic is unchanged. Instead the drop is made VISIBLE and
+/// ATTRIBUTABLE — a `tracing::error!` per entry carrying its id, seq, kind
+/// and the decode error, plus this machine-countable signal on the wire so
+/// a caller can flag the figures as possibly-incomplete rather than
+/// present them as authoritative.
+///
+/// An entry is counted AT MOST ONCE even when several decode attempts fail
+/// on it (a payload that is not JSON at all fails both the id extraction
+/// and the chain-link decode): the count answers "how many entries could
+/// not be read", not "how many decode attempts failed".
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct LedgerDiagnostics {
+    /// Number of audit entries whose payload the report walk could not
+    /// decode, and which are therefore NOT reflected in any figure above.
+    /// Exact and uncapped.
+    pub unparseable_entries: u64,
+    /// Audit-entry ids (`aud_<ULID>`) of those entries, so the operator
+    /// can go find them. Capped at [`MAX_UNPARSEABLE_ENTRY_IDS`] — the
+    /// count above stays exact, so `unparseable_entries >
+    /// unparseable_entry_ids.len()` simply means "and more".
+    pub unparseable_entry_ids: Vec<String>,
+}
+
+/// Cap on [`LedgerDiagnostics::unparseable_entry_ids`]. A systemically
+/// corrupt ledger must not balloon the report's JSON payload; the count is
+/// the machine-countable signal, the ids are the operator's starting
+/// point.
+const MAX_UNPARSEABLE_ENTRY_IDS: usize = 50;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PeriodMeta {
@@ -607,6 +660,8 @@ struct LedgerWalk {
     storno_links_in_period: u64,
     /// `InvoiceModificationIssued` chain entries in the period.
     modification_links_in_period: u64,
+    /// Entries this walk could NOT decode — see [`LedgerDiagnostics`].
+    diagnostics: LedgerDiagnostics,
 }
 
 fn walk_ledger(ledger: &Ledger, period_window: DateWindow) -> Result<LedgerWalk> {
@@ -620,34 +675,86 @@ fn walk_ledger(ledger: &Ledger, period_window: DateWindow) -> Result<LedgerWalk>
     // later entry than the chain link itself.
     let mut storno_links: Vec<(String, String)> = Vec::new();
     for entry in &entries {
-        if let Some(id) = extract_invoice_id_local(entry) {
-            walk.traces.entry(id.clone()).or_default().merge(entry, &id);
-        }
-        if let Some(link) = extract_chain_link_local(entry) {
-            if link.is_storno {
-                walk.traces
-                    .entry(link.child_invoice_id.clone())
-                    .or_default()
-                    .is_storno_self = true;
-                walk.traces.entry(link.base_invoice_id.clone()).or_default();
-                storno_links.push((link.base_invoice_id, link.child_invoice_id));
-                if entry_in_window(entry, period_window) {
-                    walk.storno_links_in_period = walk.storno_links_in_period.saturating_add(1);
-                }
-            } else {
-                walk.traces
-                    .entry(link.base_invoice_id.clone())
-                    .or_default()
-                    .is_amended_base = true;
-                if entry_in_window(entry, period_window) {
-                    walk.modification_links_in_period =
-                        walk.modification_links_in_period.saturating_add(1);
+        // A decode failure on THIS entry, if any. Recorded once at the end
+        // of the iteration rather than at each failing call site: a payload
+        // that is not JSON at all fails both decodes below, and the
+        // operator-facing count is entries-not-read, not attempts-failed.
+        let mut decode_error: Option<String> = None;
+
+        match extract_invoice_id_local(entry) {
+            Ok(Some(id)) => {
+                // The trace row is created either way (`or_default()` runs
+                // before `merge`), exactly as before — a failed typed decode
+                // leaves it at its defaults instead of vanishing the id.
+                if let Err(e) = walk.traces.entry(id.clone()).or_default().merge(entry, &id) {
+                    decode_error = Some(e.to_string());
                 }
             }
+            // Valid JSON with no `invoice_id` key — the ordinary case for
+            // every event kind that is not invoice-scoped. NOT a defect.
+            Ok(None) => {}
+            Err(e) => decode_error = Some(e.to_string()),
+        }
+
+        match extract_chain_link_local(entry) {
+            Ok(Some(link)) => {
+                if link.is_storno {
+                    walk.traces
+                        .entry(link.child_invoice_id.clone())
+                        .or_default()
+                        .is_storno_self = true;
+                    walk.traces.entry(link.base_invoice_id.clone()).or_default();
+                    storno_links.push((link.base_invoice_id, link.child_invoice_id));
+                    if entry_in_window(entry, period_window) {
+                        walk.storno_links_in_period = walk.storno_links_in_period.saturating_add(1);
+                    }
+                } else {
+                    walk.traces
+                        .entry(link.base_invoice_id.clone())
+                        .or_default()
+                        .is_amended_base = true;
+                    if entry_in_window(entry, period_window) {
+                        walk.modification_links_in_period =
+                            walk.modification_links_in_period.saturating_add(1);
+                    }
+                }
+            }
+            // Not a chain-link kind. The overwhelming majority of entries.
+            Ok(None) => {}
+            Err(e) => {
+                decode_error.get_or_insert_with(|| e.to_string());
+            }
+        }
+
+        if let Some(err) = decode_error {
+            record_unparseable_entry(&mut walk.diagnostics, entry, &err);
         }
     }
     resolve_landed_stornos(&mut walk.traces, &storno_links);
     Ok(walk)
+}
+
+/// Make one undecodable audit entry LOUD and ATTRIBUTABLE: a structured
+/// error log naming the entry, and a bump on the machine-countable signal
+/// that rides out on [`FinancialReport::ledger_diagnostics`].
+///
+/// Deliberately not a hard error. Aborting the walk would let a single
+/// corrupt row blank the operator's whole financial screen, which trades a
+/// wrong number for no number at all. See [`LedgerDiagnostics`].
+fn record_unparseable_entry(diag: &mut LedgerDiagnostics, entry: &Entry, error: &str) {
+    let id = entry.id.to_prefixed_string();
+    tracing::error!(
+        entry_id = %id,
+        entry_seq = entry.seq.0,
+        entry_kind = ?entry.kind,
+        decode_error = %error,
+        "financial report: audit entry payload could not be decoded — this entry is \
+         NOT reflected in the reported figures"
+    );
+    diag.unparseable_entries = diag.unparseable_entries.saturating_add(1);
+    if diag.unparseable_entry_ids.len() < MAX_UNPARSEABLE_ENTRY_IDS {
+        diag.unparseable_entry_ids.push(id);
+    }
 }
 
 /// Second pass over the storno chain links: flag a base as
@@ -693,54 +800,59 @@ fn resolve_landed_stornos(
 }
 
 impl ReportTrace {
-    fn merge(&mut self, entry: &Entry, invoice_id: &str) {
+    /// Fold one audit entry into this invoice's trace.
+    ///
+    /// `Err` means the entry's typed payload did NOT decode, so nothing was
+    /// folded and this entry is missing from every figure derived from the
+    /// trace. The caller MUST surface it — see [`LedgerDiagnostics`]. The
+    /// four decode arms used to be `if let Ok(..)` with no `else`, which is
+    /// precisely the silent drop.
+    ///
+    /// The `parsed.invoice_id == invoice_id` guards are unchanged: a
+    /// successfully-decoded payload naming a DIFFERENT invoice is not a
+    /// defect, it just does not belong to this trace.
+    fn merge(&mut self, entry: &Entry, invoice_id: &str) -> serde_json::Result<()> {
         match entry.kind {
             EventKind::InvoiceDraftCreated => self.has_draft = true,
             EventKind::InvoiceSubmissionAttempt => {
-                if let Ok(parsed) = serde_json::from_slice::<
+                let parsed = serde_json::from_slice::<
                     audit_payloads::InvoiceSubmissionAttemptPayload,
-                >(&entry.payload)
-                {
-                    if parsed.invoice_id == invoice_id {
-                        self.has_attempt = true;
-                    }
+                >(&entry.payload)?;
+                if parsed.invoice_id == invoice_id {
+                    self.has_attempt = true;
                 }
             }
             EventKind::InvoiceSubmissionResponse => {
-                if let Ok(parsed) = serde_json::from_slice::<
+                let parsed = serde_json::from_slice::<
                     audit_payloads::InvoiceSubmissionResponsePayload,
-                >(&entry.payload)
-                {
-                    if parsed.invoice_id == invoice_id {
-                        self.has_submission_response = true;
-                    }
+                >(&entry.payload)?;
+                if parsed.invoice_id == invoice_id {
+                    self.has_submission_response = true;
                 }
             }
             EventKind::InvoiceAckStatus => {
-                if let Ok(parsed) = serde_json::from_slice::<audit_payloads::InvoiceAckStatusPayload>(
+                let parsed = serde_json::from_slice::<audit_payloads::InvoiceAckStatusPayload>(
                     &entry.payload,
-                ) {
-                    if parsed.invoice_id == invoice_id {
-                        self.last_ack_status = Some(parsed.ack_status);
-                    }
+                )?;
+                if parsed.invoice_id == invoice_id {
+                    self.last_ack_status = Some(parsed.ack_status);
                 }
             }
             EventKind::InvoiceMarkedAbandoned => {
                 self.has_marked_abandoned = true;
             }
             EventKind::InvoicePaymentRecorded => {
-                if let Ok(parsed) = serde_json::from_slice::<
-                    audit_payloads::InvoicePaymentRecordedPayload,
-                >(&entry.payload)
-                {
-                    if parsed.invoice_id == invoice_id {
-                        self.payment_paid_at = Some(parsed.paid_at);
-                        self.payment_amount_minor = Some(parsed.amount_minor);
-                    }
+                let parsed = serde_json::from_slice::<audit_payloads::InvoicePaymentRecordedPayload>(
+                    &entry.payload,
+                )?;
+                if parsed.invoice_id == invoice_id {
+                    self.payment_paid_at = Some(parsed.paid_at);
+                    self.payment_amount_minor = Some(parsed.amount_minor);
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 }
 
@@ -750,36 +862,46 @@ struct ChainLinkLocal {
     is_storno: bool,
 }
 
-fn extract_chain_link_local(entry: &Entry) -> Option<ChainLinkLocal> {
+/// `Ok(None)` = this entry is not a chain-link kind (the ordinary case).
+/// `Err` = it IS one and its payload did not decode, so the chain link is
+/// lost — a storno that never nets its base to zero, leaving revenue and
+/// receivables overstated. Used to be `.ok()?`, indistinguishable from
+/// "not a chain link" and therefore silent.
+fn extract_chain_link_local(entry: &Entry) -> serde_json::Result<Option<ChainLinkLocal>> {
     match entry.kind {
         EventKind::InvoiceStornoIssued => {
             let parsed: audit_payloads::InvoiceStornoIssuedPayload =
-                serde_json::from_slice(&entry.payload).ok()?;
-            Some(ChainLinkLocal {
+                serde_json::from_slice(&entry.payload)?;
+            Ok(Some(ChainLinkLocal {
                 base_invoice_id: parsed.base_invoice_id,
                 child_invoice_id: parsed.storno_invoice_id,
                 is_storno: true,
-            })
+            }))
         }
         EventKind::InvoiceModificationIssued => {
             let parsed: audit_payloads::InvoiceModificationIssuedPayload =
-                serde_json::from_slice(&entry.payload).ok()?;
-            Some(ChainLinkLocal {
+                serde_json::from_slice(&entry.payload)?;
+            Ok(Some(ChainLinkLocal {
                 base_invoice_id: parsed.base_invoice_id,
                 child_invoice_id: parsed.modification_invoice_id,
                 is_storno: false,
-            })
+            }))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
-fn extract_invoice_id_local(entry: &Entry) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_slice(&entry.payload).ok()?;
-    v.as_object()
+/// `Ok(None)` = the payload is well-formed JSON that carries no
+/// `invoice_id` (chain links, tenant-level events, …) — normal, and NOT a
+/// diagnostic. `Err` = the payload is not JSON at all, so the entry never
+/// reaches [`ReportTrace::merge`] and contributes to nothing. Used to be
+/// `.ok()?`, which collapsed those two cases into one silent `None`.
+fn extract_invoice_id_local(entry: &Entry) -> serde_json::Result<Option<String>> {
+    let v: serde_json::Value = serde_json::from_slice(&entry.payload)?;
+    Ok(v.as_object()
         .and_then(|m| m.get("invoice_id"))
         .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
+        .map(|s| s.to_string()))
 }
 
 fn entry_in_window(entry: &Entry, window: DateWindow) -> bool {
@@ -1609,6 +1731,16 @@ pub fn compute_financial_report(
         binary_hash,
     );
     let walk = walk_ledger(&ledger, window)?;
+    // The walk already error-logged each undecodable entry individually.
+    // This is the one operator-facing line that says the SNAPSHOT as a
+    // whole is suspect, and it rides out on the report so a caller/UI can
+    // say so too.
+    if walk.diagnostics.unparseable_entries > 0 {
+        tracing::error!(
+            unparseable_entries = walk.diagnostics.unparseable_entries,
+            "financial report: figures may be INCOMPLETE — some audit entries could not be read"
+        );
+    }
 
     // Build a best-effort buyer-name map by reading side-store input.json
     // files for each `InvoiceDraftCreated` entry's `nav_xml_path`. Same
@@ -1867,6 +1999,7 @@ pub fn compute_financial_report(
         deltas: PeriodDeltas { mom, yoy },
         annual_running,
         deferred_notes,
+        ledger_diagnostics: walk.diagnostics,
     })
 }
 
@@ -2606,6 +2739,250 @@ mod tests {
         assert!(walk.traces["storno_aborted"].is_storno_self);
         // Hygiene counts chain links, not landings — unchanged by this fix.
         assert_eq!(walk.storno_links_in_period, 2);
+        // A ledger of exclusively well-formed payloads must produce an EMPTY
+        // diagnostic. Without this, a diagnostic that fires on everything
+        // would pass the malformed-payload pins below while crying wolf on
+        // every real report.
+        assert_eq!(
+            walk.diagnostics,
+            LedgerDiagnostics::default(),
+            "no false positives: every payload here decodes, so nothing is unreadable"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Unparseable-payload diagnostics.
+    //
+    // The walk used to swallow a payload that failed to decode (`if let
+    // Ok(..)` with no else, `.ok()?`). The entry then contributed to
+    // nothing and NOTHING said so — the operator read a clean number that
+    // silently omitted a payment / an ack / a storno reversal. These pins
+    // hold the two halves of the fix together: the drop is COUNTED and
+    // ATTRIBUTED, and the valid rows' arithmetic is untouched.
+    //
+    // Mutation check: reverting any decode site to its silent form
+    // (`if let Ok(parsed) = ..` in `merge`, `.ok()?` in the extractors)
+    // drives `unparseable_entries` to 0 and reds every assertion below.
+    // ──────────────────────────────────────────────────────────────────
+
+    fn test_ledger() -> (Ledger, Actor) {
+        let tenant = TenantId::new("t1".to_string()).unwrap();
+        let ledger = Ledger::open_in_memory(tenant, BinaryHash::from_bytes([0u8; 32])).unwrap();
+        (
+            ledger,
+            Actor::from_local_cli("sess".to_string(), "test-user"),
+        )
+    }
+
+    fn append_raw(ledger: &mut Ledger, actor: &Actor, kind: EventKind, payload: &[u8]) {
+        ledger
+            .append(kind, payload.to_vec(), actor.clone(), None)
+            .unwrap();
+    }
+
+    fn append_saved_ack(ledger: &mut Ledger, actor: &Actor, invoice: &str) {
+        let payload =
+            audit_payloads::InvoiceAckStatusPayload::new(invoice, "tx", "SAVED", b"<a/>".to_vec());
+        append_raw(
+            ledger,
+            actor,
+            EventKind::InvoiceAckStatus,
+            &payload.to_bytes(),
+        );
+    }
+
+    /// The headline case. Two SAVED invoices, both with a recorded payment;
+    /// one payment payload is malformed (well-formed JSON naming the
+    /// invoice, but missing the typed payload's required fields).
+    ///
+    /// Pre-fix the malformed payment simply evaporated: the invoice looked
+    /// unpaid, sat in receivables, and no signal existed anywhere. Post-fix
+    /// the NUMBERS ARE THE SAME — deliberately, this fix does not guess at
+    /// an amount it could not read — but the run now says one entry was
+    /// unreadable, so "receivables" can be presented as possibly-incomplete
+    /// instead of authoritative.
+    #[test]
+    fn malformed_payment_payload_is_counted_not_swallowed() {
+        let (mut ledger, actor) = test_ledger();
+
+        append_saved_ack(&mut ledger, &actor, "paid_ok");
+        let good_payment = audit_payloads::InvoicePaymentRecordedPayload::new(
+            "paid_ok",
+            IdempotencyKey::new(),
+            "2026-07-20",
+            100_000,
+            "HUF",
+            audit_payloads::PaymentMethod::BankTransfer,
+            None,
+        );
+        append_raw(
+            &mut ledger,
+            &actor,
+            EventKind::InvoicePaymentRecorded,
+            &good_payment.to_bytes(),
+        );
+
+        append_saved_ack(&mut ledger, &actor, "paid_broken");
+        // Valid JSON, carries `invoice_id` (so the entry DOES reach
+        // `merge`), but `amount_minor` / `currency` / `method` /
+        // `idempotency_key` are absent → the typed decode fails.
+        append_raw(
+            &mut ledger,
+            &actor,
+            EventKind::InvoicePaymentRecorded,
+            br#"{"invoice_id":"paid_broken","paid_at":"2026-07-20"}"#,
+        );
+
+        let walk = walk_ledger(&ledger, DateWindow::unbounded()).unwrap();
+
+        // (a) The drop is visible and attributable.
+        assert_eq!(
+            walk.diagnostics.unparseable_entries, 1,
+            "the malformed payment must be counted; 0 means it vanished silently again"
+        );
+        assert_eq!(walk.diagnostics.unparseable_entry_ids.len(), 1);
+        assert!(
+            walk.diagnostics.unparseable_entry_ids[0].starts_with("aud_"),
+            "the id must be the operator-facing prefixed form, got {:?}",
+            walk.diagnostics.unparseable_entry_ids[0]
+        );
+
+        // (b) The valid row is untouched — same payment, same ack.
+        assert_eq!(
+            walk.traces["paid_ok"].payment_paid_at.as_deref(),
+            Some("2026-07-20")
+        );
+        assert_eq!(walk.traces["paid_ok"].payment_amount_minor, Some(100_000));
+        assert_eq!(
+            walk.traces["paid_ok"].last_ack_status.as_deref(),
+            Some("SAVED")
+        );
+        // The unreadable payment is NOT invented: the invoice stays as it
+        // was before that entry — SAVED, no payment. Preserving current
+        // numeric behaviour is the point; only the silence is fixed.
+        assert_eq!(walk.traces["paid_broken"].payment_paid_at, None);
+        assert_eq!(
+            walk.traces["paid_broken"].last_ack_status.as_deref(),
+            Some("SAVED"),
+            "the malformed payment must not take the invoice's own valid ack down with it"
+        );
+
+        // (c) Aggregates over the valid rows are unchanged: `paid_ok` is out
+        // of receivables because it is paid, `paid_broken` is in because
+        // nothing readable said otherwise.
+        let today = d(2026, Month::August, 13);
+        let groups = vec![
+            group("paid_ok", "HUF", 100_000, Some("2026-07-14")),
+            group("paid_broken", "HUF", 250_000, Some("2026-07-14")),
+        ];
+        let agg = aggregate_outgoing(groups, &walk.traces, today, &HashMap::new());
+        assert_eq!(
+            agg.receivables.huf.gross_minor, 250_000,
+            "only the unpaid one is owed; the valid payment still clears its invoice"
+        );
+        assert_eq!(agg.revenue.huf.gross_minor, 350_000);
+    }
+
+    /// The other two decode surfaces on the same walk, and the
+    /// count-each-entry-once rule.
+    ///
+    /// A malformed ACK is the most damaging of the three: pre-fix it left
+    /// `last_ack_status` at `None`, so a genuinely SAVED invoice classified
+    /// as `PendingDraft` and dropped out of revenue AND VAT-collected
+    /// entirely. A malformed STORNO chain link left the base uncancelled.
+    /// A payload that is not JSON at all never even reached `merge`.
+    #[test]
+    fn malformed_ack_chain_link_and_non_json_payloads_are_each_counted_once() {
+        let (mut ledger, actor) = test_ledger();
+
+        // One healthy invoice to prove the valid path survives all of it.
+        append_saved_ack(&mut ledger, &actor, "healthy");
+
+        // Malformed ack: has `invoice_id`, missing `transaction_id` +
+        // `response_xml`.
+        append_raw(
+            &mut ledger,
+            &actor,
+            EventKind::InvoiceAckStatus,
+            br#"{"invoice_id":"bad_ack","ack_status":"SAVED"}"#,
+        );
+
+        // Malformed storno chain link: no `invoice_id` key at all (normal
+        // for this kind — `Ok(None)` from the id extractor), and the typed
+        // chain-link decode fails on the missing storno fields.
+        append_raw(
+            &mut ledger,
+            &actor,
+            EventKind::InvoiceStornoIssued,
+            br#"{"base_invoice_id":"some_base"}"#,
+        );
+
+        // Not JSON at all, on a kind that BOTH decode paths look at. Must
+        // still be one entry, not two: the count answers "how many entries
+        // could not be read", not "how many decode attempts failed".
+        append_raw(
+            &mut ledger,
+            &actor,
+            EventKind::InvoiceStornoIssued,
+            b"<<< not json >>>",
+        );
+
+        let walk = walk_ledger(&ledger, DateWindow::unbounded()).unwrap();
+
+        assert_eq!(
+            walk.diagnostics.unparseable_entries, 3,
+            "one per unreadable ENTRY — the non-JSON storno fails both decodes but counts once"
+        );
+        assert_eq!(walk.diagnostics.unparseable_entry_ids.len(), 3);
+
+        // The malformed ack did not fabricate a trace state, and — the
+        // point of the fix — did not fabricate silence either.
+        assert!(
+            walk.traces
+                .get("bad_ack")
+                .is_none_or(|t| t.last_ack_status.is_none()),
+            "an unreadable ack must not be guessed at"
+        );
+        // The healthy invoice is completely unaffected by its corrupt
+        // neighbours.
+        assert_eq!(
+            walk.traces["healthy"].last_ack_status.as_deref(),
+            Some("SAVED")
+        );
+        assert!(matches!(
+            walk.traces["healthy"].classify(),
+            CountedKind::Counted {
+                is_storno_self: false
+            }
+        ));
+        // The unreadable chain link contributed no hygiene count — pre-fix
+        // that was ALSO true, and equally silent. Now it is accounted for.
+        assert_eq!(walk.storno_links_in_period, 0);
+    }
+
+    /// The id list is capped so a systemically corrupt ledger cannot
+    /// balloon the report payload, but the COUNT stays exact — the
+    /// difference is what tells a caller "and more".
+    #[test]
+    fn unparseable_entry_ids_are_capped_while_the_count_stays_exact() {
+        let (mut ledger, actor) = test_ledger();
+        let corrupt = MAX_UNPARSEABLE_ENTRY_IDS + 7;
+        for _ in 0..corrupt {
+            append_raw(
+                &mut ledger,
+                &actor,
+                EventKind::InvoicePaymentRecorded,
+                b"not json",
+            );
+        }
+
+        let walk = walk_ledger(&ledger, DateWindow::unbounded()).unwrap();
+
+        assert_eq!(walk.diagnostics.unparseable_entries, corrupt as u64);
+        assert_eq!(
+            walk.diagnostics.unparseable_entry_ids.len(),
+            MAX_UNPARSEABLE_ENTRY_IDS
+        );
     }
 
     /// A *paid* invoice is out of AR for the ordinary reason, and a plain
