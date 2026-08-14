@@ -188,10 +188,15 @@
     ) {
       return false;
     }
-    // No early-out on a null deadline: the dashboard's `receivables_aging`
-    // ages such a row as `d90_plus` rather than dropping it, so this list
-    // must too or the click-through count disagrees with the tile.
-    return agingBucketFor(todayIsoLocal(), row.payment_deadline) === agingFacet;
+    // A row with NO recorded deadline is a settled legacy import: the
+    // dashboard's `receivables_aging` excludes it from the total and from
+    // every bucket, so it must appear under NO bucket facet here either
+    // or the click-through list over-counts the tile it came from. The
+    // `null` bucket carries that verdict — see `hasNoRecordedDeadline`,
+    // the predicate this shares with the hygiene facet.
+    const bucket = agingBucketFor(todayIsoLocal(), row.payment_deadline);
+    if (bucket === null) return false;
+    return bucket === agingFacet;
   }
 
   // PR-94 / session-114 — sortable-columns state. `key === null` keeps

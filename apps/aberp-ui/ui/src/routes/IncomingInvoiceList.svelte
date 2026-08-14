@@ -45,6 +45,7 @@
   // dashboard's AP-aging card.
   import {
     agingBucketFor,
+    hasNoRecordedDeadline,
     AGING_LABELS,
     type AgingBucket,
   } from "../lib/aging";
@@ -235,8 +236,13 @@
     const hygiene = filter.hygiene ?? null;
     if (hygiene === "past_deadline") {
       if (inv.local_status !== "Outstanding") return false;
-      if (inv.payment_deadline === null) return false;
-      if (inv.payment_deadline >= todayIso()) return false;
+      // Rows with no recorded deadline are settled legacy imports and are
+      // out of outstanding everywhere — this counter never had them, and
+      // now the payables total does not either. Routed through the SHARED
+      // predicate rather than a local `=== null`, which is the shape that
+      // silently keeps the unparseable half.
+      if (hasNoRecordedDeadline(inv.payment_deadline)) return false;
+      if (inv.payment_deadline! >= todayIso()) return false;
     }
     // S262 / PR-251 — payables-aging bucket gate. Mirrors the dashboard's
     // `payables_aging` panel: Outstanding rows only, classified by
@@ -244,10 +250,13 @@
     // `reports::aging_bucket_for` computes.
     if (agingFacet !== null) {
       if (inv.local_status !== "Outstanding") return false;
-      // No early-out on a null deadline — the dashboard's
-      // `payables_aging` ages such a row as `d90_plus` rather than
-      // dropping it, so this list must too or the click-through count
-      // disagrees with the tile.
+      // Same exclusion as the hygiene branch above, from the same
+      // predicate: the dashboard's `payables_aging` drops deadline-less
+      // rows from the total and from every bucket, so keeping them here
+      // would make this list over-count the tile that linked to it.
+      // Load-bearing on this side — `ap_sync` records no deadline at all
+      // for NAV-synced payables, so on a legacy book this is most of it.
+      if (hasNoRecordedDeadline(inv.payment_deadline)) return false;
       if (agingBucketFor(todayIso(), inv.payment_deadline) !== agingFacet) {
         return false;
       }

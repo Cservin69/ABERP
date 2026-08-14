@@ -12,8 +12,9 @@
 //      31..60 → d31_60
 //      61..90 → d61_90
 //        > 90 → d90_plus
-//     missing / unreadable deadline → d90_plus (conservative imputation,
-//       mirroring `reports::aging_placement`)
+//     NO recorded deadline (missing or unreadable) → not outstanding at
+//       all: excluded from every bucket, mirroring `aging_placement`
+//       returning `None`.
 //
 // If the two ever drift, the operator clicks "31–60 nap = 3 invoices" and
 // lands on a list showing 2 — the canonical fail-loud regression this
@@ -87,25 +88,45 @@ function dayDiff(aIso: string, bIso: string): number | null {
   return Math.round((a - b) / 86_400_000);
 }
 
+/** True when a row has NO recorded payment deadline — the field is
+ * `null`/`undefined`, or holds a string that will not parse as a date.
+ *
+ * Such an invoice is a LEGACY import from NAV, issued and settled under
+ * the prior system, and the operator's ruling is that they are all paid.
+ * It is therefore not outstanding: excluded from the receivables /
+ * payables total, from every aging bucket, and from the past-deadline
+ * hygiene counters alike. Mirrors `reports::aging_placement` returning
+ * `None`.
+ *
+ * THE ONE PREDICATE both drill-down facets share. The aging facet and the
+ * hygiene facet must agree about these rows — each is the click-through
+ * for a dashboard tile that has already excluded them, so a list that
+ * kept them shows more rows than the tile it came from. Sharing the
+ * definition is what stops the two from drifting apart one edit at a
+ * time; `payment_deadline === null` in a component is the shape that
+ * misses the unparseable half. */
+export function hasNoRecordedDeadline(deadlineIso: string | null | undefined): boolean {
+  return deadlineIso == null || Number.isNaN(Date.parse(`${deadlineIso}T00:00:00Z`));
+}
+
 /** Classify a payment deadline into its aging bucket relative to `today`.
  * `todayIso` is ISO `YYYY-MM-DD`.
  *
- * A MISSING (`null`) or unparseable deadline returns `d90_plus`, never
- * `null`: an outstanding invoice whose due date cannot be read cannot be
- * assumed not-yet-due, so it is aged as most-overdue. This mirrors
- * `reports::aging_placement` exactly — both used to exclude such a row
- * from every bucket while still counting it in the receivables / payables
- * TOTAL, so the panel's breakdown summed to less than its own headline.
- * If only one of the two sides were fixed, the operator would click
- * "90+ nap = 3" and land on a list showing 2 — the drift this shared
- * module exists to prevent. Mirrors `reports::aging_bucket_for` for every
- * readable deadline, unchanged. */
+ * Returns `null` for a row with no recorded deadline — callers MUST read
+ * that as "not outstanding, show it under no bucket", not as "unknown, so
+ * put it somewhere safe". See [`hasNoRecordedDeadline`].
+ *
+ * Mirrors `reports::aging_bucket_for` for every readable deadline —
+ * unchanged, and deliberately so: this change moves undated rows only.
+ * A revision that also nudged healthy invoices between buckets would be
+ * worse than either behaviour it replaced. */
 export function agingBucketFor(
   todayIso: string,
   deadlineIso: string | null | undefined,
-): AgingBucket {
-  const overdue = deadlineIso == null ? null : dayDiff(todayIso, deadlineIso);
-  if (overdue === null) return "d90_plus";
+): AgingBucket | null {
+  if (hasNoRecordedDeadline(deadlineIso)) return null;
+  const overdue = dayDiff(todayIso, deadlineIso as string);
+  if (overdue === null) return null;
   if (overdue <= 0) return "current";
   if (overdue <= 30) return "d1_30";
   if (overdue <= 60) return "d31_60";
