@@ -1202,8 +1202,48 @@ fn query_restored_rows(
     Ok(out)
 }
 
+/// The shared financial window's date-basis expression, normalised to a
+/// date-only `YYYY-MM-DD` VARCHAR.
+///
+/// Every financial figure rides this one expression — revenue, the ÁFA
+/// breakdown, receivables and their aging, the cash-flow projection, the
+/// EUR/HUF currency split, the DSO windowing — so it is a single `const`
+/// rather than a string repeated per WHERE arm: a fork here is a fork in
+/// the money, and it survives until the first edit to one copy.
+///
+/// The comparison against the operator's bounds is a **string** compare, and
+/// the bounds are date-only (`date_str`). The column is not: in production
+/// `invoice.issue_date` is `VARCHAR NOT NULL` holding RFC3339 —
+/// `draft.issue_date.format(&Rfc3339)` in
+/// `modules/billing/src/adapters/duckdb_store.rs`, e.g.
+/// `2026-06-30T12:00:00Z`. So the raw column made the period's upper bound
+/// read `'2026-06-30T12:00:00Z' <= '2026-06-30'`, which is FALSE — every
+/// character up to the bound's length is equal and the column is longer. An
+/// invoice issued on the period's LAST day with no `delivery_date` fell out
+/// of the period entirely, and being the SHARED predicate it left revenue,
+/// VAT and AR together. An under-count with nothing on the tile to show a
+/// row went missing (rule 11).
+///
+/// `SUBSTR(CAST(… AS VARCHAR), 1, 10)` is the same tactic the DSO anchor
+/// uses, and it is correct for all three shapes `issue_date` takes in the
+/// field: it truncates RFC3339 to its date head, is a no-op on a date-only
+/// VARCHAR (hand-seeded / imported rows), and renders a legacy DATE-typed
+/// column as `YYYY-MM-DD`. The `CAST` on **both** COALESCE members is
+/// load-bearing beyond the truncation: with a DATE-typed `issue_date` the
+/// old `COALESCE(CAST(delivery_date AS VARCHAR), issue_date)` could not
+/// bind at all ("Cannot mix values of type VARCHAR and DATE in COALESCE"),
+/// failing the WHOLE financial report rather than one panel.
+///
+/// The window semantics are otherwise untouched: same basis column
+/// (`delivery_date`, falling back to `issue_date` — `CAST(NULL)` is NULL, so
+/// the COALESCE still selects the same member), same inclusive bounds. Only
+/// the compare is corrected from lexicographic-on-mixed-shapes to
+/// date-vs-date.
+const WINDOW_DATE_EXPR: &str =
+    "SUBSTR(COALESCE(CAST(i.delivery_date AS VARCHAR), CAST(i.issue_date AS VARCHAR)), 1, 10)";
+
 fn build_date_where(window: DateWindow) -> (String, bool, bool) {
-    let date_col = "COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date)";
+    let date_col = WINDOW_DATE_EXPR;
     // The outgoing query always supplies the column via `date_col_sql_invoice`;
     // here we just emit the WHERE shape and report which bind slots are used.
     // We re-use the `i.issue_date`/`i.delivery_date` reference at the
@@ -1215,22 +1255,12 @@ fn build_date_where(window: DateWindow) -> (String, bool, bool) {
     let _ = date_col;
     match (window.from, window.to) {
         (Some(_), Some(_)) => (
-            "WHERE COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date) >= ? AND \
-                       COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date) <= ?"
-                .into(),
+            format!("WHERE {WINDOW_DATE_EXPR} >= ? AND {WINDOW_DATE_EXPR} <= ?"),
             true,
             true,
         ),
-        (Some(_), None) => (
-            "WHERE COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date) >= ?".into(),
-            true,
-            false,
-        ),
-        (None, Some(_)) => (
-            "WHERE COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date) <= ?".into(),
-            false,
-            true,
-        ),
+        (Some(_), None) => (format!("WHERE {WINDOW_DATE_EXPR} >= ?"), true, false),
+        (None, Some(_)) => (format!("WHERE {WINDOW_DATE_EXPR} <= ?"), false, true),
         (None, None) => ("".into(), false, false),
     }
 }
@@ -2772,5 +2802,349 @@ mod tests {
                 "{label}: 07-01→07-25 is a real 24-day sample, not a silently dropped one"
             );
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // The SHARED financial window predicate (`build_date_where`).
+    //
+    // Every financial figure the operator sees rides this one predicate:
+    // revenue, the ÁFA breakdown, receivables and their aging, the
+    // cash-flow projection, the EUR/HUF currency split, and the DSO
+    // windowing. A row this predicate drops is not a wrong figure on one
+    // panel — it is a *smaller* figure on all of them at once, with
+    // nothing on screen to say a row went missing.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// A production-shaped `invoice` + `invoice_line` fixture for the window
+    /// pins below.
+    ///
+    /// `issue_lit` is a literal-prefix so one fixture covers all three
+    /// shapes `issue_date` takes in the field: `""` writes the RFC3339
+    /// VARCHAR the billing store actually produces
+    /// (`draft.issue_date.format(&Rfc3339)`), and `"DATE "` writes a legacy
+    /// DATE-typed column.
+    ///
+    /// Amounts are powers of two so any total decodes to exactly one subset
+    /// of invoices: a wrong figure names the row that went missing instead
+    /// of merely being wrong.
+    fn seed_window_fixture(issue_col_ddl: &str, issue_lit: &str, time_suffix: &str) -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory duckdb");
+        let iss = |day: &str| format!("{issue_lit}'{day}{time_suffix}'");
+        conn.execute_batch(&format!(
+            "CREATE TABLE invoice (
+                 id VARCHAR,
+                 currency VARCHAR,
+                 {issue_col_ddl},
+                 delivery_date DATE,
+                 payment_deadline DATE,
+                 huf_equivalent_total DECIMAL(18,0)
+             );
+             CREATE TABLE invoice_line (
+                 invoice_id VARCHAR,
+                 vat_rate_basis_points INTEGER,
+                 vat_rate_kind VARCHAR,
+                 quantity DECIMAL(18,6),
+                 unit_price INTEGER
+             );
+             INSERT INTO invoice VALUES
+               -- IN: first day of the period, no delivery_date. The low
+               -- bound never had the defect ('…-01T12:00:00Z' >= '…-01'
+               -- lexicographically) — pinned so a fix cannot trade one
+               -- boundary for the other.
+               ('firstday',   'HUF', {first},   NULL,             DATE '2026-07-31', NULL),
+               -- IN, normal case: an ordinary mid-month invoice.
+               ('midmonth',   'HUF', {mid},     NULL,             DATE '2026-07-31', NULL),
+               -- IN, normal case: teljesítés inside the period; the basis
+               -- column is the DATE delivery_date, not issue_date.
+               ('delivered',  'HUF', {deliv},   DATE '2026-06-20', DATE '2026-07-31', NULL),
+               -- IN — THE DEFECT. Issued on the period's LAST day with no
+               -- delivery_date, so the basis is the raw RFC3339 issue_date:
+               -- '2026-06-30T12:00:00Z' <= '2026-06-30' is FALSE as a string
+               -- compare, and the invoice fell out of June entirely.
+               ('lastday',    'HUF', {last},    NULL,             DATE '2026-07-31', NULL),
+               -- IN: last day via a DATE delivery_date. Already correct
+               -- pre-fix (CAST of a DATE is date-only); pinned as the
+               -- control that isolates the defect to the issue_date half.
+               ('deliv_last', 'HUF', {mid},     DATE '2026-06-30', DATE '2026-07-31', NULL),
+               -- OUT: issued the day AFTER the period ends. The fix must not
+               -- buy inclusion at the price of over-inclusion.
+               ('nextday',    'HUF', {next},    NULL,             DATE '2026-07-31', NULL),
+               -- OUT: issued the day BEFORE the period starts.
+               ('prevmonth',  'HUF', {prev},    NULL,             DATE '2026-07-31', NULL),
+               -- OUT, normal case: issued in-period but fulfilled after it.
+               -- Teljesítés basis ⇒ it belongs to July, not June.
+               ('deliv_next', 'HUF', {mid},     DATE '2026-07-05', DATE '2026-07-31', NULL),
+               -- IN, EUR: same last-day shape, for the currency-split
+               -- consumer of this predicate.
+               ('eur_last',   'EUR', {last},    NULL,             DATE '2026-07-31', 4000000);
+             INSERT INTO invoice_line VALUES
+               ('firstday',   2700, 'Percent', 1.0,   100000),
+               ('midmonth',   2700, 'Percent', 1.0,   200000),
+               ('delivered',  2700, 'Percent', 1.0,   400000),
+               ('lastday',    2700, 'Percent', 1.0,   800000),
+               ('deliv_last', 2700, 'Percent', 1.0,  1600000),
+               ('nextday',    2700, 'Percent', 1.0,  3200000),
+               ('prevmonth',  2700, 'Percent', 1.0,  6400000),
+               ('deliv_next', 2700, 'Percent', 1.0, 12800000),
+               ('eur_last',   2700, 'Percent', 1.0,   500000);",
+            first = iss("2026-06-01"),
+            mid = iss("2026-06-15"),
+            deliv = iss("2026-06-10"),
+            last = iss("2026-06-30"),
+            next = iss("2026-07-01"),
+            prev = iss("2026-05-31"),
+        ))
+        .expect("seed invoice + invoice_line rows");
+        conn
+    }
+
+    /// June 2026, the way the operator's period selector resolves it.
+    fn june_2026() -> DateWindow {
+        DateWindow {
+            from: Some(d(2026, Month::June, 1)),
+            to: Some(d(2026, Month::June, 30)),
+        }
+    }
+
+    /// **The money pin.** An invoice issued on the LAST day of the period
+    /// with no `delivery_date` must land in that period's revenue, ÁFA and
+    /// receivables.
+    ///
+    /// `build_date_where` compares the basis column against the operator's
+    /// date-only bounds *as a string*. In production `invoice.issue_date` is
+    /// `VARCHAR NOT NULL` holding RFC3339 —
+    /// `draft.issue_date.format(&Rfc3339)` in
+    /// `modules/billing/src/adapters/duckdb_store.rs` — so the compare that
+    /// decided June's contents was `'2026-06-30T12:00:00Z' <= '2026-06-30'`,
+    /// which is FALSE: the string is longer and every leading character is
+    /// equal. The invoice silently left the period. Because this is the
+    /// SHARED window predicate, it left revenue, VAT and AR together, and a
+    /// period that is quietly short is exactly the under-count nobody can
+    /// see on a tile (rule 11).
+    ///
+    /// The seed is RFC3339 for that reason: a date-only fixture is unfaithful
+    /// to the write path and lets the broken predicate pass green.
+    ///
+    /// Mutation check (verified red): restore the pre-fix
+    /// `COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date)` in
+    /// [`build_date_where`] and `lastday` (800 000 net / 216 000 VAT) drops
+    /// out — revenue 2 300 000, VAT 621 000, AR gross 2 921 000, four
+    /// invoices instead of five.
+    #[test]
+    fn last_day_rfc3339_invoice_stays_in_revenue_vat_and_receivables() {
+        let conn = seed_window_fixture("issue_date VARCHAR", "", "T12:00:00Z");
+        let groups = query_outgoing_groups(&conn, june_2026(), DateBasis::Teljesites)
+            .expect("the outgoing query must bind and run");
+
+        let mut ids: Vec<&str> = groups.iter().map(|g| g.invoice_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![
+                "deliv_last",
+                "delivered",
+                "eur_last",
+                "firstday",
+                "lastday",
+                "midmonth"
+            ],
+            "June is the five HUF in-period invoices plus the EUR one; \
+             `lastday` missing is the RFC3339 boundary drop, `nextday` / \
+             `prevmonth` / `deliv_next` present is over-inclusion"
+        );
+
+        // Every invoice unpaid and NAV-SAVED, so receivables mirror revenue
+        // exactly and a dropped row is visible on both.
+        let traces: HashMap<String, ReportTrace> = ids
+            .iter()
+            .map(|id| ((*id).to_string(), saved_trace()))
+            .collect();
+        let agg = aggregate_outgoing(groups, &traces, d(2026, Month::July, 15), &HashMap::new());
+
+        // 100 000 + 200 000 + 400 000 + 800 000 + 1 600 000. Powers of two:
+        // 2 300 000 means `lastday` dropped, 5 500 000 means `nextday` leaked.
+        assert_eq!(
+            agg.revenue.huf.net_minor, 3_100_000,
+            "June revenue must carry the last-day invoice's 800 000"
+        );
+        assert_eq!(
+            agg.revenue.huf.vat_minor, 837_000,
+            "27% of each line, per-line truncated: 27 000 + 54 000 + 108 000 + 216 000 + 432 000"
+        );
+        assert_eq!(agg.revenue.huf.gross_minor, 3_937_000);
+        assert_eq!(agg.revenue.huf.count, 5);
+
+        // The ÁFA report's filed figure — the money on the tax return.
+        assert_eq!(
+            agg.vat_collected.huf.vat_minor, 837_000,
+            "VAT collected must not be short by the last-day invoice's 216 000"
+        );
+        assert_eq!(
+            agg.vat_breakdown.get(&("HUF".to_string(), 2700)),
+            Some(&(3_100_000, 837_000)),
+            "the 27% bucket carries the whole period, not the period minus its last day"
+        );
+
+        // Receivables ride the same predicate: an invoice that fell out of
+        // the window is also an invoice nobody chases.
+        assert_eq!(agg.receivables.huf.gross_minor, 3_937_000);
+        assert_eq!(agg.receivables.huf.count, 5);
+        // Aging is NOT currency-split (`AgingPanel` holds a bare
+        // `AmountAggregate`), so this figure is HUF gross + EUR gross in
+        // their own minor units: 3 937 000 + 635 000. That mixing is a
+        // pre-existing property of the panel and out of this fix's scope —
+        // asserted as it actually behaves so the pin measures the window,
+        // not a currency question it does not answer.
+        assert_eq!(
+            agg.receivables_aging.current.gross_minor, 4_572_000,
+            "deadline 2026-07-31 against a 2026-07-15 today is Current for all six"
+        );
+        assert_eq!(agg.receivables_aging.current.count, 6);
+        assert_eq!(agg.outstanding_past_deadline_count, 0);
+
+        // The EUR half of the split, same last-day shape.
+        assert_eq!(agg.revenue.eur.net_minor, 500_000);
+        assert_eq!(agg.revenue.eur.count, 1);
+    }
+
+    /// The same predicate seen by the OTHER `build_date_where` consumer —
+    /// the EUR→HUF currency split (S262 / PR-251). It reads `invoice`
+    /// directly, without the `invoice_line` join, so it is a genuinely
+    /// separate binding of the window and would have kept dropping the
+    /// last-day EUR invoice even if only the outgoing query were fixed.
+    ///
+    /// Mutation check (verified red): pre-fix predicate → 0, because the
+    /// only EUR row in the fixture is the last-day one.
+    #[test]
+    fn currency_split_keeps_the_last_day_rfc3339_invoice() {
+        let conn = seed_window_fixture("issue_date VARCHAR", "", "T12:00:00Z");
+        let got = query_eur_huf_equivalent(&conn, june_2026(), DateBasis::Teljesites)
+            .expect("the currency-split query must bind and run");
+        assert_eq!(
+            got, 4_000_000,
+            "the last-day EUR invoice's snapshot-rate HUF equivalent belongs to June"
+        );
+    }
+
+    /// The window predicate against `issue_date`'s two NON-RFC3339 shapes.
+    ///
+    /// A legacy install may still hold `issue_date` as a real DATE column
+    /// (see `modules/billing/tests/migration_pr73_old_schema.rs`), and
+    /// hand-seeded or imported rows carry a date-only VARCHAR. The pre-fix
+    /// predicate could not even *bind* the DATE case on a bounded window —
+    /// `COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date)` raises
+    /// "Cannot mix values of type VARCHAR and DATE in COALESCE" — which
+    /// fails the WHOLE financial report, not one panel. Normalising both
+    /// COALESCE members to `SUBSTR(CAST(… AS VARCHAR), 1, 10)` makes the
+    /// COALESCE type-consistent and the compare date-vs-date in all three
+    /// shapes.
+    ///
+    /// Same fixture, same expected membership as the RFC3339 pin: the point
+    /// is that the shape of the stored column does not move the money.
+    ///
+    /// Mutation checks (both verified red): drop the `CAST` on the
+    /// `issue_date` member → the DATE half errors out of
+    /// `query_outgoing_groups`; drop the `SUBSTR` → nothing changes here
+    /// (these shapes are already date-only), which is precisely why the
+    /// RFC3339 pin above has to exist alongside this one.
+    #[test]
+    fn window_binds_and_filters_legacy_date_and_date_only_varchar() {
+        for (label, issue_col_ddl, issue_lit) in [
+            ("legacy DATE column", "issue_date DATE", "DATE "),
+            ("date-only VARCHAR", "issue_date VARCHAR", ""),
+        ] {
+            let conn = seed_window_fixture(issue_col_ddl, issue_lit, "");
+            let groups = query_outgoing_groups(&conn, june_2026(), DateBasis::Teljesites)
+                .unwrap_or_else(|e| panic!("{label}: the outgoing query must not error: {e:#}"));
+
+            let mut ids: Vec<&str> = groups.iter().map(|g| g.invoice_id.as_str()).collect();
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                vec![
+                    "deliv_last",
+                    "delivered",
+                    "eur_last",
+                    "firstday",
+                    "lastday",
+                    "midmonth"
+                ],
+                "{label}: the stored shape of issue_date must not change which \
+                 invoices belong to June"
+            );
+
+            let traces: HashMap<String, ReportTrace> = ids
+                .iter()
+                .map(|id| ((*id).to_string(), saved_trace()))
+                .collect();
+            let agg =
+                aggregate_outgoing(groups, &traces, d(2026, Month::July, 15), &HashMap::new());
+            assert_eq!(
+                (
+                    agg.revenue.huf.net_minor,
+                    agg.revenue.huf.vat_minor,
+                    agg.receivables.huf.gross_minor
+                ),
+                (3_100_000, 837_000, 3_937_000),
+                "{label}: revenue / VAT / AR match the RFC3339 fixture exactly"
+            );
+
+            assert_eq!(
+                query_eur_huf_equivalent(&conn, june_2026(), DateBasis::Teljesites)
+                    .unwrap_or_else(|e| panic!("{label}: currency split must not error: {e:#}")),
+                4_000_000,
+                "{label}: the currency split binds the same normalised predicate"
+            );
+        }
+    }
+
+    /// The half-open shapes of the window. `build_date_where` emits three
+    /// different predicates and the fix has to reach all of them — an
+    /// operator running "from 2026-06-01" or "up to 2026-06-30" is on a
+    /// different SQL string than the bounded period selector.
+    ///
+    /// Mutation check (verified red): fix only the two-bound arm and the
+    /// `to`-only case still drops `lastday`, 2 300 000 instead of 3 100 000.
+    #[test]
+    fn half_open_windows_share_the_normalised_predicate() {
+        let conn = seed_window_fixture("issue_date VARCHAR", "", "T12:00:00Z");
+        let net_of = |window: DateWindow| {
+            let groups = query_outgoing_groups(&conn, window, DateBasis::Teljesites)
+                .expect("the outgoing query must bind and run");
+            groups
+                .iter()
+                .filter(|g| g.currency == "HUF")
+                .map(|g| g.net_minor)
+                .sum::<i64>()
+        };
+
+        // `to`-only: everything up to and including 2026-06-30 — the
+        // last-day invoice plus the four earlier HUF ones, and `prevmonth`.
+        assert_eq!(
+            net_of(DateWindow {
+                from: None,
+                to: Some(d(2026, Month::June, 30)),
+            }),
+            9_500_000,
+            "3 100 000 in-June + 6 400 000 prevmonth; 8 700 000 means the \
+             upper bound still drops the last-day invoice"
+        );
+
+        // `from`-only: 2026-06-30 onwards — the last-day invoice, `nextday`,
+        // and `deliv_next` (fulfilled 2026-07-05). `deliv_last` is on the
+        // bound via its DATE delivery_date, so it is in too.
+        assert_eq!(
+            net_of(DateWindow {
+                from: Some(d(2026, Month::June, 30)),
+                to: None,
+            }),
+            18_400_000,
+            "800 000 lastday + 1 600 000 deliv_last + 3 200 000 nextday + \
+             12 800 000 deliv_next"
+        );
+
+        // Unbounded — every HUF row, the control that says the fixture sums
+        // to what the arithmetic above assumes.
+        assert_eq!(net_of(DateWindow::unbounded()), 25_500_000);
     }
 }
