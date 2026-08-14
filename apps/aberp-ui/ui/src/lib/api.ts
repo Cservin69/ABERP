@@ -4891,6 +4891,21 @@ export interface FinancialReport {
   deltas: PeriodDeltas;
   annual_running: AnnualRunningPanel;
   deferred_notes: string[];
+  ledger_diagnostics: LedgerDiagnostics;
+}
+
+/** Integrity signal for one run of the aggregator. `unparseable_entries >
+ * 0` means the backend's audit-ledger walk hit entries whose payload it
+ * could not decode; those entries are reflected in NO figure above, so the
+ * whole snapshot must be presented as possibly-incomplete rather than
+ * authoritative. Zero on every healthy report.
+ *
+ * `unparseable_entry_ids` is capped backend-side (50); the count is exact,
+ * so `unparseable_entries > unparseable_entry_ids.length` means "and
+ * more". */
+export interface LedgerDiagnostics {
+  unparseable_entries: number;
+  unparseable_entry_ids: string[];
 }
 
 /** Fetch the financial-statistics snapshot for the given period +

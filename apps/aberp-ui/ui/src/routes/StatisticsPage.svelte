@@ -305,6 +305,34 @@
       <span><strong>Today:</strong> {r.period.today}</span>
     </p>
 
+    <!-- Audit-ledger integrity banner. The backend's ledger walk drops any
+         entry whose payload it cannot decode; it used to do so silently,
+         so a malformed payment or ack just made the figures quietly wrong.
+         Now it counts them, and a non-zero count means EVERY figure on
+         this page may be incomplete — say so above the numbers, not in a
+         collapsed disclosure. Zero on a healthy ledger, so this is
+         invisible in normal operation. -->
+    {#if r.ledger_diagnostics.unparseable_entries > 0}
+      <div class="stats__integrity" role="alert">
+        <strong>
+          {r.ledger_diagnostics.unparseable_entries} audit
+          {r.ledger_diagnostics.unparseable_entries === 1 ? "record" : "records"}
+          could not be read — figures below may be incomplete.
+        </strong>
+        <p>
+          Ezek a bejegyzések egyik számban sincsenek benne. /
+          These entries are reflected in none of the figures. Audit entry
+          {r.ledger_diagnostics.unparseable_entry_ids.length === 1 ? "id" : "ids"}:
+          <span class="stats__integrity-ids"
+            >{r.ledger_diagnostics.unparseable_entry_ids.join(", ")}</span
+          >{#if r.ledger_diagnostics.unparseable_entries > r.ledger_diagnostics.unparseable_entry_ids.length}
+            … (+{r.ledger_diagnostics.unparseable_entries -
+              r.ledger_diagnostics.unparseable_entry_ids.length} more; see the server log)
+          {/if}
+        </p>
+      </div>
+    {/if}
+
     <!-- Row 1: revenue / expenses / gross profit / VAT-to-pay -->
     <section class="stats__cards" aria-label="Headline figures">
       <article class="stats__card">
@@ -1059,6 +1087,25 @@
   }
   .stats__error strong {
     color: var(--color-signal-negative);
+  }
+  /* Ledger-integrity banner — same negative chrome as the load-failure
+   * box, because "the numbers may be wrong" is the same class of news as
+   * "there are no numbers". */
+  .stats__integrity {
+    border: 1px solid var(--color-signal-negative);
+    border-radius: 4px;
+    padding: var(--space-3);
+    background: var(--color-surface-sunken);
+    color: var(--color-text-primary);
+  }
+  .stats__integrity strong {
+    color: var(--color-signal-negative);
+  }
+  .stats__integrity-ids {
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-secondary);
+    word-break: break-all;
   }
 
   /* S262 / PR-251 — top-N number input matches the period select chrome. */
