@@ -801,7 +801,11 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // ADR-0110 D7 — the Handle's WAL fence fired
         // (`db.durability_loss_detected`). `db.`-scoped; the payload is fence
         // telemetry (breach code + the watermark/observed byte counts + the
-        // audit head seq), never NAV bytes.
+        // audit head seq), never NAV bytes. LEGACY as of D7.6 (§15.3/§16): the
+        // fence now records to the non-chained `<db>.durability-alert` marker,
+        // so nothing in this tree writes this kind any more. Kept because a
+        // tenant recovered from incident 00012 may still carry such a row, and
+        // a bundle holding one must stay verifiable.
         | EventKind::DbDurabilityLossDetected
         // ADR-0110 D7 / B2 — the operator acknowledged a durability alert.
         // `db.`-scoped consent record, no NAV bytes.

@@ -1,12 +1,15 @@
 # ADR-0110 — The durable-commit contract and business-state boot replay
 
 - **Status:** **Partially implemented** — D3 landed 2026-08-09 (rev. 3); D7 (the
-  WAL-truncation fence, added after incident 00012) landed 2026-08-12 and ships
+  WAL-truncation fence, added after incident 00012) landed 2026-08-12 and shipped
   DISARMED pending the PR #3 opener sweep (D7.6); D8/D9 closed that sweep's two
-  halves (§13, §14); **D5.1 landed 2026-08-13 (§15)** — a frozen audit mirror is
+  halves (§13, §14); D5.1 landed 2026-08-13 (§15) — a frozen audit mirror is
   now a raised, operator-visible durability fault, recorded in a NON-CHAINED
   marker rather than the ledger (route (a): a machine-spawned diagnostic must
-  never consume a ledger seq). D1, D2,
+  never consume a ledger seq). **D7.6 landed 2026-08-13 (§16): D7's own
+  diagnostic moved to that same marker, and the fence is ARMED
+  (`wal_fence_enabled` defaults `true`). A real WAL truncation now fails the ack
+  and raises the full-width red banner in production.** D1, D2,
   D4, D5.2/D5.3 and the payload widening remain proposed. Adversarially reviewed
   2026-08-08; verdict *sound after changes*, listed in §11 and folded into
   §5/§6/§7. Rev-3's corrections are in §12.
@@ -1465,7 +1468,12 @@ The corrected gate:
    was the LAST opener in the tree that could fold a live serve's WAL, so with
    it fenced the GROUP-B live-fold hazard is closed and this gate's substantive
    items are both green.
-3. ❌ A re-run adversarial over the corrected D8 **+ D9**.
+3. ✅ A re-run adversarial over the corrected D8 **+ D9** — run on the D7.6
+   head, which is the first head where the flag is actually on.
+4. ✅ **D7's diagnostic off the audit chain.** Not on the original gate, and it
+   should have been: §15.3 identified it while D5 was being built, and §16
+   closed it. See there for why an armed fence with an on-chain diagnostic is
+   the brick, not the alarm.
 
 Arming it before (2) would have reproduced exactly the failure mode D7's B1 test
 describes, with a different command as the trigger. With (2) done, the flag flip
@@ -1696,7 +1704,7 @@ Not closed, and knowingly out of scope:
   that triage; closing it is either a flock or a migration, in its own change.
 - **`wal_fence_enabled` is NOT flipped here.** Separate PR, deliberately: a fence
   armed in the same commit as its own precondition leaves §13.3 item 3's re-run
-  adversarial nothing to check.
+  adversarial nothing to check. **Done 2026-08-13 — §16.**
 - **Moving `rebuild_stock_cache.rs|run` to the read-fork allow-list.** Fencing
   EARNS that move; it does not perform it. The baseline header reserves it as a
   deliberate follow-up and it stays one.
@@ -2006,6 +2014,12 @@ which runs the freeze against an explicitly disarmed config and requires the
 alert — and goes RED when the raise is wrapped in
 `if handle.config.wal_fence_enabled`.
 
+**Superseded 2026-08-13 by D7.6 (§16.6).** That replacement kept one residual
+`assert!(!HandleConfig::default().wal_fence_enabled)` — the same vacuity, one
+line below its own fix — which arming the fence turned red without D5 changing.
+It is now `the_alarm_fires_in_both_wal_fence_states` and drives the freeze under
+BOTH configs, so no future flip can make it vacuous or red.
+
 ### 15.8 The pins
 
 `crates/aberp-db/tests/adr0110_d5_mirror_freeze_alert.rs`, all against
@@ -2021,7 +2035,7 @@ alert — and goes RED when the raise is wrapped in
 | `a_divergence_this_handle_never_saw_agree_must_not_raise` | treat `last_synced_head.is_none()` as a loss |
 | `a_mirror_advanced_by_someone_else_must_not_raise` | weaken the regression test to `now <= prev` |
 | `the_freeze_is_recorded_once_per_episode` | delete the `freeze_reported` gate (4 records instead of 1) |
-| `the_alarm_fires_with_the_wal_fence_disarmed` | gate the raise on `wal_fence_enabled` |
+| `the_alarm_fires_in_both_wal_fence_states` (was `…_with_the_wal_fence_disarmed`; §16.6) | gate the raise on `wal_fence_enabled` (reds the disarmed half); invert the gate (reds the armed half) |
 | `a_torn_marker_record_counts_as_a_loss` (R5-N1) | restore the reader's skip-and-`warn!` arm |
 | `a_torn_marker_record_is_still_acknowledgeable` (R5-N1) | stamp torn records at `now_utc`; or drop the terminate-a-torn-record step in `append_line` |
 | `an_unreadable_marker_keeps_the_banner_up_and_refuses_to_clear` (R5-N2) | clear the flag despite a failed `record_ack` |
@@ -2104,3 +2118,172 @@ torn records at `now_utc`, or drop the terminate-a-torn-record step), and
 despite a failed `record_ack`). The infinite loop is verified by construction —
 reverting `break` to `continue` hangs that pin rather than reddening it, which
 is how it was found.
+
+## 16. D7.6 — the fence is ARMED, and its diagnostic went off-chain first (2026-08-13)
+
+Two coupled changes, one PR, in this order — the order is the substance, not
+the packaging.
+
+### 16.1 The precondition: D7's diagnostic must not consume a ledger seq
+
+§15.3 left this standing, named it precisely, and said it was **"a precondition
+for arming the fence, not an optional tidy-up."** D5 obeyed Ervin's rule (route
+(a), 2026-08-13) — *a machine-spawned durability diagnostic is not a business
+event and must never consume a ledger seq* — and D7 did not. It could not bite
+while the fence shipped dark. Arming it is exactly what makes it bite.
+
+`Handle::raise_durability_alert` now records to the SAME non-chained
+`<db>.durability-alert` marker D5 writes, with `trigger =
+wal_truncated_under_writer` and the real [`WalBreach`] code. `emit_durability_
+loss_audit` — the ledger append, its `Handle::write()`, its `try_clone` and its
+`Ledger::from_connection` — is **deleted**, not gated. Nothing in this tree
+appends `db.durability_loss_detected` any more.
+
+The boot re-derivation's two LEDGER readers are **kept**, deliberately. A prod
+tenant recovered from incident 00012 may already hold such a row, and retiring
+the reader would silently stop re-raising it. They are backward-compat parsing
+now, and they stay under test through
+`an_ack_that_reached_only_the_db_still_clears_a_loss_that_reached_only_the_mirror`,
+which was re-staged to append a legacy row directly rather than to fire the
+fence — a reader nothing writes to is the kind that rots unnoticed.
+
+Everything the operator sees is unchanged: one sticky alert, one
+`GET /health durability_alert`, one red banner, one acknowledge route. Both
+triggers share all of it and are told apart by the marker's `trigger` column.
+
+**A correction to §15.7/N2 worth recording.** N2 said the ledger-sourced path
+keeps the hard-coded `WalVanished` default because it "is right for the fence
+rows that dominate them". With the writer moved, the fence's rows now carry
+their real code through the marker, so a restart after a `MainReplaced` breach
+reports `MainReplaced` rather than guessing. The default now applies only to
+genuinely legacy rows. Pinned by
+`the_fence_alert_survives_a_restart_with_the_breach_it_was_detected_as`, which
+uses an inode swap precisely so `WalVanished` cannot pass it by accident.
+
+### 16.2 Where the durable fork actually lives — §15.3's residual was right for the wrong reason
+
+§15.3 predicted the armed-fence brick as "its ledger row would consume the seq
+that forks the chains". The mechanism is real; the location was wrong, and the
+mutation is what found it.
+
+**The DB copy of the diagnostic cannot survive.** The fold that fires the fence
+severs the live DuckDB instance from its WAL: every commit after it returns
+`Ok` with `wal_len` pinned at 0 and the bytes reach no file. That is incident
+00012 itself, and it means the on-chain row dies with the process. The first cut
+of the brick-dead pin therefore stayed GREEN under its own mutation — it was
+looking in the DB.
+
+The fork is durable in the **mirror**. `emit_durability_loss_audit` relied on
+`WriteGuard::drop`'s lockstep `sync_mirror` to carry the row to the `fsync`'d
+store, and said so as a *feature*: "the durable copy lands in the mirror even
+when the DB copy does not." That is what leaves the append-only store one entry
+ahead of a DB that will never hold that seq.
+
+**How it bricks.** The tenant does not sit still. The next thing to touch it —
+a flock-fenced CLI one-shot, which runs no `ensure_consistent_with_db` of its
+own — commits one business row, and it lands at exactly the seq the mirror is
+holding the diagnostic at. The two stores are now the same length with different
+head hashes, and the reconciler's **equal-length arm** refuses:
+
+```text
+audit-ledger mirror is unrecoverable (mirror head entry_hash diverges
+from the DB at equal length (seq=4)); the original was preserved to
+…/aberp.duckdb.audit.log.corrupt-….bak
+```
+
+`serve` exits non-zero and does not boot. Note the arm: **equal-length, not
+`MirrorAheadOfDb`** — the window §15.5 (R5-N3) describes. Recorded exactly,
+because a note naming the wrong arm sends the next reader to the wrong code.
+
+Without the diagnostic the same sequence is benign: nothing consumed that seq,
+the CLI's row lands in both stores, and the tenant boots. The only difference
+between the two runs is whether a machine-spawned diagnostic took a ledger seq.
+
+### 16.3 The flip, and the precondition re-verified at THIS head
+
+`HandleConfig::default().wal_fence_enabled` is `true`. Production always
+constructs through `Handle::open_default`, so that one line is the whole flip.
+
+§13.3's method note says "GROUP A is empty" must be re-derived from the tree,
+never read off a governance file. Re-derived here:
+
+| Check | Result |
+|---|---|
+| `serve.rs` openers after `open_tenant_handle` (:1633) | only `record_upgrade_snapshot_mismatch_audit` (:6452), whose sole caller is :1127 — pre-Handle, the documented false positive |
+| `cut_gate_read_fork.sh` | green; GROUP A empty, 20 structural forks held at baseline |
+| `cut_gate_opener_census.sh` | green; 62 frozen openers, no add/remove/swap (P1+P2) |
+| `cut_gate_write_fork.sh` | green; no half-migrated subsystem |
+| `adr0110_d9_flock_shape.rs` | 3/3 green |
+| commits since the D5 merge (`d078c45..HEAD`) | two reports fixes; the only new openers are `open_in_memory` inside `#[cfg(test)]` — no new folder |
+
+No residual folder. Nothing blocked the flip.
+
+### 16.4 What the operator sees now — the consequence to state plainly
+
+**A real durability loss now shows the full-width red banner in production.**
+Before this PR the same event was silent: the fence detected it and the alert
+was raised only when a Handle was constructed with an explicitly armed config,
+which nothing in production did. From this head on, a genuine WAL truncation
+(a) fails that `durable_ack` and the failure PROPAGATES, so the money path
+reports the write as failed, and (b) raises the sticky alert, so the banner is
+up until an operator acknowledges it.
+
+That is the intended behaviour and the entire point of D7 — but it does mean
+the banner is now reachable in prod, so the first question when one appears is
+whether it is a real fold or a regression in the no-false-positive set below.
+
+**Owed before deploy:** a human eyeball on the RENDERED banner. Every pin here
+is on the `/health` field and the sticky alert; none of them looks at pixels,
+and this is the first change that makes the banner reachable on a real box.
+
+### 16.5 The pins
+
+New in `crates/aberp-db/tests/adr0110_d7_wal_fence.rs`, all against
+`armed_config()` unless noted, each mutation-verified:
+
+| Pin | Mutation that reds it |
+| --- | --- |
+| `the_fence_ships_armed_by_default` | set the default back to `false` |
+| `an_armed_fence_records_the_marker_and_consumes_no_ledger_seq` | restore the ledger append (reds the mirror half); drop `record_loss` (reds the marker half while the ack still fails) |
+| `the_d5_b1_scenario_driven_through_the_armed_fence_must_boot_cleanly` | restore the ledger append — reds at the mirror control, and the boot behind it was separately confirmed to refuse (§16.2) |
+| `the_fence_alert_survives_a_restart_with_the_breach_it_was_detected_as` | drop `record_loss`; or hard-code `WalVanished` in restore (reds the breach half alone) |
+| `an_acknowledged_fence_alert_stays_down_across_a_restart` | skip `record_ack` in `clear_durability_alert` |
+| `both_marker_triggers_coexist_and_the_newest_decides_the_breach` | make `note_loss` keep the FIRST loss instead of the newest; or skip `record_ack` |
+| `sustained_writes_past_the_auto_checkpoint_threshold_must_not_fire` | drop the `wal_autocheckpoint` raise to DuckDB's stock 16 MiB |
+| `the_stale_staging_sweep_must_not_fire` | (by construction — a widened `.creating-` prefix deletes the live WAL) |
+| `a_flock_refused_cli_must_not_fire` | (by construction — without the flock this is `foreign_open_and_close`, which `the_group_a_shape_must_fail_the_ack` proves fires) |
+
+Extended elsewhere: `snapshot_e2e.rs::snapshot_does_not_fold_the_handles_wal`
+now also requires a healthy `durable_ack` and a quiet banner, so a copy-based
+snapshot is pinned silent on an armed box;
+`adr0110_d7_durability_alert_route.rs::acknowledging_clears_the_banner_records_it_and_survives_a_restart`
+now requires the LOSS in the marker and its ABSENCE from the chain, with the
+attributable `db.durability_alert_acknowledged` row still on-chain.
+
+The pre-existing armed-fence silence set is unchanged and still green, which is
+the point of it: boot, boot onto a pre-existing WAL, the first ack after a boot
+fold, concurrent daemon writes, a legitimate reopen, a long healthy run, and an
+unreadable WAL that is not a vanished one.
+
+### 16.6 Two flag pins re-aimed, and why it is the same lesson twice
+
+Arming the default turned two off-state pins red without either property
+changing, because both were keyed to `HandleConfig::default()` while claiming
+to be about the FLAG:
+
+- `a_disarmed_fence_leaves_the_watermark_completely_untouched` (crate-internal)
+  and `with_the_fence_disarmed_the_group_a_shape_does_not_fail_the_ack` /
+  `a_disarmed_fence_never_touches_the_watermark` now build an explicitly
+  disarmed config. The disarmed body is KEPT and still pinned: it is bit-for-bit
+  the D3 ack, and it is what a bisect through the two months the fence shipped
+  dark lands on.
+- D5's `the_alarm_fires_with_the_wal_fence_disarmed` carried a residual
+  `assert!(!HandleConfig::default().wal_fence_enabled)` — the very vacuity N3
+  was raised to remove, left behind one line below the fix. Rather than
+  re-point it at the new default and re-arm the same landmine for the next
+  flip, it is now `the_alarm_fires_in_both_wal_fence_states` and drives the
+  freeze under BOTH configs. "Ungated" is a claim about both branches, so it is
+  asserted on both, and no future flip can make it vacuous or red.
+
+The lesson is §15.8's, recurring: **a test about a flag must set the flag.** A
+pin keyed to whatever the default happens to be is a pin about the default.

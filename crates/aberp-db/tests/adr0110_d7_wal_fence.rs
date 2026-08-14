@@ -117,11 +117,17 @@ fn seed(db: &Path) {
     conn.execute_batch("CHECKPOINT;").expect("seed fold");
 }
 
-/// A Handle with the D7 fence **ARMED**. Every fence test uses this, because
-/// `HandleConfig::default()` ships it DISARMED (B1) and will until the CLI-against-
-/// live opener class is fenced (ADR-0110 D8 closed the in-serve one) — see [`the_fence_ships_disarmed_by_default`] and
-/// [`with_the_fence_disarmed_the_group_a_shape_does_not_fail_the_ack`], which
-/// pin that other state.
+/// A Handle with the D7 fence **ARMED**.
+///
+/// As of ADR-0110 D7.6 (2026-08-13) this is what `HandleConfig::default()` gives
+/// too, so these tests now describe the production posture rather than a
+/// hypothetical one. It stays an explicit config all the same: what every test
+/// below asserts is a property of the ARMED fence, and a test that says so out
+/// loud cannot be quietly re-aimed by a future change to the default.
+/// [`the_fence_ships_armed_by_default`] is where the default itself is pinned;
+/// [`with_the_fence_disarmed_the_group_a_shape_does_not_fail_the_ack`] and
+/// [`a_disarmed_fence_never_touches_the_watermark`] pin the off-state, which is
+/// kept because it is bit-for-bit the pre-D7 D3 ack.
 fn handle(db: &Path) -> std::sync::Arc<Handle> {
     Handle::open(db, tenant(), armed_config()).expect("open shared Handle (fence ARMED)")
 }
@@ -129,6 +135,16 @@ fn handle(db: &Path) -> std::sync::Arc<Handle> {
 fn armed_config() -> HandleConfig {
     HandleConfig {
         wal_fence_enabled: true,
+        ..Default::default()
+    }
+}
+
+/// The fence explicitly OFF. Since D7.6 armed the shipping default this is no
+/// longer `HandleConfig::default()`, and the off-state pins say so rather than
+/// leaning on the default — the D5-N3 lesson, applied before it could bite.
+fn disarmed_config() -> HandleConfig {
+    HandleConfig {
+        wal_fence_enabled: false,
         ..Default::default()
     }
 }
@@ -152,6 +168,32 @@ fn commit_one(h: &Handle, label: &str) {
         None,
     )
     .expect("append");
+    tx.commit().expect("commit");
+    drop(guard);
+}
+
+/// One committed `db.durability_loss_detected` row — the LEGACY on-chain
+/// diagnostic, as a prod tenant recovered from incident 00012 may still hold it.
+///
+/// Nothing in this tree writes this kind any more: ADR-0110 §15.3 routed D7's
+/// fence to the non-chained marker, as D5 was already routed. The
+/// `restore_durability_alert` readers for it are kept for backward
+/// compatibility, and this is what lets them stay under test now that no
+/// production path produces one.
+fn commit_legacy_loss_row(h: &Handle) {
+    let meta = LedgerMeta::new(tenant(), BinaryHash::from_bytes([7u8; 32]));
+    let mut guard = h.write().expect("acquire the shared writer");
+    let tx = guard.conn().transaction().expect("begin");
+    let actor = Actor::from_local_cli("ulid-legacy-loss".to_string(), "system:aberp-db");
+    append_in_tx(
+        &tx,
+        &meta,
+        EventKind::DbDurabilityLossDetected,
+        br#"{"trigger":"wal_truncated_under_writer","breach":"wal_vanished"}"#.to_vec(),
+        actor,
+        None,
+    )
+    .expect("append the legacy loss row");
     tx.commit().expect("commit");
     drop(guard);
 }
@@ -561,37 +603,54 @@ fn the_healthy_path_still_journals_what_it_synced() {
     );
 }
 
-// ── B1 — THE FENCE SHIPS DISARMED ───────────────────────────────────────────
+// ── D7.6 — THE FENCE SHIPS ARMED ────────────────────────────────────────────
 
-/// **The shipping default is OFF — and as of D9 that is a SEQUENCING pin, not a
-/// hazard pin.**
+/// **The shipping default is ON, as of ADR-0110 D7.6 (2026-08-13).**
 ///
-/// Both opener classes are now closed. D8 swept the in-serve one (GROUP A in the
-/// read-fork baseline is empty). D9 closed the CLI-against-live one the only way
-/// a separate OS process can be closed — mutual exclusion, not migration: every
-/// DB-mutating one-shot takes the F-E whole-DB writer flock before it opens the
-/// tenant DB, so it REFUSES against a live serve instead of folding its WAL.
-/// `rebuild-stock-cache` was the last one that did not, and it was the acute one:
-/// ADR-0061 §3 documents it as the recovery command to run when the stock cache
-/// disagrees with its ledger — i.e. the one an operator runs *while the shop is
-/// live*. It is fenced and pinned by
-/// `aberp-inventory/tests/rebuild_stock_cache_flock.rs`.
-///
-/// What this test therefore holds is the ORDER: the flip is its own PR, so the
-/// re-run adversarial (ADR-0110 §13.3 item 3) has a head to check where the
-/// precondition landed and the flag did not. A fence armed in the same commit as
-/// its own precondition gives an adversarial nothing to disagree with.
-///
-/// The cost of getting the order wrong has not changed, and is why this stays a
-/// test rather than a comment: armed over any surviving fold, the next
-/// issue-invoice or mark-paid fails `durable_ack`, and that failure PROPAGATES
-/// via `?` (the D3-C cut-gate enforces exactly that) — a committed invoice
+/// This pin is the inverse of the one it replaces, and the reason it is still a
+/// pin is that arming was gated on three preconditions that each have to STAY
+/// closed. If any regresses, the fence stops being an alarm and becomes a
+/// money-path outage: armed over a surviving fold, the next issue-invoice or
+/// mark-paid fails its `durable_ack`, and that failure PROPAGATES via `?` (the
+/// D3-C cut-gate enforces exactly that propagation) — a committed invoice
 /// reported as failed, NAV handoff skipped.
+///
+/// The three, and what keeps each closed:
+///
+/// 1. **In-serve openers — D8.** GROUP A in
+///    `tools/adr0099_read_fork_structural_baseline.txt` is empty; held by
+///    `tools/cut_gate_read_fork.sh` + `cut_gate_opener_census.sh`.
+/// 2. **CLI-against-live openers — D9.** Every DB-mutating one-shot takes the
+///    F-E whole-DB writer flock before it opens the tenant DB, so it REFUSES
+///    against a live serve rather than folding its WAL; held by
+///    `apps/aberp/tests/adr0110_d9_flock_shape.rs` and
+///    `aberp-inventory/tests/rebuild_stock_cache_flock.rs`.
+/// 3. **The fence's own diagnostic must not fork the audit chain — §15.3.**
+///    A truncation regresses the DB audit head below the mirror's, so the
+///    `db.durability_loss_detected` ledger append the fence used to make landed
+///    at a seq the mirror held a different entry for; the next boot's gated
+///    auto-heal then refused and `serve` exited non-zero. An armed fence would
+///    have bricked the tenant with its own alarm (D5-B1). The record now goes to
+///    the non-chained marker; held by
+///    [`the_d5_b1_scenario_driven_through_the_armed_fence_must_boot_cleanly`].
+///
+/// The disarmed body is deliberately KEPT and still pinned
+/// ([`with_the_fence_disarmed_the_group_a_shape_does_not_fail_the_ack`],
+/// [`a_disarmed_fence_never_touches_the_watermark`]): it is bit-for-bit the D3
+/// ack, and it is what a bisect through the two months the fence shipped dark
+/// lands on.
 #[test]
-fn the_fence_ships_disarmed_by_default() {
+fn the_fence_ships_armed_by_default() {
     assert!(
-        !HandleConfig::default().wal_fence_enabled,
-        "ADR-0110 D7 / B1 REGRESSION: the WAL fence must default DISARMED on this head. Both          opener classes are now closed — D8 emptied GROUP A, D9 flock-fenced the last          CLI-against-live opener (rebuild-stock-cache) — so the remaining owed item is the          re-run adversarial over the corrected head, NOT another fix. Arming it here would          bundle the flip with its own precondition and leave that adversarial nothing to          check. If a fold DOES survive, an armed fence converts a silent durability bug          into routine LOUD money-path failures: the next issue-invoice or mark-paid fails          its durable_ack and propagates — a committed invoice reported as failed, NAV          handoff skipped."
+        HandleConfig::default().wal_fence_enabled,
+        "ADR-0110 D7.6 REGRESSION: the WAL fence must default ARMED. Disarming it again \
+         re-opens incident 00012's blind spot in full: a foreign opener folds this Handle's \
+         WAL, `durable_ack` fsyncs a path that no longer holds the rows, and every commit \
+         after it returns Ok while the bytes reach no file. That is a GREEN durability light \
+         with nothing behind it, which is worse than no light because it is believed. If a \
+         real fold has been found and the fence must go dark to keep the money paths up, that \
+         is an incident decision — record it in ADR-0110 D7.6 with the fold that forced it, \
+         do not just flip the constant."
     );
 }
 
@@ -606,8 +665,13 @@ fn with_the_fence_disarmed_the_group_a_shape_does_not_fail_the_ack() {
     let tmp = Tmp::new("group-a-disarmed");
     let db = tmp.db();
     seed(&db);
-    // `open_default` — the production constructor, verbatim.
-    let h = Handle::open_default(&db, tenant()).expect("open shared Handle (fence DISARMED)");
+    // An EXPLICITLY disarmed config. This used to be `open_default`, which was
+    // the same thing until D7.6 armed the default (2026-08-13). The property
+    // here is about the FLAG's off-state, so it is now stated as such —
+    // re-pointing a flag test at whatever the default happens to be is how
+    // D5-N3's vacuous pin happened.
+    let h = Handle::open(&db, tenant(), disarmed_config())
+        .expect("open shared Handle (fence DISARMED)");
 
     commit_one(&h, "before");
     assert!(wal_len(&db) > 0, "precondition: the commit is WAL-resident");
@@ -619,11 +683,16 @@ fn with_the_fence_disarmed_the_group_a_shape_does_not_fail_the_ack() {
     commit_one(&h, "after");
 
     h.durable_ack().expect(
-        "B1 REGRESSION: with `wal_fence_enabled: false` the ack must behave exactly as it did          under D3 and SUCCEED. If this fails, the fence is armed on the default path and every          CLI-against-live opener becomes a money-path outage.",
+        "REGRESSION: with `wal_fence_enabled: false` the ack must behave exactly as it did \
+         under D3 and SUCCEED. The off-state is what a bisect through the two months the fence \
+         shipped dark runs on, and what an incident would fall back to if a real fold were \
+         found — it has to keep working even though the default is now ARMED (D7.6).",
     );
     assert!(
         h.durability_alert().is_none(),
-        "B1 REGRESSION: a disarmed fence must raise no operator alert either — the banner would          be up on every box while the CLI openers still ship"
+        "REGRESSION: a disarmed fence must raise no operator alert either. Detection and the \
+         banner are one decision, so an off-state that still raised would be the worst of both: \
+         no protection on the money path and an alarm the operator cannot act on."
     );
 }
 
@@ -635,7 +704,7 @@ fn a_disarmed_fence_never_touches_the_watermark() {
     let tmp = Tmp::new("disarmed-quiet");
     let db = tmp.db();
     seed(&db);
-    let h = Handle::open_default(&db, tenant()).expect("open handle");
+    let h = Handle::open(&db, tenant(), disarmed_config()).expect("open handle");
 
     // Drive the shape that WOULD arm a breach, then prove none was latched:
     // with the fence off, `durable_ack` never consults the watermark, so a
@@ -908,22 +977,54 @@ fn a_malformed_time_wall_on_the_loss_row_fails_toward_banner_down() {
 /// acknowledgement and the next boot's reconcile, where the DB is the only
 /// store holding the ack.
 ///
+/// # D7.6 (2026-08-13) — this is now a LEGACY-ROW pin, and it had to be
+///
+/// It used to stage the split by firing the fence for real, on the strength of
+/// the fence writing a `db.durability_loss_detected` ledger row. §15.3 moved
+/// that writer to the non-chained marker, so no code path in this tree appends
+/// that kind any more and the old staging died at its own precondition
+/// (`expect("precondition: the loss row reached the mirror")`) — the failure
+/// that proves the routing landed.
+///
+/// The PROPERTY is untouched and still load-bearing, which is why the pin
+/// stayed rather than being deleted with the writer. `restore_durability_alert`
+/// keeps both ledger readers for backward compatibility: a prod tenant
+/// recovered from incident 00012 may already hold such a row, and retiring the
+/// reader would silently stop re-raising it. A reader nothing writes to is
+/// exactly the kind that rots unnoticed, so the row is now staged DIRECTLY —
+/// appended through the Handle so the guard's drop mirrors it, then deleted
+/// from the DB the way a truncation deletes it. That is a more faithful model
+/// of the case anyway: what re-derivation meets on such a tenant is a persisted
+/// row, not one this process just wrote.
+///
+/// Note the marker is deliberately NOT involved. If the fence fired here its
+/// marker record would hold the banner up on its own and the ledger halves
+/// would never be consulted — the test would pass without testing anything.
+///
 /// Mutation-verified: replace `self.db_audit_times()` with
-/// `DurabilityAuditTimes::default()` and this goes RED.
+/// `DurabilityAuditTimes::default()` and this goes RED; drop the mirror half
+/// instead and it goes red at its own precondition.
 #[test]
 fn an_ack_that_reached_only_the_db_still_clears_a_loss_that_reached_only_the_mirror() {
     let tmp = Tmp::new("split-stores");
     let db = tmp.db();
     seed(&db);
 
-    // Fire the fence for real, so the loss row lands in BOTH stores.
+    // Stage a LEGACY on-chain loss row into BOTH stores: appended through the
+    // Handle, so the guard's drop runs the lockstep mirror sync that carries it
+    // to the mirror. This is the shape a tenant recovered from incident 00012
+    // arrives with.
     {
         let h = handle(&db);
         commit_one(&h, "before");
-        h.durable_ack().expect("healthy ack");
-        foreign_open_and_close(&db);
-        commit_one(&h, "after");
-        let _ = h.durable_ack().expect_err("the fence fires");
+        commit_legacy_loss_row(&h);
+        h.durable_ack()
+            .expect("healthy ack — no fold happened here");
+        assert!(
+            h.durability_alert().is_none(),
+            "precondition: nothing in this process fired a detector; the row is staged, not \
+             detected, so the marker must be untouched"
+        );
     }
     let mirror = mirror_path_for(&db);
     let mirrored = aberp_audit_ledger::read_mirror_entries(&mirror).expect("read mirror");
@@ -966,4 +1067,657 @@ fn an_ack_that_reached_only_the_db_still_clears_a_loss_that_reached_only_the_mir
          is what still accepts writes while the mirror is refusing appends and holds the ack. \
          Reading the mirror alone makes the Acknowledge button inert in exactly that window."
     );
+}
+
+// ── D7.6 — THE DIAGNOSTIC GOES OFF-CHAIN, AND THE FENCE IS ARMED ────────────
+//
+// ADR-0110 §15.3 named routing D7's durability row to the non-chained marker a
+// PRECONDITION for arming the fence, not an optional tidy-up. The mechanism is
+// D5-B1 with a different trigger: a WAL truncation is exactly what regresses
+// the DB's audit head below the append-only mirror's, so an `audit_ledger`
+// append at that moment consumes a seq the mirror already holds a DIFFERENT
+// entry for. The chains fork; the next boot's gated auto-heal proves benignness
+// by matching head `entry_hash`es and REFUSES; `ensure_consistent_with_db`
+// answers `MirrorAheadOfDb` and `serve` exits non-zero.
+//
+// Armed, that turns the alarm into the brick. These pins are what say it is
+// dead.
+
+/// Every line of the durability-alert marker, or `[]` if there is none.
+fn marker_lines(h: &Handle) -> Vec<String> {
+    match std::fs::read_to_string(h.durability_marker_path()) {
+        Ok(s) => s.lines().map(str::to_string).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => panic!("read the durability-alert marker: {e}"),
+    }
+}
+
+/// Count of `db.durability_loss_detected` rows in the DB, read on a fresh
+/// connection so it sees what a later boot would see.
+fn ledger_loss_rows(db: &Path) -> u64 {
+    let conn = Connection::open(db).expect("open to count loss rows");
+    conn.query_row(
+        "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'db.durability_loss_detected'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|v| v as u64)
+    .expect("count the loss rows")
+}
+
+/// Serve's boot mirror reconcile, run exactly where `serve::run` runs it: on
+/// its own boot-phase connection, BEFORE any Handle exists.
+fn boot_reconcile(db: &Path) -> Result<(), String> {
+    let conn = Connection::open(db).expect("boot-phase open");
+    ensure_schema(&conn).expect("boot schema");
+    let out = aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror_path_for(db))
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    drop(conn);
+    out
+}
+
+/// **A fired fence records the MARKER and consumes no ledger seq.**
+///
+/// The positive half of the routing change: the alarm still reaches the
+/// operator on exactly the surface D7 built (the sticky alert, hence
+/// `GET /health durability_alert`, hence the banner), the episode is durable,
+/// and the hash-chained ledger is untouched in BOTH stores.
+///
+/// The trigger column is asserted explicitly. It is the only thing that tells a
+/// forensic reader whether an episode came from the WAL fence or from D5's
+/// mirror freeze, and both write into the same file.
+///
+/// Mutation-verified: restore the `emit_durability_loss_audit` call in
+/// `raise_durability_alert` and the `ledger_loss_rows` assertion goes RED; drop
+/// the `record_loss` call and the marker assertions go red while the ack still
+/// fails — which is the split that matters, because the ack failing is what a
+/// casual reading would take as proof the alarm landed.
+#[test]
+fn an_armed_fence_records_the_marker_and_consumes_no_ledger_seq() {
+    let tmp = Tmp::new("fence-marker");
+    let db = tmp.db();
+    seed(&db);
+    let h = handle(&db);
+
+    commit_one(&h, "before");
+    h.durable_ack().expect("healthy ack");
+    assert!(marker_lines(&h).is_empty(), "precondition: a quiet marker");
+
+    foreign_open_and_close(&db);
+    commit_one(&h, "after");
+    expect_breach(
+        h.durable_ack().expect_err("the armed fence fires"),
+        WalBreach::WalVanished,
+    );
+
+    let alert = h.durability_alert().expect("the sticky alert must be up");
+    assert_eq!(alert.breach, WalBreach::WalVanished);
+    assert!(
+        alert.message.contains("Stop and recover"),
+        "the banner text must carry the operator instruction, got: {}",
+        alert.message
+    );
+
+    let lines = marker_lines(&h);
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one marker record for the episode, got {lines:?}"
+    );
+    assert!(
+        lines[0].starts_with("v1\tloss\t"),
+        "the marker record must be a versioned loss line, got: {}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("\twal_truncated_under_writer\t"),
+        "the record must name D7's trigger so forensics can tell it from D5's \
+         audit_mirror_sync_refused, got: {}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("\twal_vanished\t"),
+        "the record must carry the machine breach code that was DETECTED, got: {}",
+        lines[0]
+    );
+
+    assert_eq!(
+        ledger_loss_rows(&db),
+        0,
+        "D5-B1 APPLIED TO D7: the fence's diagnostic must NOT consume a ledger seq. A truncation \
+         is exactly what regresses the DB head below the mirror's, so an append here lands at a \
+         seq the mirror holds a different entry for — the chains fork and the next boot's gated \
+         auto-heal refuses. The alarm that says 'stop and recover' must not be what stops the \
+         recovery."
+    );
+    let mirrored =
+        aberp_audit_ledger::read_mirror_entries(&mirror_path_for(&db)).expect("read the mirror");
+    assert!(
+        !mirrored
+            .iter()
+            .any(|e| e.kind == "db.durability_loss_detected"),
+        "and not into the mirror either — the ledger is one chain across two stores"
+    );
+}
+
+/// **THE BRICK IS DEAD — an armed fence must not flip the tenant into the
+/// equal-length divergence that refuses boot.**
+///
+/// This is the pin ADR-0110 §15.3 asked for by name: D5-B1's mechanism, driven
+/// through the WAL-truncation fence, with the fence ARMED.
+///
+/// # Where the durable fork actually lives — and why the first cut of this pin
+/// was VACUOUS
+///
+/// The obvious construction — fire the fence, then look for the diagnostic row
+/// in the DB — proves nothing, and only the mutation showed it. **The DB copy
+/// of that row cannot survive.** The fold that fires the fence severs the live
+/// instance from its WAL, so every commit after it returns `Ok` with `wal_len`
+/// pinned at 0 and the bytes reach no file. That is incident 00012, reproduced
+/// in miniature by the very mutation meant to test for it: with the on-chain
+/// append restored, the first version of this test stayed GREEN.
+///
+/// The fork is durable in the OTHER store. `emit_durability_loss_audit` relied
+/// on `WriteGuard::drop`'s lockstep `sync_mirror` to carry the row to the
+/// `fsync`'d mirror, and said so as a FEATURE — "the durable copy lands in the
+/// mirror even when the DB copy does not". That is exactly what leaves the
+/// append-only store one entry ahead of a DB that will never hold that seq.
+///
+/// # Why that bricks
+///
+/// A tenant does not sit still after an incident. The next thing to touch it —
+/// a flock-fenced CLI one-shot, which runs no `ensure_consistent_with_db` of
+/// its own — commits one business row, and it lands at exactly the seq the
+/// mirror is holding the diagnostic at. The two stores are now the SAME LENGTH
+/// with DIFFERENT content at the head, so `ensure_consistent_with_db`'s
+/// equal-length arm compares head `entry_hash`es and REFUSES. `serve` exits
+/// non-zero and does not boot. **The alarm that says "stop and recover" is what
+/// stopped the operator recovering** — and arming the fence is what would have
+/// made that reachable in production.
+///
+/// Without the diagnostic the same sequence is benign: nothing consumed that
+/// seq, the CLI's row lands in both stores, and the tenant boots. The only
+/// difference between the two runs is whether a machine-spawned diagnostic took
+/// a ledger seq — which is Ervin's rule (2026-08-13) stated as a boot outcome.
+///
+/// # One thing deliberately NOT done
+///
+/// No business write between the fold and the ack. One would land in the mirror
+/// and leave it ahead on its own, which is the pre-existing reconciler window
+/// R5-N3 describes (ADR-0110 §15.5) — a confound that bricks the CLEAN run too
+/// and would make this pin prove nothing about the diagnostic.
+///
+/// # Mutation verification, stated as it actually behaves
+///
+/// Restore the `emit_durability_loss_audit` call in `raise_durability_alert`
+/// and this goes RED — at the **mirror assertion**, which fires first because
+/// it is the earlier and more specific control.
+///
+/// The boot refusal downstream of it was verified separately rather than
+/// assumed, by suppressing that assertion and letting the mutated run reach
+/// `boot_reconcile`. It answers, verbatim:
+///
+/// ```text
+/// audit-ledger mirror is unrecoverable (mirror head entry_hash diverges
+/// from the DB at equal length (seq=4)); the original was preserved to
+/// …/aberp.duckdb.audit.log.corrupt-….bak
+/// ```
+///
+/// Note WHICH refuse arm that is: the **equal-length** one, not
+/// `MirrorAheadOfDb`. The CLI's business row brought the DB level with the
+/// mirror, so the reconciler compares head `entry_hash`es and finds them
+/// different — the arm ADR-0110 §15.5 (R5-N3) describes. Recorded precisely
+/// because a docstring that named the wrong arm would send the next reader
+/// looking at the wrong code.
+///
+/// Both CONTROLS matter — a run where the fence never fired boots cleanly too,
+/// and would have been just as green before the change.
+#[test]
+fn the_d5_b1_scenario_driven_through_the_armed_fence_must_boot_cleanly() {
+    let tmp = Tmp::new("b1-fence-boot");
+    let db = tmp.db();
+    seed(&db);
+
+    // ── The incident: a live tenant in lockstep meets a foreign fold ────────
+    {
+        let h = handle(&db);
+        commit_one(&h, "one");
+        commit_one(&h, "two");
+        commit_one(&h, "three");
+        h.durable_ack().expect("healthy ack in lockstep");
+
+        // The GROUP-A shape verbatim. Its close folds and truncates the WAL,
+        // which arms the breach — and from here on is what stops this
+        // instance's writes reaching a file at all.
+        foreign_open_and_close(&db);
+
+        expect_breach(
+            h.durable_ack().expect_err(
+                "CONTROL: the armed fence must fire — otherwise every assertion below is about \
+                 a tenant that never had an incident",
+            ),
+            WalBreach::WalVanished,
+        );
+        assert!(
+            marker_lines(&h)
+                .iter()
+                .any(|l| l.contains("\twal_truncated_under_writer\t")),
+            "CONTROL: the episode must actually have been recorded off-chain"
+        );
+    }
+
+    // The alarm consumed nothing, in EITHER store. The mirror half is the
+    // load-bearing one — see the docs.
+    assert_eq!(
+        ledger_loss_rows(&db),
+        0,
+        "the fence's diagnostic must not consume a ledger seq in the DB"
+    );
+    let mirrored =
+        aberp_audit_ledger::read_mirror_entries(&mirror_path_for(&db)).expect("read the mirror");
+    assert!(
+        !mirrored
+            .iter()
+            .any(|e| e.kind == "db.durability_loss_detected"),
+        "D5-B1 APPLIED TO D7: the diagnostic reached the MIRROR. That is where the old on-chain \
+         path's row actually survived — the DB copy is lost to the same truncation that fired \
+         the fence, but the mirror is fsync'd, so the alarm leaves the append-only store one \
+         entry ahead of a DB that will never hold that seq. The next write to touch this tenant \
+         then collides with it."
+    );
+
+    // ── What happens next: a flock-fenced CLI one-shot touches the tenant ───
+    // It runs no boot reconcile of its own, so it writes on top of whatever the
+    // incident left behind. One business row.
+    {
+        let h = Handle::open_default(&db, tenant()).expect("a CLI one-shot opens the tenant");
+        commit_one(&h, "the-next-thing-that-touches-the-tenant");
+    }
+
+    // ── And then the tenant is booted ───────────────────────────────────────
+    boot_reconcile(&db).expect(
+        "D5-B1 REGRESSION VIA D7: the tenant no longer boots. The armed fence's diagnostic \
+         consumed a ledger seq and reached the fsync'd mirror; the DB, severed from its WAL by \
+         the same fold, never got it. The next write landed at that seq with different content, \
+         so the two stores are the same length with different head hashes and \
+         `ensure_consistent_with_db`'s equal-length arm REFUSES — serve exits non-zero. The \
+         alarm that says 'stop and recover' must not be the thing that stops the recovery. \
+         Routing the diagnostic to the non-chained marker is the precondition ADR-0110 §15.3 \
+         made for arming this fence.",
+    );
+}
+
+/// **The alert survives a restart, carrying the breach it was DETECTED as.**
+///
+/// Deliberately driven with an INODE swap rather than a vanished WAL, so the
+/// expected code is `MainReplaced`. `WalVanished` is the ledger-sourced path's
+/// hard-coded default (D5-N2), so a `WalVanished` scenario would pass whether
+/// or not the marker's stored code is consulted at all — vacuous exactly where
+/// the value is. A recovery turns on this distinction: "the WAL was truncated"
+/// and "the main DB file was swapped underneath us" are different incidents.
+///
+/// Mutation-verified: drop the `record_loss` call from `raise_durability_alert`
+/// and the alert does not survive at all; hard-code `WalVanished` in
+/// `restore_durability_alert` and the breach half alone goes red.
+#[test]
+fn the_fence_alert_survives_a_restart_with_the_breach_it_was_detected_as() {
+    let tmp = Tmp::new("fence-restart");
+    let db = tmp.db();
+    seed(&db);
+
+    {
+        let h = handle(&db);
+        commit_one(&h, "before");
+        h.durable_ack().expect("healthy ack");
+
+        // Swap the main DB file for a different inode with the same contents —
+        // the A2 shape `swapping_the_inode_between_commit_and_ack_must_fail_the_ack`
+        // uses.
+        let copy = {
+            let mut os = db.as_os_str().to_owned();
+            os.push(".swapped");
+            PathBuf::from(os)
+        };
+        std::fs::copy(&db, &copy).expect("copy the main file");
+        std::fs::rename(&copy, &db).expect("swap the inode");
+
+        expect_breach(
+            h.durable_ack()
+                .expect_err("the armed fence fires on the swap"),
+            WalBreach::MainReplaced,
+        );
+    }
+
+    let reopened = Handle::open_default(&db, tenant()).expect("reopen");
+    let alert = reopened.durability_alert().expect(
+        "D7.4b REGRESSION: the alert did not survive the restart. A restart is not an \
+                 acknowledgement — the banner tells the operator to stop and recover, so the \
+                 restart it asks for must not be the mute button.",
+    );
+    assert_eq!(
+        alert.breach,
+        WalBreach::MainReplaced,
+        "D5-N2 REGRESSION: the restored alert reports the wrong breach. The marker stores the \
+         code that was DETECTED; reporting the hard-coded WalVanished default instead loses the \
+         one distinction a recovery turns on — a swapped main file is not a truncated WAL."
+    );
+}
+
+/// **An acknowledged fence alert stays down across a restart.**
+///
+/// The other half of the sticky contract: the alarm must be clearable, and the
+/// clear must be durable. It goes through the same `clear_durability_alert` D5
+/// uses — one acknowledge path for both triggers, which is the whole reason the
+/// routing change reuses the marker rather than building a second store.
+///
+/// Mutation-verified: skip the `record_ack` call in `clear_durability_alert`
+/// and the banner comes back on the reopen.
+#[test]
+fn an_acknowledged_fence_alert_stays_down_across_a_restart() {
+    let tmp = Tmp::new("fence-ack");
+    let db = tmp.db();
+    seed(&db);
+
+    {
+        let h = handle(&db);
+        commit_one(&h, "before");
+        h.durable_ack().expect("healthy ack");
+        foreign_open_and_close(&db);
+        commit_one(&h, "after");
+        let _ = h.durable_ack().expect_err("the armed fence fires");
+        assert!(
+            h.durability_alert().is_some(),
+            "precondition: the banner is up"
+        );
+        h.clear_durability_alert()
+            .expect("the operator acknowledges");
+        assert!(
+            h.durability_alert().is_none(),
+            "and it goes down in-process"
+        );
+    }
+
+    let reopened = Handle::open_default(&db, tenant()).expect("reopen");
+    assert!(
+        reopened.durability_alert().is_none(),
+        "the acknowledgement must be DURABLE. If the banner is back, the operator cleared it, \
+         restarted, and found it up again with nothing left to do about it — which is the alarm \
+         they learn to route around."
+    );
+}
+
+/// **Both marker triggers coexist: one file, one re-derivation, one
+/// acknowledge — and each episode keeps its own breach code.**
+///
+/// D5 (`audit_mirror_sync_refused` / `audit_mirror_frozen`) and D7
+/// (`wal_truncated_under_writer` / a WAL breach) now write into the SAME
+/// non-chained marker. That is deliberate — a second store would mean a second
+/// reader, a second acknowledge path and a second way to get the ordering wrong
+/// — so what has to hold is that they do not tread on each other: both records
+/// survive, the NEWEST one decides which breach `/health` and the banner report,
+/// and one acknowledgement out-ranks both.
+///
+/// The ordering assertion is the load-bearing one. `restore_durability_alert`
+/// picks the breach by matching the marker's newest loss instant against the
+/// overall newest loss, so a reader that took the FIRST record, or the last
+/// line of the file regardless of stamp, would report the wrong incident to the
+/// operator while looking entirely healthy under a single-trigger test.
+///
+/// Mutation-verified: change `note_loss` to keep the FIRST loss rather than the
+/// newest and the breach assertion goes RED; drop the marker's `ack` half and
+/// the final assertion goes red.
+#[test]
+fn both_marker_triggers_coexist_and_the_newest_decides_the_breach() {
+    let tmp = Tmp::new("both-triggers");
+    let db = tmp.db();
+    seed(&db);
+
+    {
+        let h = handle(&db);
+        commit_one(&h, "one");
+        commit_one(&h, "two");
+        h.durable_ack().expect("healthy ack");
+
+        // D5 first: regress the DB head below the mirror's THROUGH the Handle,
+        // so the guard's drop meets `MirrorDivergent` and raises the freeze.
+        {
+            let guard = h.write().expect("acquire the shared writer");
+            guard
+                .execute_batch("DELETE FROM audit_ledger WHERE seq > 1;")
+                .expect("regress the DB audit head");
+        }
+        assert_eq!(
+            h.durability_alert().map(|a| a.breach),
+            Some(WalBreach::AuditMirrorFrozen),
+            "precondition: D5 fired first, so the sticky alert holds ITS breach"
+        );
+
+        // Then D7, strictly later: the fold arms the fence and the next ack
+        // fires it. The sticky alert is `get_or_insert` — the operator needs to
+        // know when the tenant STARTED losing writes — so in-process it keeps
+        // D5's. The marker holds both.
+        foreign_open_and_close(&db);
+        let _ = h.durable_ack().expect_err("the armed fence fires too");
+
+        let lines = marker_lines(&h);
+        assert_eq!(
+            lines.len(),
+            2,
+            "both episodes must be recorded, got {lines:?}"
+        );
+        assert!(
+            lines[0].contains("\taudit_mirror_sync_refused\t")
+                && lines[0].contains("\taudit_mirror_frozen\t"),
+            "the first record is D5's, with D5's breach: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("\twal_truncated_under_writer\t")
+                && lines[1].contains("\twal_vanished\t"),
+            "the second is D7's, with D7's breach — the two must not collapse into one \
+             vocabulary: {}",
+            lines[1]
+        );
+        assert_eq!(
+            ledger_loss_rows(&db),
+            0,
+            "and NEITHER trigger may consume a ledger seq"
+        );
+    }
+
+    // Re-derivation: the NEWEST loss decides the reported breach, which here is
+    // D7's.
+    let reopened = Handle::open_default(&db, tenant()).expect("reopen");
+    assert_eq!(
+        reopened.durability_alert().map(|a| a.breach),
+        Some(WalBreach::WalVanished),
+        "the restored alert must report the NEWEST episode's breach. Reporting the older one \
+         sends the operator after the wrong incident — and a single-trigger test cannot see the \
+         difference, which is why this pin exists."
+    );
+
+    // And ONE acknowledgement covers both, because there is one alert.
+    reopened
+        .clear_durability_alert()
+        .expect("the operator acknowledges");
+    let again = Handle::open_default(&db, tenant()).expect("reopen after the ack");
+    assert!(
+        again.durability_alert().is_none(),
+        "one acknowledgement must out-rank every loss older than it, whichever trigger raised \
+         them — two triggers must not mean two banners the operator has to clear separately"
+    );
+}
+
+// ── D7.6 — NO FALSE POSITIVE ON A HEALTHY *ARMED* BOX ───────────────────────
+//
+// The pins above this section already cover boot, boot onto a pre-existing WAL,
+// the first ack after a boot fold, concurrent daemon writes, a legitimate
+// reopen and a long healthy run — all against `armed_config()`, so arming the
+// default did not change what they prove. These two close the shapes that were
+// only ever exercised elsewhere, and that a reader of this file would otherwise
+// have to take on trust.
+
+/// **DuckDB's own auto-checkpoint must not fire the fence.**
+///
+/// The fence's premise is "our WAL only ever grows", and that is a consequence
+/// of the F-A pragmas — `disable_checkpoint_on_shutdown` plus the
+/// `wal_autocheckpoint` raise — and of nothing else. This drives enough
+/// committed bytes through the Handle to pass DuckDB's stock 16 MiB
+/// auto-checkpoint threshold several times over and requires silence.
+///
+/// If a future change loses those pragmas on the Handle's own connections, the
+/// engine folds its own WAL legitimately and an armed fence reports the
+/// engine's bookkeeping as durability loss — on a perfectly healthy box, under
+/// load, i.e. exactly when it does most damage. `the_fence_is_pinned_to_the_
+/// production_posture` asserts the pragmas are configured; this asserts the
+/// behaviour they are configured for.
+#[test]
+fn sustained_writes_past_the_auto_checkpoint_threshold_must_not_fire() {
+    let tmp = Tmp::new("autocheckpoint");
+    let db = tmp.db();
+    seed(&db);
+    let h = handle(&db);
+
+    {
+        let g = h.write().expect("writer");
+        g.execute_batch("CREATE TABLE IF NOT EXISTS bulk(x INTEGER, pad VARCHAR);")
+            .expect("bulk table");
+    }
+    // ~64 MiB of WAL-resident payload — four times DuckDB's stock 16 MiB
+    // wal_autocheckpoint, so a Handle without the raise would fold repeatedly.
+    for round in 0..8 {
+        {
+            let g = h.write().expect("writer");
+            g.execute_batch(
+                "INSERT INTO bulk SELECT i, repeat('x', 1024) FROM range(0, 8192) t(i);",
+            )
+            .expect("bulk insert");
+        }
+        h.durable_ack().unwrap_or_else(|e| {
+            panic!(
+                "round {round}: the armed fence fired on a HEALTHY box \
+                 under sustained load. DuckDB's stock 16 MiB wal_autocheckpoint folded the WAL \
+                 because this Handle's connections lost the F-A pragmas — and an armed fence \
+                 reads the engine's own bookkeeping as durability loss. Error: {e}"
+            )
+        });
+    }
+    assert!(
+        h.durability_alert().is_none(),
+        "and no banner: sustained committed load on a healthy tenant must be silent"
+    );
+    assert!(marker_lines(&h).is_empty(), "and nothing recorded");
+}
+
+/// **The `.creating-*` staging sweep must not fire the fence.**
+///
+/// `aberp_snapshot::crash_safe::cleanup_stale_staging` deletes `<db>.creating-*`
+/// siblings at boot (ADR-0095 §2), and it runs while a Handle may be live. It
+/// selects by filename prefix, and `<db>.wal` does not carry the `.creating-`
+/// infix — but "the sweep is prefix-scoped" is a property of one `starts_with`,
+/// and an armed fence turns a widened prefix into a money-path outage rather
+/// than a stray deletion. Modelled here as the sweep's own primitive (write
+/// staging litter beside a live tenant, remove everything matching) so the pin
+/// does not depend on `aberp-db` gaining a dependency on `aberp-snapshot`.
+#[test]
+fn the_stale_staging_sweep_must_not_fire() {
+    let tmp = Tmp::new("staging-sweep");
+    let db = tmp.db();
+    seed(&db);
+    let h = handle(&db);
+    commit_one(&h, "before");
+    h.durable_ack().expect("healthy ack");
+    assert!(wal_len(&db) > 0, "precondition: the commit is WAL-resident");
+
+    // Litter from a crashed prior provision, beside the live DB.
+    let stem = db
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("db filename");
+    let parent = db.parent().expect("tenant dir");
+    for tag in ["a", "b"] {
+        std::fs::write(
+            parent.join(format!("{stem}.creating-{tag}.duckdb")),
+            b"litter",
+        )
+        .expect("write staging litter");
+    }
+
+    // The sweep, verbatim in shape: remove every sibling whose name starts with
+    // `<stem>.creating-`.
+    let prefix = format!("{stem}.creating-");
+    for entry in std::fs::read_dir(parent)
+        .expect("read the tenant dir")
+        .flatten()
+    {
+        if let Some(name) = entry.file_name().to_str() {
+            if name.starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    commit_one(&h, "after");
+    h.durable_ack().expect(
+        "the staging sweep fired the armed fence. It must select `<db>.creating-*` siblings \
+         ONLY — a prefix that also catches `<db>.wal` deletes the live WAL under a running \
+         Handle, and armed that is the next invoice issuance failing its durable_ack.",
+    );
+    assert!(h.durability_alert().is_none(), "and no banner");
+}
+
+/// **A flock-refused CLI must not fire the fence.**
+///
+/// D9's answer to the CLI-against-live class is mutual exclusion, not
+/// migration: `serve` holds the F-E whole-DB writer flock for its process
+/// lifetime, and every DB-mutating one-shot takes it before opening the tenant
+/// DB — so it REFUSES rather than opening a default-pragma connection whose
+/// close folds the live WAL. `adr0110_d9_flock_shape.rs` pins that every command
+/// has the acquire in the right place; this pins the consequence the arming
+/// decision actually rests on, which is that the refusal leaves the fence
+/// silent.
+///
+/// The contrast is the point: `foreign_open_and_close` — the same CLI shape
+/// WITHOUT the flock — is what `the_group_a_shape_must_fail_the_ack` proves
+/// fires. So this is not "nothing happened", it is "the flock is what stopped
+/// it happening".
+#[test]
+fn a_flock_refused_cli_must_not_fire() {
+    use aberp_db::db_writer_lock;
+
+    let tmp = Tmp::new("flock-refused");
+    let db = tmp.db();
+    seed(&db);
+
+    // Serve's posture: the whole-DB writer flock, held for the process.
+    let _serve_lock = db_writer_lock::acquire_or_refuse(&db, TENANT, "serve")
+        .expect("serve takes the whole-DB writer flock");
+
+    let h = handle(&db);
+    commit_one(&h, "before");
+    h.durable_ack().expect("healthy ack");
+    let wal_before = wal_len(&db);
+    assert!(wal_before > 0, "precondition: the commit is WAL-resident");
+
+    // The one-shot arrives and is REFUSED before it can open the DB. This is
+    // the whole of D9: no second connection exists, so no close can fold.
+    assert!(
+        db_writer_lock::acquire_or_refuse(&db, TENANT, "rebuild-stock-cache").is_err(),
+        "D9 REGRESSION: a DB-mutating one-shot acquired the whole-DB writer flock while serve \
+         holds it. It would then open a default-pragma connection on the live tenant DB, and \
+         its close would fold and truncate the Handle's WAL — the exact GROUP-B hazard arming \
+         the fence rests on being closed."
+    );
+
+    assert_eq!(
+        wal_len(&db),
+        wal_before,
+        "the refusal must not have touched the WAL at all"
+    );
+    commit_one(&h, "after");
+    h.durable_ack()
+        .expect("and the armed fence stays silent: the refused one-shot never opened the DB");
+    assert!(h.durability_alert().is_none(), "no banner on a refused CLI");
+    assert!(marker_lines(&h).is_empty(), "and nothing recorded");
 }
