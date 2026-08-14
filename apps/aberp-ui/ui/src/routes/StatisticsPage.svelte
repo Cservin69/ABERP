@@ -333,35 +333,6 @@
       </div>
     {/if}
 
-    <!-- Undated-aging disclosure. Separate from the banner above on
-         purpose: nothing is MISSING here — every one of these invoices is
-         in the receivables/payables total AND in an aging bucket, which is
-         what the backend fix restored. What it needs to say is narrower:
-         the 90+ bucket they landed in is an imputation, because their
-         deadline could not be read. Kept above the numbers for the same
-         reason as the banner, and it disappears on clean data. -->
-    {#if r.ledger_diagnostics.aging_undated_invoices > 0}
-      <div class="stats__integrity stats__integrity--soft" role="status">
-        <strong>
-          {r.ledger_diagnostics.aging_undated_invoices} outstanding
-          {r.ledger_diagnostics.aging_undated_invoices === 1 ? "invoice has" : "invoices have"}
-          no readable payment deadline — aged as 90+.
-        </strong>
-        <p>
-          Az összegekben teljes értéken benne vannak; csak a korosításuk becslés. /
-          They are counted in full; only their AGE is a guess — shown in the most-overdue
-          bucket because an unreadable deadline cannot be assumed current. Invoice
-          {r.ledger_diagnostics.aging_undated_invoice_ids.length === 1 ? "id" : "ids"}:
-          <span class="stats__integrity-ids"
-            >{r.ledger_diagnostics.aging_undated_invoice_ids.join(", ")}</span
-          >{#if r.ledger_diagnostics.aging_undated_invoices > r.ledger_diagnostics.aging_undated_invoice_ids.length}
-            … (+{r.ledger_diagnostics.aging_undated_invoices -
-              r.ledger_diagnostics.aging_undated_invoice_ids.length} more; see the server log)
-          {/if}
-        </p>
-      </div>
-    {/if}
-
     <!-- Row 1: revenue / expenses / gross profit / VAT-to-pay -->
     <section class="stats__cards" aria-label="Headline figures">
       <article class="stats__card">
@@ -557,7 +528,12 @@
     </section>
 
     <!-- Row 2c: AR + AP aging, click-through to filtered lists. S262 -->
-    {#snippet agingPanel(title: string, panel: AgingPanel, tab: "outgoing" | "incoming")}
+    {#snippet agingPanel(
+      title: string,
+      panel: AgingPanel,
+      tab: "outgoing" | "incoming",
+      undatedCount: number,
+    )}
       <section class="stats__aging" aria-label={title}>
         <h3>{title}</h3>
         <ul class="aging-list">
@@ -588,6 +564,26 @@
           {/each}
         </ul>
         <p class="stats__detail">* counts are exact; amounts sum HUF + EUR.</p>
+        <!-- Undated rows are aged into 90+ by imputation rather than
+             dropped (that is what makes the buckets sum to the total
+             above). Deliberately a QUIET inline footnote, not a page-level
+             alert, and deliberately count-only: NAV-synced payables carry
+             no deadline at all, so an alarm block would be lit on every
+             load and a rendered id list would be a permanent wall of ids —
+             cry-wolf either way. The ids stay on the wire in
+             `ledger_diagnostics` for support, just unrendered.
+             Presentation is reversible: if Ervin would rather see this as
+             a per-side alert, a threshold-suppressed list, or its own
+             explicit "undated" aging bucket, only this block and its pins
+             need to change — the backend counts already support all
+             three. -->
+        {#if undatedCount > 0}
+          <p class="stats__detail">
+            Ebből {undatedCount} számlán nincs rögzített fizetési határidő — 90+ alá sorolva. /
+            Includes {undatedCount}
+            {undatedCount === 1 ? "invoice" : "invoices"} with no recorded due date, aged to 90+.
+          </p>
+        {/if}
       </section>
     {/snippet}
     <section class="stats__aging-grid" aria-label="Aging">
@@ -595,11 +591,13 @@
         "Receivables aging / Vevőkövetelés korosítás",
         r.receivables_aging,
         "outgoing",
+        r.ledger_diagnostics.aging_undated_receivables,
       )}
       {@render agingPanel(
         "Payables aging / Szállítói tartozás korosítás",
         r.payables_aging,
         "incoming",
+        r.ledger_diagnostics.aging_undated_payables,
       )}
     </section>
 
@@ -1129,14 +1127,6 @@
   }
   .stats__integrity strong {
     color: var(--color-signal-negative);
-  }
-  /* Undated-aging disclosure — warning chrome, not negative: the figures
-   * are complete, one column of them is an estimate. */
-  .stats__integrity--soft {
-    border-color: var(--color-signal-warning);
-  }
-  .stats__integrity--soft strong {
-    color: var(--color-signal-warning);
   }
   .stats__integrity-ids {
     font-family: var(--type-family-mono);

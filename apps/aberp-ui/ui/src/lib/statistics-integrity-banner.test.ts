@@ -86,49 +86,76 @@ describe("StatisticsPage ledger-integrity banner", () => {
 // outstanding invoice whose `payment_deadline` was missing or unreadable
 // fell out of every bucket while still counting toward the receivables /
 // payables total, so the buckets summed to less than the headline above
-// them. The backend now ages it as 90+ and reports
-// `aging_undated_invoices`. The bucket is therefore an IMPUTATION, and the
-// operator has to be told — otherwise the fix just launders a guess into
-// a number that looks measured.
+// them. The backend now ages it as 90+ and counts it. The bucket is
+// therefore an IMPUTATION and must not read as a measurement.
+//
+// It is disclosed QUIETLY, and that is a considered choice rather than an
+// oversight: `ap_sync` records no payment deadline at all for NAV-synced
+// payables, so on a real book this condition is permanent and universal.
+// A page-level alert would be lit on every single load and a rendered id
+// list would be a permanent wall of ids — both teach the operator to
+// ignore the page, which is how the ledger-integrity banner ABOVE (a rare
+// and genuinely alarming signal) loses its meaning too. So: a per-side
+// count, inline under the panel it qualifies, in the same muted
+// `stats__detail` chrome as the existing "counts are exact" footnote. The
+// ids stay on the wire for support.
 
-/** The undated-aging disclosure block only — same slicing rule as above. */
-const undated = (() => {
-  const start = page.indexOf("{#if r.ledger_diagnostics.aging_undated_invoices > 0}");
-  expect(start, "the undated-aging disclosure's {#if} guard must exist").toBeGreaterThan(-1);
-  const end = page.indexOf("</div>", start);
-  expect(end, "the undated-aging disclosure must close its element").toBeGreaterThan(start);
+/** The aging-panel snippet — the footnote's home. Sliced to the snippet
+ * body so a page-level block elsewhere cannot satisfy these by accident. */
+const agingSnippet = (() => {
+  const start = page.indexOf("{#snippet agingPanel(");
+  expect(start, "the aging-panel snippet must exist").toBeGreaterThan(-1);
+  const end = page.indexOf("{/snippet}", start);
+  expect(end, "the aging-panel snippet must close").toBeGreaterThan(start);
   return page.slice(start, end);
 })();
 
-describe("StatisticsPage undated-aging disclosure", () => {
-  it("says the invoices ARE counted — only their age is a guess", () => {
-    // The failure mode to avoid in BOTH directions: reading as "figures
-    // are missing" (they are not — that is what the fix restored), or
-    // saying nothing and letting an imputed 90+ read as measured.
-    expect(undated).toMatch(/counted in full/i);
-    expect(undated).toMatch(/90\+/);
+describe("StatisticsPage undated-aging footnote", () => {
+  it("discloses the count inline, in the panel it qualifies", () => {
+    // Saying nothing is the failure this pin blocks: an imputed 90+ that
+    // reads as measured is the original defect wearing a nicer hat.
+    expect(agingSnippet).toContain("undatedCount");
+    expect(agingSnippet).toMatch(/\{#if undatedCount > 0\}/);
+    expect(agingSnippet).toMatch(/no recorded due date/i);
+    expect(agingSnippet).toMatch(/90\+/);
   });
 
-  it("names the invoices, and discloses the id cap", () => {
-    expect(undated).toContain("r.ledger_diagnostics.aging_undated_invoice_ids");
-    expect(undated).toContain(
-      "r.ledger_diagnostics.aging_undated_invoices > r.ledger_diagnostics.aging_undated_invoice_ids.length",
-    );
+  it("is fed the PER-SIDE counts, not the combined total", () => {
+    // The combined figure under both panels would double-report it: a
+    // payables-only problem would show up as receivables trouble too.
+    expect(page).toContain("r.ledger_diagnostics.aging_undated_receivables");
+    expect(page).toContain("r.ledger_diagnostics.aging_undated_payables");
   });
 
-  it("fires ONLY on a non-zero count, and cannot be dismissed", () => {
-    expect(page).toContain("{#if r.ledger_diagnostics.aging_undated_invoices > 0}");
-    expect(undated).not.toMatch(/<button/i);
-    expect(undated).not.toMatch(/dismiss|onclick/i);
+  it("stays quiet: no alert role, no alarm chrome, no dismiss control", () => {
+    // The distinction this pin holds against drift back to a banner: the
+    // figures are COMPLETE, one column of them is an estimate. Escalating
+    // that to role="alert" next to the real integrity banner devalues
+    // both.
+    expect(agingSnippet).not.toMatch(/role="(alert|status)"/);
+    expect(agingSnippet).not.toContain("stats__integrity");
+    expect(agingSnippet).not.toMatch(/dismiss/i);
   });
 
-  it("sits ABOVE the figures it qualifies", () => {
-    const at = page.indexOf("{#if r.ledger_diagnostics.aging_undated_invoices > 0}");
-    const cardsAt = page.indexOf('<section class="stats__cards"');
-    const agingAt = page.indexOf('<section class="stats__aging-grid"');
-    expect(agingAt).toBeGreaterThan(-1);
-    expect(at).toBeLessThan(cardsAt);
-    expect(at).toBeLessThan(agingAt);
+  it("renders NO id list anywhere on the dashboard", () => {
+    // The whole point of the quiet form. `aging_undated_invoice_ids` is
+    // machine-readable diagnostics; rendering it puts 50 ids permanently
+    // on Ervin's screen.
+    expect(page).not.toContain("aging_undated_invoice_ids");
+  });
+
+  it("drives no page-level block of its own", () => {
+    // The undated counters must reach the operator ONLY as snippet
+    // arguments feeding the inline footnote. A `{#if ... > 0}` block at
+    // page level is the drift back to the alarm form this replaced —
+    // whatever chrome it wears.
+    expect(page).not.toMatch(/\{#if r\.ledger_diagnostics\.aging_undated/);
+    for (const m of page.matchAll(/r\.ledger_diagnostics\.aging_undated_\w+/g)) {
+      const line = page.slice(page.lastIndexOf("\n", m.index) + 1, page.indexOf("\n", m.index));
+      expect(line.trim(), "undated counts belong in the agingPanel call, nowhere else").toMatch(
+        /^r\.ledger_diagnostics\.aging_undated_(receivables|payables),$/,
+      );
+    }
   });
 });
 
@@ -144,6 +171,14 @@ describe("FinancialReport wire shape", () => {
 
   it("carries the undated-aging counters as required fields too", () => {
     expect(api).toMatch(/aging_undated_invoices:\s*number;/);
+    expect(api).toMatch(/aging_undated_receivables:\s*number;/);
+    expect(api).toMatch(/aging_undated_payables:\s*number;/);
+  });
+
+  it("keeps the id list on the WIRE even though the page does not render it", () => {
+    // Unrendered is not unreported. Dropping the field would take away
+    // support's only way to find the offending invoices, since the log is
+    // the debug-level per-invoice line.
     expect(api).toMatch(/aging_undated_invoice_ids:\s*string\[\];/);
   });
 });

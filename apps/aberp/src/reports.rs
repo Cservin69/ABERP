@@ -237,8 +237,24 @@ pub struct LedgerDiagnostics {
     /// deadlines. Capped at [`MAX_UNPARSEABLE_ENTRY_IDS`] on the same
     /// "count exact, ids are a starting point" contract as
     /// [`Self::unparseable_entry_ids`].
+    ///
+    /// MACHINE-READABLE ONLY — the SPA deliberately does not render this
+    /// list. NAV-synced payables carry no deadline at all, so on a real
+    /// book it would be a permanent wall of ids on the dashboard. It stays
+    /// on the wire for support and debugging; the operator-facing surface
+    /// is the per-side count below.
     #[serde(default)]
     pub aging_undated_invoice_ids: Vec<String>,
+    /// The [`Self::aging_undated_invoices`] total split by side, so each
+    /// aging panel can footnote its OWN imputed rows. Rendering the
+    /// combined figure under both panels would double-report it.
+    ///
+    /// `aging_undated_receivables + aging_undated_payables ==
+    /// aging_undated_invoices`.
+    #[serde(default)]
+    pub aging_undated_receivables: u64,
+    #[serde(default)]
+    pub aging_undated_payables: u64,
 }
 
 /// Cap on [`LedgerDiagnostics::unparseable_entry_ids`]. A systemically
@@ -2091,6 +2107,8 @@ pub fn compute_financial_report(
     // `unparseable_entry_ids` ships under; anyone needing the full list
     // reads the log.
     let mut ledger_diagnostics = walk.diagnostics;
+    ledger_diagnostics.aging_undated_receivables = outgoing.aging_undated.count;
+    ledger_diagnostics.aging_undated_payables = ap.aging_undated.count;
     ledger_diagnostics.aging_undated_invoices = outgoing
         .aging_undated
         .count
