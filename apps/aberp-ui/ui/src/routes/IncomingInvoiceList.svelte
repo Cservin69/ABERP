@@ -244,7 +244,10 @@
     // `reports::aging_bucket_for` computes.
     if (agingFacet !== null) {
       if (inv.local_status !== "Outstanding") return false;
-      if (inv.payment_deadline === null) return false;
+      // No early-out on a null deadline — the dashboard's
+      // `payables_aging` ages such a row as `d90_plus` rather than
+      // dropping it, so this list must too or the click-through count
+      // disagrees with the tile.
       if (agingBucketFor(todayIso(), inv.payment_deadline) !== agingFacet) {
         return false;
       }
