@@ -161,6 +161,49 @@ describe("the past-deadline HYGIENE facet keeps excluding undated rows", () => {
   it("a non-Outstanding row is never past deadline", () => {
     expect(incomingPastDeadlineMatches(apRow("2026-06-29", "Paid"), TODAY)).toBe(false);
   });
+
+  // ───────────────────────────────────────────────────────────────────
+  // The compare has to run on the CLASSIFIER'S OUTPUT, not on the stored
+  // string. This facet used to do `deadline < todayIso` straight off the
+  // column, under a comment claiming the deadline-less predicate above
+  // had already made it canonical. It had not — that predicate TRIMS
+  // before it matches, so a padded value passes it and then reaches the
+  // compare still padded.
+  // ───────────────────────────────────────────────────────────────────
+  it("a FUTURE deadline with leading whitespace is not past deadline", () => {
+    // The defect, in one row. `" 2026-12-30" < "2026-06-30"` is true —
+    // the leading space sorts before every digit — so a payable due in
+    // December was reported as overdue in June, in the drill-down of a
+    // tile that had counted it correctly.
+    expect(incomingPastDeadlineMatches(apRow(" 2026-12-30"), TODAY)).toBe(false);
+    expect(incomingPastDeadlineMatches(apRow("\t2026-12-30\n"), TODAY)).toBe(false);
+  });
+
+  it("a PAST deadline with whitespace is still past deadline", () => {
+    // The other direction: normalising must not buy correctness by
+    // dropping padded rows altogether.
+    expect(incomingPastDeadlineMatches(apRow(" 2026-06-29 "), TODAY)).toBe(true);
+  });
+
+  it("a whitespace-padded deadline of today is not past deadline", () => {
+    expect(incomingPastDeadlineMatches(apRow(` ${TODAY} `), TODAY)).toBe(false);
+  });
+
+  it("a year below 1000 sorts before today rather than after it", () => {
+    // Zero-padding the rendered year is what makes this hold: a
+    // three-digit or two-digit rendering sorts AFTER "2026-…" and the
+    // oldest possible deadline would read as a future one.
+    expect(incomingPastDeadlineMatches(apRow("0026-06-15"), TODAY)).toBe(true);
+    expect(incomingPastDeadlineMatches(apRow("0001-01-01"), TODAY)).toBe(true);
+  });
+
+  it("an unreadable `today` yields no past-deadline rows", () => {
+    // `todayIsoLocal()` is canonical by construction, but this arrives
+    // as a plain string parameter. Conservative direction: nothing is
+    // asserted late rather than everything.
+    expect(incomingPastDeadlineMatches(apRow("2026-06-29"), "not-a-date")).toBe(false);
+    expect(incomingPastDeadlineMatches(apRow("2026-06-29"), "")).toBe(false);
+  });
 });
 
 describe("the two incoming facets agree about which rows are deadline-less", () => {

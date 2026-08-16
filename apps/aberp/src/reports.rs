@@ -518,9 +518,38 @@ pub fn parse_period(s: &str) -> Result<PeriodKind> {
     Err(anyhow!("unparseable period `{}`", trimmed))
 }
 
+/// THE classifier. Everything downstream of it — which invoices are
+/// outstanding, which bucket they land in, which payments feed DSO —
+/// turns on whether this returns `Ok`.
+///
+/// It is `crate::iso_date`'s canonical definition with one deliberate
+/// relaxation: leading/trailing ASCII whitespace is trimmed first. Two
+/// details of that sentence are load-bearing.
+///
+/// **Canonical, not `time::Date::parse`.** The bare parser accepts an
+/// optional SIGN on `[year]`, so `"+2026-06-15"` was a date here and an
+/// eleven-character string in the column — which the SQL projections
+/// truncate to `"+2026-06-1"`, i.e. NOT a date. Writer and reader
+/// disagreeing about one invoice's deadline is how a live payable gets
+/// booked as a settled legacy import. Both write paths now share the
+/// same definition (see `crate::iso_date`).
+///
+/// **ASCII whitespace, not `str::trim`.** The SPA runs the mirror of
+/// this function (`aging.ts::parseRecordedDeadline`) over the same
+/// values, and `str::trim` and `String.prototype.trim` cover different
+/// character sets — U+FEFF, U+0085, U+000B each land on opposite
+/// verdicts. `trim_ascii_whitespace` is the intersection both languages
+/// can state exactly; `deadline_classifier_parity_with_the_spa` pins the
+/// vocabulary and `aging.test.ts` pins the same table on the other side.
+///
+/// NOTE for anyone loosening this: it is shared with the DSO and window
+/// paths. If one of those needs RFC3339 tolerance, SPLIT the function
+/// rather than widening it — widening silently changes which invoices
+/// are receivable. (The DSO path already takes its tolerance the right
+/// way: `SUBSTR(…, 1, 10)` in the projection, not a laxer parser.)
 fn parse_iso_date(s: &str) -> Result<Date> {
-    let fmt = format_description!("[year]-[month]-[day]");
-    Date::parse(s.trim(), fmt).with_context(|| format!("parse ISO date `{}`", s))
+    crate::iso_date::parse_canonical_iso_date(crate::iso_date::trim_ascii_whitespace(s))
+        .ok_or_else(|| anyhow!("parse ISO date `{}`", s))
 }
 
 /// Resolve a [`PeriodKind`] to inclusive ISO-date bounds for SQL
@@ -3431,24 +3460,64 @@ mod tests {
     /// `YYYY-MM-DD`, and the SQL projections now truncate to the date
     /// head), but nothing guarded it either.
     ///
+    /// # The three shapes that outlived that fix
+    ///
+    /// Mirroring the SPA's parser on the canonical shapes was not
+    /// enough, because the two languages disagree BEFORE the shape check
+    /// and AFTER it:
+    ///
+    ///   * **Exotic whitespace, before.** `str::trim` trims Unicode
+    ///     `White_Space`; JS trims `WhiteSpace` ∪ `LineTerminator`.
+    ///     U+FEFF was stripped by JS and kept by Rust (SPA dated, report
+    ///     undated); U+0085 the other way round; U+00A0 by both, i.e.
+    ///     agreeing by luck. Both sides now trim ASCII whitespace only,
+    ///     so every one of these is undated on both — see
+    ///     `iso_date::trim_ascii_whitespace`.
+    ///   * **A signed year, at the shape check.** `time`'s `[year]`
+    ///     accepts an optional sign, so `"+2026-06-15"` was a date here
+    ///     and never one in the SPA (its regex is anchored `^\d{4}`).
+    ///     The canonical parser now rejects it on both sides — and, more
+    ///     importantly, at the writer, so it cannot be stored.
+    ///   * **A year below 1000, after.** `"0001-01-01"` is an ordinary
+    ///     `time::Date`, but JS's `Date.UTC(1, 0, 1)` means 1901 — the
+    ///     SPA's round-trip check then rejected a date this side
+    ///     accepted. Fixed on the SPA side (`setUTCFullYear`), because
+    ///     the date is real and Rust is right about it.
+    ///
     /// NOTE for anyone loosening `parse_iso_date`: it is shared with the
     /// DSO and window paths. If one of those needs RFC3339 tolerance,
     /// SPLIT the function rather than widening it — this pin reds on
     /// purpose, because widening it silently changes which invoices are
     /// receivable. (The DSO path already gets its tolerance the right
     /// way: `SUBSTR(…, 1, 10)` in the projection, not a laxer parser.)
+    ///
+    /// Mutation checks (each verified red): put `str::trim` back → the
+    /// U+0085 and U+00A0 rows flip to dated; delegate to a bare
+    /// `time::Date::parse` → `"+2026-06-15"` flips to dated.
     #[test]
     fn deadline_classifier_parity_with_the_spa() {
         // (input, is_dated)
-        let vocabulary: [(&str, bool); 10] = [
+        let vocabulary: [(&str, bool); 22] = [
             ("2026-06-30", true),            // canonical
-            (" 2026-06-30 ", true),          // `str::trim`; JS said NaN
+            (" 2026-06-30 ", true),          // ASCII space — trimmed alike
             ("\t2026-06-30\n", true),        // tabs/newlines trim alike
+            ("\r2026-06-30\u{c}", true),     // CR / form feed: ASCII too
+            ("0001-01-01", true),            // year < 1000 is a real date
+            ("0026-06-15", true),            // and so is a two-digit one
             ("2026-02-30", false),           // impossible; JS rolled it over
             ("2026-13-45", false),           // out of range both ways
             ("2026-6-3", false),             // unpadded — not canonical
             ("2026-06-30T00:00:00Z", false), // RFC3339 is not a deadline
             ("30/06/2026", false),           // swapped format
+            ("+2026-06-15", false),          // signed year — `time` said Ok
+            ("-2026-06-15", false),          // and for the negative form too
+            ("\u{feff}2026-06-30", false),   // ZWNBSP: JS trimmed, Rust did not
+            ("2026-06-30\u{feff}", false),
+            ("\u{85}2026-06-30", false), // NEL: Rust trimmed, JS did not
+            ("2026-06-30\u{85}", false),
+            ("\u{a0}2026-06-30", false), // NBSP: both trimmed — by luck
+            ("2026-06-30\u{a0}", false),
+            ("\u{b}2026-06-30", false), // VT: JS trims, `is_ascii_whitespace` does not
             ("not-a-date", false),
             ("", false),
         ];
@@ -3695,6 +3764,207 @@ mod tests {
             assert_eq!(
                 ap.aging_settled_undated.count, excluded,
                 "AP settled-undated tally / {label}"
+            );
+        }
+    }
+
+    /// **THE DEADLINE PROJECTION, THROUGH THE REAL QUERY.** PR #69 added
+    /// `SUBSTR(CAST(… AS VARCHAR), 1, 10)` to both `payment_deadline`
+    /// projections and shipped no test that runs them. Every deadline
+    /// pin in this module hand-builds `OutgoingLineGroup` / `ApRow`
+    /// values, so the truncation could be deleted from
+    /// `query_outgoing_groups` and `query_ap_rows` and the whole suite
+    /// would stay green — the projection was guarded by a comment.
+    ///
+    /// That is not a hypothetical loss. Under the settled-undated rule a
+    /// deadline the parser cannot read is not "unbucketed", it is
+    /// "already paid": the invoice leaves the outstanding total. So a
+    /// column that renders wider than ten characters — a widened type, a
+    /// writer that stores RFC3339 the way `issue_date`'s writer already
+    /// does — silently empties the book.
+    ///
+    /// The three stored shapes are driven end to end: a TIMESTAMP
+    /// column, an RFC3339 VARCHAR, and today's DATE column as the
+    /// control that says the truncation is a no-op on it. In all three
+    /// the same invoice must be OUTSTANDING (in the total, in the
+    /// `days_1_30` bucket, asserted late) and `aging_settled_undated`
+    /// must be zero.
+    ///
+    /// Mutation checks (both verified red): drop the `SUBSTR` from the
+    /// AR projection → the TIMESTAMP and RFC3339 arms report
+    /// `receivables.huf.gross_minor == 0` and
+    /// `aging_settled_undated.count == 1`; drop the `CAST` → the
+    /// TIMESTAMP arm errors out of `query_outgoing_groups` with
+    /// `InvalidColumnType`, which fails the whole financial report.
+    #[test]
+    fn ar_deadline_projection_keeps_a_wide_deadline_outstanding() {
+        let today = d(2026, Month::August, 13);
+        for (label, deadline_ddl, deadline_lit) in [
+            (
+                "TIMESTAMP column",
+                "payment_deadline TIMESTAMP",
+                "TIMESTAMP '2026-07-31 00:00:00'",
+            ),
+            (
+                "RFC3339 VARCHAR",
+                "payment_deadline VARCHAR",
+                "'2026-07-31T00:00:00Z'",
+            ),
+            (
+                "DATE column (today's shape)",
+                "payment_deadline DATE",
+                "DATE '2026-07-31'",
+            ),
+        ] {
+            let conn = Connection::open_in_memory().expect("in-memory duckdb");
+            conn.execute_batch(&format!(
+                "CREATE TABLE invoice (
+                     id VARCHAR,
+                     currency VARCHAR,
+                     issue_date VARCHAR,
+                     delivery_date DATE,
+                     {deadline_ddl}
+                 );
+                 CREATE TABLE invoice_line (
+                     invoice_id VARCHAR,
+                     vat_rate_basis_points INTEGER,
+                     vat_rate_kind VARCHAR,
+                     quantity DECIMAL(18,6),
+                     unit_price INTEGER
+                 );
+                 INSERT INTO invoice VALUES
+                   ('ar_dated', 'HUF', '2026-07-01T09:00:00Z', NULL, {deadline_lit});
+                 INSERT INTO invoice_line VALUES
+                   ('ar_dated', 0, 'Percent', 1.0, 100000);"
+            ))
+            .unwrap_or_else(|e| panic!("{label}: seed: {e:#}"));
+
+            // Unbounded window: `build_date_where` emits no predicate, so
+            // this isolates the PROJECTION from the separately-pinned
+            // window normalisation.
+            let groups =
+                query_outgoing_groups(&conn, DateWindow::unbounded(), DateBasis::Teljesites)
+                    .unwrap_or_else(|e| {
+                        panic!("{label}: the outgoing query must not error: {e:#}")
+                    });
+            assert_eq!(groups.len(), 1, "{label}: the invoice is in the All window");
+
+            let traces: HashMap<String, ReportTrace> =
+                HashMap::from([("ar_dated".to_string(), saved_trace())]);
+            let agg = aggregate_outgoing(groups, &traces, today, &HashMap::new());
+
+            assert_eq!(
+                agg.receivables.huf.gross_minor, 100_000,
+                "{label}: an unpaid dated receivable stays in Receivables — 0 means the \
+                 deadline reached the parser unreadable and the row was booked as settled"
+            );
+            assert_eq!(agg.receivables.huf.count, 1, "{label}");
+            assert_eq!(
+                agg.receivables_aging.days_1_30.gross_minor, 100_000,
+                "{label}: 07-31 → 08-13 is 13 days overdue"
+            );
+            assert_eq!(agg.receivables_aging.days_1_30.count, 1, "{label}");
+            assert_eq!(
+                agg.aging_settled_undated.count, 0,
+                "{label}: nothing was excluded as an undated legacy import"
+            );
+            assert!(
+                agg.aging_settled_undated.ids.is_empty(),
+                "{label}: {:?}",
+                agg.aging_settled_undated.ids
+            );
+            assert_eq!(
+                agg.outstanding_past_deadline_count, 1,
+                "{label}: the deadline is readable and it has passed"
+            );
+        }
+    }
+
+    /// The AP half of the projection pin, and the sharper one: `ap_sync`
+    /// makes undated payables the DOMINANT population, so this is the
+    /// side where a deadline that stops parsing moves the whole book into
+    /// "settled, excluded" in one step. `query_ap_rows` had no fixture
+    /// test at all before this.
+    ///
+    /// Mutation check (verified red): drop the `SUBSTR` from the AP
+    /// projection → the TIMESTAMP and RFC3339 arms report
+    /// `payables.huf.gross_minor == 0`, `payables_aging` all zero, and
+    /// `aging_settled_undated.count == 1`. Drop the `CAST` → the
+    /// TIMESTAMP arm errors out of `query_ap_rows`.
+    #[test]
+    fn ap_deadline_projection_keeps_a_wide_deadline_outstanding() {
+        let today = d(2026, Month::August, 13);
+        for (label, deadline_ddl, deadline_lit) in [
+            (
+                "TIMESTAMP column",
+                "payment_deadline TIMESTAMP",
+                "TIMESTAMP '2026-07-31 00:00:00'",
+            ),
+            (
+                "RFC3339 VARCHAR",
+                "payment_deadline VARCHAR",
+                "'2026-07-31T00:00:00Z'",
+            ),
+            (
+                "VARCHAR date (today's shape)",
+                "payment_deadline VARCHAR",
+                "'2026-07-31'",
+            ),
+        ] {
+            let conn = Connection::open_in_memory().expect("in-memory duckdb");
+            conn.execute_batch(&format!(
+                "CREATE TABLE ap_invoice (
+                     id VARCHAR,
+                     tenant_id VARCHAR,
+                     supplier_name VARCHAR,
+                     issue_date VARCHAR,
+                     delivery_date VARCHAR,
+                     {deadline_ddl},
+                     total_net_minor BIGINT,
+                     total_vat_minor BIGINT,
+                     total_gross_minor BIGINT,
+                     currency VARCHAR,
+                     local_status VARCHAR
+                 );
+                 INSERT INTO ap_invoice VALUES
+                   ('ap_dated', 'tenant-a', 'Beszállító Kft.', '2026-07-01', NULL,
+                    {deadline_lit}, 100000, 0, 100000, 'HUF', 'Outstanding');"
+            ))
+            .unwrap_or_else(|e| panic!("{label}: seed: {e:#}"));
+
+            let rows = query_ap_rows(
+                &conn,
+                "tenant-a",
+                DateWindow::unbounded(),
+                DateBasis::Teljesites,
+            )
+            .unwrap_or_else(|e| panic!("{label}: the AP query must not error: {e:#}"));
+            assert_eq!(rows.len(), 1, "{label}");
+
+            let ap = aggregate_ap(&rows, today);
+            assert_eq!(
+                ap.payables.huf.gross_minor, 100_000,
+                "{label}: an Outstanding dated payable stays in Payables — 0 means the \
+                 deadline reached the parser unreadable and the row was booked as settled"
+            );
+            assert_eq!(ap.payables.huf.count, 1, "{label}");
+            assert_eq!(
+                ap.payables_aging.days_1_30.gross_minor, 100_000,
+                "{label}: 07-31 → 08-13 is 13 days overdue"
+            );
+            assert_eq!(ap.payables_aging.days_1_30.count, 1, "{label}");
+            assert_eq!(
+                ap.aging_settled_undated.count, 0,
+                "{label}: nothing was excluded as an undated legacy import"
+            );
+            assert!(
+                ap.aging_settled_undated.ids.is_empty(),
+                "{label}: {:?}",
+                ap.aging_settled_undated.ids
+            );
+            assert_eq!(
+                ap.payable_past_deadline, 1,
+                "{label}: the deadline is readable and it has passed"
             );
         }
     }

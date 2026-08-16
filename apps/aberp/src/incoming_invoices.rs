@@ -118,6 +118,11 @@ use time::OffsetDateTime;
 use ulid::Ulid;
 
 use crate::audit_payloads::{IncomingInvoiceIngestedPayload, IncomingInvoiceStatusChangedPayload};
+// Strict `YYYY-MM-DD` validation for the three date columns this module
+// writes. The report reads the same columns back and treats an
+// unreadable `payment_deadline` as SETTLED, so the writer's notion of a
+// date and the reader's have to be one definition. See `crate::iso_date`.
+use crate::iso_date::is_canonical_iso_date;
 
 // ──────────────────────────────────────────────────────────────────────
 // IncomingInvoiceId — prefixed-ULID newtype (`apinv_<26-char-ULID>`).
@@ -763,6 +768,38 @@ fn find_existing_id(
 
 /// List incoming invoices for the tenant, newest issue_date first.
 ///
+/// The column list shared by [`list_incoming`] and [`get_incoming`] —
+/// the two reads that feed the SPA's incoming-invoice list and detail
+/// views, and therefore the drill-down the dashboard's payables-aging
+/// and past-deadline tiles link INTO.
+///
+/// # Why `payment_deadline` is normalised here
+///
+/// The financial report does not read this column raw. Both of its
+/// projections truncate — `SUBSTR(CAST(a.payment_deadline AS VARCHAR),
+/// 1, 10)` in `reports::query_ap_rows` — precisely so a column that ever
+/// renders wider than a bare date (a widened type, a writer that stores
+/// RFC3339) cannot turn every payable into an unreadable deadline, which
+/// under the settled-undated rule means "already paid, drop from
+/// Payables".
+///
+/// This read used to take the column RAW. That is the same trap one
+/// level down: the tile would classify `2026-06-15T00:00:00Z` as undated
+/// and exclude the row, while the list handed the SPA the full timestamp
+/// — which its `parseRecordedDeadline` also rejects, so the row would
+/// show a blank deadline and, worse, the two sides would be reading
+/// different strings for the same invoice. Normalising identically is
+/// what keeps tile and list talking about the same value.
+///
+/// The `CAST` earns its keep separately: without it a type change makes
+/// `row.get::<Option<String>>` raise `InvalidColumnType` and fail the
+/// whole list, not one field.
+const INCOMING_COLUMNS: &str = "id, supplier_tax_number, supplier_name, supplier_address,
+                nav_invoice_number, issue_date, delivery_date,
+                SUBSTR(CAST(payment_deadline AS VARCHAR), 1, 10) AS payment_deadline,
+                total_net_minor, total_vat_minor, total_gross_minor, currency,
+                local_status, irrelevant_reason, nav_xml_path, created_at, updated_at";
+
 /// `status_filter` optionally narrows to one of the three closed-vocab
 /// values; `None` returns every row. Pagination is offset-based per
 /// the SPA list-view's existing posture (`limit` + `offset`).
@@ -788,16 +825,13 @@ pub fn list_incoming(
     let mut rows = Vec::new();
     match status_filter {
         Some(status) => {
-            let mut stmt = conn.prepare(
-                "SELECT id, supplier_tax_number, supplier_name, supplier_address,
-                        nav_invoice_number, issue_date, delivery_date, payment_deadline,
-                        total_net_minor, total_vat_minor, total_gross_minor, currency,
-                        local_status, irrelevant_reason, nav_xml_path, created_at, updated_at
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {INCOMING_COLUMNS}
                    FROM ap_invoice
                   WHERE tenant_id = ? AND local_status = ?
                   ORDER BY issue_date DESC, id DESC
-                  LIMIT ? OFFSET ?",
-            )?;
+                  LIMIT ? OFFSET ?"
+            ))?;
             let mut q = stmt.query(params![
                 tenant,
                 status.as_str(),
@@ -809,16 +843,13 @@ pub fn list_incoming(
             }
         }
         None => {
-            let mut stmt = conn.prepare(
-                "SELECT id, supplier_tax_number, supplier_name, supplier_address,
-                        nav_invoice_number, issue_date, delivery_date, payment_deadline,
-                        total_net_minor, total_vat_minor, total_gross_minor, currency,
-                        local_status, irrelevant_reason, nav_xml_path, created_at, updated_at
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {INCOMING_COLUMNS}
                    FROM ap_invoice
                   WHERE tenant_id = ?
                   ORDER BY issue_date DESC, id DESC
-                  LIMIT ? OFFSET ?",
-            )?;
+                  LIMIT ? OFFSET ?"
+            ))?;
             let mut q = stmt.query(params![tenant, limit as i64, offset as i64])?;
             while let Some(row) = q.next()? {
                 rows.push(row_to_incoming(row)?);
@@ -840,15 +871,12 @@ pub fn get_incoming(
         .read()
         .context("acquire shared reader for ap_invoice get")?;
     // R-1 — no DDL on a read connection. See `ensure_schema`'s doc-comment.
-    let mut stmt = conn.prepare(
-        "SELECT id, supplier_tax_number, supplier_name, supplier_address,
-                nav_invoice_number, issue_date, delivery_date, payment_deadline,
-                total_net_minor, total_vat_minor, total_gross_minor, currency,
-                local_status, irrelevant_reason, nav_xml_path, created_at, updated_at
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {INCOMING_COLUMNS}
            FROM ap_invoice
           WHERE tenant_id = ? AND id = ?
-          LIMIT 1",
-    )?;
+          LIMIT 1"
+    ))?;
     let mut rows = stmt.query(params![tenant, id])?;
     if let Some(row) = rows.next()? {
         Ok(Some(row_to_incoming(row)?))
@@ -1142,14 +1170,15 @@ fn read_current_status(
 // Helpers.
 // ──────────────────────────────────────────────────────────────────────
 
-/// Strict YYYY-MM-DD validator. Same posture as
-/// `mark_invoice_paid::is_canonical_iso_date` — silent acceptance of
-/// non-canonical date strings would lock the wrong shape into the
-/// audit ledger forever.
-pub(crate) fn is_canonical_iso_date(s: &str) -> bool {
-    let format = time::macros::format_description!("[year]-[month]-[day]");
-    time::Date::parse(s, &format).is_ok()
-}
+// The strict `YYYY-MM-DD` validator that used to be defined here is now
+// `crate::iso_date::is_canonical_iso_date`, imported at the top of this
+// module. It and the identical copy in `mark_invoice_paid` were both a
+// bare `time::Date::parse`, which accepts an optional SIGN on `[year]`:
+// `payment_deadline: "+2026-06-15"` validated here, stored as eleven
+// characters, and reached `reports::parse_iso_date` through
+// `SUBSTR(CAST(… AS VARCHAR), 1, 10)` as `"+2026-06-1"` — unparseable,
+// and therefore classified as a SETTLED undated legacy import. A live
+// unpaid payable would leave the Payables total. See `crate::iso_date`.
 
 #[cfg(test)]
 mod tests {
@@ -1317,6 +1346,62 @@ mod tests {
         input.currency = "USD".into();
         let result = validate_ingestion_input(&input);
         assert!(matches!(result, Err(IngestError::InvalidInput(_))));
+    }
+
+    /// A SIGNED year must not reach the `ap_invoice` date columns.
+    ///
+    /// This is a money pin, not a hygiene one. The financial report
+    /// projects `payment_deadline` as `SUBSTR(CAST(… AS VARCHAR), 1, 10)`
+    /// and parses the result with `reports::parse_iso_date`; under the
+    /// settled-undated rule a parse failure means "legacy import, already
+    /// paid — drop it from Payables". `"+2026-06-15"` is eleven
+    /// characters, so it arrives at that parser as `"+2026-06-1"` and a
+    /// live unpaid payable leaves the total behind a diagnostic counter.
+    ///
+    /// The old validator here accepted it: `time`'s `[year]` component
+    /// has `sign_is_mandatory: false`, i.e. the sign is optional rather
+    /// than forbidden, so a bare `Date::parse` said `Ok`.
+    ///
+    /// Mutation check (verified red): restore the module-local
+    /// `time::Date::parse(s, "[year]-[month]-[day]").is_ok()` and all
+    /// three signed arms below are accepted.
+    #[test]
+    fn validate_rejects_a_signed_year_on_every_date_column() {
+        for label in ["issue_date", "payment_deadline", "delivery_date"] {
+            let mut input = fixture_input();
+            match label {
+                "issue_date" => input.issue_date = "+2026-06-15".into(),
+                "payment_deadline" => input.payment_deadline = Some("+2026-06-15".into()),
+                _ => input.delivery_date = Some("+2026-06-15".into()),
+            }
+            assert!(
+                matches!(
+                    validate_ingestion_input(&input),
+                    Err(IngestError::InvalidInput(_))
+                ),
+                "{label}: a signed year must not be storable"
+            );
+        }
+    }
+
+    /// Out-of-range values fail loud at the writer too — the other half
+    /// of the canonical validator's job (`crate::iso_date`), pinned here
+    /// at the site that actually writes the column.
+    #[test]
+    fn validate_rejects_out_of_range_dates() {
+        for bad in ["2026-13-01", "2026-00-15", "2026-02-30", "2025-02-29"] {
+            let mut input = fixture_input();
+            input.payment_deadline = Some(bad.into());
+            assert!(
+                matches!(
+                    validate_ingestion_input(&input),
+                    Err(IngestError::InvalidInput(_))
+                ),
+                "{bad:?} is not a calendar date"
+            );
+        }
+        // Control: the fixture's own canonical deadline still validates.
+        assert!(validate_ingestion_input(&fixture_input()).is_ok());
     }
 
     /// Ingestion is idempotent — re-ingesting the same supplier's
@@ -2163,5 +2248,114 @@ mod tests {
                 row.nav_xml_path
             );
         }
+    }
+
+    /// **TILE ↔ LIST AGREEMENT on the deadline.** The dashboard's
+    /// payables-aging and past-deadline tiles are click-throughs INTO
+    /// this list. The report normalises the column it classifies on —
+    /// `SUBSTR(CAST(a.payment_deadline AS VARCHAR), 1, 10)` in
+    /// `reports::query_ap_rows` — and these two reads used to hand the
+    /// SPA the RAW column.
+    ///
+    /// So under a widened column (or any writer that stores RFC3339 —
+    /// exactly what already happened to `invoice.issue_date`) the tile
+    /// would classify `2026-06-29` and the list would carry
+    /// `2026-06-29T00:00:00Z`, which the SPA's `parseRecordedDeadline`
+    /// rejects: the row would render with no deadline and drop out of
+    /// the drill-down its own tile counted. Same column, two different
+    /// strings, two different verdicts.
+    ///
+    /// The fixture writes the wide value directly because the ingest
+    /// validator now refuses it — which is the point: this pin guards
+    /// the READ, on data no current writer can produce.
+    ///
+    /// Mutation check (verified red): put `payment_deadline` back in the
+    /// column list raw and both assertions return the full RFC3339
+    /// string.
+    #[test]
+    fn list_and_get_normalise_a_wide_payment_deadline() {
+        let dir = ScopedTempDir::new("wide-deadline");
+        let db_path = dir.path().join("tenant.duckdb");
+        let artifacts_dir = dir.path().join("ap-artifacts");
+        let tenant = fixture_tenant();
+        let bh = fixture_binary_hash();
+
+        let outcome = ingest_incoming_invoice(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            fixture_input(),
+        )
+        .expect("ingest");
+        let id = match outcome {
+            IngestOutcome::Created { id } => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        // Simulate the shape a widened column / an RFC3339-storing
+        // writer produces. Straight SQL: `validate_ingestion_input`
+        // rejects this string, and rightly so.
+        {
+            let handle = aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap();
+            let guard = handle.write().expect("writer");
+            guard
+                .execute(
+                    "UPDATE ap_invoice SET payment_deadline = ? WHERE tenant_id = ? AND id = ?",
+                    params!["2026-06-29T00:00:00Z", tenant.as_str(), id.as_str()],
+                )
+                .expect("widen the stored deadline");
+        }
+
+        let rows = list_incoming(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.as_str(),
+            None,
+            100,
+            0,
+        )
+        .expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].payment_deadline.as_deref(),
+            Some("2026-06-29"),
+            "the list must hand the SPA the same date head the report classifies on"
+        );
+
+        let one = get_incoming(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.as_str(),
+            id.as_str(),
+        )
+        .expect("get")
+        .expect("the row exists");
+        assert_eq!(
+            one.payment_deadline.as_deref(),
+            Some("2026-06-29"),
+            "the detail read shares the column list, and must share the normalisation"
+        );
+
+        // The control: a row with NO deadline stays `None` rather than
+        // becoming an empty string, which the SPA would have to treat as
+        // a fourth case.
+        {
+            let handle = aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap();
+            let guard = handle.write().expect("writer");
+            guard
+                .execute(
+                    "UPDATE ap_invoice SET payment_deadline = NULL WHERE tenant_id = ? AND id = ?",
+                    params![tenant.as_str(), id.as_str()],
+                )
+                .expect("clear the deadline");
+        }
+        let cleared = get_incoming(
+            &aberp_db::Handle::open_default(&db_path, tenant.clone()).unwrap(),
+            tenant.as_str(),
+            id.as_str(),
+        )
+        .expect("get")
+        .expect("the row exists");
+        assert_eq!(cleared.payment_deadline, None);
     }
 }

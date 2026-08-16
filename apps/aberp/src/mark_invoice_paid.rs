@@ -42,6 +42,12 @@ use duckdb::Connection;
 
 use crate::audit_payloads::{self, PaymentMethod};
 use crate::audit_query::{self, PaymentRecord};
+// Strict `YYYY-MM-DD` validation for `paid_at`. This module used to keep
+// its own copy — a bare `time::Date::parse` — and so did
+// `incoming_invoices`. See `crate::iso_date` for what both copies got
+// wrong (`time`'s `[year]` accepts an optional SIGN) and why the report
+// reader has to agree with the writer about it.
+use crate::iso_date::is_canonical_iso_date;
 
 /// Typed outcome of an attempted mark-paid orchestration. Mirrors
 /// the closed-vocab `SubmitRouteError` shape from `serve.rs` so the
@@ -221,15 +227,14 @@ fn write_payment_audit_entry(
     Ok(())
 }
 
-/// Strict YYYY-MM-DD validator. Uses `time::Date::parse` to reject
-/// malformed input (alphabetic, out-of-range month/day, missing
-/// dashes, etc.) per CLAUDE.md rule 12 — silent acceptance of
-/// `"2026/05/26"` or `"26 May 2026"` would lock the wrong shape
-/// into the audit ledger forever.
-fn is_canonical_iso_date(s: &str) -> bool {
-    let format = time::macros::format_description!("[year]-[month]-[day]");
-    time::Date::parse(s, &format).is_ok()
-}
+// The local `is_canonical_iso_date` that lived here is gone: it and the
+// one in `incoming_invoices` were two copies of the same bare
+// `time::Date::parse`, and both accepted a SIGNED year (`+2026-06-15`),
+// which `reports::parse_iso_date` — reading the same value back through
+// `SUBSTR(…, 1, 10)` — rejects. `paid_at` is the DSO anchor, so there
+// the consequence was a silently dropped sample rather than an invoice
+// vanishing from Receivables; one definition means the two sites no
+// longer have to be reasoned about separately. See `crate::iso_date`.
 
 #[cfg(test)]
 mod tests {
@@ -255,5 +260,30 @@ mod tests {
         assert!(!is_canonical_iso_date("2026-02-30")); // bad day
         assert!(!is_canonical_iso_date("twenty-twenty-six")); // alphabetic
         assert!(!is_canonical_iso_date("2026-05-26T00:00:00")); // timestamp form
+    }
+
+    /// `paid_at` is the DSO anchor: `reports::aggregate_outgoing` parses
+    /// it back with `parse_iso_date` and drops the sample when the parse
+    /// fails. So a shape this validator accepts and that parser rejects
+    /// is a payment that silently stops counting toward days-to-pay.
+    ///
+    /// A signed year is exactly that shape. `time`'s `[year]` component
+    /// has `sign_is_mandatory: false` — optional, not absent — so the
+    /// old bare `Date::parse` here returned `Ok` for `"+2026-06-15"`,
+    /// and eleven characters went into the audit payload.
+    ///
+    /// Mutation check (verified red): revert this module to its own
+    /// `time::Date::parse(s, "[year]-[month]-[day]").is_ok()` and the
+    /// two signed rows below come back accepted.
+    #[test]
+    fn is_canonical_iso_date_rejects_a_signed_year_and_out_of_range_values() {
+        assert!(!is_canonical_iso_date("+2026-05-26"));
+        assert!(!is_canonical_iso_date("-2026-05-26"));
+        assert!(!is_canonical_iso_date("2026-00-15")); // month below range
+        assert!(!is_canonical_iso_date("2026-05-00")); // day below range
+        assert!(!is_canonical_iso_date("2025-02-29")); // 2025 is not a leap year
+                                                       // The control: an ordinary date still validates, so the tighter
+                                                       // gate is not simply rejecting everything.
+        assert!(is_canonical_iso_date("2026-05-26"));
     }
 }

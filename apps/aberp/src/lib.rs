@@ -55,6 +55,10 @@ pub mod fs;
 pub mod incoming_invoices;
 pub mod invoice_bank_snapshot;
 pub mod invoice_currency_metadata;
+// The ONE canonical `YYYY-MM-DD` definition, shared by the two write
+// paths that validate operator-supplied dates and by the report reader
+// that decides — from the same columns — which invoices are outstanding.
+pub mod iso_date;
 // S236 / PR-230b — pre-allocation Draft state. New `invoice_draft`
 // table + `BillingInvoiceSpawner` replaces `NoopInvoiceSpawner` from
 // PR-230. Closes the Stage 3 → Stage 1 hand-off without burning a
