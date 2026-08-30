@@ -13,6 +13,14 @@
 //! production`; it is covered by the unit pins in
 //! `build_profile::tests`.
 
+// The one test in this file is the DEV-build refusal arm, already
+// `#[cfg(not(feature = "production"))]` (the PROD mirror arm lives in
+// `build_profile::tests`, as the module docs say). Hoisting the same cfg to the
+// file keeps the import below from going dead under `--features production`,
+// which `-D warnings` turns into a hard clippy failure on the flavour
+// `run_prod.sh` actually ships. Same shape as `serve_db_path_guard.rs`.
+#![cfg(not(feature = "production"))]
+
 use std::process::Command;
 
 /// A dev build (no `production` feature) launched as `--tenant prod`
