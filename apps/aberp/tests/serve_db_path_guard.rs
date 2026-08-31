@@ -21,6 +21,14 @@
 //! the rule is pinned in-process instead, against an injected root:
 //! `tenant_registry::tests::db_isolation_*`.
 
+// EVERY test in this file is the DEV-build refusal arm — both are already
+// `#[cfg(not(feature = "production"))]` individually (a PROD binary launched at
+// a prod DB is the ALLOWED case, so there is nothing to refuse). Hoisting the
+// same cfg to the file keeps the seven helpers and four imports below from
+// going dead under `--features production`, which `-D warnings` turns into a
+// hard clippy failure on the flavour `run_prod.sh` actually ships.
+#![cfg(not(feature = "production"))]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

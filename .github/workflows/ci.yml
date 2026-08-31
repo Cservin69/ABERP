@@ -38,16 +38,29 @@ jobs:
   check:
     name: build + lint + supply-chain
     runs-on: ubuntu-latest
-    # Back to 45 now the SQLite experiment is retired. It had been raised to 70
-    # for a `sqlite-engine` clippy+test arm measured at ~21m on its own; with
-    # that arm gone the job is back to the work it did under a 45m ceiling,
-    # where it had been green for months.
+    # Raised 45 -> 70 for the `--release --features production` clippy arm
+    # added below. Same shape as the precedent this comment already records:
+    # the retired `sqlite-engine` arm was ~21m on its own and needed 70.
+    #
+    # MEASURED on CI, per the rule below (job 99402113586, the run that added
+    # this arm):
+    #
+    #   step 16  clippy --release --features production   20m10s
+    #   whole job                                         36m01s
+    #
+    # 36m01s does fit under the old 45m ceiling, but with only ~9m to spare —
+    # and that run had a WARM Swatinem cache for the dependency tree. The
+    # release profile shares no artifacts with the dev steps, so any change to
+    # Cargo.lock busts the cache and makes BOTH profiles compile cold in the
+    # same job; that is the case 45m does not survive. 70m restores the margin
+    # the retired ~21m sqlite-engine arm was given, and this arm is comparable
+    # in size to it.
     #
     # A cancelled gate proves nothing — it is indistinguishable from a pass and
     # from a failure, which is the lesson cut-gate.yml's own timeout comment
     # records. If this job starts brushing the ceiling again, raise it on a
     # MEASURED number rather than trimming pins to fit.
-    timeout-minutes: 45
+    timeout-minutes: 70
 
     steps:
       - name: Checkout
@@ -161,6 +174,29 @@ jobs:
 
       - name: Clippy (warnings denied per ADR-0007 fail-loud posture)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Clippy (--release --features production — the flavour run_prod.sh ships)
+        # THE GAP THIS CLOSES. Every cargo step above runs DEFAULT features on
+        # the DEV profile. The binary operators actually run is built by
+        # `run/run_prod.sh` as
+        #     cargo build --release --features production --bin aberp
+        #     cargo build --release --features production --bin aberp-ui
+        # and that flavour was linted by NOTHING. Two things change under it,
+        # and each can hide a warning the dev-profile lint cannot see:
+        #
+        #   1. `--features production` compiles a DIFFERENT set of items —
+        #      every `#[cfg(not(feature = "production"))]` test drops out,
+        #      stranding its imports and helpers as dead code.
+        #   2. `--release` turns OFF `debug_assertions`, which makes
+        #      `#[cfg(debug_assertions)]` readers vanish. That is exactly how
+        #      `field `id` is never read` sat in the shipped build of
+        #      aberp-db's `Handle` with no gate able to see it, and it is why
+        #      PROD_v2.34.1 had to be cut as a warning-only patch.
+        #
+        # Kept in this job rather than a parallel one for the reason the job
+        # header gives: fan-out duplicates toolchain setup and a cache topology
+        # for no gate value.
+        run: cargo clippy --workspace --all-targets --release --features production --locked -- -D warnings
 
       - name: Install cargo-deny and cargo-audit
         uses: taiki-e/install-action@v2
