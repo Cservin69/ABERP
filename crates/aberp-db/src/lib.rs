@@ -622,6 +622,9 @@ thread_local! {
 pub struct Handle {
     /// Process-unique id (from [`NEXT_HANDLE_ID`]). Consumed ONLY by the
     /// debug/test re-entrancy tripwire to identify THIS Handle's writer mutex.
+    // The ADR-0099 H3 re-entrancy tripwire is its only reader and is gated
+    // `#[cfg(debug_assertions)]`, so a `--release` build never reads this field.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     id: u64,
     db_path: PathBuf,
     /// `<db>.wal` — DuckDB's write-ahead log for [`Self::db_path`]. Precomputed
