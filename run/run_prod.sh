@@ -60,6 +60,74 @@ readonly PROD_DB="${PROD_HOME}/aberp.duckdb"
 # bug in this script, not in the binary (the binary IS truth).
 readonly PROD_NAV_HOST="api.onlineszamla.nav.gov.hu"
 
+# ---------- accidental-test-run artifact self-clear -------------------------
+# Running ./run/run_desktop.sh (tenant=test) from inside the PROD install
+# drops test-tenant runtime files into the working tree. run_desktop.sh's
+# default `./aberp.duckdb` resolves against the Tauri shell's cwd, i.e.
+# apps/aberp-ui/ (see run_desktop.sh "Resolve the db path"). Two of those
+# files are UNTRACKED and NOT gitignored, so they trip the Frankenstein
+# refusal below even though they are harmless noise:
+#   apps/aberp-ui/.aberp-db-writer.test.lock   0-byte writer-lock file
+#                                              (crates/aberp-db db_writer_lock.rs)
+#   apps/aberp-ui/aberp.duckdb.ckpt-ok         ADR-0095 §4 checkpoint marker
+#                                              (crates/aberp-snapshot crash_safe.rs)
+# The repo-local aberp.duckdb / .wal / .audit.log are gitignored, do not
+# block, and are deliberately LEFT ALONE (deleting a database buys nothing).
+#
+# PROD-DATA-SAFE BY CONSTRUCTION: prod pins ABERP_DB to the absolute
+# ~/.aberp/prod/aberp.duckdb (guard #2 below) and never opens the repo-local
+# DB; this function only ever names the two exact paths above under
+# <repo>/apps/aberp-ui, never anything under ~/.aberp/.
+#
+# Removes an allowlisted file ONLY if it is a regular, non-symlink, UNTRACKED
+# file AND no live process holds the writer lock (lsof). A tracked file, an
+# unknown file, or a held lock is left untouched — the guard that follows then
+# decides exactly as before. Each removal is logged on one line.
+clear_accidental_test_artifacts() {
+  local repo_root="$1" dir name f holders
+  dir="${repo_root}/apps/aberp-ui"
+  local -a present=()
+  for name in ".aberp-db-writer.test.lock" "aberp.duckdb.ckpt-ok"; do
+    f="${dir}/${name}"
+    [[ -e "$f" || -L "$f" ]] || continue
+    if [[ -L "$f" || ! -f "$f" ]]; then
+      echo "[auto-clear] SKIP ${f} — not a regular file" >&2; continue
+    fi
+    if git -C "$repo_root" ls-files --error-unmatch -- "apps/aberp-ui/${name}" >/dev/null 2>&1; then
+      echo "[auto-clear] SKIP ${f} — tracked by git" >&2; continue
+    fi
+    present+=("$f")
+  done
+  [[ ${#present[@]} -gt 0 ]] || return 0
+  if ! command -v lsof >/dev/null 2>&1; then
+    echo "[auto-clear] lsof not found — cannot prove the writer lock is free; clearing nothing" >&2
+    return 0
+  fi
+  # A live test run holds the lock; the marker belongs to that same run, so
+  # skip everything while ANY allowlisted file is held.
+  for f in "${present[@]}"; do
+    holders="$(lsof -t -- "$f" 2>/dev/null | tr '\n' ' ' || true)"
+    if [[ -n "${holders// /}" ]]; then
+      echo "[auto-clear] SKIP all — ${f} is held by pid(s) ${holders}(a test run is live); clearing nothing" >&2
+      return 0
+    fi
+  done
+  for f in "${present[@]}"; do
+    if rm -f -- "$f"; then
+      echo "[auto-clear] removed stale accidental test-run artifact: ${f}" >&2
+    else
+      echo "[auto-clear] could not remove ${f}" >&2
+    fi
+  done
+}
+
+# Test seam: sourcing with ABERP_RUN_PROD_LIB_ONLY=1 loads the helper above
+# without running the launch flow. (run/tests/run_prod_autoclear_test.sh runs
+# the REAL script end-to-end instead; this is for ad-hoc sourcing.)
+if [[ "${ABERP_RUN_PROD_LIB_ONLY:-0}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 # ---------- colour helpers (no-op when stderr is not a terminal) ------------
 if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
   c_red=$'\033[1;31m'; c_yel=$'\033[1;33m'; c_grn=$'\033[1;32m'
@@ -130,6 +198,10 @@ echo >&2
 # Opt-out: ABERP_SKIP_GIT_CHECK=1 (for dev workflows that intentionally
 # launch from main or a feature branch — never for real prod).
 if [[ "${ABERP_SKIP_GIT_CHECK:-0}" != "1" ]]; then
+  # Clear known-harmless accidental-test-run noise first; the check below is
+  # unchanged and still refuses on anything else (see the function's header).
+  clear_accidental_test_artifacts "$REPO_ROOT"
+
   if [[ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]]; then
     echo "${c_red}❌ Working tree has uncommitted changes — refusing to launch a Frankenstein build.${c_rst}" >&2
     echo "${c_red}   A munkakönyvtár nincs tiszta — Frankenstein-bináris indítása megtagadva.${c_rst}" >&2
