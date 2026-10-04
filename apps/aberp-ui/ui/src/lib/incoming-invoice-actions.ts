@@ -6,8 +6,9 @@
 /** Trim a free-text reason and decide whether it satisfies the
  * backend's `ReasonRequiredForIrrelevant` invariant. The backend
  * loud-fails an empty / whitespace-only reason with HTTP 400; the SPA
- * gates the modal's submit button on the same predicate so the
- * operator never sees the round-trip error. */
+ * checks the same predicate in the modal's submit handler and shows the
+ * reason-required message in place, so the operator never sees the
+ * round-trip error (the button stays enabled — a disabled one gave no hint). */
 export function isIrrelevantReasonValid(reason: string): boolean {
   return reason.trim().length > 0;
 }
