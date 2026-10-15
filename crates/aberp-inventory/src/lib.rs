@@ -50,9 +50,9 @@ mod types;
 pub use audit::StockMovementRecordedPayload;
 pub use error::InventoryError;
 pub use repository::{
-    count_low_stock_products, current_stock, ensure_schema, inventory_fields_for_product,
-    inventory_fields_for_tenant, list_movements_for_product, low_stock_products,
-    rebuild_stock_cache_for_tenant, record_movement, validate_reason_sign, InventoryFields,
-    LowStockRow, RecordMovementContext, RecordMovementInputs, StockMovement,
+    count_low_stock_products, current_stock, ensure_schema, inventory_fields_for_tenant,
+    list_movements_for_product, low_stock_products, rebuild_stock_cache_for_tenant,
+    record_movement, validate_reason_sign, InventoryFields, LowStockRow, RecordMovementContext,
+    RecordMovementInputs, StockMovement,
 };
 pub use types::{ActorKind, MovementReason, MovementRefKind, RequiredSign};

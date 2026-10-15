@@ -606,6 +606,7 @@
 {#if detailProductId !== null}
   <ProductDetail
     productId={detailProductId}
+    onStockChanged={loadProducts}
     onClose={() => {
       detailProductId = null;
       void loadProducts();

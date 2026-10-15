@@ -461,56 +461,6 @@ pub fn inventory_fields_for_tenant(
     Ok(out)
 }
 
-/// Read inventory cache fields for one product. Returns `None` for
-/// missing / soft-deleted rows (matches `products::get_product`).
-pub fn inventory_fields_for_product(
-    conn: &Connection,
-    tenant: &str,
-    product_id: &str,
-) -> anyhow::Result<Option<InventoryFields>> {
-    let row = conn
-        .query_row(
-            "SELECT CAST(COALESCE(stock_qty, 0) AS VARCHAR),
-                    CAST(COALESCE(min_stock, 0) AS VARCHAR),
-                    bin_location,
-                    last_movement_at
-             FROM products
-             WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL
-             LIMIT 1;",
-            params![tenant, product_id],
-            |row| {
-                let stock_qty_str: String = row.get(0)?;
-                let min_stock_str: String = row.get(1)?;
-                let bin_location: Option<String> = row.get(2)?;
-                let last_movement_at: Option<String> = row.get(3)?;
-                Ok((stock_qty_str, min_stock_str, bin_location, last_movement_at))
-            },
-        )
-        .map(Some)
-        .or_else(|e| match e {
-            duckdb::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other),
-        })
-        .context("SELECT products inventory fields")?;
-    match row {
-        None => Ok(None),
-        Some((stock_qty_str, min_stock_str, bin_location, last_movement_at)) => {
-            let stock_qty = Decimal::from_str(&stock_qty_str)
-                .with_context(|| format!("parse stock_qty {stock_qty_str:?}"))?;
-            let min_stock = Decimal::from_str(&min_stock_str)
-                .with_context(|| format!("parse min_stock {min_stock_str:?}"))?;
-            let is_low_stock = stock_qty < min_stock;
-            Ok(Some(InventoryFields {
-                stock_qty,
-                min_stock,
-                bin_location,
-                last_movement_at,
-                is_low_stock,
-            }))
-        }
-    }
-}
-
 /// One row in the [`low_stock_products`] result. Carries enough
 /// product context that the dashboard chip + the products-list
 /// red-badge can render without re-joining `products`.

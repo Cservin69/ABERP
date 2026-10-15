@@ -6,6 +6,7 @@ import {
   MANUAL_REASONS,
   MOVEMENT_REASON_LABELS,
   formatQty,
+  postMovementThenRefresh,
   reasonLabel,
 } from "./stock-movements";
 
@@ -62,5 +63,47 @@ describe("formatQty", () => {
     expect(formatQty("10")).toBe("10");
     expect(formatQty("-5")).toBe("-5");
     expect(formatQty("0")).toBe("0");
+  });
+});
+
+// The list row and the detail drawer must show the SAME stock figure. The
+// drawer opens over the list, so after a movement posts, BOTH must re-read
+// the backend's `stock_qty` — otherwise the list keeps the pre-movement
+// value (prod: list 126 vs drawer 65.5 after a -60.5 movement).
+describe("postMovementThenRefresh", () => {
+  // Fake backend: one product's cached stock, read by both screens.
+  function harness(start: string) {
+    let backend = start;
+    const screens = { list: start, detail: start };
+    return {
+      screens,
+      post: (delta: number) => async () => {
+        backend = String(Number(backend) + delta);
+      },
+      refreshDetail: async () => {
+        screens.detail = backend;
+      },
+      refreshList: async () => {
+        screens.list = backend;
+      },
+    };
+  }
+
+  test("after an outflow the list row agrees with the drawer", async () => {
+    const h = harness("126");
+    await postMovementThenRefresh(h.post(-60.5), h.refreshDetail, h.refreshList);
+    expect(h.screens.detail).toBe("65.5");
+    expect(h.screens.list).toBe(h.screens.detail);
+  });
+
+  test("a refused movement refreshes neither screen and surfaces the error", async () => {
+    const h = harness("126");
+    const refused = async () => {
+      throw new Error("409 duplicate idempotency key");
+    };
+    await expect(
+      postMovementThenRefresh(refused, h.refreshDetail, h.refreshList),
+    ).rejects.toThrow("409");
+    expect(h.screens).toEqual({ list: "126", detail: "126" });
   });
 });
