@@ -952,3 +952,55 @@ async fn t1_concurrent_issues_stay_gap_free_and_same_key_racers_collapse() {
 
     let _keep = &dir;
 }
+
+/// ADR-0009 §7 / ADR-0031 §5 — once 50 invoices are unsubmitted, the next
+/// issue is refused BEFORE any number is allocated, with the typed
+/// `SubmissionQueueFull` the route maps to a 409 (not an untyped error that
+/// becomes a generic 500).
+#[tokio::test(flavor = "current_thread")]
+async fn queue_at_hard_cap_refuses_issue_with_typed_error_and_allocates_nothing() {
+    let dir = test_dir("queue-full");
+    std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+    let cap = aberp::submission_queue::HARD_CAP_PENDING;
+
+    for _ in 0..cap {
+        serve::issue_invoice_request(
+            &state,
+            fixture_request(Currency::Huf),
+            fixture_supplier(),
+            &UnreachableProvider,
+            Actor::from_local_cli("test-session".to_string(), "test-user"),
+            None,
+        )
+        .await
+        .expect("issues below the cap succeed");
+    }
+
+    let err = serve::issue_invoice_request(
+        &state,
+        fixture_request(Currency::Huf),
+        fixture_supplier(),
+        &UnreachableProvider,
+        Actor::from_local_cli("test-session".to_string(), "test-user"),
+        None,
+    )
+    .await
+    .expect_err("the issue at the cap must be refused");
+    let full = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<aberp::submission_queue::SubmissionQueueFull>())
+        .unwrap_or_else(|| panic!("refusal must be the typed SubmissionQueueFull, got: {err:#}"));
+    assert_eq!(full.pending, cap);
+    assert_eq!(full.cap, cap);
+    assert_eq!(full.issuing, "invoice");
+
+    assert_eq!(
+        count_kind(&ledger_for(&state), EventKind::InvoiceSequenceReserved),
+        cap,
+        "the refused issue allocated no sequence number"
+    );
+
+    let _keep = &dir;
+}

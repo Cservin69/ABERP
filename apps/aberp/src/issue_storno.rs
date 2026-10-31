@@ -295,15 +295,8 @@ pub fn storno_from_inputs(
     let pending_count =
         crate::submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
             .context("count pending submissions (ADR-0031 §5 cap check) for storno")?;
-    if pending_count >= crate::submission_queue::HARD_CAP_PENDING {
-        return Err(anyhow!(
-            "submission queue is full ({}/{} pending invoices per ADR-0009 §7 / ADR-0031 §5); \
-             run `aberp drain-submission-queue --endpoint <test|production> --tax-number ...` \
-             to submit the backlog before issuing a storno",
-            pending_count,
-            crate::submission_queue::HARD_CAP_PENDING,
-        ));
-    }
+    // ADR-0009 §7 / ADR-0031 §5 — typed so the route can answer 409, not 500.
+    crate::submission_queue::ensure_capacity(pending_count, "storno")?;
 
     // 5. Pre-flight precondition: base must be Finalized (last ack =
     //    SAVED). Open a fresh Ledger for the read; close it before

@@ -94,6 +94,58 @@ use crate::audit_payloads;
 /// Hard-coded today; F42 names the operator-config trigger.
 pub const HARD_CAP_PENDING: usize = 50;
 
+/// ADR-0009 §7 / ADR-0031 §5 — the typed refusal when the unsubmitted
+/// backlog has reached [`HARD_CAP_PENDING`]. A distinct type (not an
+/// `anyhow!` string) so the route layer can answer `409` with
+/// `{"error":"submission_queue_full", …}` and the SPA can say what to do,
+/// instead of a generic 500 "internal error". `issuing` is what was refused:
+/// `"invoice"`, `"storno"` or `"modification"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionQueueFull {
+    pub pending: usize,
+    pub cap: usize,
+    pub issuing: &'static str,
+}
+
+impl std::fmt::Display for SubmissionQueueFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "submission queue is full ({}/{} pending invoices per ADR-0009 §7 / ADR-0031 §5); \
+             run `aberp drain-submission-queue --endpoint <test|production> --tax-number ...` \
+             to submit the backlog",
+            self.pending, self.cap
+        )?;
+        if self.issuing == "invoice" {
+            write!(
+                f,
+                ", or `aberp mark-abandoned --invoice-id <id> --reason ...` \
+                 on invoices the operator has decided not to submit"
+            )
+        } else {
+            write!(f, " before issuing a {}", self.issuing)
+        }
+    }
+}
+
+impl std::error::Error for SubmissionQueueFull {}
+
+/// The shared pre-allocation cap check for the three issuance paths.
+pub fn ensure_capacity(
+    pending: usize,
+    issuing: &'static str,
+) -> std::result::Result<(), SubmissionQueueFull> {
+    if pending >= HARD_CAP_PENDING {
+        Err(SubmissionQueueFull {
+            pending,
+            cap: HARD_CAP_PENDING,
+            issuing,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// ADR-0009 §7 alert threshold: surface a WARN at this many pending
 /// invoices. ADR-0031 §6 (non-control-flow; visibility only).
 ///
@@ -1617,5 +1669,52 @@ mod tests {
         let envelope = NavTransportError::ManageInvoiceEmpty;
         assert!(!is_transport_error(&envelope));
         assert_eq!(classify_attempt_failure(&envelope).0, "envelope");
+    }
+
+    // ADR-0009 §7 / ADR-0031 §5 — the typed cap refusal.
+    #[test]
+    fn ensure_capacity_refuses_exactly_at_the_cap() {
+        assert!(ensure_capacity(HARD_CAP_PENDING - 1, "invoice").is_ok());
+        let full = ensure_capacity(HARD_CAP_PENDING, "invoice").unwrap_err();
+        assert_eq!(full.pending, HARD_CAP_PENDING);
+        assert_eq!(full.cap, HARD_CAP_PENDING);
+        assert!(ensure_capacity(HARD_CAP_PENDING + 7, "storno").is_err());
+    }
+
+    #[test]
+    fn queue_full_messages_are_unchanged_per_issuance_kind() {
+        let msg = |issuing| {
+            SubmissionQueueFull {
+                pending: 50,
+                cap: 50,
+                issuing,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            msg("invoice"),
+            "submission queue is full (50/50 pending invoices per ADR-0009 §7 / ADR-0031 §5); \
+             run `aberp drain-submission-queue --endpoint <test|production> --tax-number ...` \
+             to submit the backlog, or `aberp mark-abandoned --invoice-id <id> --reason ...` \
+             on invoices the operator has decided not to submit"
+        );
+        assert!(msg("storno").ends_with("to submit the backlog before issuing a storno"));
+        assert!(
+            msg("modification").ends_with("to submit the backlog before issuing a modification")
+        );
+    }
+
+    #[test]
+    fn queue_full_survives_anyhow_wrapping_for_the_route_layer() {
+        let e: anyhow::Error = anyhow::Error::from(SubmissionQueueFull {
+            pending: 50,
+            cap: 50,
+            issuing: "invoice",
+        })
+        .context("issue_invoice_request");
+        let found = e
+            .chain()
+            .find_map(|c| c.downcast_ref::<SubmissionQueueFull>());
+        assert_eq!(found.map(|f| f.pending), Some(50));
     }
 }
