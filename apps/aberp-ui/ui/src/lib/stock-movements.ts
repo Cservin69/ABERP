@@ -73,6 +73,20 @@ export function formatQty(qty: string): string {
   return stripped.endsWith(".") ? stripped.slice(0, -1) : stripped;
 }
 
+/** Post a manual stock movement, then re-read stock on EVERY screen that
+ * shows it. The ProductDetail drawer opens over the ProductsList and both
+ * render the same backend `stock_qty`; refreshing only the drawer left the
+ * list row behind it on the pre-movement figure (prod: list 126 vs drawer
+ * 65.5 — the 60.5 gap was the movement just posted). */
+export async function postMovementThenRefresh(
+  post: () => Promise<unknown>,
+  refreshDetail: () => Promise<void>,
+  refreshList: () => void | Promise<void>,
+): Promise<void> {
+  await post();
+  await Promise.all([refreshDetail(), refreshList()]);
+}
+
 /** S231 — mint a client-side ULID for the `idempotency_key` of a
  * manual adjustment POST. Avoids pulling a `ulid` dep into the SPA;
  * uses crypto.randomUUID() so each call is unique even within the

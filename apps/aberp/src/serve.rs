@@ -14695,8 +14695,12 @@ pub fn get_product_with_inventory_request(
         Some(p) => p,
         None => return Err(ProductRouteError::NotFound),
     };
-    let fields = aberp_inventory::inventory_fields_for_product(&conn, state.tenant.as_str(), id)
-        .map_err(ProductRouteError::Other)?;
+    // ONE stock reader for the list and the detail: the detail picks its row
+    // out of the same per-tenant map the list renders, so the two screens
+    // cannot disagree on `stock_qty`.
+    let fields = aberp_inventory::inventory_fields_for_tenant(&conn, state.tenant.as_str())
+        .map_err(ProductRouteError::Other)?
+        .remove(id);
     Ok(product_with_inventory(product, fields))
 }
 

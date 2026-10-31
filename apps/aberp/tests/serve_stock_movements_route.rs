@@ -331,3 +331,55 @@ fn post_with_duplicate_idempotency_key_surfaces_conflict() {
     let listed = serve::list_stock_movements_request(&state, &pid, 50, 0).unwrap();
     assert_eq!(listed.len(), 1);
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Pin 6 — the Products list row and the product detail agree on stock
+// ──────────────────────────────────────────────────────────────────────
+
+/// Prod report: the list's Stock column read 126 while the detail drawer's
+/// "Stock on hand" read 65.5 for the same product. Both must show the ONE
+/// net on-hand figure — `SUM(qty_delta)` over the ledger, outflows included.
+/// 126 in, 60.5 out ⇒ both screens show 65.5 (not the 126 gross receipts).
+#[test]
+fn products_list_and_detail_show_the_same_net_on_hand_after_an_outflow() {
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let dir = test_dir("list-eq-detail");
+    let db_path = dir.join("aberp.duckdb");
+    ensure_inventory_schema(&db_path);
+    let state = build_state(db_path.clone());
+    let pid = create_with_min_stock(&state, "Feladatok", "0");
+
+    for (qty, reason, key) in [("126", "receipt", "in"), ("-60.5", "scrap", "out")] {
+        serve::create_stock_movement_request(
+            &state,
+            &pid,
+            "test-operator",
+            &CreateStockMovementInputs {
+                qty_delta: qty.to_string(),
+                reason: reason.to_string(),
+                idempotency_key: key.to_string(),
+                notes: None,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{reason} {qty} must succeed: {e:?}"));
+    }
+
+    let net = Decimal::from_str("65.5").unwrap();
+    let detail = serve::get_product_with_inventory_request(&state, &pid).unwrap();
+    let list = serve::list_products_with_inventory_request(&state, None).unwrap();
+    let row = list
+        .iter()
+        .find(|p| p.product.id == pid)
+        .expect("row listed");
+
+    assert_eq!(detail.stock_qty, net, "detail must show net on-hand");
+    assert_eq!(row.stock_qty, net, "list must show net on-hand");
+    assert_eq!(
+        row.stock_qty, detail.stock_qty,
+        "list and detail must agree"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

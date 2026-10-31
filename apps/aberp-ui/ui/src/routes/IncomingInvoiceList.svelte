@@ -827,7 +827,15 @@
   aria-label="Bejövő számla nem releváns megjelölése"
 >
   {#if irrelevantTarget !== null}
-    <form class="irrelevant-form" onsubmit={submitIrrelevant}>
+    <!-- novalidate: the submit handler shows the bilingual "reason required"
+         message in-modal. Disabling the button until a reason is typed (with
+         .quiet-button:disabled's cursor:progress hourglass) read as a hung
+         save with no hint why. -->
+    <form
+      class="irrelevant-form"
+      onsubmit={submitIrrelevant}
+      novalidate
+    >
       <h3 class="irrelevant-title">Nem releváns / Mark as irrelevant</h3>
       <p class="irrelevant-subtitle mono">
         {irrelevantTarget.supplier_name} ·
@@ -840,6 +848,7 @@
         </span>
         <textarea
           bind:value={irrelevantReason}
+          oninput={() => (irrelevantError = null)}
           required
           rows="3"
           placeholder="pl. duplikált tétel, hibás címzett, teszt-számla…"
@@ -861,8 +870,7 @@
         <button
           type="submit"
           class="quiet-button primary"
-          disabled={irrelevantSubmitting ||
-            !isIrrelevantReasonValid(irrelevantReason)}
+          disabled={irrelevantSubmitting}
         >
           {irrelevantSubmitting ? "Mentés…" : "Megjelölöm nem relevánsnak"}
         </button>

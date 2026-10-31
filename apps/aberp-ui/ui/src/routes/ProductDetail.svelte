@@ -34,6 +34,7 @@
     MANUAL_REASONS,
     formatQty,
     mintIdempotencyKey,
+    postMovementThenRefresh,
     reasonLabel,
   } from "../lib/stock-movements";
   import type { StockMovementReason } from "../lib/api";
@@ -53,8 +54,11 @@
   type Props = {
     productId: string | null;
     onClose: () => void;
+    /** Re-read the list behind this drawer after a movement posts, so
+     * both screens show the same `stock_qty`. */
+    onStockChanged: () => void | Promise<void>;
   };
-  const { productId, onClose }: Props = $props();
+  const { productId, onClose, onStockChanged }: Props = $props();
 
   let product: Product | null = $state(null);
   let movements: StockMovement[] = $state([]);
@@ -255,20 +259,25 @@
     if (productId === null) return;
     submitState = "submitting";
     submitError = null;
+    const id = productId;
     try {
-      await createStockMovement(productId, {
-        qty_delta: formQty.trim(),
-        reason: formReason,
-        idempotency_key: mintIdempotencyKey(),
-        notes: formNotes.trim().length > 0 ? formNotes.trim() : undefined,
-      });
-      // Reset the form + re-fetch so the new row appears at the top
-      // of the ledger and the header's cached stock_qty updates.
+      // Re-fetch the drawer (new ledger row + header stock_qty) AND the
+      // list behind it, so the two screens never disagree on stock.
+      await postMovementThenRefresh(
+        () =>
+          createStockMovement(id, {
+            qty_delta: formQty.trim(),
+            reason: formReason,
+            idempotency_key: mintIdempotencyKey(),
+            notes: formNotes.trim().length > 0 ? formNotes.trim() : undefined,
+          }),
+        () => load(id),
+        onStockChanged,
+      );
       formQty = "";
       formNotes = "";
       formReason = "adjustment";
       submitState = "idle";
-      await load(productId);
     } catch (err: unknown) {
       submitState = "error";
       // The backend returns a structured `{ error: "..." }` body on
