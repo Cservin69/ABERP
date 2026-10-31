@@ -668,6 +668,52 @@ export interface MissingSellerConfigError {
  * pulling in a parser dep — the wrapping format is fixed and the
  * `{ ... }` substring is unambiguous (the backend's body is a JSON
  * object). */
+/** ADR-0009 §7 / ADR-0031 §5 — the backend's typed `409` when the
+ * unsubmitted-invoice queue is at its hard cap (`submission_queue_full`).
+ * Nothing was issued; the operator must submit (or abandon) the backlog. */
+export interface SubmissionQueueFullError {
+  error: "submission_queue_full";
+  message: string;
+  pending: number;
+  cap: number;
+  issuing: string;
+}
+
+/** Strict parse of the `submission_queue_full` body out of the raw Tauri
+ * error string (`backend returned 409 Conflict for …: {…}`); `null` for
+ * anything else, so the caller falls through to the next renderer. */
+export function parseSubmissionQueueFullError(
+  raw: string,
+): SubmissionQueueFullError | null {
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const obj = parsed as Record<string, unknown>;
+  if (obj.error !== "submission_queue_full") return null;
+  if (
+    typeof obj.message !== "string" ||
+    typeof obj.pending !== "number" ||
+    typeof obj.cap !== "number" ||
+    typeof obj.issuing !== "string"
+  ) {
+    return null;
+  }
+  return {
+    error: "submission_queue_full",
+    message: obj.message,
+    pending: obj.pending,
+    cap: obj.cap,
+    issuing: obj.issuing,
+  };
+}
+
 export function parseMissingSellerConfigError(
   raw: string,
 ): MissingSellerConfigError | null {

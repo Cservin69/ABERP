@@ -809,3 +809,30 @@ alternation.
   verification.
 - **F42 closure ADR** — operator config file surface for
   per-tenant tunables.
+
+## Addendum (2026-10-31): the hard-cap refusal is typed on the wire
+
+The §5 hard cap (`HARD_CAP_PENDING = 50`) used to reach the SPA as an
+untyped `anyhow!` string, which the routes turned into a generic
+`500 {"error":"internal error"}`. Over the ADR-0111 bridge this was the
+first thing an operator hit when NAV submissions lagged, with no hint
+what to do.
+
+- `submission_queue::SubmissionQueueFull { pending, cap, issuing }` is the
+  refusal from all three issuance paths (`invoice`, `storno`,
+  `modification`) via `submission_queue::ensure_capacity`. The message text
+  is unchanged byte for byte.
+- `serve::issuance_error_response` maps it, anywhere in the error chain, to
+  `409 Conflict` with
+  `{"error":"submission_queue_full","message",pending,cap,issuing}`. Every
+  other error keeps the sanitised 500.
+- The IssueInvoice SPA form renders it as a specific HU/EN message: the
+  queue is full, nothing was issued, submit or abandon the backlog.
+- The check still runs BEFORE allocation (ADR-0009 §3): a refused issue
+  burns no number.
+- **Tests:**
+  - boundary and messages in `submission_queue::tests`;
+  - 409 versus sanitised 500 in `serve::tests`;
+  - 50 issues then a refused 51st with no allocation, in
+    `tests/serve_issue_route.rs`;
+  - the SPA parser in `issue-invoice.test.ts`.

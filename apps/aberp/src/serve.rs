@@ -7577,6 +7577,48 @@ struct TypedErrorBody {
 /// `issue-invoice.test.ts`'s pin per CLAUDE.md rule 12.
 const ERR_MISSING_SELLER_CONFIG: &str = "missing_seller_config";
 
+/// ADR-0009 §7 / ADR-0031 §5 — discriminant of the typed `409` an issuance
+/// route returns when the unsubmitted queue is at its hard cap.
+const ERR_SUBMISSION_QUEUE_FULL: &str = "submission_queue_full";
+
+#[derive(Debug, Serialize)]
+struct SubmissionQueueFullBody {
+    error: &'static str,
+    message: String,
+    pending: usize,
+    cap: usize,
+    issuing: &'static str,
+}
+
+/// Issuance-route error mapping: a [`crate::submission_queue::SubmissionQueueFull`]
+/// anywhere in the chain becomes `409 Conflict` with a typed body the SPA
+/// renders; every other error stays the sanitised `500` of [`internal_error`].
+fn issuance_error_response(context_label: &'static str, e: anyhow::Error) -> Response {
+    if let Some(full) = e
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::submission_queue::SubmissionQueueFull>())
+    {
+        tracing::warn!(
+            pending = full.pending,
+            cap = full.cap,
+            issuing = full.issuing,
+            "issuance refused: submission queue is full (ADR-0009 §7)"
+        );
+        return (
+            StatusCode::CONFLICT,
+            Json(SubmissionQueueFullBody {
+                error: ERR_SUBMISSION_QUEUE_FULL,
+                message: full.to_string(),
+                pending: full.pending,
+                cap: full.cap,
+                issuing: full.issuing,
+            }),
+        )
+            .into_response();
+    }
+    internal_error(context_label, e)
+}
+
 /// PR-69 / session-91 — typed `400 Bad Request` body for the
 /// pre-issuance preflight validator (ADR-0038). Sibling of
 /// [`TypedErrorBody`] with an `errors` array instead of a single
@@ -8142,7 +8184,7 @@ async fn handle_issue_invoice(
             })
             .into_response()
         }
-        Err(e) => internal_error("issue_invoice_request", e),
+        Err(e) => issuance_error_response("issue_invoice_request", e),
     }
 }
 
@@ -9546,7 +9588,7 @@ async fn handle_storno_invoice(
             technical_validations,
             body_preview,
         ),
-        Err(SubmitRouteError::Other(e)) => internal_error("storno_invoice_request", e),
+        Err(SubmitRouteError::Other(e)) => issuance_error_response("storno_invoice_request", e),
     }
 }
 
@@ -9926,7 +9968,9 @@ async fn handle_modification_invoice(
             technical_validations,
             body_preview,
         ),
-        Err(ModificationRouteError::Other(e)) => internal_error("modification_invoice_request", e),
+        Err(ModificationRouteError::Other(e)) => {
+            issuance_error_response("modification_invoice_request", e)
+        }
     }
 }
 
@@ -29274,6 +29318,46 @@ mod tests {
     //! block rather than appending a second `mod tests`.
     use super::*;
     use aberp_audit_ledger::{Actor, BinaryHash, Ledger, TenantId};
+
+    // ADR-0009 §7 / ADR-0031 §5 — a full submission queue is a typed 409 the
+    // SPA can explain, not the generic 500 "internal error".
+    #[tokio::test]
+    async fn issuance_error_response_maps_queue_full_to_typed_409() {
+        let e = anyhow::Error::from(crate::submission_queue::SubmissionQueueFull {
+            pending: 50,
+            cap: 50,
+            issuing: "storno",
+        })
+        .context("storno_invoice_request");
+        let resp = issuance_error_response("storno_invoice_request", e);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read 409 body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("409 body is JSON");
+        assert_eq!(v["error"], "submission_queue_full");
+        assert_eq!(v["pending"], 50);
+        assert_eq!(v["cap"], 50);
+        assert_eq!(v["issuing"], "storno");
+        assert!(v["message"]
+            .as_str()
+            .unwrap()
+            .contains("before issuing a storno"));
+    }
+
+    #[tokio::test]
+    async fn issuance_error_response_keeps_other_errors_a_sanitised_500() {
+        let resp = issuance_error_response("issue_invoice_request", anyhow!("disk on fire"));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read 500 body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("disk on fire"),
+            "500 body must stay sanitised: {text}"
+        );
+    }
     use aberp_billing::IdempotencyKey;
 
     /// S434 — the demo sample-data seed migrates the demo DB and inserts 3

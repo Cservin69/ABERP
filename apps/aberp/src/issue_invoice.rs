@@ -781,16 +781,8 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     //     handle; pre_tx_setup below opens a fresh Connection.
     let pending_count = submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
         .context("count pending submissions (ADR-0031 §5 cap check)")?;
-    if pending_count >= submission_queue::HARD_CAP_PENDING {
-        return Err(anyhow!(
-            "submission queue is full ({}/{} pending invoices per ADR-0009 §7 / ADR-0031 §5); \
-             run `aberp drain-submission-queue --endpoint <test|production> --tax-number ...` \
-             to submit the backlog, or `aberp mark-abandoned --invoice-id <id> --reason ...` \
-             on invoices the operator has decided not to submit",
-            pending_count,
-            submission_queue::HARD_CAP_PENDING,
-        ));
-    }
+    // ADR-0009 §7 / ADR-0031 §5 — typed so the route can answer 409, not 500.
+    submission_queue::ensure_capacity(pending_count, "invoice")?;
     tracing::info!(
         pending_count = pending_count,
         cap = submission_queue::HARD_CAP_PENDING,

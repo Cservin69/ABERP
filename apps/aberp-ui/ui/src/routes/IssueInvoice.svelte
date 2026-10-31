@@ -72,6 +72,7 @@
     mintIdempotencyKey,
     parseInvoicePreflightErrors,
     parseMissingSellerConfigError,
+    parseSubmissionQueueFullError,
     paymentDeadlineFromOffset,
     resolveBankForCurrency,
     targetForFieldPath,
@@ -82,6 +83,7 @@
     type InvoicePreflightErrorItem,
     type IssueInvoiceFormState,
     type MissingSellerConfigError,
+    type SubmissionQueueFullError,
   } from "../lib/issue-invoice";
   import type { VatRateKindBody } from "../lib/api";
   import { daysBetween } from "../lib/invoice-dates";
@@ -161,6 +163,8 @@
    * `sample_path` hints instead of just the raw message. `null` for
    * every other error class (network, 500, plain 400). */
   let missingSellerConfig: MissingSellerConfigError | null = $state(null);
+  // ADR-0009 §7 — typed 409: the unsubmitted queue is at its hard cap.
+  let queueFull: SubmissionQueueFullError | null = $state(null);
   /** PR-69 / session-91 — when the backend's `400` body carries the
    * `invoice_preflight_failed` discriminant, hold the typed body so
    * the template can render each error inline at its `field_path`
@@ -747,6 +751,7 @@
     submitState = "submitting";
     submitError = null;
     missingSellerConfig = null;
+    queueFull = null;
     clearPreflightErrors();
     try {
       const body = { ...composeIssueInvoiceBody(form), idempotencyKey };
@@ -775,6 +780,8 @@
         // config_path + sample_path hints. Otherwise fall back to
         // displaying the raw error string verbatim.
         missingSellerConfig = parseMissingSellerConfigError(raw);
+        // ADR-0009 §7 — typed 409 when the unsubmitted queue is full.
+        queueFull = parseSubmissionQueueFullError(raw);
       }
       submitError = raw;
     }
@@ -840,6 +847,19 @@
           <p class="error-path">{missingSellerConfig.config_path}</p>
           <p class="error-hint">Template to copy from:</p>
           <p class="error-path">{missingSellerConfig.sample_path}</p>
+        </div>
+      {:else if queueFull}
+        <div class="error error-typed" role="alert" data-testid="queue-full">
+          <p class="error-summary">
+            A NAV-beküldési sor megtelt: {queueFull.pending}/{queueFull.cap}
+            beküldetlen számla. Nem készült új számla.
+          </p>
+          <p class="error-hint">
+            The NAV submission queue is full ({queueFull.pending}/{queueFull.cap}
+            unsubmitted invoices). Nothing was issued. Submit the pending
+            invoices to NAV (or mark the ones you will not submit as abandoned),
+            then issue again.
+          </p>
         </div>
       {:else}
         <p class="error" role="alert">{submitError}</p>

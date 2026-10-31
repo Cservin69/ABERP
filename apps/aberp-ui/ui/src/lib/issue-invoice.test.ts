@@ -25,6 +25,7 @@ import {
   mintIdempotencyKey,
   parseInvoicePreflightErrors,
   parseMissingSellerConfigError,
+  parseSubmissionQueueFullError,
   paymentDeadlineFromOffset,
   resolveBankForCurrency,
   targetForFieldPath,
@@ -1717,5 +1718,35 @@ describe("mintIdempotencyKey", () => {
 
   it("mints a different key each call", () => {
     expect(mintIdempotencyKey()).not.toBe(mintIdempotencyKey());
+  });
+});
+
+// ADR-0009 §7 / ADR-0031 §5 — the backend's typed 409 for a full queue.
+describe("parseSubmissionQueueFullError", () => {
+  const body = {
+    error: "submission_queue_full",
+    message: "submission queue is full (50/50 pending invoices ...)",
+    pending: 50,
+    cap: 50,
+    issuing: "invoice",
+  };
+  const raw = `backend returned 409 Conflict for /invoices/issue: ${JSON.stringify(body)}`;
+
+  it("parses the typed 409 out of the Tauri error string", () => {
+    expect(parseSubmissionQueueFullError(raw)).toEqual(body);
+  });
+
+  it("rejects other typed errors and malformed bodies", () => {
+    expect(
+      parseSubmissionQueueFullError(
+        'backend returned 400 Bad Request for /invoices/issue: {"error":"missing_seller_config","message":"x"}',
+      ),
+    ).toBeNull();
+    expect(
+      parseSubmissionQueueFullError(
+        'backend returned 409 Conflict for /invoices/issue: {"error":"submission_queue_full","pending":"50"}',
+      ),
+    ).toBeNull();
+    expect(parseSubmissionQueueFullError("network down")).toBeNull();
   });
 });
