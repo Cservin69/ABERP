@@ -176,6 +176,13 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 # build the key via `SigningKey::from_bytes`, so no `rand` dep is pulled.
 ed25519-dalek = "2"
 getrandom = "0.2"
+# ADR-0111 — the Thunderbolt-Bridge remote listener. `socket2` (feature
+# `all`) exposes `IP_BOUND_IF` so the remote socket is pinned to the bridge
+# interface, not just to an address (macOS is weak-host); `nix` (feature
+# `net`) gives safe `getifaddrs` / `if_nametoindex` without `unsafe`. Both
+# versions are already in Cargo.lock as transitive deps — no new crates.
+socket2 = { version = "0.6", features = ["all"] }
+nix = { version = "0.26", default-features = false, features = ["net"] }
 # S441 / ADR-0087 — HMAC-SHA256 for the deterministic MockTimestampAuthority
 # (RFC-3161-shaped test double). Pairs with the existing `sha2` pin; the
 # real NETLOCK RFC-3161 client is stubbed (`todo!`) pending onboarding.

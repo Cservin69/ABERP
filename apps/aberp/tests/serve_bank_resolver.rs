@@ -143,6 +143,7 @@ fn fixture_lines() -> Vec<LineJson> {
 
 fn fixture_request(currency: Currency, bank_account_id: Option<String>) -> IssueInvoiceRequest {
     IssueInvoiceRequest {
+        idempotency_key: None,
         customer: fixture_customer(),
         lines: fixture_lines(),
         currency,

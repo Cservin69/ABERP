@@ -161,6 +161,7 @@ pub mod quoting_materials;
 // quoting-engine internals.
 pub mod quoting_tunables;
 pub mod recover_from_nav;
+pub mod remote_listener;
 pub mod reports;
 pub mod request_technical_annulment;
 pub mod restore_from_nav_extract;

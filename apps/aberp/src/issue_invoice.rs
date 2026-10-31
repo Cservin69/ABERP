@@ -648,6 +648,8 @@ pub async fn run_with_provider<P: MnbRatesProvider + ?Sized>(
             // PDF render (PR-D) falls back to the seller.toml
             // legacy-flat-root bank for those rows.
             None,
+            // ADR-0112 — one CLI invocation is one issuance; no client key.
+            None,
         )
         .await?;
 
@@ -721,6 +723,11 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     // forced past any sequence NAV's shared TEST endpoint already holds.
     nav_probe: Option<&dyn NavInvoiceNumberProbe>,
     bank_snapshot: Option<aberp_billing::BankAccountSnapshot>,
+    // ADR-0112 — the caller's ADR-0009 §5 Layer-1 key. `Some` (the SPA's
+    // per-form key, resent on retry) makes a repeat call return the invoice
+    // that key already burned (`AllocateOutcome::Replay`); `None` mints a
+    // fresh key, i.e. every call issues a new invoice (CLI, fixtures).
+    client_idempotency_key: Option<IdempotencyKey>,
 ) -> Result<IssuedInvoiceSummary> {
     if input.lines.is_empty() {
         return Err(anyhow!("input has no lines"));
@@ -842,7 +849,7 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     };
 
     // 7. Build IssueInvoiceCommand + AllocateArgs for the tx body.
-    let command = build_command(&input, &series_code)?;
+    let command = build_command(&input, &series_code, client_idempotency_key)?;
     let idempotency_key = command.idempotency_key;
     // PR-84 — server-stamp the immutable invoice date (no client clock
     // ever sets this). The two operator-supplied dates (payment
@@ -1064,7 +1071,9 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     // Captures `template` by move — its only remaining use is here. The
     // closure computes + returns the rendered invoice number so the
     // caller threads it into the operator-facing summary.
-    let render_and_write = move |invoice: &aberp_billing::ReadyInvoice| -> Result<String> {
+    let render_and_write = move |invoice: &aberp_billing::ReadyInvoice,
+                                 write_xml: bool|
+          -> Result<String> {
         // PR-89 + PR-90 — the issue-date year drives BOTH the rendered
         // Year segment AND (under OnYearChange) the counter's reset-year
         // bucket — by construction they cannot disagree. S165 —
@@ -1072,6 +1081,14 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         // builds; prod builds render unprefixed.
         let invoice_number =
             template.render_for_build(invoice.issue_date.year(), invoice.sequence_number);
+        if !write_xml {
+            // ADR-0112 — replay: the original issuance already rendered,
+            // validated and wrote this invoice's NAV XML at the path its
+            // InvoiceDraftCreated entry names. Writing a second copy to this
+            // request's fresh path would leave an orphan XML for an invoice
+            // that already has one.
+            return Ok(invoice_number);
+        }
         let xml = nav_xml::render_invoice_data_with_number(
             invoice,
             &render_series_code,
@@ -1217,6 +1234,7 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         invoice_id: invoice.id.to_prefixed_string(),
         invoice_number,
         nav_xml_path: nav_xml_out,
+        replayed: !is_fresh,
     })
 }
 
@@ -1239,8 +1257,14 @@ pub struct IssuedInvoiceSummary {
     /// Server-determined on-disk path of the rendered NAV XML. Recorded
     /// on the `InvoiceDraftCreated` payload's `nav_xml_path` field; the
     /// drain worker + `print-invoice` orchestrator read it back at
-    /// submit / render time.
+    /// submit / render time. ADR-0112 — on a replay this path was NOT
+    /// written; the original path is the one on the audit payload.
     pub nav_xml_path: std::path::PathBuf,
+    /// ADR-0112 — `true` when the client idempotency key matched an
+    /// invoice that already existed (`AllocateOutcome::Replay`): no number
+    /// burned, no audit entries, no XML written. Callers must not re-run
+    /// post-issue side effects (email, NAV submit) for a replay.
+    pub replayed: bool,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1394,7 +1418,8 @@ fn run_single_tx<F>(
     render_and_write: F,
 ) -> Result<TxOutcome>
 where
-    F: FnOnce(&aberp_billing::ReadyInvoice) -> Result<String>,
+    // `bool` = write the NAV XML (Fresh) vs only render the number (Replay).
+    F: FnOnce(&aberp_billing::ReadyInvoice, bool) -> Result<String>,
 {
     let tx = conn
         .transaction()
@@ -1561,12 +1586,12 @@ where
         tracing::info!("replay path: no new audit entries written");
     }
 
-    // S375 — render + XSD-validate + write the NAV XML BEFORE commit, on
-    // both the Fresh and Replay paths (matches the pre-S375 unconditional
-    // post-commit render). A failure here returns `Err` so the tx drops
+    // S375 — render + XSD-validate + write the NAV XML BEFORE commit on the
+    // Fresh path; ADR-0112 — on Replay only the number is rendered (the
+    // original issuance wrote the XML). A failure here returns `Err` so the tx drops
     // un-committed → the allocation + audit appends roll back together and
     // no committed-but-XML-less invoice row survives.
-    let invoice_number = render_and_write(&invoice)
+    let invoice_number = render_and_write(&invoice, was_fresh)
         .context("render + XSD-validate + write NAV XML before invoice commit (S375 atomicity)")?;
 
     tx.commit()
@@ -1582,7 +1607,11 @@ where
 // Command construction
 // ──────────────────────────────────────────────────────────────────────
 
-fn build_command(input: &InvoiceInputJson, code: &SeriesCode) -> Result<IssueInvoiceCommand> {
+fn build_command(
+    input: &InvoiceInputJson,
+    code: &SeriesCode,
+    client_idempotency_key: Option<IdempotencyKey>,
+) -> Result<IssueInvoiceCommand> {
     let lines = input
         .lines
         .iter()
@@ -1608,7 +1637,7 @@ fn build_command(input: &InvoiceInputJson, code: &SeriesCode) -> Result<IssueInv
         })
         .collect();
     Ok(IssueInvoiceCommand {
-        idempotency_key: IdempotencyKey::new(),
+        idempotency_key: client_idempotency_key.unwrap_or_default(),
         series_code: code.clone(),
         customer_id: CustomerId::new(),
         lines,

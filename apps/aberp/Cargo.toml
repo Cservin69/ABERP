@@ -248,6 +248,10 @@ zstd = { workspace = true }
 # derivation. Workspace already pins `getrandom` (used by aes-gcm and
 # audit-service key mint); adding it direct here costs no build time.
 getrandom = { workspace = true }
+# ADR-0111 — Thunderbolt-Bridge remote listener: interface-pinned socket
+# (`IP_BOUND_IF`) + interface address check. See the workspace pin notes.
+socket2 = { workspace = true }
+nix = { workspace = true }
 
 # PR-92 additions — SMTP email delivery per ADR-0047.
 #

@@ -168,6 +168,7 @@ fn fixture_lines() -> Vec<LineJson> {
 
 fn fixture_request() -> IssueInvoiceRequest {
     IssueInvoiceRequest {
+        idempotency_key: None,
         customer: fixture_customer(),
         lines: fixture_lines(),
         currency: Currency::Huf,

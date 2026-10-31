@@ -925,6 +925,20 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         load_or_create_session_token(&args.tenant)?
     };
 
+    // ADR-0111 — optional Thunderbolt-Bridge remote listener. Parsed this
+    // early so a misconfiguration refuses boot before the DB is opened; its
+    // separate bearer token is minted alongside the loopback one (same
+    // keychain service, account `remote_session_token`).
+    let remote_listener_cfg = crate::remote_listener::config_from_env()
+        .context("ADR-0111 remote listener configuration")?;
+    let remote_session_token = match &remote_listener_cfg {
+        Some(_) => Some(load_or_create_keychain_token(
+            &args.tenant,
+            crate::remote_listener::REMOTE_SESSION_TOKEN_ACCOUNT,
+        )?),
+        None => None,
+    };
+
     // PR-44ζ / session-59 — load the NAV credentials at startup so the
     // `POST /invoices/issue` mutation route can derive a per-request
     // `Actor` without paying keychain latency on every issuance. The
@@ -1680,6 +1694,12 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     //    NAV poll daemon recovery (spawned inside the runtime below) has
     //    its own handle after `build_router` consumes `state`.
     let recovery_state = state.clone();
+    // ADR-0111 — the remote router is the same router on a state clone that
+    // carries the remote bearer, behind the peer/bearer/deny-list guard.
+    let remote_app = match (&remote_listener_cfg, &remote_session_token) {
+        (Some(cfg), Some(token)) => Some(build_remote_router(&state, cfg, token)),
+        _ => None,
+    };
     let app = build_router(state);
 
     // 6. Build a tokio multi-thread runtime (the serve subcommand is
@@ -1741,6 +1761,26 @@ pub fn run(args: &ServeArgs) -> Result<()> {
          `Authorization: Bearer <session_token>` to authenticated routes; \
          verify TLS cert against the SHA-256 fingerprint"
     );
+
+    // ADR-0111 — bind the Thunderbolt-Bridge listener (if configured) next
+    // to the loopback one. A bind failure refuses boot: the operator asked
+    // for remote access, so silently serving loopback-only would be a lie.
+    let remote_listener = match &remote_listener_cfg {
+        Some(cfg) => {
+            let _s = tracing::info_span!("serve.remote_bind").entered();
+            let l = crate::remote_listener::bind(cfg)
+                .context("ADR-0111 bind Thunderbolt-Bridge remote listener")?;
+            tracing::info!(
+                bind = %cfg.bind,
+                iface = %cfg.iface,
+                peer = %cfg.peer,
+                "boot step: remote listener bound (interface-pinned; one peer; remote bearer \
+                 `remote_session_token`)"
+            );
+            Some(l)
+        }
+        None => None,
+    };
 
     // PR-45a / session-61 — machine-parseable handshake line. The
     // Tauri shell's `handshake::parse` consumes the line as
@@ -3087,6 +3127,29 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             }
         });
 
+        // ADR-0111 — the remote listener shares the TLS config (same pinned
+        // cert) and the shutdown token; it drains when the loopback one does.
+        // Its failure is logged, not fatal: the local shell keeps working.
+        if let (Some(listener), Some(remote_app)) = (remote_listener, remote_app) {
+            let remote_handle = axum_server::Handle::new();
+            let remote_cancel = coordinator.token.clone();
+            let remote_shutdown_handle = remote_handle.clone();
+            tokio::spawn(async move {
+                remote_cancel.cancelled().await;
+                remote_shutdown_handle.graceful_shutdown(Some(Duration::from_secs(2)));
+            });
+            let remote_config = config.clone();
+            tokio::spawn(async move {
+                if let Err(e) = axum_server::from_tcp_rustls(listener, remote_config)
+                    .handle(remote_handle)
+                    .serve(remote_app.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+                {
+                    tracing::error!(error = %e, "ADR-0111 remote listener stopped with an error");
+                }
+            });
+        }
+
         let serve_result = axum_server::from_tcp_rustls(listener, config)
             .handle(axum_handle)
             .serve(app.into_make_service())
@@ -3362,6 +3425,13 @@ fn build_rustls_config(cert_pem: &str, key_pem: &str) -> Result<(Vec<Vec<u8>>, V
 /// absent, generate a fresh 256-bit random token (hex-encoded) and
 /// persist it.
 fn load_or_create_session_token(tenant: &str) -> Result<String> {
+    load_or_create_keychain_token(tenant, SESSION_TOKEN_ACCOUNT)
+}
+
+/// Shared mint-once body for the loopback `session_token` and the
+/// ADR-0111 `remote_session_token`: read the tenant's keychain entry under
+/// `account`, minting a fresh CSPRNG token if it is absent or empty.
+fn load_or_create_keychain_token(tenant: &str, account: &str) -> Result<String> {
     use aberp_secret_store::SecretStore as _;
     let service = keychain_service_for(tenant);
     // ADR-0100 Phase 1 — the session token is read/written through the
@@ -3369,8 +3439,8 @@ fn load_or_create_session_token(tenant: &str) -> Result<String> {
     // keychain-backed store is the only impl; behaviour is unchanged.
     let store = aberp_secret_store::keychain_store();
     match store
-        .get(&service, SESSION_TOKEN_ACCOUNT)
-        .map_err(|e| anyhow!("keychain access for session token failed: {e}"))?
+        .get(&service, account)
+        .map_err(|e| anyhow!("keychain access for `{account}` failed: {e}"))?
     {
         // An empty stored value is treated as absent → re-mint (unchanged
         // from the pre-seam behaviour).
@@ -3378,11 +3448,12 @@ fn load_or_create_session_token(tenant: &str) -> Result<String> {
         _ => {
             let fresh = generate_session_token()?;
             store
-                .set(&service, SESSION_TOKEN_ACCOUNT, &fresh)
-                .map_err(|e| anyhow!("write fresh session token to OS keychain: {e}"))?;
+                .set(&service, account, &fresh)
+                .map_err(|e| anyhow!("write fresh `{account}` to OS keychain: {e}"))?;
             tracing::info!(
                 tenant = tenant,
-                "minted fresh session token in OS keychain (account `session_token`)"
+                account = account,
+                "minted fresh bearer token in OS keychain"
             );
             Ok(fresh)
         }
@@ -3815,6 +3886,10 @@ pub const NAV_POLL_DAEMON_CONCURRENCY: usize = 50;
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(handle_health))
+        // ADR-0111 — attach handshake for a shell that did not spawn this
+        // backend: the Studio over the bridge, or the MacBook's own shell
+        // when the backend runs under the LaunchAgent. Bearer-checked.
+        .route("/remote/hello", get(handle_remote_hello))
         // S166 / prod-prep PR #2 — the operator's one-time consent to
         // real fiscal operation. A `/health` subroute (read by the SPA's
         // first-launch modal) that, unusually, writes to the audit
@@ -6168,6 +6243,60 @@ async fn handle_health(State(state): State<AppState>) -> Response {
     }
 }
 
+/// ADR-0111 — the remote router: `build_router` on a state clone whose
+/// `session_token` is the REMOTE bearer (so every handler's own bearer
+/// check validates the remote token, never the loopback one), all behind
+/// `remote_listener::guard`.
+fn build_remote_router(
+    state: &AppState,
+    cfg: &crate::remote_listener::RemoteListenerConfig,
+    remote_token: &str,
+) -> Router {
+    let mut remote_state = state.clone();
+    remote_state.session_token = Arc::new(remote_token.to_string());
+    let policy = Arc::new(crate::remote_listener::RemotePolicy {
+        peer: cfg.peer,
+        token: remote_token.to_string(),
+    });
+    build_router(remote_state).route_layer(axum::middleware::from_fn_with_state(
+        policy,
+        crate::remote_listener::guard,
+    ))
+}
+
+/// ADR-0111 — what the remote shell checks before it mounts the SPA: the
+/// tenant it reached, the boot lifecycle, and the build profile (a dev
+/// shell must never drive a production backend, nor the reverse).
+#[derive(Serialize)]
+struct RemoteHelloResponse {
+    tenant: String,
+    state: &'static str,
+    is_production_build: bool,
+}
+
+async fn handle_remote_hello(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(rejection) = check_bearer_rejection(&headers, &state.session_token) {
+        return rejection;
+    }
+    let boot_state = match state.boot_state.read() {
+        Ok(guard) => guard.state_token(),
+        Err(_) => {
+            tracing::error!("boot_state lock poisoned while answering /remote/hello");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error_body("internal error".to_string())),
+            )
+                .into_response();
+        }
+    };
+    Json(RemoteHelloResponse {
+        tenant: state.tenant.as_str().to_string(),
+        state: boot_state,
+        is_production_build: crate::build_profile::IS_PRODUCTION_BUILD,
+    })
+    .into_response()
+}
+
 /// S166 / prod-prep PR #2 — response shape for the first-prod-launch
 /// acknowledgement route. Carries the RFC3339 instant stamped into the
 /// touchfile + audit entry.
@@ -7339,6 +7468,15 @@ pub struct IssueInvoiceRequest {
     /// override that NEVER writes back to the partner master.
     #[serde(default, rename = "emailRecipientOverride")]
     pub email_recipient_override: Option<String>,
+    /// ADR-0112 — the caller's ADR-0009 §5 Layer-1 idempotency key in its
+    /// canonical `idem_<ULID>` form. The SPA mints one per IssueInvoice form
+    /// and resends it on every retry; the billing allocator then returns the
+    /// invoice that key already burned instead of allocating a second
+    /// number. `None`/absent → a fresh key per request (pre-0112 behaviour,
+    /// still what the CLI and fixtures use). A malformed value is a 400 at
+    /// `validate_issue_request`, never silently replaced by a fresh key.
+    #[serde(default, rename = "idempotencyKey")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Response body for `POST /invoices/issue`. The SPA reads
@@ -7360,6 +7498,11 @@ struct IssueInvoiceResponse {
     /// flash.
     #[serde(skip_serializing_if = "Option::is_none")]
     email: Option<EmailRouteOutcomeBody>,
+    /// ADR-0112 — `true` when the request's idempotency key matched an
+    /// already-issued invoice: no number burned, no audit entries written,
+    /// no post-issue email or NAV submit re-run. `state` is then the
+    /// invoice's CURRENT derived state, not a fresh `Ready`.
+    replayed: bool,
 }
 
 /// PR-92 — wire shape for the per-invoice email send outcome.
@@ -7850,6 +7993,46 @@ async fn handle_issue_invoice(
     )
     .await
     {
+        Ok(summary) if summary.replayed => {
+            // ADR-0112 — the key already issued this invoice. Its original
+            // request ran the post-issue email / NAV submit (or the operator
+            // ran them since); re-running them here would double-email the
+            // buyer or double-submit to NAV. Report the invoice's CURRENT
+            // derived state from the ledger instead of a fresh `Ready`.
+            tracing::info!(
+                invoice_id = %summary.invoice_id,
+                "issue replayed by idempotency key; no new number, no post-issue actions"
+            );
+            let detail_state = state.clone();
+            let detail_id = summary.invoice_id.clone();
+            let current =
+                tokio::task::spawn_blocking(move || get_invoice_detail(&detail_state, &detail_id))
+                    .await;
+            let invoice_state = match current {
+                Ok(Ok(Some(detail))) => detail.state,
+                Ok(Ok(None)) => {
+                    return internal_error(
+                        "replayed invoice detail",
+                        anyhow!("replayed invoice {} has no detail", summary.invoice_id),
+                    )
+                }
+                Ok(Err(e)) => return internal_error("replayed invoice detail", e),
+                Err(join_err) => {
+                    return internal_error(
+                        "replayed invoice detail:join",
+                        anyhow!("blocking task panicked: {join_err}"),
+                    )
+                }
+            };
+            Json(IssueInvoiceResponse {
+                invoice_id: summary.invoice_id,
+                invoice_number: summary.invoice_number,
+                state: invoice_state,
+                email: None,
+                replayed: true,
+            })
+            .into_response()
+        }
         Ok(summary) => {
             // [[post-issue-async]] (session 158) — the post-issue tail
             // (default-on auto-send-to-buyer email + default-on
@@ -7955,6 +8138,7 @@ async fn handle_issue_invoice(
                 invoice_number: summary.invoice_number,
                 state: InvoiceState::Ready,
                 email: None,
+                replayed: false,
             })
             .into_response()
         }
@@ -8115,6 +8299,11 @@ fn validate_issue_request(
             "customer name is required".to_string(),
         ));
     }
+    if parse_request_idempotency_key(request.idempotency_key.as_deref()).is_err() {
+        return Err(IssueRequestValidationError::Plain(
+            "idempotencyKey must be the canonical `idem_<ULID>` form".to_string(),
+        ));
+    }
     // Session-148 — the customer tax-number requirement is NOT
     // unconditional: PRIVATE_PERSON buyers legitimately carry no
     // ADÓSZÁM (and OTHER is v1-deferred). The vat-status-aware
@@ -8254,6 +8443,11 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
     // `bank_account_*` invoice columns are populated at INSERT time.
     bank_snapshot: Option<aberp_billing::BankAccountSnapshot>,
 ) -> Result<issue_invoice::IssuedInvoiceSummary> {
+    // ADR-0112 — parsed first so a malformed key never reaches the
+    // allocator (the route already 400s on it; this is defence in depth for
+    // direct callers).
+    let client_idempotency_key = parse_request_idempotency_key(request.idempotency_key.as_deref())
+        .map_err(|()| anyhow!("idempotencyKey must be the canonical `idem_<ULID>` form"))?;
     let xml_path = mint_issued_xml_path(state.tenant.as_str())
         .context("mint server-side NAV-XML output path for issuance")?;
     let input = InvoiceInputJson {
@@ -8337,7 +8531,7 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
                 }
             }
         };
-    issue_invoice::issue_from_parsed(
+    let summary = issue_invoice::issue_from_parsed(
         input,
         &state.db,
         state.tenant.as_str(),
@@ -8354,8 +8548,37 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         // to the five `bank_account_*` invoice columns; surfaced on
         // the list + detail wire shape via `load_invoice_bank_snapshot_in_tx`.
         bank_snapshot,
+        client_idempotency_key,
     )
-    .await
+    .await?;
+    if summary.replayed {
+        // ADR-0112 — the replayed invoice keeps the side-store written by
+        // its ORIGINAL issuance (the path its InvoiceDraftCreated entry
+        // names). The copy just written for this retry is referenced by
+        // nothing; remove it so it cannot be mistaken for a second invoice.
+        if let Err(e) = std::fs::remove_file(&input_json_path) {
+            tracing::warn!(
+                path = %input_json_path.display(),
+                error = %e,
+                "replay: could not remove the unused side-stored input.json"
+            );
+        }
+    }
+    Ok(summary)
+}
+
+/// ADR-0112 — `None` → no client key (a fresh one is minted downstream);
+/// `Some(canonical)` → the parsed key; anything else → `Err(())`. Shared by
+/// `validate_issue_request` (400) and `issue_invoice_request`.
+fn parse_request_idempotency_key(
+    raw: Option<&str>,
+) -> std::result::Result<Option<aberp_billing::IdempotencyKey>, ()> {
+    match raw {
+        None => Ok(None),
+        Some(s) => aberp_billing::IdempotencyKey::from_canonical_string(s.trim())
+            .map(Some)
+            .ok_or(()),
+    }
 }
 
 /// PR-47α / session-64 — given an issued NAV-XML path, return the
@@ -26503,7 +26726,7 @@ async fn build_poll_daemon_inputs(
 /// avoids clippy's `result_large_err` lint — `Response` is ~128 bytes
 /// and `Result` carries it in both arms. Semantically clearer too:
 /// `Some(resp)` reads as "here is the rejection response."
-fn check_bearer_rejection(headers: &HeaderMap, expected: &str) -> Option<Response> {
+pub(crate) fn check_bearer_rejection(headers: &HeaderMap, expected: &str) -> Option<Response> {
     let auth = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

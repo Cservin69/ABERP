@@ -200,6 +200,7 @@ fn fixture_customer() -> CustomerJson {
 /// the MNB rate provider unreachable.
 fn fixture_issue_request(kind: VatRateKind, rate_percent: u16) -> IssueInvoiceRequest {
     IssueInvoiceRequest {
+        idempotency_key: None,
         customer: fixture_customer(),
         lines: vec![LineJson {
             description: "Base line".to_string(),
