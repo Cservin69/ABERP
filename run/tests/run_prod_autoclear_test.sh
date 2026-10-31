@@ -54,8 +54,10 @@ CKPT_REL="apps/aberp-ui/aberp.duckdb.ckpt-ok"
 # tip, with run_prod.sh (the REAL one) committed.
 make_repo() {
   local r="${TMP}/$1"
-  mkdir -p "${r}/run" "${r}/apps/aberp-ui/ui" "${TMP}/home-$1"
+  mkdir -p "${r}/run/lib" "${r}/apps/aberp-ui/ui" "${TMP}/home-$1"
   cp "$RUN_PROD" "${r}/run/run_prod.sh"
+  # ADR-0111 addendum 2 — run_prod.sh sources the LaunchAgent helper.
+  cp "${SCRIPT_DIR}/../lib/aberp_launch_agent.sh" "${r}/run/lib/aberp_launch_agent.sh"
   (
     cd "$r" || exit 1
     git init -q .

@@ -53,6 +53,11 @@ readonly PROD_HOME="${HOME}/.aberp/${PROD_TENANT}"
 readonly PROD_SELLER_TOML="${PROD_HOME}/seller.toml"
 readonly PROD_FIRST_LAUNCH_TOUCHFILE="${PROD_HOME}/.first-launch-acknowledged"
 readonly PROD_DB="${PROD_HOME}/aberp.duckdb"
+# ADR-0111 addendum 2 — the LaunchAgent backend's pinned TLS fingerprint.
+readonly PROD_FINGERPRINT_FILE="${HOME}/.aberp/serve/${PROD_TENANT}/loopback.fingerprint.sha256"
+
+# shellcheck source=lib/aberp_launch_agent.sh
+source "${REPO_ROOT}/run/lib/aberp_launch_agent.sh"
 
 # Operator-facing constant — single source of truth so a future endpoint
 # change updates this banner too. Mirrors what nav_endpoint_base_url()
@@ -278,6 +283,34 @@ fi
 # time gate covers both halves of the process group.
 cd "$REPO_ROOT" || { echo "${c_red}[fail]${c_rst} repo not at $REPO_ROOT" >&2; exit 2; }
 
+# ---------- ADR-0111 addendum 2: attach to the LaunchAgent backend ---------
+# If the always-on backend (ch.aben.aberp.serve) is loaded, this window must
+# attach to it — a second spawned backend would hit the single-writer lock.
+# The code decides, not the operator: no env vars to remember. A loaded but
+# unusable agent fails CLOSED; it never falls back to spawning. An installed
+# but stopped agent (upgrade_prod.sh stops it for the swap) is restarted on the
+# freshly built aberp below, then attached to.
+attach_to_agent() {
+  export ABERP_REMOTE_URL
+  export ABERP_REMOTE_FINGERPRINT
+  ABERP_REMOTE_URL="$(aberp_agent_url)"
+  ABERP_REMOTE_FINGERPRINT="$(tr -d '[:space:]' < "$PROD_FINGERPRINT_FILE")"
+  echo "${c_grn}[attach]${c_rst} backend runs as LaunchAgent ${ABERP_AGENT_LABEL} — this window attaches to ${ABERP_REMOTE_URL}" >&2
+  echo "${c_grn}[attach]${c_rst} a háttér-szolgáltatás fut — az ablak ehhez csatlakozik" >&2
+}
+agent_decision="$(aberp_agent_decide "$REPO_ROOT" "$PROD_FINGERPRINT_FILE")"
+case "$agent_decision" in
+  attach) attach_to_agent ;;
+  start)
+    echo "${c_yel}[agent]${c_rst} LaunchAgent ${ABERP_AGENT_LABEL} is installed but stopped — it is restarted on this build after compiling" >&2
+    ;;
+  spawn) ;;
+  fail:*)
+    echo "${c_red}[fail]${c_rst} $(aberp_agent_fail_message "$agent_decision")" >&2
+    exit 3
+    ;;
+esac
+
 # S169 / PR-169 — build the SPA into ui/dist BEFORE cargo build.
 # tauri::generate_context!() embeds frontendDist (= apps/aberp-ui/ui/dist)
 # at compile time. ui/dist is gitignored, so a fresh prod clone has no
@@ -307,11 +340,31 @@ if [[ ! -s "$UI_DIST/index.html" ]]; then
 fi
 echo "${c_grn}[ ok ]${c_rst} SPA built; $UI_DIST/index.html present" >&2
 
-echo "${c_dim}[build] cargo build --release --features production --bin aberp${c_rst}" >&2
-cargo build --release --features production --bin aberp
+if [[ "$agent_decision" == "attach" ]]; then
+  # The agent is executing target/release/aberp right now; never relink a
+  # running binary. Only upgrade_prod.sh replaces it (agent stopped first).
+  echo "${c_dim}[build] skipping aberp (the LaunchAgent runs it; upgrade_prod.sh owns rebuilds)${c_rst}" >&2
+else
+  echo "${c_dim}[build] cargo build --release --features production --bin aberp${c_rst}" >&2
+  cargo build --release --features production --bin aberp
+fi
 
 echo "${c_dim}[build] cargo build --release --features production --bin aberp-ui${c_rst}" >&2
 cargo build --release --features production --bin aberp-ui
+
+if [[ "$agent_decision" == "start" ]]; then
+  echo "${c_yel}[agent]${c_rst} starting ${ABERP_AGENT_LABEL} on the new build (a keychain prompt for 'aberp' may appear: Always Allow)" >&2
+  echo "${c_yel}[agent]${c_rst} szolgáltatás indítása (kulcskarika-kérdésnél: Always Allow)" >&2
+  aberp_agent_start "$REPO_ROOT" \
+    || { echo "${c_red}[fail]${c_rst} could not start LaunchAgent ${ABERP_AGENT_LABEL}" >&2; exit 3; }
+  # Up to 3 minutes: a rebuilt binary's first keychain reads wait for the operator's click.
+  agent_decision="$(ABERP_AGENT_HEALTH_TRIES=180 aberp_agent_decide "$REPO_ROOT" "$PROD_FINGERPRINT_FILE")"
+  if [[ "$agent_decision" != "attach" ]]; then
+    echo "${c_red}[fail]${c_rst} $(aberp_agent_fail_message "$agent_decision")" >&2
+    exit 3
+  fi
+  attach_to_agent
+fi
 
 echo
 echo "${c_grn}[launch]${c_rst} starting ABERP in PRODUCTION mode..." >&2

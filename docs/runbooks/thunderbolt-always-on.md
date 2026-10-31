@@ -125,11 +125,12 @@ You should see exactly `127.0.0.1:18443` and `10.69.0.1:8443`.
 
 ## 7. Daily use
 
-MacBook window. It attaches to the LaunchAgent backend; a second spawned backend would hit the
-single-writer lock.
+MacBook window. From `PROD_v2.36.1` on, `run_prod.sh` finds the LaunchAgent backend by itself and
+attaches to it (ADR-0111 addendum 2). If the agent is loaded but unhealthy it refuses, rather than
+starting a second backend.
 
 ```bash
-cd ~/ABERP && ABERP_REMOTE_URL=https://127.0.0.1:18443 ABERP_REMOTE_FINGERPRINT=$(cat ~/.aberp/serve/prod/loopback.fingerprint.sha256) ./run/run_prod.sh
+cd ~/ABERP && ./run/run_prod.sh
 ```
 
 Studio window. Clone the same release once, then run:
@@ -156,17 +157,22 @@ Release as usual: `./run/release.sh PROD_vX.Y`.
 Merge them back into `main` before releasing from `main`, or the release drops them. The ADR-0111
 and ADR-0112 change applies cleanly on top of `PROD_v2.35.3`.
 
-Upgrading the MacBook. `upgrade_prod.sh` refuses while `aberp` runs, so stop the LaunchAgent
-first:
+Upgrading the MacBook. Close the prod window first. From `PROD_v2.36.1` on, `upgrade_prod.sh`
+handles the rest:
+1. it stops the LaunchAgent;
+2. snapshots and switches;
+3. `run_prod.sh` restarts the agent on the new build, waits for Ready, and opens the window
+   attached to it.
 
 ```bash
-launchctl bootout gui/$(id -u)/ch.aben.aberp.serve; cd ~/ABERP && ./run/upgrade_prod.sh PROD_vX.Y
+cd ~/ABERP && ./run/upgrade_prod.sh PROD_vX.Y
 ```
 
-When it's up, Ctrl-C the app and start the agent again:
+**Only for 2.36.0 → 2.36.1:** that upgrade is performed by the older script, so stop the agent
+by hand in the same line:
 
 ```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ch.aben.aberp.serve.plist
+launchctl bootout gui/$(id -u)/ch.aben.aberp.serve; cd ~/ABERP && ./run/upgrade_prod.sh PROD_v2.36.1
 ```
 
 Then upgrade the Studio to the same branch:

@@ -159,6 +159,50 @@ unplugs. That gives the following:
   - LaunchAgent install;
   - upgrades.
 
+## Addendum 2 (2026-10-31): the launchers decide, not the operator
+
+Ervin's steer: plain `./run/run_prod.sh`, and the window `upgrade_prod.sh` opens at the end,
+must find the LaunchAgent backend by themselves. No environment variables for the operator to
+remember ([[trust-code-not-operator]]).
+
+**One decision function.** `run/lib/aberp_launch_agent.sh::aberp_agent_decide`, sourced by both
+launchers, returns:
+
+| State | Meaning | What `run_prod.sh` does |
+|---|---|---|
+| `spawn` | Agent not installed and not loaded | Exactly the pre-0111 behaviour |
+| `start` | Plist in `~/Library/LaunchAgents` but the job is not loaded (e.g. `upgrade_prod.sh` stopped it for the swap) | Builds `aberp`, starts the agent, waits up to 3 minutes for Ready (a rebuilt binary's keychain prompts wait for the operator), then decides again; anything but `attach` is a failure |
+| `attach` | Agent loaded, loopback `/health` ok, and its `binary_hash` equals the SHA-256 of this checkout's `target/release/aberp` | Exports `ABERP_REMOTE_URL=https://127.0.0.1:18443` and the pinned fingerprint from `~/.aberp/serve/prod/loopback.fingerprint.sha256`; skips relinking `aberp`, because the agent is executing it |
+| `fail:unhealthy` / `fail:version-skew` / `fail:no-fingerprint` / `fail:no-binary` | Agent loaded but unusable | Exit 3 with an EN/HU message; never spawns a second backend |
+
+**`upgrade_prod.sh`** (from 2.36.1 on):
+- If the agent is loaded, it refuses while a prod window is open. Otherwise it stops the agent
+  itself (graceful drain) before the snapshot and swap.
+- An `EXIT` trap restarts the agent on the binary still on disk if anything fails before
+  hand-over, so the Studio is not left without a backend.
+- After hand-over, `run_prod.sh` sees `start` and brings the agent up on the new build.
+
+**Bridge bind and peer live in the plist.** `ABERP_REMOTE_BIND`, `ABERP_REMOTE_PEER` and
+`ABERP_REMOTE_IFACE` stay the ADR-0111 opt-in mechanism. The plist (installed from the checkout
+on every agent start) is their single source, so the operator never passes them. No new
+`seller.toml` slot (ADR-0055) is added.
+
+**Known limit.** `attach` compares the running agent with the binary on disk. It cannot see
+source changes that were never built; the Frankenstein guard (HEAD must equal a released
+`PROD_v*` branch, clean tree) plus `upgrade_prod.sh` as the only way to change the checkout
+covers that.
+
+**Transition 2.36.0 → 2.36.1.** The 2.36.0 `upgrade_prod.sh` that performs that upgrade predates
+this addendum, so for that one upgrade the agent is stopped by hand first:
+```bash
+launchctl bootout gui/$(id -u)/ch.aben.aberp.serve; cd ~/ABERP && ./run/upgrade_prod.sh PROD_v2.36.1
+```
+
+**Tests:** `run/tests/run_prod_launch_agent_test.sh` covers every state with stubbed
+`launchctl`/`curl`, pins the plist against the helper (label, port, binary path, bridge
+bind/peer), and runs the real `run_prod.sh` for the unhealthy (exit 3, no build), attach,
+installed-but-stopped and no-agent cases.
+
 ## Not decided here
 
 - Multi-user identity (who on which machine issued what). Today both shells

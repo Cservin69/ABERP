@@ -179,6 +179,9 @@ script_path="$(cd "$(dirname "$0")" && pwd -P)"
 readonly SCRIPT_PATH="$script_path"
 readonly REPO_ROOT="$(cd "$SCRIPT_PATH/.." && pwd -P)"
 
+# shellcheck source=lib/aberp_launch_agent.sh
+source "${REPO_ROOT}/run/lib/aberp_launch_agent.sh"
+
 readonly TENANT="$tenant"
 readonly TENANT_DIR="${HOME}/.aberp/${TENANT}"
 readonly TENANT_SELLER_TOML="${TENANT_DIR}/seller.toml"
@@ -257,6 +260,32 @@ ok "tenant directory + seller.toml present"
 # NOT the bare process name — see running_prod_pids() above. The old
 # `pgrep -x <name>` matched any checkout's aberp-ui/aberp, so a dev/test
 # session elsewhere produced a false "prod is running" refusal (S399/S400).
+#
+# ADR-0111 addendum 2 — the always-on backend (LaunchAgent ch.aben.aberp.serve)
+# is stopped HERE by the script, not by the operator. A window that is still
+# open (aberp-ui) is NOT closed for him: that stays a refusal. If anything below
+# fails before run_prod.sh takes over, the EXIT trap restarts the agent on the
+# binary that is still on disk, so the Studio is not left without a backend.
+# On success run_prod.sh (state "start") restarts it on the new build.
+agent_stopped_by_upgrade=0
+restore_agent_on_failure() {
+  if [[ "$agent_stopped_by_upgrade" == "1" ]]; then
+    warn "upgrade did not complete — restarting LaunchAgent ${ABERP_AGENT_LABEL} on the binary still on disk"
+    warn "a frissítés nem fejeződött be — a háttér-szolgáltatás újraindul a régi binárissal"
+    aberp_agent_start "$REPO_ROOT" || warn "could not restart ${ABERP_AGENT_LABEL}: launchctl bootstrap gui/\$(id -u) $(aberp_agent_plist_installed_path)"
+  fi
+}
+if aberp_agent_loaded; then
+  if pgrep -f "${REPO_ROOT}/target/release/aberp-ui"'( |$)' >/dev/null 2>&1; then
+    die "the prod window is still open. Close it first (Ctrl-C in its terminal), then re-run this script.
+HU: Az éles ablak még nyitva van — zárd be (Ctrl-C), majd futtasd újra."
+  fi
+  echo "${c_dim}[agent] stopping LaunchAgent ${ABERP_AGENT_LABEL} for the swap (graceful drain)${c_rst}" >&2
+  trap restore_agent_on_failure EXIT
+  agent_stopped_by_upgrade=1
+  aberp_agent_stop "$REPO_ROOT" || die "LaunchAgent ${ABERP_AGENT_LABEL} did not stop within 30 s"
+  ok "LaunchAgent stopped — it is restarted on the new build by run_prod.sh"
+fi
 running_pids="$(running_prod_pids "$REPO_ROOT")"
 
 if [[ -n "$running_pids" ]]; then
@@ -460,6 +489,11 @@ readonly RUN_PROD_SCRIPT="${REPO_ROOT}/run/run_prod.sh"
 if [[ ! -x "$RUN_PROD_SCRIPT" ]]; then
   die "run_prod.sh not found / not executable: $RUN_PROD_SCRIPT"
 fi
+
+# ADR-0111 addendum 2 — from here run_prod.sh owns the agent (it sees
+# "installed but stopped", builds the new aberp, restarts the agent, attaches).
+agent_stopped_by_upgrade=0
+trap - EXIT
 
 # exec replaces this process — operator sees one continuous output
 # stream and Ctrl-C in the launching terminal exits the app cleanly.
