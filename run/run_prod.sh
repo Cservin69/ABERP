@@ -116,6 +116,10 @@ echo "${c_red}  tenant=${PROD_TENANT}${c_rst}" >&2
 echo "${c_red}  NAV endpoint: https://${PROD_NAV_HOST}/invoiceService/v3/${c_rst}" >&2
 echo "${c_red}  DB:           ${PROD_DB}${c_rst}" >&2
 echo "${c_red}  seller.toml:  ${PROD_SELLER_TOML}${c_rst}" >&2
+# ADR-0111 — make an armed Thunderbolt-Bridge listener impossible to miss.
+if [[ -n "${ABERP_REMOTE_BIND:-}" ]]; then
+  echo "${c_yel}  REMOTE:       https://${ABERP_REMOTE_BIND} on ${ABERP_REMOTE_IFACE:-bridge0}, peer ${ABERP_REMOTE_PEER:-<unset: boot will refuse>}${c_rst}" >&2
+fi
 echo "${c_red}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c_rst}" >&2
 echo >&2
 

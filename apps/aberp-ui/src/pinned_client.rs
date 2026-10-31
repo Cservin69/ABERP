@@ -34,6 +34,17 @@ use sha2::{Digest, Sha256};
 /// Build the reqwest client. Consumes the fingerprint by reference;
 /// the verifier owns its own copy.
 pub fn build(fingerprint_hex: &str) -> Result<reqwest::Client> {
+    build_with_default_bearer(fingerprint_hex, None)
+}
+
+/// ADR-0111 — same pin, plus an `Authorization: Bearer` default header on
+/// every request. The remote listener requires the bearer on ALL routes
+/// (including `/health`, which the loopback shell calls unauthenticated);
+/// a request that already sets the header keeps its own value.
+pub fn build_with_default_bearer(
+    fingerprint_hex: &str,
+    bearer: Option<&str>,
+) -> Result<reqwest::Client> {
     let fingerprint_bytes = hex::decode(fingerprint_hex)
         .with_context(|| format!("decode fingerprint hex `{fingerprint_hex}`"))?;
     if fingerprint_bytes.len() != 32 {
@@ -52,8 +63,16 @@ pub fn build(fingerprint_hex: &str) -> Result<reqwest::Client> {
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
 
-    let client = reqwest::ClientBuilder::new()
-        .use_preconfigured_tls(config)
+    let mut builder = reqwest::ClientBuilder::new().use_preconfigured_tls(config);
+    if let Some(token) = bearer {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .context("bearer token is not a valid HTTP header value")?;
+        value.set_sensitive(true);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        builder = builder.default_headers(headers);
+    }
+    let client = builder
         .build()
         .context("reqwest::ClientBuilder::build with pinned-fingerprint TLS")?;
     Ok(client)

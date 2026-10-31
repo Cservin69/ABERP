@@ -22,6 +22,7 @@ import {
   deliveryDateOverrideFor,
   emptyForm,
   lineCurrencyMismatchWarning,
+  mintIdempotencyKey,
   parseInvoicePreflightErrors,
   parseMissingSellerConfigError,
   paymentDeadlineFromOffset,
@@ -1691,5 +1692,30 @@ describe("ADR-0101 — VAT rate-kind selector", () => {
     const body = composeIssueInvoiceBody(form);
     expect(body.lines[0].vatRateKind).toBe("Percent");
     expect(body.lines[0].vatRatePercent).toBe(27);
+  });
+});
+
+// ADR-0112 — the key must parse on the backend via
+// `IdempotencyKey::from_canonical_string` (`idem_` + 26-char Crockford
+// ULID), so the encoding is pinned against a known ULID vector.
+describe("mintIdempotencyKey", () => {
+  it("encodes a known timestamp + randomness as a canonical ULID", () => {
+    // Spec vector: 1469918176385 ms → `01ARYZ6S41`; all-zero randomness.
+    const key = mintIdempotencyKey(1469918176385, (buf) => buf.fill(0));
+    expect(key).toBe("idem_01ARYZ6S410000000000000000");
+  });
+
+  it("is idem_ + 26 Crockford chars, first char ≤ 7", () => {
+    const key = mintIdempotencyKey();
+    expect(key).toMatch(/^idem_[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+  });
+
+  it("maps all-ones randomness to the top of the alphabet", () => {
+    const key = mintIdempotencyKey(0, (buf) => buf.fill(255));
+    expect(key).toBe("idem_0000000000ZZZZZZZZZZZZZZZZ");
+  });
+
+  it("mints a different key each call", () => {
+    expect(mintIdempotencyKey()).not.toBe(mintIdempotencyKey());
   });
 });

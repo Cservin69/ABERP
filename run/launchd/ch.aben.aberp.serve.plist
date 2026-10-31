@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ADR-0111 — always-on ABERP backend on the DB-owning MacBook (user aben).
+
+  Runs the PRODUCTION `aberp serve` that ./run/run_prod.sh built, at login,
+  with the Thunderbolt-Bridge listener armed (10.69.0.1:8443, peer
+  10.69.0.2 only, interface-pinned to bridge0). The loopback listener is on a
+  fixed port (18443) so the MacBook's own window can attach to it
+  (ABERP_REMOTE_URL=https://127.0.0.1:18443).
+
+  KeepAlive restarts it only after a FAILED exit, e.g. the bridge address was
+  not up yet at login, which the backend refuses loudly. A graceful stop
+  (launchctl bootout → SIGTERM) is not restarted.
+
+  Install / remove: see docs/runbooks/thunderbolt-always-on.md. Must be
+  booted out before ./run/upgrade_prod.sh, which refuses to swap a running
+  binary.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ch.aben.aberp.serve</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/aben/ABERP/target/release/aberp</string>
+    <string>serve</string>
+    <string>--tenant</string>
+    <string>prod</string>
+    <string>--db</string>
+    <string>/Users/aben/.aberp/prod/aberp.duckdb</string>
+    <string>--port</string>
+    <string>18443</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ABERP_TENANT</key>
+    <string>prod</string>
+    <key>ABERP_DB</key>
+    <string>/Users/aben/.aberp/prod/aberp.duckdb</string>
+    <key>ABERP_REMOTE_BIND</key>
+    <string>10.69.0.1:8443</string>
+    <key>ABERP_REMOTE_PEER</key>
+    <string>10.69.0.2</string>
+    <key>ABERP_REMOTE_IFACE</key>
+    <string>bridge0</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>/Users/aben/ABERP</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <!-- GUI login session only: the login keychain (NAV credentials, tokens) is unlocked there. -->
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>/Users/aben/Library/Logs/aberp-serve.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/aben/Library/Logs/aberp-serve.log</string>
+</dict>
+</plist>

@@ -912,6 +912,12 @@ export interface IssueInvoiceRequest {
    * the issuance commits. Editing this field NEVER writes back to the
    * partner master — it is a one-off per-invoice override. */
   emailRecipientOverride?: string | null;
+  /** ADR-0112 — ADR-0009 §5 Layer-1 idempotency key, `idem_<ULID>`.
+   * Minted ONCE per IssueInvoice form (see `mintIdempotencyKey`) and
+   * resent unchanged on every retry, so a retry after a lost response
+   * replays the invoice that already exists instead of burning a second
+   * number. Absent → the backend mints a fresh key (pre-0112 behaviour). */
+  idempotencyKey?: string;
 }
 
 /** S160 / ADR-0050 — per-invoice payment method (Fizetési mód). Mirror
@@ -964,6 +970,10 @@ export interface IssueInvoiceResponse {
   /** PR-92 — outcome of the default-on auto-send. Present iff the
    * operator left the toggle on; absent when toggled off. */
   email?: EmailRouteOutcome;
+  /** ADR-0112 — `true` when the request's idempotency key matched an
+   * invoice that was already issued: no new number was burned and no
+   * post-issue email / NAV submit was re-run. */
+  replayed?: boolean;
 }
 
 /** PR-44ζ / session-59 — POST the SPA-composed request body to the

@@ -959,6 +959,41 @@ export function targetForFieldPath(
  * same fields) so a form value of `"   "` surfaces as a 400 with the
  * actionable "required" message rather than passing pre-validation
  * and failing deeper. */
+// ADR-0112 — ULID alphabet (Crockford base32: no I, L, O, U).
+const CROCKFORD_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/** ADR-0112 — mint an `idem_<ULID>` idempotency key for one IssueInvoice
+ * form. The backend parses it with `IdempotencyKey::from_canonical_string`
+ * and the billing allocator replays the existing invoice on a repeat
+ * (ADR-0009 §5 Layer 1). 48-bit millisecond time (10 chars) + 80 random
+ * bits (16 chars). Parameters exist only so the test can pin the
+ * encoding. */
+export function mintIdempotencyKey(
+  nowMs: number = Date.now(),
+  randomBytes: (buf: Uint8Array) => Uint8Array = (buf) =>
+    crypto.getRandomValues(buf),
+): string {
+  let time = "";
+  let t = nowMs;
+  for (let i = 0; i < 10; i++) {
+    time = CROCKFORD_BASE32[t % 32] + time;
+    t = Math.floor(t / 32);
+  }
+  let rand = "";
+  let acc = 0;
+  let bits = 0;
+  for (const byte of randomBytes(new Uint8Array(10))) {
+    acc = (acc << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      rand += CROCKFORD_BASE32[(acc >> bits) & 31];
+    }
+    acc &= (1 << bits) - 1;
+  }
+  return `idem_${time}${rand}`;
+}
+
 export function composeIssueInvoiceBody(
   form: IssueInvoiceFormState,
 ): IssueInvoiceRequest {

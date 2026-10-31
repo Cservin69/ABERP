@@ -155,6 +155,7 @@ fn fixture_lines() -> Vec<LineJson> {
 
 fn fixture_request(currency: Currency) -> IssueInvoiceRequest {
     IssueInvoiceRequest {
+        idempotency_key: None,
         customer: fixture_customer(),
         lines: fixture_lines(),
         currency,
@@ -444,6 +445,7 @@ async fn issue_route_rejects_empty_lines_with_loud_error() {
     let actor = Actor::from_local_cli("test-session".to_string(), "test-user");
 
     let request = IssueInvoiceRequest {
+        idempotency_key: None,
         customer: fixture_customer(),
         lines: Vec::new(), // ← validation failure trigger
         currency: Currency::Huf,
@@ -498,6 +500,7 @@ async fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
     bad_supplier.tax_number = "24904362".to_string(); // ← bare base; no `-y-zz`
 
     let request = IssueInvoiceRequest {
+        idempotency_key: None,
         customer: fixture_customer(),
         lines: fixture_lines(),
         currency: Currency::Huf,
@@ -602,6 +605,7 @@ async fn issue_route_other_buyer_normalizes_community_vat_in_xml_and_audit() {
         }),
     };
     let request = IssueInvoiceRequest {
+        idempotency_key: None,
         customer: other_customer,
         lines: fixture_lines(),
         currency: Currency::Huf,
@@ -669,6 +673,282 @@ async fn issue_route_other_buyer_normalizes_community_vat_in_xml_and_audit() {
         Some("ATU12345678"),
         "audit payload must carry the NORMALISED community VAT number; payload:\n{payload:#}"
     );
+
+    let _keep = &dir;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ADR-0112 — client idempotency key on `POST /invoices/issue` (T2b).
+//
+// T2b (ADR-0111 test plan): the Thunderbolt link drops AFTER the backend
+// committed the invoice but BEFORE the response reached the remote shell.
+// The operator sees an error and clicks Issue again. The second request is
+// byte-identical to the first, including the form's idempotency key.
+// ──────────────────────────────────────────────────────────────────────
+
+// Read the ledger through the state's shared Handle (ADR-0099 H3). A
+// foreign `Ledger::open` between issuances folds the live WAL and trips the
+// ADR-0110 D7 durability fence on the next commit — exactly as it would in
+// production.
+fn ledger_for(state: &AppState) -> Ledger {
+    Ledger::from_connection(
+        state.db.read().expect("shared reader"),
+        TenantId::new(TEST_TENANT.to_string()).unwrap(),
+        BinaryHash::from_bytes([0u8; 32]),
+    )
+}
+
+fn count_kind(ledger: &Ledger, kind: EventKind) -> usize {
+    ledger
+        .entries()
+        .expect("read entries")
+        .iter()
+        .filter(|e| e.kind == kind)
+        .count()
+}
+
+fn sequence_of(invoice_number: &str) -> u64 {
+    invoice_number
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no numeric counter in `{invoice_number}`"))
+}
+
+fn keyed_request(key: &str) -> IssueInvoiceRequest {
+    IssueInvoiceRequest {
+        idempotency_key: Some(key.to_string()),
+        ..fixture_request(Currency::Huf)
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn t2b_retry_with_same_idempotency_key_replays_instead_of_double_issuing() {
+    let dir = test_dir("idem-replay");
+    std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+    let actor = Actor::from_local_cli("test-session".to_string(), "test-user");
+    let key = aberp_billing::IdempotencyKey::new().to_canonical_string();
+
+    // First request commits; its response is the one "lost" on the cable.
+    let first = serve::issue_invoice_request(
+        &state,
+        keyed_request(&key),
+        fixture_supplier(),
+        &UnreachableProvider,
+        actor.clone(),
+        None,
+    )
+    .await
+    .expect("first issue must succeed");
+    assert!(!first.replayed, "the first request is a fresh issuance");
+    let entries_after_first = ledger_for(&state).entries().expect("entries").len();
+
+    // The operator's retry: same body, same key.
+    let retry = serve::issue_invoice_request(
+        &state,
+        keyed_request(&key),
+        fixture_supplier(),
+        &UnreachableProvider,
+        actor,
+        None,
+    )
+    .await
+    .expect("retry must succeed (as a replay), not error");
+
+    assert!(retry.replayed, "the retry must be reported as a replay");
+    assert_eq!(
+        retry.invoice_id, first.invoice_id,
+        "same invoice, not a second one"
+    );
+    assert_eq!(
+        retry.invoice_number, first.invoice_number,
+        "no new number burned"
+    );
+
+    let ledger = ledger_for(&state);
+    assert_eq!(
+        ledger.entries().expect("entries").len(),
+        entries_after_first,
+        "a replay writes no audit entries (ADR-0008 append-only, one event per business fact)"
+    );
+    assert_eq!(count_kind(&ledger, EventKind::InvoiceSequenceReserved), 1);
+    assert_eq!(count_kind(&ledger, EventKind::InvoiceDraftCreated), 1);
+    ledger
+        .verify_chain()
+        .expect("audit chain intact after the replay");
+
+    assert!(
+        !retry.nav_xml_path.exists(),
+        "a replay must not write a second NAV XML for the same invoice"
+    );
+    // Assert on this request's own paths, not a directory count: the tests
+    // in this file share the process-wide HOME, so sibling tests write into
+    // the same `issued/` directory concurrently.
+    assert!(
+        !serve::sibling_input_json_path(&retry.nav_xml_path).exists(),
+        "a replay leaves no orphan side-stored input.json behind"
+    );
+    assert!(
+        first.nav_xml_path.exists() && serve::sibling_input_json_path(&first.nav_xml_path).exists(),
+        "the original issuance's XML + side-store stay in place"
+    );
+
+    // The next form (fresh key) issues the next number — nothing was skipped.
+    let next = serve::issue_invoice_request(
+        &state,
+        keyed_request(&aberp_billing::IdempotencyKey::new().to_canonical_string()),
+        fixture_supplier(),
+        &UnreachableProvider,
+        Actor::from_local_cli("test-session".to_string(), "test-user"),
+        None,
+    )
+    .await
+    .expect("a new key issues a new invoice");
+    assert!(!next.replayed);
+    assert_ne!(next.invoice_id, first.invoice_id);
+    assert_eq!(
+        sequence_of(&next.invoice_number),
+        sequence_of(&first.invoice_number) + 1,
+        "gap-free: the replay consumed no sequence slot"
+    );
+
+    let _keep = &dir;
+}
+
+/// Control: without a key (CLI, pre-0112 callers) every call is a new
+/// issuance. This is exactly the T2b double-issue the SPA's key removes.
+#[tokio::test(flavor = "current_thread")]
+async fn t2b_control_retry_without_key_issues_a_second_invoice() {
+    let dir = test_dir("idem-none");
+    std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+    let actor = Actor::from_local_cli("test-session".to_string(), "test-user");
+
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let s = serve::issue_invoice_request(
+            &state,
+            fixture_request(Currency::Huf),
+            fixture_supplier(),
+            &UnreachableProvider,
+            actor.clone(),
+            None,
+        )
+        .await
+        .expect("keyless issue");
+        assert!(!s.replayed);
+        ids.push(s.invoice_id);
+    }
+    assert_ne!(ids[0], ids[1], "no key → two distinct invoices");
+    assert_eq!(
+        count_kind(&ledger_for(&state), EventKind::InvoiceSequenceReserved),
+        2
+    );
+
+    let _keep = &dir;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_idempotency_key_is_refused_before_allocation() {
+    let dir = test_dir("idem-bad");
+    std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+
+    for bad in [
+        "",
+        "not-a-key",
+        "idem_",
+        "idem_not-a-ulid",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    ] {
+        let err = serve::issue_invoice_request(
+            &state,
+            keyed_request(bad),
+            fixture_supplier(),
+            &UnreachableProvider,
+            Actor::from_local_cli("test-session".to_string(), "test-user"),
+            None,
+        )
+        .await
+        .expect_err("a malformed key must be refused, never replaced by a fresh one");
+        assert!(
+            format!("{err:#}").contains("idempotencyKey"),
+            "error names the field for `{bad}`: {err:#}"
+        );
+    }
+    assert_eq!(
+        count_kind(&ledger_for(&state), EventKind::InvoiceSequenceReserved),
+        0,
+        "nothing was allocated"
+    );
+
+    let _keep = &dir;
+}
+
+/// T1 at unit level: one backend serves both machines, so concurrency is
+/// concurrent requests into one process. Two racers with the SAME key
+/// (a double-click, or a retry racing the original) yield ONE invoice;
+/// 20 concurrent distinct keys yield 20 contiguous, unique numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t1_concurrent_issues_stay_gap_free_and_same_key_racers_collapse() {
+    let dir = test_dir("idem-concurrent");
+    std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+
+    let issue = |key: String| {
+        let state = state.clone();
+        tokio::spawn(async move {
+            serve::issue_invoice_request(
+                &state,
+                keyed_request(&key),
+                fixture_supplier(),
+                &UnreachableProvider,
+                Actor::from_local_cli("test-session".to_string(), "test-user"),
+                None,
+            )
+            .await
+            .expect("concurrent issue")
+        })
+    };
+
+    let shared = aberp_billing::IdempotencyKey::new().to_canonical_string();
+    let a = issue(shared.clone());
+    let b = issue(shared);
+    let (a, b) = (a.await.expect("join a"), b.await.expect("join b"));
+    assert_eq!(a.invoice_id, b.invoice_id, "same key → same invoice");
+    assert_eq!(
+        [a.replayed, b.replayed].iter().filter(|r| **r).count(),
+        1,
+        "exactly one racer issued, the other replayed"
+    );
+
+    let handles: Vec<_> = (0..20)
+        .map(|_| issue(aberp_billing::IdempotencyKey::new().to_canonical_string()))
+        .collect();
+    let mut seqs = vec![sequence_of(&a.invoice_number)];
+    for h in handles {
+        let s = h.await.expect("join");
+        assert!(!s.replayed);
+        seqs.push(sequence_of(&s.invoice_number));
+    }
+    seqs.sort_unstable();
+    let first = seqs[0];
+    let expected: Vec<u64> = (first..first + seqs.len() as u64).collect();
+    assert_eq!(
+        seqs, expected,
+        "21 invoices, contiguous, no duplicate, no gap"
+    );
+
+    let ledger = ledger_for(&state);
+    assert_eq!(count_kind(&ledger, EventKind::InvoiceSequenceReserved), 21);
+    ledger
+        .verify_chain()
+        .expect("audit chain intact after concurrent issuance");
 
     let _keep = &dir;
 }

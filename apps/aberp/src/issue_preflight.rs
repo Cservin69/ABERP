@@ -1143,6 +1143,7 @@ mod tests {
 
     fn good_request() -> IssueInvoiceRequest {
         IssueInvoiceRequest {
+            idempotency_key: None,
             customer: CustomerJson {
                 community_vat_number: None,
                 // PR-97 / ADR-0048 — explicit Domestic preserves
@@ -1656,6 +1657,7 @@ mod tests {
     #[test]
     fn collects_all_errors_in_one_pass_for_multi_failing_request() {
         let r = IssueInvoiceRequest {
+            idempotency_key: None,
             customer: CustomerJson {
                 community_vat_number: None,
                 vat_status: CustomerVatStatus::Domestic,

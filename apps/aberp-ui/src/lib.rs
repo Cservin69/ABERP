@@ -72,6 +72,7 @@ pub mod backend;
 pub mod commands;
 pub mod handshake;
 pub mod pinned_client;
+pub mod remote_client;
 
 use backend::BackendHandle;
 
@@ -577,7 +578,15 @@ async fn sigterm_backend_then_drain(app_handle: &tauri::AppHandle) {
     let state = app_handle.state::<AppState>();
     let backend_guard = state.backend.lock().await;
     let pid_opt: Option<u32> = if let Some(backend) = backend_guard.as_ref() {
-        backend.child.lock().await.id()
+        match backend.child.as_ref() {
+            Some(child) => child.lock().await.id(),
+            None => {
+                // ADR-0111 remote mode — the backend belongs to the machine
+                // that owns the DB and keeps running for its own shell.
+                tracing::info!("remote backend: nothing to drain locally");
+                return;
+            }
+        }
     } else {
         None
     };
@@ -763,6 +772,13 @@ fn resolve_aberp_binary() -> Result<std::path::PathBuf> {
 /// responsible for marking `Failed` (see `run`).
 pub async fn boot_backend(handle: &tauri::AppHandle) -> Result<()> {
     let tenant = read_tenant_env();
+    // ADR-0111 — `ABERP_REMOTE_URL` selects remote mode: no local spawn,
+    // no local DB; the backend on the DB-owning machine is the one truth.
+    if let Some(remote) =
+        remote_client::config_from_env().context("ADR-0111 remote backend configuration")?
+    {
+        return boot_remote_backend(handle, tenant, remote).await;
+    }
     let aberp_bin = resolve_aberp_binary()?;
     let db_path = std::env::var("ABERP_DB").unwrap_or_else(|_| "./aberp.duckdb".to_string());
 
@@ -814,6 +830,74 @@ pub async fn boot_backend(handle: &tauri::AppHandle) -> Result<()> {
     Ok(())
 }
 
+/// ADR-0111 — connect to the backend on the DB-owning machine: pinned TLS
+/// (configured fingerprint), remote bearer from THIS machine's keychain on
+/// every request, then `/remote/hello` must confirm tenant, build profile
+/// and `ready` before the SPA mounts.
+async fn boot_remote_backend(
+    handle: &tauri::AppHandle,
+    tenant: String,
+    remote: remote_client::RemoteBackendConfig,
+) -> Result<()> {
+    let state = handle.state::<AppState>();
+    *state.boot_state.lock().expect("boot_state mutex poisoned") = BootState::starting();
+    state
+        .recent_logs
+        .lock()
+        .expect("recent_logs mutex poisoned")
+        .clear();
+    push_recent_log(
+        &state.recent_logs,
+        format!(
+            "remote mode: connecting to {} (tenant {tenant})",
+            remote.url
+        ),
+    );
+
+    // ADR-0111 — the remote bearer over the bridge; the loopback
+    // `session_token` when attaching to this machine's LaunchAgent backend.
+    let token = load_keychain_token(&tenant, remote.token_account)
+        .with_context(|| format!("load `{}` from OS keychain", remote.token_account))?;
+    let client = pinned_client::build_with_default_bearer(&remote.fingerprint_hex, Some(&token))
+        .context("build pinned reqwest client for the remote backend")?;
+
+    let hello_url = format!("{}/remote/hello", remote.url);
+    let response = client
+        .get(&hello_url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| {
+            // ADR-0111 — fail closed: there is no local DB to fall back to.
+            format!(
+                "the ABERP backend at {} is not reachable — check that the MacBook is awake, \
+                 on the Thunderbolt cable, and running the ABERP backend. This machine holds \
+                 no database; nothing was issued here. Retry once the link is back.",
+                remote.url
+            )
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!(
+            "remote backend refused /remote/hello with HTTP {status} — check the remote token and ABERP_REMOTE_PEER"
+        ));
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .context("decode /remote/hello response")?;
+    let hello = remote_client::RemoteHello::from_json(&body)?;
+    remote_client::check_hello(&hello, &tenant, cfg!(feature = "production"))?;
+
+    tracing::info!(url = %remote.url, tenant = %tenant, "remote backend verified; mounting SPA");
+    *state.backend.lock().await = Some(BackendHandle::remote(remote.url, token, client, tenant));
+    *state.boot_state.lock().expect("boot_state mutex poisoned") = BootState {
+        status: BootStatus::Ready,
+        error: None,
+    };
+    Ok(())
+}
+
 /// PR-46α / session-62 — flip the Tauri-side boot state mirror after
 /// a setup-wizard POST succeeds. Called from the
 /// `setup_nav_credentials` and `setup_seller_info` Tauri commands.
@@ -860,20 +944,27 @@ pub fn mark_post_setup_state(handle: &tauri::AppHandle, next_state: &str) {
 /// absent we loud-fail and ask the operator to run `aberp serve`
 /// once first (which mints the entry as a side effect).
 fn load_session_token(tenant: &str) -> Result<String> {
+    load_keychain_token(tenant, "session_token")
+}
+
+/// Shared read for the loopback `session_token` and the ADR-0111
+/// `remote_session_token`. In remote mode the entry is copied once from the
+/// DB-owning machine's keychain (see `run/run_remote_client.sh --help`).
+fn load_keychain_token(tenant: &str, account: &str) -> Result<String> {
     // ADR-0100 Phase 1 — the shell's one keychain read goes through the
     // shared `SecretStore` seam, same keychain backend as the CLI mint.
     use aberp_secret_store::SecretStore as _;
     let service = format!("aberp.nav.{tenant}");
     match aberp_secret_store::keychain_store()
-        .get(&service, "session_token")
+        .get(&service, account)
         .map_err(|e| anyhow!("OS keychain access failed: {e}"))?
     {
         Some(t) if !t.is_empty() => Ok(t.to_string()),
         Some(_) => Err(anyhow!(
-            "OS keychain entry `{service}` / `session_token` is empty — run `aberp serve --tenant {tenant}` once to mint it"
+            "OS keychain entry `{service}` / `{account}` is empty — run `aberp serve --tenant {tenant}` once to mint it"
         )),
         None => Err(anyhow!(
-            "OS keychain has no `{service}` / `session_token` entry — run `aberp serve --tenant {tenant}` once to mint it"
+            "OS keychain has no `{service}` / `{account}` entry — run `aberp serve --tenant {tenant}` once to mint it"
         )),
     }
 }

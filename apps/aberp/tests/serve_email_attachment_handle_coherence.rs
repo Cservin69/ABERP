@@ -132,6 +132,7 @@ fn fixture_supplier() -> SupplierJson {
 
 fn fixture_request() -> IssueInvoiceRequest {
     IssueInvoiceRequest {
+        idempotency_key: None,
         customer: CustomerJson {
             community_vat_number: None,
             vat_status: CustomerVatStatus::Domestic,

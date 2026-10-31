@@ -69,6 +69,7 @@
     emptyForm,
     emptyLine,
     lineCurrencyMismatchWarning,
+    mintIdempotencyKey,
     parseInvoicePreflightErrors,
     parseMissingSellerConfigError,
     paymentDeadlineFromOffset,
@@ -106,6 +107,12 @@
   let { onIssued, onClose }: Props = $props();
 
   let form: IssueInvoiceFormState = $state(emptyForm());
+  // ADR-0112 — one idempotency key per mounted form. Kept across failed
+  // submits so a retry after a lost response (e.g. the Thunderbolt link
+  // dropping, ADR-0111) replays the already-issued invoice instead of
+  // issuing a second one. A successful issue unmounts the form, so the
+  // next form gets a fresh key.
+  const idempotencyKey = mintIdempotencyKey();
   let submitState: "idle" | "submitting" | "error" = $state("idle");
   let submitError: string | null = $state(null);
   /** PR-74 / session-96 — saved-partners cache for the buyer combobox.
@@ -742,7 +749,7 @@
     missingSellerConfig = null;
     clearPreflightErrors();
     try {
-      const body = composeIssueInvoiceBody(form);
+      const body = { ...composeIssueInvoiceBody(form), idempotencyKey };
       const response = await issueInvoice(body);
       submitState = "idle";
       // PR-86 / session-111 — the parent route navigates away on

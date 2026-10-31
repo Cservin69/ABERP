@@ -88,7 +88,11 @@ pub struct BackendHandle {
     // child PID and send SIGTERM for graceful shutdown BEFORE the
     // Child is dropped (the drop's SIGKILL is the fallback, not the
     // primary exit path).
-    pub child: Arc<Mutex<Child>>,
+    //
+    // ADR-0111 — `None` in remote mode: the backend is a process on the
+    // machine that owns the DB, not our child, so there is nothing to
+    // signal or drain.
+    pub child: Option<Arc<Mutex<Child>>>,
 }
 
 impl BackendHandle {
@@ -103,7 +107,23 @@ impl BackendHandle {
             session_token,
             client,
             tenant,
-            child: started.child,
+            child: Some(started.child),
+        }
+    }
+
+    /// ADR-0111 — a handle onto a backend on the other machine.
+    pub fn remote(
+        url: String,
+        session_token: String,
+        client: reqwest::Client,
+        tenant: String,
+    ) -> Self {
+        BackendHandle {
+            url,
+            session_token,
+            client,
+            tenant,
+            child: None,
         }
     }
 }
