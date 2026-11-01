@@ -27,8 +27,9 @@ pub use crate::ports::storage::BillingStore;
 
 // ── Adapters ──────────────────────────────────────────────────────────
 pub use crate::adapters::duckdb_store::{
-    allocate_in_tx, load_email_recipient_override_in_tx, load_invoice_note_in_tx,
-    load_ready_invoice_by_id, peek_next_number, resolve_bucket_fiscal_year, DuckDbBillingStore,
+    allocate_in_tx, idempotency_key_exists, load_email_recipient_override_in_tx,
+    load_invoice_note_in_tx, load_ready_invoice_by_id, peek_next_number,
+    resolve_bucket_fiscal_year, DuckDbBillingStore,
 };
 pub use crate::adapters::in_memory_store::InMemoryBillingStore;
 

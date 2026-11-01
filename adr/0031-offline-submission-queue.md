@@ -836,3 +836,37 @@ what to do.
   - 50 issues then a refused 51st with no allocation, in
     `tests/serve_issue_route.rs`;
   - the SPA parser in `issue-invoice.test.ts`.
+
+## Addendum 2 (2026-10-31): the cap check is atomic and replay-aware
+
+The first addendum left the §5 count *before* the shared writer was
+taken. Under a 120-way concurrent burst over the ADR-0111 bridge, the
+staging tenant reached **58 pending against a cap of 50**. Every request
+counted 49 and then queued for the writer. The same placement also
+refused an ADR-0112 *replay* of an already-issued key once the queue was
+full, although a replay creates nothing.
+
+- All three paths (`issue_invoice`, `issue_storno`,
+  `issue_modification`) now count **under** `db.write()`, through
+  `submission_queue::count_pending_on(guard.try_clone()?, …)`. A concurrent
+  issue cannot slip between the count and the allocation.
+- `issue_invoice` first asks `aberp_billing::idempotency_key_exists`. A
+  replay skips the cap and returns the prior outcome. Storno and
+  modification carry no client key yet, so they have no replay to except.
+- A refusal still burns no number: the count still runs before
+  `allocate_in_tx`.
+- **Test.** `tests/serve_issue_route.rs::queue_cap_is_atomic_under_burst_and_never_refuses_a_replay`:
+  - fill to cap−5, then send 20 concurrent keyed issues;
+  - assert exactly 5 issued and 15 typed refusals;
+  - assert `InvoiceSequenceReserved` equals the cap;
+  - assert a replay of an issued key at a full queue succeeds with `replayed: true`.
+- **Burst failures.** The earlier "4 of 20 burst requests failed" did not
+  reproduce. These runs completed with no transport errors:
+  - 40 concurrent over the bridge: all 200, connect ≤ 14 ms;
+  - 40 concurrent on loopback against a prod copy: all 200, max 2.8 s;
+  - 120 concurrent over the bridge: connect ≤ 34 ms.
+
+  This rules out the listener backlog, TLS and client timeouts. The first
+  harness discarded curl's errors (`-s` without `-S`), so the failures are
+  attributed to the harness, not the server. The over-cap count above was
+  the real defect.

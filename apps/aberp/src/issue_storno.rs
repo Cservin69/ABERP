@@ -287,16 +287,10 @@ pub fn storno_from_inputs(
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
-    // 4a. PR-18 / ADR-0031 §5 — pre-allocation hard-cap check.
-    //     A storno burns its own sequence number, so it counts
+    // 4a. PR-18 / ADR-0031 §5 — the pre-allocation hard-cap check runs UNDER
+    //     the write guard below (ADR-0031 addendum 2), atomic with the
+    //     allocation. A storno burns its own sequence number, so it counts
     //     against the same ADR-0009 §7 backlog as a fresh invoice.
-    //     Loud-fail before any allocator tx opens so the
-    //     sequence-slot invariant is preserved.
-    let pending_count =
-        crate::submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
-            .context("count pending submissions (ADR-0031 §5 cap check) for storno")?;
-    // ADR-0009 §7 / ADR-0031 §5 — typed so the route can answer 409, not 500.
-    crate::submission_queue::ensure_capacity(pending_count, "storno")?;
 
     // 5. Pre-flight precondition: base must be Finalized (last ack =
     //    SAVED). Open a fresh Ledger for the read; close it before
@@ -351,6 +345,18 @@ pub fn storno_from_inputs(
     let mut guard = db
         .write()
         .context("acquire shared writer for storno issuance")?;
+    // ADR-0031 §5 + addendum 2 — cap check under the single writer, so it is
+    // atomic with the allocation below (a storno never replays: fresh key).
+    let pending_count = crate::submission_queue::count_pending_on(
+        guard
+            .try_clone()
+            .context("try_clone shared writer for the queue-cap count")?,
+        tenant.clone(),
+        binary_hash_bytes,
+    )
+    .context("count pending submissions (ADR-0031 §5 cap check) for storno")?;
+    // ADR-0009 §7 / ADR-0031 §5 — typed so the route can answer 409, not 500.
+    crate::submission_queue::ensure_capacity(pending_count, "storno")?;
     let series = {
         let mut billing = DuckDbBillingStore::from_connection(
             guard

@@ -255,12 +255,8 @@ pub fn modification_from_inputs(
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
-    // ADR-0031 §5 pre-allocation hard-cap check.
-    let pending_count =
-        crate::submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
-            .context("count pending submissions (ADR-0031 §5 cap check) for modification")?;
-    // ADR-0009 §7 / ADR-0031 §5 — typed so the route can answer 409, not 500.
-    crate::submission_queue::ensure_capacity(pending_count, "modification")?;
+    // ADR-0031 §5 pre-allocation hard-cap check: runs UNDER the write guard
+    // below (ADR-0031 addendum 2), atomic with the allocation.
 
     // Pre-flight precondition: base is Finalized OR already Amended,
     // and not Storno-cancelled. Read-only ledger; drop before opening
@@ -314,6 +310,18 @@ pub fn modification_from_inputs(
     let mut guard = db
         .write()
         .context("acquire shared writer for modification issuance")?;
+    // ADR-0031 §5 + addendum 2 — cap check under the single writer, so it is
+    // atomic with the allocation below (a modification never replays: fresh key).
+    let pending_count = crate::submission_queue::count_pending_on(
+        guard
+            .try_clone()
+            .context("try_clone shared writer for the queue-cap count")?,
+        tenant.clone(),
+        binary_hash_bytes,
+    )
+    .context("count pending submissions (ADR-0031 §5 cap check) for modification")?;
+    // ADR-0009 §7 / ADR-0031 §5 — typed so the route can answer 409, not 500.
+    crate::submission_queue::ensure_capacity(pending_count, "modification")?;
     let series = {
         let mut billing = DuckDbBillingStore::from_connection(
             guard

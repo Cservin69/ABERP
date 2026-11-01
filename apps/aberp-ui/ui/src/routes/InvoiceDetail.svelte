@@ -185,6 +185,7 @@
     type LabelSignal,
   } from "../lib/labels";
   import { onDestroy } from "svelte";
+  import { submissionQueueFullMessage } from "../lib/issue-invoice";
   import { navStatusPictogram } from "../lib/nav-status-pictogram";
   import {
     createDetailPoller,
@@ -856,7 +857,8 @@
       mutationState = {
         kind: "error",
         action: "cancel",
-        message,
+        // ADR-0031 addendum — a full NAV queue reads as a sentence, not raw JSON.
+        message: submissionQueueFullMessage(message) ?? message,
         navFault: parseNavUpstreamFault(message),
       };
     }

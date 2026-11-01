@@ -771,23 +771,10 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
-    // 4a. PR-18 / ADR-0031 §5 — pre-allocation hard-cap check
-    //     against the offline submission queue. Refuses fresh
-    //     allocation when the ledger already shows the
-    //     `HARD_CAP_PENDING` threshold of unsubmitted invoices.
-    //     Loud-fail per CLAUDE.md rule 12 BEFORE the allocator
-    //     tx opens so the sequence-slot invariant (ADR-0009 §3)
-    //     is preserved. The check opens + drops its own Ledger
-    //     handle; pre_tx_setup below opens a fresh Connection.
-    let pending_count = submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
-        .context("count pending submissions (ADR-0031 §5 cap check)")?;
-    // ADR-0009 §7 / ADR-0031 §5 — typed so the route can answer 409, not 500.
-    submission_queue::ensure_capacity(pending_count, "invoice")?;
-    tracing::info!(
-        pending_count = pending_count,
-        cap = submission_queue::HARD_CAP_PENDING,
-        "ADR-0031 §5 cap check passed"
-    );
+    // 4a. PR-18 / ADR-0031 §5 — the pre-allocation hard-cap check against
+    //     the offline submission queue runs UNDER the issuance write guard
+    //     below (ADR-0031 addendum 2), not here: checked before the guard,
+    //     a concurrent burst all passed the check and overshot the cap.
 
     // 5a. PR-90 / ADR-0045 §2 — resolve the operator's numbering
     //     template once. Used immediately to thread the desired
@@ -1129,6 +1116,29 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     let mut guard = db
         .write()
         .context("acquire shared writer for invoice issuance tx")?;
+    // ADR-0031 §5 + addendum 2 — the hard-cap check, atomic with the
+    // allocation because issuance holds the single writer. A request whose
+    // idempotency key already burned an invoice is a REPLAY (ADR-0112): it
+    // allocates nothing, so it is never refused by the cap.
+    let is_replay = aberp_billing::idempotency_key_exists(guard.conn(), &idempotency_key)
+        .context("look up idempotency key before the queue-cap check")?;
+    if !is_replay {
+        let pending_count = submission_queue::count_pending_on(
+            guard
+                .try_clone()
+                .context("try_clone shared writer for the queue-cap count")?,
+            tenant.clone(),
+            binary_hash_bytes,
+        )
+        .context("count pending submissions (ADR-0031 §5 cap check)")?;
+        // ADR-0009 §7 / ADR-0031 §5 — typed so the route can answer 409, not 500.
+        submission_queue::ensure_capacity(pending_count, "invoice")?;
+        tracing::info!(
+            pending_count = pending_count,
+            cap = submission_queue::HARD_CAP_PENDING,
+            "ADR-0031 §5 cap check passed"
+        );
+    }
     let outcome = run_single_tx(
         guard.conn(),
         &ledger_meta,

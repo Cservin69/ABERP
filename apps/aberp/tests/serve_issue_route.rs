@@ -953,19 +953,24 @@ async fn t1_concurrent_issues_stay_gap_free_and_same_key_racers_collapse() {
     let _keep = &dir;
 }
 
-/// ADR-0009 §7 / ADR-0031 §5 — once 50 invoices are unsubmitted, the next
-/// issue is refused BEFORE any number is allocated, with the typed
-/// `SubmissionQueueFull` the route maps to a 409 (not an untyped error that
-/// becomes a generic 500).
-#[tokio::test(flavor = "current_thread")]
-async fn queue_at_hard_cap_refuses_issue_with_typed_error_and_allocates_nothing() {
+/// ADR-0009 §7 / ADR-0031 §5 + addendum 2 — the hard cap holds under a
+/// concurrent burst, refuses with the typed `SubmissionQueueFull` (the route
+/// maps it to a 409, not a generic 500) BEFORE any number is allocated, and
+/// never refuses a REPLAY of an invoice that already exists (ADR-0112).
+///
+/// Fill the queue to `cap - 5`, then fire 20 concurrent fresh issues: exactly 5
+/// may succeed. Before addendum 2 the check ran outside the write guard and a
+/// burst overshot the cap (observed live: 58/50).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_cap_is_atomic_under_burst_and_never_refuses_a_replay() {
     let dir = test_dir("queue-full");
     std::env::set_var("HOME", &dir);
     write_fixture_seller_toml(&dir);
     let state = build_state(dir.join("aberp.duckdb"));
     let cap = aberp::submission_queue::HARD_CAP_PENDING;
+    let headroom = 5;
 
-    for _ in 0..cap {
+    for _ in 0..(cap - headroom) {
         serve::issue_invoice_request(
             &state,
             fixture_request(Currency::Huf),
@@ -978,28 +983,79 @@ async fn queue_at_hard_cap_refuses_issue_with_typed_error_and_allocates_nothing(
         .expect("issues below the cap succeed");
     }
 
-    let err = serve::issue_invoice_request(
+    let keys: Vec<String> = (0..20)
+        .map(|_| aberp_billing::IdempotencyKey::new().to_canonical_string())
+        .collect();
+    let handles: Vec<_> = keys
+        .iter()
+        .cloned()
+        .map(|key| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let r = serve::issue_invoice_request(
+                    &state,
+                    keyed_request(&key),
+                    fixture_supplier(),
+                    &UnreachableProvider,
+                    Actor::from_local_cli("test-session".to_string(), "test-user"),
+                    None,
+                )
+                .await;
+                (key, r)
+            })
+        })
+        .collect();
+
+    let mut issued_keys = Vec::new();
+    let mut refused = 0;
+    for h in handles {
+        let (key, r) = h.await.expect("join");
+        match r {
+            Ok(s) => {
+                assert!(!s.replayed);
+                issued_keys.push(key);
+            }
+            Err(err) => {
+                let full = err
+                    .chain()
+                    .find_map(|c| c.downcast_ref::<aberp::submission_queue::SubmissionQueueFull>())
+                    .unwrap_or_else(|| {
+                        panic!("refusal must be the typed SubmissionQueueFull, got: {err:#}")
+                    });
+                assert_eq!(full.cap, cap);
+                assert_eq!(full.issuing, "invoice");
+                refused += 1;
+            }
+        }
+    }
+    assert_eq!(
+        issued_keys.len(),
+        headroom,
+        "exactly the headroom is issued under a burst"
+    );
+    assert_eq!(refused, 20 - headroom);
+    assert_eq!(
+        count_kind(&ledger_for(&state), EventKind::InvoiceSequenceReserved),
+        cap,
+        "the burst did not overshoot the cap"
+    );
+
+    // A lost-response retry of an invoice that exists replays even though the
+    // queue is full: it allocates nothing.
+    let retry = serve::issue_invoice_request(
         &state,
-        fixture_request(Currency::Huf),
+        keyed_request(&issued_keys[0]),
         fixture_supplier(),
         &UnreachableProvider,
         Actor::from_local_cli("test-session".to_string(), "test-user"),
         None,
     )
     .await
-    .expect_err("the issue at the cap must be refused");
-    let full = err
-        .chain()
-        .find_map(|c| c.downcast_ref::<aberp::submission_queue::SubmissionQueueFull>())
-        .unwrap_or_else(|| panic!("refusal must be the typed SubmissionQueueFull, got: {err:#}"));
-    assert_eq!(full.pending, cap);
-    assert_eq!(full.cap, cap);
-    assert_eq!(full.issuing, "invoice");
-
+    .expect("a replay is not refused by a full queue");
+    assert!(retry.replayed);
     assert_eq!(
         count_kind(&ledger_for(&state), EventKind::InvoiceSequenceReserved),
-        cap,
-        "the refused issue allocated no sequence number"
+        cap
     );
 
     let _keep = &dir;

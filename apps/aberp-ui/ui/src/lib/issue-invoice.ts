@@ -714,6 +714,25 @@ export function parseSubmissionQueueFullError(
   };
 }
 
+/** ADR-0031 addendum — one HU/EN sentence for a `submission_queue_full`
+ * refusal from ANY issuance route (invoice, storno, modification), or `null`
+ * when `raw` is some other error so the caller shows `raw` as before. */
+export function submissionQueueFullMessage(raw: string): string | null {
+  const q = parseSubmissionQueueFullError(raw);
+  if (!q) return null;
+  const what: Record<string, [string, string]> = {
+    invoice: ["számla", "invoice"],
+    storno: ["sztornó számla", "storno"],
+    modification: ["módosító számla", "modification"],
+  };
+  const [hu, en] = what[q.issuing] ?? [q.issuing, q.issuing];
+  return (
+    `A NAV-beküldési sor megtelt (${q.pending}/${q.cap} beküldetlen számla); nem készült ${hu}. ` +
+    `The NAV submission queue is full (${q.pending}/${q.cap} unsubmitted invoices); no ${en} was issued. ` +
+    "Submit the pending invoices to NAV (or mark the ones you will not submit as abandoned), then try again."
+  );
+}
+
 export function parseMissingSellerConfigError(
   raw: string,
 ): MissingSellerConfigError | null {

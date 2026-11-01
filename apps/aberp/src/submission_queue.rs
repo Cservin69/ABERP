@@ -232,12 +232,24 @@ pub fn pending_from_ledger(ledger: &Ledger) -> Result<Vec<PendingInvoice>> {
 /// already threads; this keeps the cap check a one-liner at the `issue-*`
 /// orchestration boundaries.
 pub fn count_pending(db: &Handle, tenant: TenantId, binary_hash: BinaryHash) -> Result<usize> {
-    let ledger = Ledger::from_connection(
+    count_pending_on(
         db.read()
             .context("acquire shared reader to count pending submissions")?,
         tenant,
         binary_hash,
-    );
+    )
+}
+
+/// ADR-0031 addendum 2 — the same count on a caller-supplied connection. The
+/// issuance paths pass a `try_clone` of the WRITE guard they hold, so the cap
+/// check and the allocation are serialized by the single writer (a check made
+/// before taking the guard let a concurrent burst overshoot the cap).
+pub fn count_pending_on(
+    conn: duckdb::Connection,
+    tenant: TenantId,
+    binary_hash: BinaryHash,
+) -> Result<usize> {
+    let ledger = Ledger::from_connection(conn, tenant, binary_hash);
     Ok(pending_from_ledger(&ledger)?.len())
 }
 

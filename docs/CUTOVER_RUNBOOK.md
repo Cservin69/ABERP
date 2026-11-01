@@ -591,7 +591,9 @@ that warrants a full rollback to pre-upgrade), the snapshot artifacts
 land under `~/aberp-snapshots/`:
 
 - `<tenant>-<timestamp>.tgz` — the tenant directory.
-- `<tenant>-<timestamp>-keychain.zip` — encrypted keychain dump.
+- `<tenant>-<timestamp>-keychain.json.age` — encrypted keychain dump (age,
+  ADR-0113). Snapshots taken by releases before ADR-0113 are
+  `<tenant>-<timestamp>-keychain.zip`; the same restore tool reads both.
 
 ```bash
 # 1. Stop the running app (Ctrl-C in the run_prod.sh terminal).
@@ -601,14 +603,14 @@ land under `~/aberp-snapshots/`:
 cd ~/.aberp
 tar -xzf ~/aberp-snapshots/prod-20260601-143022.tgz   # pick the right ts
 
-# 3. Restore keychain entries from the encrypted zip. The zip contains
-#    one JSON file; unzip with the password you set at snapshot time.
-cd /tmp
-unzip ~/aberp-snapshots/prod-20260601-143022-keychain.zip
-# Then for each entry in the JSON, re-import:
-#   security add-generic-password -U -s <service> -a <account> -w <password>
-# (The `-U` flag updates an existing entry instead of failing on duplicate.)
-# Don't leave the unzipped JSON on disk — `shred -uz` it after you're done.
+# 3. Restore keychain entries. The tool asks for the passphrase (or the
+#    legacy zip password), lists the entries and asks before overwriting.
+#    It decrypts into a private tempdir that is removed on exit.
+cd ~/ABERP
+./tools/restore-keychain-snapshot.sh ~/aberp-snapshots/prod-20260601-143022-keychain.json.age
+#    Restore drill without touching the keychain:
+#    ./tools/restore-keychain-snapshot.sh --verify <snapshot-file>
+#    On next launch, answer "Always Allow" for aberp on each keychain prompt.
 
 # 4. Relaunch with the prior release branch (Step 8 procedure).
 cd ~/ABERP-prod

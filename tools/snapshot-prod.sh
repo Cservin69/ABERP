@@ -39,12 +39,16 @@
 #      defense-in-depth against a future S170-class regression in
 #      any write surface that might silently drop one of these
 #      load-bearing safety sections.
-#   3. A password-protected zip of the per-tenant macOS keychain
-#      entries (NAV credentials blob + SMTP password). The operator
-#      types the encryption password interactively at zip-creation;
-#      we never write the keychain values unencrypted anywhere on
-#      disk except inside a tempfile that's `shred`-removed before
-#      the script exits.
+#   3. A passphrase-encrypted `age` file of the per-tenant macOS
+#      keychain entries (NAV credentials blob + SMTP password). The
+#      operator types the passphrase interactively (or presses Enter
+#      to have age generate a strong one and print it); we never
+#      write the keychain values unencrypted anywhere on disk except
+#      inside a 0700 tempdir that is removed before the script exits.
+#      ADR-0113: age (scrypt + ChaCha20-Poly1305, authenticated)
+#      replaced `zip -e` (ZipCrypto — unauthenticated, known-plaintext
+#      breakable). Restore either format with
+#      ./tools/restore-keychain-snapshot.sh <file>.
 #
 # What it does NOT capture:
 #   - The session_token keychain entry (`aberp.nav.prod` /
@@ -71,7 +75,7 @@ TENANT="prod"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h)
-      sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     -*)
@@ -98,7 +102,7 @@ readonly SNAPSHOT_ROOT="${HOME}/aberp-snapshots"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 readonly TIMESTAMP
 readonly SNAPSHOT_TGZ="${SNAPSHOT_ROOT}/${TENANT}-${TIMESTAMP}.tgz"
-readonly KEYCHAIN_ZIP="${SNAPSHOT_ROOT}/${TENANT}-${TIMESTAMP}-keychain.zip"
+readonly KEYCHAIN_AGE="${SNAPSHOT_ROOT}/${TENANT}-${TIMESTAMP}-keychain.json.age"
 
 # Keychain entries to capture for this tenant. The session_token is
 # deliberately omitted — it's regenerated on each binary boot, so
@@ -109,6 +113,14 @@ KEYCHAIN_ENTRIES=(
 )
 
 # ---------- pre-flight ------------------------------------------------------
+# age is checked FIRST so a missing tool fails before anything is written
+# (ADR-0113: no silent fallback to the weak zip cipher).
+if ! command -v age >/dev/null 2>&1; then
+  echo "${c_red}[fail]${c_rst} 'age' not found — install it with: brew install age" >&2
+  echo "${c_red}[hiba]${c_rst} az 'age' nincs telepítve — telepítés: brew install age" >&2
+  exit 2
+fi
+
 if [[ ! -d "$TENANT_DIR" ]]; then
   echo "${c_red}[fail]${c_rst} tenant directory not found: $TENANT_DIR" >&2
   echo "${c_red}[hiba]${c_rst} a bérlő mappa nem található: $TENANT_DIR" >&2
@@ -189,7 +201,7 @@ TGZ_SIZE="$(du -h "$SNAPSHOT_TGZ" | awk '{print $1}')"
 echo "${c_grn}[ ok ]${c_rst} tarball written ($TGZ_SIZE): $SNAPSHOT_TGZ" >&2
 echo "${c_grn}[ ok ]${c_rst} tarball kész ($TGZ_SIZE): $SNAPSHOT_TGZ" >&2
 
-# ---------- 3) keychain dump + encrypted zip --------------------------------
+# ---------- 3) keychain dump + age encryption -------------------------------
 # Tempfile + cleanup. NEVER print the dump contents.
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aberp-snapshot.XXXXXX")"
 trap 'shred -uz "${TMP_DIR}"/* 2>/dev/null || rm -rf "${TMP_DIR}"' EXIT
@@ -241,19 +253,22 @@ DUMP_FILE="${TMP_DIR}/keychain-${TENANT}.json"
 } > "$DUMP_FILE"
 chmod 0600 "$DUMP_FILE"
 
-# Encrypt to zip. `zip -e` prompts for a password twice on stderr.
-# Operator types it interactively — we never see it.
+# Encrypt with age. `age -p` reads the passphrase twice from the
+# terminal (not stdin) — the operator types it, we never see it. An empty
+# passphrase makes age generate a strong one and print it once on stderr.
 echo >&2
-echo "${c_yel}[3/3] encrypting keychain dump → ${KEYCHAIN_ZIP}${c_rst}" >&2
-echo "${c_yel}[3/3] kulcstartó-másolat titkosítása → ${KEYCHAIN_ZIP}${c_rst}" >&2
-echo "${c_dim}      zip will prompt for an encryption password — pick one you can remember;${c_rst}" >&2
-echo "${c_dim}      a zip jelszót fog kérni — válassz olyat, amit meg tudsz jegyezni;${c_rst}" >&2
-echo "${c_dim}      restore needs it.${c_rst}" >&2
-echo "${c_dim}      a visszaállításhoz szükséges lesz.${c_rst}" >&2
+echo "${c_yel}[3/3] encrypting keychain dump → ${KEYCHAIN_AGE}${c_rst}" >&2
+echo "${c_yel}[3/3] kulcstartó-másolat titkosítása → ${KEYCHAIN_AGE}${c_rst}" >&2
+echo "${c_dim}      age will ask for a passphrase twice — pick one you can remember,${c_rst}" >&2
+echo "${c_dim}      or press Enter to get a generated one (write it down);${c_rst}" >&2
+echo "${c_dim}      az age kétszer kér jelmondatot — válassz megjegyezhetőt,${c_rst}" >&2
+echo "${c_dim}      vagy Enter: generált jelmondat (írd fel);${c_rst}" >&2
+echo "${c_dim}      restore needs it. / a visszaállításhoz szükséges lesz.${c_rst}" >&2
 echo >&2
 
-(cd "$TMP_DIR" && zip -e "$KEYCHAIN_ZIP" "$(basename "$DUMP_FILE")")
-chmod 0600 "$KEYCHAIN_ZIP"
+# umask so the ciphertext is never briefly world-readable.
+(umask 077 && age -p -o "$KEYCHAIN_AGE" "$DUMP_FILE")
+chmod 0600 "$KEYCHAIN_AGE"
 
 # Tempfile is shredded by the EXIT trap.
 echo
@@ -262,12 +277,12 @@ echo "${c_grn}  snapshot complete${c_rst}" >&2
 echo "${c_grn}  biztonsági mentés kész${c_rst}" >&2
 echo "${c_grn}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c_rst}" >&2
 echo "${c_grn}  tenant tarball: ${SNAPSHOT_TGZ}${c_rst}" >&2
-echo "${c_grn}  keychain zip:   ${KEYCHAIN_ZIP}${c_rst}" >&2
+echo "${c_grn}  keychain age:   ${KEYCHAIN_AGE}${c_rst}" >&2
 echo "${c_grn}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c_rst}" >&2
 echo
 echo "${c_dim}Restore recipe (see runbook Step 9 for full procedure):${c_rst}" >&2
 echo "${c_dim}  1. Stop the app (Ctrl-C in the run_prod.sh terminal).${c_rst}" >&2
 echo "${c_dim}  2. tar -C \"\${HOME}/.aberp\" -xzf \"${SNAPSHOT_TGZ}\"${c_rst}" >&2
-echo "${c_dim}  3. unzip the keychain zip + re-import via 'security add-generic-password'.${c_rst}" >&2
+echo "${c_dim}  3. ./tools/restore-keychain-snapshot.sh \"${KEYCHAIN_AGE}\"${c_rst}" >&2
 echo "${c_dim}  4. Relaunch ./run/run_prod.sh${c_rst}" >&2
 echo

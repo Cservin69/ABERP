@@ -56,6 +56,7 @@
   // closed-vocab drift.
   import {
     parseInvoicePreflightErrors,
+    submissionQueueFullMessage,
     targetForFieldPath,
     type InvoicePreflightErrorBody,
     type InvoicePreflightErrorItem,
@@ -352,7 +353,9 @@
         preflightErrors = preflight;
         routePreflightErrors(preflight);
       }
-      submitError = raw;
+      // ADR-0031 addendum — the typed 409 for a full NAV queue reads as a
+      // sentence, not raw JSON.
+      submitError = submissionQueueFullMessage(raw) ?? raw;
     }
   }
 

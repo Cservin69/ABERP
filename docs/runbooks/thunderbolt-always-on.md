@@ -188,3 +188,42 @@ was issued on the Studio. Reconnect or wake the MacBook and press Retry.
 
 A retry of an issue whose response was lost returns the invoice that was already issued. It does
 not create a second one (ADR-0112).
+
+## Claude Code sandbox and bridge commands
+
+The Claude Code sandbox blocks LAN traffic, including the bridge. The user settings exempt
+these bridge commands from the sandbox (`sandbox.excludedCommands`):
+- `ssh aben@10.69.0.1 *`
+- `scp aben@10.69.0.1:* *`
+- `rsync -a[v] aben@10.69.0.1:* *`
+- `ping -c* 10.69.0.1`
+
+An exemption applies only when the **whole** command line matches a pattern. If the line does
+not match, it runs inside the sandbox and fails with
+`connect to host 10.69.0.1 port 22: Operation not permitted`. These break the match:
+- anything around the command: a local pipe, `&&`, `;`, a redirect into a second command or a
+  leading `cd`;
+- an option before the host, such as `ssh -o BatchMode=yes aben@10.69.0.1 …`. The pattern
+  begins `ssh aben@`, so put options after the host or in `~/.ssh/config`;
+- a `$(…)` or backtick substitution anywhere, even inside the quoted remote command.
+
+Pipes and `;` *inside* the quoted remote command are fine.
+
+Observed 2026-10-31 and 2026-11-01:
+
+| Command | Result |
+|---|---|
+| `ssh aben@10.69.0.1 "zsh -lc '…'"` | exempt, reached the MacBook |
+| `ssh aben@10.69.0.1 'echo a \| cat'` | exempt, reached the MacBook |
+| `ssh aben@10.69.0.1 'echo a; echo b'` | exempt, reached the MacBook |
+| `ssh aben@10.69.0.1 echo reached \| cat` | blocked (local pipe) |
+| `ssh -o BatchMode=yes aben@10.69.0.1 …` | blocked (option before host) |
+| `ssh aben@10.69.0.1 'echo $(whoami)'` | blocked (substitution) |
+
+To keep bridge work prompt-free, issue the remote call as one bare command, with any pipeline
+inside the quotes, and post-process the output in a separate local step.
+
+The exemptions are deliberately narrow:
+- they are pinned to the `aben@10.69.0.1` peer;
+- `scp`/`rsync` match only the pull direction (MacBook → Studio);
+- they do not loosen any permission ask rule.

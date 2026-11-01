@@ -78,7 +78,7 @@ For the rule to be enforceable in review, the categories are explicit:
 | AP per-digest side-store | `~/.aberp/<tenant>/ap-artifacts/` | S177 + S197 | required |
 | Logo asset | `~/.aberp/<tenant>/logo.png` | PR-176 | optional (operator-supplied) |
 | Loopback TLS cert | `~/.aberp/serve/<tenant>/` | serve at boot | regenerated as needed |
-| Keychain entry | `aberp.<scope>.<tenant>` | various wizards | encrypted dump in `*-keychain.zip` |
+| Keychain entry | `aberp.<scope>.<tenant>` | various wizards | age-encrypted dump in `*-keychain.json.age` (ADR-0113; legacy `*-keychain.zip`) |
 | Mirror table | DuckDB table in `aberp.duckdb` | per-feature schema | captured via DB file |
 
 Any future surface MUST land in one of these categories or extend the

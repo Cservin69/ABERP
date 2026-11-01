@@ -1199,6 +1199,19 @@ fn row_to_reservation(row: &duckdb::Row<'_>) -> duckdb::Result<SequenceReservati
 /// [`allocate_in_tx`] is: the binary owns the `Transaction` lifecycle
 /// and calls this inside its own tx that also drives audit-ledger
 /// appends per ADR-0008 §Storage.
+/// ADR-0031 addendum 2 — whether `key` already burned an invoice, i.e. a
+/// request with it will REPLAY (allocate nothing). The issuance path uses it
+/// to skip the submission-queue cap for a replay: refusing a retry of an
+/// invoice that already exists would turn a lost response into a 409.
+pub fn idempotency_key_exists(
+    conn: &duckdb::Connection,
+    key: &crate::app::issue_invoice::IdempotencyKey,
+) -> Result<bool, BillingError> {
+    let mut stmt = conn.prepare("SELECT 1 FROM invoice WHERE idempotency_key = ? LIMIT 1;")?;
+    let mut rows = stmt.query([key.to_canonical_string()])?;
+    Ok(rows.next()?.is_some())
+}
+
 pub fn load_ready_invoice_by_id(
     tx: &duckdb::Transaction<'_>,
     invoice_id: &str,
