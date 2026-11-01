@@ -56,8 +56,13 @@ pub const REMOTE_SESSION_TOKEN_ACCOUNT: &str = "remote_session_token";
 /// Thunderbolt Bridge service is `bridge0`.
 pub const DEFAULT_REMOTE_IFACE: &str = "bridge0";
 
-/// Listen backlog for the remote socket. One client; a small queue is plenty.
-const REMOTE_LISTEN_BACKLOG: i32 = 16;
+/// Listen backlog for the remote socket. One client, but it issues in
+/// parallel and each request is its own TCP connection: at 16 a 20+-way
+/// burst had connects refused before reaching the server (ADR-0031
+/// addendum 2). 1024 matches tokio's default; the kernel clamps it to
+/// `kern.ipc.somaxconn` (128 on stock macOS). The peer allowlist, not the
+/// queue depth, is what keeps other hosts out.
+const REMOTE_LISTEN_BACKLOG: i32 = 1024;
 
 /// Validated remote-listener configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,5 +384,38 @@ mod tests {
                 "{route} must stay reachable"
             );
         }
+    }
+
+    /// Item 6 reproduction: one client issuing in parallel opens one TCP
+    /// connection per request. With a 16-deep accept queue a 20+-way burst
+    /// over the bridge had requests refused before they reached the server
+    /// ("Couldn't connect to server" at ~50 ms). Bind the real listener on
+    /// lo0, accept nothing, and open a burst of connections: every one must
+    /// complete the TCP handshake into the accept queue.
+    #[test]
+    fn listen_backlog_absorbs_a_parallel_burst_from_one_client() {
+        const BURST: usize = 100;
+        let cfg = RemoteListenerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            iface: "lo0".to_string(),
+            peer: Ipv4Addr::new(127, 0, 0, 2),
+        };
+        let listener = bind(&cfg).expect("bind on lo0");
+        let addr = listener.local_addr().unwrap();
+        let handles: Vec<_> = (0..BURST)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3))
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let failed = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(
+            failed, 0,
+            "{failed} of {BURST} parallel connects were refused or timed out with nothing \
+             accepting yet — the remote listen backlog is too small for a burst"
+        );
+        drop(listener);
     }
 }

@@ -8137,32 +8137,12 @@ async fn handle_issue_invoice(
                             // ~31s `poll_ack_request`. The daemon runs to
                             // terminal (or process shutdown); if NAV takes
                             // minutes-to-hours the pictogram still flips on
-                            // its own with no operator click. Spawned as its
-                            // own task so this post-issue tail returns once
-                            // submit lands rather than living for the
-                            // daemon's whole lifetime.
-                            match build_poll_daemon_inputs(&task_state, &task_invoice_id).await {
-                                Ok(inputs) => {
-                                    let sem = task_state.nav_poll_semaphore.clone();
-                                    let cancel = task_state.shutdown_token.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) =
-                                            poll_ack::run_nav_poll_daemon(inputs, sem, cancel).await
-                                        {
-                                            tracing::warn!(
-                                                error = ?e,
-                                                "post-issue NAV poll daemon failed"
-                                            );
-                                        }
-                                    });
-                                }
-                                Err(e) => tracing::warn!(
-                                    invoice_id = %task_invoice_id,
-                                    error = ?e,
-                                    "post-issue could not build poll daemon inputs; \
-                                     pictogram stays actionable for a manual poll"
-                                ),
-                            }
+                            // its own with no operator click.
+                            spawn_nav_poll_daemon_after_submit(
+                                &task_state,
+                                &task_invoice_id,
+                                "post-issue",
+                            );
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -8256,26 +8236,9 @@ async fn run_chain_post_issue_tail(
     }
     if submit_to_nav_flag {
         match submit_invoice_request(state, chain_invoice_id).await {
-            Ok(_) => match build_poll_daemon_inputs(state, chain_invoice_id).await {
-                Ok(inputs) => {
-                    let sem = state.nav_poll_semaphore.clone();
-                    let cancel = state.shutdown_token.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = poll_ack::run_nav_poll_daemon(inputs, sem, cancel).await {
-                            tracing::warn!(
-                                error = ?e,
-                                "post-issue chain NAV poll daemon failed"
-                            );
-                        }
-                    });
-                }
-                Err(e) => tracing::warn!(
-                    chain_invoice_id = %chain_invoice_id,
-                    error = ?e,
-                    "post-issue chain could not build poll daemon inputs; \
-                     pictogram stays actionable for a manual poll"
-                ),
-            },
+            Ok(_) => {
+                spawn_nav_poll_daemon_after_submit(state, chain_invoice_id, "post-issue chain")
+            }
             Err(e) => {
                 tracing::warn!(
                     chain_invoice_id = %chain_invoice_id,
@@ -8742,19 +8705,28 @@ async fn handle_submit_invoice(
         return resp;
     }
     match submit_invoice_request(&state, &invoice_id).await {
-        Ok(outcome) => Json(SubmitInvoiceResponse {
-            invoice_id: outcome.invoice_id,
-            transaction_id: outcome.transaction_id,
-            // S434 — NAV-off issuance lands LocalOnly; the normal NAV wire
-            // path lands Submitted.
-            state: if outcome.local_only {
-                InvoiceState::LocalOnly
-            } else {
-                InvoiceState::Submitted
-            },
-            entries_verified: outcome.entries_verified,
-        })
-        .into_response(),
+        Ok(outcome) => {
+            // A manual submit gets the same ack poller as the post-issue
+            // auto-submit; before this the pictogram sat at Submitted until
+            // an operator poll click or the next app boot. A local-only
+            // invoice has no NAV transaction to poll.
+            if !outcome.local_only {
+                spawn_nav_poll_daemon_after_submit(&state, &outcome.invoice_id, "manual submit");
+            }
+            Json(SubmitInvoiceResponse {
+                invoice_id: outcome.invoice_id,
+                transaction_id: outcome.transaction_id,
+                // S434 — NAV-off issuance lands LocalOnly; the normal NAV wire
+                // path lands Submitted.
+                state: if outcome.local_only {
+                    InvoiceState::LocalOnly
+                } else {
+                    InvoiceState::Submitted
+                },
+                entries_verified: outcome.entries_verified,
+            })
+            .into_response()
+        }
         Err(SubmitRouteError::PreconditionMismatch {
             current_state,
             message,
@@ -26661,6 +26633,41 @@ fn query_non_terminal_invoices(state: &AppState) -> Result<Vec<String>> {
         .entries()
         .context("read audit ledger entries for boot-recovery scan")?;
     Ok(non_terminal_invoice_ids_from_entries(&entries))
+}
+
+/// Hand a just-submitted invoice to the indefinite two-phase NAV ack poll
+/// daemon (session-161). Shared by every successful-submit path — the
+/// post-issue tail, the post-issue chain tail and the manual
+/// `POST /invoices/:id/submit` route — so no submit leaves the pictogram
+/// waiting on an operator poll click. Spawned as its own task: the caller
+/// returns once submit lands, not after the daemon's whole lifetime.
+/// `origin` only labels the log lines.
+fn spawn_nav_poll_daemon_after_submit(state: &AppState, invoice_id: &str, origin: &'static str) {
+    let state = state.clone();
+    let invoice_id = invoice_id.to_string();
+    tokio::spawn(async move {
+        match build_poll_daemon_inputs(&state, &invoice_id).await {
+            Ok(inputs) => {
+                let sem = state.nav_poll_semaphore.clone();
+                let cancel = state.shutdown_token.clone();
+                if let Err(e) = poll_ack::run_nav_poll_daemon(inputs, sem, cancel).await {
+                    tracing::warn!(
+                        invoice_id = %invoice_id,
+                        origin,
+                        error = ?e,
+                        "NAV poll daemon failed"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                invoice_id = %invoice_id,
+                origin,
+                error = ?e,
+                "could not build poll daemon inputs; \
+                 pictogram stays actionable for a manual poll"
+            ),
+        }
+    });
 }
 
 /// Build the [`poll_ack::PollDaemonInputs`] for `invoice_id` from the

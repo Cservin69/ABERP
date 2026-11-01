@@ -26,6 +26,7 @@ import {
   parseInvoicePreflightErrors,
   parseMissingSellerConfigError,
   parseSubmissionQueueFullError,
+  submissionQueueFullMessage,
   paymentDeadlineFromOffset,
   resolveBankForCurrency,
   targetForFieldPath,
@@ -1748,5 +1749,44 @@ describe("parseSubmissionQueueFullError", () => {
       ),
     ).toBeNull();
     expect(parseSubmissionQueueFullError("network down")).toBeNull();
+  });
+});
+
+// ADR-0031 addendum — the same friendly sentence on the storno and
+// modification screens (InvoiceDetail cancel, ModificationInvoice submit).
+describe("submissionQueueFullMessage", () => {
+  const raw409 = (issuing: string) =>
+    `backend returned 409 Conflict for /api/invoices/inv_X/${issuing}: ${JSON.stringify({
+      error: "submission_queue_full",
+      message: "submission queue is full (50/50 ...)",
+      pending: 50,
+      cap: 50,
+      issuing,
+    })}`;
+
+  it("names the refused storno in HU and EN", () => {
+    const m = submissionQueueFullMessage(raw409("storno"));
+    expect(m).toContain("50/50");
+    expect(m).toContain("nem készült sztornó számla");
+    expect(m).toContain("no storno was issued");
+  });
+
+  it("names the refused modification in HU and EN", () => {
+    const m = submissionQueueFullMessage(raw409("modification"));
+    expect(m).toContain("nem készült módosító számla");
+    expect(m).toContain("no modification was issued");
+  });
+
+  it("covers a plain invoice too", () => {
+    expect(submissionQueueFullMessage(raw409("invoice"))).toContain("no invoice was issued");
+  });
+
+  it("returns null for any other error so the screen shows it unchanged", () => {
+    expect(
+      submissionQueueFullMessage(
+        'backend returned 409 Conflict for /api/invoices/inv_X/storno: {"error":"precondition_mismatch","message":"x"}',
+      ),
+    ).toBeNull();
+    expect(submissionQueueFullMessage("network down")).toBeNull();
   });
 });
