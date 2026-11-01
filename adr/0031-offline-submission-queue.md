@@ -860,13 +860,23 @@ full, although a replay creates nothing.
   - assert exactly 5 issued and 15 typed refusals;
   - assert `InvoiceSequenceReserved` equals the cap;
   - assert a replay of an issued key at a full queue succeeds with `replayed: true`.
-- **Burst failures.** The earlier "4 of 20 burst requests failed" did not
-  reproduce. These runs completed with no transport errors:
-  - 40 concurrent over the bridge: all 200, connect ≤ 14 ms;
-  - 40 concurrent on loopback against a prod copy: all 200, max 2.8 s;
-  - 120 concurrent over the bridge: connect ≤ 34 ms.
-
-  This rules out the listener backlog, TLS and client timeouts. The first
-  harness discarded curl's errors (`-s` without `-S`), so the failures are
-  attributed to the harness, not the server. The over-cap count above was
-  the real defect.
+- **Burst failures — root cause: the remote listen backlog.** The "4 of 20
+  burst requests failed before reaching the server" was real. The ADR-0111
+  remote socket listened with a backlog of 16, sized for "one client", but
+  one client issuing in parallel opens one TCP connection per request.
+  - Smaller bursts (40 and 120 over the bridge, 2026-10-31) happened to
+    get through, which is why the first pass wrongly put the failures down
+    to the harness.
+  - The live run on 2026-11-01 reproduced it: 120 parallel issues over the
+    bridge gave 50 issued, 12 typed 409s and **58 `Couldn't connect` /
+    `Broken pipe`** failures at 44–63 ms.
+  - Fix: `REMOTE_LISTEN_BACKLOG = 1024`, which the kernel clamps to
+    `kern.ipc.somaxconn` (128 on stock macOS). Access control stays with
+    the interface pin and the peer allowlist, not the queue depth.
+  - Test:
+    `remote_listener::tests::listen_backlog_absorbs_a_parallel_burst_from_one_client`
+    binds the real listener on lo0, accepts nothing and opens 100 parallel
+    connects. At 16, 84 of 100 failed; at 1024, all 100 succeed.
+  - Live re-run on the fixed build: 120 parallel issues over the bridge
+    gave 50 issued, 70 typed 409s, **0 transport errors**, and exactly 50
+    invoices on the server.
