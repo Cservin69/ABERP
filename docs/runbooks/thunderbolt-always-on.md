@@ -181,6 +181,29 @@ Then upgrade the Studio to the same branch:
 cd ~/ABERP && git fetch && git checkout -B PROD_vX.Y origin/PROD_vX.Y && ./run/run_remote_client.sh
 ```
 
+### Dialogs to expect during an upgrade
+
+This is the list as observed on the 2.36.2 → 2.37.0 upgrade (2026-11-01). Each new build is a new
+binary to macOS, so its keychain and folder prompts come back. If a dialog appears that is not
+listed here, read its exact text before you click.
+
+**MacBook** (`upgrade_prod.sh`):
+
+| When | Dialog | Press |
+|---|---|---|
+| Snapshot | "security wants to use your confidential information stored in 'aberp.nav.prod' in your keychain" (and 'aberp.smtp.prod') | **Allow**, not Always |
+| Snapshot | Passphrase for the keychain dump, asked twice. Since 2.37.0 this is `age` (ADR-0113): leave it empty and age prints a strong one; store it with the snapshot record. Up to 2.36.2 it was `zip -e`. | your passphrase |
+| Agent start | "aberp wants to use your confidential information stored in 'aberp.nav.prod'", several times (session token, remote token, NAV credentials, SMTP, …) | **Always Allow** each |
+| Agent start | "aberp would like to access files in your Documents folder". This is the snapshot daemon (ADR-0082) writing `~/Documents/ABERP-snapshots/prod`. | **Allow** |
+| Attach | "aberp-ui wants to use … 'aberp.nav.prod'" | **Always Allow** |
+| Tenant settings page, or a window that restores onto it | "aberp wants to use … 'aberp.quote_intake.prod'". The page's `has_token` check reads the secret; a fix that only probes the item's attributes is in review (branch `quote-intake-token-presence-no-prompt`). | **Always Allow** |
+
+**Studio** (`run_remote_client.sh`):
+
+| When | Dialog | Press |
+|---|---|---|
+| Client start | "aberp-ui wants to use … 'aberp.nav.prod'" (the client token) | **Always Allow** |
+
 ## 9. When the link is down
 
 The Studio's boot pane, or the failing action, says the backend is unreachable and that nothing
