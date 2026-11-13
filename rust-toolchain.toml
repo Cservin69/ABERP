@@ -15,8 +15,12 @@
 # SEPARATE, deliberate decision at H7 (end of the effort) — not to be reverted
 # piecemeal. The MSRV floor still lives in each Cargo.toml `rust-version`;
 # Cargo.lock remains the dependency pin (ADR-0007 §Supply chain).
+#
+# 2026-11-13: owner bumped the exact pin 1.97.0 -> 1.99.1 after a full green
+# gate on 1.99.1 (ADR-0099 Addendum "Toolchain bump 1.99.1"). Still an EXACT
+# pin; the next bump is again its own gated, labelled commit.
 
 [toolchain]
-channel = "1.97.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 profile = "default"
