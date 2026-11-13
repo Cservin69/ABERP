@@ -1434,3 +1434,38 @@ triage: `docs/findings/precut-integration-v2_33_2-2026-07-28.md`.
 name list: `aberp-mes::ledger_writer::write_one` opens a fresh connection in-serve and
 appends through `write_mes_adapter_event`, and the write-fork gate reports ZERO. The
 D1 treatment applied to CHECK N has NOT been applied to CHECK 10M.
+
+## Addendum — Toolchain bump 1.97.0 → 1.99.1 (2026-11-13, owner Ervin)
+
+**Decision.** The owner asked for 1.99.1 (`rustc 1.99.1 (58cf8f9c3 2026-10-13)`). The pin stays
+**exact**: `rust-toolchain.toml` moves from `channel = "1.97.0"` to `channel = "1.99.1"`. This is a
+deliberate bump in its own labelled commit, as the 2026-07-09 decision requires. It is not an
+un-pin to floating `stable`. `rust-version` (MSRV floor) and `Cargo.lock` are unchanged.
+
+**Gate on 1.99.1.**
+- fmt, the SPA (npm ci, build, vitest, check), the run/tests shell tests (`provision_pipeline_venv`
+  skipped: the Studio has Python 3.9), the locked build, `cargo test --workspace --locked`
+  (3147 passed, 0 failed; `aberp-cad-extract-wrapper` excluded, as before),
+  and clippy `-D warnings` in both the default and the `--release --features production` flavour.
+- The only new findings came from two clippy 1.99 lints. All the fixes are mechanical and change
+  no behaviour:
+  - `chunks_exact_to_as_chunks` (8 sites): `x.chunks_exact(N)` → `x.as_chunks::<N>().0`.
+    - `nav-transport/src/cipher.rs`: the token-exchange decrypt, plus its test-only encrypt helper.
+      The ciphertext is already rejected unless its length is a multiple of 16, so both forms see
+      the same blocks.
+    - `invoice-pdf/src/logo.rs`: the RGBA and grey+alpha pixel loops, plus 4 test assertions.
+      Both forms drop a trailing partial chunk identically.
+  - `double_must_use` (5 traits): this fires on the `#[must_use]` that the `async_trait` macro
+    (0.1.89) itself emits. It is silenced with a commented `#[allow(clippy::double_must_use)]` on
+    exactly those traits (`aberp-mes` `Adapter`; `aberp` `OutboxSender`, `NavInvoiceNumberProbe`,
+    `PricedReposter`, `MnbRatesProvider`), not workspace-wide.
+
+**Durability re-check (ADR-0110).** ADR-0110 and `aberp-db` rely on the pinned stdlib routing
+`File::sync_all` to `fcntl(F_FULLFSYNC)` on Apple targets. This was re-verified for 1.99.1 on the
+compiled stdlib, since no `rust-src` is installed: a `sync_all` probe built with 1.97.0 and with 1.99.1
+imports `_fcntl` and not `_fsync`, and calls it with `w1 = 0x33` (51 = `F_FULLFSYNC`) in both. The
+"pinned 1.97.0 stdlib" wording in those comments still holds for 1.99.1.
+
+**Operator impact.** The prod MacBook builds with the pinned toolchain, so rustup installs 1.99.1
+on the first `upgrade_prod.sh` that builds this release. The next bump is again its own gated,
+labelled commit.

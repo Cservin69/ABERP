@@ -196,6 +196,8 @@ struct EmailOutboxListResponse {
 /// test in `tests/email_outbox_poll_full_cycle.rs` injects a capture-
 /// only fake so the cycle's audit / writeback paths can be exercised
 /// without a real SMTP server.
+// clippy 1.99 `double_must_use` fires on the `#[must_use]` the async_trait macro emits.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait OutboxSender: Send + Sync {
     async fn send(&self, entry: &EmailOutboxEntry) -> Result<()>;

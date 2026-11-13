@@ -31,6 +31,9 @@ use crate::events::CanonicalEvent;
 /// mutability for their JoinHandles / cancellation tokens / state
 /// trackers. This matches the `Arc<dyn Adapter>` ownership shape the
 /// [`AdapterRegistry`](crate::AdapterRegistry) uses.
+// clippy 1.99 `double_must_use` fires on the `#[must_use]` that the async_trait
+// macro itself emits on the boxed-future methods; not our code, nothing to fix here.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Adapter: Send + Sync + std::fmt::Debug {
     /// Stable identifier — typically `vendor-model-instance`. Used as
