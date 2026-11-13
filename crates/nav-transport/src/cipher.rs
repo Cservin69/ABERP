@@ -113,7 +113,7 @@ pub fn decrypt_exchange_token(
 
     let mut out = Vec::with_capacity(ciphertext.len());
     let mut block = GenericArray::<u8, aes::cipher::typenum::U16>::default();
-    for chunk in ciphertext.chunks_exact(AES_BLOCK_SIZE) {
+    for chunk in ciphertext.as_chunks::<AES_BLOCK_SIZE>().0 {
         block.copy_from_slice(chunk);
         cipher.decrypt_block(&mut block);
         out.extend_from_slice(block.as_slice());
@@ -150,7 +150,7 @@ mod tests {
         let cipher = Aes128::new(key_array);
         let mut out = Vec::with_capacity(plaintext.len());
         let mut block = GenericArray::<u8, aes::cipher::typenum::U16>::default();
-        for chunk in plaintext.chunks_exact(16) {
+        for chunk in plaintext.as_chunks::<16>().0 {
             block.copy_from_slice(chunk);
             cipher.encrypt_block(&mut block);
             out.extend_from_slice(block.as_slice());

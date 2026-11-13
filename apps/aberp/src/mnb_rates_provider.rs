@@ -68,6 +68,8 @@ use time::Date;
 /// `build_live_provider_for_currency` returns
 /// `Box<dyn MnbRatesProvider>`) AND keep the resulting future `Send`
 /// (axum's handler bound requires `Future: Send`).
+// clippy 1.99 `double_must_use` fires on the `#[must_use]` the async_trait macro emits.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait MnbRatesProvider: Send + Sync {
     /// Fetch the MNB official mid-rate for `currency` on `date`. The

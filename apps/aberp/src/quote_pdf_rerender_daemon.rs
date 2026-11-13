@@ -233,6 +233,8 @@ pub struct RepostResponse {
 /// [`HttpReposter`] goes over reqwest; the integration test injects a
 /// canned-status fake so the classify / audit / re-queue paths run
 /// without a live storefront.
+// clippy 1.99 `double_must_use` fires on the `#[must_use]` the async_trait macro emits.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait PricedReposter: Send + Sync {
     /// POST the re-rendered PDF to `{base_url}/api/quotes/{id}/priced`

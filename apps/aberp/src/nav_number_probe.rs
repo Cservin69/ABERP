@@ -112,6 +112,8 @@ pub struct ClearSequence {
 /// Existence-checks a candidate invoice number against NAV. Injected into
 /// the issuance pipeline so the loop is unit-testable with a mock and so
 /// production swaps in [`LiveNavInvoiceNumberProbe`].
+// clippy 1.99 `double_must_use` fires on the `#[must_use]` the async_trait macro emits.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait NavInvoiceNumberProbe: Send + Sync {
     /// Check `nav_invoice_number` against NAV's `queryInvoiceCheck`.
